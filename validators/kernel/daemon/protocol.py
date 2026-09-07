@@ -43,7 +43,16 @@ class JsonRpcProtocol:
             return self.manager.resume_session(params["session_id"])
         if method == "session.cancel":
             return self.manager.cancel_session(params["session_id"])
+        if method == "session.approval":
+            self.manager.record_approval(
+                params["session_id"], bool(params["approved"]), str(params.get("reason", ""))
+            )
+            return self.manager.get_session(params["session_id"])
         if method == "event.list":
-            return [event.as_dict() for event in self.manager.events.events(
-                params.get("session_id"), int(params.get("after", 0)))]
+            return [
+                event.as_dict()
+                for event in self.manager.events.events(
+                    params.get("session_id"), int(params.get("after", 0))
+                )
+            ]
         raise ValueError("Method not found")

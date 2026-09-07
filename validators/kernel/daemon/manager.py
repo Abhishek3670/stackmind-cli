@@ -43,8 +43,14 @@ class SessionManager:
     def _view(session: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in session.items() if key != "active_operation"}
 
-    def create_session(self, agent: str, provider: str, contract: dict[str, Any], workspace: str,
-                       session_id: str | None = None) -> dict[str, Any]:
+    def create_session(
+        self,
+        agent: str,
+        provider: str,
+        contract: dict[str, Any],
+        workspace: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         if not all(isinstance(value, str) and value for value in (agent, provider, workspace)):
             raise ValueError("agent, provider, and workspace are required")
         if not isinstance(contract, dict):
@@ -53,9 +59,16 @@ class SessionManager:
         if identifier in self._sessions:
             raise ValueError("session already exists")
         session = {
-            "session_id": identifier, "agent": agent, "provider": provider, "contract": contract,
-            "workspace": workspace, "state": "RUNNING", "created_at": _now(), "updated_at": _now(),
-            "journal": [], "active_operation": None,
+            "session_id": identifier,
+            "agent": agent,
+            "provider": provider,
+            "contract": contract,
+            "workspace": workspace,
+            "state": "RUNNING",
+            "created_at": _now(),
+            "updated_at": _now(),
+            "journal": [],
+            "active_operation": None,
         }
         self._sessions[identifier] = session
         self.events.publish("session.started", identifier, agent=agent, provider=provider)
@@ -102,8 +115,14 @@ class SessionManager:
         cancel = Event()
         self._active[operation_id] = cancel
         session["active_operation"] = operation_id
-        session["journal"].append({"operation_id": operation_id, "operation": operation,
-                                   "status": "STARTED", "started_at": _now()})
+        session["journal"].append(
+            {
+                "operation_id": operation_id,
+                "operation": operation,
+                "status": "STARTED",
+                "started_at": _now(),
+            }
+        )
         self.events.publish(
             "operation.requested", session_id, operation_id=operation_id, operation=operation
         )
@@ -122,8 +141,9 @@ class SessionManager:
         if record is None:
             raise KeyError("unknown operation")
         cancelled = operation_id not in self._active or self._active[operation_id].is_set()
-        record.update(status="CANCELLED" if cancelled else "COMPLETED",
-                      completed_at=_now(), result=result)
+        record.update(
+            status="CANCELLED" if cancelled else "COMPLETED", completed_at=_now(), result=result
+        )
         self._active.pop(operation_id, None)
         if session["active_operation"] == operation_id:
             session["active_operation"] = None
@@ -148,3 +168,20 @@ class SessionManager:
 
     def record_experience(self, session_id: str, experience_id: str) -> None:
         self.events.publish("experience.recorded", session_id, experience_id=experience_id)
+
+    def record_approval(self, session_id: str, approved: bool, reason: str = "") -> None:
+        """Persist a human decision; the UI may request this, never make it itself."""
+        session = self._sessions.get(session_id)
+        if not session:
+            raise KeyError("unknown session")
+        decision = "APPROVED" if approved else "REJECTED"
+        session["journal"].append(
+            {
+                "operation": "human.approval",
+                "status": decision,
+                "reason": reason,
+                "completed_at": _now(),
+            }
+        )
+        self.events.publish("approval.recorded", session_id, approved=approved, reason=reason)
+        self._save()

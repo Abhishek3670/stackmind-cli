@@ -42,6 +42,7 @@ from .providers import (
 )
 from .session import AgentSession, Attempt, LifecycleState
 from .tools import ToolGateway
+from .tui import DaemonClient, StackMindTuiAdapter
 from .verification import SandboxCanaryVerifier
 from .workspace import ScratchWorkspace, WorkspaceEscapeError
 
@@ -59,6 +60,7 @@ __all__ = [
     "ContractEvaluator",
     "ContractNormalizer",
     "DaemonStorage",
+    "DaemonClient",
     "EligibilityDecision",
     "EventDispatcher",
     "GovernedToolRegistry",
@@ -87,6 +89,7 @@ __all__ = [
     "RateLimitError",
     "RuntimeBoundary",
     "STANDARD_KERNEL_TOOLS",
+    "StackMindTuiAdapter",
     "RuntimeEvent",
     "SandboxCanaryVerifier",
     "ScratchWorkspace",
