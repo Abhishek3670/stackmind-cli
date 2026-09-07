@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from validators.skill.models import SkillRecord
+if TYPE_CHECKING:
+    from validators.skill.models import SkillRecord
+
 from validators.verification.models import StageResult
+
 
 
 class StructuralVerifier:

@@ -19,6 +19,7 @@ docs/SMPOC/
 
 .sync/
 
+.venv/
 .pytest-tmp/
 
 .sync/knowledge/cache/embeddings/

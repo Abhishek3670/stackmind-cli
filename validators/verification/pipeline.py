@@ -14,13 +14,16 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from validators.skill.models import SkillRecord
+if TYPE_CHECKING:
+    from validators.skill.models import SkillRecord
+
 from validators.verification.canary import CanaryVerifier
 from validators.verification.models import PipelineResult, StageResult
 from validators.verification.replay import ReplayVerifier
 from validators.verification.structural import StructuralVerifier
+
 
 
 class VerificationPipeline:
