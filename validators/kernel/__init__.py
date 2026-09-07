@@ -20,6 +20,7 @@ from .evidence import (
 )
 from .identity import AgentIdentity, AuthorizationPolicy, HumanIdentity, ProviderIdentity
 from .mcp import GovernedToolRegistry, McpProtocol, McpServer, OperatingMode, OperatingModeTracker
+from .multi import AgentRole, EnsembleMember, HandoffRecord, MultiAgentSupervisor, TaskDelegation
 from .operations import OperationJournal, OperationRecord, OperationRequest, OperationType
 from .providers import (
     STANDARD_KERNEL_TOOLS,
@@ -50,6 +51,7 @@ __all__ = [
     "AgentContract",
     "AgentIdentity",
     "AgentSession",
+    "AgentRole",
     "Attempt",
     "AuthenticationError",
     "AuthenticEvidenceTracer",
@@ -63,10 +65,12 @@ __all__ = [
     "DaemonClient",
     "EligibilityDecision",
     "EventDispatcher",
+    "EnsembleMember",
     "GovernedToolRegistry",
     "ExperienceEligibilityGate",
     "FileDiffSnapshot",
     "HumanIdentity",
+    "HandoffRecord",
     "LifecycleState",
     "JsonRpcProtocol",
     "LocalDaemon",
@@ -75,6 +79,7 @@ __all__ = [
     "OpenAICompatibleAdapter",
     "McpProtocol",
     "McpServer",
+    "MultiAgentSupervisor",
     "OperationJournal",
     "OperationRecord",
     "OperationRequest",
@@ -99,6 +104,7 @@ __all__ = [
     "TokenUsage",
     "ToolCallRequest",
     "ToolDefinition",
+    "TaskDelegation",
     "ToolGateway",
     "WorkspaceEscapeError",
     "derive_verification_dimensions",
