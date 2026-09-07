@@ -1,12 +1,44 @@
-# Stackmind runtime
-.sync/
-graphify-out/
-
-# Python / Environment
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.pytest_cache/
-.ruff_cache/
 .coverage
+scratch/
+memory/
+openclaw-workspace-state.json
+
+# Python bytecode — never commit
+__pycache__/
+*.pyc
+*.pyo
+
+# SKC planning / research docs — not for commit
+docs/SKC-STATUS.md
+docs/SKC-IMPLEMENTATION-PLAN.md
+docs/HARNESS-ENGINEERING-EVALUATION.md
+docs/STACKMIND_ARCHITECTURE.md
+docs/rfcs/
+docs/SMPOC/
+
+
+.sync/
+
+.pytest-tmp/
+
+.sync/knowledge/cache/embeddings/
+demo.md
+report.md
+docs/STACKMIND-V2-REPORT.md
+
+USER.md
+TOOLS.md
+SOUL.md
+HEARTBEAT.md
+IDENTITY.md
+.vscode/settings.json
+CBM_ADAPTER_BUG_REPORT.md
+code-graph-RAG-in-stackmind.md
+StackMind_Code_Graph_Intelligence_POC.md
+StackMind_Verified_Procedural_Learning_FINAL.md
+StackMind_Verified_Procedural_Learning.md
+PLAN_PROCEDURAL_LEARNING.md
+Project_Study_&_Future_Improvements.md
+STACKMIND_AGENT_RUNTIME_ROADMAP_FINAL.md
+STACKMIND_AGENT_RUNTIME_ROADMAP.md
+StackMind_Agent_Runtime.md

@@ -1,0 +1,11 @@
+# Rework Budget Escalation Template
+# Filed when an agent exhausts rework attempts on a work order.
+# File as: .sync/escalations/{WO-ID}-rework.yaml
+
+wo_id: "WO-XXX"
+reason: ""
+attempts_summary:
+  - ""
+filed_by: ""
+filed_at: ""
+resolution: null

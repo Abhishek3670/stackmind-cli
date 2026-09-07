@@ -1,0 +1,49 @@
+# Migration: 1.1.0 → 1.2.0
+# Normalizes drifted phase_status values back into the lifecycle enum.
+#
+# Long-running 1.0.x runtimes accumulated free-form phase_status values
+# (e.g. "RELEASED_DEPLOYED_HEALTHY (v1.0.5 ...)") that were never valid against
+# the [INIT, PLANNING, ACTIVE, COMPLETE, BLOCKED] enum. This migration maps
+# those values to the nearest lifecycle state and preserves the original text
+# (losslessly) in `phase_status_detail` so nothing is lost and the change is
+# reversible.
+
+from_version: "1.1.0"
+to_version: "1.2.0"
+description: "Normalize drifted phase_status values to the lifecycle enum"
+
+up:
+  - action: normalize_enum_field
+    glob: "runtime/TREE.yaml"
+    field: phase_status
+    allowed: [INIT, PLANNING, ACTIVE, COMPLETE, BLOCKED]
+    mapping:
+      RELEASED: COMPLETE
+      DEPLOYED: COMPLETE
+      DONE: COMPLETE
+      SHIPPED: COMPLETE
+    fallback: COMPLETE
+    preserve_to: phase_status_detail
+
+  - action: normalize_enum_field
+    glob: "runtime/boot/*.yaml"
+    field: phase_status
+    allowed: [INIT, PLANNING, ACTIVE, COMPLETE, BLOCKED]
+    mapping:
+      RELEASED: COMPLETE
+      DEPLOYED: COMPLETE
+      DONE: COMPLETE
+      SHIPPED: COMPLETE
+    fallback: COMPLETE
+    preserve_to: phase_status_detail
+
+down:
+  - action: restore_field
+    glob: "runtime/TREE.yaml"
+    field: phase_status
+    source: phase_status_detail
+
+  - action: restore_field
+    glob: "runtime/boot/*.yaml"
+    field: phase_status
+    source: phase_status_detail

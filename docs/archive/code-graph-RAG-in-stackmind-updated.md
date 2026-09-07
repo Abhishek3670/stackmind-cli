@@ -1,0 +1,42 @@
+# StackMind vs Code-Graph-RAG: Integration Analysis
+
+## 1. StackMind’s existing graph features  
+StackMind’s Knowledge Compiler (SKC) already builds a rich code graph in pure Python, storing it as sharded JSON (diff-friendly) without external services.  In practice, running `stackmind graph build` on the StackMind codebase produces thousands of nodes and edges quickly (e.g. ~3,300 nodes/36,700 edges in seconds).  It supports calling/impact queries out of the box, and all existing tests pass with the built graph.  SKC also maintains **stable IDs** for symbols via a cryptographic `birth_key()` hash, so that renames or file moves do not break identity (aliases are recorded).  In other words, StackMind’s graph layer is deterministic and in-process.  It also includes a semantic search engine (content-hash + embedding store), and per-agent, path-scoped access-control gated in its runtime.  In short, StackMind already covers basic code indexing, call graphs, and search without any Memgraph or Qdrant.  
+
+## 2. Code-Graph-RAG architecture and dependencies  
+By contrast, **Code-Graph-RAG (CGR)** is a standalone “graph RAG” system that treats the code repository as a multi-language knowledge graph.  Its architecture (from the CGR docs) is:  
+
+- **Tree-sitter parser** → extract all functions, classes, modules and relationships.  
+- **Memgraph**: a running graph database (in Docker) that stores the AST-derived code graph under a unified schema.  
+- **Qdrant** (with embeddings): an optional vector DB for semantic search. CGR’s CLI provides natural-language queries that translate to Cypher, combine graph retrieval with vector search, and even AST-based code editing.  
+
+CGR supports ~12–15 languages (Python, JS/TS, Go, Java, C/C++, Rust, etc.) out of the box.  Its quick-start explicitly brings up **“the packaged Memgraph + Qdrant stack”** via `cgr daemon up`. In other words, enabling CGR means running two stateful services (the Memgraph server and the Qdrant vector store) alongside any agent processes.  
+
+## 3. Integration points and ID mapping  
+There is substantial overlap between SKC and CGR. Both build call graphs and relationships (imports, inheritance, etc.) across files.  However, CGR’s graph lives in Memgraph with its own internal node IDs, while SKC’s graph is JSON-based with SHA-256 “birth keys”.  Integrating them would require either: (a) **pushing SKC’s graph into CGR** (transforming SKC JSON into Memgraph), or (b) **pulling from CGR into SKC**. Either way, one must map the identities. StackMind’s architecture assumes its own IDs are authoritative: any external CGR IDs would have to be translated back to SKC’s birth-keys (or discarded and re-created by SKC). This “ID-sync” is nontrivial and was flagged as a risk in the CGR design docs. In practice, if we installed CGR, SKC would likely treat Memgraph as a *projection* of its code graph rather than the source of truth.  
+
+More importantly, StackMind already has working multi-file call graphs and a semantic index. For example, StackMind’s “graph callers” and “graph impact” tools return correct results on its own code today. CGR adds more (in particular, *dynamic tracing* of runtime calls and taint edges, and AST-based code rewrite tools). But note: Code-Graph-RAG’s “new” features like runtime tracing (using test runs to add `CALLS` edges) or `FLOWS_TO` taint analysis, **none of that is currently in SKC**. If desired, those could be added as focused improvements to SKC or its data feeds. They are a narrower scope than a full CGR integration.  
+
+### Comparison of overlapping capabilities:  
+- **Call Graph & Imports:** Both SKC and CGR use Tree-sitter (or LibCST/Jedi for Python in SKC’s case) to build the static call/ import graph. So SKC already covers what CGR does here.  
+- **Semantic Search:** SKC has an embedding-based search over code; CGR uses Qdrant + UniXcoder embeddings. SKC’s approach is “built-in, no Docker” (similar to codebase-memory’s bundled embeddings) vs CGR’s separate vector DB.  
+- **Multi-language:** SKC’s current compiler is Python-only, but StackMind is adopting a separate Tree-sitter pipeline (`codebase-memory-mcp`) to add multi-language support (via its own normalizer). CGR would use Tree-sitter for all languages by default. The paths conflict: StackMind insists on normalizing everything through its `birth_key()` model, whereas CGR would ingest raw Tree-sitter output and assign its own IDs.  
+- **Code editing/Agents:** CGR even includes AST rewriting and an MCP server for LLM-driven edits. SKC currently stops at graph analysis; it doesn’t natively perform automated refactoring. This is a CGR plus, but adding that would involve pulling in an AST-editing tool, not the full CGR stack necessarily.  
+
+## 4. Operational & security implications  
+Adopting Code-Graph-RAG **as-is** would add significant infrastructure: a Memgraph database and a Qdrant vector store (usually deployed via Docker/Kubernetes). That contrasts with StackMind’s “zero-config, single binary or diffable files” philosophy. For example, the `codebase-memory-mcp` engine that StackMind is aligning with is a *static binary* with an embedded SQLite graph store. It requires no running services at all. In contrast, CGR’s quick-start explicitly brings up two containers. Every service must be secured (TLS, auth) and managed (backups, high availability).  
+
+On security: StackMind currently enforces fine-grained, agent- and path-scoped access controls in-process. CGR’s approach would rely on database-level controls. Memgraph Enterprise can restrict by user/profile (if enabled) and Qdrant uses API keys/JWTs for access. But those are *coarser*: Qdrant keys are scoped per cluster/collections, and Memgraph profiles are more about resource limits than granular graph rewrites.  StackMind would inherit whatever DB access rules are configured, but would likely still need to gate queries in its own policy layer.  In short, adding CGR increases the attack surface and shifts the trust boundary to new components.  
+
+## 5. Proposed implementation plan  
+If one were to enable Code-Graph-RAG in StackMind, a cautious phased approach is advised: 
+
+1. **Proof of Concept (Dev Only):** Clone the StackMind repo and run `cgr start` on it in a separate environment. Verify CGR can index the code and answer basic queries. Compare its results (callers, definitions) with StackMind’s existing `stackmind graph` tool to identify discrepancies.  
+2. **ID Alignment Prototype:** Experiment with mapping Memgraph node IDs to StackMind’s birth-keys. For example, ingest SKC’s JSON into Memgraph or vice versa, and try to reconcile a few symbol IDs. This will reveal if a sync layer is feasible.  
+3. **Performance and Load Testing:** Measure how long CGR takes vs SKC on large codebases. Evaluate Memgraph’s and Qdrant’s resource usage. Ensure the host can run these services reliably.  
+4. **Incremental Integration:** If POC is successful, add CGR integration behind a feature flag. For now, keep SKC as primary. Implement a migration step: either SKC “exports” its graph to Memgraph on update, or it “mirrors” CGR’s data by running CGR internally but discarding CGR’s IDs (using SKC’s `birth_key()`).  
+5. **Testing & Rollback:** Extend StackMind’s test suite to include comparing a known query’s output under SKC vs CGR. Any mismatch should trigger alerts. Maintain the ability to roll back to the existing SKC-only mode (the safe graph) if CGR proves unstable.  
+
+Throughout, preserve StackMind’s existing workflows: SKC must remain the source of truth. In practice, this likely means using CGR only as a supplemental analysis tool (e.g. for cross-language projects or future dynamic-tracing features) rather than a replacement. If adopted carefully, CGR’s strengths (multi-language indexing, RAG CLI, dynamic tracing) could augment StackMind. But as of now, StackMind already “has what the proposal adds,” and adding CGR wholesale would duplicate effort and complicate the infrastructure. Citations from Code-Graph-RAG and related tools are included to substantiate these differences.  
+
+**Sources:** Official Code-Graph-RAG documentation; codebase-memory-mcp community docs; Qdrant security guide. These highlight the service requirements and design trade-offs of each approach.

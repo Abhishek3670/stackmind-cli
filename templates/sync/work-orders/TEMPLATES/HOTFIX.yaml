@@ -1,0 +1,30 @@
+# Work Order Template: HOTFIX
+# Use for: Critical production issues requiring immediate attention
+# Triggered by: CEO escalation or production incident
+
+id: "WO-XXX"
+type: HOTFIX
+title: ""
+status: ACTIVE
+priority: P0
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Hotfix-Specific Fields ───────────────────────────────
+severity: CRITICAL   # CRITICAL|HIGH
+incident_description: ""
+affected_services: []
+rollback_plan: ""
+fix_verified: false
+deployed: false
+
+# ─── Rework Budget ─────────────────────────────────────────
+rework_budget: 2
+rework_count: 0
+blocked_by_rework: false
+
+# ─── Execution Log ─────────────────────────────────────────
+log: []

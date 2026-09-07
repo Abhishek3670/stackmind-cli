@@ -1,0 +1,23 @@
+# Migration: 1.0.0 → 1.1.0
+# Adds graph_version to TREE.yaml and CEO inbox _read folder
+
+from_version: "1.0.0"
+to_version: "1.1.0"
+description: "Add graph_version field and require CEO inbox _read folder"
+
+up:
+  - action: add_field
+    file: runtime/TREE.yaml
+    field: graph_version
+    value: null
+
+  - action: add_dir
+    path: inbox/CEO/_read
+
+down:
+  - action: remove_dir
+    path: inbox/CEO/_read
+
+  - action: remove_field
+    file: runtime/TREE.yaml
+    field: graph_version

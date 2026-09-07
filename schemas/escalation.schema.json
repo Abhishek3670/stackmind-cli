@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stackmind Rework Escalation",
+  "type": "object",
+  "required": ["wo_id", "reason", "filed_by", "filed_at"],
+  "properties": {
+    "wo_id": {
+      "type": "string",
+      "pattern": "^WO-[0-9]{3}$"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "attempts_summary": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "filed_by": {
+      "type": "string"
+    },
+    "filed_at": {
+      "type": "string"
+    },
+    "resolution": {
+      "type": ["object", "null"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["reset_budget", "reassign", "cancel"]
+        },
+        "new_budget": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reassign_to": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resolved_by": {
+          "type": "string"
+        },
+        "resolved_at": {
+          "type": "string"
+        }
+      },
+      "required": ["action", "resolved_by", "resolved_at"]
+    }
+  },
+  "additionalProperties": false
+}

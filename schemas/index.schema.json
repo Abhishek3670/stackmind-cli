@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stackmind Work Order Index",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "orders",
+    "next_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "last_updated": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "updated_by": {
+      "type": "string"
+    },
+    "orders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "status",
+          "priority",
+          "dependencies"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^WO-[0-9]{3}$"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "PHASE",
+              "FEATURE",
+              "BUGFIX",
+              "HOTFIX",
+              "REFACTOR",
+              "RESEARCH",
+              "AUDIT",
+              "VALIDATION",
+              "FIX"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "READY",
+              "PENDING",
+              "ACTIVE",
+              "BLOCKED",
+              "COMPLETE",
+              "COMPLETED"
+            ]
+          },
+          "priority": {
+            "type": "string",
+            "pattern": "^P[0-3]$"
+          },
+          "assigned_agents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "plan_ref": {
+            "type": "string"
+          },
+          "created": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "updated": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "completed_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "file": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "next_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "total_active": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_completed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_blocked": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": true
+}

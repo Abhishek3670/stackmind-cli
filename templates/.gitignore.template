@@ -1,0 +1,12 @@
+# Stackmind runtime
+.sync/
+graphify-out/
+
+# Python / Environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage

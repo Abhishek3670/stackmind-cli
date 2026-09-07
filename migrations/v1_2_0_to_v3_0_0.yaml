@@ -1,0 +1,43 @@
+# Migration: 1.2.0 → 3.0.0
+# Introduces:
+# - Knowledge store directories (KNOW-01)
+# - Agent contracts directory (CONTRACT-01)
+# - Runtime upgrade to 3.0.0
+
+from_version: "1.2.0"
+to_version: "3.0.0"
+description: "Initialize Knowledge Compiler directories, Contract layer, and upgrade to v3.0.0"
+
+up:
+  - action: add_dir
+    path: contracts
+  - action: add_dir
+    path: knowledge/registry
+  - action: add_dir
+    path: knowledge/nodes
+  - action: add_dir
+    path: knowledge/revisions
+  - action: add_dir
+    path: knowledge/cache
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: version
+    value: "3.0.0"
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: min_cli_version
+    value: "3.0.0"
+
+down:
+  - action: remove_dir
+    path: contracts
+  - action: remove_dir
+    path: knowledge
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: version
+    value: "1.2.0"
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: min_cli_version
+    value: "1.2.0"

@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stackmind Runtime Version",
+  "type": "object",
+  "required": [
+    "version",
+    "schema_versions",
+    "min_cli_version"
+  ],
+  "properties": {
+    "version": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\\+[A-Za-z0-9.-]+)?$"
+        }
+      ]
+    },
+    "schema_versions": {
+      "type": "object",
+      "required": [
+        "tree",
+        "boot",
+        "work_order",
+        "index"
+      ],
+      "properties": {
+        "tree": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "boot": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "work_order": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "min_cli_version": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\\+[A-Za-z0-9.-]+)?$"
+        }
+      ]
+    },
+    "created_at": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "created_by": {
+      "type": "string"
+    },
+    "upgraded_at": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "upgraded_from": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\\+[A-Za-z0-9.-]+)?$"
+        }
+      ]
+    }
+  },
+  "additionalProperties": true
+}

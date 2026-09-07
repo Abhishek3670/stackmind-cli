@@ -1,0 +1,25 @@
+# Work Order Template: RESEARCH
+# Use for: Investigation, spike, or proof-of-concept work
+# Triggered by: Architecture question, tech evaluation, or CEO inquiry
+
+id: "WO-XXX"
+type: RESEARCH
+title: ""
+status: ACTIVE
+priority: P3
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Research-Specific Fields ─────────────────────────────
+question: ""         # what we're trying to answer
+hypothesis: ""
+time_box: ""         # max time to spend (e.g., "1 session", "2 hours")
+findings: ""
+recommendation: ""
+decision_needed: false
+
+# ─── Execution Log ─────────────────────────────────────────
+log: []

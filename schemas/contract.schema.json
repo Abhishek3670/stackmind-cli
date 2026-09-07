@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stackmind Agent Contract",
+  "type": "object",
+  "required": [
+    "agent_id",
+    "work_order",
+    "scope",
+    "budget"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "agent_id": {
+      "type": "string"
+    },
+    "work_order": {
+      "type": "string",
+      "pattern": "^WO-[0-9]{3}$"
+    },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "reports_to": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "allow",
+        "deny"
+      ],
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "module"
+            ],
+            "properties": {
+              "module": {
+                "type": "string"
+              },
+              "depth": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "module"
+            ],
+            "properties": {
+              "module": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "write": {
+          "type": "string",
+          "enum": [
+            "read-write",
+            "read-only"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_files_touched": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expires_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,29 @@
+# Work Order Template: AUDIT
+# Use for: Code quality, security, performance, or compliance audits
+# Triggered by: CEO request, phase gate, or scheduled review
+
+id: "WO-XXX"
+type: AUDIT
+title: ""
+status: ACTIVE
+priority: P2
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Audit-Specific Fields ────────────────────────────────
+audit_type: ""       # security|performance|quality|compliance
+scope: []            # services/files/areas to audit
+findings: []
+# finding format:
+#   - severity: HIGH|MEDIUM|LOW
+#     description: ""
+#     location: ""
+#     remediation: ""
+#     resolved: false
+report_file: ""
+
+# ─── Execution Log ─────────────────────────────────────────
+log: []

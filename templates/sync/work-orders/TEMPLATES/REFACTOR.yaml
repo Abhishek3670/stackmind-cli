@@ -1,0 +1,30 @@
+# Work Order Template: REFACTOR
+# Use for: Code restructuring without behavior change
+# Triggered by: Tech debt, Gemma review findings, or architecture evolution
+
+id: "WO-XXX"
+type: REFACTOR
+title: ""
+status: ACTIVE
+priority: P3
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Refactor-Specific Fields ─────────────────────────────
+description: ""
+motivation: ""       # why this refactor is needed
+affected_services: []
+breaking_changes: false
+test_coverage_before: ""
+test_coverage_after: ""
+
+# ─── Rework Budget ─────────────────────────────────────────
+rework_budget: 2
+rework_count: 0
+blocked_by_rework: false
+
+# ─── Execution Log ─────────────────────────────────────────
+log: []

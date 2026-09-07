@@ -1,0 +1,53 @@
+# Migration: 3.0.0 → 3.1.0
+# Introduces Verified Procedural Learning (LEARN-01):
+# - Experience capture and cache directories
+# - Procedural skill storage and manifest directories
+# - Runtime version bump to 3.1.0
+
+from_version: "3.0.0"
+to_version: "3.1.0"
+description: "Initialize Procedural Learning directories, skills manifests, and runtime upgrade"
+
+up:
+  - action: add_dir
+    path: experience/records
+  - action: add_dir
+    path: experience/cache
+  - action: add_dir
+    path: skills/manifests
+  - action: add_dir
+    path: skills/active
+  - action: add_dir
+    path: skills/approvals
+  - action: add_dir
+    path: skills/verification
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: version
+    value: "3.1.0"
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: min_cli_version
+    value: "3.1.0"
+
+down:
+  - action: remove_dir
+    path: experience/records
+  - action: remove_dir
+    path: experience/cache
+  - action: remove_dir
+    path: skills/manifests
+  - action: remove_dir
+    path: skills/active
+  - action: remove_dir
+    path: skills/approvals
+  - action: remove_dir
+    path: skills/verification
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: version
+    value: "3.0.0"
+  - action: set_value
+    file: RUNTIME_VERSION
+    field: min_cli_version
+    value: "3.0.0"

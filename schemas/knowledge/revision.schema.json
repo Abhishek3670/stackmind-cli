@@ -1,0 +1,6 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["built_at", "diagnostics", "id", "parent", "revision_inputs", "schema_version"],
+  "properties": {"built_at": {"type": "string"}, "diagnostics": {"type": "array"}, "id": {"type": "integer", "minimum": 1}, "parent": {"type": ["integer", "null"]}, "revision_inputs": {"type": "object"}, "schema_version": {"const": "knowledge-1"}}
+}

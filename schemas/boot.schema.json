@@ -1,0 +1,152 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stackmind Boot Snapshot",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "agent",
+    "session_count"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "agent": {
+      "type": "string",
+      "pattern": "^[a-z-]+$"
+    },
+    "role": {
+      "type": "string"
+    },
+    "session_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "current_phase": {
+      "type": "string"
+    },
+    "phase_status": {
+      "type": "string",
+      "enum": [
+        "INIT",
+        "PLANNING",
+        "ACTIVE",
+        "COMPLETE",
+        "DONE",
+        "SHIPPED",
+        "BLOCKED"
+      ]
+    },
+    "release": {
+      "type": "string"
+    },
+    "last_completed_task": {
+      "type": "string"
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assigned_work_orders": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "unread_inbox_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_seen_decision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_seen_reports": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "protocol_digest_hash": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string",
+          "pattern": "^[A-F0-9]{64}$"
+        }
+      ]
+    },
+    "tree_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "graph_version": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[A-F0-9]{64}$"
+        },
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        }
+      ]
+    },
+    "workspace_root": {
+      "type": "string"
+    },
+    "sync_root": {
+      "type": "string"
+    },
+    "graph_commit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "last_updated": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\{\\{[A-Z0-9_]+\\}\\}$"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "updated_by": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

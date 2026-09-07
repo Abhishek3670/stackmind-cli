@@ -1,0 +1,84 @@
+schema_version: 1
+tree_version: 1
+graph_version: null
+last_updated: "{{INIT_TIMESTAMP}}"
+
+current_phase: "INIT"
+phase_status: "INIT"
+release: "{{RUNTIME_VERSION}}"
+
+work_orders:
+  total_active: 0
+  total_blocked: 0
+  total_completed: 0
+  index_file: "work-orders/INDEX.yaml"
+
+agents:
+  claude:
+    status: "idle"
+    session_count: 0
+    last_task: "Runtime initialized"
+    next_task: "Await first assignment"
+    blockers: []
+    boot_version: "v1.0"
+    assigned_work_orders: []
+
+  codex:
+    status: "idle"
+    session_count: 0
+    last_task: "Runtime initialized"
+    next_task: "Await first assignment"
+    blockers: []
+    boot_version: "v1.0"
+    assigned_work_orders: []
+
+  gemini:
+    status: "idle"
+    session_count: 0
+    last_task: "Runtime initialized"
+    next_task: "Await first assignment"
+    blockers: []
+    boot_version: "v1.0"
+    assigned_work_orders: []
+
+  gemma:
+    status: "idle"
+    session_count: 0
+    last_task: "Runtime initialized"
+    next_task: "Await first assignment"
+    blockers: []
+    boot_version: "v1.0"
+    assigned_work_orders: []
+
+  local-llm:
+    status: "idle"
+    session_count: 0
+    last_task: "Runtime initialized"
+    next_task: "Await first assignment"
+    blockers: []
+    boot_version: "v1.0"
+    assigned_work_orders: []
+
+inbox_unread:
+  claude: 0
+  codex: 0
+  gemini: 0
+  gemma: 0
+  local-llm: 0
+
+latest_decision: null
+latest_decision_title: null
+decisions_pending: []
+active_dependencies: []
+
+quality:
+  backend_coverage: "0.00%"
+  frontend_coverage: "0/0 passing"
+  tests_passing: "not-run"
+  build_status: "not-run"
+
+compliance:
+  codex: "COMPLIANT"
+  gemini: "COMPLIANT"
+  gemma: "COMPLIANT"
+  local-llm: "COMPLIANT"

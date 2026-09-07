@@ -1,0 +1,8 @@
+schema_version: 1
+last_updated: "{{INIT_TIMESTAMP}}"
+updated_by: "stackmind-init"
+orders: []
+next_id: 1
+total_active: 0
+total_completed: 0
+total_blocked: 0

@@ -1,0 +1,30 @@
+# Work Order Template: FEATURE
+# Use for: New feature implementation within a phase
+# Triggered by: CEO request, PLAN.md scope, or phase decomposition
+
+id: "WO-XXX"
+type: FEATURE
+title: ""
+status: ACTIVE
+priority: P2
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Feature-Specific Fields ──────────────────────────────
+description: ""
+acceptance_criteria: []
+affected_services: []   # api_gateway, inference_worker, frontend, etc.
+api_changes: false
+db_migration: false
+frontend_changes: false
+
+# ─── Rework Budget ─────────────────────────────────────────
+rework_budget: 2
+rework_count: 0
+blocked_by_rework: false
+
+# ─── Execution Log ─────────────────────────────────────────
+log: []

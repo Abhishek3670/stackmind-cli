@@ -1,0 +1,149 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stackmind.dev/schemas/skill.schema.json",
+  "title": "SkillRecord",
+  "description": "Schema for versioned, verified procedural skill artifacts in StackMind",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "name",
+    "version",
+    "status",
+    "risk_tier",
+    "applicability",
+    "procedure",
+    "provenance",
+    "metrics",
+    "schema_version"
+  ],
+  "properties": {
+    "skill_id": {
+      "type": "string",
+      "pattern": "^SKILL-[0-9a-f]{16}$",
+      "description": "Deterministic birth-hashed skill node ID"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+$",
+      "description": "Slugified unique skill name"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Cardinal skill version number"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "candidate",
+        "experimental",
+        "active",
+        "stale",
+        "deprecated",
+        "archived"
+      ],
+      "description": "Unified lifecycle state of the skill"
+    },
+    "risk_tier": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"],
+      "description": "Consequence tier governing promotion and execution autonomy"
+    },
+    "description": {
+      "type": "string",
+      "description": "High-level summary of what procedure this skill performs"
+    },
+    "applicability": {
+      "type": "object",
+      "required": ["preconditions", "target_modules"],
+      "properties": {
+        "preconditions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "known_exclusions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "target_modules": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "procedure": {
+      "type": "object",
+      "required": ["steps"],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["step_index", "action", "tool"],
+            "properties": {
+              "step_index": { "type": "integer", "minimum": 1 },
+              "action": { "type": "string" },
+              "tool": { "type": "string" },
+              "command_template": { "type": ["string", "null"] },
+              "rationale": { "type": ["string", "null"] },
+              "expected_outcome": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "constraints": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "fallback_procedure": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["source_experience_ids", "created_at", "author_agent"],
+      "properties": {
+        "source_experience_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^EXP-[0-9a-f]{16}$"
+          }
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "author_agent": {
+          "type": "string"
+        },
+        "promotion_reason": {
+          "type": ["string", "null"]
+        },
+        "previous_version_id": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["success_count", "failure_count", "success_rate", "confidence_score"],
+      "properties": {
+        "success_count": { "type": "integer", "minimum": 0 },
+        "failure_count": { "type": "integer", "minimum": 0 },
+        "success_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "last_used_at": { "type": ["string", "null"], "format": "date-time" },
+        "confidence_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+      }
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StackMind Interactive Flow Explorer</title>
+    <!-- Mermaid CDN -->
+    <script type="module">
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+      mermaid.initialize({ 
+        startOnLoad: true,
+        theme: 'dark',
+        securityLevel: 'loose',
+        themeVariables: {
+          darkMode: true,
+          background: '#0d1117',
+          primaryColor: '#1f6feb',
+          primaryTextColor: '#c9d1d9',
+          primaryBorderColor: '#30363d',
+          lineColor: '#58a6ff',
+          secondaryColor: '#238636',
+          tertiaryColor: '#161b22'
+        }
+      });
+    </script>
+    <!-- Panzoom CDN for zoom/pan interaction -->
+    <script src="https://cdn.jsdelivr.net/npm/@panzoom/panzoom@4.5.1/dist/panzoom.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --panel-bg: #161b22;
+            --border-color: #30363d;
+            --text-main: #c9d1d9;
+            --text-heading: #f0f6fc;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-purple: #bc8cff;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Sidebar Navigation */
+        .sidebar {
+            width: 320px;
+            background-color: var(--panel-bg);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            z-index: 10;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .sidebar-header h1 {
+            color: var(--text-heading);
+            font-size: 1.4rem;
+            margin: 0 0 5px 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .sidebar-header h1 span {
+            color: var(--accent-blue);
+        }
+
+        .sidebar-header p {
+            margin: 0;
+            color: #8b949e;
+            font-size: 0.85rem;
+        }
+
+        .nav-list {
+            list-style: none;
+            padding: 10px 0;
+            margin: 0;
+            overflow-y: auto;
+            flex-grow: 1;
+        }
+
+        .nav-item {
+            padding: 12px 20px;
+            cursor: pointer;
+            border-left: 3px solid transparent;
+            font-size: 0.95rem;
+            color: #8b949e;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .nav-item:hover {
+            background-color: rgba(110, 118, 129, 0.1);
+            color: var(--text-heading);
+        }
+
+        .nav-item.active {
+            border-left-color: var(--accent-blue);
+            background-color: rgba(56, 139, 253, 0.1);
+            color: var(--accent-blue);
+            font-weight: 600;
+        }
+
+        .nav-item .icon {
+            font-size: 1.1rem;
+        }
+
+        .sidebar-footer {
+            padding: 15px 20px;
+            border-top: 1px solid var(--border-color);
+            font-size: 0.8rem;
+            color: #484f58;
+            text-align: center;
+        }
+
+        /* Main Workspace */
+        .main-content {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            background-color: #010409;
+        }
+
+        .top-bar {
+            height: 60px;
+            background-color: var(--panel-bg);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 25px;
+            z-index: 5;
+        }
+
+        .flow-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-heading);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .btn {
+            background-color: #21262d;
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .btn:hover {
+            background-color: #30363d;
+            border-color: #8b949e;
+        }
+
+        .btn-primary {
+            background-color: #238636;
+            color: #fff;
+            border-color: rgba(240,246,252,0.1);
+        }
+
+        .btn-primary:hover {
+            background-color: #2ea043;
+        }
+
+        /* Viewport Canvas */
+        .diagram-viewport {
+            flex-grow: 1;
+            position: relative;
+            overflow: hidden;
+            cursor: grab;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .diagram-viewport:active {
+            cursor: grabbing;
+        }
+
+        .panzoom-element {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .diagram-card {
+            display: none;
+            width: 90%;
+            max-width: 1200px;
+            padding: 20px;
+        }
+
+        .diagram-card.active {
+            display: block;
+        }
+
+        /* Inspect Panel Sidebar */
+        .inspector-panel {
+            position: absolute;
+            right: -380px;
+            top: 60px;
+            bottom: 0;
+            width: 380px;
+            background-color: var(--panel-bg);
+            border-left: 1px solid var(--border-color);
+            box-shadow: -5px 0 25px rgba(0,0,0,0.5);
+            transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            z-index: 8;
+            padding: 25px;
+            overflow-y: auto;
+        }
+
+        .inspector-panel.open {
+            right: 0;
+        }
+
+        .inspector-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 15px;
+            margin-bottom: 20px;
+        }
+
+        .inspector-header h3 {
+            margin: 0;
+            color: var(--accent-blue);
+            font-size: 1.1rem;
+        }
+
+        .close-inspector {
+            background: none;
+            border: none;
+            color: #8b949e;
+            font-size: 1.2rem;
+            cursor: pointer;
+        }
+
+        .close-inspector:hover {
+            color: var(--text-heading);
+        }
+
+        .detail-group {
+            margin-bottom: 20px;
+        }
+
+        .detail-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #8b949e;
+            margin-bottom: 5px;
+        }
+
+        .detail-value {
+            font-size: 0.95rem;
+            color: var(--text-main);
+            background: #0d1117;
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+        }
+
+        code {
+            background-color: rgba(110, 118, 129, 0.3);
+            color: var(--accent-blue);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.85em;
+        }
+
+        .hint-badge {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(22, 27, 34, 0.85);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border-color);
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            color: #8b949e;
+            pointer-events: none;
+            z-index: 4;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar Navigation -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <h1>⚡ Stack<span>Mind</span></h1>
+            <p>Interactive Runtime & Flow Inspector</p>
+        </div>
+        <ul class="nav-list">
+            <li class="nav-item active" onclick="switchTab(0, 'Platform Architecture & Engine vs Instance')">
+                <span class="icon">🏛️</span> Platform Architecture
+            </li>
+            <li class="nav-item" onclick="switchTab(1, 'Multi-Agent Governance Workflow Sequence')">
+                <span class="icon">🔄</span> Agent Governance Sequence
+            </li>
+            <li class="nav-item" onclick="switchTab(2, 'Knowledge Compiler (SKC) Execution Pipeline')">
+                <span class="icon">🧠</span> SKC Compilation Flow
+            </li>
+            <li class="nav-item" onclick="switchTab(3, 'Knowledge API & Unified RAG Engine')">
+                <span class="icon">🔍</span> Unified RAG Pipeline
+            </li>
+            <li class="nav-item" onclick="switchTab(4, 'Governed Harness Execution & D025 Gate')">
+                <span class="icon">🛡️</span> Harness Execution Loop
+            </li>
+        </ul>
+        <div class="sidebar-footer">
+            StackMind v2.1.0-dev · Click nodes to inspect details
+        </div>
+    </div>
+
+    <!-- Main Content Workspace -->
+    <div class="main-content">
+        <div class="top-bar">
+            <div class="flow-title" id="current-title">
+                <span>🏛️</span> Platform Architecture & Engine vs Instance
+            </div>
+            <div class="controls">
+                <button class="btn" onclick="zoomIn()">➕ Zoom In</button>
+                <button class="btn" onclick="zoomOut()">➖ Zoom Out</button>
+                <button class="btn" onclick="resetZoom()">🔄 Reset</button>
+                <button class="btn btn-primary" onclick="toggleInspector()">ℹ️ Toggle Details</button>
+            </div>
+        </div>
+
+        <!-- Interactive Diagram Viewport -->
+        <div class="diagram-viewport" id="viewport">
+            <div class="panzoom-element" id="panzoom-target">
+                
+                <!-- DIAGRAM 1 -->
+                <div class="diagram-card active" id="diagram-0">
+                    <pre class="mermaid">
+graph TB
+    subgraph ENGINE["🛠️ StackMind Runtime Engine (Python Package)"]
+        CLI["💻 CLI Entrypoints (Click)"]
+        VAL["🛡️ 5-Layer Validator"]
+        SKC_ENG["🧠 SKC Core & 14 Domain Compilers"]
+        HARN_ENG["⚡ Harness Execution Engine & D025"]
+    end
+
+    subgraph INSTANCE["📁 Runtime Instance (.sync / Repo)"]
+        T0["🔑 T0 Symbol Registry (Birth Hashes)"]
+        T1["📦 T1 Sharded Nodes & Revisions (JSON)"]
+        T2["⚡ T2 Derived Projections & Cache"]
+        CTRL["📜 Contracts (CONTRACT-01) & Work Orders"]
+        MSG["📬 Inboxes / Outboxes / Receipts"]
+    end
+
+    CLI --> VAL
+    CLI --> SKC_ENG
+    SKC_ENG --> T0
+    SKC_ENG --> T1
+    T1 --> T2
+    HARN_ENG --> CTRL
+    HARN_ENG --> MSG
+
+    click CLI nodeClick "CLI Entrypoints handles click commands for graph, lock, harness, validate"
+    click VAL nodeClick "5-Layer Validator checks schemas, structures, protocol, boot integrity, and graph state"
+    click SKC_ENG nodeClick "Knowledge Compiler converts codebase into deterministic sharded JSON IR"
+    click HARN_ENG nodeClick "Governed agent runner enforcing CONTRACT-01 scope boundaries & D025 safeguards"
+    click T0 nodeClick "T0 Symbol Registry stores permanent NodeIDs and immutable birth-hashes"
+    click CTRL nodeClick "CONTRACT-01 contracts statefully enforce scope (allow/deny) and token budgets"
+                    </pre>
+                </div>
+
+                <!-- DIAGRAM 2 -->
+                <div class="diagram-card" id="diagram-1">
+                    <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    actor CEO as 👑 User / CEO
+    participant Claude as 🏛️ Claude (Architect)
+    participant Harness as ⚡ Harness Runtime
+    participant Worker as ⚙️ Codex / Gemini (Workers)
+    participant Gate as 🔒 Contract & D025 Gates
+    participant Gemma as 🛡️ Gemma (QA Lead)
+    participant Local as 🚀 Local-LLM (GitOps)
+
+    CEO->>Claude: Define Goal / Feature Request
+    Claude->>Claude: Draft Work Order & CONTRACT-01 Scope
+    Claude->>Harness: Register WO & Contract in .sync/
+    
+    loop Worker Harness Loop
+        Harness->>Worker: Poll Inbox & Trigger Execution Task
+        Worker->>Gate: Query Knowledge API (Contract-Filtered)
+        Gate-->>Worker: Return Bounded Context Bundle
+        Worker->>Worker: Generate Implementation / Code Staging
+        Worker->>Gate: Validate Staged Diff & D025 Safeguards
+        Gate-->>Worker: Scope & Safety Verification
+    end
+
+    Worker->>Gemma: Submit Code for Review & QA Verification
+    alt Rejected
+        Gemma-->>Worker: Return QA Defects to Inbox
+    else Approved
+        Gemma->>Claude: Emit APPROVED Verdict Receipt
+        Claude->>Local: Directive to Create Signed Git Commit
+        Local->>Local: Execute Commit & Sign SHA
+        Local-->>Claude: Return Signed SHA
+        Claude-->>CEO: Close Work Order & Report Completion
+    end
+                    </pre>
+                </div>
+
+                <!-- DIAGRAM 3 -->
+                <div class="diagram-card" id="diagram-2">
+                    <pre class="mermaid">
+graph LR
+    subgraph INGEST["Source Ingestion"]
+        SRC["📄 Source Files (.py, yaml, etc)"]
+        CBM["🌳 Tree-sitter Adapter (cbm)"]
+        AST["🐍 LibCST + Jedi Resolver"]
+    end
+
+    subgraph MINT["Identity Minting"]
+        REG["🔑 Symbol Registry (T0)"]
+        HASH["🆔 Mint Birth-Hash NodeID"]
+    end
+
+    subgraph DOMAINS["14 Domain Compilers"]
+        FAST["FastAPI Compiler"]
+        PYD["Pydantic Compiler"]
+        SQL["SQLAlchemy Compiler"]
+        OTHER["Django, Celery, Alembic, etc."]
+    end
+
+    subgraph STORE["3-Tier Knowledge Store"]
+        T0_S["T0: Registry (Permanent)"]
+        T1_S["T1: Sharded IR Nodes & Revisions"]
+        T2_S["T2: Derived Projections (Reverse Index, Vector)"]
+    end
+
+    SRC --> AST & CBM
+    AST --> REG
+    REG --> HASH
+    HASH --> DOMAINS
+    DOMAINS --> T1_S
+    REG --> T0_S
+    T1_S --> T2_S
+
+    click HASH nodeClick "NodeID = TYPE-first16(SHA256(path:qualname)). Survives renames and refactoring."
+    click FAST nodeClick "Extracts FastAPI routes, dependency injection DAG, middleware, and security scopes."
+    click T1_S nodeClick "Sharded JSON documents under .sync/knowledge/nodes/ storing AST & domain metadata."
+                    </pre>
+                </div>
+
+                <!-- DIAGRAM 4 -->
+                <div class="diagram-card" id="diagram-3">
+                    <pre class="mermaid">
+flowchart TD
+    Q["💬 Agent Query / Task Prompt"] --> API["🔍 Knowledge API Interface"]
+    
+    subgraph RETRIEVAL["Multi-Signal Retrieval Engine"]
+        API --> LEX["🔤 Lexical Search Engine"]
+        API --> SEM["🧠 Vector Embeddings (Semantic)"]
+        API --> GRA["🕸️ Graph Traversal (CALLS / DEPENDS_ON)"]
+        API --> RUN["⚡ Runtime Call Tracer + Data-Flow Taint"]
+    end
+
+    LEX --> RANK["📊 Hybrid Reranking Engine"]
+    SEM --> RANK
+    GRA --> RANK
+    RUN --> RANK
+
+    RANK --> NORM["📝 Evidence Normalization"]
+    NORM --> GATE{"🔒 CONTRACT-01 Scope Gate"}
+    
+    GATE -->|In Scope| BUNDLE["📦 Ranked & Bounded Context Package"]
+    GATE -->|Out of Scope| DENIED["❌ Log Denial & Filter Out"]
+    
+    BUNDLE --> LLM["🤖 LLM Context Window"]
+
+    click GATE nodeClick "CONTRACT-01 restricts context assembly to explicit allow lists defined in contract YAML."
+    click RUN nodeClick "Uses sys.setprofile runtime tracing and bounded data-flow taint tracking (FLOWS_TO)."
+                    </pre>
+                </div>
+
+                <!-- DIAGRAM 5 -->
+                <div class="diagram-card" id="diagram-4">
+                    <pre class="mermaid">
+flowchart TD
+    START["▶️ Start Harness Task Execution"] --> POLL["📬 Poll Work Orders & Inboxes"]
+    POLL --> CONTRACT_CHK["📜 Validate Active CONTRACT-01 Gate"]
+    
+    CONTRACT_CHK -->|Contract Passed| LOCK["🔒 Acquire Advisory Write Lock"]
+    CONTRACT_CHK -->|Contract Violation| REJECT_C["❌ Reject Task & Log Violation"]
+
+    LOCK --> CTX["🧠 Assemble Context via Knowledge API"]
+    CTX --> LLM_CALL["🤖 Call Agent LLM"]
+    LLM_CALL --> SCHEMA_CHK["📋 Validate Output against Harness JSON Schema"]
+
+    SCHEMA_CHK -->|Schema OK| D025{"🛡️ D025 Destructive Operations Check"}
+    SCHEMA_CHK -->|Schema Fail| REJECT_S["❌ Reject Response & Retry"]
+
+    D025 -->|Safe Change| DRAFT["✍️ Draft Code Modification in Worker Isolation"]
+    D025 -->|Destructive Action Detected| BACKUP["💾 Enforce Mandatory Backup & CEO Escalation"]
+    BACKUP --> DRAFT
+
+    DRAFT --> PROMOTE["🚀 Promote Worker Draft to Canonical State"]
+    PROMOTE --> RELEASE["🔓 Release Write Lock"]
+    RELEASE --> DONE["✅ Task Complete & Receipt Written"]
+
+    click D025 nodeClick "D025 Safeguard requires backup-verify-escalate cycle for non-reversible code changes."
+    click LOCK nodeClick "Advisory write lock serializes canonical writes across multi-agent executions."
+                    </pre>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="hint-badge">💡 Scroll to zoom · Click and drag to pan · Click nodes for details</div>
+
+        <!-- Right Side Inspector Panel -->
+        <div class="inspector-panel" id="inspector">
+            <div class="inspector-header">
+                <h3 id="inspect-title">Node Inspector</h3>
+                <button class="close-inspector" onclick="toggleInspector()">✕</button>
+            </div>
+            <div class="detail-group">
+                <div class="detail-label">Selected Component</div>
+                <div class="detail-value" id="inspect-node-id">None Selected</div>
+            </div>
+            <div class="detail-group">
+                <div class="detail-label">Component Function & Flow Role</div>
+                <div class="detail-value" id="inspect-desc">Click any node on the diagram to view its role in the StackMind runtime pipeline.</div>
+            </div>
+            <div class="detail-group">
+                <div class="detail-label">Associated Protocols</div>
+                <div class="detail-value" id="inspect-protocol"><code>CONTRACT-01</code> · <code>HARNESS-01</code></div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // Initialize Panzoom
+        const elem = document.getElementById('panzoom-target');
+        const panzoom = Panzoom(elem, {
+            maxScale: 3,
+            minScale: 0.5,
+            contain: 'outside',
+            startScale: 1
+        });
+
+        // Zoom Controls
+        function zoomIn() { panzoom.zoomIn(); }
+        function zoomOut() { panzoom.zoomOut(); }
+        function resetZoom() { panzoom.reset(); }
+
+        // Enable mouse wheel pan/zoom
+        elem.parentElement.addEventListener('wheel', panzoom.zoomWithWheel);
+
+        // Navigation Tab Switcher
+        function switchTab(index, title) {
+            document.querySelectorAll('.nav-item').forEach((item, i) => {
+                item.classList.toggle('active', i === index);
+            });
+
+            document.querySelectorAll('.diagram-card').forEach((card, i) => {
+                card.classList.toggle('active', i === index);
+            });
+
+            document.getElementById('current-title').innerHTML = `<span>⚡</span> ${title}`;
+            panzoom.reset();
+        }
+
+        // Inspector Panel Trigger
+        function toggleInspector() {
+            document.getElementById('inspector').classList.toggle('open');
+        }
+
+        // Global Node Click Callback for Mermaid
+        window.nodeClick = function(info) {
+            document.getElementById('inspect-node-id').innerText = info;
+            document.getElementById('inspect-desc').innerText = info;
+            document.getElementById('inspector').classList.add('open');
+        };
+    </script>
+
+</body>
+</html>

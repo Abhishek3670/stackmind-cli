@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["ai", "deterministic", "kind", "node_id", "status"],
+  "properties": {
+    "node_id": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*-[0-9a-f]{16}$"},
+    "kind": {"type": "string"}, "status": {"type": "string"}, "ai": {"type": "object"},
+    "deterministic": {"type": "object", "required": ["content_hash", "location", "outgoing", "path", "qualified_name", "signature"], "properties": {
+      "content_hash": {"type": "string"}, "location": {"type": "object"}, "owner": {"type": ["string", "null"]},
+      "path": {"type": "string"}, "qualified_name": {"type": "string"}, "signature": {"type": "string"},
+      "outgoing": {"type": "array", "items": {"type": "object", "required": ["confidence", "line", "path", "relation", "resolution", "source_id", "target_id", "target_name"]}}
+    }}
+  }
+}

@@ -1,0 +1,174 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StackMind Experience Record",
+  "type": "object",
+  "required": [
+    "experience_id",
+    "task_id",
+    "agent_id",
+    "task_signature",
+    "environment",
+    "actions",
+    "observations",
+    "verification",
+    "trust_level",
+    "learning_eligible",
+    "outcome",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "experience_id": {
+      "type": "string",
+      "pattern": "^EXP-[0-9a-f]{16}$"
+    },
+    "work_order_id": {
+      "type": ["string", "null"]
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "agent_id": {
+      "type": "string"
+    },
+    "task_signature": {
+      "type": "string"
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "git_commit": { "type": ["string", "null"] },
+        "python_version": { "type": "string" },
+        "runtime_version": { "type": "string" },
+        "platform": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "initial_state": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["tool", "command_or_symbol", "input_summary", "timestamp"],
+        "properties": {
+          "tool": { "type": "string" },
+          "command_or_symbol": { "type": "string" },
+          "input_summary": { "type": "string" },
+          "timestamp": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["output_summary", "is_error"],
+        "properties": {
+          "output_summary": { "type": "string" },
+          "exit_code": { "type": ["integer", "null"] },
+          "is_error": { "type": "boolean" },
+          "error_type": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["phase", "error_message"],
+        "properties": {
+          "phase": { "type": "string" },
+          "error_message": { "type": "string" },
+          "attempted_action": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      }
+    },
+    "corrections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["failure_ref", "correction_action", "rationale"],
+        "properties": {
+          "failure_ref": { "type": "string" },
+          "correction_action": { "type": "string" },
+          "rationale": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "final_state": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "verification": {
+      "type": "object",
+      "required": ["dimensions", "observed_diff"],
+      "properties": {
+        "dimensions": {
+          "type": "object",
+          "required": [
+            "scope_verified",
+            "state_verified",
+            "code_verified",
+            "behavioral_verified",
+            "security_verified",
+            "outcome_verified",
+            "all_passed"
+          ],
+          "properties": {
+            "scope_verified": { "type": "boolean" },
+            "state_verified": { "type": "boolean" },
+            "code_verified": { "type": "boolean" },
+            "behavioral_verified": { "type": "boolean" },
+            "security_verified": { "type": "boolean" },
+            "outcome_verified": { "type": "boolean" },
+            "all_passed": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "contract_id": { "type": ["string", "null"] },
+        "observed_diff": {
+          "type": "object",
+          "properties": {
+            "added": { "type": "array", "items": { "type": "string" } },
+            "modified": { "type": "array", "items": { "type": "string" } },
+            "deleted": { "type": "array", "items": { "type": "string" } },
+            "all_changed_files": { "type": "array", "items": { "type": "string" } },
+            "is_empty": { "type": "boolean" }
+          },
+          "additionalProperties": true
+        },
+        "declaration_matches": { "type": "boolean" },
+        "tests_passed": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "trust_level": {
+      "type": "string",
+      "enum": ["OBSERVABLE", "VERIFIED", "LEARNING_ELIGIBLE"]
+    },
+    "learning_eligible": {
+      "type": "boolean"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["completed", "blocked", "deferred", "failed"]
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "recorded_at": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

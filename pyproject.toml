@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stackmind"
+version = "3.1.1"
+description = "Compiler-Backed Multi-Agent Engineering Runtime"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Abhishek Sharma" }
+]
+keywords = [
+    "multi-agent",
+    "runtime",
+    "coordination",
+    "llm",
+    "engineering"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "click>=8.0",
+    "pyyaml>=6.0",
+    "jsonschema>=4.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=2.2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+stackmind = "cli.main:cli"
+
+[project.urls]
+Homepage = "https://github.com/Abhishek3670/stackmind"
+Documentation = "https://github.com/Abhishek3670/stackmind#readme"
+Repository = "https://github.com/Abhishek3670/stackmind"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli", "schemas", "templates", "migrations", "validators"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

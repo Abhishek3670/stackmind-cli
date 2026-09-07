@@ -1,0 +1,39 @@
+# Work Order Template: PHASE
+# Use for: Major product phases (Phase 7, Phase 8, etc.)
+# Triggered by: CEO directive or PLAN.md progression
+
+id: "WO-XXX"
+type: PHASE
+title: ""
+status: ACTIVE
+priority: P1
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Phase-Specific Fields ─────────────────────────────────
+phase_number: null
+scope:
+  features: []
+  deliverables: []
+  acceptance_criteria: []
+milestones: []
+# milestone format:
+#   - name: "M1 — Backend foundation"
+#     status: PENDING  # PENDING|IN_PROGRESS|COMPLETE
+#     assigned: codex
+#     due: ""
+
+quality_gates:
+  backend_coverage_min: "80%"
+  frontend_coverage_min: "80%"
+  tests_passing: true
+  build_clean: true
+
+# ─── Execution Log ─────────────────────────────────────────
+log: []
+# - timestamp: ""
+#   action: ""
+#   by: claude
