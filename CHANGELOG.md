@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.0] - 2026-09-08
+
+### Added
+- **Agent Runtime Kernel (P0–P7 GA):** Full runtime kernel release spanning all phases:
+  - **P0 — WO-001 Runtime Kernel Contract:** Core types, interfaces, and config schema.
+  - **P1 — WO-002 Secure Execution Kernel:** Sandboxed subprocess execution with timeout and resource limits.
+  - **P2 — WO-003 Real Provider Gateway:** Multi-provider LLM support with streaming and token tracking.
+  - **P3 — WO-004 Verification & Authentic Experience Capture:** Multi-dimensional verification and trust foundation.
+  - **P4 — WO-005 Local Runtime Daemon & Stateful Sessions:** Background daemon with persistent session state.
+  - **P5 — WO-006 IDE + MCP Integration:** IDE and Model Context Protocol integration.
+  - **P6 — WO-007 Open-Source TUI Adoption & Integration:** Terminal user interface adoption and adapter layer.
+  - **P7 — WO-008 Supervised Multi-Agent Runtime:** Multi-agent supervision and runtime coordination.
+  - **CLEANUP-1 — WO-009 Architecture & Encapsulation Hardening:** 32 kernel tests, architecture and encapsulation hardening.
+- **StackMind Agent Runtime GA:** Formal GA release of the complete agent runtime platform (v3.2.0).
+
+### Changed
+- **Version Normalization:** Bumped all canonical version declarations (VERSION, VERSION.md, pyproject.toml) to `3.2.0`.
+
+---
+
 ## [3.1.1] - 2026-09-06
 
 ### Changed
