@@ -107,7 +107,9 @@ class SessionManager:
             raise ValueError("only paused sessions can be resumed")
         return self._set_state(session_id, "RUNNING", "session.resumed")
 
-    def begin_operation(self, session_id: str, operation: str) -> Event:
+    def begin_operation(
+        self, session_id: str, operation_name: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Event, str]:
         session = self._sessions.get(session_id)
         if not session or session["state"] != "RUNNING":
             raise ValueError("session is not running")
@@ -118,18 +120,22 @@ class SessionManager:
         session["journal"].append(
             {
                 "operation_id": operation_id,
-                "operation": operation,
+                "operation": operation_name,
                 "status": "STARTED",
                 "started_at": _now(),
             }
         )
         self.events.publish(
-            "operation.requested", session_id, operation_id=operation_id, operation=operation
+            "operation.requested",
+            session_id,
+            operation_id=operation_id,
+            operation=operation_name,
+            metadata=metadata or {},
         )
         self.events.publish("operation.authorized", session_id, operation_id=operation_id)
         self.events.publish("operation.started", session_id, operation_id=operation_id)
         self._save()
-        return cancel
+        return cancel, operation_id
 
     def complete_operation(self, session_id: str, operation_id: str, result: Any = None) -> None:
         session = self._sessions.get(session_id)

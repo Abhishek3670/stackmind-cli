@@ -37,4 +37,7 @@ def diff_viewer(diff: str) -> str:
 
 
 def hitl_prompt(operation: str, target: str) -> str:
-    return f"Approval Required\nOperation: {operation}\nPath: {target}\n[Approve] [Reject] [Inspect Diff]"
+    return (
+        f"Approval Required\nOperation: {operation}\nPath: {target}\n"
+        "[Approve] [Reject] [Inspect Diff]"
+    )

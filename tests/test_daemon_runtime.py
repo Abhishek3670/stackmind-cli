@@ -13,25 +13,43 @@ def _contract() -> dict[str, object]:
 
 
 def _rpc(daemon: LocalDaemon, method: str, params: dict[str, object], request_id: int = 1) -> dict:
-    request = Request(f"{daemon.url}/rpc", data=json.dumps({
-        "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
-    }).encode(), headers={"Content-Type": "application/json"})
+    request = Request(
+        f"{daemon.url}/rpc",
+        data=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     with urlopen(request) as response:
         return json.loads(response.read())
 
 
 def test_client_reconnects_and_streams_lifecycle_events(tmp_path):
     with LocalDaemon(tmp_path) as daemon:
-        created = _rpc(daemon, "session.create", {
-            "agent": "codex", "provider": "test", "contract": _contract(), "workspace": "workspace",
-        })["result"]
-        attached = _rpc(
-            daemon, "session.attach", {"session_id": created["session_id"]}, 2
+        created = _rpc(
+            daemon,
+            "session.create",
+            {
+                "agent": "codex",
+                "provider": "test",
+                "contract": _contract(),
+                "workspace": "workspace",
+            },
         )["result"]
+        attached = _rpc(daemon, "session.attach", {"session_id": created["session_id"]}, 2)[
+            "result"
+        ]
         events = _rpc(daemon, "event.list", {"session_id": created["session_id"]}, 3)["result"]
         assert attached["session_id"] == created["session_id"]
         assert [event["name"] for event in events][:3] == [
-            "session.started", "attempt.started", "contract.loaded",
+            "session.started",
+            "attempt.started",
+            "contract.loaded",
         ]
         with urlopen(f"{daemon.url}/health") as response:
             assert json.loads(response.read()) == {"status": "ok", "sessions": 1}
@@ -40,8 +58,7 @@ def test_client_reconnects_and_streams_lifecycle_events(tmp_path):
 def test_active_operation_cancels_mid_turn_and_is_journaled(tmp_path):
     manager = SessionManager(DaemonStorage(tmp_path))
     session = manager.create_session("codex", "test", _contract(), "workspace")
-    cancellation = manager.begin_operation(session["session_id"], "provider.call")
-    operation_id = manager._sessions[session["session_id"]]["active_operation"]
+    cancellation, operation_id = manager.begin_operation(session["session_id"], "provider.call")
     manager.cancel_session(session["session_id"])
     assert cancellation.is_set()
     manager.complete_operation(session["session_id"], operation_id, {"reason": "cancelled"})
