@@ -1,188 +1,251 @@
 # StackMind
 
-> **Compiler-Backed Multi-Agent Engineering Runtime**
+> **Interactive Terminal OS & Governed Multi-Agent Engineering Runtime**
 
-StackMind compiles your codebase into a persistent, queryable knowledge graph. Ask *"who calls this function?"*, *"what breaks if I rename it?"*, *"what data flows from request into SQL query?"*, or *"give me context for this task"* — and get instant, provenance-tracked answers without scanning files.
+StackMind compiles codebases into deterministic, queryable knowledge graphs and provides a **zero-bypass, contract-governed Terminal User Interface (TUI)** for autonomous AI software engineering. 
 
-StackMind is also an operating system for teams of AI agents working on a shared software project. It provides three integrated pillars: **Runtime Governance & Contract Layer** (`CONTRACT-01`), **Knowledge Compiler & Graph Intelligence** (`KNOW-01`), and a **Governed Harness Runtime** (`HARNESS-01`).
+Rather than allowing agents unrestricted access to shells and filesystems, StackMind routes all interactions through an authoritative **Runtime Kernel, Local Daemon, and Contract Boundary HUD**, complete with **Human-in-the-Loop (HITL)** controls and **6-dimensional authentic verification**.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Version: 3.1.0](https://img.shields.io/badge/version-3.1.0-blue.svg)](VERSION.md)
-[![Tests: 449 Passing](https://img.shields.io/badge/tests-449%20passing-brightgreen.svg)](tests/)
+[![Version: 3.2.0 GA](https://img.shields.io/badge/version-3.2.0%20GA-blue.svg)](VERSION.md)
+[![Tests: 32 Kernel / 480 Suite](https://img.shields.io/badge/tests-32%20kernel%20%7C%20480%20passed-brightgreen.svg)](tests/)
+[![Architecture: Zero--Bypass](https://img.shields.io/badge/architecture-zero--bypass-orange.svg)](docs/P6_TUI_ARCHITECTURE.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
-## The Four Pillars
+## 🖥️ The StackMind Interactive TUI
+
+StackMind features an interactive terminal interface built on OpenCode-compatible presentation principles, connected exclusively via **HTTP JSON-RPC** to the local runtime daemon.
 
 ```text
-                                  STACKMIND PLATFORM
-                                          │
-        ┌───────────────────┬─────────────┴─────────────┬───────────────────┐
-        ▼                   ▼                           ▼                   ▼
-┌──────────────┐    ┌──────────────┐            ┌──────────────┐    ┌──────────────┐
-│   Pillar 1   │    │   Pillar 2   │            │   Pillar 3   │    │   Pillar 4   │
-│  Governance  │    │  Knowledge   │            │   Harness    │    │  Procedural  │
-│  & Contract  │    │   Compiler   │            │   Runtime    │    │   Learning   │
-│(CONTRACT-01) │    │  (KNOW-01)   │            │ (HARNESS-01) │    │  (LEARN-01)  │
-└──────────────┘    └──────────────┘            └──────────────┘    └──────────────┘
-```
-
-1. **Runtime Governance & Contract Layer (`CONTRACT-01`):** Stateful YAML contracts restricting worker agents to strict `allow`/`deny` module boundaries with token & file budgets.
-2. **Knowledge Compiler & Code-Graph Intelligence (`KNOW-01`):** Deterministic AST source-to-IR compilation, 14 domain compilers (FastAPI, Pydantic, SQLAlchemy, etc.), runtime call tracing (`sys.setprofile`), and data-flow taint tracking (`FLOWS_TO`).
-3. **Harness Runtime (`HARNESS-01`):** Governed execution runner coordinating LLM agent tasks with contract pre-flight gates, schema verification, and `D025` destructive safeguards.
-4. **Verified Procedural Learning (`LEARN-01`):** Captures execution trajectories (`EXP-*`), compiles SQLite FTS5 search indexes, mines recurring patterns ($N \ge 3$), verifies via a 3-stage pipeline (Structural $\to$ Replay $\to$ Canary), and injects scope-bounded skills into agent prompts.
-
----
-
-## Quick Start
-
-### Standalone Knowledge Graph (Zero Config)
-
-Point StackMind at any Python project — no configuration required:
-
-```bash
-# 1. Compile entire project into deterministic knowledge store
-stackmind graph build -p /path/to/project
-
-# 2. Query symbols without scanning files
-stackmind graph query "AuthService.login" -p /path/to/project
-
-# 3. Discover callers (static + runtime confirmed)
-stackmind graph callers "AuthService.login" -p /path/to/project
-
-# 4. Impact analysis for refactoring
-stackmind graph impact "AuthService.login" --depth 3 -p /path/to/project
-
-# 5. Assemble bounded, ranked context for an LLM prompt
-stackmind graph context "How does user authentication work?" --token-budget 2000 -p /path/to/project
-```
-
-### Multi-Agent Governance Workspace
-
-Initialize a governed multi-agent workspace:
-
-```bash
-# 1. Initialize runtime
-stackmind init ./my-project --name "My App"
-
-# 2. Validate runtime health and structure
-stackmind validate ./my-project
-
-# 3. System diagnostics & version compatibility
-stackmind doctor ./my-project
-
-# 4. Run governed agent execution cycle
-stackmind harness run-once codex -p ./my-project
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ STACKMIND TUI v3.2.0  │ Session: sess-9f20c │ State: RUNNING │ Provider: claude-3-5-sonnet       │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 📋 CONTRACT HUD (WO-007)                                                                         │
+│ Agent: codex (Backend Lead)  │ Token Budget: 34,210 / 50,000 │ Touched Files: 3 / 8              │
+│ Allowed Subgraphs: validators.kernel.*, cli.tui, tests.test_tui_*                                │
+│ Denied Subgraphs:  validators.learning.*, .sync.runtime.boot.*, production_db.*                  │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ⚡ ACTIVITY STREAM (Sequenced & Checkpointed)                                                     │
+│  [10:42:01] ✓ Allowed tool call: query_graph(symbol="StackMindTuiAdapter")                      │
+│  [10:42:03] ✓ Allowed tool call: read_file(path="validators/kernel/tui/adapter.py")              │
+│  [10:42:05] ✓ Staged scratch mutation: validators/kernel/tui/views.py (+44 lines)                │
+│  [10:42:07] ✗ BLOCKED: write_file("validators/learning/skill.py") -> OUT_OF_SCOPE_DENIAL         │
+│  [10:42:10] ⚠️  HITL REQUIRED: staged write to production-mapped path                            │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 🛡️  HUMAN-IN-THE-LOOP (HITL) APPROVAL REQUIRED                                                    │
+│ Operation: Apply scratch changeset to workspace                                                  │
+│ Target:    validators/kernel/tui/views.py                                                        │
+│ Action:    [ A - Approve ]   [ R - Reject ]   [ D - Inspect Unified Diff ]   [ C - Cancel Turn ] │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 🔍 6-DIMENSIONAL VERIFICATION MATRIX                                                            │
+│ Scope: PASS  │ State: PASS  │ AST: PASS  │ Behavioral: PASS  │ Security: PASS  │ Outcome: PASS    │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ :new [wo]  │ :resume <id>  │ :diff  │ :pause  │ :cancel  │ :help                   [STATUS: READY] │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## CLI Reference
+## 🏛️ Zero-Bypass Architecture
 
-| Command | Subcommands / Options | Description |
+A core invariant of StackMind: **The TUI never executes subprocesses, accesses the filesystem, or contacts LLM providers directly.** All operations flow through an isolated JSON-RPC daemon and the governed runtime kernel:
+
+```text
+┌────────────────────────────────────────────────────────┐
+│                    USER / DEVELOPER                    │
+└───────────────────────────┬────────────────────────────┘
+                            │ (Keystrokes / Approvals)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│              INTERACTIVE TERMINAL UI                   │
+│       OpenCode-Compatible Presentation Surface         │
+└───────────────────────────┬────────────────────────────┘
+                            │ (Lifecycle & HITL Events)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│               STACKMIND TUI ADAPTER                    │
+│   Maps TUI events to strictly typed RPC requests       │
+└───────────────────────────┬────────────────────────────┘
+                            │ (HTTP JSON-RPC over /rpc)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│               STACKMIND RUNTIME DAEMON                 │
+│                                                        │
+│  ┌────────────────┐  ┌────────────────┐  ┌──────────┐  │
+│  │ SessionManager │  │  Contract Gate │  │ Sandboxes│  │
+│  └────────────────┘  └────────────────┘  └──────────┘  │
+│  ┌────────────────┐  ┌────────────────┐  ┌──────────┐  │
+│  │ ProviderGateway│  │ 6D Verifier    │  │ Evidence │  │
+│  └────────────────┘  └────────────────┘  └──────────┘  │
+└───────────────────────────┬────────────────────────────┘
+                            │ (Deterministic Isolation)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│          SCRATCH-WORKSPACE EXECUTION KERNEL            │
+│       Non-Destructive Mutations & Formal Audits        │
+└────────────────────────────────────────────────────────┘
+```
+
+### Architectural Guarantees:
+- **No Direct Shell Access:** The TUI cannot run arbitrary commands. Shell operations execute only inside sandboxed scratch workspaces.
+- **Fail-Closed Governance:** File writes outside the active YAML contract are rejected at the kernel level before disk mutation occurs.
+- **Persistent Auditability:** Every keystroke, tool invocation, token count, and HITL decision is recorded in monotonic journal receipts.
+- **Seamless Reconnection:** Client connections stream checkpointed events using sequence cursors (`event.list`), enabling instant session recovery upon terminal restart.
+
+---
+
+## ⚡ Quick Start
+
+### 1. Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/Abhishek3670/stackmind.git
+cd stackmind
+
+# Install in editable mode with development dependencies
+pip install -e ".[dev]"
+```
+
+### 2. Launching the Interactive TUI
+
+Start the local runtime daemon and open the interactive terminal interface:
+
+```bash
+# Start the background daemon
+stackmind daemon start
+
+# Launch the interactive TUI
+stackmind tui
+```
+
+### 3. TUI Navigation & Keybindings
+
+| Command | Action | Description |
 |---|---|---|
-| `stackmind init` | `[path] [--name] [--agents]` | Initializes a governed runtime with `.sync/` and isolated `.gitignore` |
-| `stackmind validate` | `[path] [--fix]` | Executes 5-layer runtime integrity and consistency validation |
-| `stackmind doctor` | `[path]` | System diagnostics, version alignment, and agent health |
-| `stackmind graph` | `build`, `update`, `query`, `callers`, `impact`, `context`, `stats`, `watch` | Builds and queries the deterministic knowledge store |
-| `stackmind graph contract` | `show`, `validate`, `explain-denial`, `scope` | Inspects and debugs agent contracts and scope boundaries |
-| `stackmind analyze` | `runtime`, `flows` | Executes runtime call tracing and data-flow taint analysis |
-| `stackmind harness` | `run-once` | Executes a governed agent task execution cycle |
-| `stackmind experience` | `list`, `show`, `capture`, `compile`, `search`, `stats` | Captures, compiles, and searches execution trajectories (`EXP-*`) |
-| `stackmind learn` | `clusters`, `mine` | Mines pattern clusters ($N \ge 3$) into candidate procedural skills |
-| `stackmind skill` | `list`, `show`, `test`, `promote`, `approve`, `retrieve`, `audit`, `feedback`, `revalidate` | Manages 3-stage verified procedural skill manifests and active pointers |
-| `stackmind lock` | `acquire`, `release`, `status` | Advisory write lock for serializing canonical writes |
-| `stackmind shutdown` | `<agent> [--defer] [--force]` | Terminate agent session with pre-flight handoff and experience capture |
-| `stackmind promote` | `<agent>` | Promotes a worker draft snapshot to canonical with validation |
-| `stackmind migrate` | `[path] [--check] [--rollback]` | Executes version upgrades using YAML manifests |
+| `:new <WO-ID>` | **Start Session** | Initializes a governed session bound to a specific Work Order contract |
+| `:resume <id>` | **Resume Session** | Reconnects to an existing session and replays checkpointed events |
+| `:diff` | **Inspect Diff** | Opens the unified diff viewer showing scratch vs. workspace changes |
+| `:approve` / `A` | **HITL Approve** | Authorizes an in-scope sensitive tool or changeset application |
+| `:reject` / `R` | **HITL Reject** | Denies the requested operation and returns control to the agent |
+| `:pause` | **Pause Turn** | Temporarily halts agent execution turns without dropping state |
+| `:cancel` / `C` | **Abort Turn** | Immediately cancels in-flight agent actions and records cancellation receipt |
+| `:help` | **Help HUD** | Toggles the command palette and active keyboard shortcuts |
 
 ---
 
-## 🔄 Runtime Migrations (Upgrading Existing Projects)
+## 🧩 The Six Platform Pillars
 
-When upgrading StackMind across version milestones (e.g., upgrading an existing project from `v3.0.0` to `v3.1.0` with Verified Procedural Learning), you can migrate safely with automated schema manifests, rollback protection, and historical experience backfill:
+StackMind provides a complete, unified operating system for autonomous agentic engineering:
 
-### Step-by-Step Project Upgrade
-
-```bash
-# 1. Preview pending migrations for your project
-stackmind migrate /path/to/project --check
-
-# 2. Execute forward migration (updates RUNTIME_VERSION and initializes directories)
-stackmind migrate /path/to/project
-
-# 3. Harvest past completed work orders into verified experience records (EXP-*)
-stackmind experience capture --backfill -p /path/to/project
-
-# 4. Synchronize records into the rebuildable SQLite FTS5 search index
-stackmind experience compile -p /path/to/project
-
-# 5. Validate repository integrity and governance compliance
-stackmind validate /path/to/project
+```text
+                                  STACKMIND PLATFORM (v3.2.0 GA)
+                                                │
+    ┌──────────────┬──────────────┬─────────────┴─────────────┬──────────────┬──────────────┐
+    ▼              ▼              ▼                           ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐             ┌────────────┐ ┌────────────┐ ┌────────────┐
+│  Pillar 1  │ │  Pillar 2  │ │  Pillar 3  │             │  Pillar 4  │ │  Pillar 5  │ │  Pillar 6  │
+│ Interactive│ │ Governance │ │ Knowledge  │             │   Secure   │ │ Supervised │ │ Procedural │
+│  TUI & IDE │ │& Contracts │ │  Compiler  │             │ Execution  │ │Multi-Agent │ │  Learning  │
+│  (P5 & P6) │ │(CONTRACT-01│ │  (KNOW-01) │             │ (HARNESS-01│ │  (Phase P7)│ │ (LEARN-01) │
+└────────────┘ └────────────┘ └────────────┘             └────────────┘ └────────────┘ └────────────┘
 ```
 
-> **Rollback Support**: If needed, migrations can be rolled back to the previous version with:
-> ```bash
-> stackmind migrate /path/to/project --rollback
-> ```
+1. **Interactive TUI & Presentation Layer (`Phase P5 & P6`):** OpenCode-compatible TUI and governed MCP/IDE bridges communicating over JSON-RPC.
+2. **Runtime Governance & Contract Layer (`CONTRACT-01`):** Formal YAML contracts specifying allowed AST symbols, file scopes, token budgets, and security tiers.
+3. **Knowledge Compiler & Graph Intelligence (`KNOW-01`):** Deterministic AST-to-IR compilation, 14 domain compilers, runtime call tracing (`sys.setprofile`), and data-flow taint analysis (`FLOWS_TO`).
+4. **Secure Execution Kernel (`HARNESS-01`):** Scratch-workspace execution isolating unverified code changes until passing 6-dimensional verification.
+5. **Supervised Multi-Agent Runtime (`Phase P7`):** Strict process isolation across specialized roles (`claude` Architect, `codex` Backend, `gemini` Frontend, `gemma` QA, `local-llm` GitOps).
+6. **Verified Procedural Learning (`LEARN-01`):** Distills verified execution clusters ($N \ge 3$) into reusable, 3-stage tested procedural skill manifests.
 
 ---
 
-## Architecture & Storage Model
+## 🛠️ CLI Reference
+
+```bash
+# Terminal User Interface & Daemon
+stackmind tui                          # Launch the interactive terminal user interface
+stackmind daemon start                 # Start the local JSON-RPC runtime daemon
+stackmind daemon status                # Inspect active daemon sessions and connections
+
+# Multi-Agent Governance Workspace
+stackmind init ./my-project            # Initialize a new governed runtime workspace
+stackmind validate ./my-project        # Execute 5-layer runtime integrity & contract validation
+stackmind doctor ./my-project          # Diagnostics, dependency integrity, and agent health
+stackmind shutdown <agent>             # Gracefully terminate session with handoff validation
+
+# Knowledge Compiler & Symbol Queries
+stackmind graph build -p .             # Compile workspace into deterministic graph IR
+stackmind graph query "symbol" -p .    # Look up symbols without scanning source files
+stackmind graph callers "symbol" -p .  # Find statically verified and runtime-traced callers
+stackmind graph impact "symbol" -p .   # Analyze blast radius of changes across graph
+stackmind graph context "task" -p .    # Assemble token-bounded, ranked prompt context bundle
+
+# Governance & Verification
+stackmind graph contract show <WO>     # Inspect active contract boundaries & budgets
+stackmind graph contract validate <WO> # Test operation validity against contract rules
+stackmind graph explain-denial <WO>    # Debug scope denial reasons for a symbol or file
+
+# Procedural Learning & Skill Engine
+stackmind experience search "query"    # Search past verified execution episodes (EXP-*)
+stackmind learn mine -p .              # Mine recurring execution patterns into skill candidates
+stackmind skill test <name>            # Run 3-stage verification pipeline (Structural/Replay/Canary)
+stackmind skill list --status active   # View active, verified procedural skills
+```
+
+---
+
+## 🔍 Authentic 6-Dimensional Verification
+
+StackMind never relies on LLM self-reporting. Every staged code modification is verified across 6 independent dimensions before touching your project repository:
+
+| Dimension | Verification Method | Enforcement |
+|---|---|---|
+| **Scope** | Compares modified paths against Contract YAML `allow` / `deny` | Fail-Closed |
+| **State** | Authoritative `WorkspaceSnapshot` before/after diff analysis | Zero Phantom Edits |
+| **AST** | Syntactic parse validation preventing syntax regressions | Lint & AST check |
+| **Behavioral**| Automated test execution (`pytest`) in isolated virtual environment | Non-zero Exit Rejection |
+| **Security** | Static taint analysis (`FLOWS_TO`) and secret regex scanning | Prevents credential leaks |
+| **Outcome** | Verification criteria check against Work Order deliverables | Acceptance Gate |
+
+---
+
+## 📂 Architecture & Storage Model
 
 ```text
 .sync/
-├── knowledge/
-│   ├── registry/           # T0 — Canonical symbol identity (birth-hashes, never deleted)
-│   ├── nodes/              # T1 — Deterministic node documents (sharded JSON)
-│   ├── revisions/          # T1 — Monotonic revision chain
-│   └── cache/              # T2 — Derived projections (reverse index, search, vector cache)
-├── experience/             # LEARN-01 captured execution episodes (EXP-*) & FTS5 cache
-│   ├── records/            # Canonical immutable experience records (EXP-*.json)
-│   └── cache/              # Rebuildable SQLite FTS5 BM25 search index (experience_index.db)
-├── skills/                 # Procedural skill manifests, active pointers, verification receipts
-│   ├── manifests/          # Versioned skill manifests (v1.json, v2.json, ...)
-│   ├── active/             # Fast O(1) active skill pointers (<name>.json)
-│   ├── approvals/          # Formal human/lead review approval receipts
-│   └── verification/       # 3-stage test run receipts (RECEIPT-*.json)
-├── contracts/              # CONTRACT-01 scope boundaries & budgets (YAML)
+├── contracts/              # CONTRACT-01 scope boundaries & token/file budgets (YAML)
 ├── work-orders/            # Persistent task lifecycles (ACTIVE, BLOCKED, COMPLETED)
+├── knowledge/              # KNOW-01 deterministic graph IR and canonical registries
+│   ├── registry/           # T0 — Canonical symbol identity (birth-hashes)
+│   ├── nodes/              # T1 — Sharded deterministic node documents
+│   └── cache/              # T2 — Derived projections (reverse index, vector search)
+├── experience/             # LEARN-01 captured execution episodes (EXP-*.json)
+│   └── cache/              # Rebuildable SQLite FTS5 search index (experience_index.db)
+├── skills/                 # Procedural skill manifests, receipts, and active pointers
+│   ├── manifests/          # Versioned skill manifests (v1.json, v2.json, ...)
+│   └── active/             # Fast O(1) active skill pointers
 ├── runtime/                # Canonical TREE.yaml, boot snapshots, receipts, write lock
 └── inbox/ & outbox/        # Structured inter-agent communication channels
 ```
 
 ---
 
-## Installation
+## 📖 Documentation Links
 
-### Requirements
-- Python ≥ 3.10
-- Core dependencies: `click`, `pyyaml`, `jsonschema`, `rich` (optional: `sentence-transformers` via `stackmind[embeddings]`)
-
-### From Source
-
-```bash
-git clone https://github.com/Abhishek3670/stackmind.git
-cd stackmind
-pip install -e ".[dev]"
-```
-
----
-
-## Documentation Links
-
-- **End-to-End Walkthrough & Hands-On Demo Guide**: [demo.md](demo.md)
+- **TUI Architecture & Specification**: [docs/P6_TUI_ARCHITECTURE.md](docs/P6_TUI_ARCHITECTURE.md)
+- **TUI Evaluation & Adoption Decision**: [docs/P6_TUI_ADOPTION_DECISION.md](docs/P6_TUI_ADOPTION_DECISION.md)
+- **Multi-Agent Governance Rules**: [AGENTS.md](AGENTS.md)
+- **Agent Runtime Roadmap**: [STACKMIND_AGENT_RUNTIME_ROADMAP_FINAL.md](STACKMIND_AGENT_RUNTIME_ROADMAP_FINAL.md)
 - **Complete Architecture Handbook**: [STACKMIND.md](STACKMIND.md)
-- **Agent Governance & Rules**: [AGENTS.md](AGENTS.md)
 - **Procedural Learning Specification**: [PLAN_PROCEDURAL_LEARNING.md](PLAN_PROCEDURAL_LEARNING.md)
-- **Interactive Architecture Explorer**: [StackMind_Interactive_Architecture.html](StackMind_Interactive_Architecture.html)
 - **Changelog**: [CHANGELOG.md](CHANGELOG.md)
-- **Version Overview**: [VERSION.md](VERSION.md)
+- **Version Manifest**: [VERSION.md](VERSION.md)
 
 ---
 
-## License
+## 📄 License
 
-MIT — [Abhishek Sharma](https://github.com/Abhishek3670/stackmind)
-
+MIT © [Abhishek Sharma](https://github.com/Abhishek3670/stackmind)
