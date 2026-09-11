@@ -7,23 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [3.2.0] - 2026-09-08
+## [3.2.0] - 2026-09-11
 
 ### Added
-- **Agent Runtime Kernel (P0–P7 GA):** Full runtime kernel release spanning all phases:
-  - **P0 — WO-001 Runtime Kernel Contract:** Core types, interfaces, and config schema.
-  - **P1 — WO-002 Secure Execution Kernel:** Sandboxed subprocess execution with timeout and resource limits.
-  - **P2 — WO-003 Real Provider Gateway:** Multi-provider LLM support with streaming and token tracking.
-  - **P3 — WO-004 Verification & Authentic Experience Capture:** Multi-dimensional verification and trust foundation.
-  - **P4 — WO-005 Local Runtime Daemon & Stateful Sessions:** Background daemon with persistent session state.
-  - **P5 — WO-006 IDE + MCP Integration:** IDE and Model Context Protocol integration.
-  - **P6 — WO-007 Open-Source TUI Adoption & Integration:** Terminal user interface adoption and adapter layer.
-  - **P7 — WO-008 Supervised Multi-Agent Runtime:** Multi-agent supervision and runtime coordination.
-  - **CLEANUP-1 — WO-009 Architecture & Encapsulation Hardening:** 32 kernel tests, architecture and encapsulation hardening.
+- **Interactive Terminal UI & Daemon Control Plane (Milestone P6):** Complete Python-native interactive terminal client (`stackmind tui`) and HTTP JSON-RPC daemon control plane:
+  - **WO-011 — Targeted Preflight & Architecture Audit:** System preflight checks, environment verification, and architectural dependency validation.
+  - **WO-012 — Operation Lifecycle & Cooperative Cancellation:** Session lifecycle state machine, monotonic operation tracking, and cooperative cancellation across 10 execution checkpoints.
+  - **WO-013 — Versioned JSON-RPC 2.0 Contract & Typed Error Model:** Strictly-typed JSON-RPC 2.0 interface over HTTP `/rpc`, structured error domain codes, and request schema validation.
+  - **WO-014 — Streaming / Subscription Transport (SSE) & Tool Event Model:** Server-Sent Events `/events` endpoint, sequence-numbered event streaming, and live tool activity tracking.
+  - **WO-015 — Governed Prompt/Turn Execution via Harness AgentRunner:** Harness execution integration, turn-based state isolation, and zero-bypass tool call governance.
+  - **WO-016 — Python-Native Terminal Client (`stackmind tui`):** Rich interactive TUI control plane featuring Contract HUD, live activity stream, HITL approval modal, and 6D verification matrix.
+  - **WO-017 — P6 Acceptance, Full Regression Audit & Release Cut:** Metadata alignment across `cli/__init__.py`, `VERSION`, `VERSION.md`, and `pyproject.toml`, full regression testing, and release cut.
+- **Agent Runtime Kernel Foundation (P0–P5 GA):**
+  - **WO-001 Runtime Kernel Contract:** Core types, interfaces, and configuration schema.
+  - **WO-002 Secure Execution Kernel:** Sandboxed subprocess execution with timeout and resource limits.
+  - **WO-003 Real Provider Gateway:** Multi-provider LLM support with streaming and token tracking.
+  - **WO-004 Verification & Authentic Experience Capture:** Multi-dimensional verification and trust foundation.
+  - **WO-005 Local Runtime Daemon & Stateful Sessions:** Background daemon with persistent session state.
+  - **WO-006 IDE + MCP Integration:** IDE and Model Context Protocol integration.
+  - **WO-009 Architecture & Encapsulation Hardening:** 32 kernel unit/integration tests and encapsulation hardening.
 - **StackMind Agent Runtime GA:** Formal GA release of the complete agent runtime platform (v3.2.0).
 
 ### Changed
-- **Version Normalization:** Bumped all canonical version declarations (VERSION, VERSION.md, pyproject.toml) to `3.2.0`.
+- **Version Alignment:** Synchronized canonical version declarations across `cli/__init__.py`, `pyproject.toml`, `VERSION`, and `VERSION.md` to `3.2.0`.
 
 ---
 
