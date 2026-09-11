@@ -28,6 +28,79 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _is_narrower_or_equal(child_pat: str, parent_pat: str) -> bool:
+    if child_pat == parent_pat:
+        return True
+    child_p = child_pat.replace("\\", "/").strip("/")
+    parent_p = parent_pat.replace("\\", "/").strip("/")
+    if parent_p in ("*", "**", ""):
+        return True
+    p_base = parent_p
+    while p_base.endswith("/*"):
+        p_base = p_base[:-2]
+    if p_base.endswith("/**"):
+        p_base = p_base[:-3]
+    if p_base.endswith("*"):
+        p_base = p_base[:-1]
+    p_base = p_base.rstrip("/")
+    if not p_base:
+        return True
+    return child_p == p_base or child_p.startswith(p_base + "/")
+
+
+def _verify_contract_scope_narrowing(parent_scope: Any, child_scope: Any) -> None:
+    """Verify child's contract_scope is a subset of parent's contract_scope."""
+    if parent_scope is None:
+        return
+    if child_scope is None:
+        raise ValueError("Child contract_scope cannot be None when parent has contract_scope")
+
+    def _normalize(scope: Any) -> tuple[set[str] | None, set[str] | None]:
+        if scope is None:
+            return None, None
+        if isinstance(scope, (list, set, tuple)):
+            return set(str(x) for x in scope), None
+        if isinstance(scope, dict):
+            inner = scope.get("scope") if isinstance(scope.get("scope"), dict) else scope
+            allow = (
+                set(str(x) for x in inner["allow"])
+                if "allow" in inner and isinstance(inner["allow"], (list, set, tuple))
+                else None
+            )
+            deny = (
+                set(str(x) for x in inner["deny"])
+                if "deny" in inner and isinstance(inner["deny"], (list, set, tuple))
+                else None
+            )
+            if allow is None and deny is None:
+                return set(str(k) for k in inner.keys()), None
+            return allow, deny
+        return {str(scope)}, None
+
+    parent_allow, parent_deny = _normalize(parent_scope)
+    child_allow, child_deny = _normalize(child_scope)
+
+    if parent_allow is not None:
+        if child_allow is None:
+            raise ValueError("child contract_scope cannot be wider than parent contract_scope")
+        for c in child_allow:
+            if not any(_is_narrower_or_equal(c, p) for p in parent_allow):
+                raise ValueError(
+                    f"child contract_scope allow pattern '{c}' is out of parent allow scope: {parent_allow}"
+                )
+
+    if parent_deny is not None:
+        if child_deny is None:
+            raise ValueError(
+                f"Child contract_scope must include all parent deny patterns: {parent_deny}"
+            )
+        for p in parent_deny:
+            if not any(p == c or _is_narrower_or_equal(p, c) for c in child_deny):
+                raise ValueError(
+                    f"Child contract_scope must include all parent deny patterns: {parent_deny}"
+                )
+
+
 class SessionManager:
     """Owns daemon sessions, their audit journals, and active-operation cancellation."""
 
@@ -49,6 +122,19 @@ class SessionManager:
                 session["state"] = "WAITING"
                 session["updated_at"] = _now()
                 self.events.publish("session.recovered", session["session_id"], state="WAITING")
+            records = {
+                r["operation_id"]: r
+                for r in session.get("journal", [])
+                if isinstance(r, dict) and "operation_id" in r
+            }
+            for r in records.values():
+                r.setdefault("children", [])
+            for r in records.values():
+                pid = r.get("parent_operation_id")
+                if pid and pid in records:
+                    parent_children = records[pid].setdefault("children", [])
+                    if r["operation_id"] not in parent_children:
+                        parent_children.append(r["operation_id"])
         self._save()
 
     def _persist_event(self, _: RuntimeEvent) -> None:
@@ -166,14 +252,31 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if not session or session["state"] != "RUNNING":
                 raise ValueError("session is not running")
-            if session.get("active_operation"):
-                raise ValueError("session already has an active operation")
+
+            parent_record = None
+            if parent_operation_id is not None:
+                for r in session.get("journal", []):
+                    if r.get("operation_id") == parent_operation_id:
+                        parent_record = r
+                        break
+                if parent_record is None:
+                    raise KeyError(f"parent operation '{parent_operation_id}' not found in session")
+                if parent_record.get("status") in _OPERATION_TERMINAL:
+                    raise ValueError(
+                        f"parent operation '{parent_operation_id}' is terminal ({parent_record.get('status')})"
+                    )
+                _verify_contract_scope_narrowing(parent_record.get("contract_scope"), contract_scope)
+            else:
+                if session.get("active_operation"):
+                    raise ValueError("session already has an active operation")
+
             operation_id = str(uuid4())
             cancel = Event()
             now = _now()
             record = {
                 "operation_id": operation_id,
                 "parent_operation_id": parent_operation_id,
+                "children": [],
                 "operation": operation_name,
                 "metadata": metadata or {},
                 "work_order_id": work_order_id,
@@ -186,8 +289,12 @@ class SessionManager:
                     {"status": "RUNNING", "at": now},
                 ],
             }
+            if parent_record is not None:
+                parent_record.setdefault("children", []).append(operation_id)
+            else:
+                session["active_operation"] = operation_id
+
             self._active[operation_id] = cancel
-            session["active_operation"] = operation_id
             session["journal"].append(record)
             payload = {
                 "operation_id": operation_id,
@@ -215,6 +322,18 @@ class SessionManager:
             _, record = self._operation(operation_id)
             return dict(record)
 
+    def list_children(self, operation_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            _, record = self._operation(operation_id)
+            children_ids = record.get("children", [])
+            children = []
+            for child_id in children_ids:
+                try:
+                    children.append(self.get_operation(child_id))
+                except KeyError:
+                    pass
+            return children
+
     def list_operations(self, session_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
             sessions = (
@@ -234,38 +353,56 @@ class SessionManager:
         record["status"] = status
         record.setdefault("transitions", []).append({"status": status, "at": _now()})
 
-    def cancel_operation(self, operation_id: str, cascade: bool = False) -> dict[str, Any]:
+    def cancel_operation(self, operation_id: str, cascade: bool = True) -> dict[str, Any]:
         """Request cooperative cancellation without changing the session lifecycle."""
         with self._lock:
             session, record = self._operation(operation_id)
-            if record["status"] in _OPERATION_TERMINAL:
-                return dict(record)
-            self._transition(record, "CANCEL_REQUESTED")
-            cancel = self._active.get(operation_id)
-            if cancel:
-                cancel.set()
-            self.events.publish(
-                "operation.cancel_requested",
-                session["session_id"],
-                operation_id=operation_id,
-                cascade=cascade,
-            )
+            if record["status"] not in _OPERATION_TERMINAL:
+                self._transition(record, "CANCEL_REQUESTED")
+                cancel = self._active.get(operation_id)
+                if cancel:
+                    cancel.set()
+                self.events.publish(
+                    "operation.cancel_requested",
+                    session["session_id"],
+                    operation_id=operation_id,
+                    cascade=cascade,
+                )
+            if cascade:
+                for child_id in list(record.get("children", [])):
+                    try:
+                        self.cancel_operation(child_id, cascade=True)
+                    except KeyError:
+                        pass
             self._save()
             return dict(record)
 
     def complete_operation(
-        self, session_id: str, operation_id: str, result: Any = None, status: str = "COMPLETED"
-    ) -> None:
+        self,
+        session_id: str | None = None,
+        operation_id: str | None = None,
+        result: Any = None,
+        status: str = "COMPLETED",
+    ) -> dict[str, Any]:
         with self._lock:
-            session = self._sessions.get(session_id)
-            if not session:
-                raise KeyError("unknown session")
-            found_session, record = self._operation(operation_id)
-            if found_session is not session:
-                raise KeyError("unknown operation")
+            if operation_id is None:
+                target_op_id = session_id
+                target_session_id = None
+            else:
+                target_op_id = operation_id
+                target_session_id = session_id
+
+            if not target_op_id:
+                raise KeyError("operation_id is required")
+
+            found_session, record = self._operation(target_op_id)
+            if target_session_id is not None and found_session["session_id"] != target_session_id:
+                raise KeyError("unknown operation in session")
+            session = found_session
+
             if record["status"] in _OPERATION_TERMINAL:
-                return
-            cancel = self._active.get(operation_id)
+                return dict(record)
+            cancel = self._active.get(target_op_id)
             final_status = (
                 "CANCELLED"
                 if record["status"] == "CANCEL_REQUESTED" or (cancel is not None and cancel.is_set())
@@ -273,18 +410,33 @@ class SessionManager:
             )
             if final_status not in {"COMPLETED", "FAILED", "CANCELLED"}:
                 raise ValueError("operation completion status must be terminal")
+
+            if final_status == "COMPLETED":
+                children_ids = record.get("children", [])
+                for child_id in children_ids:
+                    _, child_record = self._operation(child_id)
+                    if child_record.get("status") not in _OPERATION_TERMINAL:
+                        raise ValueError(
+                            f"cannot complete operation '{target_op_id}': child operation '{child_id}' is active ({child_record.get('status')})"
+                        )
+                    if child_record.get("status") == "FAILED":
+                        raise ValueError(
+                            f"cannot complete operation '{target_op_id}' as COMPLETED: child operation '{child_id}' failed"
+                        )
+
             self._transition(record, final_status)
             record.update(completed_at=_now(), result=result)
-            self._active.pop(operation_id, None)
-            if session["active_operation"] == operation_id:
+            self._active.pop(target_op_id, None)
+            if session.get("active_operation") == target_op_id:
                 session["active_operation"] = None
             event = (
                 "operation.cancelled" if final_status == "CANCELLED"
                 else "operation.failed" if final_status == "FAILED"
                 else "operation.completed"
             )
-            self.events.publish(event, session_id, operation_id=operation_id, status=final_status)
+            self.events.publish(event, session["session_id"], operation_id=target_op_id, status=final_status)
             self._save()
+            return dict(record)
 
     def cancel_session(self, session_id: str) -> dict[str, Any]:
         with self._lock:

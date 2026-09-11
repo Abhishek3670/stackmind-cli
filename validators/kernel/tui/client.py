@@ -63,7 +63,10 @@ class DaemonClient:
     def operation_get(self, operation_id: str) -> dict[str, Any]:
         return self.call("operation.get", operation_id=operation_id)
 
-    def operation_cancel(self, operation_id: str, cascade: bool = False) -> dict[str, Any]:
+    def operation_children(self, operation_id: str) -> list[dict[str, Any]]:
+        return self.call("operation.children", operation_id=operation_id)
+
+    def operation_cancel(self, operation_id: str, cascade: bool = True) -> dict[str, Any]:
         return self.call("operation.cancel", operation_id=operation_id, cascade=cascade)
 
     def turn(self, session_id: str, prompt: str, **params: Any) -> dict[str, Any]:

@@ -103,11 +103,13 @@ class JsonRpcProtocol:
             return self.manager.get_operation(operation_id)
         if method == "operation.get":
             return self.manager.get_operation(params["operation_id"])
+        if method == "operation.children":
+            return self.manager.list_children(params["operation_id"])
         if method == "operation.list":
             return self.manager.list_operations(params.get("session_id"))
         if method == "operation.cancel":
             return self.manager.cancel_operation(
-                params["operation_id"], bool(params.get("cascade", False))
+                params["operation_id"], bool(params.get("cascade", True))
             )
         if method == "session.approval":
             self.manager.record_approval(
