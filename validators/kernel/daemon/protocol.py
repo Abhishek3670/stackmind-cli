@@ -111,6 +111,49 @@ class JsonRpcProtocol:
             return self.manager.cancel_operation(
                 params["operation_id"], bool(params.get("cascade", True))
             )
+        if method == "plan.propose":
+            plan_id = params.get("plan_id")
+            title = params.get("title")
+            if not isinstance(plan_id, str) or not plan_id:
+                raise ValueError("plan_id is required")
+            if not isinstance(title, str) or not title:
+                raise ValueError("title is required")
+            return self.manager.propose_plan(
+                params["session_id"],
+                plan_id,
+                title,
+                content=params.get("content", ""),
+                metadata=params.get("metadata"),
+            )
+        if method == "plan.get":
+            try:
+                return self.manager.get_plan(params["session_id"], params.get("plan_id"))
+            except KeyError as error:
+                if "plan" in str(error).lower():
+                    raise _RpcError(-32002, str(error)) from error
+                raise
+        if method == "plan.approve":
+            try:
+                return self.manager.approve_plan(
+                    params["session_id"], params["plan_id"], reason=str(params.get("reason", ""))
+                )
+            except ValueError as error:
+                raise _RpcError(-32003, str(error)) from error
+        if method == "plan.reject":
+            try:
+                return self.manager.reject_plan(
+                    params["session_id"], params["plan_id"], reason=str(params.get("reason", ""))
+                )
+            except ValueError as error:
+                raise _RpcError(-32003, str(error)) from error
+        if method == "work_order.execute":
+            turn_params = {
+                key: value for key, value in params.items() if key not in {"session_id", "prompt", "work_order_id"}
+            }
+            prompt = params.get("prompt", f"Execute work order {params['work_order_id']}")
+            return self.manager.start_turn(
+                params["session_id"], prompt, work_order_id=params["work_order_id"], **turn_params
+            )
         if method == "session.approval":
             self.manager.record_approval(
                 params["session_id"], bool(params["approved"]), str(params.get("reason", ""))

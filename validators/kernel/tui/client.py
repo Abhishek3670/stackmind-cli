@@ -72,6 +72,39 @@ class DaemonClient:
     def turn(self, session_id: str, prompt: str, **params: Any) -> dict[str, Any]:
         return self.call("session.turn", session_id=session_id, prompt=prompt, **params)
 
+    def work_order_execute(self, session_id: str, work_order_id: str, prompt: str | None = None, **params: Any) -> dict[str, Any]:
+        p = prompt or f"Execute work order {work_order_id}"
+        return self.call("work_order.execute", session_id=session_id, work_order_id=work_order_id, prompt=p, **params)
+
+    def plan_propose(
+        self,
+        session_id: str,
+        plan_id: str,
+        title: str,
+        content: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.call(
+            "plan.propose",
+            session_id=session_id,
+            plan_id=plan_id,
+            title=title,
+            content=content,
+            metadata=metadata or {},
+        )
+
+    def plan_get(self, session_id: str, plan_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"session_id": session_id}
+        if plan_id is not None:
+            params["plan_id"] = plan_id
+        return self.call("plan.get", **params)
+
+    def plan_approve(self, session_id: str, plan_id: str, reason: str = "") -> Any:
+        return self.call("plan.approve", session_id=session_id, plan_id=plan_id, reason=reason)
+
+    def plan_reject(self, session_id: str, plan_id: str, reason: str = "") -> dict[str, Any]:
+        return self.call("plan.reject", session_id=session_id, plan_id=plan_id, reason=reason)
+
     def approve(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
         return self.call(
             "session.approval", session_id=session_id, approved=approved, reason=reason

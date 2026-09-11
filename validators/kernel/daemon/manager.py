@@ -8,10 +8,13 @@ from threading import Event, RLock, Thread
 from typing import Any, Callable
 from uuid import uuid4
 
+import yaml
+
 from .events import EventDispatcher, RuntimeEvent
 from .storage import DaemonStorage
 
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
+_PLAN_STATES = {"DRAFT", "AWAITING_APPROVAL", "APPROVED", "REJECTED", "SUPERSEDED"}
 _OPERATION_STATES = {
     "REQUESTED",
     "AUTHORIZED",
@@ -118,6 +121,7 @@ class SessionManager:
         self._runner_factory = runner_factory or self._default_runner
         self.events = EventDispatcher(recovered.get("events", []), self._persist_event)
         for session in self._sessions.values():
+            session.setdefault("plans", {})
             if session["state"] == "RUNNING":
                 session["state"] = "WAITING"
                 session["updated_at"] = _now()
@@ -182,6 +186,7 @@ class SessionManager:
                 "created_at": _now(),
                 "updated_at": _now(),
                 "journal": [],
+                "plans": {},
                 "active_operation": None,
             }
             self._sessions[identifier] = session
@@ -237,6 +242,243 @@ class SessionManager:
             if not session or session["state"] != "PAUSED":
                 raise ValueError("only paused sessions can be resumed")
             return self._set_state(session_id, "RUNNING", "session.resumed")
+
+    def propose_plan(
+        self,
+        session_id: str,
+        plan_id: str,
+        title: str,
+        content: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Propose an architectural plan, placing it in AWAITING_APPROVAL state."""
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValueError("plan_id is required")
+        if not isinstance(title, str) or not title:
+            raise ValueError("title is required")
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            if session["state"] in _TERMINAL:
+                raise ValueError("session is terminal")
+
+            plans = session.setdefault("plans", {})
+            now = _now()
+            meta = metadata or {}
+            work_orders = meta.get("work_orders", [])
+
+            if plan_id in plans:
+                existing = plans[plan_id]
+                if existing.get("state") == "APPROVED":
+                    raise ValueError(f"Plan '{plan_id}' is already APPROVED")
+                # Revision of existing plan
+                revisions = existing.setdefault("revisions", [])
+                revisions.append({
+                    "title": existing.get("title"),
+                    "content": existing.get("content"),
+                    "state": existing.get("state"),
+                    "feedback": existing.get("feedback"),
+                    "updated_at": existing.get("updated_at"),
+                })
+                existing.update(
+                    title=title,
+                    content=content,
+                    metadata=meta,
+                    work_orders=work_orders,
+                    state="AWAITING_APPROVAL",
+                    feedback=None,
+                    updated_at=now,
+                )
+                plan_record = existing
+            else:
+                plan_record = {
+                    "plan_id": plan_id,
+                    "session_id": session_id,
+                    "title": title,
+                    "content": content,
+                    "metadata": meta,
+                    "work_orders": work_orders,
+                    "state": "AWAITING_APPROVAL",
+                    "feedback": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                plans[plan_id] = plan_record
+
+            self.events.publish(
+                "plan.proposed",
+                session_id,
+                plan_id=plan_id,
+                title=title,
+                content=content,
+                metadata=meta,
+                state="AWAITING_APPROVAL",
+            )
+            self._save()
+            return dict(plan_record)
+
+    def get_plan(self, session_id: str, plan_id: str | None = None) -> dict[str, Any]:
+        """Return the specified plan or the latest plan for the session."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            plans = session.get("plans", {})
+            if plan_id is not None:
+                if plan_id not in plans:
+                    raise KeyError(f"plan '{plan_id}' not found in session")
+                return dict(plans[plan_id])
+            if not plans:
+                raise KeyError(f"no plans found in session '{session_id}'")
+            return dict(list(plans.values())[-1])
+
+    def list_plans(self, session_id: str) -> list[dict[str, Any]]:
+        """Return all plans proposed in the session."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            return [dict(p) for p in session.get("plans", {}).values()]
+
+    def approve_plan(
+        self, session_id: str, plan_id: str, reason: str = ""
+    ) -> list[dict[str, Any]]:
+        """Approve a proposed plan and create its persistent Work Orders."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            plans = session.get("plans", {})
+            if plan_id not in plans:
+                raise KeyError(f"plan '{plan_id}' not found in session")
+
+            plan = plans[plan_id]
+            if plan.get("state") != "AWAITING_APPROVAL":
+                raise ValueError("Plan is not in AWAITING_APPROVAL state")
+
+            now = _now()
+            plan["state"] = "APPROVED"
+            plan["updated_at"] = now
+            plan["approval_reason"] = reason
+
+            created_work_orders: list[dict[str, Any]] = []
+            proposed_wos = plan.get("metadata", {}).get("work_orders", [])
+            workspace = Path(session["workspace"])
+            wo_dir = workspace / ".sync" / "work-orders" / "ACTIVE"
+
+            for item in proposed_wos:
+                if isinstance(item, dict):
+                    wo_id = str(item.get("id") or item.get("wo_id"))
+                    wo_record = {
+                        "id": wo_id,
+                        "title": item.get("title", f"Work order {wo_id}"),
+                        "type": item.get("type", "FEATURE"),
+                        "status": "ACTIVE",
+                        "priority": item.get("priority", "P0"),
+                        "assigned_agents": item.get("assigned_agents", [session["agent"]]),
+                        "description": item.get("description", ""),
+                        "created": now,
+                        "updated": now,
+                    }
+                    for k, v in item.items():
+                        if k not in wo_record:
+                            wo_record[k] = v
+                else:
+                    wo_id = str(item)
+                    wo_record = {
+                        "id": wo_id,
+                        "title": f"Work order {wo_id}",
+                        "type": "FEATURE",
+                        "status": "ACTIVE",
+                        "priority": "P0",
+                        "assigned_agents": [session["agent"]],
+                        "description": "",
+                        "created": now,
+                        "updated": now,
+                    }
+
+                created_work_orders.append(wo_record)
+                if (workspace / ".sync").exists():
+                    try:
+                        wo_dir.mkdir(parents=True, exist_ok=True)
+                        wo_path = wo_dir / f"{wo_id}.yaml"
+                        with wo_path.open("w", encoding="utf-8") as handle:
+                            yaml.safe_dump(wo_record, handle, sort_keys=False)
+                    except Exception:
+                        pass
+                    index_path = workspace / ".sync" / "work-orders" / "INDEX.yaml"
+                    if index_path.exists():
+                        try:
+                            index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+                            if isinstance(index_data, dict) and "orders" in index_data:
+                                existing_ids = {
+                                    o.get("id")
+                                    for o in index_data["orders"]
+                                    if isinstance(o, dict)
+                                }
+                                if wo_id not in existing_ids:
+                                    index_data["orders"].append({
+                                        "id": wo_id,
+                                        "type": wo_record.get("type", "FEATURE"),
+                                        "title": wo_record.get("title", f"Work order {wo_id}"),
+                                        "status": wo_record.get("status", "ACTIVE"),
+                                        "priority": wo_record.get("priority", "P0"),
+                                        "assigned_agents": wo_record.get("assigned_agents", [session["agent"]]),
+                                        "dependencies": wo_record.get("dependencies", []),
+                                        "deliverable": wo_record.get("deliverable"),
+                                        "created": wo_record.get("created"),
+                                        "updated": wo_record.get("updated"),
+                                        "file": f"work-orders/ACTIVE/{wo_id}.yaml",
+                                    })
+                                    with index_path.open("w", encoding="utf-8") as handle:
+                                        yaml.safe_dump(index_data, handle, sort_keys=False)
+                        except Exception:
+                            pass
+
+            plan["created_work_orders"] = created_work_orders
+            self.events.publish(
+                "plan.approved",
+                session_id,
+                plan_id=plan_id,
+                reason=reason,
+                work_orders=[w["id"] for w in created_work_orders],
+                created_records=created_work_orders,
+            )
+            self._save()
+            return [dict(w) for w in created_work_orders]
+
+    def reject_plan(
+        self, session_id: str, plan_id: str, reason: str = ""
+    ) -> dict[str, Any]:
+        """Reject a proposed plan with operator feedback, creating zero Work Orders."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            plans = session.get("plans", {})
+            if plan_id not in plans:
+                raise KeyError(f"plan '{plan_id}' not found in session")
+
+            plan = plans[plan_id]
+            if plan.get("state") != "AWAITING_APPROVAL":
+                raise ValueError("Plan is not in AWAITING_APPROVAL state")
+
+            now = _now()
+            plan["state"] = "REJECTED"
+            plan["feedback"] = reason
+            plan["reason"] = reason
+            plan["updated_at"] = now
+            plan["created_work_orders"] = []
+
+            self.events.publish(
+                "plan.rejected",
+                session_id,
+                plan_id=plan_id,
+                reason=reason,
+            )
+            self._save()
+            return dict(plan)
 
     def begin_operation(
         self,
@@ -475,6 +717,13 @@ class SessionManager:
             self._save()
         thread.start()
         return self.get_operation(operation_id)
+
+    def execute_work_order(
+        self, session_id: str, work_order_id: str, prompt: str | None = None, **params: Any
+    ) -> dict[str, Any]:
+        """Start a turn to execute an assigned work order via the AgentRunner harness."""
+        p = prompt or f"Execute work order {work_order_id}"
+        return self.start_turn(session_id, p, work_order_id=work_order_id, **params)
 
     def _run_turn(
         self, session_id: str, operation_id: str, cancel_event: Event, prompt: str
