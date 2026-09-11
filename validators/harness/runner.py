@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any, Protocol
 
 import yaml
@@ -221,7 +222,24 @@ class AgentRunner:
         self.reader = ResourceReadTracker(max_reads=3)
         self._tree_cache: dict[str, Any] | None = None
 
-    def run_once(self) -> HarnessRunResult:
+    @staticmethod
+    def _is_cancelled(cancellation: Event | None) -> bool:
+        return cancellation is not None and cancellation.is_set()
+
+    @staticmethod
+    def _cancelled_result(task: HarnessTask, operation_id: str | None) -> HarnessRunResult:
+        return HarnessRunResult(
+            status='cancelled',
+            persisted=False,
+            task_id=task.identifier,
+            reason='operation cancelled',
+            meta={'operation_id': operation_id} if operation_id else None,
+        )
+
+    def run_once(
+        self, cancellation: Event | None = None, operation_id: str | None = None
+    ) -> HarnessRunResult:
+        """Run one task, cooperatively stopping at operation lifecycle boundaries."""
         try:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)
@@ -234,6 +252,10 @@ class AgentRunner:
                     reason='no inbox items or assigned work orders',
                 )
 
+            # 1. Post-task discovery.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             run_at = self.now_fn()
             poll_started = time.monotonic()
             context = KnowledgeAPI(self.project_path).assemble_context(
@@ -242,6 +264,10 @@ class AgentRunner:
                 limit=self.context_limit,
             )
             poll_ms = int((time.monotonic() - poll_started) * 1000)
+
+            # 2. Post-context assembly.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             # Pre-execution plan verification
             from validators.harness.contract_gate import verify_pre_execution
@@ -255,6 +281,10 @@ class AgentRunner:
                     reason=f'Pre-execution contract validation failed: {exc}',
                 )
 
+            # 3. Post-pre-execution contract verification.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             from validators.harness.snapshot import (
                 WorkspaceSnapshot,
                 WorkspaceDiff,
@@ -266,9 +296,17 @@ class AgentRunner:
             # Phase 0: Capture runner-owned before snapshot
             before_snapshot = WorkspaceSnapshot.capture(self.project_path)
 
+            # 4. Post-workspace snapshot.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             retrieval_started = time.monotonic()
             retrieval = self.search_tool.search(task.query, limit=3)
             retrieval_ms = int((time.monotonic() - retrieval_started) * 1000)
+
+            # 5. Post-retrieval, before provider execution.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             request = LLMRequest(
                 agent=self.agent,
@@ -281,6 +319,10 @@ class AgentRunner:
             llm_started = time.monotonic()
             completion = self.llm_provider.complete(request)
             llm_ms = completion.latency_ms or int((time.monotonic() - llm_started) * 1000)
+
+            # 6. Post-provider completion.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
             try:
                 decision = self._validate_decision(task, completion.payload)
             except ValueError as exc:
@@ -290,6 +332,10 @@ class AgentRunner:
                     task_id=task.identifier,
                     reason=str(exc),
                 )
+
+            # 7. Post-decision validation.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             # Post-execution declared validation
             from validators.harness.contract_gate import verify_post_execution
@@ -302,6 +348,10 @@ class AgentRunner:
                     task_id=task.identifier,
                     reason=f'Post-execution contract validation failed: {exc}',
                 )
+
+            # 8. Post-post-execution contract verification.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             stage_inputs = {
                 'completion': completion,
@@ -323,6 +373,10 @@ class AgentRunner:
                     reason='staged stackmind validate failed: ' + '; '.join(staged_errors),
                 )
 
+            # 9. Post-staged validation, before lock acquisition.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             ok, message, lock_wait_ms = self._acquire_runtime_lock()
             if not ok:
                 return HarnessRunResult(
@@ -341,6 +395,9 @@ class AgentRunner:
             declaration_matches = True
             mismatch_reason = None
             try:
+                # 10. Post-lock acquisition, before any persistent write.
+                if self._is_cancelled(cancellation):
+                    return self._cancelled_result(task, operation_id)
                 self._apply_non_report_writes(stage_inputs)
                 write_ms = int((time.monotonic() - hold_started) * 1000)
                 hold_ms = write_ms
@@ -357,6 +414,8 @@ class AgentRunner:
                         )
                     import subprocess
                     for cmd in decision.commands:
+                        if self._is_cancelled(cancellation):
+                            return self._cancelled_result(task, operation_id)
                         subprocess.run(cmd, shell=True, cwd=str(self.project_path), check=True)
 
                 # Phase 0: Capture runner-owned after snapshot & derive authoritative diff

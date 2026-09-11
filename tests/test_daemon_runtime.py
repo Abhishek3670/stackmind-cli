@@ -55,16 +55,33 @@ def test_client_reconnects_and_streams_lifecycle_events(tmp_path):
             assert json.loads(response.read()) == {"status": "ok", "sessions": 1}
 
 
-def test_active_operation_cancels_mid_turn_and_is_journaled(tmp_path):
+def test_cancelled_operation_leaves_session_reusable_and_is_journaled(tmp_path):
     manager = SessionManager(DaemonStorage(tmp_path))
     session = manager.create_session("codex", "test", _contract(), "workspace")
     cancellation, operation_id = manager.begin_operation(session["session_id"], "provider.call")
-    manager.cancel_session(session["session_id"])
+    requested = manager.cancel_operation(operation_id)
     assert cancellation.is_set()
+    assert requested["status"] == "CANCEL_REQUESTED"
     manager.complete_operation(session["session_id"], operation_id, {"reason": "cancelled"})
     restored = manager.get_session(session["session_id"])
-    assert restored["state"] == "CANCELLED"
+    assert restored["state"] == "RUNNING"
     assert restored["journal"][0]["status"] == "CANCELLED"
+    _, next_operation_id = manager.begin_operation(session["session_id"], "provider.call")
+    manager.complete_operation(session["session_id"], next_operation_id)
+    assert manager.get_session(session["session_id"])["journal"][1]["status"] == "COMPLETED"
+
+
+def test_late_completion_cannot_overwrite_cancel_requested(tmp_path):
+    manager = SessionManager(DaemonStorage(tmp_path))
+    session = manager.create_session("codex", "test", _contract(), "workspace")
+    _, operation_id = manager.begin_operation(session["session_id"], "provider.call")
+    manager.cancel_operation(operation_id)
+    manager.complete_operation(session["session_id"], operation_id, status="COMPLETED")
+    record = manager.get_session(session["session_id"])["journal"][0]
+    assert record["status"] == "CANCELLED"
+    names = [event.name for event in manager.events.events(session["session_id"])]
+    assert "operation.cancel_requested" in names
+    assert "operation.cancelled" in names
 
 
 def test_state_and_audit_trail_recover_after_daemon_restart(tmp_path):

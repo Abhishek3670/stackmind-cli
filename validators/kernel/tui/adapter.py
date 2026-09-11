@@ -29,7 +29,7 @@ class StackMindTuiAdapter:
 
     def stream(self, session_id: str) -> Iterator[dict[str, Any]]:
         after = self._sequences.get(session_id, 0)
-        for event in self.client.events(session_id, after):
+        for event in self.client.stream_events(session_id, after):
             self._sequences[session_id] = event["sequence"]
             yield event
 
