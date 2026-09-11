@@ -6,12 +6,16 @@ from typing import Any, Mapping
 
 
 def session_header(session: Mapping[str, Any]) -> str:
-    return f"Session {session['session_id']} | {session['state']} | provider: {session['provider']}"
+    agent_info = f" | agent: {session['agent']}" if "agent" in session else ""
+    ws_info = f" | workspace: {session['workspace']}" if "workspace" in session else ""
+    return f"Session {session['session_id']} | {session['state']} | provider: {session['provider']}{agent_info}{ws_info}"
 
 
 def contract_panel(contract: Mapping[str, Any]) -> str:
+    mode_str = f"Write Mode: {contract['write_mode']}\n" if "write_mode" in contract else ""
     return (
-        "Allowed: "
+        mode_str
+        + "Allowed: "
         + ", ".join(contract.get("allow", []))
         + "\nDenied: "
         + ", ".join(contract.get("deny", []))

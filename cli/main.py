@@ -8,6 +8,7 @@ from . import __version__
 from .analyze import analyze
 from .graph import graph
 from .harness import harness
+from .tui import tui
 
 
 @click.group()
@@ -396,6 +397,7 @@ cli.add_command(analyze)
 cli.add_command(experience_group)
 cli.add_command(skill_group)
 cli.add_command(learn_group)
+cli.add_command(tui)
 
 if __name__ == "__main__":
     cli()
