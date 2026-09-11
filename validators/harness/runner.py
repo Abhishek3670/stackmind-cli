@@ -237,9 +237,17 @@ class AgentRunner:
         )
 
     def run_once(
-        self, cancellation: Event | None = None, operation_id: str | None = None
+        self,
+        cancellation: Event | None = None,
+        operation_id: str | None = None,
+        *,
+        cancel_event: Event | None = None,
     ) -> HarnessRunResult:
         """Run one task, cooperatively stopping at operation lifecycle boundaries."""
+        if cancel_event is not None:
+            if cancellation is not None and cancellation is not cancel_event:
+                raise ValueError("only one cancellation event may be provided")
+            cancellation = cancel_event
         try:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)

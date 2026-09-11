@@ -23,9 +23,14 @@ class StackMindTuiAdapter:
             return self.client.pause(argument or params["session_id"])
         if command == ":cancel":
             return self.client.cancel(argument or params["session_id"])
-        raise ValueError(
-            "Prompts and tool execution are runtime-owned and require a runtime turn endpoint"
-        )
+        if command == ":prompt":
+            prompt = argument
+        elif not command.startswith(":"):
+            prompt = text
+        else:
+            raise ValueError("unknown TUI command")
+        turn_params = {key: value for key, value in params.items() if key != "session_id"}
+        return self.client.turn(params["session_id"], prompt, **turn_params)
 
     def stream(self, session_id: str) -> Iterator[dict[str, Any]]:
         after = self._sequences.get(session_id, 0)

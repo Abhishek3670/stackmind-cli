@@ -66,6 +66,9 @@ class DaemonClient:
     def operation_cancel(self, operation_id: str, cascade: bool = False) -> dict[str, Any]:
         return self.call("operation.cancel", operation_id=operation_id, cascade=cascade)
 
+    def turn(self, session_id: str, prompt: str, **params: Any) -> dict[str, Any]:
+        return self.call("session.turn", session_id=session_id, prompt=prompt, **params)
+
     def approve(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
         return self.call(
             "session.approval", session_id=session_id, approved=approved, reason=reason

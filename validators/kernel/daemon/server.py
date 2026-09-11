@@ -22,8 +22,9 @@ class LocalDaemon:
         host: str = "127.0.0.1",
         port: int = 0,
         mcp_protocol: Any | None = None,
+        runner_factory: Any | None = None,
     ) -> None:
-        self.manager = SessionManager(DaemonStorage(state_dir))
+        self.manager = SessionManager(DaemonStorage(state_dir), runner_factory=runner_factory)
         self.protocol = JsonRpcProtocol(self.manager)
         self.mcp_protocol = mcp_protocol
         self._server = ThreadingHTTPServer((host, port), self._handler())

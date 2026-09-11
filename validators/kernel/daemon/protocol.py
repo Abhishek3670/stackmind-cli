@@ -82,6 +82,11 @@ class JsonRpcProtocol:
             return self.manager.cancel_session(params["session_id"])
         if method == "session.close":
             return self.manager.close_session(params["session_id"])
+        if method in {"session.turn", "operation.turn"}:
+            turn_params = {
+                key: value for key, value in params.items() if key not in {"session_id", "prompt"}
+            }
+            return self.manager.start_turn(params["session_id"], params["prompt"], **turn_params)
         if method == "operation.begin":
             operation_name = params.get("operation", params.get("operation_name"))
             if not isinstance(operation_name, str) or not operation_name:
