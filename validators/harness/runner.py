@@ -198,6 +198,7 @@ class AgentRunner:
         project_path: Path,
         agent: str,
         *,
+        backend: Any | None = None,
         llm_provider: LLMProvider | None = None,
         search_provider: SearchProvider | None = None,
         retrieval_policy: RetrievalPolicy | None = None,
@@ -211,7 +212,20 @@ class AgentRunner:
         self.project_path = project_path.resolve()
         self.sync_path = self.project_path / '.sync'
         self.agent = agent
-        self.llm_provider = llm_provider or EchoLLMProvider()
+        self.backend = backend
+        if backend is not None:
+            self.backend_id = getattr(backend, 'backend_id', 'custom-backend')
+            self.backend_model = getattr(backend, 'model', None) or 'default'
+            if llm_provider is not None:
+                self.llm_provider = llm_provider
+            elif hasattr(backend, 'complete'):
+                self.llm_provider = backend
+            else:
+                self.llm_provider = EchoLLMProvider()
+        else:
+            self.llm_provider = llm_provider or EchoLLMProvider()
+            self.backend_id = getattr(self.llm_provider, 'provider_name', 'echo')
+            self.backend_model = getattr(self.llm_provider, 'model_name', 'stackmind-echo-v1')
         self.search_tool = SessionSearchTool(search_provider, policy=retrieval_policy)
         self.token_budget = token_budget
         self.context_limit = context_limit
@@ -325,7 +339,25 @@ class AgentRunner:
             )
 
             llm_started = time.monotonic()
-            completion = self.llm_provider.complete(request)
+            try:
+                if self.backend is not None and hasattr(self.backend, 'start_operation'):
+                    self.backend.start_operation(task=task, context=context, operation_id=operation_id)
+                completion = self.llm_provider.complete(request)
+                if self.backend is not None and hasattr(self.backend, 'report_result') and operation_id:
+                    self.backend.report_result(operation_id)
+            except Exception as exc:
+                return HarnessRunResult(
+                    status='failed',
+                    persisted=False,
+                    task_id=task.identifier,
+                    reason=f'Backend execution error: {exc}',
+                    meta={
+                        'backend_id': self.backend_id,
+                        'model': self.backend_model,
+                        'operation_id': operation_id,
+                        'error': str(exc),
+                    },
+                )
             llm_ms = completion.latency_ms or int((time.monotonic() - llm_started) * 1000)
 
             # 6. Post-provider completion.
@@ -817,6 +849,7 @@ class AgentRunner:
             'learning_eligible': exp_rec.learning_eligible if exp_rec else False,
             'lock_hold_ms': lock_hold_ms,
             'lock_wait_ms': lock_wait_ms,
+            'backend_id': getattr(self, 'backend_id', completion.provider),
             'model': completion.model,
             'observed_changes': diff.to_dict() if diff else {},
             'prompt_tokens': completion.prompt_tokens,

@@ -125,3 +125,30 @@ class DaemonClient:
                 line = raw_line.decode("utf-8").strip()
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
+
+    def list_backends(self) -> list[dict[str, Any]]:
+        result = self.call("backend.list")
+        if isinstance(result, dict) and "backends" in result:
+            return result["backends"]
+        return result
+
+    def list_roles(self) -> list[dict[str, Any]]:
+        result = self.call("role.list")
+        if isinstance(result, dict) and "roles" in result:
+            return result["roles"]
+        return result
+
+    def configure_role_backend(
+        self,
+        role: str,
+        backend: str,
+        model: str | None = None,
+        credential_ref: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"role": role, "backend": backend}
+        if model is not None:
+            params["model"] = model
+        if credential_ref is not None:
+            params["credentialRef"] = credential_ref
+        return self.call("role.configureBackend", **params)
+

@@ -26,6 +26,35 @@ _OPERATION_STATES = {
 }
 _OPERATION_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
+_LOGICAL_ROLES = ["architecture", "backend", "frontend", "qa", "gitops"]
+_ROLE_ALIASES = {
+    "claude": "architecture",
+    "architecture": "architecture",
+    "architect": "architecture",
+    "codex": "backend",
+    "backend": "backend",
+    "gemini": "frontend",
+    "frontend": "frontend",
+    "gemma": "qa",
+    "qa": "qa",
+    "local-llm": "gitops",
+    "gitops": "gitops",
+}
+_ROLE_TO_AGENTS = {
+    "architecture": ["claude", "architecture", "architect"],
+    "backend": ["codex", "backend"],
+    "frontend": ["gemini", "frontend"],
+    "qa": ["gemma", "qa"],
+    "gitops": ["local-llm", "gitops"],
+}
+_DEFAULT_ROLE_CONFIG = {
+    "architecture": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
+    "backend": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
+    "frontend": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
+    "qa": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
+    "gitops": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -118,6 +147,10 @@ class SessionManager:
         self._sessions: dict[str, dict[str, Any]] = recovered["sessions"]
         self._active: dict[str, Event] = {}
         self._turn_threads: dict[str, Thread] = {}
+        self._roles: dict[str, dict[str, Any]] = {k: dict(v) for k, v in _DEFAULT_ROLE_CONFIG.items()}
+        for r_name, r_cfg in recovered.get("roles", {}).items():
+            if isinstance(r_cfg, dict):
+                self._roles[r_name] = dict(r_cfg)
         self._runner_factory = runner_factory or self._default_runner
         self.events = EventDispatcher(recovered.get("events", []), self._persist_event)
         for session in self._sessions.values():
@@ -148,13 +181,161 @@ class SessionManager:
             self._save()
 
     def _save(self) -> None:
-        self.storage.save({"sessions": self._sessions, "events": self.events.dump()})
+        self.storage.save({
+            "sessions": self._sessions,
+            "events": self.events.dump(),
+            "roles": self._roles,
+        })
 
-    @staticmethod
-    def _default_runner(workspace: str, agent: str) -> Any:
+    def _default_runner(self, workspace: str, agent: str) -> Any:
+        from validators.harness.backend import get_default_registry
         from validators.harness.runner import AgentRunner
 
+        if isinstance(self, SessionManager):
+            canonical = self._canonical_role(agent)
+            role_cfg = self._roles.get(canonical, {})
+            backend_id = role_cfg.get("backend", "echo-agent")
+            registry = get_default_registry()
+            backend = registry.get(backend_id) if backend_id in registry else None
+            return AgentRunner(Path(workspace), agent, backend=backend)
         return AgentRunner(Path(workspace), agent)
+
+    def list_backends(self) -> list[dict[str, Any]]:
+        from validators.harness.backend import get_default_registry
+
+        return get_default_registry().list_backends()
+
+    def list_roles(self) -> list[dict[str, Any]]:
+        with self._lock:
+            result = []
+            for role_name, config in self._roles.items():
+                entry: dict[str, Any] = {
+                    "role": role_name,
+                    "backend": config.get("backend", "echo-agent"),
+                    "model": config.get("model"),
+                    "status": config.get("status", "configured"),
+                }
+                if config.get("credential_ref"):
+                    entry["credentialRef"] = config["credential_ref"]
+                result.append(entry)
+            return result
+
+    def _canonical_role(self, role: str) -> str:
+        role_lower = str(role or "").lower().strip()
+        return _ROLE_ALIASES.get(role_lower, role_lower)
+
+    def _role_target_identifiers(self, role: str) -> set[str]:
+        canonical = self._canonical_role(role)
+        agents = set(_ROLE_TO_AGENTS.get(canonical, [canonical]))
+        agents.add(str(role).lower().strip())
+        agents.add(canonical)
+        return agents
+
+    def configure_role_backend(
+        self,
+        role: str,
+        backend: str,
+        model: str | None = None,
+        credential_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Configure the execution backend for an agent role.
+
+        Strict Rebinding Guard:
+        Must be rejected (raises ValueError) if target role has any non-terminal
+        Work Order in flight or active operation. Rebinding is permitted only
+        between assignments when the role has zero non-terminal work orders.
+        """
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError("role is required")
+        if not isinstance(backend, str) or not backend.strip():
+            raise ValueError("backend is required")
+
+        canonical = self._canonical_role(role)
+        target_ids = self._role_target_identifiers(role)
+
+        with self._lock:
+            for session in self._sessions.values():
+                sess_agent = str(session.get("agent", "")).lower().strip()
+                is_target_role = sess_agent in target_ids
+
+                # 1. Active operation in session belonging to target role
+                if is_target_role:
+                    if session.get("active_operation") is not None and session.get("state") == "RUNNING":
+                        raise ValueError(
+                            f"Cannot rebind role '{role}': session '{session['session_id']}' has an active operation in flight"
+                        )
+                    for rec in session.get("journal", []):
+                        if rec.get("status") not in _OPERATION_TERMINAL:
+                            raise ValueError(
+                                f"Cannot rebind role '{role}': operation '{rec.get('operation_id')}' is currently in flight ({rec.get('status')})"
+                            )
+
+                # 2. Any active operations explicitly tagged with target agent / role
+                for rec in session.get("journal", []):
+                    if rec.get("status") not in _OPERATION_TERMINAL:
+                        op_agent = str(rec.get("metadata", {}).get("agent", sess_agent)).lower().strip()
+                        if op_agent in target_ids:
+                            raise ValueError(
+                                f"Cannot rebind role '{role}': active operation '{rec.get('operation_id')}' belongs to role '{role}'"
+                            )
+
+                # 3. Created work orders in proposed / approved plans
+                for plan in session.get("plans", {}).values():
+                    for wo in plan.get("created_work_orders", []):
+                        wo_status = str(wo.get("status", "ACTIVE")).upper()
+                        if wo_status not in {"COMPLETED", "CANCELLED", "FAILED"}:
+                            assigned = [str(a).lower().strip() for a in wo.get("assigned_agents", [])]
+                            if any(a in target_ids for a in assigned):
+                                raise ValueError(
+                                    f"Cannot rebind role '{role}': in-flight non-terminal work order '{wo.get('id')}' assigned to role"
+                                )
+
+                # 4. Check workspace disk work orders
+                workspace_str = session.get("workspace")
+                if workspace_str:
+                    active_wos_dir = Path(workspace_str) / ".sync" / "work-orders" / "ACTIVE"
+                    if active_wos_dir.is_dir():
+                        for wo_file in active_wos_dir.glob("*.yaml"):
+                            try:
+                                data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                                if isinstance(data, dict):
+                                    status = str(data.get("status", "ACTIVE")).upper()
+                                    if status not in {"COMPLETED", "CANCELLED", "FAILED"}:
+                                        assigned = [str(a).lower().strip() for a in data.get("assigned_agents", [])]
+                                        if any(a in target_ids for a in assigned):
+                                            raise ValueError(
+                                                f"Cannot rebind role '{role}': in-flight non-terminal work order '{data.get('id', wo_file.stem)}' assigned to role"
+                                            )
+                            except ValueError:
+                                raise
+                            except Exception:
+                                pass
+
+            # Rebinding is permitted between assignments
+            now = _now()
+            entry: dict[str, Any] = {
+                "backend": backend,
+                "model": model,
+                "status": "configured",
+                "credential_ref": credential_ref,
+                "updated_at": now,
+            }
+            self._roles[canonical] = entry
+            self.events.publish(
+                "role.backend_configured",
+                "daemon",
+                role=canonical,
+                backend=backend,
+                model=model,
+                credential_ref=credential_ref,
+            )
+            self._save()
+            return {
+                "role": canonical,
+                "backend": backend,
+                "model": model,
+                "appliedAt": now,
+            }
 
     @staticmethod
     def _view(session: dict[str, Any]) -> dict[str, Any]:
@@ -739,12 +920,23 @@ class SessionManager:
                 workspace = str(session["workspace"])
                 agent = str(session["agent"])
             runner = self._runner_factory(workspace, agent)
+            with self._lock:
+                try:
+                    _, op_rec = self._operation(operation_id)
+                    if hasattr(runner, "backend_id"):
+                        op_rec["backend_id"] = runner.backend_id
+                    if hasattr(runner, "backend_model"):
+                        op_rec["model"] = runner.backend_model
+                except KeyError:
+                    pass
             result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
             result_data = {
                 "status": result.status,
                 "persisted": result.persisted,
                 "task_id": result.task_id,
                 "reason": result.reason,
+                "backend_id": getattr(runner, "backend_id", None),
+                "model": getattr(runner, "backend_model", None),
             }
             if result.status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(

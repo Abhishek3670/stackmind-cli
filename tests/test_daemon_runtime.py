@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from validators.kernel.daemon import DaemonStorage, LocalDaemon, SessionManager
+
+_opener = build_opener(ProxyHandler({}))
 
 
 def _contract() -> dict[str, object]:
@@ -25,7 +27,7 @@ def _rpc(daemon: LocalDaemon, method: str, params: dict[str, object], request_id
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urlopen(request) as response:
+    with _opener.open(request) as response:
         return json.loads(response.read())
 
 
@@ -51,7 +53,7 @@ def test_client_reconnects_and_streams_lifecycle_events(tmp_path):
             "attempt.started",
             "contract.loaded",
         ]
-        with urlopen(f"{daemon.url}/health") as response:
+        with _opener.open(f"{daemon.url}/health") as response:
             assert json.loads(response.read()) == {"status": "ok", "sessions": 1}
 
 

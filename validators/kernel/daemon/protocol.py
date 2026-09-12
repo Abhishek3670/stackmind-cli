@@ -10,7 +10,13 @@ from .manager import SessionManager
 
 
 _PROTOCOL_VERSION = 1
-_CAPABILITIES = ["session", "operation", "events", "cooperative_cancellation"]
+_CAPABILITIES = [
+    "session",
+    "operation",
+    "events",
+    "cooperative_cancellation",
+    "executionBackends",
+]
 
 
 class _RpcError(Exception):
@@ -159,6 +165,26 @@ class JsonRpcProtocol:
                 params["session_id"], bool(params["approved"]), str(params.get("reason", ""))
             )
             return self.manager.get_session(params["session_id"])
+        if method == "backend.list":
+            return {"backends": self.manager.list_backends()}
+        if method == "role.list":
+            return {"roles": self.manager.list_roles()}
+        if method == "role.configureBackend":
+            role = params.get("role")
+            backend = params.get("backend")
+            model = params.get("model")
+            credential_ref = params.get("credentialRef") or params.get("credential_ref")
+            if not role or not backend:
+                raise ValueError("role and backend are required")
+            try:
+                return self.manager.configure_role_backend(
+                    role=role,
+                    backend=backend,
+                    model=model,
+                    credential_ref=credential_ref,
+                )
+            except ValueError as error:
+                raise _RpcError(-32003, f"Policy denied: {error}") from error
         if method == "event.list":
             return [
                 event.as_dict()

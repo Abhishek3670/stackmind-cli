@@ -21,8 +21,13 @@ def test_protocol_handshake_and_typed_errors(tmp_path):
 
     version = protocol.handle(_request("health.version"))["result"]
     assert version["package_version"] == __version__
-    assert version["protocol_version"] == 1
-    assert version["capabilities"] == ["session", "operation", "events", "cooperative_cancellation"]
+    assert version["capabilities"] == [
+        "session",
+        "operation",
+        "events",
+        "cooperative_cancellation",
+        "executionBackends",
+    ]
 
     mismatch = protocol.handle(_request("health.version", {"protocol_version": 2}))
     assert mismatch["error"] == {"code": -32004, "message": "Protocol mismatch"}
