@@ -577,6 +577,7 @@ def _show_help() -> None:
         "Available commands:\n"
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :roles            Display Agent Roles & Execution Backend bindings\n"
+        "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
         "  :wo               Display Work Orders table and progress\n"
         "  :tree, :agents    Display Hierarchical Operation Tree\n"
         "  :plan             Display Plan Approval surface and revision history\n"
@@ -711,6 +712,27 @@ def dispatch_delivery_command(
         except Exception:
             pass
         click.echo(render_roles_panel(state, detailed=True))
+        return session, False
+
+    if normalized.startswith(":rebind") or normalized.startswith(":configure"):
+        parts = normalized.split()
+        if len(parts) >= 3:
+            role_arg = parts[1]
+            backend_arg = parts[2]
+            model_arg = parts[3] if len(parts) >= 4 else None
+            try:
+                client.configure_role_backend(role=role_arg, backend=backend_arg, model=model_arg)
+                role_key = role_arg.title()
+                normalized_key = "Q/A" if role_key.upper() in {"QA", "Q/A"} else role_key
+                if normalized_key in state.roles:
+                    state.roles[normalized_key].backend = backend_arg
+                    if model_arg:
+                        state.roles[normalized_key].model = model_arg
+                click.echo(f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'" + (f" (model: {model_arg})" if model_arg else ""))
+            except Exception as err:
+                click.echo(f"[ERROR] Failed to rebind role '{role_arg}': {err}")
+        else:
+            click.echo("Usage: :rebind <role> <backend> [model]  (e.g., :rebind gitops ollama llama3)")
         return session, False
 
     if normalized == ":wo":
