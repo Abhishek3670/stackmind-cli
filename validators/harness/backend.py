@@ -8,6 +8,7 @@ RPC responses, and serialized states.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -424,7 +425,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
         *,
         endpoint: str | None = "http://localhost:11434",
         credential_ref: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 300.0,
         budget_policy: dict[str, Any] | None = None,
         capabilities: list[str] | None = None,
         available: bool = True,
@@ -494,6 +495,31 @@ class ModelExecutionBackend(BaseExecutionBackend):
             "uncertainty": [],
             "commands": [],
         }
+
+        if self.endpoint:
+            import urllib.request
+            try:
+                req_url = self.endpoint.rstrip("/") + "/api/generate"
+                prompt_text = f"Task: {task.title}\n\n{task.body}"
+                data = json.dumps({
+                    "model": self.model or "llama3",
+                    "prompt": prompt_text,
+                    "stream": False,
+                }).encode("utf-8")
+                req = urllib.request.Request(req_url, data=data, headers={"Content-Type": "application/json", "User-Agent": "StackMind-CLI/3.3"})
+                with urllib.request.urlopen(req, timeout=max(self.timeout, 300.0)) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    actual_response = resp_data.get("response", "")
+                    if actual_response:
+                        payload["summary"] = actual_response.strip()
+                        payload["report_markdown"] = (
+                            f"# Response from {self.model}\n\n"
+                            f"{actual_response.strip()}\n\n"
+                            f"Knowledge revision: {getattr(request.context, 'revision', 'unknown')}\n"
+                        )
+            except Exception as err:
+                payload["report_markdown"] += f"\n\n*Note: Local model endpoint notice ({err})*"
+
         if release_target:
             payload["release_target"] = release_target
 
@@ -567,7 +593,7 @@ def get_default_registry() -> BackendRegistry:
         reg = BackendRegistry()
         reg.register(AgentExecutionBackend(backend_id="echo-agent", model="stackmind-echo-v1"))
         reg.register(ModelExecutionBackend(backend_id="mock-model", model="mock-llama3", available=True))
-        reg.register(ModelExecutionBackend(backend_id="ollama", model="llama3", endpoint="http://localhost:11434", available=False))
+        reg.register(ModelExecutionBackend(backend_id="ollama", model="llama3", endpoint="http://localhost:11434", available=True))
         _DEFAULT_REGISTRY = reg
     return _DEFAULT_REGISTRY
 

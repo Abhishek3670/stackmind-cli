@@ -877,10 +877,13 @@ def dispatch_delivery_command(
         return session, False
 
     # Governed turn prompt
-    result = adapter.command(normalized, session_id=session["session_id"])
-    op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
-    state.add_activity("User", "submitted turn", op_id)
-    click.echo(f"Turn submitted to the governed daemon (operation: {op_id}).")
+    try:
+        result = adapter.command(normalized, session_id=session["session_id"])
+        op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
+        state.add_activity("User", "submitted turn", op_id)
+        click.echo(f"Turn submitted to the governed daemon (operation: {op_id}).")
+    except Exception as err:
+        click.echo(f"[ERROR] Could not submit turn: {err} (An operation may already be in flight. Use :status or :cancel).")
     return session, False
 
 
@@ -908,8 +911,9 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
     if daemon_url is None:
-        temporary_state = tempfile.TemporaryDirectory(prefix="stackmind-tui-")
-        daemon = LocalDaemon(temporary_state.name, port=0).start()
+        state_dir = workspace.resolve() / ".sync" / "runtime" / "daemon"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        daemon = LocalDaemon(str(state_dir), port=0).start()
         daemon_url = daemon.url
 
     try:

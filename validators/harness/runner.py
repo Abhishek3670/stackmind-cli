@@ -256,6 +256,7 @@ class AgentRunner:
         operation_id: str | None = None,
         *,
         cancel_event: Event | None = None,
+        prompt: str | None = None,
     ) -> HarnessRunResult:
         """Run one task, cooperatively stopping at operation lifecycle boundaries."""
         if cancel_event is not None:
@@ -266,6 +267,16 @@ class AgentRunner:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)
             task = self.discover_next_task(tree_data)
+            if task is None and prompt:
+                adhoc_file = self.sync_path / 'inbox' / self.agent / 'adhoc.md'
+                task = HarnessTask(
+                    kind='adhoc',
+                    identifier=operation_id or 'adhoc',
+                    path=adhoc_file,
+                    title=prompt.strip() or 'User Prompt',
+                    body=prompt.strip() or 'User Prompt',
+                    query=prompt.strip() or 'User Prompt',
+                )
             if task is None:
                 return HarnessRunResult(
                     status='idle',

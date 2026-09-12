@@ -47,6 +47,13 @@ _ROLE_TO_AGENTS = {
     "qa": ["gemma", "qa"],
     "gitops": ["local-llm", "gitops"],
 }
+_ROLE_TO_PRIMARY_AGENT = {
+    "architecture": "claude",
+    "backend": "codex",
+    "frontend": "gemini",
+    "qa": "gemma",
+    "gitops": "local-llm",
+}
 _DEFAULT_ROLE_CONFIG = {
     "architecture": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
     "backend": {"backend": "echo-agent", "model": "stackmind-echo-v1", "status": "configured"},
@@ -206,8 +213,12 @@ class SessionManager:
             canonical = self._canonical_role(agent)
             role_cfg = self._roles.get(canonical, {})
             backend_id = role_cfg.get("backend", "echo-agent")
+            model_name = role_cfg.get("model")
             registry = get_default_registry()
             backend = registry.get(backend_id) if backend_id in registry else None
+            if backend is not None and model_name:
+                backend.model = model_name
+                backend.model_name = model_name
             return AgentRunner(Path(workspace), agent, backend=backend)
         return AgentRunner(Path(workspace), agent)
 
@@ -986,7 +997,8 @@ class SessionManager:
                 session = self._sessions[session_id]
                 workspace = str(session["workspace"])
                 _, op_rec = self._operation(operation_id)
-                agent = str(op_rec.get("role") or op_rec.get("agent_id") or session.get("agent", "codex"))
+                raw_agent = str(op_rec.get("agent_id") or op_rec.get("role") or session.get("agent") or "codex").lower().strip()
+                agent = _ROLE_TO_PRIMARY_AGENT.get(raw_agent, raw_agent)
             runner = self._runner_factory(workspace, agent)
             with self._lock:
                 try:
@@ -997,7 +1009,10 @@ class SessionManager:
                         op_rec["model"] = runner.backend_model
                 except KeyError:
                     pass
-            result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
+            try:
+                result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+            except TypeError:
+                result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
             result_data = {
                 "status": result.status,
                 "persisted": result.persisted,
@@ -1011,7 +1026,7 @@ class SessionManager:
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id
                 )
                 self.complete_operation(session_id, operation_id, result_data, status="CANCELLED")
-            elif result.status == "completed":
+            elif result.status in {"completed", "idle"}:
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "success", operation_id=operation_id,
                     result=result_data,
