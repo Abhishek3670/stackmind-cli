@@ -27,6 +27,7 @@ def test_protocol_handshake_and_typed_errors(tmp_path):
         "events",
         "cooperative_cancellation",
         "executionBackends",
+        "subagents",
     ]
 
     mismatch = protocol.handle(_request("health.version", {"protocol_version": 2}))

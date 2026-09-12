@@ -166,12 +166,23 @@ class SessionManager:
             }
             for r in records.values():
                 r.setdefault("children", [])
+                r.setdefault("child_results", {})
             for r in records.values():
                 pid = r.get("parent_operation_id")
                 if pid and pid in records:
                     parent_children = records[pid].setdefault("children", [])
                     if r["operation_id"] not in parent_children:
                         parent_children.append(r["operation_id"])
+                    if r.get("status") in _OPERATION_TERMINAL or r.get("result") is not None:
+                        records[pid].setdefault("child_results", {})[r["operation_id"]] = {
+                            "operation_id": r["operation_id"],
+                            "agent_id": r.get("agent_id"),
+                            "role": r.get("role"),
+                            "work_order_id": r.get("work_order_id"),
+                            "status": r.get("status"),
+                            "result": r.get("result"),
+                            "completed_at": r.get("completed_at"),
+                        }
         self._save()
 
     def _persist_event(self, _: RuntimeEvent) -> None:
@@ -273,7 +284,11 @@ class SessionManager:
                 # 2. Any active operations explicitly tagged with target agent / role
                 for rec in session.get("journal", []):
                     if rec.get("status") not in _OPERATION_TERMINAL:
-                        op_agent = str(rec.get("metadata", {}).get("agent", sess_agent)).lower().strip()
+                        op_agent = str(
+                            rec.get("role")
+                            or rec.get("agent_id")
+                            or rec.get("metadata", {}).get("agent", sess_agent)
+                        ).lower().strip()
                         if op_agent in target_ids:
                             raise ValueError(
                                 f"Cannot rebind role '{role}': active operation '{rec.get('operation_id')}' belongs to role '{role}'"
@@ -670,6 +685,8 @@ class SessionManager:
         parent_operation_id: str | None = None,
         work_order_id: str | None = None,
         contract_scope: Any = None,
+        role: str | None = None,
+        agent_id: str | None = None,
     ) -> tuple[Event, str]:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -688,6 +705,8 @@ class SessionManager:
                     raise ValueError(
                         f"parent operation '{parent_operation_id}' is terminal ({parent_record.get('status')})"
                     )
+                if contract_scope == "inherit":
+                    contract_scope = parent_record.get("contract_scope")
                 _verify_contract_scope_narrowing(parent_record.get("contract_scope"), contract_scope)
             else:
                 if session.get("active_operation"):
@@ -696,14 +715,21 @@ class SessionManager:
             operation_id = str(uuid4())
             cancel = Event()
             now = _now()
+            effective_role = self._canonical_role(
+                role or agent_id or (session.get("agent") if parent_operation_id is None else "backend")
+            )
+            effective_agent_id = agent_id or role or effective_role
             record = {
                 "operation_id": operation_id,
                 "parent_operation_id": parent_operation_id,
                 "children": [],
+                "child_results": {},
                 "operation": operation_name,
                 "metadata": metadata or {},
                 "work_order_id": work_order_id,
                 "contract_scope": contract_scope,
+                "role": effective_role,
+                "agent_id": effective_agent_id,
                 "status": "RUNNING",
                 "started_at": now,
                 "transitions": [
@@ -726,10 +752,22 @@ class SessionManager:
                 "metadata": metadata or {},
                 "work_order_id": work_order_id,
                 "contract_scope": contract_scope,
+                "role": effective_role,
+                "agent_id": effective_agent_id,
             }
             self.events.publish("operation.requested", session_id, **payload)
             self.events.publish("operation.authorized", session_id, operation_id=operation_id)
             self.events.publish("operation.started", session_id, operation_id=operation_id)
+            if parent_operation_id is not None:
+                self.events.publish(
+                    "event.agentSpawned",
+                    session_id,
+                    agent_id=effective_agent_id,
+                    role=effective_role,
+                    operation_id=operation_id,
+                    parent_operation_id=parent_operation_id,
+                    work_order_id=work_order_id,
+                )
             self._save()
             return cancel, operation_id
 
@@ -849,6 +887,32 @@ class SessionManager:
 
             self._transition(record, final_status)
             record.update(completed_at=_now(), result=result)
+            parent_id = record.get("parent_operation_id")
+            if parent_id:
+                try:
+                    _, parent_record = self._operation(parent_id)
+                    parent_record.setdefault("child_results", {})[target_op_id] = {
+                        "operation_id": target_op_id,
+                        "agent_id": record.get("agent_id"),
+                        "role": record.get("role"),
+                        "work_order_id": record.get("work_order_id"),
+                        "status": final_status,
+                        "result": result,
+                        "completed_at": record.get("completed_at"),
+                    }
+                except KeyError:
+                    pass
+            if record.get("child_results"):
+                if isinstance(record.get("result"), dict):
+                    record["result"].setdefault("child_results", record["child_results"])
+                    record["result"].setdefault(
+                        "aggregated_results", list(record["child_results"].values())
+                    )
+                elif record.get("result") is None:
+                    record["result"] = {
+                        "child_results": record["child_results"],
+                        "aggregated_results": list(record["child_results"].values()),
+                    }
             self._active.pop(target_op_id, None)
             if session.get("active_operation") == target_op_id:
                 session["active_operation"] = None
@@ -884,8 +948,11 @@ class SessionManager:
                 session_id,
                 "turn",
                 {"prompt": prompt, **params},
+                parent_operation_id=params.get("parent_operation_id"),
                 work_order_id=params.get("work_order_id"),
                 contract_scope=params.get("contract_scope"),
+                role=params.get("role"),
+                agent_id=params.get("agent_id"),
             )
             self.events.publish("turn.started", session_id, operation_id=operation_id, prompt=prompt)
             thread = Thread(
@@ -918,7 +985,8 @@ class SessionManager:
             with self._lock:
                 session = self._sessions[session_id]
                 workspace = str(session["workspace"])
-                agent = str(session["agent"])
+                _, op_rec = self._operation(operation_id)
+                agent = str(op_rec.get("role") or op_rec.get("agent_id") or session.get("agent", "codex"))
             runner = self._runner_factory(workspace, agent)
             with self._lock:
                 try:
@@ -993,3 +1061,212 @@ class SessionManager:
             )
             self.events.publish("approval.recorded", session_id, approved=approved, reason=reason)
             self._save()
+
+    def dispatch_subagent(
+        self,
+        session_id: str,
+        parent_operation_id: str,
+        role: str,
+        work_order_id: str,
+        contract_scope: Any = None,
+        agent_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a specialized subagent operation under a parent operation."""
+        canonical_role = self._canonical_role(role)
+        if canonical_role not in _LOGICAL_ROLES:
+            raise ValueError(f"Unknown role '{role}'; must be one of {_LOGICAL_ROLES}")
+        with self._lock:
+            parent_session, parent_record = self._operation(parent_operation_id)
+            if parent_session["session_id"] != session_id:
+                raise KeyError(
+                    f"parent operation '{parent_operation_id}' does not belong to session '{session_id}'"
+                )
+            effective_scope = (
+                parent_record.get("contract_scope")
+                if contract_scope is None or contract_scope == "inherit"
+                else contract_scope
+            )
+        _, op_id = self.begin_operation(
+            session_id,
+            f"execute.{canonical_role}",
+            metadata=metadata,
+            parent_operation_id=parent_operation_id,
+            work_order_id=work_order_id,
+            contract_scope=effective_scope,
+            role=canonical_role,
+            agent_id=agent_id or canonical_role,
+        )
+        return self.get_operation(op_id)
+
+    def _resolve_agent_operation(
+        self, agent_identifier: str, session_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Find the most relevant operation for an agent identifier or operation_id."""
+        target_id = str(agent_identifier).strip()
+        sessions = (
+            [self._sessions[session_id]]
+            if session_id is not None and session_id in self._sessions
+            else list(self._sessions.values())
+        )
+        # 1. Exact operation_id match
+        for session in sessions:
+            for r in session.get("journal", []):
+                if r.get("operation_id") == target_id:
+                    return r
+        # 2. Match by agent_id or role
+        candidates: list[dict[str, Any]] = []
+        target_canonical = self._canonical_role(target_id)
+        for session in sessions:
+            for r in session.get("journal", []):
+                if "operation_id" not in r:
+                    continue
+                aid = str(r.get("agent_id", "")).lower()
+                role = str(r.get("role", "")).lower()
+                if (
+                    aid == target_id.lower()
+                    or role == target_id.lower()
+                    or role == target_canonical
+                    or self._canonical_role(aid) == target_canonical
+                ):
+                    candidates.append(r)
+        if not candidates:
+            return None
+        active_candidates = [c for c in candidates if c.get("status") not in _OPERATION_TERMINAL]
+        if active_candidates:
+            active_ids = {x["operation_id"] for x in active_candidates}
+            roots = [c for c in active_candidates if c.get("parent_operation_id") not in active_ids]
+            return roots[-1] if roots else active_candidates[0]
+        candidate_ids = {x["operation_id"] for x in candidates}
+        roots = [c for c in candidates if c.get("parent_operation_id") not in candidate_ids]
+        return roots[-1] if roots else candidates[-1]
+
+    def list_agents(
+        self, session_id: str | None = None, operation_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            sessions = (
+                [self._sessions[session_id]]
+                if session_id is not None and session_id in self._sessions
+                else list(self._sessions.values())
+            )
+            agents: list[dict[str, Any]] = []
+            seen_ops: set[str] = set()
+
+            for session in sessions:
+                records = [r for r in session.get("journal", []) if "operation_id" in r]
+                if operation_id is not None:
+                    records = [
+                        r for r in records
+                        if r["operation_id"] == operation_id or r.get("parent_operation_id") == operation_id
+                    ]
+                for r in records:
+                    op_id = r["operation_id"]
+                    if op_id in seen_ops:
+                        continue
+                    seen_ops.add(op_id)
+                    role = r.get("role") or self._canonical_role(
+                        r.get("agent_id") or session.get("agent", "backend")
+                    )
+                    agent_id = r.get("agent_id") or role or session.get("agent", "agent")
+                    entry = {
+                        "agentId": agent_id,
+                        "agent_id": agent_id,
+                        "role": role,
+                        "state": r.get("status", "UNKNOWN"),
+                        "status": r.get("status", "UNKNOWN"),
+                        "workOrderId": r.get("work_order_id"),
+                        "work_order_id": r.get("work_order_id"),
+                        "operationId": op_id,
+                        "operation_id": op_id,
+                        "parentOperationId": r.get("parent_operation_id"),
+                        "parent_operation_id": r.get("parent_operation_id"),
+                        "contractScope": r.get("contract_scope"),
+                        "contract_scope": r.get("contract_scope"),
+                        "sessionId": session.get("session_id"),
+                        "session_id": session.get("session_id"),
+                    }
+                    if r.get("backend_id"):
+                        entry["backend"] = r["backend_id"]
+                    if r.get("model"):
+                        entry["model"] = r["model"]
+                    agents.append(entry)
+            return agents
+
+    def cancel_agent(
+        self,
+        agent_identifier: str,
+        session_id: str | None = None,
+        reason: str = "user_cancelled",
+        cascade: bool = True,
+    ) -> dict[str, Any]:
+        """Cancel an agent's operation subtree without affecting parent or siblings."""
+        with self._lock:
+            op_record = self._resolve_agent_operation(agent_identifier, session_id=session_id)
+            if op_record is None:
+                raise KeyError(f"agent '{agent_identifier}' not found")
+            op_id = op_record["operation_id"]
+            cancelled_record = self.cancel_operation(op_id, cascade=cascade)
+            return {
+                "agentId": op_record.get("agent_id", agent_identifier),
+                "agent_id": op_record.get("agent_id", agent_identifier),
+                "role": op_record.get("role"),
+                "operationId": op_id,
+                "operation_id": op_id,
+                "canceled": True,
+                "cancelled": True,
+                "reason": reason,
+                "state": cancelled_record.get("status"),
+            }
+
+    def inspect_agent(
+        self,
+        agent_identifier: str,
+        session_id: str | None = None,
+        after: int = 0,
+    ) -> dict[str, Any]:
+        with self._lock:
+            op_record = self._resolve_agent_operation(agent_identifier, session_id=session_id)
+            if op_record is None:
+                raise KeyError(f"agent '{agent_identifier}' not found")
+            op_id = op_record["operation_id"]
+            sess_id = session_id
+            if sess_id is None:
+                for s in self._sessions.values():
+                    if any(r.get("operation_id") == op_id for r in s.get("journal", [])):
+                        sess_id = s.get("session_id")
+                        break
+
+            all_events = self.events.events(session_id=sess_id, after=after)
+            agent_events = [
+                e
+                for e in all_events
+                if e.payload.get("operation_id") == op_id
+                or e.payload.get("agent_id") == op_record.get("agent_id")
+                or (e.payload.get("parent_operation_id") == op_id)
+            ]
+            cursor = max((e.sequence for e in agent_events), default=after)
+            role = op_record.get("role") or self._canonical_role(op_record.get("agent_id", "backend"))
+            agent_id = op_record.get("agent_id") or role
+            return {
+                "agentId": agent_id,
+                "agent_id": agent_id,
+                "role": role,
+                "operationId": op_id,
+                "operation_id": op_id,
+                "workOrderId": op_record.get("work_order_id"),
+                "work_order_id": op_record.get("work_order_id"),
+                "state": op_record.get("status"),
+                "status": op_record.get("status"),
+                "contractScope": op_record.get("contract_scope"),
+                "contract_scope": op_record.get("contract_scope"),
+                "parentOperationId": op_record.get("parent_operation_id"),
+                "parent_operation_id": op_record.get("parent_operation_id"),
+                "children": list(op_record.get("children", [])),
+                "transitions": list(op_record.get("transitions", [])),
+                "result": op_record.get("result"),
+                "childResults": op_record.get("child_results", {}),
+                "child_results": op_record.get("child_results", {}),
+                "events": [e.as_dict() for e in agent_events],
+                "cursor": cursor,
+            }

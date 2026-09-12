@@ -16,6 +16,7 @@ _CAPABILITIES = [
     "events",
     "cooperative_cancellation",
     "executionBackends",
+    "subagents",
 ]
 
 
@@ -47,6 +48,8 @@ class JsonRpcProtocol:
             message = str(error).lower()
             if "operation" in message:
                 return self._error(request_id, -32002, "Operation not found")
+            if "agent" in message:
+                return self._error(request_id, -32002, "Agent not found")
             return self._error(request_id, -32001, "Session not found")
         except PermissionError:
             return self._error(request_id, -32003, "Policy denied")
@@ -101,9 +104,11 @@ class JsonRpcProtocol:
                 params["session_id"],
                 operation_name,
                 params.get("metadata"),
-                parent_operation_id=params.get("parent_operation_id"),
-                work_order_id=params.get("work_order_id"),
-                contract_scope=params.get("contract_scope"),
+                parent_operation_id=params.get("parent_operation_id") or params.get("parentOperationId"),
+                work_order_id=params.get("work_order_id") or params.get("workOrderId"),
+                contract_scope=params.get("contract_scope") or params.get("contractScope"),
+                role=params.get("role"),
+                agent_id=params.get("agent_id") or params.get("agentId"),
             )
             del cancel
             return self.manager.get_operation(operation_id)
@@ -192,4 +197,41 @@ class JsonRpcProtocol:
                     params.get("session_id"), int(params.get("after", 0))
                 )
             ]
+        if method == "agent.list":
+            session_id = params.get("sessionId") or params.get("session_id")
+            operation_id = params.get("operationId") or params.get("operation_id")
+            return {"agents": self.manager.list_agents(session_id=session_id, operation_id=operation_id)}
+        if method == "agent.cancel":
+            agent_id = (
+                params.get("agentId")
+                or params.get("agent_id")
+                or params.get("operationId")
+                or params.get("operation_id")
+            )
+            if not agent_id:
+                raise ValueError("agentId or operationId is required")
+            session_id = params.get("sessionId") or params.get("session_id")
+            reason = str(params.get("reason", "user_cancelled"))
+            cascade = bool(params.get("cascade", True))
+            try:
+                return self.manager.cancel_agent(
+                    agent_id, session_id=session_id, reason=reason, cascade=cascade
+                )
+            except KeyError as error:
+                raise _RpcError(-32002, str(error)) from error
+        if method == "agent.inspect":
+            agent_id = (
+                params.get("agentId")
+                or params.get("agent_id")
+                or params.get("operationId")
+                or params.get("operation_id")
+            )
+            if not agent_id:
+                raise ValueError("agentId or operationId is required")
+            session_id = params.get("sessionId") or params.get("session_id")
+            after = int(params.get("after", 0))
+            try:
+                return self.manager.inspect_agent(agent_id, session_id=session_id, after=after)
+            except KeyError as error:
+                raise _RpcError(-32002, str(error)) from error
         raise _RpcError(-32601, "Method not found")

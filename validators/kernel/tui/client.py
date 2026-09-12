@@ -152,3 +152,46 @@ class DaemonClient:
             params["credentialRef"] = credential_ref
         return self.call("role.configureBackend", **params)
 
+    def list_agents(
+        self, session_id: str | None = None, operation_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if session_id is not None:
+            params["sessionId"] = session_id
+        if operation_id is not None:
+            params["operationId"] = operation_id
+        result = self.call("agent.list", **params)
+        if isinstance(result, dict) and "agents" in result:
+            return result["agents"]
+        return result
+
+    def cancel_agent(
+        self,
+        agent_id: str,
+        session_id: str | None = None,
+        reason: str = "user_cancelled",
+        cascade: bool = True,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "agentId": agent_id,
+            "reason": reason,
+            "cascade": cascade,
+        }
+        if session_id is not None:
+            params["sessionId"] = session_id
+        return self.call("agent.cancel", **params)
+
+    def inspect_agent(
+        self,
+        agent_id: str,
+        session_id: str | None = None,
+        after: int = 0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "agentId": agent_id,
+            "after": after,
+        }
+        if session_id is not None:
+            params["sessionId"] = session_id
+        return self.call("agent.inspect", **params)
+
