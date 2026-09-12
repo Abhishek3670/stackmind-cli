@@ -5,6 +5,21 @@ All notable changes to the **StackMind** platform will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-09-12
+
+### Added
+- **Autonomous Multi-Role Engineering Delivery Runtime (Milestone P7):** Complete governed multi-agent execution runtime, hierarchical operation tree, backend abstraction, subagent orchestration, autonomous delivery TUI, and security hardening:
+  - **WO-018 — Hierarchical Operation Tree (P7-0):** Decoupled session lifecycle from runtime operations with monotonic parent-child operation linking, operation-scoped contracts, independent child cancellation, and `operation.tree` JSON-RPC query endpoint.
+  - **WO-019 — Harness Work Order Execution (P7-1):** Bound durable Work Orders (`.sync/work-orders/`) directly to Agent Roles, running them strictly through the governed `AgentRunner` harness with 6-dimensional verification and cooperative cancellation checkpoints.
+  - **WO-020 — Execution Backend Abstraction & Role Rebinding (P7-2):** Standardized `ExecutionBackend` protocol interface, `BackendRegistry` discovery and health checking, concrete adapters (`AgentExecutionBackend`, `ModelExecutionBackend`, `EchoAgentBackend`, `OllamaBackend`), strict rebinding guards rejecting `role.configureBackend` during active operations, and RPC endpoints `backend.list`, `role.list`, and `role.configureBackend`.
+  - **WO-021 — Work Order Dispatch & Subagent Orchestration (P7-3):** Architecture role (`claude`) dispatch to specialized child roles (`codex`, `gemini`, `gemma`, `local-llm`), child contract scope inheritance and strict narrowing validation, parent completion blocking, targeted child cancellation isolation, parent cascade cancellation, and durable tree recovery across restarts.
+  - **WO-022 — Autonomous Delivery TUI & Control Plane (P7-4):** Rich Python-native interactive terminal control plane featuring Project Phase Banner, Multi-Role Agents Panel, Work Orders Progress Panel, Hierarchical Operation Tree, Governed Activity Stream, interactive Plan Approval Surface with 3-revision loop, Completion Handover checklist Surface, navigation commands (`:roles`, `:wo`, `:agents`, `:tree`, `:plan`, `:completion`, `:cancel`), and reactive SSE event processor.
+  - **WO-023 — Security Hardening & Fault Injection (P7-5):** Subagent scope containment validation, recursive credential zero-leakage scanning, D025 subagent destructive safeguards verification, terminal escape/OSC sequence sanitization, resource budget overrun gating (tokens, steps, files, time), and comprehensive `FaultInjectionEngine` simulating crashes, timeouts, and cancellation races.
+  - **WO-024 — Documentation, Baseline Reconciliation & Final Release Cut (P7-6):** Comprehensive architectural baseline reconciliation in `docs/runtime-truth/P7-final-delivery.md`, complete regression verification (65/65 P7 tests passing), 5/5 validation layers clean, and release harmonization to v3.3.0.
+
+### Changed
+- **Version Alignment:** Updated canonical platform version in `VERSION.md` and `pyproject.toml` to `3.3.0`.
+
 ---
 
 ## [3.2.0] - 2026-09-11
