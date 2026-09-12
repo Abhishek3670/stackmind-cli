@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -108,7 +109,7 @@ def test_runner_completes_assigned_work_order_and_keeps_tree_byte_identical(tmp_
             'summary': 'Harness task completed',
             'report_markdown': 'Validated, staged, and wrote back the harness result.',
             'blockers': [],
-            'modified_files': ['validators/harness/runner.py'],
+            'modified_files': [],
             'release_target': 'v2.0.0',
             'retrieval_queries': [],
             'uncertainty': [],
@@ -253,6 +254,68 @@ def test_retrieval_cap_exhaustion_falls_back_to_internal_only(tmp_path):
     assert result.meta is not None
     assert result.meta['retrieval_cap_exhausted'] is True
     assert result.meta['benchmark_mode'] == 'internal_only'
+
+
+def test_verification_gate_blocks_syntax_error_without_live_writeback(tmp_path):
+    project = _init_project(tmp_path)
+    inbox = project / '.sync' / 'inbox' / 'codex' / 'syntax-task.md'
+    inbox.write_text('# Syntax task', encoding='utf-8')
+    command = (
+        f'"{sys.executable}" -c '
+        '"from pathlib import Path; Path(\'broken.py\').write_text(\'def broken(\')"'
+    )
+    provider = StaticLLMProvider({
+        'status': 'completed', 'summary': 'write broken code', 'report_markdown': 'broken',
+        'blockers': [], 'modified_files': ['broken.py'], 'retrieval_queries': [],
+        'uncertainty': [], 'commands': [command],
+    })
+
+    result = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now).run_once()
+
+    assert result.status == 'blocked'
+    assert 'code_verified' in (result.reason or '')
+    assert not (project / 'broken.py').exists()
+    assert inbox.exists(), 'inbox move must not happen before verification passes'
+
+
+def test_verification_gate_blocks_undeclared_out_of_scope_change(tmp_path):
+    project = _init_project(tmp_path)
+    inbox = project / '.sync' / 'inbox' / 'codex' / 'scope-task.md'
+    inbox.write_text('# Scope task', encoding='utf-8')
+    command = (
+        f'"{sys.executable}" -c '
+        '"from pathlib import Path; Path(\'undeclared.txt\').write_text(\'no\')"'
+    )
+    provider = StaticLLMProvider({
+        'status': 'completed', 'summary': 'undeclared write', 'report_markdown': 'scope',
+        'blockers': [], 'modified_files': [], 'retrieval_queries': [],
+        'uncertainty': [], 'commands': [command],
+    })
+
+    result = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now).run_once()
+
+    assert result.status == 'blocked'
+    assert 'scope_verified' in (result.reason or '')
+    assert not (project / 'undeclared.txt').exists()
+    assert inbox.exists()
+
+
+def test_verification_gate_blocks_failed_command_without_live_writeback(tmp_path):
+    project = _init_project(tmp_path)
+    inbox = project / '.sync' / 'inbox' / 'codex' / 'command-task.md'
+    inbox.write_text('# Command task', encoding='utf-8')
+    command = f'"{sys.executable}" -c "import sys; sys.exit(7)"'
+    provider = StaticLLMProvider({
+        'status': 'completed', 'summary': 'failed command', 'report_markdown': 'failure',
+        'blockers': [], 'modified_files': [], 'retrieval_queries': [],
+        'uncertainty': [], 'commands': [command],
+    })
+
+    result = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now).run_once()
+
+    assert result.status == 'blocked'
+    assert 'behavioral_verified' in (result.reason or '')
+    assert inbox.exists()
 
 
 def test_prompt_injection_snippets_are_sanitized():

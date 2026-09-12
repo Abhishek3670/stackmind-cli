@@ -15,8 +15,12 @@ Covers:
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import urllib.error
 from pathlib import Path
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -26,6 +30,7 @@ from validators.harness.backend import (
     BackendExecutionError,
     BackendRegistry,
     BackendTimeoutError,
+    BackendUnavailableError,
     EchoAgentBackend,
     ExecutionBackend,
     ModelExecutionBackend,
@@ -161,6 +166,46 @@ def test_backend_registry_management_and_status():
         registry.get("unconfigured")
 
 
+def test_concurrent_backend_registry_operations():
+    """Registry mutations and snapshot listings are safe under concurrent use."""
+    registry = BackendRegistry()
+    errors: list[BaseException] = []
+    start = threading.Barrier(8)
+
+    def mutate(worker_id: int) -> None:
+        try:
+            start.wait()
+            for iteration in range(200):
+                backend_id = f"concurrent-{worker_id}-{iteration % 12}"
+                registry.register(EchoAgentBackend(backend_id=backend_id))
+                assert registry.has(backend_id)
+                assert backend_id in registry
+                assert registry.get(backend_id).backend_id == backend_id
+                if iteration % 2:
+                    registry.unregister(backend_id)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def list_snapshots() -> None:
+        try:
+            start.wait()
+            for _ in range(300):
+                snapshot = registry.list_backends()
+                assert all("id" in backend for backend in snapshot)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=mutate, args=(index,)) for index in range(4)]
+    threads.extend(threading.Thread(target=list_snapshots) for _ in range(4))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads), "registry operation deadlocked"
+    assert not errors
+
+
 def test_global_default_registry():
     reg = reset_default_registry()
     assert reg.has("echo-agent")
@@ -171,6 +216,60 @@ def test_global_default_registry():
     backend_ids = [b["id"] for b in backends]
     assert "echo-agent" in backend_ids
     assert "mock-model" in backend_ids
+
+
+def _live_model_request() -> SimpleNamespace:
+    task = HarnessTask(
+        kind="test",
+        identifier="live-model-test",
+        path=Path("task.md"),
+        title="Live model test",
+        body="Return a response",
+        query="live model test",
+    )
+    return SimpleNamespace(task=task, context=SimpleNamespace(revision=1), retrieval=SimpleNamespace(query="test"))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (urllib.error.URLError("connection refused; token=do-not-leak"), BackendUnavailableError),
+        (socket.timeout("password=do-not-leak"), BackendTimeoutError),
+        (urllib.error.HTTPError("http://token@localhost", 500, "server", None, None), BackendExecutionError),
+    ],
+)
+def test_live_model_transport_errors_are_typed_and_sanitized(error, expected):
+    backend = ModelExecutionBackend(backend_id="live-model", endpoint="http://localhost:11434")
+
+    with patch("urllib.request.urlopen", side_effect=error):
+        with pytest.raises(expected) as raised:
+            backend.complete(_live_model_request())
+
+    message = str(raised.value).lower()
+    assert "do-not-leak" not in message
+    assert "password" not in message
+    assert "token@" not in message
+
+
+def test_live_model_malformed_json_is_typed_and_sanitized():
+    backend = ModelExecutionBackend(backend_id="live-model", endpoint="http://localhost:11434")
+    response = MagicMock()
+    response.read.return_value = b"not valid json"
+    response.__enter__.return_value = response
+
+    with patch("urllib.request.urlopen", return_value=response):
+        with pytest.raises(BackendExecutionError, match="invalid response") as raised:
+            backend.complete(_live_model_request())
+
+    assert "not valid json" not in str(raised.value)
+
+
+def test_model_without_endpoint_uses_explicit_synthetic_completion():
+    backend = ModelExecutionBackend(backend_id="offline-model", endpoint=None)
+
+    completion = backend.complete(_live_model_request())
+
+    assert completion.payload["status"] == "completed"
 
 
 # -----------------------------------------------------------------------------

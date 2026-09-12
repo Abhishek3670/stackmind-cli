@@ -9,7 +9,11 @@ RPC responses, and serialized states.
 from __future__ import annotations
 
 import json
+import socket
+import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
@@ -432,6 +436,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
         should_fail: bool = False,
         failure_reason: str = "Simulated model backend failure",
         simulate_timeout: bool = False,
+        mock_mode: bool = False,
         default_release_target: str | None = None,
     ) -> None:
         caps = capabilities or ["model", "completion", "streaming", "cancellation", "approval"]
@@ -453,6 +458,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
         self.should_fail = should_fail
         self.failure_reason = failure_reason
         self.simulate_timeout = simulate_timeout
+        self.mock_mode = mock_mode
         self.default_release_target = default_release_target
 
     def complete(self, request: Any) -> Any:
@@ -467,7 +473,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
             raise BackendExecutionError(
                 f"Model backend '{self.backend_id}' error: {self.failure_reason}"
             )
-        if self.status == "not configured":
+        if self.status == "not configured" and self.endpoint:
             raise BackendUnavailableError(
                 f"Model backend '{self.backend_id}' is not configured"
             )
@@ -496,8 +502,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
             "commands": [],
         }
 
-        if self.endpoint:
-            import urllib.request
+        if self.endpoint and not self.mock_mode:
             try:
                 req_url = self.endpoint.rstrip("/") + "/api/generate"
                 prompt_text = f"Task: {task.title}\n\n{task.body}"
@@ -517,8 +522,26 @@ class ModelExecutionBackend(BaseExecutionBackend):
                             f"{actual_response.strip()}\n\n"
                             f"Knowledge revision: {getattr(request.context, 'revision', 'unknown')}\n"
                         )
-            except Exception as err:
-                payload["report_markdown"] += f"\n\n*Note: Local model endpoint notice ({err})*"
+            except (TimeoutError, socket.timeout) as exc:
+                raise BackendTimeoutError(
+                    f"Model backend '{self.backend_id}' timed out"
+                ) from exc
+            except urllib.error.HTTPError as exc:
+                raise BackendExecutionError(
+                    f"Model backend '{self.backend_id}' returned HTTP {exc.code}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                    raise BackendTimeoutError(
+                        f"Model backend '{self.backend_id}' timed out"
+                    ) from exc
+                raise BackendUnavailableError(
+                    f"Model backend '{self.backend_id}' is unavailable"
+                ) from exc
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise BackendExecutionError(
+                    f"Model backend '{self.backend_id}' returned an invalid response"
+                ) from exc
 
         if release_target:
             payload["release_target"] = release_target
@@ -541,31 +564,39 @@ class BackendRegistry:
 
     def __init__(self) -> None:
         self._backends: dict[str, ExecutionBackend] = {}
+        self._lock = threading.RLock()
 
     def register(self, backend: ExecutionBackend) -> None:
         if not hasattr(backend, "backend_id") or not backend.backend_id:
             raise ValueError("backend must have a non-empty backend_id")
-        self._backends[backend.backend_id] = backend
+        with self._lock:
+            self._backends[backend.backend_id] = backend
 
     def unregister(self, backend_id: str) -> None:
-        self._backends.pop(backend_id, None)
+        with self._lock:
+            self._backends.pop(backend_id, None)
 
     def get(self, backend_id: str) -> ExecutionBackend:
-        try:
-            return self._backends[backend_id]
-        except KeyError as exc:
-            raise KeyError(f"Execution backend '{backend_id}' not found") from exc
+        with self._lock:
+            try:
+                return self._backends[backend_id]
+            except KeyError as exc:
+                raise KeyError(f"Execution backend '{backend_id}' not found") from exc
 
     def has(self, backend_id: str) -> bool:
-        return backend_id in self._backends
+        with self._lock:
+            return backend_id in self._backends
 
     def __contains__(self, backend_id: str) -> bool:
-        return backend_id in self._backends
+        with self._lock:
+            return backend_id in self._backends
 
     def list_backends(self) -> list[dict[str, Any]]:
         """Return public list of registered backends with zero credential exposure."""
+        with self._lock:
+            backends = list(self._backends.values())
         result = []
-        for backend in self._backends.values():
+        for backend in backends:
             if hasattr(backend, "as_dict"):
                 result.append(backend.as_dict())
             else:
