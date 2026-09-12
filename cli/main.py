@@ -390,6 +390,7 @@ def lock_status(project_path: str):
 from .experience import experience_group
 from .skill import skill_group
 from .learn import learn_group
+from .daemon import daemon_group
 
 cli.add_command(graph)
 cli.add_command(harness)
@@ -397,6 +398,7 @@ cli.add_command(analyze)
 cli.add_command(experience_group)
 cli.add_command(skill_group)
 cli.add_command(learn_group)
+cli.add_command(daemon_group)
 cli.add_command(tui)
 
 if __name__ == "__main__":
