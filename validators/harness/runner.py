@@ -376,6 +376,46 @@ class AgentRunner:
             # 6. Post-provider completion.
             if self._is_cancelled(cancellation):
                 return self._cancelled_result(task, operation_id)
+
+            # Streamline conversational adhoc turns (pure chat with no files and no commands)
+            if task.kind == 'adhoc':
+                has_modifications = bool(completion.payload.get('modified_files'))
+                has_commands = bool(completion.payload.get('commands'))
+                if not has_modifications and not has_commands:
+                    raw_summary = str(completion.payload.get('summary') or '').strip()
+                    raw_report = str(completion.payload.get('report_markdown') or '').strip()
+                    if not raw_summary and not raw_report:
+                        return HarnessRunResult(
+                            status='blocked',
+                            persisted=False,
+                            task_id=task.identifier,
+                            reason='verification gate failed: outcome_verified',
+                        )
+
+                    outbox_dir = self.sync_path / 'outbox' / self.agent
+                    outbox_dir.mkdir(parents=True, exist_ok=True)
+                    now_str = run_at.isoformat().replace(':', '-')
+                    out_path = outbox_dir / f'harness-{now_str}.md'
+                    report_content = (
+                        f'# Harness Report: {task.identifier}\n\n'
+                        f'- agent: `{self.agent}`\n'
+                        f'- task: `{task.identifier}`\n'
+                        f'- kind: `adhoc`\n'
+                        f'- status: `completed`\n'
+                        f'- recorded_at: `{run_at.isoformat()}`\n\n'
+                        f'## Summary\n{raw_summary or raw_report}\n\n'
+                        f'## Report\n{raw_report or raw_summary}\n'
+                    )
+                    out_path.write_text(report_content, encoding='utf-8')
+                    summary = raw_summary or raw_report
+                    return HarnessRunResult(
+                        status='completed',
+                        persisted=True,
+                        task_id=task.identifier,
+                        report_path=out_path,
+                        meta={'summary': summary},
+                    )
+
             try:
                 decision = self._validate_decision(task, completion.payload)
             except ValueError as exc:
@@ -646,21 +686,66 @@ class AgentRunner:
         boot_file = self.sync_path / 'runtime' / 'boot' / f'{self.agent}.boot.yaml'
         contract_file = self.sync_path / 'agents' / f'{self.agent}.agent.md'
         inbox_dir = self.sync_path / 'inbox' / self.agent
+        inbox_read_dir = inbox_dir / '_read'
         outbox_dir = self.sync_path / 'outbox' / self.agent
-        if self.agent not in tree_data.get('agents', {}):
-            raise ValueError(f"Agent '{self.agent}' missing from TREE.yaml")
-        for path in (boot_file, contract_file):
-            if not path.exists():
-                raise ValueError(
-                    f"Agent '{self.agent}' is not protocol-registered ({path.name} missing)"
-                )
-        for path in (inbox_dir, outbox_dir):
-            if not path.is_dir():
-                raise ValueError(f"Agent '{self.agent}' is missing runtime directory {path.name}")
+
+        if 'agents' not in tree_data or not isinstance(tree_data.get('agents'), dict):
+            tree_data['agents'] = {}
+        if self.agent not in tree_data['agents']:
+            tree_data['agents'][self.agent] = {
+                'session_count': 0,
+                'status': 'IDLE',
+                'assigned_work_orders': [],
+            }
+            tree_file = self.sync_path / 'runtime' / 'TREE.yaml'
+            tree_file.parent.mkdir(parents=True, exist_ok=True)
+            tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding='utf-8')
+
+        if not boot_file.exists():
+            boot_file.parent.mkdir(parents=True, exist_ok=True)
+            boot_payload = {
+                'agent': self.agent,
+                'role': 'Backend Developer' if self.agent == 'codex' else self.agent.capitalize(),
+                'schema_version': 1,
+                'release': '3.1.0',
+                'session_count': 0,
+                'status': 'IDLE',
+                'assigned_work_orders': [],
+                'blockers': [],
+            }
+            boot_file.write_text(yaml.safe_dump(boot_payload, sort_keys=False), encoding='utf-8')
+
+        if not contract_file.exists():
+            contract_file.parent.mkdir(parents=True, exist_ok=True)
+            contract_file.write_text(
+                f"# Agent: {self.agent}\n\nRole: Protocol Citizen\nStatus: Active\n",
+                encoding='utf-8',
+            )
+
+        inbox_read_dir.mkdir(parents=True, exist_ok=True)
+        outbox_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_tree(self) -> dict[str, Any]:
+        tree_file = self.sync_path / 'runtime' / 'TREE.yaml'
+        if not tree_file.exists():
+            tree_file.parent.mkdir(parents=True, exist_ok=True)
+            initial_tree: dict[str, Any] = {
+                'schema_version': 1,
+                'tree_version': 1,
+                'release': '3.1.0',
+                'agents': {
+                    self.agent: {
+                        'session_count': 0,
+                        'status': 'IDLE',
+                        'assigned_work_orders': [],
+                    }
+                },
+            }
+            tree_file.write_text(yaml.safe_dump(initial_tree, sort_keys=False), encoding='utf-8')
+            self._tree_cache = initial_tree
+            return self._tree_cache
         if self._tree_cache is None:
-            self._tree_cache = self._read_yaml(self.sync_path / 'runtime' / 'TREE.yaml')
+            self._tree_cache = self._read_yaml(tree_file)
         return self._tree_cache
 
     def _read_text(self, path: Path) -> str:

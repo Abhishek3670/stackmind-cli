@@ -1058,15 +1058,50 @@ def dispatch_delivery_command(
                             state.add_message("assistant", summary)
                             click.echo(render_assistant_message_str(summary))
                             assistant_rendered = True
+                        elif op_status in {"FAILED", "CANCELLED"}:
+                            err_raw = (
+                                res.get("error")
+                                or res.get("message")
+                                or res.get("reason")
+                                or op_rec.get("error")
+                                or f"Operation {op_status.lower()}."
+                            )
+                            if isinstance(err_raw, dict):
+                                err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
+                            else:
+                                err_msg = str(err_raw)
+                            state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}")
+                            click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
+                            assistant_rendered = True
                     break
             except Exception:
                 pass
             time.sleep(0.05)
 
         if not assistant_rendered:
-            timeout_msg = f"Turn operation {op_id} completed."
-            state.add_message("assistant", timeout_msg)
-            click.echo(render_assistant_message_str(timeout_msg))
+            if completed and 'op_status' in locals() and op_status in {"FAILED", "CANCELLED"}:
+                res = (op_rec.get("result") or {}) if 'op_rec' in locals() and op_rec else {}
+                err_raw = (
+                    res.get("error")
+                    or res.get("message")
+                    or res.get("reason")
+                    or (op_rec.get("error") if 'op_rec' in locals() and op_rec else None)
+                    or f"Operation {op_status.lower()}."
+                )
+                if isinstance(err_raw, dict):
+                    err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
+                else:
+                    err_msg = str(err_raw)
+                state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}")
+                click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
+            elif completed:
+                completion_msg = f"Turn operation {op_id} completed."
+                state.add_message("assistant", completion_msg)
+                click.echo(render_assistant_message_str(completion_msg))
+            else:
+                timeout_msg = f"Turn operation {op_id} timed out."
+                state.add_message("assistant", timeout_msg)
+                click.echo(render_error_box_str(timeout_msg, title="TURN TIMEOUT"))
     except Exception as err:
         if is_connection_error(err):
             state.connection_status = "reconnecting"
