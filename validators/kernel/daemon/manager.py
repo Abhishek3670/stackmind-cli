@@ -155,6 +155,35 @@ class SessionManager:
         self._active: dict[str, Event] = {}
         self._turn_threads: dict[str, Thread] = {}
         self._roles: dict[str, dict[str, Any]] = {k: dict(v) for k, v in _DEFAULT_ROLE_CONFIG.items()}
+        try:
+            from validators.harness.backend import get_default_registry
+
+            reg = get_default_registry()
+            if "ollama" in reg and reg.get("ollama").status == "available" and reg.get("ollama").model:
+                ollama_m = reg.get("ollama").model
+                for r_name in self._roles:
+                    self._roles[r_name] = {
+                        "backend": "ollama",
+                        "model": ollama_m,
+                        "status": "configured",
+                    }
+            elif "anthropic" in reg and reg.get("anthropic").status == "available":
+                for r_name in self._roles:
+                    self._roles[r_name] = {
+                        "backend": "anthropic",
+                        "model": reg.get("anthropic").model or "claude-3-7-sonnet",
+                        "status": "configured",
+                    }
+            elif "openai" in reg and reg.get("openai").status == "available":
+                for r_name in self._roles:
+                    self._roles[r_name] = {
+                        "backend": "openai",
+                        "model": reg.get("openai").model or "gpt-4o",
+                        "status": "configured",
+                    }
+        except Exception:
+            pass
+
         for r_name, r_cfg in recovered.get("roles", {}).items():
             if isinstance(r_cfg, dict):
                 self._roles[r_name] = dict(r_cfg)
@@ -999,6 +1028,11 @@ class SessionManager:
                 _, op_rec = self._operation(operation_id)
                 raw_agent = str(op_rec.get("agent_id") or op_rec.get("role") or session.get("agent") or "codex").lower().strip()
                 agent = _ROLE_TO_PRIMARY_AGENT.get(raw_agent, raw_agent)
+            ws_path = Path(workspace)
+            tree_file = ws_path / ".sync" / "runtime" / "TREE.yaml"
+            if not tree_file.exists():
+                tree_file.parent.mkdir(parents=True, exist_ok=True)
+                tree_file.write_text(f"agents:\n  {agent}:\n    session_count: 0\n", encoding="utf-8")
             runner = self._runner_factory(workspace, agent)
             with self._lock:
                 try:

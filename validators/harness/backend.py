@@ -9,6 +9,7 @@ RPC responses, and serialized states.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -505,7 +506,14 @@ class ModelExecutionBackend(BaseExecutionBackend):
         if self.endpoint and not self.mock_mode:
             try:
                 req_url = self.endpoint.rstrip("/") + "/api/generate"
-                prompt_text = f"Task: {task.title}\n\n{task.body}"
+                task_title = getattr(task, "title", "").strip()
+                task_body = getattr(task, "body", "").strip()
+                if not task_title:
+                    prompt_text = task_body
+                elif not task_body or task_title == task_body:
+                    prompt_text = task_title
+                else:
+                    prompt_text = f"Task: {task_title}\n\n{task_body}"
                 data = json.dumps({
                     "model": self.model or "llama3",
                     "prompt": prompt_text,
@@ -614,6 +622,46 @@ class BackendRegistry:
         return result
 
 
+def discover_ollama_models(endpoint: str = "http://localhost:11434", timeout: float = 1.0) -> list[str]:
+    """Discover installed models from a running Ollama endpoint."""
+    url = endpoint.rstrip("/") + "/api/tags"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "StackMind-CLI/3.3"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = data.get("models", [])
+            return [m.get("name") for m in models if isinstance(m, dict) and m.get("name")]
+    except Exception:
+        return []
+
+
+def pick_best_ollama_model(models: list[str]) -> str | None:
+    """Pick the most capable coding or chat model from a list of discovered Ollama models."""
+    if not models:
+        return None
+
+    # Priority 1: Dedicated coding models (e.g. qwen2.5-coder:7b)
+    for m in models:
+        name_lower = m.lower()
+        if "coder" in name_lower or "code" in name_lower:
+            return m
+
+    # Priority 2: Modern chat/instruct reasoning models
+    preferred_prefixes = ["qwen", "gemma", "llama", "mistral", "deepseek", "phi"]
+    for prefix in preferred_prefixes:
+        for m in models:
+            if m.lower().startswith(prefix):
+                return m
+
+    # Priority 3: Non-embedding general model
+    for m in models:
+        name_lower = m.lower()
+        if not any(skip in name_lower for skip in ["bge", "embed", "bert", "rerank"]):
+            return m
+
+    return models[0]
+
+
 _DEFAULT_REGISTRY: BackendRegistry | None = None
 
 
@@ -624,7 +672,48 @@ def get_default_registry() -> BackendRegistry:
         reg = BackendRegistry()
         reg.register(AgentExecutionBackend(backend_id="echo-agent", model="stackmind-echo-v1"))
         reg.register(ModelExecutionBackend(backend_id="mock-model", model="mock-llama3", available=True))
-        reg.register(ModelExecutionBackend(backend_id="ollama", model="llama3", endpoint="http://localhost:11434", available=True))
+
+        # Auto-detect local Ollama models
+        ollama_endpoint = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        discovered_models = discover_ollama_models(ollama_endpoint)
+        best_model = pick_best_ollama_model(discovered_models)
+        ollama_available = bool(discovered_models)
+        selected_model = best_model or "llama3"
+
+        reg.register(
+            ModelExecutionBackend(
+                backend_id="ollama",
+                model=selected_model,
+                endpoint=ollama_endpoint,
+                available=ollama_available,
+            )
+        )
+
+        # Register cloud providers if environment variables are present
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+        if anthropic_key:
+            reg.register(
+                ModelExecutionBackend(
+                    backend_id="anthropic",
+                    model="claude-3-7-sonnet",
+                    endpoint="https://api.anthropic.com",
+                    credential_ref="env:ANTHROPIC_API_KEY",
+                    available=True,
+                )
+            )
+
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if openai_key:
+            reg.register(
+                ModelExecutionBackend(
+                    backend_id="openai",
+                    model="gpt-4o",
+                    endpoint="https://api.openai.com",
+                    credential_ref="env:OPENAI_API_KEY",
+                    available=True,
+                )
+            )
+
         _DEFAULT_REGISTRY = reg
     return _DEFAULT_REGISTRY
 

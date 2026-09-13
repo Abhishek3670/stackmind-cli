@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -948,17 +949,20 @@ def dispatch_delivery_command(
     if normalized == ":events":
         try:
             events = adapter.command(":events", session_id=session["session_id"])
-            if not events:
-                click.echo("No new events.")
-            else:
+            rendered_any = False
+            if events:
                 recover_transcript_from_events(events, state)
                 for event in events:
                     ev_str = render_operational_event_str(event)
                     if ev_str:
                         click.echo(ev_str)
+                        rendered_any = True
                     resp = extract_assistant_response(event.get("payload", {}))
                     if resp:
                         click.echo(render_assistant_message_str(resp))
+                        rendered_any = True
+            if not rendered_any:
+                click.echo("No new events.")
         except Exception as err:
             if is_connection_error(err):
                 state.connection_status = "reconnecting"
@@ -991,21 +995,78 @@ def dispatch_delivery_command(
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         state.add_activity("User", "submitted turn", op_id)
-        msg_text = f"Turn submitted to the governed daemon (operation: {op_id})."
-        state.add_message("assistant", msg_text)
-        click.echo(render_assistant_message_str(msg_text))
+        # Clean thinking status notice while awaiting completion
+        status_line = Text(f"● Thinking... (Turn submitted to the governed daemon: {op_id})", style="dim #64748b")
+        click.echo(status_line)
 
-        # Check for immediate events or completed turn response from adapter
-        events = list(adapter.stream(session["session_id"]))
-        for ev in events:
-            state.process_event(ev)
-            ev_str = render_operational_event_str(ev)
-            if ev_str:
-                click.echo(ev_str)
-            resp = extract_assistant_response(ev.get("payload", {}))
-            if resp:
-                state.add_message("assistant", resp)
-                click.echo(render_assistant_message_str(resp))
+        # Synchronously await turn completion while consuming events
+        workspace = Path(session["workspace"]) if session.get("workspace") else None
+        max_wait = 45.0
+        start_time = time.time()
+        completed = False
+        assistant_rendered = False
+
+        while time.time() - start_time < max_wait:
+            events = list(adapter.stream(session["session_id"]))
+            for ev in events:
+                state.process_event(ev)
+                ev_str = render_operational_event_str(ev)
+                if ev_str:
+                    click.echo(ev_str)
+                resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
+                if resp and not assistant_rendered:
+                    state.add_message("assistant", resp)
+                    click.echo(render_assistant_message_str(resp))
+                    assistant_rendered = True
+
+            try:
+                op_rec = client.operation_get(op_id)
+                op_status = op_rec.get("status")
+                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                    completed = True
+                    for ev in list(adapter.stream(session["session_id"])):
+                        state.process_event(ev)
+                        ev_str = render_operational_event_str(ev)
+                        if ev_str:
+                            click.echo(ev_str)
+                        resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
+                        if resp and not assistant_rendered:
+                            state.add_message("assistant", resp)
+                            click.echo(render_assistant_message_str(resp))
+                            assistant_rendered = True
+
+                    if not assistant_rendered:
+                        res = op_rec.get("result") or {}
+                        summary = res.get("summary") or res.get("reason")
+                        report_path_raw = res.get("report_path")
+                        if report_path_raw:
+                            rp = Path(report_path_raw)
+                            if not rp.is_absolute() and workspace:
+                                rp = workspace / rp
+                            if rp.exists():
+                                try:
+                                    cnt = rp.read_text(encoding="utf-8")
+                                    if "## Report" in cnt:
+                                        _, _, b = cnt.partition("## Report")
+                                        rb, _, _ = b.partition("## Meta")
+                                        summary = rb.strip() or cnt.strip()
+                                    else:
+                                        summary = cnt.strip()
+                                except Exception:
+                                    pass
+                        if summary:
+                            state.add_message("assistant", summary)
+                            click.echo(render_assistant_message_str(summary))
+                            assistant_rendered = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        if not assistant_rendered:
+            timeout_msg = f"Turn operation {op_id} completed."
+            state.add_message("assistant", timeout_msg)
+            click.echo(render_assistant_message_str(timeout_msg))
     except Exception as err:
         if is_connection_error(err):
             state.connection_status = "reconnecting"

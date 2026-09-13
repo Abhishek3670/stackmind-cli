@@ -197,10 +197,20 @@ def render_tool_activity_line_str(
     return render_tool_activity_str(activity, width=width, inline=True)
 
 
-def render_operational_event(event: Mapping[str, Any]) -> RenderableType:
+def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
     """Render a daemon operational event cleanly."""
     name = str(event.get("name", ""))
     payload = event.get("payload", {}) if isinstance(event.get("payload"), Mapping) else {}
+
+    # Filter out low-level internal kernel diagnostic events from chat display
+    if name in {
+        "session.started",
+        "attempt.started",
+        "contract.loaded",
+        "operation.requested",
+        "operation.authorized",
+    }:
+        return None
 
     if name == "event.toolCall":
         args = payload.get("arguments", {})
@@ -291,9 +301,12 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType:
 
 def render_operational_event_str(event: Mapping[str, Any], width: int = 80) -> str:
     """Render a daemon operational event as a string using in-memory capture."""
+    rendered = render_operational_event(event)
+    if rendered is None:
+        return ""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_operational_event(event))
+    console.print(rendered)
     return console.export_text().rstrip()
 
 
