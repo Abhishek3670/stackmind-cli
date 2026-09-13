@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
 from uuid import uuid4
+
+from .contract import AgentContract
 
 
 def utc_now() -> datetime:
@@ -25,14 +26,33 @@ class LifecycleState(str, Enum):
 
 
 _TRANSITIONS = {
-    LifecycleState.CREATED: {LifecycleState.RUNNING, LifecycleState.CANCELLED, LifecycleState.FAILED},
-    LifecycleState.RUNNING: {LifecycleState.WAITING, LifecycleState.PAUSED, LifecycleState.VERIFYING,
-                             LifecycleState.FAILED, LifecycleState.CANCELLED},
-    LifecycleState.WAITING: {LifecycleState.RUNNING, LifecycleState.PAUSED, LifecycleState.FAILED,
-                             LifecycleState.CANCELLED},
+    LifecycleState.CREATED: {
+        LifecycleState.RUNNING,
+        LifecycleState.CANCELLED,
+        LifecycleState.FAILED,
+    },
+    LifecycleState.RUNNING: {
+        LifecycleState.WAITING,
+        LifecycleState.PAUSED,
+        LifecycleState.VERIFYING,
+        LifecycleState.FAILED,
+        LifecycleState.CANCELLED,
+    },
+    LifecycleState.WAITING: {
+        LifecycleState.RUNNING,
+        LifecycleState.PAUSED,
+        LifecycleState.FAILED,
+        LifecycleState.CANCELLED,
+    },
     LifecycleState.PAUSED: {LifecycleState.RUNNING, LifecycleState.CANCELLED},
-    LifecycleState.VERIFYING: {LifecycleState.COMPLETED, LifecycleState.FAILED, LifecycleState.CANCELLED},
-    LifecycleState.COMPLETED: set(), LifecycleState.FAILED: set(), LifecycleState.CANCELLED: set(),
+    LifecycleState.VERIFYING: {
+        LifecycleState.COMPLETED,
+        LifecycleState.FAILED,
+        LifecycleState.CANCELLED,
+    },
+    LifecycleState.COMPLETED: set(),
+    LifecycleState.FAILED: set(),
+    LifecycleState.CANCELLED: set(),
 }
 
 
@@ -41,7 +61,7 @@ class Attempt:
     """One immutable-contract execution attempt within an agent session."""
 
     attempt_id: str
-    contract: Any
+    contract: AgentContract | None
     state: LifecycleState = LifecycleState.CREATED
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
@@ -54,7 +74,11 @@ class Attempt:
         self.updated_at = utc_now()
 
     def add_usage(self, **usage: int) -> None:
-        if self.state in {LifecycleState.COMPLETED, LifecycleState.FAILED, LifecycleState.CANCELLED}:
+        if self.state in {
+            LifecycleState.COMPLETED,
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+        }:
             raise ValueError("Cannot add usage to a terminal attempt")
         for key, value in usage.items():
             if value < 0:
@@ -75,10 +99,16 @@ class AgentSession:
     updated_at: datetime = field(default_factory=utc_now)
     attempts: list[Attempt] = field(default_factory=list)
 
-    def create_attempt(self, contract: Any, attempt_id: str | None = None) -> Attempt:
-        if self.state in {LifecycleState.COMPLETED, LifecycleState.FAILED, LifecycleState.CANCELLED}:
+    def create_attempt(
+        self, contract: AgentContract | None, attempt_id: str | None = None
+    ) -> Attempt:
+        if self.state in {
+            LifecycleState.COMPLETED,
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+        }:
             raise ValueError("Cannot create an attempt for a terminal session")
-        frozen = contract.freeze() if hasattr(contract, "freeze") else contract
+        frozen = contract
         attempt = Attempt(attempt_id or str(uuid4()), frozen)
         self.attempts.append(attempt)
         return attempt

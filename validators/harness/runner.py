@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any, Protocol
 
 import yaml
@@ -197,6 +200,7 @@ class AgentRunner:
         project_path: Path,
         agent: str,
         *,
+        backend: Any | None = None,
         llm_provider: LLMProvider | None = None,
         search_provider: SearchProvider | None = None,
         retrieval_policy: RetrievalPolicy | None = None,
@@ -210,7 +214,20 @@ class AgentRunner:
         self.project_path = project_path.resolve()
         self.sync_path = self.project_path / '.sync'
         self.agent = agent
-        self.llm_provider = llm_provider or EchoLLMProvider()
+        self.backend = backend
+        if backend is not None:
+            self.backend_id = getattr(backend, 'backend_id', 'custom-backend')
+            self.backend_model = getattr(backend, 'model', None) or 'default'
+            if llm_provider is not None:
+                self.llm_provider = llm_provider
+            elif hasattr(backend, 'complete'):
+                self.llm_provider = backend
+            else:
+                self.llm_provider = EchoLLMProvider()
+        else:
+            self.llm_provider = llm_provider or EchoLLMProvider()
+            self.backend_id = getattr(self.llm_provider, 'provider_name', 'echo')
+            self.backend_model = getattr(self.llm_provider, 'model_name', 'stackmind-echo-v1')
         self.search_tool = SessionSearchTool(search_provider, policy=retrieval_policy)
         self.token_budget = token_budget
         self.context_limit = context_limit
@@ -221,11 +238,47 @@ class AgentRunner:
         self.reader = ResourceReadTracker(max_reads=3)
         self._tree_cache: dict[str, Any] | None = None
 
-    def run_once(self) -> HarnessRunResult:
+    @staticmethod
+    def _is_cancelled(cancellation: Event | None) -> bool:
+        return cancellation is not None and cancellation.is_set()
+
+    @staticmethod
+    def _cancelled_result(task: HarnessTask, operation_id: str | None) -> HarnessRunResult:
+        return HarnessRunResult(
+            status='cancelled',
+            persisted=False,
+            task_id=task.identifier,
+            reason='operation cancelled',
+            meta={'operation_id': operation_id} if operation_id else None,
+        )
+
+    def run_once(
+        self,
+        cancellation: Event | None = None,
+        operation_id: str | None = None,
+        *,
+        cancel_event: Event | None = None,
+        prompt: str | None = None,
+    ) -> HarnessRunResult:
+        """Run one task, cooperatively stopping at operation lifecycle boundaries."""
+        if cancel_event is not None:
+            if cancellation is not None and cancellation is not cancel_event:
+                raise ValueError("only one cancellation event may be provided")
+            cancellation = cancel_event
         try:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)
             task = self.discover_next_task(tree_data)
+            if task is None and prompt:
+                adhoc_file = self.sync_path / 'inbox' / self.agent / 'adhoc.md'
+                task = HarnessTask(
+                    kind='adhoc',
+                    identifier=operation_id or 'adhoc',
+                    path=adhoc_file,
+                    title=prompt.strip() or 'User Prompt',
+                    body=prompt.strip() or 'User Prompt',
+                    query=prompt.strip() or 'User Prompt',
+                )
             if task is None:
                 return HarnessRunResult(
                     status='idle',
@@ -233,6 +286,10 @@ class AgentRunner:
                     task_id=None,
                     reason='no inbox items or assigned work orders',
                 )
+
+            # 1. Post-task discovery.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             run_at = self.now_fn()
             poll_started = time.monotonic()
@@ -242,6 +299,10 @@ class AgentRunner:
                 limit=self.context_limit,
             )
             poll_ms = int((time.monotonic() - poll_started) * 1000)
+
+            # 2. Post-context assembly.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             # Pre-execution plan verification
             from validators.harness.contract_gate import verify_pre_execution
@@ -255,6 +316,10 @@ class AgentRunner:
                     reason=f'Pre-execution contract validation failed: {exc}',
                 )
 
+            # 3. Post-pre-execution contract verification.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             from validators.harness.snapshot import (
                 WorkspaceSnapshot,
                 WorkspaceDiff,
@@ -266,9 +331,17 @@ class AgentRunner:
             # Phase 0: Capture runner-owned before snapshot
             before_snapshot = WorkspaceSnapshot.capture(self.project_path)
 
+            # 4. Post-workspace snapshot.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             retrieval_started = time.monotonic()
             retrieval = self.search_tool.search(task.query, limit=3)
             retrieval_ms = int((time.monotonic() - retrieval_started) * 1000)
+
+            # 5. Post-retrieval, before provider execution.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             request = LLMRequest(
                 agent=self.agent,
@@ -279,8 +352,30 @@ class AgentRunner:
             )
 
             llm_started = time.monotonic()
-            completion = self.llm_provider.complete(request)
+            try:
+                if self.backend is not None and hasattr(self.backend, 'start_operation'):
+                    self.backend.start_operation(task=task, context=context, operation_id=operation_id)
+                completion = self.llm_provider.complete(request)
+                if self.backend is not None and hasattr(self.backend, 'report_result') and operation_id:
+                    self.backend.report_result(operation_id)
+            except Exception as exc:
+                return HarnessRunResult(
+                    status='failed',
+                    persisted=False,
+                    task_id=task.identifier,
+                    reason=f'Backend execution error: {exc}',
+                    meta={
+                        'backend_id': self.backend_id,
+                        'model': self.backend_model,
+                        'operation_id': operation_id,
+                        'error': str(exc),
+                    },
+                )
             llm_ms = completion.latency_ms or int((time.monotonic() - llm_started) * 1000)
+
+            # 6. Post-provider completion.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
             try:
                 decision = self._validate_decision(task, completion.payload)
             except ValueError as exc:
@@ -290,6 +385,10 @@ class AgentRunner:
                     task_id=task.identifier,
                     reason=str(exc),
                 )
+
+            # 7. Post-decision validation.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             # Post-execution declared validation
             from validators.harness.contract_gate import verify_post_execution
@@ -302,6 +401,10 @@ class AgentRunner:
                     task_id=task.identifier,
                     reason=f'Post-execution contract validation failed: {exc}',
                 )
+
+            # 8. Post-post-execution contract verification.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
 
             stage_inputs = {
                 'completion': completion,
@@ -323,6 +426,10 @@ class AgentRunner:
                     reason='staged stackmind validate failed: ' + '; '.join(staged_errors),
                 )
 
+            # 9. Post-staged validation, before lock acquisition.
+            if self._is_cancelled(cancellation):
+                return self._cancelled_result(task, operation_id)
+
             ok, message, lock_wait_ms = self._acquire_runtime_lock()
             if not ok:
                 return HarnessRunResult(
@@ -341,47 +448,92 @@ class AgentRunner:
             declaration_matches = True
             mismatch_reason = None
             try:
-                self._apply_non_report_writes(stage_inputs)
-                write_ms = int((time.monotonic() - hold_started) * 1000)
-                hold_ms = write_ms
-
-                # Execute bash commands after applying ops
-                if decision.commands:
-                    from validators.harness.d025_gate import D025Gate, D025ViolationError
-                    gate = D025Gate()
-                    gate_decision = gate.evaluate_sequence(decision.commands)
-                    gate.log_decision(self.project_path, self.agent, gate_decision, task_id=task.identifier)
-                    if not gate_decision.passed:
-                        raise D025ViolationError(
-                            f"Command sequence triggered D025 Destructive Operations Safeguard: {gate_decision.reason}"
-                        )
-                    import subprocess
-                    for cmd in decision.commands:
-                        subprocess.run(cmd, shell=True, cwd=str(self.project_path), check=True)
-
-                # Phase 0: Capture runner-owned after snapshot & derive authoritative diff
-                after_snapshot = WorkspaceSnapshot.capture(self.project_path)
-                diff = before_snapshot.diff(after_snapshot)
-                declaration_matches, mismatch_reason = diff.matches_declaration(decision.modified_files)
-
-                # Enforce contract on observed changes if modifications occurred
-                if diff.all_changed_files:
-                    verify_post_execution(
-                        self.project_path,
-                        self.agent,
-                        task,
-                        decision,
-                        observed_files=diff.all_changed_files,
+                # 10. Post-lock acquisition, before any persistent write.
+                if self._is_cancelled(cancellation):
+                    return self._cancelled_result(task, operation_id)
+                from validators.harness.d025_gate import D025Gate
+                gate = D025Gate()
+                gate_decision = gate.evaluate_sequence(decision.commands)
+                if not gate_decision.passed:
+                    return HarnessRunResult(
+                        status='blocked',
+                        persisted=False,
+                        task_id=task.identifier,
+                        reason=f'D025 validation failed: {gate_decision.reason}',
                     )
 
-                dimensions = VerificationDimensions(
-                    scope_verified=True,
-                    state_verified=len(staged_errors) == 0,
-                    code_verified=True,
-                    behavioral_verified=decision.status == 'completed',
-                    security_verified=True,
-                    outcome_verified=decision.status == 'completed' and not decision.blockers,
-                )
+                # Run all state-changing work in an isolated copy.  Nothing reaches the
+                # live workspace until its observed diff has passed every verification gate.
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    staged_root = Path(tmp_dir) / self.project_path.name
+                    shutil.copytree(
+                        self.project_path,
+                        staged_root,
+                        dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('.git', '__pycache__', '.pytest_cache', '.ruff_cache'),
+                    )
+                    self._apply_non_report_writes(stage_inputs, base_path=staged_root)
+                    command_results: list[subprocess.CompletedProcess[str]] = []
+                    for cmd in decision.commands:
+                        if self._is_cancelled(cancellation):
+                            return self._cancelled_result(task, operation_id)
+                        try:
+                            command_results.append(
+                                subprocess.run(
+                                    cmd,
+                                    shell=True,
+                                    cwd=str(staged_root),
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                            )
+                        except OSError as exc:
+                            command_results.append(
+                                subprocess.CompletedProcess(cmd, returncode=-1, stderr=type(exc).__name__)
+                            )
+
+                    after_snapshot = WorkspaceSnapshot.capture(staged_root)
+                    diff = before_snapshot.diff(after_snapshot)
+                    # LLM declarations describe task changes, not harness-owned audit,
+                    # inbox, and report bookkeeping under `.sync/`.
+                    observed_task_files = tuple(
+                        path for path in diff.all_changed_files if not path.startswith('.sync/')
+                    )
+                    declaration_matches = set(observed_task_files) == set(decision.modified_files)
+                    mismatch_reason = (
+                        None if declaration_matches
+                        else f'declared {sorted(decision.modified_files)} != observed {sorted(observed_task_files)}'
+                    )
+                    dimensions = self._evaluate_verification_dimensions(
+                        task=task,
+                        decision=decision,
+                        diff=diff,
+                        before_snapshot=before_snapshot,
+                        after_snapshot=after_snapshot,
+                        staged_root=staged_root,
+                        staged_errors=staged_errors,
+                        declaration_matches=declaration_matches,
+                        command_results=command_results,
+                        d025_passed=gate_decision.passed,
+                        has_staged_writes=(task.kind == 'inbox' or task.work_order_id is not None),
+                    )
+                    if not dimensions.all_passed:
+                        failed = [name for name, passed in dimensions.to_dict().items() if name != 'all_passed' and not passed]
+                        return HarnessRunResult(
+                            status='blocked',
+                            persisted=False,
+                            task_id=task.identifier,
+                            reason='verification gate failed: ' + ', '.join(failed),
+                        )
+                    self._apply_verified_workspace_diff(staged_root, diff)
+
+                # `.sync` is excluded from workspace snapshots, so commit the
+                # harness-owned bookkeeping only after the staged verification passes.
+                self._apply_non_report_writes(stage_inputs)
+
+                write_ms = int((time.monotonic() - hold_started) * 1000)
+                hold_ms = write_ms
                 trust_level = evaluate_learning_eligibility(
                     decision_status=decision.status,
                     dimensions=dimensions,
@@ -594,7 +746,11 @@ class AgentRunner:
             ops.append(FileMove(task.path.relative_to(self.project_path), archived))
 
         if task.work_order_id:
-            payload = self._read_yaml(task.path).copy()
+            cached_payload = stage_inputs.get('_work_order_payload')
+            if cached_payload is None:
+                cached_payload = self._read_yaml(task.path)
+                stage_inputs['_work_order_payload'] = dict(cached_payload)
+            payload = dict(cached_payload)
             log_entries = list(payload.get('log', []))
             log_entries.append(f"{now.isoformat()} harness {decision.status}: {decision.summary}")
             payload['log'] = log_entries
@@ -750,7 +906,10 @@ class AgentRunner:
             'learning_eligible': exp_rec.learning_eligible if exp_rec else False,
             'lock_hold_ms': lock_hold_ms,
             'lock_wait_ms': lock_wait_ms,
+            'backend_id': getattr(self, 'backend_id', completion.provider),
             'model': completion.model,
+            'summary': decision.summary,
+            'report_markdown': decision.report_markdown,
             'observed_changes': diff.to_dict() if diff else {},
             'prompt_tokens': completion.prompt_tokens,
             'provider': completion.provider,
@@ -760,6 +919,160 @@ class AgentRunner:
             'uncertainty': list(decision.uncertainty),
             'verification_dimensions': dimensions.to_dict() if dimensions else {},
         }
+
+    def _evaluate_verification_dimensions(
+        self,
+        *,
+        task: HarnessTask,
+        decision: HarnessDecision,
+        diff: Any,
+        before_snapshot: Any,
+        after_snapshot: Any,
+        staged_root: Path,
+        staged_errors: list[str],
+        declaration_matches: bool,
+        command_results: list[subprocess.CompletedProcess[str]],
+        d025_passed: bool,
+        has_staged_writes: bool,
+    ) -> Any:
+        """Derive verification flags from the staged filesystem and command telemetry."""
+        from validators.harness.contract_gate import verify_post_execution
+        from validators.harness.snapshot import VerificationDimensions
+
+        changed_files = tuple(diff.all_changed_files)
+        task_changed_files = tuple(
+            relative_path for relative_path in changed_files if not relative_path.startswith('.sync/')
+        )
+        scope_verified = declaration_matches
+        if task_changed_files:
+            try:
+                verify_post_execution(
+                    self.project_path,
+                    self.agent,
+                    task,
+                    decision,
+                    observed_files=task_changed_files,
+                )
+            except Exception:
+                scope_verified = False
+
+        # Runtime contracts use path rules; validate those directly when present.
+        if task.work_order_id:
+            contract_path = self.sync_path / 'contracts' / f'{task.work_order_id}.yaml'
+            if contract_path.exists():
+                raw_contract = self._read_yaml(contract_path)
+                allow_rules = raw_contract.get('scope', {}).get('allow', [])
+                deny_rules = raw_contract.get('scope', {}).get('deny', [])
+                allow_paths = [str(rule.get('path', '')) for rule in allow_rules if isinstance(rule, dict)]
+                deny_paths = [str(rule.get('path', '')) for rule in deny_rules if isinstance(rule, dict)]
+                for relative_path in task_changed_files:
+                    normalized = Path(relative_path).as_posix()
+                    if normalized.startswith('.sync/'):
+                        continue  # Harness-owned bookkeeping writes are authorized separately.
+                    allowed = any(
+                        normalized == rule or normalized.startswith(rule.rstrip('/') + '/')
+                        for rule in allow_paths
+                    )
+                    denied = any(
+                        normalized == rule or normalized.startswith(rule.rstrip('/') + '/')
+                        for rule in deny_paths
+                    )
+                    if not allowed or denied:
+                        scope_verified = False
+
+        state_verified = not staged_errors
+        for relative_path in changed_files:
+            before = before_snapshot.files.get(relative_path)
+            after = after_snapshot.files.get(relative_path)
+            if after is not None and not after.content_hash:
+                state_verified = False
+            if before is not None and after is not None and before.content_hash == after.content_hash:
+                state_verified = False
+            if after is None and before is None:
+                state_verified = False
+
+        code_verified = True
+        for relative_path in changed_files:
+            if relative_path.endswith('.py'):
+                candidate = staged_root / relative_path
+                if candidate.exists():
+                    try:
+                        ast.parse(candidate.read_text(encoding='utf-8'))
+                    except (OSError, UnicodeDecodeError, SyntaxError):
+                        code_verified = False
+        for result in command_results:
+            command = str(result.args).lower()
+            if ('pytest' in command or 'test' in command) and result.returncode != 0:
+                code_verified = False
+
+        behavioral_verified = (
+            decision.status == 'completed'
+            and all(result.returncode == 0 for result in command_results)
+        )
+
+        security_verified = d025_passed and all(
+            not Path(relative_path).is_absolute() and '..' not in Path(relative_path).parts
+            for relative_path in changed_files
+        )
+        if security_verified:
+            from validators.kernel.security import scan_for_credential_leaks
+
+            for relative_path in changed_files:
+                candidate = staged_root / relative_path
+                if candidate.is_file():
+                    try:
+                        if scan_for_credential_leaks(candidate.read_text(encoding='utf-8', errors='replace')):
+                            security_verified = False
+                            break
+                    except OSError:
+                        security_verified = False
+                        break
+
+        deliverable_exists = False
+        if task.deliverable_path:
+            deliverable = staged_root / task.deliverable_path
+            deliverable_exists = deliverable.exists()
+        elif task.kind == 'inbox':
+            # Inbox tasks are intentionally archived by the staged operation; the
+            # task selected at discovery is itself the completed deliverable.
+            deliverable_exists = True
+        elif task.kind == 'adhoc':
+            # Ad-hoc prompt turns produce conversational completion/report deliverables.
+            deliverable_exists = bool(
+                (decision.summary and decision.summary.strip())
+                or (decision.report_markdown and decision.report_markdown.strip())
+            )
+        outcome_verified = (
+            decision.status == 'completed'
+            and not decision.blockers
+            and (deliverable_exists or bool(changed_files) or has_staged_writes)
+        )
+        return VerificationDimensions(
+            scope_verified=scope_verified,
+            state_verified=state_verified,
+            code_verified=code_verified,
+            behavioral_verified=behavioral_verified,
+            security_verified=security_verified,
+            outcome_verified=outcome_verified,
+        )
+
+    def _apply_verified_workspace_diff(self, staged_root: Path, diff: Any) -> None:
+        """Commit only the already-verified staged diff to the live workspace."""
+        for relative_path in (*diff.added, *diff.modified):
+            relative = Path(relative_path)
+            if relative.is_absolute() or '..' in relative.parts:
+                raise ValueError(f'unsafe staged path: {relative_path}')
+            source = staged_root / relative
+            target = self.project_path / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        for relative_path in diff.deleted:
+            relative = Path(relative_path)
+            if relative.is_absolute() or '..' in relative.parts:
+                raise ValueError(f'unsafe staged path: {relative_path}')
+            target = self.project_path / relative
+            if target.exists():
+                target.unlink()
 
     def _acquire_runtime_lock(self) -> tuple[bool, str, int]:
         waited_ms = 0

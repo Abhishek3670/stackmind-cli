@@ -94,8 +94,7 @@ class GovernedToolRegistry:
         arguments = arguments or {}
         if not isinstance(arguments, Mapping):
             raise ValueError("tool arguments must be an object")
-        self.manager.begin_operation(self.session_id, name)
-        operation_id = self.manager._sessions[self.session_id]["active_operation"]
+        _, operation_id = self.manager.begin_operation(self.session_id, name)
         try:
             result = self._call(name, arguments)
         except Exception as error:

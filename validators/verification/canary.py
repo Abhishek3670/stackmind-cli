@@ -6,7 +6,7 @@ Implements Phase 5 & Phase P3 Canary Verification executing in ScratchWorkspace 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from validators.verification.models import StageResult
 

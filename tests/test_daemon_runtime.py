@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from validators.kernel.daemon import DaemonStorage, LocalDaemon, SessionManager
+
+_opener = build_opener(ProxyHandler({}))
 
 
 def _contract() -> dict[str, object]:
@@ -13,41 +15,75 @@ def _contract() -> dict[str, object]:
 
 
 def _rpc(daemon: LocalDaemon, method: str, params: dict[str, object], request_id: int = 1) -> dict:
-    request = Request(f"{daemon.url}/rpc", data=json.dumps({
-        "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
-    }).encode(), headers={"Content-Type": "application/json"})
-    with urlopen(request) as response:
+    request = Request(
+        f"{daemon.url}/rpc",
+        data=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with _opener.open(request) as response:
         return json.loads(response.read())
 
 
 def test_client_reconnects_and_streams_lifecycle_events(tmp_path):
     with LocalDaemon(tmp_path) as daemon:
-        created = _rpc(daemon, "session.create", {
-            "agent": "codex", "provider": "test", "contract": _contract(), "workspace": "workspace",
-        })["result"]
-        attached = _rpc(
-            daemon, "session.attach", {"session_id": created["session_id"]}, 2
+        created = _rpc(
+            daemon,
+            "session.create",
+            {
+                "agent": "codex",
+                "provider": "test",
+                "contract": _contract(),
+                "workspace": "workspace",
+            },
         )["result"]
+        attached = _rpc(daemon, "session.attach", {"session_id": created["session_id"]}, 2)[
+            "result"
+        ]
         events = _rpc(daemon, "event.list", {"session_id": created["session_id"]}, 3)["result"]
         assert attached["session_id"] == created["session_id"]
         assert [event["name"] for event in events][:3] == [
-            "session.started", "attempt.started", "contract.loaded",
+            "session.started",
+            "attempt.started",
+            "contract.loaded",
         ]
-        with urlopen(f"{daemon.url}/health") as response:
+        with _opener.open(f"{daemon.url}/health") as response:
             assert json.loads(response.read()) == {"status": "ok", "sessions": 1}
 
 
-def test_active_operation_cancels_mid_turn_and_is_journaled(tmp_path):
+def test_cancelled_operation_leaves_session_reusable_and_is_journaled(tmp_path):
     manager = SessionManager(DaemonStorage(tmp_path))
     session = manager.create_session("codex", "test", _contract(), "workspace")
-    cancellation = manager.begin_operation(session["session_id"], "provider.call")
-    operation_id = manager._sessions[session["session_id"]]["active_operation"]
-    manager.cancel_session(session["session_id"])
+    cancellation, operation_id = manager.begin_operation(session["session_id"], "provider.call")
+    requested = manager.cancel_operation(operation_id)
     assert cancellation.is_set()
+    assert requested["status"] == "CANCEL_REQUESTED"
     manager.complete_operation(session["session_id"], operation_id, {"reason": "cancelled"})
     restored = manager.get_session(session["session_id"])
-    assert restored["state"] == "CANCELLED"
+    assert restored["state"] == "RUNNING"
     assert restored["journal"][0]["status"] == "CANCELLED"
+    _, next_operation_id = manager.begin_operation(session["session_id"], "provider.call")
+    manager.complete_operation(session["session_id"], next_operation_id)
+    assert manager.get_session(session["session_id"])["journal"][1]["status"] == "COMPLETED"
+
+
+def test_late_completion_cannot_overwrite_cancel_requested(tmp_path):
+    manager = SessionManager(DaemonStorage(tmp_path))
+    session = manager.create_session("codex", "test", _contract(), "workspace")
+    _, operation_id = manager.begin_operation(session["session_id"], "provider.call")
+    manager.cancel_operation(operation_id)
+    manager.complete_operation(session["session_id"], operation_id, status="COMPLETED")
+    record = manager.get_session(session["session_id"])["journal"][0]
+    assert record["status"] == "CANCELLED"
+    names = [event.name for event in manager.events.events(session["session_id"])]
+    assert "operation.cancel_requested" in names
+    assert "operation.cancelled" in names
 
 
 def test_state_and_audit_trail_recover_after_daemon_restart(tmp_path):

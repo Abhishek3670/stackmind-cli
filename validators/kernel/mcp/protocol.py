@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from typing import Any, TextIO
 
+from .constants import MCP_PROTOCOL_VERSION
 from .tools import GovernedToolRegistry
 
 
 class McpProtocol:
-    protocol_version = "2024-11-05"
+    protocol_version = MCP_PROTOCOL_VERSION
 
     def __init__(
         self,

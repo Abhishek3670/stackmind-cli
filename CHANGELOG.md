@@ -5,6 +5,47 @@ All notable changes to the **StackMind** platform will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-09-12
+
+### Added
+- **Autonomous Multi-Role Engineering Delivery Runtime (Milestone P7):** Complete governed multi-agent execution runtime, hierarchical operation tree, backend abstraction, subagent orchestration, autonomous delivery TUI, and security hardening:
+  - **WO-018 — Hierarchical Operation Tree (P7-0):** Decoupled session lifecycle from runtime operations with monotonic parent-child operation linking, operation-scoped contracts, independent child cancellation, and `operation.tree` JSON-RPC query endpoint.
+  - **WO-019 — Harness Work Order Execution (P7-1):** Bound durable Work Orders (`.sync/work-orders/`) directly to Agent Roles, running them strictly through the governed `AgentRunner` harness with 6-dimensional verification and cooperative cancellation checkpoints.
+  - **WO-020 — Execution Backend Abstraction & Role Rebinding (P7-2):** Standardized `ExecutionBackend` protocol interface, `BackendRegistry` discovery and health checking, concrete adapters (`AgentExecutionBackend`, `ModelExecutionBackend`, `EchoAgentBackend`, `OllamaBackend`), strict rebinding guards rejecting `role.configureBackend` during active operations, and RPC endpoints `backend.list`, `role.list`, and `role.configureBackend`.
+  - **WO-021 — Work Order Dispatch & Subagent Orchestration (P7-3):** Architecture role (`claude`) dispatch to specialized child roles (`codex`, `gemini`, `gemma`, `local-llm`), child contract scope inheritance and strict narrowing validation, parent completion blocking, targeted child cancellation isolation, parent cascade cancellation, and durable tree recovery across restarts.
+  - **WO-022 — Autonomous Delivery TUI & Control Plane (P7-4):** Rich Python-native interactive terminal control plane featuring Project Phase Banner, Multi-Role Agents Panel, Work Orders Progress Panel, Hierarchical Operation Tree, Governed Activity Stream, interactive Plan Approval Surface with 3-revision loop, Completion Handover checklist Surface, navigation commands (`:roles`, `:wo`, `:agents`, `:tree`, `:plan`, `:completion`, `:cancel`), and reactive SSE event processor.
+  - **WO-023 — Security Hardening & Fault Injection (P7-5):** Subagent scope containment validation, recursive credential zero-leakage scanning, D025 subagent destructive safeguards verification, terminal escape/OSC sequence sanitization, resource budget overrun gating (tokens, steps, files, time), and comprehensive `FaultInjectionEngine` simulating crashes, timeouts, and cancellation races.
+  - **WO-024 — Documentation, Baseline Reconciliation & Final Release Cut (P7-6):** Comprehensive architectural baseline reconciliation in `docs/runtime-truth/P7-final-delivery.md`, complete regression verification (65/65 P7 tests passing), 5/5 validation layers clean, and release harmonization to v3.3.0.
+
+### Changed
+- **Version Alignment:** Updated canonical platform version in `VERSION.md` and `pyproject.toml` to `3.3.0`.
+
+---
+
+## [3.2.0] - 2026-09-11
+
+### Added
+- **Interactive Terminal UI & Daemon Control Plane (Milestone P6):** Complete Python-native interactive terminal client (`stackmind tui`) and HTTP JSON-RPC daemon control plane:
+  - **WO-011 — Targeted Preflight & Architecture Audit:** System preflight checks, environment verification, and architectural dependency validation.
+  - **WO-012 — Operation Lifecycle & Cooperative Cancellation:** Session lifecycle state machine, monotonic operation tracking, and cooperative cancellation across 10 execution checkpoints.
+  - **WO-013 — Versioned JSON-RPC 2.0 Contract & Typed Error Model:** Strictly-typed JSON-RPC 2.0 interface over HTTP `/rpc`, structured error domain codes, and request schema validation.
+  - **WO-014 — Streaming / Subscription Transport (SSE) & Tool Event Model:** Server-Sent Events `/events` endpoint, sequence-numbered event streaming, and live tool activity tracking.
+  - **WO-015 — Governed Prompt/Turn Execution via Harness AgentRunner:** Harness execution integration, turn-based state isolation, and zero-bypass tool call governance.
+  - **WO-016 — Python-Native Terminal Client (`stackmind tui`):** Rich interactive TUI control plane featuring Contract HUD, live activity stream, HITL approval modal, and 6D verification matrix.
+  - **WO-017 — P6 Acceptance, Full Regression Audit & Release Cut:** Metadata alignment across `cli/__init__.py`, `VERSION`, `VERSION.md`, and `pyproject.toml`, full regression testing, and release cut.
+- **Agent Runtime Kernel Foundation (P0–P5 GA):**
+  - **WO-001 Runtime Kernel Contract:** Core types, interfaces, and configuration schema.
+  - **WO-002 Secure Execution Kernel:** Sandboxed subprocess execution with timeout and resource limits.
+  - **WO-003 Real Provider Gateway:** Multi-provider LLM support with streaming and token tracking.
+  - **WO-004 Verification & Authentic Experience Capture:** Multi-dimensional verification and trust foundation.
+  - **WO-005 Local Runtime Daemon & Stateful Sessions:** Background daemon with persistent session state.
+  - **WO-006 IDE + MCP Integration:** IDE and Model Context Protocol integration.
+  - **WO-009 Architecture & Encapsulation Hardening:** 32 kernel unit/integration tests and encapsulation hardening.
+- **StackMind Agent Runtime GA:** Formal GA release of the complete agent runtime platform (v3.2.0).
+
+### Changed
+- **Version Alignment:** Synchronized canonical version declarations across `cli/__init__.py`, `pyproject.toml`, `VERSION`, and `VERSION.md` to `3.2.0`.
+
 ---
 
 ## [3.1.1] - 2026-09-06
