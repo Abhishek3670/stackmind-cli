@@ -136,6 +136,14 @@ class AutonomousDeliveryState:
             "Tests": False,
             "Git": False,
         }
+        self.verification_dimensions: dict[str, bool] = {
+            "scope": True,
+            "state": True,
+            "ast": True,
+            "behavioral": True,
+            "security": True,
+            "outcome": True,
+        }
         self.is_complete: bool = False
 
     def now_str(self) -> str:
@@ -368,6 +376,16 @@ class AutonomousDeliveryState:
             role = (payload.get("role") or "Agent").title()
             status = payload.get("status", "completed")
             self.add_activity(role, f"{tool_name} ({status})", "")
+
+        elif name in {"verification.completed", "verification.recorded"}:
+            res = payload.get("result")
+            if isinstance(res, Mapping):
+                dims = res.get("dimensions") or res.get("verification_dimensions") or res
+                for k, v in dims.items():
+                    norm_k = str(k).lower().replace("_verified", "")
+                    if norm_k in self.verification_dimensions:
+                        self.verification_dimensions[norm_k] = bool(v)
+            self.add_activity("StackMind", "recorded 6-D verification matrix")
 
         elif name == "project.completed" or name == "project.complete":
             self.phase = ProjectPhase.PROJECT_COMPLETE

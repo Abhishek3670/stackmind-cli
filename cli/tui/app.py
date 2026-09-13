@@ -44,6 +44,14 @@ from cli.tui.events import (
     render_tool_activity_line_str,
     render_tool_activity_str,
 )
+from cli.tui.governance import (
+    render_contract_hud,
+    render_contract_hud_str,
+    render_plan_panel,
+    render_plan_panel_str,
+    render_verification_matrix,
+    render_verification_matrix_str,
+)
 from cli.tui.landing import (
     render_landing_block,
     render_landing_block_str,
@@ -269,8 +277,7 @@ def _default_contract() -> dict[str, Any]:
 
 def _show_status(session: dict[str, Any], state: AutonomousDeliveryState | None = None) -> None:
     click.echo(session_header(session))
-    click.echo("[CONTRACT BOUNDARY HUD]")
-    click.echo(contract_panel(session.get("contract", {})))
+    click.echo(render_contract_hud_str(session.get("contract", {})))
     if state is not None:
         state.update_from_session(session)
         click.echo("")
@@ -292,6 +299,7 @@ def _show_help() -> None:
     click.echo(
         "Available commands:\n"
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
+        "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :roles            Display Agent Roles & Execution Backend bindings\n"
         "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
         "  :wo               Display Work Orders table and progress\n"
@@ -416,6 +424,11 @@ def dispatch_delivery_command(
         _show_status(session, state=state)
         return session, False
 
+    if normalized == ":contract":
+        contract_data = session.get("contract", {})
+        click.echo(render_contract_hud_str(contract_data))
+        return session, False
+
     if normalized == ":roles":
         # Query daemon role bindings if supported, and render detailed role panel
         try:
@@ -487,7 +500,7 @@ def dispatch_delivery_command(
                     state.phase = ProjectPhase.AWAITING_APPROVAL
         except Exception:
             pass
-        click.echo(render_plan_surface(state))
+        click.echo(render_plan_panel_str(state))
         return session, False
 
     if normalized.startswith(":approve"):
@@ -504,7 +517,9 @@ def dispatch_delivery_command(
                     state.plan["state"] = "APPROVED"
                 if state.plan_revisions:
                     state.plan_revisions[-1].state = "APPROVED"
-                click.echo(f"Plan '{plan_id}' approved. Approval recorded.")
+                feedback_msg = f"Plan '{plan_id}' approved. Approval recorded."
+                click.echo(feedback_msg)
+                state.add_message("assistant", f"✓ {feedback_msg} (reason: {clean_reason})")
                 return session, False
             except Exception as e:
                 click.echo(f"Plan approval error: {e}")
@@ -512,6 +527,7 @@ def dispatch_delivery_command(
         # Fallback to standard HITL approval
         adapter.command(f":approve {clean_reason}".strip(), session_id=session["session_id"])
         click.echo("Approval recorded.")
+        state.add_message("assistant", f"✓ HITL Approval recorded: {clean_reason}")
         return session, False
 
     if normalized.startswith(":reject"):
@@ -528,7 +544,9 @@ def dispatch_delivery_command(
                 if state.plan_revisions:
                     state.plan_revisions[-1].state = "REJECTED"
                     state.plan_revisions[-1].feedback = clean_feedback
-                click.echo(f"Plan '{plan_id}' rejected. Rejection recorded.")
+                feedback_msg = f"Plan '{plan_id}' rejected. Rejection recorded."
+                click.echo(feedback_msg)
+                state.add_message("assistant", f"✗ {feedback_msg} (feedback: {clean_feedback})")
                 return session, False
             except Exception as e:
                 click.echo(f"Plan rejection error: {e}")
@@ -536,6 +554,7 @@ def dispatch_delivery_command(
         # Fallback to standard HITL rejection
         adapter.command(f":reject {clean_feedback}".strip(), session_id=session["session_id"])
         click.echo("Rejection recorded.")
+        state.add_message("assistant", f"✗ HITL Rejection recorded: {clean_feedback}")
         return session, False
 
     if normalized == ":completion":
@@ -584,7 +603,8 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":matrix":
-        click.echo(adapter.command(":matrix", session_id=session["session_id"]))
+        dims = state.verification_dimensions if state is not None else None
+        click.echo(render_verification_matrix_str(dims))
         return session, False
 
     if normalized == ":events":

@@ -39,6 +39,15 @@ from .events import (
     render_tool_activity_line_str,
     render_tool_activity_str,
 )
+from .governance import (
+    VERIFICATION_DIMENSIONS,
+    render_contract_hud,
+    render_contract_hud_str,
+    render_plan_panel,
+    render_plan_panel_str,
+    render_verification_matrix,
+    render_verification_matrix_str,
+)
 from .landing import (
     render_landing_block,
     render_landing_block_str,
@@ -65,6 +74,7 @@ __all__ = [
     "RoleStatus",
     "ToolActivity",
     "ToolStatus",
+    "VERIFICATION_DIMENSIONS",
     "WorkOrderItem",
     "create_tui_adapter",
     "dispatch_delivery_command",
@@ -76,6 +86,8 @@ __all__ = [
     "render_chat_transcript",
     "render_chat_transcript_str",
     "render_completion_surface",
+    "render_contract_hud",
+    "render_contract_hud_str",
     "render_file_diff",
     "render_landing_block",
     "render_landing_block_str",
@@ -83,6 +95,8 @@ __all__ = [
     "render_operational_event",
     "render_operational_event_str",
     "render_phase_banner",
+    "render_plan_panel",
+    "render_plan_panel_str",
     "render_plan_surface",
     "render_project_delivery_view",
     "render_roles_panel",
@@ -94,6 +108,8 @@ __all__ = [
     "render_unified_diff_str",
     "render_user_message",
     "render_user_message_str",
+    "render_verification_matrix",
+    "render_verification_matrix_str",
     "render_work_orders_panel",
     "tui",
 ]
