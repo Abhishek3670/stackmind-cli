@@ -425,6 +425,159 @@ class OperationalEventManager:
         return render_operational_event(event), assistant_response
 
 
+def render_connection_status(status: str = "online") -> RenderableType:
+    """Render connection status with standard visual indicator."""
+    s = str(status).lower()
+    if s == "online":
+        return Text("● online", style="bold green")
+    elif s in {"reconnecting", "reconnect"}:
+        return Text("○ reconnecting", style="bold yellow")
+    else:
+        return Text("✗ offline", style="bold red")
+
+
+def render_connection_status_str(status: str = "online") -> str:
+    """Render connection status indicator as string."""
+    s = str(status).lower()
+    if s == "online":
+        return "● online"
+    elif s in {"reconnecting", "reconnect"}:
+        return "○ reconnecting"
+    else:
+        return "✗ offline"
+
+
+def is_connection_error(err: Exception) -> bool:
+    """Check if exception represents a network or transport disconnection."""
+    if isinstance(err, (ConnectionError, OSError, TimeoutError)):
+        return True
+    msg = str(err).lower()
+    return any(phrase in msg for phrase in (
+        "connection refused",
+        "connection reset",
+        "connection error",
+        "remotedisconnected",
+        "broken pipe",
+        "timed out",
+        "unreachable",
+        "failed to establish a new connection",
+        "target machine actively refused",
+        "network",
+    ))
+
+
+def render_error_box(
+    message: str,
+    title: str = "ERROR",
+    hint: str | None = None,
+    width: int | None = None,
+) -> RenderableType:
+    """Render a concise inline error panel avoiding raw Python stack traces."""
+    content = Text()
+    clean_msg = str(message)
+    if "Traceback (most recent call last):" in clean_msg:
+        lines = clean_msg.strip().splitlines()
+        clean_msg = lines[-1] if lines else clean_msg
+
+    content.append(clean_msg, style="bold red")
+    if hint:
+        content.append("\n")
+        content.append(hint, style="dim white")
+
+    panel_title = Text(" ! ", style="bold red").append(title, style="bold white").append(" ")
+    return Panel(
+        content,
+        title=panel_title,
+        title_align="left",
+        box=box.ROUNDED,
+        border_style="red dim",
+        padding=(0, 1),
+    )
+
+
+def render_error_box_str(
+    message: str,
+    title: str = "ERROR",
+    hint: str | None = None,
+    width: int = 80,
+) -> str:
+    """Render an inline error box as plain formatted string."""
+    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_error_box(message, title=title, hint=hint, width=width))
+    return console.export_text().rstrip()
+
+
+def recover_transcript_from_events(
+    events: list[Mapping[str, Any]],
+    state: AutonomousDeliveryState,
+    workspace: Path | None = None,
+) -> list[ChatMessage]:
+    """Recover visible conversation transcript and delivery state from event.list.
+
+    Reconstructs user prompts and assistant responses while preventing
+    duplicate messages or duplicate activity entries.
+    """
+    from cli.tui.state import ChatMessage
+
+    recovered: list[ChatMessage] = []
+    sorted_events = sorted(events, key=lambda ev: ev.get("sequence", 0))
+
+    for ev in sorted_events:
+        seq = ev.get("sequence")
+        if seq is not None and isinstance(seq, int) and seq in state.seen_sequences:
+            continue
+
+        name = str(ev.get("name", ""))
+        payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
+
+        # Update core delivery state (operations, roles, WOs, verifications)
+        state.process_event(ev)
+
+        # 1. Recover user prompt from turn.started or operation.started
+        if name in {"turn.started", "operation.started"}:
+            prompt = payload.get("prompt") or payload.get("input")
+            if prompt and isinstance(prompt, str) and prompt.strip():
+                clean_prompt = prompt.strip()
+                msg_key = ("user", clean_prompt)
+                if msg_key not in state.seen_message_keys:
+                    state.seen_message_keys.add(msg_key)
+                    msg = state.add_message("user", clean_prompt)
+                    recovered.append(msg)
+
+        # 2. Recover assistant response from toolResult, completed, or report
+        elif name in {"event.toolResult", "operation.completed", "turn.completed"}:
+            resp = extract_assistant_response(payload, workspace=workspace)
+            if resp and isinstance(resp, str) and resp.strip():
+                clean_resp = resp.strip()
+                msg_key = ("assistant", clean_resp)
+                if msg_key not in state.seen_message_keys:
+                    state.seen_message_keys.add(msg_key)
+                    msg = state.add_message("assistant", clean_resp)
+                    recovered.append(msg)
+
+    # 3. Check outbox for any unattached harness reports if workspace provided
+    if workspace:
+        outbox_dir = workspace / ".sync" / "outbox"
+        if outbox_dir.exists():
+            for rpt in sorted(outbox_dir.glob("**/harness-*.md")):
+                try:
+                    content = rpt.read_text(encoding="utf-8")
+                    if "## Report" in content:
+                        _, _, body = content.partition("## Report")
+                        report_body, _, _ = body.partition("## Meta")
+                        clean = report_body.strip()
+                        if clean:
+                            msg_key = ("assistant", clean)
+                            if msg_key not in state.seen_message_keys:
+                                state.seen_message_keys.add(msg_key)
+                                msg = state.add_message("assistant", clean)
+                                recovered.append(msg)
+                except Exception:
+                    pass
+
+    return recovered
+
+
 __all__ = [
     "OperationalEventManager",
     "STATUS_MARKERS",
@@ -432,7 +585,13 @@ __all__ = [
     "ToolStatus",
     "extract_assistant_response",
     "format_tool_name",
+    "is_connection_error",
     "normalize_status",
+    "recover_transcript_from_events",
+    "render_connection_status",
+    "render_connection_status_str",
+    "render_error_box",
+    "render_error_box_str",
     "render_operational_event",
     "render_operational_event_str",
     "render_tool_activity",

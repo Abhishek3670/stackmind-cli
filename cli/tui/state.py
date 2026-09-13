@@ -145,14 +145,29 @@ class AutonomousDeliveryState:
             "outcome": True,
         }
         self.is_complete: bool = False
+        self.last_sequence: int = 0
+        self.seen_sequences: set[int] = set()
+        self.seen_message_keys: set[tuple[str, str]] = set()
+        self.connection_status: str = "online"  # "online", "reconnecting", "offline"
 
     def now_str(self) -> str:
         return datetime.datetime.now().strftime("%H:%M")
 
-    def add_activity(self, role: str, action: str, target: str = "") -> None:
+    def add_activity(self, role: str, action: str, target: str = "", deduplicate: bool = False) -> None:
+        if deduplicate:
+            for entry in self.activity_log:
+                if entry.role == role and entry.action == action and entry.target == target:
+                    return
         self.activity_log.append(ActivityEntry(self.now_str(), role, action, target))
 
-    def add_message(self, role: str, content: str) -> ChatMessage:
+    def add_message(self, role: str, content: str, deduplicate: bool = False) -> ChatMessage:
+        clean = content.strip()
+        key = (role, clean)
+        if deduplicate and key in self.seen_message_keys:
+            for m in self.messages:
+                if m.role == role and m.content.strip() == clean:
+                    return m
+        self.seen_message_keys.add(key)
         msg = ChatMessage(role=role, content=content, timestamp=self.now_str())
         self.messages.append(msg)
         return msg
@@ -231,6 +246,14 @@ class AutonomousDeliveryState:
 
     def process_event(self, event: Mapping[str, Any]) -> None:
         """Process incoming sequenced daemon / SSE events to update delivery state."""
+        seq = event.get("sequence")
+        if seq is not None and isinstance(seq, int):
+            if seq in self.seen_sequences:
+                return
+            self.seen_sequences.add(seq)
+            if seq > self.last_sequence:
+                self.last_sequence = seq
+
         name = event.get("name", "")
         payload = event.get("payload", {})
 

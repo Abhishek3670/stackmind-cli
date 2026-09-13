@@ -37,6 +37,12 @@ from cli.tui.events import (
     ToolActivity,
     ToolStatus,
     extract_assistant_response,
+    is_connection_error,
+    recover_transcript_from_events,
+    render_connection_status,
+    render_connection_status_str,
+    render_error_box,
+    render_error_box_str,
     render_operational_event,
     render_operational_event_str,
     render_tool_activity,
@@ -275,9 +281,72 @@ def _default_contract() -> dict[str, Any]:
     return {"allow": [], "deny": [], "write_mode": "governed"}
 
 
-def _show_status(session: dict[str, Any], state: AutonomousDeliveryState | None = None) -> None:
-    click.echo(session_header(session))
-    click.echo(render_contract_hud_str(session.get("contract", {})))
+def format_session_header(
+    session: Mapping[str, Any],
+    width: int = 80,
+    status: str | None = None,
+) -> str:
+    """Format session header responsively depending on terminal width."""
+    sid = str(session.get("session_id", "session"))
+    state_val = str(session.get("state", "RUNNING"))
+    provider = str(session.get("provider", "daemon"))
+    agent = session.get("agent")
+    workspace = session.get("workspace")
+
+    status_suffix = f" | {render_connection_status_str(status)}" if status else ""
+
+    if width >= 80:
+        agent_info = f" | agent: {agent}" if agent else ""
+        ws_info = f" | workspace: {workspace}" if workspace else ""
+        return f"Session {sid} | {state_val} | provider: {provider}{agent_info}{ws_info}{status_suffix}"
+    elif width >= 55:
+        ws_short = Path(str(workspace)).name if workspace else ""
+        agent_info = f" | {agent}" if agent else ""
+        ws_info = f" | ws: {ws_short}" if ws_short else ""
+        display_sid = sid if len(sid) <= 12 else sid[:8] + "..."
+        return f"Session {display_sid} | {state_val}{agent_info}{ws_info}{status_suffix}"
+    else:
+        display_sid = sid if len(sid) <= 8 else sid[:6] + ".."
+        return f"Session {display_sid} | {state_val}{status_suffix}"
+
+
+def reconnect_and_sync(
+    client: DaemonClient,
+    adapter: StackMindTuiAdapter,
+    state: AutonomousDeliveryState,
+    session: dict[str, Any],
+    workspace: Path | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Attempt reconnection to daemon and replay missed events without duplication."""
+    state.connection_status = "reconnecting"
+    sid = session.get("session_id")
+    try:
+        if sid:
+            updated_session = client.get_session(sid)
+            session.update(updated_session)
+            state.update_from_session(updated_session)
+        else:
+            client.health_version()
+
+        state.connection_status = "online"
+        missed: list[dict[str, Any]] = []
+        if sid:
+            missed = client.events(sid, after=state.last_sequence)
+            recover_transcript_from_events(missed, state, workspace=workspace)
+        return True, missed
+    except Exception:
+        state.connection_status = "offline"
+        return False, []
+
+
+def _show_status(
+    session: dict[str, Any],
+    state: AutonomousDeliveryState | None = None,
+    width: int = 80,
+) -> None:
+    conn_status = state.connection_status if state else "online"
+    click.echo(format_session_header(session, width=width, status=conn_status))
+    click.echo(render_contract_hud_str(session.get("contract", {}), width=width))
     if state is not None:
         state.update_from_session(session)
         click.echo("")
@@ -300,6 +369,7 @@ def _show_help() -> None:
         "Available commands:\n"
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
+        "  :reconnect        Reconnect to daemon and replay missed events\n"
         "  :roles            Display Agent Roles & Execution Backend bindings\n"
         "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
         "  :wo               Display Work Orders table and progress\n"
@@ -419,8 +489,33 @@ def dispatch_delivery_command(
         _show_help()
         return session, False
 
+    if normalized == ":reconnect":
+        click.echo(render_connection_status_str("reconnecting"))
+        ok, missed = reconnect_and_sync(client, adapter, state, session)
+        if ok:
+            click.echo(f"{render_connection_status_str('online')} (reconnected, {len(missed)} missed events synced)")
+        else:
+            click.echo(render_error_box_str(
+                f"Could not reconnect to daemon at {client.url}",
+                title="RECONNECTION FAILED",
+                hint="Verify that the daemon process is running and reachable.",
+            ))
+        return session, False
+
     if normalized == ":status":
-        session = adapter.command(":status", session_id=session["session_id"])
+        try:
+            session = adapter.command(":status", session_id=session["session_id"])
+            state.connection_status = "online"
+        except Exception as err:
+            if is_connection_error(err):
+                state.connection_status = "reconnecting"
+                click.echo(render_error_box_str(
+                    f"Daemon connection failed: {err}",
+                    title="CONNECTION ERROR",
+                    hint="Daemon appears unreachable. Use :reconnect or check daemon status.",
+                ))
+            else:
+                click.echo(render_error_box_str(str(err), title="STATUS ERROR"))
         _show_status(session, state=state)
         return session, False
 
@@ -608,16 +703,29 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":events":
-        events = adapter.command(":events", session_id=session["session_id"])
-        if not events:
-            click.echo("No new events.")
-        for event in events:
-            state.process_event(event)
-            click.echo(render_operational_event_str(event))
-            resp = extract_assistant_response(event.get("payload", {}))
-            if resp:
-                state.add_message("assistant", resp)
-                click.echo(render_assistant_message_str(resp))
+        try:
+            events = adapter.command(":events", session_id=session["session_id"])
+            if not events:
+                click.echo("No new events.")
+            else:
+                recover_transcript_from_events(events, state)
+                for event in events:
+                    ev_str = render_operational_event_str(event)
+                    if ev_str:
+                        click.echo(ev_str)
+                    resp = extract_assistant_response(event.get("payload", {}))
+                    if resp:
+                        click.echo(render_assistant_message_str(resp))
+        except Exception as err:
+            if is_connection_error(err):
+                state.connection_status = "reconnecting"
+                click.echo(render_error_box_str(
+                    f"Event stream disconnected: {err}",
+                    title="CONNECTION ERROR",
+                    hint="Use :reconnect to recover missed events once daemon is restored.",
+                ))
+            else:
+                click.echo(render_error_box_str(str(err), title="EVENT ERROR"))
         return session, False
 
     if normalized in {":chat", ":history"}:
@@ -656,9 +764,21 @@ def dispatch_delivery_command(
                 state.add_message("assistant", resp)
                 click.echo(render_assistant_message_str(resp))
     except Exception as err:
-        err_msg = f"[ERROR] Could not submit turn: {err} (An operation may already be in flight. Use :status or :cancel)."
-        state.add_message("system", err_msg)
-        click.echo(err_msg)
+        if is_connection_error(err):
+            state.connection_status = "reconnecting"
+            err_box = render_error_box_str(
+                f"Could not submit turn: {err}",
+                title="CONNECTION ERROR",
+                hint="Daemon connection was lost. Use :reconnect to restore connection.",
+            )
+        else:
+            err_box = render_error_box_str(
+                f"Could not submit turn: {err}",
+                title="TURN SUBMISSION ERROR",
+                hint="An operation may already be in flight. Use :status, :cancel, or :reconnect.",
+            )
+        state.add_message("system", f"[ERROR] Could not submit turn: {err}")
+        click.echo(err_box)
     return session, False
 
 
@@ -704,6 +824,14 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             project_name=workspace.resolve().name, session_id=session["session_id"]
         )
         state.update_from_session(session)
+
+        # Recover any pre-existing events/transcript from daemon session
+        try:
+            init_events = client.events(session["session_id"], after=0)
+            if init_events:
+                recover_transcript_from_events(init_events, state, workspace=workspace.resolve())
+        except Exception:
+            pass
 
         _ensure_utf8()
 

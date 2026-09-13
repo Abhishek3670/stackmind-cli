@@ -21,10 +21,13 @@ LANDING_HINTS = [
 ]
 
 
-def render_landing_block(version: str | None = None) -> RenderableType:
+def render_landing_block(
+    version: str | None = None, width: int | None = None
+) -> RenderableType:
     """Render the OpenCode-inspired minimal StackMind landing block.
 
-    Uses dynamic cli.__version__ unless an explicit version string is provided.
+    Supports responsive degradation: adapts hints table to 2 columns on
+    narrow displays (width < 60) without breaking diamond or header layout.
     """
     pkg_version = version if version is not None else cli.__version__
     ver_str = f"v{pkg_version}" if not str(pkg_version).startswith("v") else str(pkg_version)
@@ -36,21 +39,27 @@ def render_landing_block(version: str | None = None) -> RenderableType:
     tagline_text = Text(LANDING_TAGLINE, style="italic white", justify="center")
     pillars_text = Text(" · ".join(LANDING_PILLARS), style="bold cyan", justify="center")
 
-    # Clean static input hints table
-    hints_table = Table.grid(padding=(0, 3))
-    hints_table.add_column(justify="left", style="bold cyan")
-    hints_table.add_column(justify="left", style="dim white")
-    hints_table.add_column(justify="left", style="bold cyan")
-    hints_table.add_column(justify="left", style="dim white")
-
-    hints_table.add_row(
-        LANDING_HINTS[0][0], LANDING_HINTS[0][1],
-        LANDING_HINTS[1][0], LANDING_HINTS[1][1],
-    )
-    hints_table.add_row(
-        LANDING_HINTS[2][0], LANDING_HINTS[2][1],
-        LANDING_HINTS[3][0], LANDING_HINTS[3][1],
-    )
+    # Responsive static input hints table
+    if width is not None and width < 60:
+        hints_table = Table.grid(padding=(0, 2))
+        hints_table.add_column(justify="left", style="bold cyan")
+        hints_table.add_column(justify="left", style="dim white")
+        for key, desc in LANDING_HINTS:
+            hints_table.add_row(key, desc)
+    else:
+        hints_table = Table.grid(padding=(0, 3))
+        hints_table.add_column(justify="left", style="bold cyan")
+        hints_table.add_column(justify="left", style="dim white")
+        hints_table.add_column(justify="left", style="bold cyan")
+        hints_table.add_column(justify="left", style="dim white")
+        hints_table.add_row(
+            LANDING_HINTS[0][0], LANDING_HINTS[0][1],
+            LANDING_HINTS[1][0], LANDING_HINTS[1][1],
+        )
+        hints_table.add_row(
+            LANDING_HINTS[2][0], LANDING_HINTS[2][1],
+            LANDING_HINTS[3][0], LANDING_HINTS[3][1],
+        )
 
     centered_hints = Align.center(hints_table)
 
@@ -73,7 +82,7 @@ def render_landing_block(version: str | None = None) -> RenderableType:
 def render_landing_block_str(version: str | None = None, width: int = 80) -> str:
     """Render the landing block as plain formatted string."""
     console = Console(record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_landing_block(version=version))
+    console.print(render_landing_block(version=version, width=width))
     return console.export_text().rstrip()
 
 
