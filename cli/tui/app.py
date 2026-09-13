@@ -19,9 +19,22 @@ from typing import Any, Mapping
 
 import click
 
+from cli.tui.chat import (
+    render_assistant_message,
+    render_assistant_message_str,
+    render_chat_transcript,
+    render_chat_transcript_str,
+    render_user_message,
+    render_user_message_str,
+)
+from cli.tui.landing import (
+    render_landing_block,
+    render_landing_block_str,
+)
 from cli.tui.state import (
     ActivityEntry,
     AutonomousDeliveryState,
+    ChatMessage,
     OperationNode,
     PlanRevision,
     ProjectPhase,
@@ -247,6 +260,17 @@ def _show_status(session: dict[str, Any], state: AutonomousDeliveryState | None 
         click.echo(render_project_delivery_view(state))
 
 
+def _ensure_utf8() -> None:
+    """Ensure standard streams support UTF-8 encoding without crashing on Windows cp1252."""
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def _show_help() -> None:
     click.echo(
         "Available commands:\n"
@@ -265,6 +289,8 @@ def _show_help() -> None:
         "  :events           Stream incremental sequenced events from daemon\n"
         "  :pause            Pause active session turn\n"
         "  :resume           Resume active session\n"
+        "  :chat             Display conversation transcript\n"
+        "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
         "  :exit, :quit, q   Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent"
@@ -547,18 +573,33 @@ def dispatch_delivery_command(
             click.echo(activity_line(event))
         return session, False
 
+    if normalized in {":chat", ":history"}:
+        click.echo(render_chat_transcript_str(state.messages))
+        return session, False
+
+    if normalized == ":landing":
+        click.echo(render_landing_block_str())
+        return session, False
+
     if normalized.startswith(":") and not normalized.startswith(":prompt "):
         click.echo("Unknown command. Type :help.")
         return session, False
 
     # Governed turn prompt
+    prompt_text = normalized[8:].strip() if normalized.startswith(":prompt ") else normalized
+    state.add_message("user", prompt_text)
+    click.echo(render_user_message_str(prompt_text))
     try:
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         state.add_activity("User", "submitted turn", op_id)
-        click.echo(f"Turn submitted to the governed daemon (operation: {op_id}).")
+        msg_text = f"Turn submitted to the governed daemon (operation: {op_id})."
+        state.add_message("assistant", msg_text)
+        click.echo(render_assistant_message_str(msg_text))
     except Exception as err:
-        click.echo(f"[ERROR] Could not submit turn: {err} (An operation may already be in flight. Use :status or :cancel).")
+        err_msg = f"[ERROR] Could not submit turn: {err} (An operation may already be in flight. Use :status or :cancel)."
+        state.add_message("system", err_msg)
+        click.echo(err_msg)
     return session, False
 
 
@@ -605,12 +646,15 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
         )
         state.update_from_session(session)
 
+        _ensure_utf8()
+
         if demo:
             _run_demo(client, session)
             return
 
-        _show_status(session, state=state)
-        _show_help()
+        if not state.has_conversation:
+            click.echo(render_landing_block_str())
+
         while True:
             try:
                 sid = (session["session_id"][:8] + "...") if "session_id" in session else "IDLE"

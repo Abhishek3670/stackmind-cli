@@ -91,6 +91,13 @@ class ActivityEntry:
         return f"{t:<5} {self.role:<10} {self.action}{target_part}"
 
 
+@dataclass
+class ChatMessage:
+    role: str  # "user", "assistant", "system"
+    content: str
+    timestamp: str = ""
+
+
 class AutonomousDeliveryState:
     """Live in-memory state tracking the autonomous project delivery lifecycle."""
 
@@ -118,6 +125,7 @@ class AutonomousDeliveryState:
             "op-root": OperationNode("op-root", "Architecture", role="Architecture", backend="Claude", status="RUNNING")
         }
         self.activity_log: list[ActivityEntry] = []
+        self.messages: list[ChatMessage] = []
         self.completion_checklist: dict[str, bool] = {
             "PLAN.md": False,
             "Backend": False,
@@ -135,6 +143,18 @@ class AutonomousDeliveryState:
 
     def add_activity(self, role: str, action: str, target: str = "") -> None:
         self.activity_log.append(ActivityEntry(self.now_str(), role, action, target))
+
+    def add_message(self, role: str, content: str) -> ChatMessage:
+        msg = ChatMessage(role=role, content=content, timestamp=self.now_str())
+        self.messages.append(msg)
+        return msg
+
+    @property
+    def has_conversation(self) -> bool:
+        return len(self.messages) > 0
+
+    def clear_conversation(self) -> None:
+        self.messages.clear()
 
     def update_from_session(self, session: Mapping[str, Any]) -> None:
         if not session:
@@ -347,6 +367,7 @@ class AutonomousDeliveryState:
 __all__ = [
     "ActivityEntry",
     "AutonomousDeliveryState",
+    "ChatMessage",
     "OperationNode",
     "PlanRevision",
     "ProjectPhase",
