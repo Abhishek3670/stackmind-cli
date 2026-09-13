@@ -1,19 +1,19 @@
 # STACKMIND_CLI
-> CLI Frontend & Governed Runtime Kernel for StackMind
+> CLI Frontend, Governed Runtime Kernel & Autonomous Engineering Control Plane for StackMind
 
-**Version:** 3.2.0 · **Python:** ≥3.10 · **License:** MIT · **Author:** Abhishek Sharma
+**Version:** 3.3.0 GA · **Python:** ≥3.10 · **License:** MIT · **Author:** Abhishek Sharma
 
 ---
 
 ## Table of Contents
 1. [What Is StackMind CLI?](#1-what-is-stackmind-cli)
 2. [Quick Start](#2-quick-start)
-3. [Architecture](#3-architecture)
-4. [Runtime Kernel](#4-runtime-kernel)
-5. [Daemon (JSON-RPC 2.0)](#5-daemon-json-rpc-20)
-6. [TUI Client](#6-tui-client)
-7. [Governance Layer](#7-governance-layer)
-8. [Harness Runtime](#8-harness-runtime)
+3. [Architecture & The Single-Source Rule](#3-architecture--the-single-source-rule)
+4. [Runtime Kernel & Governance Primitives](#4-runtime-kernel--governance-primitives)
+5. [Daemon (JSON-RPC 2.0 & SSE)](#5-daemon-json-rpc-20--sse)
+6. [TUI Control Plane Client](#6-tui-control-plane-client)
+7. [Execution Backend Abstraction & Dynamic Rebinding](#7-execution-backend-abstraction--dynamic-rebinding)
+8. [Harness Runtime & Authentic 6D Verification Gate](#8-harness-runtime--authentic-6d-verification-gate)
 9. [CLI Reference](#9-cli-reference)
 10. [File Structure](#10-file-structure)
 11. [Tech Stack](#11-tech-stack)
@@ -24,40 +24,54 @@
 
 ## 1. What Is StackMind CLI?
 
-StackMind CLI is the command-line frontend and governed runtime kernel for the StackMind platform. It provides three integrated capabilities:
+StackMind CLI is the command-line frontend, interactive terminal operating system, and governed multi-agent engineering runtime for the StackMind platform. It provides four tightly integrated capabilities:
 
 | Capability | What It Does | Status |
 |---|---|---|
-| **TUI Client + JSON-RPC Daemon** | Interactive terminal client communicating with a local daemon over JSON-RPC 2.0; session lifecycle, streaming events, HITL approvals, operation-scoped cancellation | Shipped v3.2.0 GA |
-| **Runtime Governance Kernel** | Operation journal, contract enforcement, authorization boundary, sandboxing, D025 destructive safeguards | Shipped v3.2.0 GA |
-| **Harness Runtime** | Governed agent execution loop with Knowledge API integration, contract verification gates, D025 safeguards | Shipped v2.0.0 |
+| **Terminal Control Plane (TUI)** | OpenCode-inspired interactive client with Phase Banner, Agent Roles panel, Work Orders panel, Hierarchical Operation Tree, Live Activity Feed, and interactive `:rebind` command | Shipped v3.3.0 GA |
+| **Local Runtime Daemon** | Background HTTP JSON-RPC 2.0 daemon with SSE streaming, durable operation tree persistence in `.sync/runtime/daemon/daemon-state.json`, and dynamic role rebinding | Shipped v3.3.0 GA |
+| **Execution Backend Abstraction** | Thread-safe `BackendRegistry` (`threading.RLock`) managing model/agent backends (Ollama, local LLMs, echo) with typed fault classification and timeout resilience | Shipped v3.3.0 GA |
+| **Harness Runtime & 6D Gate** | Single-Source execution pipeline (`AgentRunner`) with isolated workspace staging and fail-closed authentic 6-stage verification gate | Shipped v3.3.0 GA |
 
-The TUI is a **client only** — it never becomes a second runtime. The daemon is the trusted governance authority. All tool execution, contract evaluation, and state mutation happen inside the daemon process.
+The TUI is an **unprivileged presentation client** — it never becomes a second runtime or bypasses the daemon. All tool execution, model querying, contract validation, and file modifications strictly execute within the governed daemon and harness pipeline.
 
 ```text
-                 STACKMIND CLI RUNTIME
-                          │
-        ┌─────────────────┼─────────────────┐
-        ▼                                   ▼
-┌──────────────┐                   ┌──────────────┐
-│  TUI Client  │  JSON-RPC 2.0    │   LocalDaemon │
-│  (tui.py)    │◄─────────────────►│  (server.py)  │
-│              │    request/id      │              │
-│ :new         │                   │ SessionManager │
-│ :status      │                   │ EventDispatcher│
-│ :approve     │                   │ DaemonStorage  │
-│ :cancel      │                   │ JsonRpcProtocol│
-│ :events      │                   │ /health /rpc   │
-│ :diff        │                   └──────────────┘
-│ :matrix      │
-│ :pause       │              ┌──────────────────┐
-│ :demo        │              │  Runtime Kernel  │
-└──────────────┘              │  (kernel/*)      │
-                              │  Contract/Policy │
-                              │  ToolGateway     │
-                              │  ScratchWorkspace│
-                              │  D025 Gate       │
-                              └──────────────────┘
+                 STACKMIND CLI RUNTIME (v3.3.0 GA)
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        ▼                                               ▼
+┌──────────────┐         JSON-RPC 2.0           ┌──────────────┐
+│  TUI Client  │◄──────────────────────────────►│ LocalDaemon  │
+│  (cli/tui/)  │   :8765/rpc & SSE /events      │ (validators/ │
+│              │                                │  kernel/     │
+│ :status      │                                │  daemon/)    │
+│ :roles       │                                ├──────────────┤
+│ :wo          │                                │SessionManager│
+│ :tree        │                                │OperationTree │
+│ :plan        │                                │RoleRegistry  │
+│ :approve     │                                │DaemonStorage │
+│ :rebind      │                                └──────┬───────┘
+│ :diff        │                                       │ Single-Source
+│ :matrix      │                                       ▼
+│ :events      │                                ┌──────────────┐
+│ :cancel      │                                │ AgentRunner  │
+│ :exit        │                                │ (validators/ │
+└──────────────┘                                │  harness/    │
+                                                │  runner.py)  │
+                                                ├──────────────┤
+                                                │ContractGate  │
+                                                │Knowledge API │
+                                                │Isolated Stage│
+                                                │6D Verifier   │
+                                                │D025 Gate     │
+                                                └──────┬───────┘
+                                                       │
+                                                       ▼
+                                                ┌──────────────┐
+                                                │BackendRegist.│
+                                                │(RLock Sync)  │
+                                                │OllamaBackend │
+                                                └──────────────┘
 ```
 
 ---
@@ -76,245 +90,214 @@ cd stackmind
 pip install -e ".[dev]"
 ```
 
-### Run the Interactive TUI (v3.2.0 GA)
+### 1. Initialize Workspace & Build Knowledge Graph
 ```bash
-# Start the TUI — launches daemon + interactive terminal
+# Initialize governed workspace
+stackmind init .
+
+# Build deterministic Code-Graph Intelligence IR
+stackmind graph build -p .
+
+# Verify runtime health across all 5 validation layers
+stackmind validate .
+```
+
+### 2. Start Daemon & Launch Interactive TUI
+```bash
+# Start the background daemon
+stackmind daemon start
+
+# Check daemon health and active session count
+stackmind daemon status
+
+# Launch the interactive Terminal Control Plane
 stackmind tui
-# Or directly:
-python tui.py
 ```
 
-### Available TUI Commands
-| Command | Description |
-|---|---|
-| `:new [agent]` | Create a new governed session (default agent: codex) |
-| `:status` | Display session header + Contract Boundary HUD |
-| `:events` | Stream incremental sequenced events from daemon |
-| `:approve [reason]` | Submit Human-in-the-Loop (HITL) approval |
-| `:reject [reason]` | Submit HITL rejection |
-| `:pause` / `:resume` | Pause / resume active session |
-| `:cancel` | Cancel in-flight operation (operation-scoped, not session-kill) |
-| `:diff` | Unified diff viewer for staged changes |
-| `:matrix` | 6-Dimensional Verification Matrix |
-| `:demo` | Re-run automated TUI demonstration |
-| `:help` | Show help |
-| `:exit` / `:quit` / `q` | Graceful shutdown |
-
-### Standalone Knowledge Graph (unchanged)
-```bash
-stackmind graph build -p /path/to/project
-stackmind graph query "AuthService.login" -p /path/to/project
-stackmind graph callers "AuthService.login" -p /path/to/project
-stackmind graph impact "AuthService.login" --depth 3 -p /path/to/project
-```
+### 3. Key TUI Commands & Shortcuts
+| Command / Key | Action | Description |
+|---|---|---|
+| `:status` / `s` | **Phase Banner** | Display overall delivery phase, session ID, and Contract HUD |
+| `:roles` / `a` | **Agent Roles Panel** | View real-time status and active backend bindings for all roster agents |
+| `:wo` / `w` | **Work Orders Panel** | View active vs completed Work Orders and assigned workers |
+| `:tree` / `:agents` | **Operation Tree** | Inspect hierarchical parent-child operation tree (`Session` → `Operation` → `children`) |
+| `:plan` / `p` | **Plan Surface** | View proposed architecture plan with HITL approval modal |
+| `:approve` / `Ctrl+A` | **HITL Approve** | Formally approve proposed architecture plan to commence worker dispatch |
+| `:reject` / `Ctrl+R` | **HITL Reject** | Reject proposed plan and trigger structured revision loop (up to 3 revisions) |
+| `:rebind <role> <backend> [model]` | **Dynamic Rebind** | Rebind a role to a model backend (e.g. `:rebind backend ollama ornith-1.5:9b`) |
+| `:diff` / `d` | **Diff Viewer** | Inspect staged workspace changes before write-back |
+| `:matrix` / `m` | **6D Quality Matrix** | View authentic verification dimensions (Scope, State, AST, Behavioral, Security, Outcome) |
+| `:events` / `e` | **Activity Stream** | Stream live sequenced daemon events with monotonic cursors |
+| `:completion` / `c` | **Completion Handover**| View final delivery report, test summary, and commit SHAs |
+| `Ctrl+C` / `:cancel` | **Cooperative Cancel** | Cancel in-flight operation checkpoint without killing session |
+| `:exit` / `:quit` / `q` | **Exit TUI** | Disconnect from TUI (daemon continues running in background) |
 
 ---
 
-## 3. Architecture
+## 3. Architecture & The Single-Source Rule
 
-### Client–Daemon Separation (v3.2.0)
+StackMind enforces strict separation between client presentation, daemon governance, and harness execution:
 
-The TUI client and daemon are separate processes communicating over JSON-RPC 2.0:
+### The Single-Source Rule
+> **There is exactly one authoritative execution engine in StackMind: `AgentRunner`.**  
+> No daemon route, TUI command, or subagent orchestrator may execute prompts or mutate code outside of `AgentRunner.run_once()`. All ad-hoc prompt turns, work-order tasks, and subagent dispatches traverse this single pipeline to ensure universal contract gating, D025 policy checks, and authentic verification.
 
-```text
-┌─────────────────┐         JSON-RPC 2.0          ┌──────────────────┐
-│  TUI Client      │  session.create/get/list      │   LocalDaemon    │
-│  (tui.py)        │  session.pause/resume/cancel  │   (server.py)    │
-│                  │  session.approval             │                  │
-│  StackMindTuiAdapter│ event.list                │  SessionManager  │
-│  DaemonClient    │                               │  EventDispatcher │
-│                  │◄── notification (stream) ─────│  DaemonStorage   │
-└─────────────────┘    keyed by requestId + seq    └──────────────────┘
-       │                                                      │
-       │  :new / :status / :approve / :cancel / :events        │
-       ▼                                                      ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    Runtime Kernel (kernel/*)                      │
-│  ContractEvaluator  │  ToolGateway  │  RuntimeBoundary          │
-│  ScratchWorkspace   │  D025 Gate    │  AuthenticEvidenceTracer  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Key Separation Principles
-1. **TUI is a client, never a runtime** — no execution privileges, no direct file access
-2. **Daemon is the trusted authority** — session state, contract enforcement, cancellation
-3. **Operation-scoped cancellation** — canceling a response cancels only that operation, not the session
-4. **Event sequence numbers** — monotonic cursor for replay/resume, canonical ordering
-5. **Capability negotiation** — client declares support via `health.version` handshake
+### Core Architectural Invariants:
+1. **Unprivileged Client:** The TUI client has zero file system write privileges and zero shell subprocess capabilities.
+2. **Durable Daemon Recovery:** Daemon state (`sessions`, `operations`, `role_bindings`, `journals`) is persisted atomically to `workspace/.sync/runtime/daemon/daemon-state.json`. If restarted, operations and parent-child cancellation trees reconstruct reliably.
+3. **Role Normalization:** Logical role names (`backend`, `architect`, `frontend`, `qa`, `gitops`) normalize deterministically to primary roster agents (`codex`, `claude`, `gemini`, `gemma`, `local-llm`), preventing citizenship errors in `TREE.yaml`.
+4. **Hierarchical Operation Tree:** Every task executes as a node in an operation tree with parent-child links, cascade cancellation, and aggregated results.
+5. **Fail-Closed Verification:** Staged changes execute in a temporary isolated workspace (`tempfile.TemporaryDirectory()`). Live workspace write-back occurs strictly after all 6 verification dimensions pass.
 
 ---
 
-## 4. Runtime Kernel
+## 4. Runtime Kernel & Governance Primitives
 
 The kernel (`validators/kernel/`) provides the core governance primitives:
 
 ### Module Map
 | Module | Purpose |
 |---|---|
-| `boundary.py` | P0 provider-to-runtime operation boundary; records + authorizes, no live execution |
-| `contract.py` | `AgentContract` (immutable), `ContractNormalizer`, `ContractEvaluator` (fail-closed) |
-| `evidence.py` | `AuthenticEvidenceTracer`, `AuthenticObservation`, `ExperienceEligibilityGate` |
-| `identity.py` | `AgentIdentity`, `ProviderIdentity`, `HumanIdentity`, `AuthorizationPolicy` |
-| `operations.py` | `OperationRequest`, `OperationRecord`, `OperationJournal` (auditable first-class ops) |
+| `contract.py` | `AgentContract`, `ContractEvaluator`, `ContractNormalizer` (fail-closed scope gating) |
+| `operations.py` | `OperationRequest`, `OperationRecord`, `OperationTree`, `OperationJournal` |
+| `daemon/manager.py` | `SessionManager` — session lifecycle, role binding, hierarchical operation dispatch |
+| `daemon/server.py` | HTTP JSON-RPC 2.0 server + SSE event stream |
+| `subagents.py` | Governed subagent delegation, contract narrowing, and parent lifecycle tracking |
+| `security.py` | `CredentialLeakScanner`, D025 destructive safeguards, terminal sanitization, fault injection |
+| `evidence.py` | `AuthenticEvidenceTracer`, `VerificationDimensions`, `evaluate_verification_dimensions()` |
 | `session.py` | `AgentSession`, `Attempt`, `LifecycleState` state machine |
-| `tools.py` | `ToolGateway` — all tools cross policy + contract + journal boundaries |
-| `workspace.py` | `ScratchWorkspace` — disposable copy, never live directory; escape detection |
-| `sandbox.py` | `ProcessSandbox` — contained subprocess execution |
+| `tools.py` | `ToolGateway` — all tool invocations cross policy, contract, and journal boundaries |
 
-### Lifecycle States
+### Lifecycle State Machine
 ```text
 CREATED → RUNNING → WAITING → PAUSED → VERIFYING → COMPLETED
                   ↘ FAILED  ↗          ↘ CANCELLED
 ```
 
-### Operation Types
-`READ_FILE` · `WRITE_FILE` · `RUN_COMMAND` · `QUERY_GRAPH`
-
-Every operation is journaled, authorized against contract scope, and recorded with before/after hashes.
-
 ---
 
-## 5. Daemon (JSON-RPC 2.0)
+## 5. Daemon (JSON-RPC 2.0 & SSE)
 
-The daemon (`validators/kernel/daemon/`) is a single-threaded HTTP JSON-RPC server with a notification-capable event stream.
+The daemon (`validators/kernel/daemon/`) is an HTTP JSON-RPC 2.0 server with an SSE event notification stream:
 
 ### RPC Methods
 | Method | Params | Result | Description |
 |---|---|---|---|
 | `session.create` | agent, provider, contract, workspace | session view | Create governed session |
-| `session.get` | session_id | session view | Get session state |
-| `session.list` | — | [session…] | List all sessions |
-| `session.pause` | session_id | session view | Pause session |
+| `session.get` | session_id | session view | Retrieve session state |
+| `session.list` | — | [session…] | List all active/historical sessions |
+| `session.pause` | session_id | session view | Pause active session |
 | `session.resume` | session_id | session view | Resume paused session |
-| `session.cancel` | session_id | session view | Cancel session (terminal) |
-| `session.approval` | session_id, approved, reason? | session view | Record HITL decision |
-| `event.list` | session_id, after (seq) | [event…] | Replay events since cursor |
-
-### Error Codes
-| Code | Meaning |
-|---|---|
-| `-32600` | Invalid Request |
-| `-32602` | Invalid params / unknown session / session terminal |
-| `-32603` | Internal error |
-
-### Event Stream (notification-capable)
-Events carry: `sequence`, `name`, `session_id`, `payload`, `timestamp`. Key events:
-- `session.started` · `session.recovered` · `session.paused` · `session.resumed`
-- `operation.requested` · `operation.authorized` · `operation.started` · `operation.completed` · `operation.cancelled`
-- `contract.loaded` · `attempt.started`
-- `approval.recorded` · `verification.started/completed` · `experience.recorded`
+| `session.cancel` | session_id, operation_id? | session view | Cancel session or operation |
+| `session.approval` | session_id, approved, reason? | session view | Record HITL plan decision |
+| `session.turn` | session_id, prompt | operation record | Execute governed prompt turn |
+| `role.configureBackend` | role, backend, model?, credentialRef? | role config | Dynamically bind role to execution backend |
+| `role.list` | — | [role config…] | List active role bindings |
+| `backend.list` | — | [backend view…] | List registered execution backends |
+| `event.list` | session_id, after (seq) | [event…] | Replay events from sequence cursor |
 
 ### Endpoints
 | Endpoint | Method | Response |
 |---|---|---|
-| `/health` | GET | `{status, sessions}` |
-| `/rpc` | POST | JSON-RPC response |
-| `/mcp` | POST | MCP protocol dispatch (optional) |
-
-### Persistence
-`DaemonStorage` uses atomic write (tempfile + fsync + rename) to `daemon-state.json`. On recovery, RUNNING sessions are reset to WAITING; events are replayable from sequence numbers.
+| `/health` | GET | `{status: "ok", sessions: N}` |
+| `/rpc` | POST | JSON-RPC 2.0 response |
+| `/events` | GET | Server-Sent Events (SSE) notification stream |
 
 ---
 
-## 6. TUI Client
+## 6. TUI Control Plane Client
 
-The TUI client (`validators/kernel/tui/`) is a dependency-free terminal renderer with no execution privileges.
+The TUI client (`cli/tui/`) provides an OpenCode-style terminal control surface:
 
-### Components
-| Component | Purpose |
-|---|---|
-| `DaemonClient` | HTTP/JSON-RPC client — raw TCP, no execution |
-| `StackMindTuiAdapter` | Maps TUI commands to daemon calls; event replay cursor |
-| `session_header` | Renders session ID, state, provider |
-| `contract_panel` | Renders allow/deny scope boundary |
-| `activity_line` | Renders sequenced event with ✓/✗ marker |
-| `diff_viewer` | Unified diff renderer |
-| `hitl_prompt` | Human-in-the-loop approval prompt |
-| `verification_matrix` | 6-dimension verification display |
-
-### Adapter Command Map
-| TUI Input | Daemon Call |
-|---|---|
-| `:new` | `session.create` |
-| `:resume` | `session.get` |
-| `:pause` | `session.pause` |
-| `:cancel` | `session.cancel` |
-| `:approve` / `:reject` | `session.approval` |
-| `:events` | `event.list` (streaming with seq cursor) |
+### Views & Panels
+- **Phase Status Banner:** Displays current delivery phase (`Planning`, `Autonomous Execution`, `Complete`) with real-time spinners.
+- **Agent Roles Panel:** Real-time visibility into all 5 roster agents (`claude`, `codex`, `gemini`, `gemma`, `local-llm`), their current status, and active backend/model bindings.
+- **Work Orders Panel:** Live breakdown of active vs completed work orders with priority and assigned agent badges.
+- **Hierarchical Operation Tree:** Interactive display of parent-child operation linkages, cancellation tokens, and task durations.
+- **Live Activity Feed:** Sequenced timeline of tool calls, contract verifications, and agent events.
+- **Plan Surface Modal:** Interactive HITL plan review modal with `:approve` and `:reject` triggers.
+- **Completion Handover Surface:** Comprehensive release audit screen showing test pass counts, commit SHAs, and deliverable paths.
 
 ---
 
-## 7. Governance Layer
+## 7. Execution Backend Abstraction & Dynamic Rebinding
 
-### D025 Destructive Operations Safeguard
-Programmatic gate for agent-proposed commands:
-1. Detects destructive operations (git history rewrite, mass deletion, docker prune, DB drop)
-2. Enforces mandatory pre-operation backup
-3. Enforces mandatory post-operation verification
-4. Blocks execution when safeguards are missing
-5. Emits structured audit events
+The execution backend layer (`validators/harness/backend.py`) abstracts model execution behind a unified protocol:
 
-### Contract Enforcement (CONTRACT-01)
-- Fail-closed scope boundaries (allow/deny rules)
-- Write-mode gating (read-only vs read-write)
-- File-touch budget enforcement
-- Path traversal prevention
-- Rule matching via fnmatch + prefix checks
+### Backend Hierarchy
+- **`BaseExecutionBackend`**: Abstract protocol defining `backend_id`, `backend_type`, `capabilities`, `status`, and `complete(request) -> CompletionRecord`.
+- **`AgentExecutionBackend`**: Internal agent role execution backend.
+- **`ModelExecutionBackend` (Ollama)**: Live local HTTP model execution backend connecting to `/api/generate` with custom User-Agent and 300-second timeout resilience.
+- **`EchoAgentBackend`**: Deterministic test backend.
 
-### Authorization Chain
-```text
-TUI Command → DaemonClient → JsonRpcProtocol → SessionManager
-    → RuntimeBoundary → ContractEvaluator → AuthorizationPolicy
-    → OperationJournal → ToolGateway → ProcessSandbox
-```
+### Thread-Safe Registry (`WO-026`)
+`BackendRegistry` is synchronized with `threading.RLock`. All mutations (`register`, `unregister`) and accessors (`get`, `has`, `list_backends`) acquire the reentrant lock. `list_backends()` creates a defensive snapshot of values under lock before serialization, completely preventing dictionary mutation errors during iteration under concurrent multi-agent traffic.
+
+### Typed Fault Handling (`WO-027`)
+`ModelExecutionBackend.complete()` classifies live failures into typed exceptions rather than masking errors as successful completions:
+- Connection refused / host unreachable $\rightarrow$ `BackendUnavailableError`
+- Network or socket timeout $\rightarrow$ `BackendTimeoutError`
+- HTTP 4xx/5xx errors or malformed JSON $\rightarrow$ `BackendExecutionError`
+- All exception messages are sanitized with `CredentialLeakScanner` to eliminate credential, token, or local path leakage.
 
 ---
 
-## 8. Harness Runtime
+## 8. Harness Runtime & Authentic 6D Verification Gate
 
-The Harness (`validators/harness/`) provides the governed execution loop:
+The Harness runtime (`validators/harness/runner.py`) executes worker turns under strict contract governance:
 
-```text
-1. Poll Inbox / Work Orders
-2. Validate active Contract boundary
-3. Assemble context via Knowledge API (contract-gated)
-4. Invoke LLM provider
-5. Validate LLM output against harness schema
-6. Validate staged diff against Contract scope & D025
-7. Write-back results on SUCCESS
-8. Emit audit/events
-9. Update Work Order / operation state
-```
-
-### Key Primitives
-| Primitive | Purpose |
-|---|---|
-| `AgentRunner` | Governed worker execution loop with staged verification |
-| `LLMProvider` | Protocol for LLM backends (echo for testing) |
-| `HarnessTask` | Inbox item or assigned work order |
-| `HarnessDecision` | Validated LLM output safe to stage |
-| `D025Gate` | Destructive operations evaluator |
-| `contract_gate.py` | Pre/post execution contract validation |
-| `retrieval.py` | Multi-signal retrieval (lexical + semantic + graph) |
-| `snapshot.py` | Workspace snapshot + diff + verification dimensions |
+### Execution Pipeline:
+1. **Task & Scope Resolution**: Resolve task from inbox, active work order, or ad-hoc prompt turn.
+2. **Contract Pre-Gate**: Validate task target paths against active Contract YAML `allow` and `deny` rules.
+3. **Knowledge Context Assembly**: Retrieve ranked, token-budgeted context bundle via KNOW-01 Knowledge API.
+4. **Isolated Staging**: Execute task in an isolated temporary directory (`tempfile.TemporaryDirectory()`).
+5. **Authentic 6D Verification Gate (`WO-028`)**: Evaluate all 6 verification dimensions:
+   - **`scope_verified`**: Staged diff verified against contract allow/deny path rules.
+   - **`state_verified`**: Lock file state and file hash consistency verified.
+   - **`code_verified`**: AST parsing (`ast.parse`) executed across all modified `.py` files and test return codes verified.
+   - **`behavioral_verified`**: Assert all executed commands succeeded (returncode 0).
+   - **`security_verified`**: D025 safeguards enforced, path traversals blocked, and diffs scanned for credentials.
+   - **`outcome_verified`**: Deliverable existence and zero unhandled blockers verified.
+6. **Fail-Closed Write-Back**: Live workspace write-back via `_apply_verified_workspace_diff()` occurs strictly when all 6 dimensions pass. If any check fails, the staging directory is discarded.
 
 ---
 
 ## 9. CLI Reference
 
-| Command | Subcommands / Options | Description |
-|---|---|---|
-| `stackmind tui` | — | Launch interactive TUI (v3.2.0 GA) |
-| `stackmind init` | `[path] [--name] [--agents]` | Initialize governed runtime |
-| `stackmind validate` | `[path] [--fix]` | 5-layer runtime integrity check |
-| `stackmind doctor` | `[path]` | System diagnostics |
-| `stackmind graph` | `build`, `update`, `query`, `callers`, `impact`, `context` | Knowledge graph commands |
-| `stackmind analyze` | `runtime`, `flows` | Runtime call tracer & data-flow |
-| `stackmind lock` | `acquire`, `release`, `status` | Advisory write lock |
-| `stackmind shutdown` | `<agent> [--defer]` | Mandatory session termination |
-| `stackmind promote` | `<agent>` | Worker draft → canonical |
-| `stackmind harness` | `run-once` | Single governed execution cycle |
-| `stackmind migrate` | `[path] [--check] [--rollback]` | Version upgrade manager |
+```powershell
+# --- Daemon Management ---
+stackmind daemon start [--port 8765]      # Start local runtime daemon
+stackmind daemon status                   # Inspect active daemon status and sessions
+stackmind daemon stop                     # Stop running daemon process
+stackmind daemon restart                  # Restart running daemon
+
+# --- Terminal User Interface ---
+stackmind tui                             # Launch interactive TUI control plane
+stackmind tui --demo                      # Run multi-agent autonomous delivery simulation
+
+# --- Repository Governance & Integrity ---
+stackmind init [path]                     # Initialize governed StackMind runtime workspace
+stackmind validate [path]                 # Validate all 5 runtime integrity layers
+stackmind validate --fix [path]           # Auto-normalize canonical drift in TREE.yaml
+stackmind doctor [path]                   # Environment, dependency, and agent health diagnostics
+stackmind shutdown <agent>                # Graceful agent session termination and handoff archive
+stackmind lock acquire|release|status     # Advisory repository write lock
+
+# --- Knowledge Graph Operations ---
+stackmind graph build -p .                # Compile workspace into deterministic graph IR
+stackmind graph update -p .               # Incremental update after code modifications
+stackmind graph query "<symbol>" -p .     # Look up symbols without scanning source files
+stackmind callers "<symbol>" -p .         # Find static and runtime-traced callers
+stackmind impact "<symbol>" -p .          # Analyze blast radius of changes across graph
+stackmind context "<task>" -p .           # Assemble token-bounded, ranked prompt context bundle
+
+# --- Harness & Procedural Learning ---
+stackmind harness run-once                # Run single governed harness execution cycle
+stackmind learn mine -p .                 # Mine recurring execution patterns into skill candidates
+stackmind skill list                      # View active and candidate procedural skills
+stackmind skill test <name>               # Execute 3-stage skill verification pipeline
+stackmind experience search "<query>"     # Search past verified execution episodes (EXP-*)
+```
 
 ---
 
@@ -322,60 +305,48 @@ The Harness (`validators/harness/`) provides the governed execution loop:
 
 ```text
 stackmind/
-├── cli/                        # Click CLI entrypoints (18 modules)
-│   ├── main.py                 # Root CLI group
+├── cli/                        # Click CLI & TUI entrypoints
+│   ├── main.py                 # Root CLI group & command registrations
+│   ├── daemon.py               # stackmind daemon (start, stop, restart, status)
+│   ├── tui/                    # Terminal Control Plane application
+│   │   ├── app.py              # OpenCode-style Textual/Rich TUI application
+│   │   ├── client.py           # DaemonClient JSON-RPC & SSE client
+│   │   ├── views/              # Views (banner, roles, work orders, tree, activity)
+│   │   └── commands.py         # TUI command dispatcher (:rebind, :roles, :plan, etc.)
 │   ├── graph.py                # Knowledge graph commands
 │   ├── contract.py             # Contract inspection & denial explainer
-│   ├── analyze.py              # Runtime call tracer & data-flow analyzer
-│   ├── harness.py              # Governed execution runner
+│   ├── harness.py              # Harness run-once command
 │   ├── validate.py             # 5-layer runtime validator
-│   ├── lock.py                 # Advisory write lock management
-│   ├── shutdown.py             # Session termination & receipt writing
-│   └── +10                     # decisions, doctor, experience, learn, etc.
+│   └── shutdown.py             # Session termination & receipt writing
 │
 ├── validators/
 │   ├── kernel/                 # Runtime governance kernel
-│   │   ├── boundary.py         # P0 provider-to-runtime boundary
 │   │   ├── contract.py         # AgentContract, ContractEvaluator, ContractNormalizer
-│   │   ├── evidence.py         # AuthenticEvidenceTracer, Observation, EligibilityGate
-│   │   ├── identity.py         # Agent/Provider/Human identities, AuthorizationPolicy
-│   │   ├── operations.py       # OperationRequest, OperationRecord, OperationJournal
-│   │   ├── session.py          # AgentSession, Attempt, LifecycleState
-│   │   ├── tools.py            # ToolGateway — all tools cross policy/contract/journal
-│   │   ├── workspace.py        # ScratchWorkspace — disposable copy, escape detection
-│   │   ├── sandbox.py          # ProcessSandbox — contained subprocess execution
-│   │   ├── verification/       # SandboxCanaryVerifier
-│   │   ├── daemon/             # JSON-RPC daemon (server, protocol, manager, events, storage)
-│   │   ├── mcp/                # MCP protocol server + tool registry
-│   │   ├── multi/              # Agent roles, ensemble supervisor, task delegation
-│   │   ├── providers/          # Provider adapter, gateway, models, errors
-│   │   ├── tui/                # TUI client (adapter, client, views)
-│   │   └── experience/         # Experience recorder, models, store, index
+│   │   ├── operations.py       # OperationRequest, OperationRecord, OperationTree
+│   │   ├── subagents.py        # Governed subagent delegation & contract narrowing
+│   │   ├── security.py         # CredentialLeakScanner, D025 safeguards, sanitization
+│   │   ├── evidence.py         # AuthenticEvidenceTracer, VerificationDimensions
+│   │   ├── daemon/             # JSON-RPC daemon (server, protocol, manager, storage)
+│   │   └── session.py          # AgentSession, Attempt, LifecycleState
 │   │
 │   ├── harness/                # Governed execution runtime
-│   │   ├── runner.py           # AgentRunner — governed execution loop
+│   │   ├── runner.py           # AgentRunner — Single-Source execution pipeline
+│   │   ├── backend.py          # ExecutionBackend, BackendRegistry, ModelExecutionBackend
 │   │   ├── contract_gate.py    # Pre/post execution contract validation
 │   │   ├── d025_gate.py        # D025 destructive operations safeguard
-│   │   ├── retrieval.py        # Multi-signal retrieval
-│   │   ├── snapshot.py         # Workspace snapshot + diff + verification dimensions
-│   │   └── __init__.py         # Exports AgentRunner, D025Gate, HarnessTask, etc.
+│   │   ├── retrieval.py        # Multi-signal context retrieval
+│   │   └── snapshot.py         # WorkspaceSnapshot & WorkspaceDiff
 │   │
 │   └── knowledge/              # Knowledge compiler (Pillar 2)
-│       ├── analysis/           # Runtime tracer, FLOWS_TO, evidence model
-│       ├── compiler/           # 14 domain compilers
-│       ├── embedding/          # Embedding backend + cache
-│       ├── projections/        # Reverse index, search index, metrics
-│       └── contract.py         # Contract parser + fail-closed gate
+│       ├── compiler/           # 14 domain AST compilers
+│       ├── embedding/          # Embedding backend & cache
+│       └── projections/        # Reverse index, search index, metrics
 │
 ├── schemas/                    # JSON Schemas (boot, tree, work-order, contract, harness)
-├── tests/                      # pytest suite (20+ test files)
-├── cli/                        # Click CLI modules
-├── migrations/                 # Version upgrade manifests
-├── templates/                  # Scaffolding templates
-├── docs/                       # Architecture handbook, RFCs, guides
-├── tui.py                      # TUI entrypoint (v3.2.0 GA)
-├── pyproject.toml              # Package config (v3.2.0)
-└── README.md                   # User-facing documentation
+├── tests/                      # Automated test suite (85 P7 tests / 570+ suite tests)
+├── pyproject.toml              # Package configuration (v3.3.0)
+├── VERSION.md                  # Canonical version manifest (3.3.0)
+└── CHANGELOG.md                # Release history & milestone notes
 ```
 
 ---
@@ -384,40 +355,37 @@ stackmind/
 
 | Component | Technology |
 |---|---|
-| **Language** | Python ≥3.10 |
+| **Language** | Python ≥3.10 (tested on Python 3.11 & 3.12) |
 | **CLI Framework** | Click ≥8.0 |
-| **Daemon Transport** | `ThreadingHTTPServer` + JSON-RPC 2.0 (stdlib) |
-| **TUI** | Rich ≥13.0 (renderers), stdio input (no external TUI framework) |
-| **AST Parser** | LibCST (full-fidelity AST) |
-| **Symbol Resolver** | Jedi (cross-file static inference) |
-| **Tree-sitter** | Codebase-Memory (`cbm`) multi-language backend |
+| **TUI Control Plane** | Rich ≥13.0, custom OpenCode presentation surface |
+| **Daemon Transport** | `ThreadingHTTPServer` + JSON-RPC 2.0 (stdlib) + SSE |
+| **Concurrency & Synchronization** | `threading.RLock`, `threading.Barrier`, `threading.Event` |
+| **Model Integration** | Native HTTP POST to Ollama `/api/generate` with timeout resilience |
+| **AST Analysis** | LibCST & `ast.parse` |
 | **Schema Validation** | jsonschema ≥4.0 |
-| **Data Format** | YAML (PyYAML ≥6.0) + Sharded JSON (Knowledge Store) |
-| **Build Backend** | Hatchling |
-| **Testing** | pytest (20+ test files), Ruff linting |
+| **Testing** | pytest (85 P7 tests / 570+ full suite tests, 100% pass rate) |
 
 ---
 
 ## 12. Key Design Decisions
 
-1. **TUI is a client, never a runtime** — daemon is the sole execution authority; no second runtime path.
-2. **Operation-scoped cancellation** — canceling a response cancels only that operation; session survives.
-3. **Event sequence numbers as canonical cursor** — monotonic, replayable, single stream for all event types.
-4. **File-system as database** — all state lives in deterministic JSON/YAML under `.sync/`; no external DB.
-5. **Fail-Closed Contract Layer** — agents cannot query or touch files outside assigned scope.
-6. **D025 Destructive Safeguard** — backup-verify-escalate gate before any non-reversible operation.
-7. **ScratchWorkspace isolation** — disposable copy, never live directory; escape detection on every path resolution.
-8. **Authentic evidence capture** — before/after hashes, diffs, timing, exit codes recorded per operation.
-9. **No Node `vm` module** — Python runtime only; no JavaScript sandbox as security boundary.
-10. **Stdlib-only daemon transport** — `ThreadingHTTPServer` + `urllib.request`, no external dependencies.
+1. **Single-Source Rule**: Exactly one execution engine (`AgentRunner`). All prompts, commands, and subagent turns traverse the same governed pipeline.
+2. **Client-Daemon Separation**: The TUI client has zero execution privileges; all state mutation lives inside the daemon.
+3. **Fail-Closed Verification**: Staged changes execute in a disposable temporary directory; write-back is blocked unless all 6 verification dimensions pass.
+4. **Thread-Safe Backend Registry**: Registry operations are guarded by `threading.RLock` with defensive snapshot iteration.
+5. **Durable Operation Tree**: Daemon crashes or restarts reconstruct active operations, role bindings, and cancellation checkpoints from `.sync/runtime/daemon/daemon-state.json`.
+6. **Zero-Leakage Security**: Proactive regex and entropy scanning redacts credentials from RPC payloads, journals, and event streams.
 
 ---
 
 ## 13. Non-Goals
 
-- No Node.js runtime or `vm` module as security boundary
-- No WebSocket transport (JSON-RPC over HTTP for now)
-- No external database (file-system persistence only)
-- No second execution runtime (TUI is client-only)
-- No provider switching mid-execution (backend binding is setup-time, not live)
-- No session-level cancellation that kills all operations at once
+- No direct shell execution from TUI client (client is presentation-only)
+- No un-governed tool loops (all tools cross `ToolGateway` and contract boundaries)
+- No JavaScript/Node.js dependency (pure Python stdlib runtime)
+- No external database requirement (file-system persistence under `.sync/`)
+- No session-wide hard aborts (targeted cooperative cancellation checkpointing)
+
+---
+
+*StackMind CLI v3.3.0 GA — Enterprise Multi-Role Engineering Runtime Built for Absolute Reliability.*
