@@ -42,6 +42,11 @@ from cli.tui import (
     render_user_message_str,
     render_verification_matrix_str,
 )
+from cli.tui.app import (
+    prompt_composer_input,
+    render_composer_bottom_border_str,
+    render_composer_top_border_str,
+)
 from validators.kernel.daemon import LocalDaemon
 
 
@@ -269,3 +274,41 @@ def test_tui_repl_startup_layout_fidelity(tmp_path: Path):
         assert "/help" in result.output
         assert "/status" in result.output
         assert "/sessions" in result.output
+
+        # WO-035: No plain legacy prompt anywhere
+        assert "stackmind [" not in result.output
+
+
+def test_interactive_composer_box_borders():
+    """Verify top and bottom borders of interactive composer box match image.png (WO-035)."""
+    top = render_composer_top_border_str(width=80)
+    assert top.startswith("╭─ ")
+    assert "Type a message..." in top
+    assert "Ctrl+K commands | Ctrl+L clear" in top
+    assert top.endswith(" ─╮")
+    assert len(top) == 80
+
+    bot = render_composer_bottom_border_str(width=80)
+    assert bot.startswith("╰")
+    assert bot.endswith("╯")
+    assert len(bot) == 80
+
+
+def test_interactive_composer_input_and_prompt(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    """Verify prompt_composer_input captures user input, displays borders and footer (WO-035)."""
+    monkeypatch.setattr("builtins.input", lambda prompt: "hello from test")
+    capsys.readouterr()
+
+    received = prompt_composer_input(width=80)
+    assert received == "hello from test"
+
+    captured = capsys.readouterr()
+    assert "Type a message..." in captured.out
+    assert "Ctrl+K commands | Ctrl+L clear" in captured.out
+    assert "╭─ " in captured.out
+    assert "╰" in captured.out
+    assert "/help" in captured.out
+    assert "/status" in captured.out
+    assert "/sessions" in captured.out
+    assert f"StackMind v{cli.__version__}" in captured.out
+

@@ -14,6 +14,7 @@ Implements the user-facing control plane for the StackMind governed runtime:
 from __future__ import annotations
 
 import io
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -447,6 +448,75 @@ def render_composer_box_str(
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width))
     return console.export_text().rstrip()
+
+
+def render_composer_top_border(
+    placeholder: str = "Type a message...",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    width: int = 80,
+) -> RenderableType:
+    """Render the top border of the composer box with placeholder and shortcuts."""
+    fixed_len = len("╭─ ") + len(placeholder) + len(" ") + len(" ") + len(shortcuts) + len(" ─╮")
+    if width >= fixed_len + 2:
+        fill_count = width - fixed_len
+        text = Text()
+        text.append("╭─ ", style="#334155")
+        text.append(placeholder, style="dim #94a3b8")
+        text.append(" " + "─" * fill_count + " ", style="#334155")
+        text.append(shortcuts, style="dim #64748b")
+        text.append(" ─╮", style="#334155")
+        return text
+    text = Text()
+    text.append("╭" + "─" * max(2, width - 2) + "╮", style="#334155")
+    return text
+
+
+def render_composer_top_border_str(
+    placeholder: str = "Type a message...",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    width: int = 80,
+) -> str:
+    """Render top border of the composer box as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_composer_top_border(placeholder=placeholder, shortcuts=shortcuts, width=width))
+    return console.export_text().rstrip()
+
+
+def render_composer_bottom_border(width: int = 80) -> RenderableType:
+    """Render the bottom rounded border of the composer box."""
+    text = Text()
+    text.append("╰" + "─" * max(2, width - 2) + "╯", style="#334155")
+    return text
+
+
+def render_composer_bottom_border_str(width: int = 80) -> str:
+    """Render bottom border of the composer box as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_composer_bottom_border(width=width))
+    return console.export_text().rstrip()
+
+
+def prompt_composer_input(
+    placeholder: str = "Type a message...",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    width: int = 80,
+) -> str:
+    """Prompt the user for input inside a styled composer box border.
+
+    Renders the composer top border, displays an inline prompt with left border '│ > ',
+    and upon input completion renders the bottom border and footer bar.
+    """
+    click.echo(render_composer_top_border_str(placeholder=placeholder, shortcuts=shortcuts, width=width))
+    if sys.stdin.isatty():
+        prompt_str = "\033[90m│\033[0m \033[1;36m>\033[0m "
+    else:
+        prompt_str = "│ > "
+    text = input(prompt_str)
+    click.echo(render_composer_bottom_border_str(width=width))
+    click.echo(render_bottom_footer_bar_str(width=width))
+    return text
 
 
 def render_bottom_footer_bar(
@@ -1015,13 +1085,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
         if not state.has_conversation:
             click.echo(render_top_header_bar_str(session, width=80))
             click.echo(render_landing_block_str())
-            click.echo(render_composer_box_str())
-            click.echo(render_bottom_footer_bar_str())
 
         while True:
             try:
-                sid = (session["session_id"][:8] + "...") if "session_id" in session else "IDLE"
-                text = click.prompt(f"stackmind [{sid}]", prompt_suffix="> ")
+                text = prompt_composer_input(width=80)
             except (EOFError, KeyboardInterrupt):
                 click.echo()
                 break
