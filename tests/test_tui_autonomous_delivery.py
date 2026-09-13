@@ -624,3 +624,49 @@ def test_tui_cli_repl_autonomous_delivery_commands(tmp_path: Path):
         assert "● Architecture" in result.output
         assert "PLAN.md" in result.output
         assert "PROJECT COMPLETE" in result.output
+
+
+def test_tui_state_modular_extraction_and_backward_compatibility():
+    """Verify clean state extraction into cli.tui.state and backward-compatible re-exports."""
+    import cli.tui as tui_pkg
+    import cli.tui.app as tui_app
+    import cli.tui.state as tui_state
+
+    # Verify identical class identities across state, app, and package root
+    exported_symbols = [
+        "ActivityEntry",
+        "AutonomousDeliveryState",
+        "OperationNode",
+        "PlanRevision",
+        "ProjectPhase",
+        "RoleStatus",
+        "WorkOrderItem",
+    ]
+    for sym in exported_symbols:
+        state_cls = getattr(tui_state, sym)
+        app_cls = getattr(tui_app, sym)
+        pkg_cls = getattr(tui_pkg, sym)
+        assert state_cls is app_cls, f"{sym} mismatch between state.py and app.py"
+        assert state_cls is pkg_cls, f"{sym} mismatch between state.py and __init__.py"
+
+    # Verify instantiation and methods in extracted state
+    state = tui_state.AutonomousDeliveryState(project_name="test-proj", session_id="test-session")
+    assert state.phase == tui_state.ProjectPhase.INITIALIZING
+    assert state.project_name == "test-proj"
+    assert state.session_id == "test-session"
+
+    # RoleStatus display_state
+    rs = tui_state.RoleStatus("Backend", backend="Codex", state="RUNNING")
+    assert rs.display_state == "implementing"
+    rs_arch = tui_state.RoleStatus("Architecture", backend="Claude", state="RUNNING")
+    assert rs_arch.display_state == "orchestrating"
+    rs_done = tui_state.RoleStatus("Frontend", backend="AGY", state="COMPLETED")
+    assert rs_done.display_state == "completed"
+
+    # ActivityEntry format_line
+    entry = tui_state.ActivityEntry("2026-09-13T12:00:00", "Backend", "edit", "cli/tui/state.py")
+    line = entry.format_line()
+    assert "12:00" in line
+    assert "Backend" in line
+    assert "edit cli/tui/state.py" in line
+
