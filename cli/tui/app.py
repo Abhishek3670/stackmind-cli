@@ -13,11 +13,17 @@ Implements the user-facing control plane for the StackMind governed runtime:
 
 from __future__ import annotations
 
+import io
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
 import click
+from rich import box
+from rich.console import Console, RenderableType
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from cli.tui.chat import (
     render_assistant_message,
@@ -308,6 +314,173 @@ def format_session_header(
     else:
         display_sid = sid if len(sid) <= 8 else sid[:6] + ".."
         return f"Session {display_sid} | {state_val}{status_suffix}"
+
+
+def _get_version() -> str:
+    try:
+        from cli import __version__
+        return f"v{__version__}"
+    except Exception:
+        return "v3.1.0"
+
+
+def render_top_header_bar(
+    session: Mapping[str, Any],
+    width: int = 80,
+    status: str | None = "online",
+) -> RenderableType:
+    """Render the top status header bar matching image.png:
+    Left: stackmind  |  dev  ~/projects/stackmind
+    Right: session: <id> | agent: <agent> | provider: <provider> | ● online
+    """
+    sid = str(session.get("session_id", "session"))
+    short_sid = sid if len(sid) <= 8 else sid[:8]
+    agent = str(session.get("agent") or "codex")
+    provider = str(session.get("provider") or "daemon")
+    workspace = session.get("workspace")
+
+    # Format status indicator
+    st = str(status or "online").lower()
+    if st == "online":
+        glyph, glyph_style, st_name = "●", "bold #22c55e", "online"
+    elif st in {"reconnecting", "reconnect"}:
+        glyph, glyph_style, st_name = "○", "bold yellow", "reconnecting"
+    else:
+        glyph, glyph_style, st_name = "✗", "bold red", "offline"
+
+    # Assemble right-side components based on available width
+    right_items: list[str] = []
+    if width >= 90:
+        right_items.append(f"session: {short_sid}")
+        right_items.append(f"agent: {agent}")
+        right_items.append(f"provider: {provider}")
+    elif width >= 65:
+        right_items.append(f"session: {short_sid}")
+        right_items.append(f"agent: {agent}")
+    elif width >= 45:
+        right_items.append(f"session: {short_sid}")
+
+    status_str = f"{glyph} {st_name}"
+    right_plain = " | ".join(right_items + [status_str]) if right_items else status_str
+
+    # Format workspace path
+    if workspace:
+        p = Path(str(workspace))
+        ws_display = f"~/{p.name}"
+    else:
+        ws_display = "~/projects/stackmind"
+
+    left_prefix = "stackmind  |  dev  "
+    left_plain = left_prefix + ws_display
+
+    # Adjust workspace display if necessary to fit in width
+    if len(left_plain) + len(right_plain) + 2 > width:
+        max_ws = max(6, width - len(left_prefix) - len(right_plain) - 4)
+        if len(ws_display) > max_ws:
+            ws_display = ws_display[:max(4, max_ws - 2)] + ".."
+        left_plain = left_prefix + ws_display
+
+    spaces_count = max(2, width - len(left_plain) - len(right_plain))
+
+    # Build styled Text
+    res = Text()
+    res.append("stackmind", style="bold #22c55e")
+    res.append("  |  ", style="dim #475569")
+    res.append("dev  ", style="dim white")
+    res.append(ws_display, style="dim #64748b")
+    res.append(" " * spaces_count)
+
+    for item in right_items:
+        res.append(item, style="dim white")
+        res.append(" | ", style="dim #475569")
+    res.append(f"{glyph} {st_name}", style=glyph_style)
+
+    return res
+
+
+def render_top_header_bar_str(
+    session: Mapping[str, Any],
+    width: int = 80,
+    status: str | None = "online",
+) -> str:
+    """Render top header bar as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_top_header_bar(session, width=width, status=status))
+    return console.export_text().rstrip()
+
+
+def render_composer_box(
+    placeholder: str = "Type a message...",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    width: int = 80,
+) -> Panel:
+    """Render the rounded input composer box matching image.png:
+    > Type a message...               Ctrl+K commands | Ctrl+L clear
+    """
+    inner_width = max(40, width - 4)
+    left_plain = f"> {placeholder}"
+    right_plain = shortcuts
+    spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
+
+    line = Text()
+    line.append("> ", style="bold #38bdf8")
+    line.append(placeholder, style="dim #94a3b8")
+    line.append(" " * spaces_count)
+    line.append(shortcuts, style="dim #64748b")
+
+    return Panel(
+        line,
+        box=box.ROUNDED,
+        border_style="#334155",
+        padding=(0, 1),
+    )
+
+
+def render_composer_box_str(
+    placeholder: str = "Type a message...",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    width: int = 80,
+) -> str:
+    """Render input composer box as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width))
+    return console.export_text().rstrip()
+
+
+def render_bottom_footer_bar(
+    version: str | None = None,
+    width: int = 80,
+) -> RenderableType:
+    """Render bottom navigation footer bar matching image.png:
+    /help   /status   /diff   /compact   /sessions          StackMind v3.1.0
+    """
+    commands = ["/help", "/status", "/diff", "/compact", "/sessions"]
+    left_plain = "   ".join(commands)
+    ver = version or _get_version()
+    right_plain = f"StackMind {ver}"
+    spaces_count = max(2, width - len(left_plain) - len(right_plain))
+
+    line = Text()
+    for i, cmd in enumerate(commands):
+        line.append(cmd, style="dim #94a3b8")
+        if i < len(commands) - 1:
+            line.append("   ", style="dim #475569")
+    line.append(" " * spaces_count)
+    line.append(right_plain, style="dim #64748b")
+    return line
+
+
+def render_bottom_footer_bar_str(
+    version: str | None = None,
+    width: int = 80,
+) -> str:
+    """Render bottom footer bar as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_bottom_footer_bar(version=version, width=width))
+    return console.export_text().rstrip()
 
 
 def reconnect_and_sync(
@@ -840,7 +1013,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             return
 
         if not state.has_conversation:
+            click.echo(render_top_header_bar_str(session, width=80))
             click.echo(render_landing_block_str())
+            click.echo(render_composer_box_str())
+            click.echo(render_bottom_footer_bar_str())
 
         while True:
             try:

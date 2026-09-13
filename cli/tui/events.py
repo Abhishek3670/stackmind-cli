@@ -6,6 +6,7 @@ and turn completion responses into the chat-first conversation flow.
 
 from __future__ import annotations
 
+import io
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -145,10 +146,10 @@ def render_tool_activity(
     grid.add_column(ratio=3)
     grid.add_column(justify="right", ratio=1)
 
-    left = Text("⚒  ", style="bold cyan")
+    left = Text("⚯  ", style="bold #38bdf8")
     left.append(display_name, style="bold white")
     if target:
-        left.append(f"   {target}", style="white")
+        left.append(f"   {target}", style="dim white")
 
     right = Text()
     if duration_seconds is not None:
@@ -169,7 +170,7 @@ def render_tool_activity(
     return Panel(
         body,
         box=box.ROUNDED,
-        border_style="dim white",
+        border_style="#334155",
         padding=(0, 1),
     )
 
@@ -177,8 +178,9 @@ def render_tool_activity(
 def render_tool_activity_str(
     activity: ToolActivity | Mapping[str, Any], width: int = 80, inline: bool = False
 ) -> str:
-    """Render tool activity as a plain formatted string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render tool activity as a plain formatted string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_tool_activity(activity, inline=inline))
     return console.export_text().rstrip()
 
@@ -288,8 +290,9 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType:
 
 
 def render_operational_event_str(event: Mapping[str, Any], width: int = 80) -> str:
-    """Render a daemon operational event as a string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render a daemon operational event as a string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_operational_event(event))
     return console.export_text().rstrip()
 
@@ -501,8 +504,9 @@ def render_error_box_str(
     hint: str | None = None,
     width: int = 80,
 ) -> str:
-    """Render an inline error box as plain formatted string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render an inline error box as plain formatted string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_error_box(message, title=title, hint=hint, width=width))
     return console.export_text().rstrip()
 

@@ -9,12 +9,15 @@ Renders file diffs inline directly in the chat and activity streams with Rich:
 
 from __future__ import annotations
 
+import io
 import re
 from typing import Any
 
 from rich import box
 from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
 
@@ -137,16 +140,21 @@ def render_file_diff(file_path: str, lines: list[tuple[str, str]] | list[str] | 
     if content_text.plain.endswith("\n"):
         content_text.plain = content_text.plain[:-1]
 
-    header_title = Text(" ", style="dim")
-    header_title.append(file_path, style="bold cyan")
-    header_title.append(" ", style="dim")
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="left", ratio=3)
+    grid.add_column(justify="right", ratio=1)
+
+    left_hdr = Text(file_path, style="bold cyan")
+    right_hdr = Text("unified diff", style="dim")
+    grid.add_row(left_hdr, right_hdr)
+
+    rule = Rule(style="dim #334155")
+    body = Group(grid, rule, content_text)
 
     return Panel(
-        content_text,
-        title=header_title,
-        title_align="left",
+        body,
         box=box.ROUNDED,
-        border_style="cyan dim",
+        border_style="#334155",
         padding=(0, 1),
     )
 
@@ -161,7 +169,7 @@ def render_unified_diff(diff_text: str, title: str | None = None) -> RenderableT
             title=" Diff " if not title else f" {title} ",
             title_align="left",
             box=box.ROUNDED,
-            border_style="dim white",
+            border_style="#334155",
             padding=(0, 1),
         )
 
@@ -179,8 +187,9 @@ def render_unified_diff(diff_text: str, title: str | None = None) -> RenderableT
 
 
 def render_unified_diff_str(diff_text: str, width: int = 80, title: str | None = None) -> str:
-    """Render unified diff as a plain formatted string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render unified diff as a plain formatted string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_unified_diff(diff_text, title=title))
     return console.export_text().rstrip()
 

@@ -8,6 +8,7 @@ Renders on-demand governance surfaces without permanent dashboard clutter:
 
 from __future__ import annotations
 
+import io
 from typing import TYPE_CHECKING, Any, Mapping
 
 from rich import box
@@ -99,8 +100,9 @@ def render_verification_matrix(
 def render_verification_matrix_str(
     dimensions: Mapping[str, bool] | None = None, width: int = 80
 ) -> str:
-    """Render 6D verification matrix as plain string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render 6D verification matrix as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_verification_matrix(dimensions))
     return console.export_text().rstrip()
 
@@ -187,8 +189,9 @@ def render_contract_hud(
 
 
 def render_contract_hud_str(contract: Mapping[str, Any], width: int = 80) -> str:
-    """Render contract HUD as plain string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render contract HUD as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_contract_hud(contract))
     return console.export_text().rstrip()
 
@@ -266,8 +269,9 @@ def render_plan_panel(state: AutonomousDeliveryState) -> Panel:
 
 
 def render_plan_panel_str(state: AutonomousDeliveryState, width: int = 80) -> str:
-    """Render HITL plan panel as plain string."""
-    console = Console(record=True, width=width, force_terminal=False, color_system=None)
+    """Render HITL plan panel as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
     console.print(render_plan_panel(state))
     return console.export_text().rstrip()
 
