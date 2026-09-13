@@ -46,13 +46,24 @@ def render_assistant_message_str(content: str, width: int = 80) -> str:
 
 
 def render_chat_transcript(messages: list[ChatMessage]) -> RenderableType:
-    """Render the full conversation transcript."""
+    """Render the full conversation transcript including tool activities and diffs."""
     elements: list[RenderableType] = []
     for msg in messages:
-        if msg.role.lower() == "user":
+        role = msg.role.lower()
+        if role == "user":
             elements.append(render_user_message(msg.content))
-        elif msg.role.lower() == "assistant":
+        elif role == "assistant":
             elements.append(render_assistant_message(msg.content))
+        elif role == "tool":
+            from cli.tui.events import ToolActivity, render_tool_activity
+            parts = msg.content.split(None, 1)
+            t_name = parts[0] if parts else "tool"
+            t_target = parts[1] if len(parts) > 1 else ""
+            activity = ToolActivity(tool_name=t_name, target=t_target, status="COMPLETED")
+            elements.append(render_tool_activity(activity))
+        elif role == "diff":
+            from cli.tui.diff import render_unified_diff
+            elements.append(render_unified_diff(msg.content))
         else:
             header = Text(f"✦ {msg.role.title()}", style="dim cyan")
             elements.append(Group(header, Markdown(msg.content)))

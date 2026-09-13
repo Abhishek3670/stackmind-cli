@@ -27,6 +27,23 @@ from cli.tui.chat import (
     render_user_message,
     render_user_message_str,
 )
+from cli.tui.diff import (
+    render_file_diff,
+    render_unified_diff,
+    render_unified_diff_str,
+)
+from cli.tui.events import (
+    OperationalEventManager,
+    ToolActivity,
+    ToolStatus,
+    extract_assistant_response,
+    render_operational_event,
+    render_operational_event_str,
+    render_tool_activity,
+    render_tool_activity_line,
+    render_tool_activity_line_str,
+    render_tool_activity_str,
+)
 from cli.tui.landing import (
     render_landing_block,
     render_landing_block_str,
@@ -556,8 +573,14 @@ def dispatch_delivery_command(
         click.echo(f"Session {session.get('state', 'RUNNING')}")
         return session, False
 
-    if normalized == ":diff":
-        click.echo(adapter.command(":diff", session_id=session["session_id"]))
+    if normalized.startswith(":diff"):
+        _, _, diff_arg = normalized.partition(" ")
+        diff_val = diff_arg.strip() if diff_arg.strip() else None
+        if diff_val:
+            raw_diff = adapter.command(f":diff diff={diff_val}", session_id=session["session_id"], diff=diff_val)
+        else:
+            raw_diff = adapter.command(":diff", session_id=session["session_id"])
+        click.echo(render_unified_diff_str(str(raw_diff)))
         return session, False
 
     if normalized == ":matrix":
@@ -570,7 +593,11 @@ def dispatch_delivery_command(
             click.echo("No new events.")
         for event in events:
             state.process_event(event)
-            click.echo(activity_line(event))
+            click.echo(render_operational_event_str(event))
+            resp = extract_assistant_response(event.get("payload", {}))
+            if resp:
+                state.add_message("assistant", resp)
+                click.echo(render_assistant_message_str(resp))
         return session, False
 
     if normalized in {":chat", ":history"}:
@@ -596,6 +623,18 @@ def dispatch_delivery_command(
         msg_text = f"Turn submitted to the governed daemon (operation: {op_id})."
         state.add_message("assistant", msg_text)
         click.echo(render_assistant_message_str(msg_text))
+
+        # Check for immediate events or completed turn response from adapter
+        events = list(adapter.stream(session["session_id"]))
+        for ev in events:
+            state.process_event(ev)
+            ev_str = render_operational_event_str(ev)
+            if ev_str:
+                click.echo(ev_str)
+            resp = extract_assistant_response(ev.get("payload", {}))
+            if resp:
+                state.add_message("assistant", resp)
+                click.echo(render_assistant_message_str(resp))
     except Exception as err:
         err_msg = f"[ERROR] Could not submit turn: {err} (An operation may already be in flight. Use :status or :cancel)."
         state.add_message("system", err_msg)

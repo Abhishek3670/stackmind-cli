@@ -356,6 +356,19 @@ class AutonomousDeliveryState:
             target = payload.get("path") or payload.get("file") or payload.get("command") or payload.get("symbol") or ""
             self.add_activity(role, tool_name, str(target))
 
+        elif name == "event.toolCall":
+            tool_name = payload.get("tool_name", "tool")
+            role = (payload.get("role") or "Agent").title()
+            args = payload.get("arguments", {})
+            target = args.get("path") or args.get("file") or args.get("command") or args.get("target") or ""
+            self.add_activity(role, tool_name, str(target))
+
+        elif name == "event.toolResult":
+            tool_name = payload.get("tool_name", "tool")
+            role = (payload.get("role") or "Agent").title()
+            status = payload.get("status", "completed")
+            self.add_activity(role, f"{tool_name} ({status})", "")
+
         elif name == "project.completed" or name == "project.complete":
             self.phase = ProjectPhase.PROJECT_COMPLETE
             for k in self.completion_checklist:
