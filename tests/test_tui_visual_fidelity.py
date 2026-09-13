@@ -312,3 +312,69 @@ def test_interactive_composer_input_and_prompt(monkeypatch: pytest.MonkeyPatch, 
     assert "/sessions" in captured.out
     assert f"StackMind v{cli.__version__}" in captured.out
 
+
+def test_tui_startup_unconditionally_renders_header_and_landing_even_with_prior_outbox_reports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Verify top header and landing block are always rendered on startup even when prior outbox reports exist (WO-038)."""
+    # Create prior outbox report
+    outbox_dir = tmp_path / ".sync" / "outbox" / "codex"
+    outbox_dir.mkdir(parents=True, exist_ok=True)
+    report_file = outbox_dir / "harness-2026-09-13.md"
+    report_file.write_text(
+        "# Harness Run\n\n## Report\nPrior session completed successfully.\n\n## Meta\nsession: 22\n",
+        encoding="utf-8",
+    )
+
+    from validators.kernel.tui import DaemonClient
+
+    monkeypatch.setattr(
+        DaemonClient,
+        "events",
+        lambda self, session_id, after=0: [
+            {"sequence": 1, "name": "turn.started", "payload": {"prompt": "prior prompt"}},
+        ],
+    )
+
+    with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
+        runner = CliRunner()
+        result = runner.invoke(
+            main_cli,
+            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            input=":exit\n",
+        )
+
+        assert result.exit_code == 0, result.output
+
+        # Top header bar must be present despite state.has_conversation being True
+        assert "stackmind" in result.output
+        assert "● online" in result.output
+
+        # Branded landing card must be present despite state.has_conversation being True
+        assert "✦" in result.output
+        assert "StackMind" in result.output
+        assert "PLAN · BUILD · VERIFY · GOVERN" in result.output
+        assert "Build better. Safer. Together." in result.output
+
+
+def test_tui_landing_command_renders_both_header_and_landing(tmp_path: Path):
+    """Verify :landing command renders both the top header bar and landing block (WO-038)."""
+    with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
+        runner = CliRunner()
+        result = runner.invoke(
+            main_cli,
+            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            input=":landing\n:exit\n",
+        )
+
+        assert result.exit_code == 0, result.output
+
+        # Both header bar and landing block should appear
+        assert "stackmind" in result.output
+        assert "● online" in result.output
+        assert "✦" in result.output
+        assert "StackMind" in result.output
+        assert "PLAN · BUILD · VERIFY · GOVERN" in result.output
+
+
+

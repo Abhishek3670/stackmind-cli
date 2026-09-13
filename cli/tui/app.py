@@ -980,6 +980,7 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":landing":
+        click.echo(render_top_header_bar_str(session, width=80))
         click.echo(render_landing_block_str())
         return session, False
 
@@ -1178,9 +1179,8 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             _run_demo(client, session)
             return
 
-        if not state.has_conversation:
-            click.echo(render_top_header_bar_str(session, width=80))
-            click.echo(render_landing_block_str())
+        click.echo(render_top_header_bar_str(session, width=80))
+        click.echo(render_landing_block_str())
 
         while True:
             try:
