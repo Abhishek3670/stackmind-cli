@@ -908,6 +908,8 @@ class AgentRunner:
             'lock_wait_ms': lock_wait_ms,
             'backend_id': getattr(self, 'backend_id', completion.provider),
             'model': completion.model,
+            'summary': decision.summary,
+            'report_markdown': decision.report_markdown,
             'observed_changes': diff.to_dict() if diff else {},
             'prompt_tokens': completion.prompt_tokens,
             'provider': completion.provider,
@@ -1034,6 +1036,12 @@ class AgentRunner:
             # Inbox tasks are intentionally archived by the staged operation; the
             # task selected at discovery is itself the completed deliverable.
             deliverable_exists = True
+        elif task.kind == 'adhoc':
+            # Ad-hoc prompt turns produce conversational completion/report deliverables.
+            deliverable_exists = bool(
+                (decision.summary and decision.summary.strip())
+                or (decision.report_markdown and decision.report_markdown.strip())
+            )
         outcome_verified = (
             decision.status == 'completed'
             and not decision.blockers

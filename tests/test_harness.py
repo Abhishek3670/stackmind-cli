@@ -351,3 +351,53 @@ def test_harness_run_once_cli_processes_inbox_item(tmp_path):
     assert result.exit_code == 0
     assert 'status: completed' in result.output
     assert list((project / '.sync' / 'outbox' / 'codex').glob('harness-*.md'))
+
+
+def test_runner_adhoc_prompt_turn_passes_outcome_verified(tmp_path):
+    project = _init_project(tmp_path)
+    provider = StaticLLMProvider(
+        {
+            'status': 'completed',
+            'summary': 'Conversational response to prompt.',
+            'report_markdown': 'Here is the detailed response to your adhoc request.',
+            'blockers': [],
+            'modified_files': [],
+            'release_target': 'v3.3.0',
+            'retrieval_queries': [],
+            'uncertainty': [],
+        }
+    )
+    runner = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now)
+    result = runner.run_once(prompt='Hey')
+
+    assert result.status == 'completed'
+    assert result.persisted
+    assert result.report_path is not None and result.report_path.exists()
+    assert result.meta.get('summary') == 'Conversational response to prompt.'
+    outbox_files = list((project / '.sync' / 'outbox' / 'codex').glob('harness-*.md'))
+    assert len(outbox_files) == 1
+    content = outbox_files[0].read_text(encoding='utf-8')
+    assert 'Conversational response to prompt.' in content
+
+
+def test_runner_adhoc_prompt_turn_fails_when_deliverable_empty(tmp_path):
+    project = _init_project(tmp_path)
+    provider = StaticLLMProvider(
+        {
+            'status': 'completed',
+            'summary': '   ',
+            'report_markdown': '   ',
+            'blockers': [],
+            'modified_files': [],
+            'release_target': 'v3.3.0',
+            'retrieval_queries': [],
+            'uncertainty': [],
+        }
+    )
+    runner = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now)
+    result = runner.run_once(prompt='Empty')
+
+    assert result.status == 'blocked'
+    assert not result.persisted
+    assert 'outcome_verified' in (result.reason or '')
+

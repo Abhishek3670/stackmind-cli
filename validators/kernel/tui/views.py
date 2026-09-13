@@ -23,10 +23,18 @@ def contract_panel(contract: Mapping[str, Any]) -> str:
 
 
 def activity_line(event: Mapping[str, Any]) -> str:
-    marker = (
-        "✗ Blocked" if "cancelled" in event["name"] or "denied" in event["name"] else "✓ Allowed"
-    )
-    return f"{marker} {event['name']}: {event.get('payload', {})}"
+    name = str(event.get("name", ""))
+    payload = event.get("payload", {})
+    status = payload.get("status") if isinstance(payload, Mapping) else None
+    if "cancelled" in name or status == "cancelled":
+        marker = "✗ Cancelled"
+    elif "denied" in name or status == "blocked" or status == "denied":
+        marker = "✗ Blocked"
+    elif status == "failure":
+        marker = "✗ Failed"
+    else:
+        marker = "✓ Allowed"
+    return f"{marker} {name}: {payload}"
 
 
 def verification_matrix(dimensions: Mapping[str, bool]) -> str:

@@ -1018,6 +1018,8 @@ class SessionManager:
                 "persisted": result.persisted,
                 "task_id": result.task_id,
                 "reason": result.reason,
+                "report_path": str(result.report_path) if getattr(result, "report_path", None) else None,
+                "summary": (result.meta or {}).get("summary") if getattr(result, "meta", None) else None,
                 "backend_id": getattr(runner, "backend_id", None),
                 "model": getattr(runner, "backend_model", None),
             }
