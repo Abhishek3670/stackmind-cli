@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -23,11 +24,21 @@ class DaemonClient:
         request = Request(
             f"{self.url}/rpc", data=payload, headers={"Content-Type": "application/json"}
         )
-        with self._opener.open(request) as response:
-            body = json.loads(response.read())
-        if "error" in body:
-            raise RuntimeError(body["error"]["message"])
-        return body["result"]
+        try:
+            with self._opener.open(request) as response:
+                body = json.loads(response.read())
+        except HTTPError as err:
+            try:
+                body = json.loads(err.read())
+            except Exception:
+                raise RuntimeError(f"HTTP error {err.code}: {err.reason}") from err
+        if isinstance(body, dict) and "error" in body:
+            err_obj = body["error"]
+            err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+            raise RuntimeError(err_msg)
+        if isinstance(body, dict):
+            return body.get("result")
+        return body
 
     def create_session(self, **params: Any) -> dict[str, Any]:
         return self.call("session.create", **params)
@@ -40,7 +51,12 @@ class DaemonClient:
         return self.call("session.get", session_id=session_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        return self.call("session.list")
+        result = self.call("session.list")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "sessions" in result and isinstance(result["sessions"], list):
+            return result["sessions"]
+        return []
 
     def pause(self, session_id: str) -> dict[str, Any]:
         return self.call("session.pause", session_id=session_id)
@@ -52,7 +68,12 @@ class DaemonClient:
         return self.call("session.cancel", session_id=session_id)
 
     def session_history(self, session_id: str) -> list[dict[str, Any]]:
-        return self.call("session.history", session_id=session_id)
+        result = self.call("session.history", session_id=session_id)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "history" in result and isinstance(result["history"], list):
+            return result["history"]
+        return []
 
     def session_close(self, session_id: str) -> dict[str, Any]:
         return self.call("session.close", session_id=session_id)
@@ -64,7 +85,12 @@ class DaemonClient:
         return self.call("operation.get", operation_id=operation_id)
 
     def operation_children(self, operation_id: str) -> list[dict[str, Any]]:
-        return self.call("operation.children", operation_id=operation_id)
+        result = self.call("operation.children", operation_id=operation_id)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "children" in result and isinstance(result["children"], list):
+            return result["children"]
+        return []
 
     def operation_cancel(self, operation_id: str, cascade: bool = True) -> dict[str, Any]:
         return self.call("operation.cancel", operation_id=operation_id, cascade=cascade)
@@ -111,7 +137,12 @@ class DaemonClient:
         )
 
     def events(self, session_id: str, after: int = 0) -> list[dict[str, Any]]:
-        return self.call("event.list", session_id=session_id, after=after)
+        result = self.call("event.list", session_id=session_id, after=after)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "events" in result and isinstance(result["events"], list):
+            return result["events"]
+        return []
 
     def stream_events(
         self, session_id: str | None = None, after: int = 0
@@ -122,9 +153,14 @@ class DaemonClient:
         request = Request(f"{self.url}/events?{urlencode(params)}")
         with self._opener.open(request) as response:
             for raw_line in response:
-                line = raw_line.decode("utf-8").strip()
+                line = raw_line.decode("utf-8", errors="replace").strip()
                 if line.startswith("data: "):
-                    yield json.loads(line[6:])
+                    try:
+                        data = json.loads(line[6:])
+                        if isinstance(data, dict):
+                            yield data
+                    except (json.JSONDecodeError, ValueError):
+                        continue
 
     def list_backends(self) -> list[dict[str, Any]]:
         result = self.call("backend.list")

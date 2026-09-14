@@ -180,54 +180,62 @@ class AutonomousDeliveryState:
         self.messages.clear()
 
     def update_from_session(self, session: Mapping[str, Any]) -> None:
-        if not session:
+        if not session or not isinstance(session, Mapping):
             return
-        self.session_id = session.get("session_id", self.session_id)
+        self.session_id = str(session.get("session_id", self.session_id))
         # Check plans in session
-        plans = session.get("plans", {})
-        if plans:
+        plans = session.get("plans")
+        if isinstance(plans, Mapping) and plans:
             latest_plan = list(plans.values())[-1]
-            self.plan = dict(latest_plan)
-            st = latest_plan.get("state", "").upper()
-            if st == "AWAITING_APPROVAL":
-                self.phase = ProjectPhase.AWAITING_APPROVAL
-            elif st == "APPROVED":
-                self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
-                self.completion_checklist["PLAN.md"] = True
-            elif st == "REJECTED":
-                self.phase = ProjectPhase.PLAN_REJECTED
+            if isinstance(latest_plan, Mapping):
+                self.plan = dict(latest_plan)
+                st = str(latest_plan.get("state", "")).upper()
+                if st == "AWAITING_APPROVAL":
+                    self.phase = ProjectPhase.AWAITING_APPROVAL
+                elif st == "APPROVED":
+                    self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                    self.completion_checklist["PLAN.md"] = True
+                elif st == "REJECTED":
+                    self.phase = ProjectPhase.PLAN_REJECTED
 
-            created_wos = latest_plan.get("created_work_orders", [])
-            if created_wos:
-                self.sync_work_orders(created_wos)
+                created_wos = latest_plan.get("created_work_orders")
+                if isinstance(created_wos, list):
+                    self.sync_work_orders(created_wos)
 
         # Check journal operations
-        journal = session.get("journal", [])
-        for entry in journal:
-            op_id = entry.get("operation_id")
-            if op_id and op_id not in self.operations:
-                role = entry.get("role") or self._infer_role_from_op(entry.get("operation", ""))
-                backend = entry.get("backend") or "Codex"
-                status = entry.get("status", "RUNNING")
-                parent_id = entry.get("parent_operation_id")
-                node = OperationNode(op_id, entry.get("operation", role), role=role, backend=backend, status=status, parent_id=parent_id)
-                self.operations[op_id] = node
-                if parent_id and parent_id in self.operations:
-                    if op_id not in self.operations[parent_id].children:
-                        self.operations[parent_id].children.append(op_id)
-                else:
-                    if op_id not in self.operations["op-root"].children:
-                        self.operations["op-root"].children.append(op_id)
+        journal = session.get("journal")
+        if isinstance(journal, list):
+            for entry in journal:
+                if not isinstance(entry, Mapping):
+                    continue
+                op_id = entry.get("operation_id")
+                if op_id and op_id not in self.operations:
+                    role = entry.get("role") or self._infer_role_from_op(entry.get("operation", ""))
+                    backend = entry.get("backend") or "Codex"
+                    status = entry.get("status", "RUNNING")
+                    parent_id = entry.get("parent_operation_id")
+                    node = OperationNode(op_id, entry.get("operation", role), role=role, backend=backend, status=status, parent_id=parent_id)
+                    self.operations[op_id] = node
+                    if parent_id and parent_id in self.operations:
+                        if op_id not in self.operations[parent_id].children:
+                            self.operations[parent_id].children.append(op_id)
+                    else:
+                        if op_id not in self.operations["op-root"].children:
+                            self.operations["op-root"].children.append(op_id)
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
+        if not isinstance(wo_records, list):
+            return
         items = []
         for r in wo_records:
-            wo_id = r.get("id") or r.get("wo_id") or "WO-xxx"
-            title = r.get("title", f"Work order {wo_id}")
-            agents = r.get("assigned_agents", [])
-            role = agents[0].title() if agents else "Backend"
-            priority = r.get("priority", "P0")
-            status = r.get("status", "WAITING")
+            if not isinstance(r, Mapping):
+                continue
+            wo_id = str(r.get("id") or r.get("wo_id") or "WO-xxx")
+            title = str(r.get("title", f"Work order {wo_id}"))
+            agents = r.get("assigned_agents")
+            role = agents[0].title() if isinstance(agents, list) and agents else "Backend"
+            priority = str(r.get("priority", "P0"))
+            status = str(r.get("status", "WAITING"))
             items.append(WorkOrderItem(wo_id, title, role=role, priority=priority, status=status))
         if items:
             self.work_orders = items
@@ -246,6 +254,8 @@ class AutonomousDeliveryState:
 
     def process_event(self, event: Mapping[str, Any]) -> None:
         """Process incoming sequenced daemon / SSE events to update delivery state."""
+        if not event or not isinstance(event, Mapping):
+            return
         seq = event.get("sequence")
         if seq is not None and isinstance(seq, int):
             if seq in self.seen_sequences:
@@ -254,8 +264,9 @@ class AutonomousDeliveryState:
             if seq > self.last_sequence:
                 self.last_sequence = seq
 
-        name = event.get("name", "")
-        payload = event.get("payload", {})
+        name = str(event.get("name", ""))
+        payload_raw = event.get("payload")
+        payload: Mapping[str, Any] = payload_raw if isinstance(payload_raw, Mapping) else {}
 
         if name == "plan.proposed":
             self.phase = ProjectPhase.AWAITING_APPROVAL
@@ -290,8 +301,8 @@ class AutonomousDeliveryState:
             if "Q/A" in self.roles:
                 self.roles["Q/A"].state = "WAITING"
             # Sync created work orders
-            created_records = payload.get("created_records") or payload.get("work_orders", [])
-            if created_records and isinstance(created_records[0], dict):
+            created_records = payload.get("created_records") or payload.get("work_orders")
+            if isinstance(created_records, list) and created_records and isinstance(created_records[0], Mapping):
                 self.sync_work_orders(created_records)
             self.add_activity("Architecture", f"plan approved: {plan_id}")
 
@@ -390,7 +401,8 @@ class AutonomousDeliveryState:
         elif name == "event.toolCall":
             tool_name = payload.get("tool_name", "tool")
             role = (payload.get("role") or "Agent").title()
-            args = payload.get("arguments", {})
+            args_raw = payload.get("arguments")
+            args = args_raw if isinstance(args_raw, Mapping) else {}
             target = args.get("path") or args.get("file") or args.get("command") or args.get("target") or ""
             self.add_activity(role, tool_name, str(target))
 

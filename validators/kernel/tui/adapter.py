@@ -15,7 +15,9 @@ class StackMindTuiAdapter:
         self._sequences: dict[str, int] = {}
 
     def command(self, text: str, **params: Any) -> Any:
-        command, _, argument = text.partition(" ")
+        stripped = text.strip()
+        command, _, argument = stripped.partition(" ")
+        argument = argument.strip()
         if command == ":new":
             return self.client.create_session(**params)
         if command == ":status":
@@ -65,7 +67,7 @@ class StackMindTuiAdapter:
         if command == ":prompt":
             prompt = argument
         elif not command.startswith(":"):
-            prompt = text
+            prompt = stripped
         else:
             raise ValueError("unknown TUI command")
         if "session_id" not in params:
@@ -78,7 +80,8 @@ class StackMindTuiAdapter:
     def stream(self, session_id: str) -> Iterator[dict[str, Any]]:
         after = self._sequences.get(session_id, 0)
         for event in self.client.events(session_id, after):
-            self._sequences[session_id] = event["sequence"]
+            if isinstance(event, dict) and "sequence" in event and isinstance(event["sequence"], int):
+                self._sequences[session_id] = event["sequence"]
             yield event
 
     def decide(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
