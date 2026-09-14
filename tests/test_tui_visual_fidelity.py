@@ -145,8 +145,13 @@ def test_top_header_bar_visual_fidelity():
 
 
 def test_card_bordered_landing_block_visual_fidelity():
-    """Verify landing card block matches exact visual specifications."""
-    landing_text = render_landing_block_str(width=80)
+    """Verify landing card block matches exact visual specifications for Phase 2."""
+    session = {
+        "session_id": "a295c255",
+        "project": "~/projects/stackmind",
+        "status": "online",
+    }
+    landing_text = render_landing_block_str(session=session, width=80)
 
     # 1. Centered glowing purple star
     assert "✦" in landing_text
@@ -161,21 +166,60 @@ def test_card_bordered_landing_block_visual_fidelity():
     # 4. 4 multi-colored pillars
     assert "PLAN · BUILD · VERIFY · GOVERN" in landing_text
 
-    # 5. Keyboard pill buttons
-    assert "[ / ]" in landing_text
-    assert "Start chatting" in landing_text
-    assert "[ Ctrl+K ]" in landing_text
-    assert "Open commands" in landing_text
-    assert "[ :help ]" in landing_text
-    assert "Show all commands" in landing_text
-    assert "[ :status ]" in landing_text
-    assert "Show session status" in landing_text
-
-    # 6. Bottom card motto
+    # 5. Bottom card motto
     assert "Build better. Safer. Together." in landing_text
 
-    # 7. Card boundary borders (Rich rounded panel box)
-    assert any(border_char in landing_text for border_char in ("─", "│", "┌", "┐", "└", "┘"))
+    # 6. Strict exclusions: no shortcut rows or command hints
+    assert "Start chatting" not in landing_text
+    assert "Ctrl+K" not in landing_text
+    assert "[ :help ]" not in landing_text
+
+    # 7. Metadata section: strictly ordered Status -> Session -> Project without inner card
+    assert "Status:" in landing_text
+    assert "● online" in landing_text
+    assert "Session:" in landing_text
+    assert "a295c255" in landing_text
+    assert "Project:" in landing_text
+    assert "~/projects/stackmind" in landing_text
+
+    idx_status = landing_text.index("Status:")
+    idx_session = landing_text.index("Session:")
+    idx_project = landing_text.index("Project:")
+    assert idx_status < idx_session < idx_project
+
+    # 8. Card boundary borders (Rich rounded panel box)
+    assert any(border_char in landing_text for border_char in ("─", "│", "┌", "┐", "└", "┘", "╭", "╮", "╰", "╯"))
+
+
+def test_landing_block_phase2_locked_design_and_metadata_order():
+    """Verify Phase 2 locked landing block design, metadata order, and exclusions."""
+    session = {
+        "session_id": "fe92a104",
+        "project": "/custom/path/repo",
+        "status": "reconnecting",
+    }
+    landing = render_landing_block_str(session=session, width=80)
+
+    # Structural brand elements
+    assert "✦  StackMind" in landing
+    assert "Your AI development partner, with control." in landing
+    assert "PLAN · BUILD · VERIFY · GOVERN" in landing
+    assert "Build better. Safer. Together." in landing
+
+    # Metadata ordered
+    assert "Status:" in landing
+    assert "reconnecting" in landing
+    assert "Session:" in landing
+    assert "fe92a104" in landing
+    assert "Project:" in landing
+    assert "/custom/path/repo" in landing
+
+    assert landing.index("Status:") < landing.index("Session:") < landing.index("Project:")
+
+    # Exclusions
+    assert "Start chatting" not in landing
+    assert "Ctrl+K" not in landing
+    assert "Open commands" not in landing
 
 
 def test_chat_messages_accent_and_timestamps():

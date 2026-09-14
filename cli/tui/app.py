@@ -979,7 +979,7 @@ def dispatch_delivery_command(
 
     if normalized == ":landing":
         click.echo(render_top_header_bar_str(session, width=80))
-        click.echo(render_landing_block_str())
+        click.echo(render_landing_block_str(session=session, status=state.connection_status, width=80))
         return session, False
 
     if normalized.startswith(":") and not normalized.startswith(":prompt "):
@@ -1178,7 +1178,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             return
 
         click.echo(render_top_header_bar_str(session, width=80))
-        click.echo(render_landing_block_str())
+        click.echo(render_landing_block_str(session=session, status=state.connection_status, width=80))
 
         while True:
             try:

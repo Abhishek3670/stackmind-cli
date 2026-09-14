@@ -46,11 +46,18 @@ def test_landing_block_dynamic_version_and_pillars():
     for pillar in LANDING_PILLARS:
         assert pillar in rendered
 
-    # Test static input hints
-    assert "Start chatting" in rendered
-    assert "Ctrl+K" in rendered
-    assert ":help" in rendered
-    assert ":status" in rendered
+    # Phase 2: Centered motto present
+    assert "Build better. Safer. Together." in rendered
+
+    # Phase 2: Exclude shortcut/help rows and command hints
+    assert "Start chatting" not in rendered
+    assert "Ctrl+K" not in rendered
+
+    # Phase 2: Metadata section strictly ordered
+    assert "Status:" in rendered
+    assert "Session:" in rendered
+    assert "Project:" in rendered
+    assert rendered.index("Status:") < rendered.index("Session:") < rendered.index("Project:")
 
     # Test version override (proving it's dynamic and never hardcoded)
     custom_rendered = _extract_plain(render_landing_block(version="9.8.7"))
