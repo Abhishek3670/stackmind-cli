@@ -47,6 +47,17 @@ from cli.tui.app import (
     render_composer_bottom_border_str,
     render_composer_top_border_str,
 )
+from cli.tui.layout import (
+    NARROW_THRESHOLD,
+    RUNTIME_HEADING,
+    RUNTIME_MAX_WIDTH,
+    RUNTIME_MIN_WIDTH,
+    RUNTIME_SECTIONS,
+    ColumnLayout,
+    compute_layout,
+    render_runtime_panel_str,
+    render_workspace_layout_str,
+)
 from validators.kernel.daemon import LocalDaemon
 
 
@@ -422,3 +433,123 @@ def test_tui_landing_command_renders_both_header_and_landing(tmp_path: Path):
         assert "StackMind" in result.output
         assert "PLAN · BUILD · VERIFY · GOVERN" in result.output
 
+
+# ── Phase 3: Two-Column Workspace Layout Tests ──────────────────────────────
+
+
+def test_compute_layout_narrow_hides_runtime():
+    """Verify narrow terminals (< 100) hide the runtime panel entirely."""
+    for w in (40, 60, 80, 99):
+        layout = compute_layout(w)
+        assert not layout.show_runtime, f"width={w} should hide runtime"
+        assert layout.conversation_width == w
+        assert layout.runtime_width == 0
+        assert layout.divider_width == 0
+
+
+def test_compute_layout_wide_shows_runtime():
+    """Verify wide terminals (>= 100) show runtime panel with correct proportions."""
+    for w in (100, 120, 160):
+        layout = compute_layout(w)
+        assert layout.show_runtime, f"width={w} should show runtime"
+        assert layout.divider_width == 1
+        # Runtime within bounds
+        assert RUNTIME_MIN_WIDTH <= layout.runtime_width <= RUNTIME_MAX_WIDTH
+        # Conversation + divider + runtime = total
+        assert layout.conversation_width + 1 + layout.runtime_width == w
+        # Conversation gets ~70-75%
+        conv_pct = layout.conversation_width / w
+        assert 0.55 <= conv_pct <= 0.80, f"conversation={conv_pct:.2%} out of range at width={w}"
+
+
+def test_compute_layout_target_dimensions():
+    """Verify the four target dimensions from the spec: 80x24, 100x30, 120x40, 160x50."""
+    # 80: narrow fallback
+    l80 = compute_layout(80)
+    assert not l80.show_runtime
+    assert l80.conversation_width == 80
+
+    # 100: minimum two-column
+    l100 = compute_layout(100)
+    assert l100.show_runtime
+    assert l100.conversation_width + 1 + l100.runtime_width == 100
+
+    # 120: standard two-column
+    l120 = compute_layout(120)
+    assert l120.show_runtime
+    assert RUNTIME_MIN_WIDTH <= l120.runtime_width <= RUNTIME_MAX_WIDTH
+
+    # 160: wide two-column
+    l160 = compute_layout(160)
+    assert l160.show_runtime
+    assert RUNTIME_MIN_WIDTH <= l160.runtime_width <= RUNTIME_MAX_WIDTH
+
+
+def test_runtime_panel_placeholder_sections():
+    """Verify runtime panel renders all three section headings."""
+    panel = render_runtime_panel_str(width=35)
+
+    assert RUNTIME_HEADING in panel
+    for section in RUNTIME_SECTIONS:
+        assert section in panel
+
+    # Verify section order
+    idx_agents = panel.index("AGENTS")
+    idx_wo = panel.index("WORK ORDERS")
+    idx_op = panel.index("CURRENT OPERATION")
+    assert idx_agents < idx_wo < idx_op
+
+
+def test_runtime_panel_with_dynamic_data():
+    """Verify runtime panel renders actual agent/WO/operation data."""
+    agents = [
+        {"name": "codex", "status": "active"},
+        {"name": "gemma", "status": "idle"},
+    ]
+    work_orders = [{"id": "WO-043", "title": "Layout"}]
+    current_op = {"name": "graph update", "status": "running"}
+
+    panel = render_runtime_panel_str(
+        width=35, agents=agents, work_orders=work_orders, current_operation=current_op
+    )
+
+    assert "codex: active" in panel
+    assert "gemma: idle" in panel
+    assert "WO-043: Layout" in panel
+    assert "graph update" in panel
+    assert "running" in panel
+
+
+def test_runtime_panel_no_stdout_leak(capsys: pytest.CaptureFixture[str]):
+    """Verify runtime panel str renderer does not leak to stdout."""
+    capsys.readouterr()
+    out = render_runtime_panel_str(width=30)
+    captured = capsys.readouterr()
+    assert captured.out == "", "render_runtime_panel_str leaked to sys.stdout"
+    assert RUNTIME_HEADING in out
+
+
+def test_workspace_layout_narrow_returns_conversation_only():
+    """Verify narrow workspace layout returns only conversation text."""
+    result = render_workspace_layout_str("Hello world", width=80)
+    assert "Hello world" in result
+    # Runtime sections should NOT be present
+    assert "AGENTS" not in result
+    assert "WORK ORDERS" not in result
+
+
+def test_workspace_layout_wide_renders_both_columns():
+    """Verify wide workspace layout renders both conversation and runtime panel."""
+    result = render_workspace_layout_str("Conversation content here", width=120)
+    assert "Conversation content here" in result
+    # Runtime panel sections should be present
+    assert RUNTIME_HEADING in result
+    assert "AGENTS" in result
+    assert "WORK ORDERS" in result
+    assert "CURRENT OPERATION" in result
+
+
+def test_workspace_layout_vertical_divider():
+    """Verify the vertical divider character is present in wide layout."""
+    result = render_workspace_layout_str("Left side", width=120)
+    assert "│" in result
