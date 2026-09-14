@@ -95,6 +95,14 @@ def test_assistant_message_markdown_rendering():
     assert "def auth():" in str_out
 
 
+def test_assistant_message_strips_provider_thinking_tags():
+    """Private provider reasoning must not enter the conversational surface."""
+    plain = _extract_plain(render_assistant_message("<think>private plan</think>\n\n## Final\nSafe answer."))
+    assert "private plan" not in plain
+    assert "Final" in plain
+    assert "Safe answer." in plain
+
+
 def test_chat_transcript_rendering():
     """Verify full transcript rendering of conversation messages."""
     messages = [
@@ -157,4 +165,18 @@ def test_tui_repl_landing_and_chat_transition(tmp_path: Path):
 
         # 3. Assistant response rendered
         assert "✦ StackMind" in result.output
-        assert "Turn submitted to the governed daemon" in result.output
+        assert "Thinking" in result.output
+
+
+def test_tui_treats_slash_prefixed_input_as_prompt(tmp_path: Path):
+    """Slash text is a governed prompt, not an unsupported command."""
+    with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
+        result = CliRunner().invoke(
+            main_cli,
+            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            input="/status\n:exit\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "/status" in result.output
+    assert "Unknown command" not in result.output

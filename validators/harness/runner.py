@@ -382,8 +382,9 @@ class AgentRunner:
                 has_modifications = bool(completion.payload.get('modified_files'))
                 has_commands = bool(completion.payload.get('commands'))
                 if not has_modifications and not has_commands:
-                    raw_summary = str(completion.payload.get('summary') or '').strip()
-                    raw_report = str(completion.payload.get('report_markdown') or '').strip()
+                    from cli.tui.chat import strip_internal_reasoning
+                    raw_summary = strip_internal_reasoning(str(completion.payload.get('summary') or ''))
+                    raw_report = strip_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
                     if not raw_summary and not raw_report:
                         return HarnessRunResult(
                             status='blocked',

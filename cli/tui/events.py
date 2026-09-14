@@ -223,7 +223,7 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
             operation_id=payload.get("operation_id"),
             arguments=args,
         )
-        return render_tool_activity(activity)
+        return render_tool_activity_line(activity)
 
     if name == "event.toolResult":
         activity = ToolActivity(
@@ -233,7 +233,7 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
             operation_id=payload.get("operation_id"),
             error=str(payload.get("error")) if payload.get("error") else None,
         )
-        return render_tool_activity(activity)
+        return render_tool_activity_line(activity)
 
     if name == "operation.started":
         op_id = payload.get("operation_id") or "op"
@@ -317,6 +317,12 @@ def extract_assistant_response(
     if not isinstance(payload, Mapping):
         return None
 
+    from cli.tui.chat import strip_internal_reasoning
+
+    def clean_response(value: str) -> str | None:
+        clean = strip_internal_reasoning(value)
+        return clean or None
+
     # 1. Inspect direct result dict
     result = payload.get("result")
     if isinstance(result, Mapping):
@@ -334,29 +340,29 @@ def extract_assistant_response(
                         report_body, _, _ = body.partition("## Meta")
                         clean = report_body.strip()
                         if clean:
-                            return clean
-                    return content.strip()
+                            return clean_response(clean)
+                    return clean_response(content)
                 except Exception:
                     pass
 
         summary = result.get("summary")
         if summary and isinstance(summary, str) and summary.strip():
-            return summary.strip()
+            return clean_response(summary)
 
         response = result.get("response")
         if response and isinstance(response, str) and response.strip():
-            return response.strip()
+            return clean_response(response)
 
         reason = result.get("reason")
         if reason and isinstance(reason, str) and reason.strip():
-            return reason.strip()
+            return clean_response(reason)
 
     # 2. Inspect direct payload keys
     if isinstance(payload.get("response"), str) and payload["response"].strip():
-        return payload["response"].strip()
+        return clean_response(payload["response"])
 
     if isinstance(payload.get("summary"), str) and payload["summary"].strip():
-        return payload["summary"].strip()
+        return clean_response(payload["summary"])
 
     return None
 

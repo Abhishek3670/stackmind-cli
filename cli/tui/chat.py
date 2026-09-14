@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import re
 from typing import TYPE_CHECKING
 
 from rich.console import Console, Group, RenderableType
@@ -17,6 +18,12 @@ if TYPE_CHECKING:
 
 def _current_time_str() -> str:
     return datetime.datetime.now().strftime("%H:%M")
+
+
+def strip_internal_reasoning(content: str) -> str:
+    """Remove provider-delimited private reasoning without altering final Markdown."""
+    clean = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", content, flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"<think\b[^>]*>.*$", "", clean, flags=re.IGNORECASE | re.DOTALL).strip()
 
 
 def render_user_message(content: str, timestamp: str | None = None) -> RenderableType:
@@ -57,7 +64,7 @@ def render_assistant_message(content: str, timestamp: str | None = None) -> Rend
     right = Text(ts_str, style="dim #64748b")
     grid.add_row(left, right)
 
-    body = Markdown(content)
+    body = Markdown(strip_internal_reasoning(content))
     return Group(grid, Text(""), body)
 
 
@@ -108,6 +115,7 @@ __all__ = [
     "render_assistant_message_str",
     "render_chat_transcript",
     "render_chat_transcript_str",
+    "strip_internal_reasoning",
     "render_user_message",
     "render_user_message_str",
 ]

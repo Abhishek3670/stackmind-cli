@@ -368,7 +368,7 @@ def render_top_header_bar(
     # Format workspace path
     if workspace:
         p = Path(str(workspace))
-        ws_display = f"~/{p.name}"
+        ws_display = str(p) if width >= 90 else f".../{p.name}"
     else:
         ws_display = "~/projects/stackmind"
 
@@ -379,7 +379,7 @@ def render_top_header_bar(
     if len(left_plain) + len(right_plain) + 2 > width:
         max_ws = max(6, width - len(left_prefix) - len(right_plain) - 4)
         if len(ws_display) > max_ws:
-            ws_display = ws_display[:max(4, max_ws - 2)] + ".."
+            ws_display = ".../" + p.name[-max(1, max_ws - 4):] if workspace else ws_display
         left_plain = left_prefix + ws_display
 
     spaces_count = max(2, width - len(left_plain) - len(right_plain))
@@ -524,10 +524,8 @@ def render_bottom_footer_bar(
     version: str | None = None,
     width: int = 80,
 ) -> RenderableType:
-    """Render bottom navigation footer bar matching image.png:
-    /help   /status   /diff   /compact   /sessions          StackMind v3.1.0
-    """
-    commands = ["/help", "/status", "/diff", "/compact", "/sessions"]
+    """Render only commands accepted by the active colon-command dispatcher."""
+    commands = [":help", ":status", ":diff", ":events", ":roles", ":landing"]
     left_plain = "   ".join(commands)
     ver = version or _get_version()
     right_plain = f"StackMind {ver}"
@@ -996,8 +994,8 @@ def dispatch_delivery_command(
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         state.add_activity("User", "submitted turn", op_id)
-        # Clean thinking status notice while awaiting completion
-        status_line = Text(f"● Thinking... (Turn submitted to the governed daemon: {op_id})", style="dim #64748b")
+        # This is a local wait indicator, not a claim about daemon state.
+        status_line = Text("● Thinking… Turn submitted to the governed daemon.", style="dim #64748b")
         click.echo(status_line)
 
         # Synchronously await turn completion while consuming events
@@ -1011,7 +1009,7 @@ def dispatch_delivery_command(
             events = list(adapter.stream(session["session_id"]))
             for ev in events:
                 state.process_event(ev)
-                ev_str = render_operational_event_str(ev)
+                ev_str = "" if ev.get("name") in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
                 if ev_str:
                     click.echo(ev_str)
                 resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
@@ -1027,7 +1025,7 @@ def dispatch_delivery_command(
                     completed = True
                     for ev in list(adapter.stream(session["session_id"])):
                         state.process_event(ev)
-                        ev_str = render_operational_event_str(ev)
+                        ev_str = "" if ev.get("name") in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
                         if ev_str:
                             click.echo(ev_str)
                         resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
@@ -1100,9 +1098,9 @@ def dispatch_delivery_command(
                 state.add_message("assistant", completion_msg)
                 click.echo(render_assistant_message_str(completion_msg))
             else:
-                timeout_msg = f"Turn operation {op_id} timed out."
-                state.add_message("assistant", timeout_msg)
-                click.echo(render_error_box_str(timeout_msg, title="TURN TIMEOUT"))
+                timeout_msg = "Still waiting for the daemon; the operation may continue in the background. Use :status or :events to check it."
+                state.add_message("system", timeout_msg)
+                click.echo(render_error_box_str(timeout_msg, title="TURN WAIT TIMEOUT"))
     except Exception as err:
         if is_connection_error(err):
             state.connection_status = "reconnecting"

@@ -115,7 +115,7 @@ def test_double_echo_elimination_in_str_renderers(capsys: pytest.CaptureFixture[
     foot_out = render_bottom_footer_bar_str()
     captured = capsys.readouterr()
     assert captured.out == "", "render_bottom_footer_bar_str leaked to sys.stdout"
-    assert "/help" in foot_out
+    assert ":help" in foot_out
 
 
 def test_top_header_bar_visual_fidelity():
@@ -236,11 +236,13 @@ def test_composer_box_and_footer_bar():
     assert "Ctrl+K commands | Ctrl+L clear" in comp
 
     foot = render_bottom_footer_bar_str(width=80)
-    assert "/help" in foot
-    assert "/status" in foot
-    assert "/diff" in foot
-    assert "/compact" in foot
-    assert "/sessions" in foot
+    assert ":help" in foot
+    assert ":status" in foot
+    assert ":diff" in foot
+    assert ":events" in foot
+    assert ":roles" in foot
+    assert ":landing" in foot
+    assert "/help" not in foot
     assert f"StackMind v{cli.__version__}" in foot
 
 
@@ -271,9 +273,9 @@ def test_tui_repl_startup_layout_fidelity(tmp_path: Path):
         assert "Ctrl+K commands | Ctrl+L clear" in result.output
 
         # Footer bar
-        assert "/help" in result.output
-        assert "/status" in result.output
-        assert "/sessions" in result.output
+        assert ":help" in result.output
+        assert ":status" in result.output
+        assert ":events" in result.output
 
         # WO-035: No plain legacy prompt anywhere
         assert "stackmind [" not in result.output
@@ -307,9 +309,9 @@ def test_interactive_composer_input_and_prompt(monkeypatch: pytest.MonkeyPatch, 
     assert "Ctrl+K commands | Ctrl+L clear" in captured.out
     assert "╭─ " in captured.out
     assert "╰" in captured.out
-    assert "/help" in captured.out
-    assert "/status" in captured.out
-    assert "/sessions" in captured.out
+    assert ":help" in captured.out
+    assert ":status" in captured.out
+    assert ":events" in captured.out
     assert f"StackMind v{cli.__version__}" in captured.out
 
 
@@ -375,6 +377,4 @@ def test_tui_landing_command_renders_both_header_and_landing(tmp_path: Path):
         assert "✦" in result.output
         assert "StackMind" in result.output
         assert "PLAN · BUILD · VERIFY · GOVERN" in result.output
-
-
 
