@@ -187,3 +187,140 @@ def test_tui_treats_slash_prefixed_input_as_prompt(tmp_path: Path):
     assert result.exit_code == 0, result.output
     assert "/status" in result.output
     assert "Unknown command" not in result.output
+
+
+def test_conversation_layout_left_aligned_with_horizontal_padding():
+    """Verify conversation uses full available width with small horizontal padding and left alignment (§13)."""
+    messages = [
+        ChatMessage(role="user", content="Deploy authentication service"),
+        ChatMessage(role="assistant", content="Starting authentication deployment."),
+    ]
+    # Default transcript with padding
+    transcript = render_chat_transcript_str(messages, width=80)
+    lines = [ln for ln in transcript.splitlines() if ln.strip()]
+
+    # First char should be a padding space (small horizontal padding, does not touch terminal edge)
+    for line in lines:
+        assert line.startswith(" "), f"Expected line to have horizontal padding: {line!r}"
+
+    # Left alignment: content must not be centered (leading spaces should be minimal padding, e.g. 1-2 chars)
+    assert "You" in lines[0]
+    assert lines[0].startswith(" │ You") or lines[0].startswith(" You")
+    assert not lines[0].startswith("                    ")  # not centered
+
+    # Empty transcript also preserves small horizontal padding
+    empty_out = render_chat_transcript_str([], width=80)
+    assert empty_out.startswith(" ")
+    assert "No messages in conversation yet" in empty_out
+
+
+def test_user_message_visually_quiet_unboxed_styling():
+    """Verify user message styling is visually quiet, unboxed, with no avatar icons (§14)."""
+    # 1. Default quiet styling with accent line
+    user_out = render_user_message_str("Refactor token management", width=80)
+    assert "You" in user_out
+    assert "Refactor token management" in user_out
+    assert "👤" not in user_out
+    assert "┌" not in user_out  # No heavy box card
+    assert "└" not in user_out
+
+    # 2. Quiet styling without accent bar
+    quiet_out = render_user_message_str("Refactor token management", width=80, accent=False)
+    assert "You" in quiet_out
+    assert "│" not in quiet_out
+    assert "Refactor token management" in quiet_out
+
+
+def test_assistant_message_identity_and_breathing_room():
+    """Verify exact '✦ StackMind' assistant identity (§15) and generous breathing room (§16)."""
+    content = "Here is the architectural analysis.\n\nAll security invariants are preserved."
+    rendered = render_assistant_message_str(content, width=80)
+
+    # Exact identity label
+    assert "✦ StackMind" in rendered
+
+    # Breathing room: blank line between header and markdown body
+    lines = rendered.splitlines()
+    assert lines[0].strip() == "✦ StackMind"
+    assert lines[1].strip() == ""  # blank line breathing room
+    assert "Here is the architectural analysis." in lines[2]
+
+
+def test_suppress_per_message_timestamps_in_chat_transcript():
+    """Verify regular chat transcript suppresses per-message timestamps (§17)."""
+    messages = [
+        ChatMessage(role="user", content="Check health status", timestamp="10:24"),
+        ChatMessage(role="assistant", content="All services operational.", timestamp="10:25"),
+    ]
+
+    # Normal transcript suppresses per-message timestamps
+    transcript = render_chat_transcript_str(messages, width=80)
+    assert "10:24" not in transcript
+    assert "10:25" not in transcript
+    assert "You" in transcript
+    assert "✦ StackMind" in transcript
+
+    # Explicit diagnostic request can display timestamps
+    diag_transcript = render_chat_transcript_str(messages, width=80, show_timestamps=True)
+    assert "10:24" in diag_transcript
+    assert "10:25" in diag_transcript
+
+
+def test_rich_markdown_rendering_features():
+    """Verify headings, lists, inline code, and fenced code blocks render rich Markdown (§32)."""
+    md_content = """# System Architecture
+
+Here is the plan:
+1. Initialize SQLite storage
+2. Bind FastAPI router
+
+Key benefits:
+- Zero overhead
+- Strict type checking
+
+Use `get_db()` helper:
+```python
+def get_db():
+    yield db
+```
+"""
+    rendered = render_assistant_message_str(md_content, width=80)
+
+    # Heading rendered
+    assert "System Architecture" in rendered
+    # Numbered and bullet list items rendered
+    assert "Initialize SQLite storage" in rendered
+    assert "Bind FastAPI router" in rendered
+    assert "Zero overhead" in rendered
+    # Inline code and fenced code rendered
+    assert "get_db()" in rendered
+    assert "def get_db():" in rendered
+    assert "yield db" in rendered
+
+
+def test_inline_diff_rendering_in_conversation():
+    """Verify diffs render inline within the conversation using unified diff viewer (§33)."""
+    diff_payload = """--- a/src/auth.py
++++ b/src/auth.py
+@@ -1,3 +1,4 @@
+ import os
++import secrets
+ def generate_token():
+"""
+    messages = [
+        ChatMessage(role="user", content="Show the token diff"),
+        ChatMessage(role="diff", content=diff_payload),
+        ChatMessage(role="assistant", content="Applied secure secrets token generator."),
+    ]
+
+    transcript = render_chat_transcript_str(messages, width=80)
+    assert "You" in transcript
+    assert "Show the token diff" in transcript
+    # Inline diff rendered with unified diff headers and chunks
+    assert "src/auth.py" in transcript
+    assert "unified diff" in transcript
+    assert "+import secrets" in transcript
+    # Following assistant response remains inline
+    assert "✦ StackMind" in transcript
+    assert "Applied secure secrets token generator." in transcript
+
