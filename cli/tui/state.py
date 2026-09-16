@@ -98,32 +98,57 @@ class ChatMessage:
     timestamp: str = ""
 
 
+from cli.tui.runtime_panel import RuntimePanelScroll
+
+
 class AutonomousDeliveryState:
     """Live in-memory state tracking the autonomous project delivery lifecycle."""
 
-    def __init__(self, project_name: str = "stackmind-project", session_id: str = "SESSION-INIT") -> None:
+    def __init__(
+        self,
+        project_name: str = "stackmind-project",
+        session_id: str = "SESSION-INIT",
+        roles: dict[str, RoleStatus] | None = None,
+        work_orders: list[WorkOrderItem] | None = None,
+        operations: dict[str, OperationNode] | None = None,
+        scroll: RuntimePanelScroll | None = None,
+    ) -> None:
         self.project_name = project_name
         self.session_id = session_id
         self.phase: ProjectPhase = ProjectPhase.INITIALIZING
         self.plan: dict[str, Any] = {}
         self.plan_revisions: list[PlanRevision] = []
-        self.roles: dict[str, RoleStatus] = {
-            "Architecture": RoleStatus("Architecture", backend="Claude", work_order_id="WO-001", state="RUNNING"),
-            "Backend": RoleStatus("Backend", backend="Codex", work_order_id="WO-002", state="WAITING"),
-            "Frontend": RoleStatus("Frontend", backend="AGY", work_order_id="WO-003", state="WAITING"),
-            "Q/A": RoleStatus("Q/A", backend="Ollama", work_order_id="WO-004", state="WAITING"),
-            "GitOps": RoleStatus("GitOps", backend="Ollama", work_order_id="WO-005", state="WAITING"),
-        }
-        self.work_orders: list[WorkOrderItem] = [
-            WorkOrderItem("WO-001", "Architecture & Orchestration", role="Architecture", priority="P0", status="RUNNING"),
-            WorkOrderItem("WO-002", "Backend API & Services", role="Backend", priority="P0", status="WAITING"),
-            WorkOrderItem("WO-003", "Frontend Client & Views", role="Frontend", priority="P0", status="WAITING"),
-            WorkOrderItem("WO-004", "Q/A Verification Suite", role="Q/A", priority="P0", status="WAITING"),
-            WorkOrderItem("WO-005", "GitOps Release & Hygiene", role="GitOps", priority="P0", status="WAITING"),
-        ]
-        self.operations: dict[str, OperationNode] = {
-            "op-root": OperationNode("op-root", "Architecture", role="Architecture", backend="Claude", status="RUNNING")
-        }
+        if roles is not None:
+            self.roles = dict(roles)
+        else:
+            self.roles = {
+                "Architecture": RoleStatus("Architecture", backend="Claude", work_order_id="WO-001", state="RUNNING"),
+                "Backend": RoleStatus("Backend", backend="Codex", work_order_id="WO-002", state="WAITING"),
+                "Frontend": RoleStatus("Frontend", backend="AGY", work_order_id="WO-003", state="WAITING"),
+                "Q/A": RoleStatus("Q/A", backend="Ollama", work_order_id="WO-004", state="WAITING"),
+                "GitOps": RoleStatus("GitOps", backend="Ollama", work_order_id="WO-005", state="WAITING"),
+            }
+        if work_orders is not None:
+            self.work_orders = list(work_orders)
+        elif roles is not None:
+            self.work_orders = []
+        else:
+            self.work_orders = [
+                WorkOrderItem("WO-001", "Architecture & Orchestration", role="Architecture", priority="P0", status="RUNNING"),
+                WorkOrderItem("WO-002", "Backend API & Services", role="Backend", priority="P0", status="WAITING"),
+                WorkOrderItem("WO-003", "Frontend Client & Views", role="Frontend", priority="P0", status="WAITING"),
+                WorkOrderItem("WO-004", "Q/A Verification Suite", role="Q/A", priority="P0", status="WAITING"),
+                WorkOrderItem("WO-005", "GitOps Release & Hygiene", role="GitOps", priority="P0", status="WAITING"),
+            ]
+        if operations is not None:
+            self.operations = dict(operations)
+        elif roles is not None:
+            self.operations = {}
+        else:
+            self.operations = {
+                "op-root": OperationNode("op-root", "Architecture", role="Architecture", backend="Claude", status="RUNNING")
+            }
+        self.scroll: RuntimePanelScroll = scroll if scroll is not None else RuntimePanelScroll()
         self.activity_log: list[ActivityEntry] = []
         self.messages: list[ChatMessage] = []
         self.completion_checklist: dict[str, bool] = {
@@ -240,6 +265,169 @@ class AutonomousDeliveryState:
         if items:
             self.work_orders = items
 
+    def get_agent_hierarchy(self) -> list[dict[str, Any]]:
+        """Return the dynamic agent hierarchy without hard-coding the agent roster (§7, §8).
+
+        Blends live operations and configured roles into structured entries:
+        ◉ Architecture    orchestrating
+          ├─ ● Backend    running
+          ├─ ○ Frontend   waiting
+          └─ ○ GitOps     waiting
+        """
+        if not self.roles and not self.operations:
+            return []
+
+        entries: list[dict[str, Any]] = []
+
+        # 1. Build from configured roles if present
+        if self.roles:
+            arch_role = None
+            worker_roles: list[RoleStatus] = []
+            for r_name, r_obj in self.roles.items():
+                if r_name.lower() == "architecture" or "arch" in r_name.lower() or "lead" in r_name.lower():
+                    arch_role = r_obj
+                else:
+                    worker_roles.append(r_obj)
+
+            if arch_role:
+                root_obj = arch_role
+                children_objs = worker_roles
+            elif worker_roles:
+                root_obj = worker_roles[0]
+                children_objs = worker_roles[1:]
+            else:
+                root_obj = None
+                children_objs = []
+
+            if root_obj:
+                r_stat = "orchestrating" if "arch" in root_obj.role.lower() else root_obj.display_state
+                entries.append({
+                    "name": root_obj.role,
+                    "role": root_obj.role,
+                    "backend": root_obj.backend,
+                    "status": r_stat,
+                    "is_root": True,
+                })
+            for w_obj in children_objs:
+                entries.append({
+                    "name": w_obj.role,
+                    "role": w_obj.role,
+                    "backend": w_obj.backend,
+                    "status": w_obj.display_state,
+                    "is_root": False,
+                })
+            return entries
+
+        # 2. Build from operations if no roles defined
+        if self.operations:
+            root = self.operations.get("op-root")
+            children_ids = root.children if root else [k for k in self.operations if k != "op-root"]
+            if root:
+                r_status = "orchestrating" if (root.role or "").lower() == "architecture" else (
+                    "running" if str(root.status).upper() in {"RUNNING", "ACTIVE"} else str(root.status).lower()
+                )
+                entries.append({
+                    "name": root.role or "Architecture",
+                    "role": root.role or "Architecture",
+                    "backend": root.backend,
+                    "status": r_status,
+                    "is_root": True,
+                })
+            for cid in children_ids:
+                node = self.operations.get(cid)
+                if node:
+                    entries.append({
+                        "name": node.name or node.role,
+                        "role": node.role,
+                        "backend": node.backend,
+                        "status": node.status.lower(),
+                        "is_root": False,
+                    })
+            return entries
+
+        return entries
+
+    def get_current_operation(self) -> dict[str, Any] | None:
+        """Return the currently active running operation, or None if idle (§6, §7)."""
+        for op in reversed(list(self.operations.values())):
+            if str(op.status).upper() in {"RUNNING", "ACTIVE"}:
+                return {
+                    "name": op.name,
+                    "operation_id": op.operation_id,
+                    "role": op.role,
+                    "backend": op.backend,
+                    "status": op.status.lower(),
+                }
+        return None
+
+    def populate_from_runtime(
+        self,
+        client: Any = None,
+        session: Mapping[str, Any] | None = None,
+        workspace: Any = None,
+    ) -> None:
+        """Populate live runtime state dynamically from daemon/session before first prompt."""
+        if session:
+            self.update_from_session(session)
+
+        if client is not None:
+            # 1. Fetch live roles configured in daemon
+            try:
+                roles_list = client.list_roles()
+                if roles_list and isinstance(roles_list, list):
+                    new_roles: dict[str, RoleStatus] = {}
+                    for item in roles_list:
+                        if not isinstance(item, Mapping):
+                            continue
+                        r_name = str(item.get("role") or "Worker").title()
+                        normalized = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name
+                        b_end = str(item.get("backend") or "Codex")
+                        m_del = item.get("model")
+                        new_roles[normalized] = RoleStatus(
+                            role=normalized,
+                            backend=b_end,
+                            model=m_del,
+                            state="RUNNING" if normalized.lower() == "architecture" else "WAITING",
+                        )
+                    if new_roles:
+                        self.roles = new_roles
+            except Exception:
+                pass
+
+            # 2. Fetch live agents/operations
+            try:
+                sid = getattr(self, "session_id", None)
+                agents_list = client.list_agents(session_id=sid)
+                if agents_list and isinstance(agents_list, list):
+                    for a in agents_list:
+                        if not isinstance(a, Mapping):
+                            continue
+                        aid = a.get("agent_id") or a.get("agentId") or "agent"
+                        r_name = (a.get("role") or "Backend").title()
+                        normalized = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name
+                        op_id = a.get("operation_id") or a.get("operationId") or f"op-{aid}"
+                        parent_id = a.get("parent_operation_id") or a.get("parentOperationId") or "op-root"
+                        backend = a.get("backend", "Codex")
+                        status = a.get("status", "RUNNING")
+                        node = OperationNode(op_id, normalized, role=normalized, backend=backend, status=status, parent_id=parent_id)
+                        self.operations[op_id] = node
+                        if parent_id in self.operations and op_id not in self.operations[parent_id].children:
+                            self.operations[parent_id].children.append(op_id)
+            except Exception:
+                pass
+
+            # 3. Fetch active plan & work orders
+            try:
+                sid = getattr(self, "session_id", None)
+                if sid:
+                    plan_obj = client.plan_get(sid)
+                    if plan_obj and isinstance(plan_obj, Mapping):
+                        wos = plan_obj.get("work_orders") or plan_obj.get("created_work_orders")
+                        if isinstance(wos, list):
+                            self.sync_work_orders(wos)
+            except Exception:
+                pass
+
     def _infer_role_from_op(self, op_name: str) -> str:
         low = op_name.lower()
         if "arch" in low or "plan" in low:
@@ -256,6 +444,8 @@ class AutonomousDeliveryState:
         """Process incoming sequenced daemon / SSE events to update delivery state."""
         if not event or not isinstance(event, Mapping):
             return
+        if hasattr(self, "scroll") and self.scroll is not None:
+            self.scroll.notify_activity()
         seq = event.get("sequence")
         if seq is not None and isinstance(seq, int):
             if seq in self.seen_sequences:
@@ -341,16 +531,23 @@ class AutonomousDeliveryState:
             self.operations[op_id] = node
             if parent_id in self.operations and op_id not in self.operations[parent_id].children:
                 self.operations[parent_id].children.append(op_id)
-            elif op_id not in self.operations["op-root"].children:
+            elif "op-root" in self.operations and op_id not in self.operations["op-root"].children:
                 self.operations["op-root"].children.append(op_id)
 
             self.add_activity(normalized_role, f"spawned ({backend})", wo_id or "")
 
         elif name in {"operation.started", "turn.started"}:
-            op_name = payload.get("operation", "")
+            op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             wo_id = payload.get("work_order_id")
+            op_id = payload.get("operation_id") or f"op-{len(self.operations)+1}"
+            backend = payload.get("backend") or (self.roles[normalized_role].backend if normalized_role in self.roles else "Codex")
+
+            # Update or register operation node
+            node = OperationNode(op_id, op_name or normalized_role, role=normalized_role, backend=backend, status="RUNNING")
+            self.operations[op_id] = node
+
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "RUNNING"
                 if wo_id:
@@ -361,10 +558,19 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, "started", op_name or (wo_id or ""))
 
         elif name in {"operation.completed", "turn.completed"}:
-            op_name = payload.get("operation", "")
+            op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             wo_id = payload.get("work_order_id")
+            op_id = payload.get("operation_id")
+
+            if op_id and op_id in self.operations:
+                self.operations[op_id].status = "COMPLETED"
+            else:
+                for op in self.operations.values():
+                    if (op.role == normalized_role or (op_name and op.name == op_name)) and op.status == "RUNNING":
+                        op.status = "COMPLETED"
+
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "COMPLETED"
             for wo in self.work_orders:
@@ -388,6 +594,13 @@ class AutonomousDeliveryState:
         elif name in {"operation.cancelled", "agent.cancelled"}:
             role = (payload.get("role") or "Agent").title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
+            op_id = payload.get("operation_id")
+            if op_id and op_id in self.operations:
+                self.operations[op_id].status = "CANCELLED"
+            else:
+                for op in self.operations.values():
+                    if op.role == normalized_role and op.status == "RUNNING":
+                        op.status = "CANCELLED"
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "CANCELLED"
             self.add_activity(normalized_role, "cancelled", payload.get("reason", ""))

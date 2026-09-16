@@ -229,3 +229,246 @@ def test_state_resilience_to_malformed_events_and_sessions():
 
     assert state.session_id == "test-session"
 
+
+# ─── Phase 4: Dynamic Runtime Panel Population (WO-044) ──────────────────────
+
+
+def test_runtime_panel_dynamic_agent_hierarchy():
+    """Verify dynamic agent hierarchy rendering with tree formatting per §7, §8."""
+    from cli.tui.runtime_panel import render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus
+
+    state = AutonomousDeliveryState(
+        session_id="test-p4-hierarchy",
+        roles={
+            "Architecture": RoleStatus("Architecture", backend="Claude", state="RUNNING"),
+            "Backend": RoleStatus("Backend", backend="Codex", state="RUNNING"),
+            "Frontend": RoleStatus("Frontend", backend="AGY", state="WAITING"),
+            "Q/A": RoleStatus("Q/A", backend="Ollama", state="WAITING"),
+            "GitOps": RoleStatus("GitOps", backend="Ollama", state="WAITING"),
+        },
+    )
+
+    out = render_runtime_panel_str(width=36, state=state)
+
+    # 1. Heading
+    assert "StackMind Runtime" in out
+    assert "AGENTS" in out
+
+    # 2. Tree hierarchy formatting
+    assert "◉ Architecture" in out
+    assert "orchestrating" in out
+    assert "├─ ● Backend" in out
+    assert "implementing" in out or "running" in out
+    assert "├─ ○ Frontend" in out
+    assert "waiting" in out
+    assert "├─ ○ Q/A" in out
+    assert "└─ ○ GitOps" in out
+
+
+def test_runtime_panel_never_hardcodes_roster():
+    """Verify runtime panel adapts dynamically to completely arbitrary project roles per §7."""
+    from cli.tui.runtime_panel import render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus
+
+    # Project with unique, non-standard agents
+    custom_roles = {
+        "LeadArchitect": RoleStatus("LeadArchitect", backend="CustomLLM", state="RUNNING"),
+        "DataEngineer": RoleStatus("DataEngineer", backend="SparkAgent", state="RUNNING"),
+        "SecurityAuditor": RoleStatus("SecurityAuditor", backend="SecBot", state="WAITING"),
+    }
+    state = AutonomousDeliveryState(session_id="custom-project", roles=custom_roles)
+
+    out = render_runtime_panel_str(width=38, state=state)
+
+    # Must render the custom roles and NOT the hardcoded default roster
+    assert "LeadArchitect" in out
+    assert "DataEngineer" in out
+    assert "SecurityAuditor" in out
+    assert "Backend" not in out
+    assert "Frontend" not in out
+    assert "GitOps" not in out
+
+
+def test_runtime_panel_all_standard_status_symbols():
+    """Verify all 8 standard status symbols from §8 are correctly mapped."""
+    from cli.tui.runtime_panel import get_status_symbol
+
+    assert get_status_symbol("orchestrating")[0] == "◉"
+    assert get_status_symbol("running")[0] == "●"
+    assert get_status_symbol("implementing")[0] == "●"
+    assert get_status_symbol("completed")[0] == "✓"
+    assert get_status_symbol("done")[0] == "✓"
+    assert get_status_symbol("waiting")[0] == "○"
+    assert get_status_symbol("idle")[0] == "○"
+    assert get_status_symbol("failed")[0] == "×"
+    assert get_status_symbol("error")[0] == "×"
+    assert get_status_symbol("cancelled")[0] == "⊘"
+    assert get_status_symbol("canceled")[0] == "⊘"
+    assert get_status_symbol("blocked")[0] == "!"
+
+
+def test_runtime_panel_work_orders_section():
+    """Verify work orders section displays actual orders with standard status symbols."""
+    from cli.tui.runtime_panel import render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState, WorkOrderItem
+
+    state = AutonomousDeliveryState(
+        session_id="test-wo-panel",
+        work_orders=[
+            WorkOrderItem("WO-044", "Dynamic Runtime Panel Population", status="RUNNING"),
+            WorkOrderItem("WO-045", "Conversation styling & markdown", status="WAITING"),
+            WorkOrderItem("WO-043", "Two-Column Workspace Layout", status="COMPLETED"),
+        ],
+    )
+
+    out = render_runtime_panel_str(width=36, state=state)
+
+    assert "WORK ORDERS" in out
+    assert "● WO-044" in out
+    assert "○ WO-045" in out
+    assert "✓ WO-043" in out
+
+
+def test_runtime_panel_current_operation_section():
+    """Verify current operation section displays compact active operation and idle state."""
+    from cli.tui.runtime_panel import render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState, OperationNode
+
+    # 1. Active operation
+    state = AutonomousDeliveryState(
+        session_id="test-op-panel",
+        operations={
+            "op-1": OperationNode("op-1", "compile_knowledge_graph", role="Backend", backend="Codex", status="RUNNING")
+        },
+    )
+    out = render_runtime_panel_str(width=36, state=state)
+    assert "CURRENT OPERATION" in out
+    assert "● Backend · Codex" in out
+    assert "compile_knowledge_graph" in out
+    assert "(running)" in out
+
+    # 2. Idle operation
+    state_idle = AutonomousDeliveryState(
+        session_id="test-op-idle",
+        operations={
+            "op-1": OperationNode("op-1", "prior_task", role="Backend", backend="Codex", status="COMPLETED")
+        },
+    )
+    out_idle = render_runtime_panel_str(width=36, state=state_idle)
+    assert "CURRENT OPERATION" in out_idle
+    assert "○ Idle" in out_idle
+
+
+def test_runtime_panel_initialization_before_first_prompt(tmp_path):
+    """Verify runtime panel initializes and populates on launch before first prompt (§9, §37)."""
+    from cli.tui.state import AutonomousDeliveryState
+    from validators.kernel.daemon import LocalDaemon
+    from validators.kernel.tui import DaemonClient
+
+    with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
+        client = DaemonClient(daemon.url)
+        session = client.create_session(
+            agent="codex",
+            provider="test",
+            contract={"scope": {}},
+            workspace=str(tmp_path),
+        )
+
+        state = AutonomousDeliveryState(project_name="init-test", session_id=session["session_id"])
+        # Populate from runtime before any user prompt
+        state.populate_from_runtime(client=client, session=session, workspace=tmp_path)
+
+        # Confirm state is populated with actual daemon data
+        assert state.session_id == session["session_id"]
+        assert len(state.roles) > 0
+        # Agent hierarchy can be extracted
+        hierarchy = state.get_agent_hierarchy()
+        assert isinstance(hierarchy, list)
+        assert len(hierarchy) > 0
+
+
+def test_runtime_panel_event_driven_state_transitions():
+    """Verify runtime state transitions are driven by daemon events without fake states (§9)."""
+    from cli.tui.runtime_panel import render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(
+        session_id="test-event-driven",
+        roles={},
+        work_orders=[],
+        operations={},
+    )
+
+    # Initial empty state
+    panel_empty = render_runtime_panel_str(width=36, state=state)
+    assert "No agents" in panel_empty
+    assert "No active orders" in panel_empty
+    assert "○ Idle" in panel_empty
+
+    # Event 1: Agent spawned
+    state.process_event({
+        "sequence": 1,
+        "name": "agent.spawned",
+        "payload": {"agent_id": "codex-1", "role": "Backend", "backend": "Codex", "work_order_id": "WO-044"},
+    })
+    panel_spawned = render_runtime_panel_str(width=36, state=state)
+    assert "Backend" in panel_spawned
+    assert "●" in panel_spawned
+
+    # Event 2: Operation started
+    state.process_event({
+        "sequence": 2,
+        "name": "operation.started",
+        "payload": {"operation": "compile_graph", "role": "Backend", "work_order_id": "WO-044"},
+    })
+    panel_running = render_runtime_panel_str(width=36, state=state)
+    assert "CURRENT OPERATION" in panel_running
+    assert "compile_graph" in panel_running
+
+    # Event 3: Operation completed
+    state.process_event({
+        "sequence": 3,
+        "name": "operation.completed",
+        "payload": {"operation": "compile_graph", "role": "Backend", "work_order_id": "WO-044"},
+    })
+    assert state.roles["Backend"].state == "COMPLETED"
+
+
+def test_runtime_panel_independent_scroll_and_activity_indicator():
+    """Verify independent vertical scroll and '↓ New runtime activity' indicator (§10)."""
+    from cli.tui.runtime_panel import RuntimePanelScroll, render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState
+
+    scroll = RuntimePanelScroll()
+    state = AutonomousDeliveryState(session_id="test-scroll", scroll=scroll)
+
+    # Initially at bottom -> live-following
+    assert scroll.follow_bottom is True
+    assert scroll.has_new_activity is False
+
+    # Scroll upward manually
+    scroll.scroll_up(3)
+    assert scroll.follow_bottom is False
+    assert scroll.scroll_offset == 3
+
+    # New runtime event arrives outside viewport
+    state.process_event({
+        "sequence": 10,
+        "name": "operation.started",
+        "payload": {"operation": "async_task", "role": "Backend"},
+    })
+    assert scroll.has_new_activity is True
+
+    # Panel rendering includes '↓ New runtime activity'
+    out = render_runtime_panel_str(width=36, state=state, scroll=scroll)
+    assert "↓ New runtime activity" in out
+
+    # Scroll back to bottom resumes live following and clears indicator
+    scroll.scroll_to_bottom()
+    assert scroll.follow_bottom is True
+    assert scroll.has_new_activity is False
+    out_resumed = render_runtime_panel_str(width=36, state=state, scroll=scroll)
+    assert "↓ New runtime activity" not in out_resumed
+
+

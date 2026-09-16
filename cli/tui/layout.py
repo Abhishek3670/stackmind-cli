@@ -88,95 +88,12 @@ def compute_layout(width: int) -> ColumnLayout:
     )
 
 
-# ── Runtime Panel Renderer ───────────────────────────────────────────────────
-
-def render_runtime_panel(
-    width: int | None = None,
-    *,
-    agents: list[dict[str, Any]] | None = None,
-    work_orders: list[dict[str, Any]] | None = None,
-    current_operation: dict[str, Any] | None = None,
-) -> RenderableType:
-    """Render the persistent StackMind Runtime panel (right column).
-
-    Phase 3 renders placeholder sections; Phase 4 will populate dynamically.
-    """
-    items: list[RenderableType] = []
-
-    # Header
-    items.append(Text(RUNTIME_HEADING, style="bold dim white", justify="center"))
-    items.append(Text(""))
-
-    # Section: AGENTS
-    items.append(Text("AGENTS", style="bold #38bdf8"))
-    if agents:
-        for agent in agents:
-            name = agent.get("name", "unknown")
-            status = agent.get("status", "idle")
-            items.append(Text(f"  {name}: {status}", style="dim white"))
-    else:
-        items.append(Text("  No agents", style="dim #475569"))
-    items.append(Text(""))
-
-    # Divider
-    items.append(Rule(style="dim #334155"))
-    items.append(Text(""))
-
-    # Section: WORK ORDERS
-    items.append(Text("WORK ORDERS", style="bold #60a5fa"))
-    if work_orders:
-        for wo in work_orders:
-            wo_id = wo.get("id", "—")
-            title = wo.get("title", "")
-            items.append(Text(f"  {wo_id}: {title}", style="dim white"))
-    else:
-        items.append(Text("  No active orders", style="dim #475569"))
-    items.append(Text(""))
-
-    # Divider
-    items.append(Rule(style="dim #334155"))
-    items.append(Text(""))
-
-    # Section: CURRENT OPERATION
-    items.append(Text("CURRENT OPERATION", style="bold #a855f7"))
-    if current_operation:
-        op_name = current_operation.get("name", "—")
-        op_status = current_operation.get("status", "—")
-        items.append(Text(f"  {op_name}", style="dim white"))
-        items.append(Text(f"  {op_status}", style="dim #475569"))
-    else:
-        items.append(Text("  Idle", style="dim #475569"))
-
-    return Panel(
-        Group(*items),
-        box=box.SIMPLE,
-        border_style="dim #334155",
-        padding=(0, 1),
-        width=width,
-    )
-
-
-def render_runtime_panel_str(
-    width: int = 30,
-    *,
-    agents: list[dict[str, Any]] | None = None,
-    work_orders: list[dict[str, Any]] | None = None,
-    current_operation: dict[str, Any] | None = None,
-) -> str:
-    """Render the runtime panel as plain formatted string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(
-        file=buf, record=True, width=width, force_terminal=False, color_system=None
-    )
-    console.print(
-        render_runtime_panel(
-            width=width,
-            agents=agents,
-            work_orders=work_orders,
-            current_operation=current_operation,
-        )
-    )
-    return console.export_text().rstrip()
+from cli.tui.runtime_panel import (
+    RuntimePanelScroll,
+    get_status_symbol,
+    render_runtime_panel,
+    render_runtime_panel_str,
+)
 
 
 # ── Two-Column Compositor ────────────────────────────────────────────────────
@@ -188,6 +105,8 @@ def render_workspace_layout(
     agents: list[dict[str, Any]] | None = None,
     work_orders: list[dict[str, Any]] | None = None,
     current_operation: dict[str, Any] | None = None,
+    state: Any | None = None,
+    scroll: RuntimePanelScroll | None = None,
 ) -> RenderableType:
     """Compose the full two-column workspace layout.
 
@@ -210,6 +129,8 @@ def render_workspace_layout(
         agents=agents,
         work_orders=work_orders,
         current_operation=current_operation,
+        state=state,
+        scroll=scroll,
     )
 
     divider_char = Text("│", style="dim #334155")
@@ -225,6 +146,8 @@ def render_workspace_layout_str(
     agents: list[dict[str, Any]] | None = None,
     work_orders: list[dict[str, Any]] | None = None,
     current_operation: dict[str, Any] | None = None,
+    state: Any | None = None,
+    scroll: RuntimePanelScroll | None = None,
 ) -> str:
     """Render the full workspace layout as plain text."""
     buf = io.StringIO()
@@ -238,6 +161,8 @@ def render_workspace_layout_str(
             agents=agents,
             work_orders=work_orders,
             current_operation=current_operation,
+            state=state,
+            scroll=scroll,
         )
     )
     return console.export_text().rstrip()
@@ -250,7 +175,9 @@ __all__ = [
     "RUNTIME_MIN_WIDTH",
     "RUNTIME_SECTIONS",
     "ColumnLayout",
+    "RuntimePanelScroll",
     "compute_layout",
+    "get_status_symbol",
     "render_runtime_panel",
     "render_runtime_panel_str",
     "render_workspace_layout",

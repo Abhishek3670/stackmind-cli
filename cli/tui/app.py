@@ -70,6 +70,10 @@ from cli.tui.landing import (
     render_landing_block,
     render_landing_block_str,
 )
+from cli.tui.layout import (
+    render_runtime_panel_str,
+    render_workspace_layout_str,
+)
 from cli.tui.state import (
     ActivityEntry,
     AutonomousDeliveryState,
@@ -982,6 +986,10 @@ def dispatch_delivery_command(
         click.echo(render_landing_block_str(session=session, status=state.connection_status, width=80))
         return session, False
 
+    if normalized == ":runtime":
+        click.echo(render_runtime_panel_str(width=36, state=state))
+        return session, False
+
     if normalized.startswith(":") and not normalized.startswith(":prompt "):
         click.echo("Unknown command. Type :help.")
         return session, False
@@ -1162,6 +1170,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             project_name=workspace.resolve().name, session_id=session["session_id"]
         )
         state.update_from_session(session)
+        state.populate_from_runtime(client=client, session=session, workspace=workspace.resolve())
 
         # Recover any pre-existing events/transcript from daemon session
         try:
