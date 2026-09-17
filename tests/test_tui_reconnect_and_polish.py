@@ -49,6 +49,7 @@ from cli.tui.state import (
     AutonomousDeliveryState,
     ChatMessage,
     ConversationScroll,
+    OperationNode,
     ProjectPhase,
 )
 from validators.kernel.tui import DaemonClient, StackMindTuiAdapter
@@ -75,6 +76,8 @@ class _MockReconnectionClient:
         self.cancels: list[str] = []
         self.approvals: list[tuple[str, bool, str]] = []
         self.turns: list[tuple[str, str]] = []
+        self.operations_db: dict[str, dict[str, Any]] = {}
+        self.cancelled_operations: list[str] = []
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         if not self.is_connected:
@@ -95,7 +98,29 @@ class _MockReconnectionClient:
         if not self.is_connected:
             raise ConnectionError("Connection refused by daemon")
         self.turns.append((session_id, prompt))
-        return {"operation_id": f"op-{len(self.turns)}"}
+        op_id = f"op-{len(self.turns)}"
+        if op_id not in self.operations_db:
+            self.operations_db[op_id] = {"operation_id": op_id, "status": "RUNNING"}
+        return {"operation_id": op_id}
+
+    def operation_get(self, operation_id: str) -> dict[str, Any]:
+        if not self.is_connected:
+            raise ConnectionError("Connection refused by daemon")
+        return self.operations_db.get(operation_id, {"operation_id": operation_id, "status": "RUNNING"})
+
+    def operation_cancel(self, operation_id: str, cascade: bool = True) -> dict[str, Any]:
+        if not self.is_connected:
+            raise ConnectionError("Connection refused by daemon")
+        self.cancelled_operations.append(operation_id)
+        if operation_id in self.operations_db:
+            self.operations_db[operation_id]["status"] = "CANCELLED"
+        return {"operation_id": operation_id, "status": "CANCELLED"}
+
+    def cancel_agent(self, agent_id: str, session_id: str | None = None) -> dict[str, Any]:
+        if not self.is_connected:
+            raise ConnectionError("Connection refused by daemon")
+        self.cancelled_operations.append(agent_id)
+        return {"agent_id": agent_id, "status": "CANCELLED"}
 
     def pause(self, session_id: str) -> dict[str, Any]:
         if not self.is_connected:
@@ -596,4 +621,133 @@ def test_responsive_workspace_layout_dimensions():
     assert layout_160.show_runtime is True
     assert layout_160.runtime_width <= 42
     assert layout_160.conversation_width + layout_160.runtime_width + 1 == 160
+
+
+# ── Phase 9: Reconnect, Timeout & Error Handling Tests (§38–§40) ─────────────
+
+def test_client_wait_timeout_demarcation_and_non_failure():
+    """Verify client wait timeout is strictly demarcated and does NOT emit FAILED/STOPPED (§40)."""
+    client = _MockReconnectionClient("session-timeout-1")
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    state = AutonomousDeliveryState(session_id="session-timeout-1")
+
+    # Run turn with small client_timeout to trigger wait timeout deterministically
+    session, should_exit = dispatch_delivery_command(
+        adapter, client, client.session_data, "long running task", state, client_timeout=0.05  # type: ignore[arg-type]
+    )
+
+    assert should_exit is False
+    # Verify exact required timeout message
+    expected_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
+    assert any(m.role == "system" and m.content == expected_msg for m in state.messages)
+
+    # Verify operation was created and preserved as RUNNING (never marked FAILED or STOPPED)
+    assert "op-1" in state.operations
+    assert state.operations["op-1"].status == "RUNNING"
+    assert state.operations["op-1"].status not in {"FAILED", "STOPPED", "ERROR"}
+
+
+def test_late_completion_appears_once_without_duplication():
+    """Verify late completions from background operations appear once without duplicating transcripts (§39, §40)."""
+    client = _MockReconnectionClient("session-late-1")
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    state = AutonomousDeliveryState(session_id="session-late-1")
+
+    # 1. Initial turn times out at client level
+    dispatch_delivery_command(
+        adapter, client, client.session_data, "compute report", state, client_timeout=0.05  # type: ignore[arg-type]
+    )
+    assert state.operations["op-1"].status == "RUNNING"
+    initial_msg_count = len(state.messages)
+
+    # 2. Daemon operation completes in the background
+    client.operations_db["op-1"]["status"] = "COMPLETED"
+    client.events_db.append({
+        "sequence": 1,
+        "name": "operation.completed",
+        "payload": {
+            "operation_id": "op-1",
+            "status": "COMPLETED",
+            "result": {"response": "Background calculation finished successfully."},
+        },
+    })
+
+    # 3. User checks :status -> recovers the late completion
+    dispatch_delivery_command(adapter, client, client.session_data, ":status", state)  # type: ignore[arg-type]
+
+    # Verify assistant message was added once
+    late_msgs = [m for m in state.messages if m.role == "assistant" and "Background calculation finished" in m.content]
+    assert len(late_msgs) == 1
+    assert state.operations["op-1"].status == "COMPLETED"
+
+    # 4. User runs :events -> does NOT duplicate the assistant message
+    dispatch_delivery_command(adapter, client, client.session_data, ":events", state)  # type: ignore[arg-type]
+    late_msgs_after_events = [m for m in state.messages if m.role == "assistant" and "Background calculation finished" in m.content]
+    assert len(late_msgs_after_events) == 1
+
+    # 5. User reconnects via :reconnect -> does NOT duplicate the assistant message
+    dispatch_delivery_command(adapter, client, client.session_data, ":reconnect", state)  # type: ignore[arg-type]
+    late_msgs_after_recon = [m for m in state.messages if m.role == "assistant" and "Background calculation finished" in m.content]
+    assert len(late_msgs_after_recon) == 1
+
+
+def test_authoritative_cancellation_routes_to_daemon():
+    """Verify user cancellation routes through authoritative daemon path and updates state cleanly (§39, §40)."""
+    client = _MockReconnectionClient("session-cancel-1")
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    state = AutonomousDeliveryState(session_id="session-cancel-1")
+
+    # Set up running operations and roles
+    client.operations_db["op-worker-1"] = {"operation_id": "op-worker-1", "status": "RUNNING"}
+    state.operations["op-worker-1"] = OperationNode(
+        "op-worker-1", "Backend Task", role="Backend", backend="Codex", status="RUNNING"
+    )
+    state.roles["Backend"].state = "RUNNING"
+
+    # 1. Target-specific cancellation: :cancel op-worker-1
+    dispatch_delivery_command(adapter, client, client.session_data, ":cancel op-worker-1", state)  # type: ignore[arg-type]
+    assert "op-worker-1" in client.cancelled_operations
+    assert state.operations["op-worker-1"].status == "CANCELLED"
+    assert state.operations["op-worker-1"].status not in {"FAILED", "ERROR"}
+
+    # 2. General session turn cancellation: :cancel
+    state.operations["op-worker-2"] = OperationNode(
+        "op-worker-2", "Another Task", role="Backend", backend="Codex", status="RUNNING"
+    )
+    dispatch_delivery_command(adapter, client, client.session_data, ":cancel", state)  # type: ignore[arg-type]
+    assert "session-cancel-1" in client.cancels
+    assert client.session_data["state"] == "CANCELLED"
+    # Session-wide cancellation marks running operations and roles CANCELLED
+    assert state.operations["op-worker-2"].status == "CANCELLED"
+    assert state.roles["Backend"].state == "CANCELLED"
+    assert state.roles["Backend"].state not in {"FAILED", "ERROR"}
+
+
+def test_chat_separation_from_raw_session_history():
+    """Verify raw session history/journal is not conflated with structured chat turns (§38, §39)."""
+    state = AutonomousDeliveryState(session_id="session-sep-1")
+
+    # Raw daemon events including non-chat internal operations
+    events = [
+        {"sequence": 1, "name": "operation.started", "payload": {"operation": "internal_cache_warmup"}},
+        {"sequence": 2, "name": "turn.started", "payload": {"prompt": "What is the project phase?"}},
+        {"sequence": 3, "name": "event.toolCall", "payload": {"tool_name": "read", "arguments": {"path": "state.py"}}},
+        {"sequence": 4, "name": "event.toolResult", "payload": {"tool_name": "read", "status": "completed", "response": "The project is in Phase 9."}},
+        {"sequence": 5, "name": "operation.completed", "payload": {"operation": "internal_cache_warmup", "status": "COMPLETED"}},
+    ]
+
+    recovered = recover_transcript_from_events(events, state)
+
+    # Transcript should ONLY contain structured user turn and assistant answer
+    assert len(state.messages) == 2
+    assert state.messages[0].role == "user"
+    assert state.messages[0].content == "What is the project phase?"
+    assert state.messages[1].role == "assistant"
+    assert state.messages[1].content == "The project is in Phase 9."
+
+    # Internal operation events are tracked in activity_log, NOT dumped into chat messages
+    chat_transcript = render_chat_transcript_str(state.messages)
+    assert "internal_cache_warmup" not in chat_transcript
+    assert "What is the project phase?" in chat_transcript
+    assert "The project is in Phase 9." in chat_transcript
 

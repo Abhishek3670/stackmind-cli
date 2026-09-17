@@ -385,12 +385,33 @@ def extract_assistant_response(
         if reason and isinstance(reason, str) and reason.strip():
             return clean_response(reason)
 
+        message = result.get("message")
+        if message and isinstance(message, str) and message.strip():
+            return clean_response(message)
+
+        text = result.get("text")
+        if text and isinstance(text, str) and text.strip():
+            return clean_response(text)
+
+        output = result.get("output")
+        if output and isinstance(output, str) and output.strip():
+            return clean_response(output)
+
     # 2. Inspect direct payload keys
     if isinstance(payload.get("response"), str) and payload["response"].strip():
         return clean_response(payload["response"])
 
     if isinstance(payload.get("summary"), str) and payload["summary"].strip():
         return clean_response(payload["summary"])
+
+    if isinstance(payload.get("message"), str) and payload["message"].strip():
+        return clean_response(payload["message"])
+
+    if isinstance(payload.get("text"), str) and payload["text"].strip():
+        return clean_response(payload["text"])
+
+    if isinstance(payload.get("output"), str) and payload["output"].strip():
+        return clean_response(payload["output"])
 
     return None
 

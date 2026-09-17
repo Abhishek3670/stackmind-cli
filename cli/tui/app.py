@@ -823,6 +823,8 @@ def dispatch_delivery_command(
     session: dict[str, Any],
     text: str,
     state: AutonomousDeliveryState,
+    *,
+    client_timeout: float = 45.0,
 ) -> tuple[dict[str, Any], bool]:
     """Dispatch interactive TUI commands, updating delivery state reactively."""
     normalized = text.strip()
@@ -853,6 +855,12 @@ def dispatch_delivery_command(
         try:
             session = adapter.command(":status", session_id=session["session_id"])
             state.connection_status = "online"
+            sid = session.get("session_id")
+            if sid:
+                missed = client.events(sid, after=state.last_sequence)
+                if missed:
+                    workspace = Path(session["workspace"]) if session.get("workspace") else None
+                    recover_transcript_from_events(missed, state, workspace=workspace)
         except Exception as err:
             if is_connection_error(err):
                 state.connection_status = "reconnecting"
@@ -1009,18 +1017,26 @@ def dispatch_delivery_command(
         if clean_target:
             try:
                 client.cancel_agent(clean_target, session_id=session["session_id"])
+                if clean_target in state.operations:
+                    state.operations[clean_target].status = "CANCELLED"
+                for role_key, role_obj in state.roles.items():
+                    if role_key.lower() == clean_target.lower() or getattr(role_obj, "agent_id", "") == clean_target:
+                        role_obj.state = "CANCELLED"
                 click.echo(f"Agent/Operation {clean_target} CANCELLED")
                 return session, False
             except Exception:
                 try:
                     client.operation_cancel(clean_target)
+                    if clean_target in state.operations:
+                        state.operations[clean_target].status = "CANCELLED"
                     click.echo(f"Operation {clean_target} CANCELLED")
                     return session, False
                 except Exception as e:
-                    click.echo(f"Cancellation error: {e}")
+                    click.echo(render_error_box_str(f"Cancellation error: {e}", title="CANCEL ERROR"))
                     return session, False
         # General session turn cancellation
         session = adapter.command(":cancel", session_id=session["session_id"])
+        state.update_from_session(session)
         click.echo(f"Session {session.get('state', 'CANCELLED')}")
         return session, False
 
@@ -1054,15 +1070,16 @@ def dispatch_delivery_command(
             events = adapter.command(":events", session_id=session["session_id"])
             rendered_any = False
             if events:
-                recover_transcript_from_events(events, state)
+                workspace = Path(session["workspace"]) if session.get("workspace") else None
+                recovered_msgs = recover_transcript_from_events(events, state, workspace=workspace)
                 for event in events:
                     ev_str = render_operational_event_str(event)
                     if ev_str:
                         click.echo(ev_str)
                         rendered_any = True
-                    resp = extract_assistant_response(event.get("payload", {}))
-                    if resp:
-                        click.echo(render_assistant_message_str(resp))
+                for msg in recovered_msgs:
+                    if msg.role == "assistant":
+                        click.echo(render_assistant_message_str(msg.content, actions=msg.actions, thinking=msg.thinking))
                         rendered_any = True
             if not rendered_any:
                 click.echo("No new events.")
@@ -1138,13 +1155,15 @@ def dispatch_delivery_command(
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         state.add_activity("User", "submitted turn", op_id)
+        if op_id and op_id not in state.operations:
+            state.operations[op_id] = OperationNode(op_id, "Turn", role="Backend", backend="Codex", status="RUNNING")
         # This is a local wait indicator, not a claim about daemon state.
         status_line = Text("● Thinking… Turn submitted to the governed daemon.", style="dim #64748b")
         click.echo(status_line)
 
         # Synchronously await turn completion while consuming events
         workspace = Path(session["workspace"]) if session.get("workspace") else None
-        max_wait = 45.0
+        max_wait = client_timeout
         start_time = time.time()
         completed = False
         assistant_rendered = False
@@ -1262,9 +1281,9 @@ def dispatch_delivery_command(
                 state.add_message("assistant", completion_msg, actions=turn_acts)
                 click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
             else:
-                timeout_msg = "Still waiting for the daemon; the operation may continue in the background. Use :status or :events to check it."
+                timeout_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
                 state.add_message("system", timeout_msg)
-                click.echo(render_error_box_str(timeout_msg, title="TURN WAIT TIMEOUT"))
+                click.echo(render_error_box_str(timeout_msg, title="REQUEST TIMEOUT", hint="Use :status or :events to inspect."))
     except Exception as err:
         if is_connection_error(err):
             state.connection_status = "reconnecting"
@@ -1292,11 +1311,13 @@ def _dispatch_command(
     session: dict[str, Any],
     text: str,
     state: AutonomousDeliveryState | None = None,
+    *,
+    client_timeout: float = 45.0,
 ) -> tuple[dict[str, Any], bool]:
     if state is None:
         state = AutonomousDeliveryState(session_id=session.get("session_id", "session-1"))
         state.update_from_session(session)
-    return dispatch_delivery_command(adapter, client, session, text, state)
+    return dispatch_delivery_command(adapter, client, session, text, state, client_timeout=client_timeout)
 
 
 @click.command("tui")

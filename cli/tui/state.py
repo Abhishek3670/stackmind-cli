@@ -529,6 +529,14 @@ class AutonomousDeliveryState:
         if not session or not isinstance(session, Mapping):
             return
         self.session_id = str(session.get("session_id", self.session_id))
+        st_raw = str(session.get("state", "")).upper()
+        if st_raw == "CANCELLED":
+            for op in self.operations.values():
+                if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                    op.status = "CANCELLED"
+            for role_obj in self.roles.values():
+                if role_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                    role_obj.state = "CANCELLED"
         # Check plans in session
         plans = session.get("plans")
         if isinstance(plans, Mapping) and plans:
@@ -912,17 +920,24 @@ class AutonomousDeliveryState:
 
             self.add_activity(normalized_role, "completed", op_name or (wo_id or ""))
 
-        elif name in {"operation.cancelled", "agent.cancelled"}:
+        elif name in {"operation.cancelled", "agent.cancelled", "turn.cancelled", "session.cancelled"}:
             role = (payload.get("role") or "Agent").title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             op_id = payload.get("operation_id")
             if op_id and op_id in self.operations:
                 self.operations[op_id].status = "CANCELLED"
+            elif name == "session.cancelled":
+                for op in self.operations.values():
+                    if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                        op.status = "CANCELLED"
+                for r in self.roles.values():
+                    if r.state.upper() in {"RUNNING", "ACTIVE"}:
+                        r.state = "CANCELLED"
             else:
                 for op in self.operations.values():
                     if op.role == normalized_role and op.status == "RUNNING":
                         op.status = "CANCELLED"
-            if normalized_role in self.roles:
+            if normalized_role in self.roles and name != "session.cancelled":
                 self.roles[normalized_role].state = "CANCELLED"
             self.add_activity(normalized_role, "cancelled", payload.get("reason", ""))
 
