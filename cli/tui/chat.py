@@ -87,14 +87,79 @@ def render_user_message_str(
     return console.export_text().rstrip()
 
 
+def render_actions_group(
+    group: Any,
+) -> RenderableType:
+    """Render compact Actions disclosure group per §20, §21."""
+    if isinstance(group, list):
+        from cli.tui.state import ActionsGroup
+        actions_obj = ActionsGroup(actions=group)
+    else:
+        actions_obj = group
+
+    if not actions_obj or getattr(actions_obj, "is_empty", False):
+        return Text("")
+
+    arrow = "▾" if actions_obj.expanded else "▸"
+    count = len(actions_obj.actions)
+    if getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
+        suffix = f"{count}"
+    else:
+        suffix = f"{count} completed"
+
+    header = Text()
+    header.append(f"{arrow} ", style="bold cyan")
+    header.append("Actions", style="bold white")
+    header.append(" · ", style="dim")
+    header.append(suffix, style="dim white")
+
+    if not actions_obj.expanded:
+        return header
+
+    lines: list[RenderableType] = [header]
+    for act in actions_obj.actions:
+        line = Text("  ")
+        sym = act.symbol
+        if sym == "✓":
+            line.append(sym, style="bold green")
+        elif sym == "●":
+            line.append(sym, style="bold yellow")
+        elif sym == "×":
+            line.append(sym, style="bold red")
+        elif sym == "⊘":
+            line.append(sym, style="dim white")
+        else:
+            line.append(sym, style="white")
+
+        line.append(f" {act.description}", style="white")
+        if getattr(act, "error", None) and str(getattr(act, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"}:
+            line.append(f" ({act.error})", style="bold red")
+        lines.append(line)
+
+    return Group(*lines)
+
+
+def render_actions_group_str(
+    group: Any,
+    width: int = 80,
+) -> str:
+    """Render actions disclosure group as plain formatted string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_actions_group(group))
+    return console.export_text().rstrip()
+
+
 def render_assistant_message(
     content: str,
     timestamp: str | None = None,
     *,
     show_timestamp: bool | None = None,
     inline_diffs: bool = True,
+    actions: Any | None = None,
+    thinking: str | None = None,
 ) -> RenderableType:
-    """Render an assistant message with '✦ StackMind' header (§15), rich Markdown (§32), and breathing room (§16)."""
+    """Render an assistant message with '✦ StackMind' header (§15), dynamic turn regions (§18, §20, §24), and rich Markdown (§32)."""
     hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
 
     # Per §17: Suppress timestamps from normal chat rows unless explicitly enabled
@@ -111,20 +176,44 @@ def render_assistant_message(
     else:
         top_elem = hdr
 
+    elements: list[RenderableType] = [top_elem]
+
+    # Dynamic Region 1: Turn Actions disclosure group (§18, §20, §21)
+    if actions is not None:
+        if isinstance(actions, list):
+            from cli.tui.state import ActionsGroup
+            actions_obj = ActionsGroup(actions=actions)
+        else:
+            actions_obj = actions
+        if not getattr(actions_obj, "is_empty", False):
+            elements.append(Text(""))
+            elements.append(render_actions_group(actions_obj))
+
+    # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24)
+    if thinking and thinking.strip():
+        elements.append(Text(""))
+        clean_think = thinking.strip()
+        think_text = Text("Thinking...\n", style="dim italic #94a3b8")
+        for tline in clean_think.splitlines():
+            think_text.append(f"  {tline}\n", style="dim #cbd5e1")
+        elements.append(think_text)
+
     cleaned = strip_internal_reasoning(content)
 
-    # Check for raw unified diff to render cleanly inline per §32, §33
-    if inline_diffs and (
-        cleaned.startswith("diff --git ")
-        or (cleaned.startswith("--- ") and "\n+++ " in cleaned)
-    ):
-        from cli.tui.diff import render_unified_diff
-        body: RenderableType = render_unified_diff(cleaned)
-    else:
-        body = Markdown(cleaned, code_theme="monokai")
+    # Dynamic Region 3: Final assistant response (§18, §32)
+    if cleaned:
+        elements.append(Text(""))
+        if inline_diffs and (
+            cleaned.startswith("diff --git ")
+            or (cleaned.startswith("--- ") and "\n+++ " in cleaned)
+        ):
+            from cli.tui.diff import render_unified_diff
+            body: RenderableType = render_unified_diff(cleaned)
+        else:
+            body = Markdown(cleaned, code_theme="monokai")
+        elements.append(body)
 
-    # Generous breathing room: header, blank line, and rich Markdown body (§16)
-    return Group(top_elem, Text(""), body)
+    return Group(*elements)
 
 
 def render_assistant_message_str(
@@ -134,6 +223,8 @@ def render_assistant_message_str(
     *,
     show_timestamp: bool | None = None,
     inline_diffs: bool = True,
+    actions: Any | None = None,
+    thinking: str | None = None,
 ) -> str:
     """Render an assistant message as plain formatted string using in-memory capture."""
     buf = io.StringIO()
@@ -144,6 +235,8 @@ def render_assistant_message_str(
             timestamp=timestamp,
             show_timestamp=show_timestamp,
             inline_diffs=inline_diffs,
+            actions=actions,
+            thinking=thinking,
         )
     )
     return console.export_text().rstrip()
@@ -180,6 +273,8 @@ def render_chat_transcript(
                     msg.content,
                     timestamp=msg.timestamp if show_timestamps else None,
                     show_timestamp=show_timestamps,
+                    actions=getattr(msg, "actions", None),
+                    thinking=getattr(msg, "thinking", None),
                 )
             )
         elif role == "tool":
@@ -229,6 +324,8 @@ def render_chat_transcript_str(
 
 
 __all__ = [
+    "render_actions_group",
+    "render_actions_group_str",
     "render_assistant_message",
     "render_assistant_message_str",
     "render_chat_transcript",

@@ -28,6 +28,8 @@ from rich.table import Table
 from rich.text import Text
 
 from cli.tui.chat import (
+    render_actions_group,
+    render_actions_group_str,
     render_assistant_message,
     render_assistant_message_str,
     render_chat_transcript,
@@ -631,6 +633,7 @@ def _show_help() -> None:
         "  :pause            Pause active session turn\n"
         "  :resume           Resume active session\n"
         "  :chat             Display conversation transcript\n"
+        "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
         "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
         "  :exit, :quit, q   Gracefully stop daemon and exit\n"
@@ -990,6 +993,41 @@ def dispatch_delivery_command(
         click.echo(render_runtime_panel_str(width=36, state=state))
         return session, False
 
+    if normalized.startswith(":actions"):
+        _, _, subcmd = normalized.partition(" ")
+        subcmd = subcmd.strip().lower()
+        target_group = state.get_latest_actions_group()
+        if not target_group or target_group.is_empty:
+            click.echo("No actions recorded for the current turn.")
+            return session, False
+
+        if subcmd in {"expand", "open"}:
+            target_group.expand()
+        elif subcmd in {"collapse", "close"}:
+            target_group.collapse()
+        elif subcmd.isdigit():
+            idx = int(subcmd)
+            state.toggle_actions(turn_index=idx)
+            target_group = state.get_latest_actions_group()
+        else:
+            target_group.toggle()
+
+        click.echo(render_actions_group_str(target_group))
+        return session, False
+
+    if (
+        normalized in {":click actions", ":mouse click actions", ":click"}
+        or normalized.startswith("\x1b[<")
+        or normalized.startswith("\x1b[M")
+    ):
+        target_group = state.get_latest_actions_group()
+        if target_group and not target_group.is_empty:
+            target_group.handle_click()
+            click.echo(render_actions_group_str(target_group))
+        else:
+            click.echo("No actions to toggle.")
+        return session, False
+
     if normalized.startswith(":") and not normalized.startswith(":prompt "):
         click.echo("Unknown command. Type :help.")
         return session, False
@@ -1022,8 +1060,9 @@ def dispatch_delivery_command(
                     click.echo(ev_str)
                 resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
                 if resp and not assistant_rendered:
-                    state.add_message("assistant", resp)
-                    click.echo(render_assistant_message_str(resp))
+                    turn_acts = state.current_turn_actions
+                    state.add_message("assistant", resp, actions=turn_acts)
+                    click.echo(render_assistant_message_str(resp, actions=turn_acts))
                     assistant_rendered = True
 
             try:
@@ -1038,8 +1077,9 @@ def dispatch_delivery_command(
                             click.echo(ev_str)
                         resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
                         if resp and not assistant_rendered:
-                            state.add_message("assistant", resp)
-                            click.echo(render_assistant_message_str(resp))
+                            turn_acts = state.current_turn_actions
+                            state.add_message("assistant", resp, actions=turn_acts)
+                            click.echo(render_assistant_message_str(resp, actions=turn_acts))
                             assistant_rendered = True
 
                     if not assistant_rendered:
@@ -1062,8 +1102,9 @@ def dispatch_delivery_command(
                                 except Exception:
                                     pass
                         if summary:
-                            state.add_message("assistant", summary)
-                            click.echo(render_assistant_message_str(summary))
+                            turn_acts = state.current_turn_actions
+                            state.add_message("assistant", summary, actions=turn_acts)
+                            click.echo(render_assistant_message_str(summary, actions=turn_acts))
                             assistant_rendered = True
                         elif op_status in {"FAILED", "CANCELLED"}:
                             err_raw = (
@@ -1077,7 +1118,8 @@ def dispatch_delivery_command(
                                 err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
                             else:
                                 err_msg = str(err_raw)
-                            state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}")
+                            turn_acts = state.current_turn_actions
+                            state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
                             click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
                             assistant_rendered = True
                     break
@@ -1099,12 +1141,14 @@ def dispatch_delivery_command(
                     err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
                 else:
                     err_msg = str(err_raw)
-                state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}")
+                turn_acts = state.current_turn_actions
+                state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
                 click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
             elif completed:
                 completion_msg = f"Turn operation {op_id} completed."
-                state.add_message("assistant", completion_msg)
-                click.echo(render_assistant_message_str(completion_msg))
+                turn_acts = state.current_turn_actions
+                state.add_message("assistant", completion_msg, actions=turn_acts)
+                click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
             else:
                 timeout_msg = "Still waiting for the daemon; the operation may continue in the background. Use :status or :events to check it."
                 state.add_message("system", timeout_msg)

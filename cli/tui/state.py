@@ -92,10 +92,143 @@ class ActivityEntry:
 
 
 @dataclass
+class TurnAction:
+    """Individual action invocation within an assistant turn (§19–§21)."""
+
+    action_id: str
+    description: str
+    status: str = "RUNNING"  # RUNNING, COMPLETED, FAILED, CANCELLED
+    duration_seconds: float | None = None
+    error: str | None = None
+
+    @property
+    def symbol(self) -> str:
+        s = self.status.upper()
+        if s in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}:
+            return "✓"
+        if s in {"FAILED", "FAILURE", "ERROR"}:
+            return "×"
+        if s in {"CANCELLED", "CANCELED"}:
+            return "⊘"
+        return "●"
+
+
+@dataclass
+class ActionsGroup:
+    """Turn-specific Actions disclosure group (§20–§23)."""
+
+    actions: list[TurnAction] = field(default_factory=list)
+    expanded: bool = False
+    active: bool = False
+    turn_id: str | None = None
+
+    def add_or_update(
+        self,
+        action_id: str,
+        description: str = "",
+        status: str = "RUNNING",
+        duration_seconds: float | None = None,
+        error: str | None = None,
+    ) -> TurnAction:
+        """Add new action or update existing invocation in-place (§21)."""
+        for a in self.actions:
+            if a.action_id == action_id:
+                a.status = status
+                if description and (not a.description or a.description == a.action_id):
+                    a.description = description
+                if duration_seconds is not None:
+                    a.duration_seconds = duration_seconds
+                if error is not None:
+                    a.error = error
+                return a
+        act = TurnAction(
+            action_id=action_id,
+            description=description or action_id,
+            status=status,
+            duration_seconds=duration_seconds,
+            error=error,
+        )
+        self.actions.append(act)
+        return act
+
+    def complete_action(
+        self,
+        action_id: str,
+        status: str = "COMPLETED",
+        duration_seconds: float | None = None,
+        error: str | None = None,
+    ) -> TurnAction | None:
+        """Complete an existing action in-place without duplicate cards (§21)."""
+        for a in self.actions:
+            if a.action_id == action_id:
+                a.status = status
+                if duration_seconds is not None:
+                    a.duration_seconds = duration_seconds
+                if error is not None:
+                    a.error = error
+                return a
+        act = TurnAction(
+            action_id=action_id,
+            description=action_id,
+            status=status,
+            duration_seconds=duration_seconds,
+            error=error,
+        )
+        self.actions.append(act)
+        return act
+
+    def toggle(self) -> bool:
+        """Toggle disclosure expansion (§22, §23)."""
+        self.expanded = not self.expanded
+        return self.expanded
+
+    def expand(self) -> None:
+        """Expand actions disclosure (§22)."""
+        self.expanded = True
+
+    def collapse(self) -> None:
+        """Collapse actions disclosure (§22)."""
+        self.expanded = False
+
+    def handle_click(self, x: int | None = None, y: int | None = None) -> bool:
+        """Handle mouse click on disclosure (approved mouse exception per §23)."""
+        return self.toggle()
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self.actions) == 0
+
+    @property
+    def has_running(self) -> bool:
+        return any(a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"} for a in self.actions)
+
+    @property
+    def count(self) -> int:
+        return len(self.actions)
+
+    @property
+    def completed_count(self) -> int:
+        return sum(1 for a in self.actions if a.status.upper() in {"COMPLETED", "SUCCESS", "DONE", "PASSED"})
+
+    def format_header_text(self) -> str:
+        """Format the summary header line per §20 and §21."""
+        arrow = "▾" if self.expanded else "▸"
+        count = len(self.actions)
+        if self.active or self.has_running:
+            suffix = f"{count}"
+        else:
+            suffix = f"{count} completed"
+        return f"{arrow} Actions · {suffix}"
+
+
+@dataclass
 class ChatMessage:
     role: str  # "user", "assistant", "system"
     content: str
     timestamp: str = ""
+    actions: ActionsGroup | None = None
+    thinking: str | None = None
+    turn_id: str | None = None
 
 
 from cli.tui.runtime_panel import RuntimePanelScroll
@@ -174,6 +307,7 @@ class AutonomousDeliveryState:
         self.seen_sequences: set[int] = set()
         self.seen_message_keys: set[tuple[str, str]] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
+        self.current_turn_actions: ActionsGroup = ActionsGroup(active=False)
 
     def now_str(self) -> str:
         return datetime.datetime.now().strftime("%H:%M")
@@ -185,17 +319,140 @@ class AutonomousDeliveryState:
                     return
         self.activity_log.append(ActivityEntry(self.now_str(), role, action, target))
 
-    def add_message(self, role: str, content: str, deduplicate: bool = False) -> ChatMessage:
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        deduplicate: bool = False,
+        *,
+        actions: ActionsGroup | None = None,
+        thinking: str | None = None,
+        turn_id: str | None = None,
+    ) -> ChatMessage:
         clean = content.strip()
         key = (role, clean)
         if deduplicate and key in self.seen_message_keys:
             for m in self.messages:
                 if m.role == role and m.content.strip() == clean:
+                    if actions is not None:
+                        m.actions = actions
+                    if thinking is not None:
+                        m.thinking = thinking
                     return m
         self.seen_message_keys.add(key)
-        msg = ChatMessage(role=role, content=content, timestamp=self.now_str())
+
+        msg_actions = actions
+        if role == "assistant" and msg_actions is None and self.current_turn_actions and not self.current_turn_actions.is_empty:
+            msg_actions = self.current_turn_actions
+            msg_actions.active = False
+            self.current_turn_actions = ActionsGroup(active=False)
+
+        msg = ChatMessage(
+            role=role,
+            content=content,
+            timestamp=self.now_str(),
+            actions=msg_actions,
+            thinking=thinking,
+            turn_id=turn_id,
+        )
         self.messages.append(msg)
         return msg
+
+    def record_turn_action(
+        self,
+        action_id: str,
+        description: str = "",
+        status: str = "RUNNING",
+        duration_seconds: float | None = None,
+        error: str | None = None,
+    ) -> TurnAction:
+        """Record or update a turn action in-place (§21)."""
+        if not self.current_turn_actions.active:
+            self.current_turn_actions.active = True
+        action = self.current_turn_actions.add_or_update(
+            action_id=action_id,
+            description=description,
+            status=status,
+            duration_seconds=duration_seconds,
+            error=error,
+        )
+        if self.messages and self.messages[-1].role == "assistant":
+            if self.messages[-1].actions is None:
+                self.messages[-1].actions = self.current_turn_actions
+        return action
+
+    def complete_turn_action(
+        self,
+        action_id: str,
+        status: str = "COMPLETED",
+        duration_seconds: float | None = None,
+        error: str | None = None,
+    ) -> TurnAction | None:
+        """Complete a turn action in-place (§21)."""
+        act = self.current_turn_actions.complete_action(
+            action_id=action_id,
+            status=status,
+            duration_seconds=duration_seconds,
+            error=error,
+        )
+        if self.messages and self.messages[-1].role == "assistant":
+            if self.messages[-1].actions is None:
+                self.messages[-1].actions = self.current_turn_actions
+        return act
+
+    def get_latest_actions_group(self) -> ActionsGroup | None:
+        """Get the actions group of the active turn or latest assistant message."""
+        if self.current_turn_actions and not self.current_turn_actions.is_empty:
+            return self.current_turn_actions
+        for msg in reversed(self.messages):
+            if msg.role == "assistant" and msg.actions and not msg.actions.is_empty:
+                return msg.actions
+        return None
+
+    def toggle_actions(self, turn_index: int | None = None) -> bool:
+        """Toggle actions expansion via keyboard (§22)."""
+        if turn_index is not None:
+            asst_msgs = [m for m in self.messages if m.role == "assistant" and m.actions]
+            if 0 <= turn_index < len(asst_msgs):
+                return asst_msgs[turn_index].actions.toggle()  # type: ignore[union-attr]
+        group = self.get_latest_actions_group()
+        if group:
+            return group.toggle()
+        return False
+
+    def expand_actions(self, turn_index: int | None = None) -> None:
+        """Expand actions disclosure via keyboard (§22)."""
+        if turn_index is not None:
+            asst_msgs = [m for m in self.messages if m.role == "assistant" and m.actions]
+            if 0 <= turn_index < len(asst_msgs):
+                asst_msgs[turn_index].actions.expand()  # type: ignore[union-attr]
+                return
+        group = self.get_latest_actions_group()
+        if group:
+            group.expand()
+
+    def collapse_actions(self, turn_index: int | None = None) -> None:
+        """Collapse actions disclosure via keyboard (§22)."""
+        if turn_index is not None:
+            asst_msgs = [m for m in self.messages if m.role == "assistant" and m.actions]
+            if 0 <= turn_index < len(asst_msgs):
+                asst_msgs[turn_index].actions.collapse()  # type: ignore[union-attr]
+                return
+        group = self.get_latest_actions_group()
+        if group:
+            group.collapse()
+
+    def handle_mouse_click(
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        target: str = "actions",
+        turn_index: int | None = None,
+    ) -> bool:
+        """Handle mouse click on actions disclosure (§23 approved mouse exception)."""
+        if str(target).lower() in {"actions", "action", "disclosure"}:
+            return self.toggle_actions(turn_index=turn_index)
+        return False
 
     @property
     def has_conversation(self) -> bool:
@@ -203,6 +460,7 @@ class AutonomousDeliveryState:
 
     def clear_conversation(self) -> None:
         self.messages.clear()
+        self.current_turn_actions = ActionsGroup(active=False)
 
     def update_from_session(self, session: Mapping[str, Any]) -> None:
         if not session or not isinstance(session, Mapping):
@@ -610,6 +868,10 @@ class AutonomousDeliveryState:
             role = (payload.get("role") or "Backend").title()
             target = payload.get("path") or payload.get("file") or payload.get("command") or payload.get("symbol") or ""
             self.add_activity(role, tool_name, str(target))
+            call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.current_turn_actions.actions) + 1}")
+            from cli.tui.events import format_action_description
+            desc = format_action_description(tool_name, str(target))
+            self.record_turn_action(call_id, desc, status="RUNNING")
 
         elif name == "event.toolCall":
             tool_name = payload.get("tool_name", "tool")
@@ -618,12 +880,21 @@ class AutonomousDeliveryState:
             args = args_raw if isinstance(args_raw, Mapping) else {}
             target = args.get("path") or args.get("file") or args.get("command") or args.get("target") or ""
             self.add_activity(role, tool_name, str(target))
+            call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.current_turn_actions.actions) + 1}")
+            from cli.tui.events import format_action_description
+            desc = format_action_description(tool_name, str(target))
+            self.record_turn_action(call_id, desc, status="RUNNING")
 
         elif name == "event.toolResult":
             tool_name = payload.get("tool_name", "tool")
             role = (payload.get("role") or "Agent").title()
             status = payload.get("status", "completed")
-            self.add_activity(role, f"{tool_name} ({status})", "")
+            from cli.tui.events import normalize_status
+            norm_status = normalize_status(status)
+            self.add_activity(role, f"{tool_name} ({norm_status.lower()})", "")
+            call_id = str(payload.get("call_id") or payload.get("operation_id") or "")
+            err = str(payload.get("error")) if payload.get("error") else None
+            self.complete_turn_action(call_id, status=norm_status, error=err)
 
         elif name in {"verification.completed", "verification.recorded"}:
             res = payload.get("result")
@@ -644,6 +915,7 @@ class AutonomousDeliveryState:
 
 
 __all__ = [
+    "ActionsGroup",
     "ActivityEntry",
     "AutonomousDeliveryState",
     "ChatMessage",
@@ -651,5 +923,6 @@ __all__ = [
     "PlanRevision",
     "ProjectPhase",
     "RoleStatus",
+    "TurnAction",
     "WorkOrderItem",
 ]

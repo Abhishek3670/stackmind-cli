@@ -82,6 +82,34 @@ def format_tool_name(tool_name: str) -> str:
     return cleaned.title()
 
 
+def format_action_description(tool_name: str, target: str = "") -> str:
+    """Format an action description string for disclosure display per §19-§21."""
+    cleaned_tool = (
+        tool_name.replace("tool_call.", "")
+        .replace("tool.", "")
+        .replace("event.", "")
+        .strip()
+    )
+    t = target.strip()
+    lower = cleaned_tool.lower()
+    if lower in {"read", "read_file", "read file"}:
+        return f"Read {t}".strip() if t else "Read file"
+    if lower in {"edit", "edit_file", "edit file"}:
+        return f"Edit {t}".strip() if t else "Edit file"
+    if lower in {"write", "write_file", "write file"}:
+        return f"Write {t}".strip() if t else "Write file"
+    if lower in {"create", "create_file", "create file"}:
+        return f"Create {t}".strip() if t else "Create file"
+    if lower in {"test", "run_tests", "run_test", "run tests"}:
+        return f"Run tests {t}".strip() if t else "Run tests"
+    if "harness" in lower:
+        return f"Run harness {t}".strip() if t and t != "long_running_task" else "Run harness"
+    if "verify" in lower:
+        return f"Verify {t}".strip() if t else "Verify changes"
+    base = cleaned_tool.replace("_", " ").title()
+    return f"{base} {t}".strip() if t else base
+
+
 @dataclass
 class ToolActivity:
     """Inline execution record for a tool call."""
@@ -375,6 +403,8 @@ class OperationalEventManager:
         self.active_tools: dict[str, ToolActivity] = {}
         self.tool_history: list[ToolActivity] = []
         self._tool_start_times: dict[str, float] = {}
+        from cli.tui.state import ActionsGroup
+        self.current_actions: ActionsGroup = ActionsGroup(active=True)
 
     def process_event(
         self,
@@ -407,6 +437,8 @@ class OperationalEventManager:
                 start_time=start_t,
             )
             self.active_tools[call_id] = activity
+            desc = format_action_description(tool_name, target)
+            self.current_actions.add_or_update(call_id, desc, status=ToolStatus.RUNNING)
             return render_tool_activity(activity), None
 
         if name == "event.toolResult":
@@ -430,6 +462,12 @@ class OperationalEventManager:
                     error=str(payload.get("error")) if payload.get("error") else None,
                 )
             self.tool_history.append(activity)
+            self.current_actions.complete_action(
+                call_id,
+                status=status,
+                duration_seconds=duration,
+                error=activity.error,
+            )
 
             # Check if this toolResult yields an assistant response
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
@@ -440,6 +478,7 @@ class OperationalEventManager:
 
         # Check if operation.completed has response
         if name in {"operation.completed", "turn.completed"}:
+            self.current_actions.active = False
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
             if assistant_response and state is not None:
                 state.add_message("assistant", assistant_response)
@@ -607,6 +646,7 @@ __all__ = [
     "ToolActivity",
     "ToolStatus",
     "extract_assistant_response",
+    "format_action_description",
     "format_tool_name",
     "is_connection_error",
     "normalize_status",

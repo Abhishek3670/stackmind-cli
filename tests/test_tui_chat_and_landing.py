@@ -8,7 +8,10 @@ from rich.console import Console
 
 import cli
 from cli.main import cli as main_cli
+from cli.tui.app import dispatch_delivery_command
 from cli.tui.chat import (
+    render_actions_group,
+    render_actions_group_str,
     render_assistant_message,
     render_assistant_message_str,
     render_chat_transcript,
@@ -24,7 +27,12 @@ from cli.tui.landing import (
     render_landing_block,
     render_landing_block_str,
 )
-from cli.tui.state import AutonomousDeliveryState, ChatMessage
+from cli.tui.state import (
+    ActionsGroup,
+    AutonomousDeliveryState,
+    ChatMessage,
+    TurnAction,
+)
 from validators.kernel.daemon import LocalDaemon
 from validators.kernel.tui import DaemonClient, StackMindTuiAdapter
 
@@ -323,4 +331,209 @@ def test_inline_diff_rendering_in_conversation():
     # Following assistant response remains inline
     assert "✦ StackMind" in transcript
     assert "Applied secure secrets token generator." in transcript
+
+
+def test_actions_group_collapsed_default():
+    """Verify actions disclosure group is collapsed by default per §20 and §22."""
+    actions = [
+        TurnAction("1", "Read src/auth.py", status="COMPLETED"),
+        TurnAction("2", "Read tests/test_auth.py", status="COMPLETED"),
+        TurnAction("3", "Run harness", status="COMPLETED"),
+        TurnAction("4", "Verify changes", status="COMPLETED"),
+    ]
+    group = ActionsGroup(actions=actions)
+    assert not group.expanded  # Collapsed by default
+
+    plain = _extract_plain(render_actions_group(group))
+    assert "▸ Actions · 4 completed" in plain
+    assert "Read src/auth.py" not in plain  # Details hidden while collapsed
+
+    # Render within assistant message
+    asst_rendered = _extract_plain(render_assistant_message("Task finished.", actions=group))
+    assert "✦ StackMind" in asst_rendered
+    assert "▸ Actions · 4 completed" in asst_rendered
+    assert "Task finished." in asst_rendered
+    assert "Read src/auth.py" not in asst_rendered
+
+
+def test_actions_group_expand_collapse_keyboard():
+    """Verify actions disclosure group expands/collapses via keyboard command per §20, §22."""
+    actions = [
+        TurnAction("1", "Read src/auth.py", status="COMPLETED"),
+        TurnAction("2", "Read tests/test_auth.py", status="COMPLETED"),
+        TurnAction("3", "Run harness", status="COMPLETED"),
+        TurnAction("4", "Verify changes", status="COMPLETED"),
+    ]
+    group = ActionsGroup(actions=actions)
+    group.expand()
+    assert group.expanded
+
+    plain_expanded = _extract_plain(render_actions_group(group))
+    assert "▾ Actions · 4 completed" in plain_expanded
+    assert "✓ Read src/auth.py" in plain_expanded
+    assert "✓ Read tests/test_auth.py" in plain_expanded
+    assert "✓ Run harness" in plain_expanded
+    assert "✓ Verify changes" in plain_expanded
+
+    group.collapse()
+    assert not group.expanded
+    plain_collapsed = _extract_plain(render_actions_group(group))
+    assert "▸ Actions · 4 completed" in plain_collapsed
+    assert "✓ Read src/auth.py" not in plain_collapsed
+
+    # Keyboard command via state
+    state = AutonomousDeliveryState()
+    state.add_message("assistant", "Result", actions=group)
+    assert not group.expanded
+
+    state.toggle_actions()
+    assert group.expanded
+
+    state.toggle_actions()
+    assert not group.expanded
+
+
+def test_actions_group_expand_collapse_mouse():
+    """Verify actions disclosure group expands/collapses via mouse click (approved exception per §23)."""
+    group = ActionsGroup(actions=[TurnAction("1", "Read src/auth.py", status="COMPLETED")])
+    assert not group.expanded
+
+    # Click to expand
+    group.handle_click()
+    assert group.expanded
+    plain_exp = _extract_plain(render_actions_group(group))
+    assert "▾ Actions · 1 completed" in plain_exp
+    assert "✓ Read src/auth.py" in plain_exp
+
+    # Click to collapse
+    group.handle_click()
+    assert not group.expanded
+    plain_col = _extract_plain(render_actions_group(group))
+    assert "▸ Actions · 1 completed" in plain_col
+
+    # Mouse click handling on state level
+    state = AutonomousDeliveryState()
+    state.add_message("assistant", "Done", actions=group)
+    res = state.handle_mouse_click(target="actions")
+    assert res is True
+    assert group.expanded
+    res = state.handle_mouse_click(target="actions")
+    assert res is False
+    assert not group.expanded
+
+
+def test_actions_group_one_invocation_one_entry_and_inplace_update():
+    """Verify running->completed updates in-place using event IDs without duplicate cards (§21)."""
+    group = ActionsGroup(active=True)
+
+    # 1. Start invocation
+    group.add_or_update("call-1", "Run harness", status="RUNNING")
+    assert len(group.actions) == 1
+    assert group.actions[0].status == "RUNNING"
+    assert group.actions[0].symbol == "●"
+
+    # Active header shows count without completed
+    plain_running = _extract_plain(render_actions_group(group))
+    assert "▸ Actions · 1" in plain_running
+    assert "completed" not in plain_running
+
+    group.expand()
+    plain_running_exp = _extract_plain(render_actions_group(group))
+    assert "● Run harness" in plain_running_exp
+
+    # 2. Complete the same invocation
+    group.add_or_update("call-1", status="COMPLETED")
+    assert len(group.actions) == 1  # No duplicate card!
+    assert group.actions[0].status == "COMPLETED"
+    assert group.actions[0].symbol == "✓"
+
+    group.active = False
+    plain_comp_exp = _extract_plain(render_actions_group(group))
+    assert "▾ Actions · 1 completed" in plain_comp_exp
+    assert "✓ Run harness" in plain_comp_exp
+    assert "● Run harness" not in plain_comp_exp
+
+    # 3. Add distinct invocation
+    group.add_or_update("call-2", "Verify changes", status="COMPLETED")
+    assert len(group.actions) == 2
+    assert group.actions[1].description == "Verify changes"
+
+
+def test_actions_group_failed_and_cancelled_states():
+    """Verify actions symbols across completed (✓), running (●), failed (×), and cancelled (⊘)."""
+    actions = [
+        TurnAction("1", "Read src/auth.py", status="COMPLETED"),
+        TurnAction("2", "Run harness", status="RUNNING"),
+        TurnAction("3", "Run tests", status="FAILED", error="1 test failed"),
+        TurnAction("4", "Deploy changes", status="CANCELLED"),
+    ]
+    group = ActionsGroup(actions=actions, expanded=True)
+    plain = _extract_plain(render_actions_group(group))
+
+    assert "✓ Read src/auth.py" in plain
+    assert "● Run harness" in plain
+    assert "× Run tests (1 test failed)" in plain
+    assert "⊘ Deploy changes" in plain
+
+
+def test_actions_group_turn_expansion_preservation():
+    """Verify current-turn state preserved and completed turns remain collapsed unless expanded (§22)."""
+    turn1_actions = ActionsGroup(actions=[TurnAction("1", "Read file", status="COMPLETED")])
+    turn2_actions = ActionsGroup(actions=[TurnAction("2", "Edit file", status="COMPLETED")])
+
+    # Turn 1 is historical and remains collapsed
+    assert not turn1_actions.expanded
+
+    # Turn 2 (current turn) is expanded by user
+    turn2_actions.expand()
+    assert turn2_actions.expanded
+    assert not turn1_actions.expanded  # Turn 1 stays collapsed
+
+    messages = [
+        ChatMessage(role="user", content="Turn 1"),
+        ChatMessage(role="assistant", content="Turn 1 done", actions=turn1_actions),
+        ChatMessage(role="user", content="Turn 2"),
+        ChatMessage(role="assistant", content="Turn 2 done", actions=turn2_actions),
+    ]
+
+    transcript = render_chat_transcript_str(messages, width=80)
+    # Turn 1 rendered collapsed
+    assert "▸ Actions · 1 completed" in transcript
+    # Turn 2 rendered expanded
+    assert "▾ Actions · 1 completed" in transcript
+    assert "✓ Edit file" in transcript
+
+
+def test_tui_repl_actions_command_and_mouse_click():
+    """Verify interactive REPL handles :actions keyboard command and mouse click exception (§22, §23)."""
+    state = AutonomousDeliveryState()
+    actions = [
+        TurnAction("1", "Read src/auth.py", status="COMPLETED"),
+        TurnAction("2", "Run harness", status="COMPLETED"),
+    ]
+    group = ActionsGroup(actions=actions)
+    state.add_message("assistant", "Changes verified.", actions=group)
+    assert not group.expanded
+
+    # Keyboard command: toggle/expand
+    session = {"session_id": "s1"}
+    dispatch_delivery_command(None, None, session, ":actions expand", state)
+    assert group.expanded
+
+    # Keyboard command: collapse
+    dispatch_delivery_command(None, None, session, ":actions collapse", state)
+    assert not group.expanded
+
+    # Keyboard command: bare :actions toggles
+    dispatch_delivery_command(None, None, session, ":actions", state)
+    assert group.expanded
+
+    # Mouse click exception: :click actions
+    dispatch_delivery_command(None, None, session, ":click actions", state)
+    assert not group.expanded
+
+    # Mouse escape sequence: \x1b[<0;20;10M
+    dispatch_delivery_command(None, None, session, "\x1b[<0;20;10M", state)
+    assert group.expanded
+
 
