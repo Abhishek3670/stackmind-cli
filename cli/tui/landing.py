@@ -51,6 +51,35 @@ def _get_version(version: str | None = None) -> str:
     return "v3.3.0"
 
 
+def abbreviate_path(path_str: str, max_len: int = 60) -> str:
+    """Visually abbreviate long project paths so metadata is never clipped (§43)."""
+    if len(path_str) <= max_len:
+        return path_str
+
+    sep = "/" if ("/" in path_str or "\\" not in path_str) else "\\"
+    normalized = path_str.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+
+    if not parts:
+        return path_str[:max_len]
+
+    # Try parent/basename: .../parent/name
+    if len(parts) >= 2:
+        candidate = f"...{sep}{parts[-2]}{sep}{parts[-1]}"
+        if len(candidate) <= max_len:
+            return candidate
+
+    # Try basename only: .../name
+    candidate = f"...{sep}{parts[-1]}"
+    if len(candidate) <= max_len:
+        return candidate
+
+    # Suffix truncation if basename alone exceeds max_len
+    if max_len > 4:
+        return f"...{sep}" + parts[-1][-(max_len - 4):]
+    return candidate[:max_len]
+
+
 def render_landing_block(
     session: Mapping[str, Any] | None = None,
     version: str | None = None,
@@ -166,11 +195,17 @@ def render_landing_block(
     else:
         status_cell.append(f"● {stat_val}", style="white")
 
+    left_pad = 2 if (width is not None and width < 60) else 7
+    if width is not None:
+        max_proj_w = max(16, width - (15 if width < 60 else 20))
+    else:
+        max_proj_w = 60
+    proj_display = abbreviate_path(proj_val, max_proj_w)
+
     meta_table.add_row("Status:", status_cell)
     meta_table.add_row("Session:", Text(sid_val, style="cyan"))
-    meta_table.add_row("Project:", Text(proj_val, style="dim white"))
+    meta_table.add_row("Project:", Text(proj_display, style="dim white"))
 
-    left_pad = 2 if (width is not None and width < 60) else 7
     padded_meta = Padding(meta_table, (0, 0, 0, left_pad))
 
     items: list[RenderableType] = [
@@ -264,6 +299,7 @@ __all__ = [
     "LANDING_NAME",
     "LANDING_PILLARS",
     "LANDING_TAGLINE",
+    "abbreviate_path",
     "render_landing_block",
     "render_landing_block_str",
 ]

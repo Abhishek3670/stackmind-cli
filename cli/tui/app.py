@@ -427,14 +427,17 @@ def render_composer_box(
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
     content: str | list[str] | None = None,
+    is_active: bool = False,
 ) -> Panel:
     """Render the rounded input composer box matching image.png:
     > Type a message...               Ctrl+K commands | Ctrl+L clear
 
     Expands vertically upward/downward for multiline typing (§28, §30).
-    Has the strongest container border in the interface (§29, §43).
+    Has the strongest container border in the interface (§29, §43),
+    highlighting to #60a5fa when active.
     """
     inner_width = max(40, width - 4)
+    border_color = "#60a5fa" if is_active else "#475569"
 
     if not content:
         left_plain = f"> {placeholder}"
@@ -477,7 +480,7 @@ def render_composer_box(
     return Panel(
         body,
         box=box.ROUNDED,
-        border_style="#475569",  # Strongest visual container border in interface (§29, §43)
+        border_style=border_color,  # Strongest visual container border in interface (§29, §43)
         padding=(0, 1),
     )
 
@@ -487,11 +490,12 @@ def render_composer_box_str(
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
     content: str | list[str] | None = None,
+    is_active: bool = False,
 ) -> str:
     """Render input composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width, content=content))
+    console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width, content=content, is_active=is_active))
     return console.export_text().rstrip()
 
 
@@ -517,24 +521,41 @@ def preserve_composer_buffer(state: Any | None, text: str) -> None:
         state.composer_buffer = text
 
 
+def restore_terminal_state() -> None:
+    """Restore terminal cursor and modes cleanly on exit and uncaught exceptions (§43, §44)."""
+    try:
+        Console().show_cursor(True)
+    except Exception:
+        pass
+    try:
+        if sys.stdout and hasattr(sys.stdout, "write"):
+            # Standard ANSI escape to show cursor (\x1b[?25h) and reset attributes (\x1b[0m)
+            sys.stdout.write("\x1b[?25h\x1b[0m")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def render_composer_top_border(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    is_active: bool = False,
 ) -> RenderableType:
     """Render the top border of the composer box with placeholder and shortcuts."""
+    border_color = "#60a5fa" if is_active else "#475569"
     fixed_len = len("╭─ ") + len(placeholder) + len(" ") + len(" ") + len(shortcuts) + len(" ─╮")
     if width >= fixed_len + 2:
         fill_count = width - fixed_len
         text = Text()
-        text.append("╭─ ", style="#475569")
+        text.append("╭─ ", style=border_color)
         text.append(placeholder, style="dim #94a3b8")
-        text.append(" " + "─" * fill_count + " ", style="#475569")
+        text.append(" " + "─" * fill_count + " ", style=border_color)
         text.append(shortcuts, style="dim #64748b")
-        text.append(" ─╮", style="#475569")
+        text.append(" ─╮", style=border_color)
         return text
     text = Text()
-    text.append("╭" + "─" * max(2, width - 2) + "╮", style="#475569")
+    text.append("╭" + "─" * max(2, width - 2) + "╮", style=border_color)
     return text
 
 
@@ -542,26 +563,28 @@ def render_composer_top_border_str(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    is_active: bool = False,
 ) -> str:
     """Render top border of the composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_top_border(placeholder=placeholder, shortcuts=shortcuts, width=width))
+    console.print(render_composer_top_border(placeholder=placeholder, shortcuts=shortcuts, width=width, is_active=is_active))
     return console.export_text().rstrip()
 
 
-def render_composer_bottom_border(width: int = 80) -> RenderableType:
+def render_composer_bottom_border(width: int = 80, is_active: bool = False) -> RenderableType:
     """Render the bottom rounded border of the composer box."""
+    border_color = "#60a5fa" if is_active else "#475569"
     text = Text()
-    text.append("╰" + "─" * max(2, width - 2) + "╯", style="#475569")
+    text.append("╰" + "─" * max(2, width - 2) + "╯", style=border_color)
     return text
 
 
-def render_composer_bottom_border_str(width: int = 80) -> str:
+def render_composer_bottom_border_str(width: int = 80, is_active: bool = False) -> str:
     """Render bottom border of the composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_bottom_border(width=width))
+    console.print(render_composer_bottom_border(width=width, is_active=is_active))
     return console.export_text().rstrip()
 
 
@@ -584,7 +607,7 @@ def prompt_composer_input(
         state.is_typing = True
         state.focus_target = "composer"
 
-    click.echo(render_composer_top_border_str(placeholder=placeholder, shortcuts=shortcuts, width=width))
+    click.echo(render_composer_top_border_str(placeholder=placeholder, shortcuts=shortcuts, width=width, is_active=True))
     if sys.stdin.isatty():
         prompt_str = "\033[90m│\033[0m \033[1;36m>\033[0m "
         cont_prompt_str = "\033[90m│\033[0m   "
@@ -619,7 +642,7 @@ def prompt_composer_input(
             state.is_typing = False
             state.composer_buffer = ""
 
-    click.echo(render_composer_bottom_border_str(width=width))
+    click.echo(render_composer_bottom_border_str(width=width, is_active=True))
     click.echo(render_bottom_footer_bar_str(width=width))
     return "\n".join(lines)
 
@@ -1404,6 +1427,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             if should_exit:
                 break
     finally:
+        restore_terminal_state()
         if daemon is not None:
             daemon.stop()
         if temporary_state is not None:

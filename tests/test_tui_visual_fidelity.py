@@ -44,9 +44,12 @@ from cli.tui import (
 )
 from cli.tui.app import (
     prompt_composer_input,
+    render_composer_box,
     render_composer_bottom_border_str,
     render_composer_top_border_str,
+    restore_terminal_state,
 )
+from cli.tui.landing import abbreviate_path
 from cli.tui.layout import (
     NARROW_THRESHOLD,
     RUNTIME_HEADING,
@@ -553,3 +556,118 @@ def test_workspace_layout_vertical_divider():
     """Verify the vertical divider character is present in wide layout."""
     result = render_workspace_layout_str("Left side", width=120)
     assert "│" in result
+
+
+def test_phase10_responsive_sizing_canonical_dimensions():
+    """Verify responsive sizing across all canonical form factors (§41, §43).
+    - 80x24: narrow single-column fallback (suppress runtime panel, conversation full width).
+    - 100x30: entry threshold for two-column layout (70/30 split, runtime ~28 cols).
+    - 120x40: standard two-column workspace layout (runtime ~33 cols).
+    - 160x50: wide two-column workspace layout (runtime capped at RUNTIME_MAX_WIDTH=42).
+    """
+    # 80x24: Single-column fallback
+    layout_80 = compute_layout(80)
+    assert not layout_80.show_runtime
+    assert layout_80.conversation_width == 80
+    assert layout_80.runtime_width == 0
+    assert layout_80.divider_width == 0
+
+    # 100x30: Entry threshold for two-column layout
+    layout_100 = compute_layout(100)
+    assert layout_100.show_runtime
+    assert layout_100.runtime_width == 28
+    assert layout_100.conversation_width == 71
+    assert layout_100.divider_width == 1
+    assert layout_100.conversation_width + layout_100.divider_width + layout_100.runtime_width == 100
+
+    # 120x40: Standard two-column workspace
+    layout_120 = compute_layout(120)
+    assert layout_120.show_runtime
+    assert layout_120.runtime_width == 33
+    assert layout_120.conversation_width == 86
+    assert layout_120.divider_width == 1
+    assert layout_120.conversation_width + layout_120.divider_width + layout_120.runtime_width == 120
+
+    # 160x50: Wide layout capped at RUNTIME_MAX_WIDTH=42
+    layout_160 = compute_layout(160)
+    assert layout_160.show_runtime
+    assert layout_160.runtime_width == RUNTIME_MAX_WIDTH  # 42
+    assert layout_160.conversation_width == 117
+    assert layout_160.divider_width == 1
+    assert layout_160.conversation_width + layout_160.divider_width + layout_160.runtime_width == 160
+
+
+def test_phase10_visual_palette_and_border_hierarchy():
+    """Verify visual palette and border hierarchy (§42, §43).
+    - Composer container border is strongest (#475569 idle, highlighted to #60a5fa when active).
+    - Composer border is stronger and distinct from subtle divider/landing borders (#334155).
+    """
+    # Idle composer box
+    idle_panel = render_composer_box(is_active=False)
+    assert idle_panel.border_style == "#475569"
+
+    # Active composer box
+    active_panel = render_composer_box(is_active=True)
+    assert active_panel.border_style == "#60a5fa"
+
+    # Top & bottom border renderers reflect active state
+    top_idle = render_composer_top_border_str(width=80, is_active=False)
+    top_active = render_composer_top_border_str(width=80, is_active=True)
+    assert "─" in top_idle
+    assert "─" in top_active
+
+    bottom_idle = render_composer_bottom_border_str(width=80, is_active=False)
+    bottom_active = render_composer_bottom_border_str(width=80, is_active=True)
+    assert "╰" in bottom_idle and "╯" in bottom_idle
+    assert "╰" in bottom_active and "╯" in bottom_active
+
+
+def test_phase10_long_path_visual_abbreviation_in_landing():
+    """Verify long project paths are visually abbreviated on constrained viewports (§43)."""
+    # Short path is preserved as-is
+    short_path = "~/projects/stackmind"
+    assert abbreviate_path(short_path, max_len=60) == short_path
+
+    # Long nested path is abbreviated
+    long_path = "/users/developer/company/large-repository/very/deeply/nested/stackmind-cli-repo"
+    abbr_30 = abbreviate_path(long_path, max_len=30)
+    assert len(abbr_30) <= 30
+    assert "stackmind-cli-repo" in abbr_30
+    assert "..." in abbr_30
+
+    # In landing block: standard path at width 80
+    session_std = {"session_id": "s1", "project": "~/projects/stackmind", "status": "online"}
+    out_std = render_landing_block_str(session=session_std, width=80)
+    assert "~/projects/stackmind" in out_std
+
+    # In landing block: very long path at width 60
+    session_long = {
+        "session_id": "s2",
+        "project": "/very/long/nested/path/to/some/enterprise/project/monorepo/subproject",
+        "status": "online",
+    }
+    out_narrow = render_landing_block_str(session=session_long, width=60)
+    assert "Project:" in out_narrow
+    assert "subproject" in out_narrow
+    assert "..." in out_narrow
+    # Crucially, metadata lines remain ordered and not wrapped awkwardly
+    assert out_narrow.index("Status:") < out_narrow.index("Session:") < out_narrow.index("Project:")
+
+
+def test_phase10_terminal_state_restoration(monkeypatch):
+    """Verify terminal state restoration cleanly resets cursor and terminal modes (§43, §44)."""
+    import io
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdout", fake_stdout)
+
+    restore_terminal_state()
+
+    output = fake_stdout.getvalue()
+    # Verifies ANSI show cursor sequence (\x1b[?25h) and attribute reset (\x1b[0m)
+    assert "\x1b[?25h" in output
+    assert "\x1b[0m" in output
+
+    # Handles broken or missing stdout gracefully without raising exception
+    monkeypatch.setattr("sys.stdout", None)
+    restore_terminal_state()  # Must not raise
+
