@@ -341,6 +341,15 @@ class AutonomousDeliveryState:
                     return m
         self.seen_message_keys.add(key)
 
+        msg_thinking = thinking
+        msg_content = content
+        if role == "assistant":
+            from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning
+            if msg_thinking is None and "<think" in content.lower():
+                msg_thinking = extract_internal_reasoning(content)
+            if "<think" in msg_content.lower():
+                msg_content = strip_internal_reasoning(msg_content)
+
         msg_actions = actions
         if role == "assistant" and msg_actions is None and self.current_turn_actions and not self.current_turn_actions.is_empty:
             msg_actions = self.current_turn_actions
@@ -349,10 +358,10 @@ class AutonomousDeliveryState:
 
         msg = ChatMessage(
             role=role,
-            content=content,
+            content=msg_content,
             timestamp=self.now_str(),
             actions=msg_actions,
-            thinking=thinking,
+            thinking=msg_thinking,
             turn_id=turn_id,
         )
         self.messages.append(msg)

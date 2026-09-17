@@ -382,9 +382,17 @@ class AgentRunner:
                 has_modifications = bool(completion.payload.get('modified_files'))
                 has_commands = bool(completion.payload.get('commands'))
                 if not has_modifications and not has_commands:
-                    from cli.tui.chat import strip_internal_reasoning
+                    from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning
                     raw_summary = strip_internal_reasoning(str(completion.payload.get('summary') or ''))
                     raw_report = strip_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
+                    raw_thinking = (
+                        completion.payload.get('thinking')
+                        or completion.payload.get('reasoning')
+                        or completion.payload.get('thought')
+                        or completion.payload.get('reasoning_content')
+                        or extract_internal_reasoning(str(completion.payload.get('summary') or ''))
+                        or extract_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
+                    )
                     if not raw_summary and not raw_report:
                         return HarnessRunResult(
                             status='blocked',
@@ -397,6 +405,7 @@ class AgentRunner:
                     outbox_dir.mkdir(parents=True, exist_ok=True)
                     now_str = run_at.isoformat().replace(':', '-')
                     out_path = outbox_dir / f'harness-{now_str}.md'
+                    thinking_section = f'## Thinking\n{raw_thinking}\n\n' if raw_thinking else ''
                     report_content = (
                         f'# Harness Report: {task.identifier}\n\n'
                         f'- agent: `{self.agent}`\n'
@@ -404,17 +413,21 @@ class AgentRunner:
                         f'- kind: `adhoc`\n'
                         f'- status: `completed`\n'
                         f'- recorded_at: `{run_at.isoformat()}`\n\n'
+                        f'{thinking_section}'
                         f'## Summary\n{raw_summary or raw_report}\n\n'
                         f'## Report\n{raw_report or raw_summary}\n'
                     )
                     out_path.write_text(report_content, encoding='utf-8')
                     summary = raw_summary or raw_report
+                    meta: dict[str, Any] = {'summary': summary}
+                    if raw_thinking:
+                        meta['thinking'] = raw_thinking
                     return HarnessRunResult(
                         status='completed',
                         persisted=True,
                         task_id=task.identifier,
                         report_path=out_path,
-                        meta={'summary': summary},
+                        meta=meta,
                     )
 
             try:

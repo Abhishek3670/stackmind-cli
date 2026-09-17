@@ -27,6 +27,17 @@ def strip_internal_reasoning(content: str) -> str:
     return re.sub(r"<think\b[^>]*>.*$", "", clean, flags=re.IGNORECASE | re.DOTALL).strip()
 
 
+def extract_internal_reasoning(content: str) -> str | None:
+    """Extract provider-delimited private reasoning text without <think> tags."""
+    if not content or not isinstance(content, str):
+        return None
+    matches = re.findall(r"<think\b[^>]*>(.*?)(?:</think\s*>|$)", content, flags=re.IGNORECASE | re.DOTALL)
+    if not matches:
+        return None
+    joined = "\n\n".join(m.strip() for m in matches if m.strip())
+    return joined.strip() or None
+
+
 def render_user_message(
     content: str,
     timestamp: str | None = None,
@@ -189,13 +200,16 @@ def render_assistant_message(
             elements.append(Text(""))
             elements.append(render_actions_group(actions_obj))
 
-    # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24)
+    # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24, §27)
     if thinking and thinking.strip():
         elements.append(Text(""))
         clean_think = thinking.strip()
-        think_text = Text("Thinking...\n", style="dim italic #94a3b8")
-        for tline in clean_think.splitlines():
-            think_text.append(f"  {tline}\n", style="dim #cbd5e1")
+        if clean_think == "✓":
+            think_text = Text("Thinking... ✓", style="dim italic #94a3b8")
+        else:
+            think_text = Text("Thinking...\n", style="dim italic #94a3b8")
+            for tline in clean_think.splitlines():
+                think_text.append(f"  {tline}\n", style="dim #cbd5e1")
         elements.append(think_text)
 
     cleaned = strip_internal_reasoning(content)
@@ -324,6 +338,7 @@ def render_chat_transcript_str(
 
 
 __all__ = [
+    "extract_internal_reasoning",
     "render_actions_group",
     "render_actions_group_str",
     "render_assistant_message",

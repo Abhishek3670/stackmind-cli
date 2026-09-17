@@ -10,6 +10,7 @@ import cli
 from cli.main import cli as main_cli
 from cli.tui.app import dispatch_delivery_command
 from cli.tui.chat import (
+    extract_internal_reasoning,
     render_actions_group,
     render_actions_group_str,
     render_assistant_message,
@@ -19,6 +20,7 @@ from cli.tui.chat import (
     render_user_message,
     render_user_message_str,
 )
+from cli.tui.events import extract_assistant_thinking
 from cli.tui.landing import (
     LANDING_DIAMOND,
     LANDING_NAME,
@@ -535,5 +537,113 @@ def test_tui_repl_actions_command_and_mouse_click():
     # Mouse escape sequence: \x1b[<0;20;10M
     dispatch_delivery_command(None, None, session, "\x1b[<0;20;10M", state)
     assert group.expanded
+
+
+def test_assistant_message_renders_genuine_thinking_when_present():
+    """If upstream provider exposes genuine thinking, render 'Thinking...' followed by reasoning text (§24)."""
+    reasoning = "Inspecting the existing authentication middleware...\nVerifying token expiration handling..."
+    msg = "The authentication flow has been updated."
+    rendered = _extract_plain(render_assistant_message(msg, thinking=reasoning))
+
+    # Header
+    assert "✦ StackMind" in rendered
+    # Region 2: Thinking
+    assert "Thinking..." in rendered
+    assert "Inspecting the existing authentication middleware..." in rendered
+    assert "Verifying token expiration handling..." in rendered
+    # Region 3: Response
+    assert "The authentication flow has been updated." in rendered
+    # Order: Header -> Thinking -> Content
+    think_idx = rendered.index("Thinking...")
+    content_idx = rendered.index("The authentication flow has been updated.")
+    assert think_idx < content_idx
+
+
+def test_assistant_message_clean_3_region_turn_structure():
+    """Assistant message cleanly separates Region 1 (Actions), Region 2 (Thinking), Region 3 (Content) per §18, §26, §27."""
+    actions = ActionsGroup(actions=[
+        TurnAction("1", "Read middleware.py", status="COMPLETED"),
+        TurnAction("2", "Edit middleware.py", status="COMPLETED"),
+    ])
+    reasoning = "Found missing bearer prefix verification in middleware."
+    content = "Patched token parsing in `middleware.py`."
+
+    rendered = _extract_plain(render_assistant_message(content, actions=actions, thinking=reasoning))
+
+    assert "▸ Actions · 2 completed" in rendered
+    assert "Thinking..." in rendered
+    assert "Found missing bearer prefix verification" in rendered
+    assert "Patched token parsing in middleware.py." in rendered
+
+    actions_idx = rendered.index("Actions · 2 completed")
+    think_idx = rendered.index("Thinking...")
+    content_idx = rendered.index("Patched token parsing")
+    assert actions_idx < think_idx < content_idx
+
+
+def test_assistant_message_does_not_fabricate_thinking_when_absent():
+    """If no upstream thinking capability exists, do NOT fabricate 'Thinking...' text (§24)."""
+    msg = "Pure assistant response with no upstream thinking."
+    rendered = _extract_plain(render_assistant_message(msg, thinking=None))
+
+    assert "✦ StackMind" in rendered
+    assert "Pure assistant response with no upstream thinking." in rendered
+    assert "Thinking..." not in rendered
+    assert "Thinking" not in rendered
+
+
+def test_assistant_message_completed_thinking_indicator():
+    """Completed thinking indicator 'Thinking... ✓' renders when thinking is '✓' (§27)."""
+    rendered = _extract_plain(render_assistant_message("Task complete.", thinking="✓"))
+    assert "Thinking... ✓" in rendered
+    assert "Task complete." in rendered
+
+
+def test_extract_internal_reasoning():
+    """extract_internal_reasoning isolates text inside <think> tags."""
+    content = "<think>line 1\nline 2</think>\n\nFinal answer."
+    extracted = extract_internal_reasoning(content)
+    assert extracted == "line 1\nline 2"
+
+    assert extract_internal_reasoning("No thinking tags here.") is None
+    assert extract_internal_reasoning("") is None
+
+
+def test_extract_assistant_thinking_from_structured_payloads(tmp_path: Path):
+    """extract_assistant_thinking retrieves genuine thinking from events, payloads, and reports."""
+    # 1. Direct thinking keys in payload
+    assert extract_assistant_thinking({"thinking": "thought A"}) == "thought A"
+    assert extract_assistant_thinking({"thought": "thought B"}) == "thought B"
+    assert extract_assistant_thinking({"reasoning": "thought C"}) == "thought C"
+    assert extract_assistant_thinking({"reasoning_content": "thought D"}) == "thought D"
+
+    # 2. Inside result dict
+    assert extract_assistant_thinking({"result": {"thinking": "res thought"}}) == "res thought"
+    assert extract_assistant_thinking({"result": {"thought": "res thought 2"}}) == "res thought 2"
+    assert extract_assistant_thinking({"result": {"reasoning_content": "res thought 3"}}) == "res thought 3"
+
+    # 3. Inside report file with ## Thinking
+    report_file = tmp_path / "harness-report.md"
+    report_file.write_text(
+        "# Harness Report\n\n"
+        "## Thinking\n"
+        "Identified edge case in session recovery.\n\n"
+        "## Summary\n"
+        "Session recovery fixed.\n\n"
+        "## Report\n"
+        "Session recovery fixed successfully.\n",
+        encoding="utf-8",
+    )
+    payload_with_report = {"result": {"report_path": str(report_file)}}
+    assert extract_assistant_thinking(payload_with_report, workspace=tmp_path) == "Identified edge case in session recovery."
+
+    # 4. From delimited tags inside response text
+    payload_with_tags = {"response": "<think>Delimited reason</think>Clean text"}
+    assert extract_assistant_thinking(payload_with_tags) == "Delimited reason"
+
+    # 5. Payload without thinking returns None (never fabricates fake reasoning)
+    assert extract_assistant_thinking({"response": "Clean text only"}) is None
+    assert extract_assistant_thinking({}) is None
+
 
 

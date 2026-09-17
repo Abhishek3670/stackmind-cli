@@ -395,6 +395,68 @@ def extract_assistant_response(
     return None
 
 
+def extract_assistant_thinking(
+    payload: Mapping[str, Any] | Any, workspace: Path | None = None
+) -> str | None:
+    """Extract genuine provider thinking/reasoning text from event payload or outbox report."""
+    if not isinstance(payload, Mapping):
+        return None
+
+    from cli.tui.chat import extract_internal_reasoning
+
+    # 1. Direct thinking keys in payload
+    for key in ("thinking", "reasoning", "reasoning_content", "thought"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # 2. Inspect direct result dict
+    result = payload.get("result")
+    if isinstance(result, Mapping):
+        for key in ("thinking", "reasoning", "reasoning_content", "thought"):
+            val = result.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        report_path_raw = result.get("report_path")
+        if report_path_raw:
+            report_path = Path(report_path_raw)
+            if not report_path.is_absolute() and workspace:
+                report_path = workspace / report_path
+            if report_path.exists():
+                try:
+                    content = report_path.read_text(encoding="utf-8")
+                    if "## Thinking" in content:
+                        _, _, think_part = content.partition("## Thinking")
+                        think_body, _, _ = think_part.partition("## ")
+                        clean = think_body.strip()
+                        if clean:
+                            return clean
+                    extracted = extract_internal_reasoning(content)
+                    if extracted:
+                        return extracted
+                except Exception:
+                    pass
+
+        # Check inside result string fields for <think>...</think>
+        for field in ("response", "summary", "reason"):
+            val = result.get(field)
+            if isinstance(val, str):
+                extracted = extract_internal_reasoning(val)
+                if extracted:
+                    return extracted
+
+    # 3. Check inside payload string fields for <think>...</think>
+    for field in ("response", "summary"):
+        val = payload.get(field)
+        if isinstance(val, str):
+            extracted = extract_internal_reasoning(val)
+            if extracted:
+                return extracted
+
+    return None
+
+
 class OperationalEventManager:
     """Stateful tracker for operational event stream and inline tool execution."""
 
@@ -471,8 +533,9 @@ class OperationalEventManager:
 
             # Check if this toolResult yields an assistant response
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
+            assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
-                state.add_message("assistant", assistant_response)
+                state.add_message("assistant", assistant_response, thinking=assistant_thinking)
 
             return render_tool_activity(activity), assistant_response
 
@@ -480,8 +543,9 @@ class OperationalEventManager:
         if name in {"operation.completed", "turn.completed"}:
             self.current_actions.active = False
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
+            assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
-                state.add_message("assistant", assistant_response)
+                state.add_message("assistant", assistant_response, thinking=assistant_thinking)
 
         return render_operational_event(event), assistant_response
 
@@ -609,12 +673,13 @@ def recover_transcript_from_events(
         # 2. Recover assistant response from toolResult, completed, or report
         elif name in {"event.toolResult", "operation.completed", "turn.completed"}:
             resp = extract_assistant_response(payload, workspace=workspace)
+            thinking = extract_assistant_thinking(payload, workspace=workspace)
             if resp and isinstance(resp, str) and resp.strip():
                 clean_resp = resp.strip()
                 msg_key = ("assistant", clean_resp)
                 if msg_key not in state.seen_message_keys:
                     state.seen_message_keys.add(msg_key)
-                    msg = state.add_message("assistant", clean_resp)
+                    msg = state.add_message("assistant", clean_resp, thinking=thinking)
                     recovered.append(msg)
 
     # 3. Check outbox for any unattached harness reports if workspace provided
@@ -624,6 +689,11 @@ def recover_transcript_from_events(
             for rpt in sorted(outbox_dir.glob("**/harness-*.md")):
                 try:
                     content = rpt.read_text(encoding="utf-8")
+                    thinking = None
+                    if "## Thinking" in content:
+                        _, _, think_part = content.partition("## Thinking")
+                        think_body, _, _ = think_part.partition("## ")
+                        thinking = think_body.strip() or None
                     if "## Report" in content:
                         _, _, body = content.partition("## Report")
                         report_body, _, _ = body.partition("## Meta")
@@ -632,7 +702,7 @@ def recover_transcript_from_events(
                             msg_key = ("assistant", clean)
                             if msg_key not in state.seen_message_keys:
                                 state.seen_message_keys.add(msg_key)
-                                msg = state.add_message("assistant", clean)
+                                msg = state.add_message("assistant", clean, thinking=thinking)
                                 recovered.append(msg)
                 except Exception:
                     pass
@@ -646,6 +716,7 @@ __all__ = [
     "ToolActivity",
     "ToolStatus",
     "extract_assistant_response",
+    "extract_assistant_thinking",
     "format_action_description",
     "format_tool_name",
     "is_connection_error",

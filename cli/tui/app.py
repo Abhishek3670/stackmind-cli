@@ -47,6 +47,7 @@ from cli.tui.events import (
     ToolActivity,
     ToolStatus,
     extract_assistant_response,
+    extract_assistant_thinking,
     is_connection_error,
     recover_transcript_from_events,
     render_connection_status,
@@ -1059,10 +1060,11 @@ def dispatch_delivery_command(
                 if ev_str:
                     click.echo(ev_str)
                 resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
+                thinking = extract_assistant_thinking(ev.get("payload", {}), workspace=workspace)
                 if resp and not assistant_rendered:
                     turn_acts = state.current_turn_actions
-                    state.add_message("assistant", resp, actions=turn_acts)
-                    click.echo(render_assistant_message_str(resp, actions=turn_acts))
+                    state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
+                    click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
                     assistant_rendered = True
 
             try:
@@ -1076,15 +1078,24 @@ def dispatch_delivery_command(
                         if ev_str:
                             click.echo(ev_str)
                         resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
+                        thinking = extract_assistant_thinking(ev.get("payload", {}), workspace=workspace)
                         if resp and not assistant_rendered:
                             turn_acts = state.current_turn_actions
-                            state.add_message("assistant", resp, actions=turn_acts)
-                            click.echo(render_assistant_message_str(resp, actions=turn_acts))
+                            state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
+                            click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
                             assistant_rendered = True
 
                     if not assistant_rendered:
                         res = op_rec.get("result") or {}
                         summary = res.get("summary") or res.get("reason")
+                        thinking = (
+                            res.get("thinking")
+                            or res.get("thought")
+                            or res.get("reasoning")
+                            or res.get("reasoning_content")
+                            or op_rec.get("thinking")
+                            or op_rec.get("thought")
+                        )
                         report_path_raw = res.get("report_path")
                         if report_path_raw:
                             rp = Path(report_path_raw)
@@ -1093,6 +1104,10 @@ def dispatch_delivery_command(
                             if rp.exists():
                                 try:
                                     cnt = rp.read_text(encoding="utf-8")
+                                    if "## Thinking" in cnt and not thinking:
+                                        _, _, tp = cnt.partition("## Thinking")
+                                        tb, _, _ = tp.partition("## ")
+                                        thinking = tb.strip() or None
                                     if "## Report" in cnt:
                                         _, _, b = cnt.partition("## Report")
                                         rb, _, _ = b.partition("## Meta")
@@ -1103,8 +1118,8 @@ def dispatch_delivery_command(
                                     pass
                         if summary:
                             turn_acts = state.current_turn_actions
-                            state.add_message("assistant", summary, actions=turn_acts)
-                            click.echo(render_assistant_message_str(summary, actions=turn_acts))
+                            state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
+                            click.echo(render_assistant_message_str(summary, actions=turn_acts, thinking=thinking))
                             assistant_rendered = True
                         elif op_status in {"FAILED", "CANCELLED"}:
                             err_raw = (
