@@ -14,6 +14,7 @@ Implements the user-facing control plane for the StackMind governed runtime:
 from __future__ import annotations
 
 import io
+import shutil
 import sys
 import tempfile
 import time
@@ -22,7 +23,7 @@ from typing import Any, Mapping
 
 import click
 from rich import box
-from rich.console import Console, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -74,6 +75,8 @@ from cli.tui.landing import (
     render_landing_block_str,
 )
 from cli.tui.layout import (
+    NARROW_THRESHOLD,
+    compute_layout,
     render_runtime_panel_str,
     render_workspace_layout_str,
 )
@@ -423,25 +426,58 @@ def render_composer_box(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    content: str | list[str] | None = None,
 ) -> Panel:
     """Render the rounded input composer box matching image.png:
     > Type a message...               Ctrl+K commands | Ctrl+L clear
+
+    Expands vertically upward/downward for multiline typing (§28, §30).
+    Has the strongest container border in the interface (§29, §43).
     """
     inner_width = max(40, width - 4)
-    left_plain = f"> {placeholder}"
-    right_plain = shortcuts
-    spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
 
-    line = Text()
-    line.append("> ", style="bold #38bdf8")
-    line.append(placeholder, style="dim #94a3b8")
-    line.append(" " * spaces_count)
-    line.append(shortcuts, style="dim #64748b")
+    if not content:
+        left_plain = f"> {placeholder}"
+        right_plain = shortcuts
+        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
+
+        line = Text()
+        line.append("> ", style="bold #38bdf8")
+        line.append(placeholder, style="dim #94a3b8")
+        line.append(" " * spaces_count)
+        line.append(shortcuts, style="dim #64748b")
+        body: RenderableType = line
+    else:
+        if isinstance(content, str):
+            lines = content.splitlines() or [""]
+        else:
+            lines = list(content) or [""]
+
+        rendered_lines: list[Text] = []
+        first_text = lines[0]
+        left_plain = f"> {first_text}"
+        right_plain = shortcuts
+        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
+
+        line1 = Text()
+        line1.append("> ", style="bold #38bdf8")
+        line1.append(first_text, style="bold white")
+        line1.append(" " * spaces_count)
+        line1.append(shortcuts, style="dim #64748b")
+        rendered_lines.append(line1)
+
+        for sub_line in lines[1:]:
+            line_n = Text()
+            line_n.append("  ", style="dim #38bdf8")
+            line_n.append(sub_line, style="white")
+            rendered_lines.append(line_n)
+
+        body = Group(*rendered_lines)
 
     return Panel(
-        line,
+        body,
         box=box.ROUNDED,
-        border_style="#334155",
+        border_style="#475569",  # Strongest visual container border in interface (§29, §43)
         padding=(0, 1),
     )
 
@@ -450,12 +486,35 @@ def render_composer_box_str(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    content: str | list[str] | None = None,
 ) -> str:
     """Render input composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width))
+    console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width, content=content))
     return console.export_text().rstrip()
+
+
+def restore_composer_focus(state: Any | None = None) -> bool:
+    """Restore terminal focus to the composer after an operation completes (§30).
+
+    Safely restores focus without interrupting or stealing keystrokes
+    if the user is actively typing.
+    Returns True if focus was set/restored to composer, False if skipped
+    because user was actively typing.
+    """
+    if state is None:
+        return True
+    if getattr(state, "is_typing", False):
+        return False
+    state.focus_target = "composer"
+    return True
+
+
+def preserve_composer_buffer(state: Any | None, text: str) -> None:
+    """Preserve partially typed composer buffer during live events or renders (§30)."""
+    if state is not None and hasattr(state, "composer_buffer"):
+        state.composer_buffer = text
 
 
 def render_composer_top_border(
@@ -468,14 +527,14 @@ def render_composer_top_border(
     if width >= fixed_len + 2:
         fill_count = width - fixed_len
         text = Text()
-        text.append("╭─ ", style="#334155")
+        text.append("╭─ ", style="#475569")
         text.append(placeholder, style="dim #94a3b8")
-        text.append(" " + "─" * fill_count + " ", style="#334155")
+        text.append(" " + "─" * fill_count + " ", style="#475569")
         text.append(shortcuts, style="dim #64748b")
-        text.append(" ─╮", style="#334155")
+        text.append(" ─╮", style="#475569")
         return text
     text = Text()
-    text.append("╭" + "─" * max(2, width - 2) + "╮", style="#334155")
+    text.append("╭" + "─" * max(2, width - 2) + "╮", style="#475569")
     return text
 
 
@@ -494,7 +553,7 @@ def render_composer_top_border_str(
 def render_composer_bottom_border(width: int = 80) -> RenderableType:
     """Render the bottom rounded border of the composer box."""
     text = Text()
-    text.append("╰" + "─" * max(2, width - 2) + "╯", style="#334155")
+    text.append("╰" + "─" * max(2, width - 2) + "╯", style="#475569")
     return text
 
 
@@ -510,21 +569,59 @@ def prompt_composer_input(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    initial_text: str = "",
+    multiline: bool = False,
+    state: Any | None = None,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
-    Renders the composer top border, displays an inline prompt with left border '│ > ',
-    and upon input completion renders the bottom border and footer bar.
+    Supports multiline expansion, active typing state tracking, and preserves
+    partially typed input buffer across background events (§28-§30).
     """
+    if state is not None:
+        if not initial_text and getattr(state, "composer_buffer", ""):
+            initial_text = state.composer_buffer
+        state.is_typing = True
+        state.focus_target = "composer"
+
     click.echo(render_composer_top_border_str(placeholder=placeholder, shortcuts=shortcuts, width=width))
     if sys.stdin.isatty():
         prompt_str = "\033[90m│\033[0m \033[1;36m>\033[0m "
+        cont_prompt_str = "\033[90m│\033[0m   "
     else:
         prompt_str = "│ > "
-    text = input(prompt_str)
+        cont_prompt_str = "│   "
+
+    lines: list[str] = []
+    try:
+        first_line = input(prompt_str)
+        if initial_text and not first_line.startswith(initial_text):
+            first_line = initial_text + first_line
+        lines.append(first_line)
+
+        if multiline:
+            while True:
+                next_line = input(cont_prompt_str)
+                if not next_line.strip():
+                    break
+                lines.append(next_line)
+        elif first_line.endswith("\\"):
+            lines[0] = first_line[:-1]
+            while True:
+                next_line = input(cont_prompt_str)
+                if next_line.endswith("\\"):
+                    lines.append(next_line[:-1])
+                else:
+                    lines.append(next_line)
+                    break
+    finally:
+        if state is not None:
+            state.is_typing = False
+            state.composer_buffer = ""
+
     click.echo(render_composer_bottom_border_str(width=width))
     click.echo(render_bottom_footer_bar_str(width=width))
-    return text
+    return "\n".join(lines)
 
 
 def render_bottom_footer_bar(
@@ -1184,6 +1281,7 @@ def dispatch_delivery_command(
             )
         state.add_message("system", f"[ERROR] Could not submit turn: {err}")
         click.echo(err_box)
+    restore_composer_focus(state)
     return session, False
 
 
@@ -1245,12 +1343,39 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             _run_demo(client, session)
             return
 
-        click.echo(render_top_header_bar_str(session, width=80))
-        click.echo(render_landing_block_str(session=session, status=state.connection_status, width=80))
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        click.echo(render_top_header_bar_str(session, width=term_cols))
+
+        layout = compute_layout(term_cols)
+        if layout.show_runtime:
+            landing_str = render_landing_block_str(
+                session=session,
+                status=state.connection_status,
+                width=layout.conversation_width,
+            )
+            click.echo(
+                render_workspace_layout_str(
+                    landing_str,
+                    width=term_cols,
+                    state=state,
+                    scroll=state.scroll,
+                    conversation_scroll=state.conversation_scroll,
+                )
+            )
+        else:
+            click.echo(
+                render_landing_block_str(
+                    session=session,
+                    status=state.connection_status,
+                    width=term_cols,
+                )
+            )
 
         while True:
             try:
-                text = prompt_composer_input(width=80)
+                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                conv_width = compute_layout(term_cols).conversation_width if term_cols >= NARROW_THRESHOLD else term_cols
+                text = prompt_composer_input(width=conv_width, state=state)
             except (EOFError, KeyboardInterrupt):
                 click.echo()
                 break

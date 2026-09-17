@@ -231,6 +231,39 @@ class ChatMessage:
     turn_id: str | None = None
 
 
+@dataclass
+class ConversationScroll:
+    """Manages independent vertical scroll position and activity tracking for the conversation column per §31."""
+
+    scroll_offset: int = 0
+    viewport_height: int | None = None
+    has_new_activity: bool = False
+    follow_bottom: bool = True
+
+    def scroll_up(self, lines: int = 1) -> None:
+        """Scroll view upward, detaching from live-following."""
+        self.scroll_offset += max(1, lines)
+        self.follow_bottom = False
+
+    def scroll_down(self, lines: int = 1) -> None:
+        """Scroll view downward towards bottom."""
+        self.scroll_offset = max(0, self.scroll_offset - max(1, lines))
+        if self.scroll_offset == 0:
+            self.follow_bottom = True
+            self.has_new_activity = False
+
+    def scroll_to_bottom(self) -> None:
+        """Jump to the bottom and resume live-following."""
+        self.scroll_offset = 0
+        self.follow_bottom = True
+        self.has_new_activity = False
+
+    def notify_activity(self) -> None:
+        """Notify that new conversation content arrived outside current viewport."""
+        if not self.follow_bottom and self.scroll_offset > 0:
+            self.has_new_activity = True
+
+
 from cli.tui.runtime_panel import RuntimePanelScroll
 
 
@@ -245,6 +278,7 @@ class AutonomousDeliveryState:
         work_orders: list[WorkOrderItem] | None = None,
         operations: dict[str, OperationNode] | None = None,
         scroll: RuntimePanelScroll | None = None,
+        conversation_scroll: ConversationScroll | None = None,
     ) -> None:
         self.project_name = project_name
         self.session_id = session_id
@@ -282,6 +316,12 @@ class AutonomousDeliveryState:
                 "op-root": OperationNode("op-root", "Architecture", role="Architecture", backend="Claude", status="RUNNING")
             }
         self.scroll: RuntimePanelScroll = scroll if scroll is not None else RuntimePanelScroll()
+        self.conversation_scroll: ConversationScroll = (
+            conversation_scroll if conversation_scroll is not None else ConversationScroll()
+        )
+        self.composer_buffer: str = ""
+        self.is_typing: bool = False
+        self.focus_target: str = "composer"
         self.activity_log: list[ActivityEntry] = []
         self.messages: list[ChatMessage] = []
         self.completion_checklist: dict[str, bool] = {
@@ -365,7 +405,21 @@ class AutonomousDeliveryState:
             turn_id=turn_id,
         )
         self.messages.append(msg)
+        if hasattr(self, "conversation_scroll") and self.conversation_scroll is not None:
+            self.conversation_scroll.notify_activity()
         return msg
+
+    def scroll_conversation_up(self, lines: int = 1) -> None:
+        """Scroll conversation viewport upward, detaching from live-follow (§31)."""
+        self.conversation_scroll.scroll_up(lines)
+
+    def scroll_conversation_down(self, lines: int = 1) -> None:
+        """Scroll conversation viewport downward towards bottom (§31)."""
+        self.conversation_scroll.scroll_down(lines)
+
+    def scroll_conversation_to_bottom(self) -> None:
+        """Jump conversation viewport to bottom and resume live-following (§31)."""
+        self.conversation_scroll.scroll_to_bottom()
 
     def record_turn_action(
         self,
@@ -928,6 +982,7 @@ __all__ = [
     "ActivityEntry",
     "AutonomousDeliveryState",
     "ChatMessage",
+    "ConversationScroll",
     "OperationNode",
     "PlanRevision",
     "ProjectPhase",

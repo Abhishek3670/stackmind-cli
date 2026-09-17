@@ -94,6 +94,27 @@ from cli.tui.runtime_panel import (
     render_runtime_panel,
     render_runtime_panel_str,
 )
+from cli.tui.state import ConversationScroll
+
+
+# ── Conversation Column & Activity Indicator ──────────────────────────────────
+
+def render_conversation_column(
+    conversation_renderable: RenderableType,
+    *,
+    scroll: ConversationScroll | None = None,
+    state: Any | None = None,
+) -> RenderableType:
+    """Wrap conversation column with scroll badge when new activity arrived outside viewport (§31)."""
+    if scroll is None and state is not None and hasattr(state, "conversation_scroll"):
+        scroll = getattr(state, "conversation_scroll")
+    if scroll is not None and scroll.has_new_activity:
+        return Group(
+            conversation_renderable,
+            Text(""),
+            Text("↓ New activity", style="bold #38bdf8", justify="center"),
+        )
+    return conversation_renderable
 
 
 # ── Two-Column Compositor ────────────────────────────────────────────────────
@@ -107,16 +128,24 @@ def render_workspace_layout(
     current_operation: dict[str, Any] | None = None,
     state: Any | None = None,
     scroll: RuntimePanelScroll | None = None,
+    conversation_scroll: ConversationScroll | None = None,
 ) -> RenderableType:
     """Compose the full two-column workspace layout.
 
-    If width < NARROW_THRESHOLD, returns just the conversation renderable.
+    If width < NARROW_THRESHOLD, returns just the conversation renderable
+    (wrapped with scroll badge if applicable).
     Otherwise, returns a Table grid with conversation | divider | runtime.
     """
     layout = compute_layout(width)
 
+    conv_column = render_conversation_column(
+        conversation_renderable,
+        scroll=conversation_scroll,
+        state=state,
+    )
+
     if not layout.show_runtime:
-        return conversation_renderable
+        return conv_column
 
     # Build a grid: [conversation] [divider] [runtime]
     grid = Table.grid(padding=0)
@@ -135,7 +164,7 @@ def render_workspace_layout(
 
     divider_char = Text("│", style="dim #334155")
 
-    grid.add_row(conversation_renderable, divider_char, runtime)
+    grid.add_row(conv_column, divider_char, runtime)
     return grid
 
 
@@ -148,6 +177,7 @@ def render_workspace_layout_str(
     current_operation: dict[str, Any] | None = None,
     state: Any | None = None,
     scroll: RuntimePanelScroll | None = None,
+    conversation_scroll: ConversationScroll | None = None,
 ) -> str:
     """Render the full workspace layout as plain text."""
     buf = io.StringIO()
@@ -163,12 +193,14 @@ def render_workspace_layout_str(
             current_operation=current_operation,
             state=state,
             scroll=scroll,
+            conversation_scroll=conversation_scroll,
         )
     )
     return console.export_text().rstrip()
 
 
 __all__ = [
+    "ConversationScroll",
     "NARROW_THRESHOLD",
     "RUNTIME_HEADING",
     "RUNTIME_MAX_WIDTH",
@@ -178,6 +210,7 @@ __all__ = [
     "RuntimePanelScroll",
     "compute_layout",
     "get_status_symbol",
+    "render_conversation_column",
     "render_runtime_panel",
     "render_runtime_panel_str",
     "render_workspace_layout",

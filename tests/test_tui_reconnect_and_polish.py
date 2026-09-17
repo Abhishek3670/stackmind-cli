@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -12,7 +13,11 @@ from cli.main import cli
 from cli.tui.app import (
     dispatch_delivery_command,
     format_session_header,
+    preserve_composer_buffer,
+    prompt_composer_input,
     reconnect_and_sync,
+    render_composer_box_str,
+    restore_composer_focus,
 )
 from cli.tui.chat import (
     render_assistant_message_str,
@@ -33,9 +38,17 @@ from cli.tui.landing import (
     render_landing_block,
     render_landing_block_str,
 )
+from cli.tui.layout import (
+    NARROW_THRESHOLD,
+    compute_layout,
+    render_conversation_column,
+    render_workspace_layout_str,
+)
+from cli.tui.runtime_panel import RuntimePanelScroll
 from cli.tui.state import (
     AutonomousDeliveryState,
     ChatMessage,
+    ConversationScroll,
     ProjectPhase,
 )
 from validators.kernel.tui import DaemonClient, StackMindTuiAdapter
@@ -388,3 +401,199 @@ def test_tui_repl_comprehensive_colon_commands_regression(tmp_path: Path):
     assert "Session RUNNING" in result.output
     assert "reconnected" in result.output or "online" in result.output
     assert "✦" in result.output
+
+
+# ── Phase 8: Composer, Scroll & Focus Behavior Tests (§28–§31, §41) ──────────
+
+def test_composer_multiline_vertical_expansion():
+    """Verify composer styling, border, and dynamic vertical expansion for multiline input (§28, §29, §30)."""
+    # 1. Single-line default composer
+    comp_single = render_composer_box_str(width=80)
+    assert "> " in comp_single
+    assert "Type a message..." in comp_single
+    assert "Ctrl+K commands | Ctrl+L clear" in comp_single
+    single_lines = [line for line in comp_single.splitlines() if line.strip()]
+    # Top border, single content line, bottom border -> 3 lines
+    assert len(single_lines) == 3
+
+    # 2. Multiline expansion with string content
+    multiline_text = "def calculate_total():\n    return sum(items)\ncalculate_total()"
+    comp_multi = render_composer_box_str(width=80, content=multiline_text)
+    assert "> def calculate_total():" in comp_multi
+    assert "return sum(items)" in comp_multi
+    assert "calculate_total()" in comp_multi
+    assert "Ctrl+K commands | Ctrl+L clear" in comp_multi
+    multi_lines = [line for line in comp_multi.splitlines() if line.strip()]
+    # Top border + 3 content lines + bottom border -> 5 lines (expanded vertically!)
+    assert len(multi_lines) == 5
+    assert len(multi_lines) > len(single_lines)
+
+    # 3. Multiline expansion with list of lines
+    comp_list = render_composer_box_str(width=80, content=["line alpha", "line beta"])
+    assert "> line alpha" in comp_list
+    assert "line beta" in comp_list
+    list_lines = [line for line in comp_list.splitlines() if line.strip()]
+    assert len(list_lines) == 4
+
+
+def test_composer_partial_input_preservation_and_state_tracking(monkeypatch):
+    """Verify composer retains partially typed text during live updates without freezing input (§29, §30)."""
+    state = AutonomousDeliveryState(session_id="session-pres-1")
+    assert state.composer_buffer == ""
+    assert state.is_typing is False
+
+    # Simulate user partially typing
+    preserve_composer_buffer(state, "git commit -m 'in progress")
+    assert state.composer_buffer == "git commit -m 'in progress"
+
+    # Simulate prompt input completion with preserved buffer
+    monkeypatch.setattr("builtins.input", lambda prompt: "'")
+    result = prompt_composer_input(width=80, state=state)
+    assert result == "git commit -m 'in progress'"
+    # Buffer consumed and typing flag reset
+    assert state.composer_buffer == ""
+    assert state.is_typing is False
+
+
+def test_focus_restoration_without_hijacking():
+    """Verify focus restoration restores focus when idle but never steals from active typing (§30)."""
+    state = AutonomousDeliveryState(session_id="session-focus-1")
+
+    # When not typing, focus restoration succeeds and sets focus target
+    state.is_typing = False
+    state.focus_target = "terminal"
+    restored = restore_composer_focus(state)
+    assert restored is True
+    assert state.focus_target == "composer"
+
+    # When user is actively typing, focus restoration must NOT steal focus or keystrokes
+    state.is_typing = True
+    state.focus_target = "active_input_buffer"
+    restored_while_typing = restore_composer_focus(state)
+    assert restored_while_typing is False
+    assert state.focus_target == "active_input_buffer"  # Preserved!
+
+
+def test_conversation_auto_scroll_and_activity_badge():
+    """Verify conversation auto-scroll follows at bottom and shows '↓ New activity' badge when scrolled up (§31)."""
+    state = AutonomousDeliveryState(session_id="session-scroll-1")
+    scroll = state.conversation_scroll
+    assert scroll.scroll_offset == 0
+    assert scroll.follow_bottom is True
+    assert scroll.has_new_activity is False
+
+    # 1. At bottom: new incoming messages maintain live-follow without badge
+    state.add_message("assistant", "Initial welcome message")
+    assert scroll.follow_bottom is True
+    assert scroll.has_new_activity is False
+
+    # 2. Scrolled upward: detaches from live-follow
+    state.scroll_conversation_up(lines=3)
+    assert scroll.scroll_offset == 3
+    assert scroll.follow_bottom is False
+
+    # 3. New message arrives while scrolled up: triggers '↓ New activity' badge
+    state.add_message("assistant", "Background operation finished.")
+    assert scroll.has_new_activity is True
+
+    # 4. Conversation column rendering includes the badge
+    rendered_col = render_conversation_column("Chat transcript body", state=state)
+    buf = io.StringIO()
+    from rich.console import Console
+    c = Console(file=buf, color_system=None, force_terminal=False)
+    c.print(rendered_col)
+    output = buf.getvalue()
+    assert "↓ New activity" in output
+    assert "Chat transcript body" in output
+
+    # 5. Returning to bottom resumes live-follow and clears the badge
+    state.scroll_conversation_to_bottom()
+    assert scroll.scroll_offset == 0
+    assert scroll.follow_bottom is True
+    assert scroll.has_new_activity is False
+
+    # Verify badge is removed after returning to bottom
+    buf_bottom = io.StringIO()
+    c_bottom = Console(file=buf_bottom, color_system=None, force_terminal=False)
+    c_bottom.print(render_conversation_column("Chat transcript body", state=state))
+    assert "↓ New activity" not in buf_bottom.getvalue()
+
+
+def test_independent_scrolling_conversation_and_runtime():
+    """Verify independent vertical scrolling between conversation column and runtime panel (§10, §31)."""
+    state = AutonomousDeliveryState(session_id="session-indep-1")
+
+    # Scroll conversation column up, keep runtime panel at bottom
+    state.scroll_conversation_up(2)
+    assert state.conversation_scroll.follow_bottom is False
+    assert state.scroll.follow_bottom is True
+
+    # Trigger conversation activity
+    state.add_message("assistant", "New conversation turn")
+    assert state.conversation_scroll.has_new_activity is True
+    assert state.scroll.has_new_activity is False
+
+    # Render workspace layout: left has badge, right does not
+    ws_text_1 = render_workspace_layout_str("Conversation area", width=120, state=state)
+    assert "↓ New activity" in ws_text_1
+    assert "↓ New runtime activity" not in ws_text_1
+
+    # Scroll runtime panel up and trigger runtime activity
+    state.scroll.scroll_up(1)
+    state.scroll.notify_activity()
+    assert state.scroll.has_new_activity is True
+
+    # Now both have their respective badges independently
+    ws_text_2 = render_workspace_layout_str("Conversation area", width=120, state=state)
+    assert "↓ New activity" in ws_text_2
+    assert "↓ New runtime activity" in ws_text_2
+
+    # Clear conversation scroll -> conversation badge clears, runtime badge remains
+    state.scroll_conversation_to_bottom()
+    ws_text_3 = render_workspace_layout_str("Conversation area", width=120, state=state)
+    assert "↓ New activity" not in ws_text_3
+    assert "↓ New runtime activity" in ws_text_3
+
+    # Clear runtime scroll -> runtime badge clears
+    state.scroll.scroll_to_bottom()
+    ws_text_4 = render_workspace_layout_str("Conversation area", width=120, state=state)
+    assert "↓ New activity" not in ws_text_4
+    assert "↓ New runtime activity" not in ws_text_4
+
+
+def test_responsive_workspace_layout_dimensions():
+    """Verify responsive two-column workspace layout calculation and rendering across terminal dimensions (§41)."""
+    # 80 cols: Narrow threshold (<100) -> runtime hidden, full width to conversation
+    layout_80 = compute_layout(80)
+    assert layout_80.show_runtime is False
+    assert layout_80.conversation_width == 80
+    assert layout_80.runtime_width == 0
+    assert layout_80.divider_width == 0
+
+    rendered_80 = render_workspace_layout_str("Narrow terminal conversation", width=80)
+    assert "Narrow terminal conversation" in rendered_80
+    assert "│" not in rendered_80  # No divider when narrow
+    assert "StackMind Runtime" not in rendered_80
+
+    # 100 cols: Threshold met -> runtime visible (~28%)
+    layout_100 = compute_layout(100)
+    assert layout_100.show_runtime is True
+    assert layout_100.runtime_width == 28
+    assert layout_100.conversation_width == 100 - 28 - 1  # 71
+    assert layout_100.divider_width == 1
+
+    # 120 cols: Two-column layout with divider and runtime panel
+    layout_120 = compute_layout(120)
+    assert layout_120.show_runtime is True
+    assert layout_120.conversation_width + layout_120.runtime_width + 1 == 120
+    rendered_120 = render_workspace_layout_str("Wide terminal conversation", width=120)
+    assert "Wide terminal conversation" in rendered_120
+    assert "│" in rendered_120
+    assert "StackMind Runtime" in rendered_120
+
+    # 160 cols: Wide layout respects RUNTIME_MAX_WIDTH (42)
+    layout_160 = compute_layout(160)
+    assert layout_160.show_runtime is True
+    assert layout_160.runtime_width <= 42
+    assert layout_160.conversation_width + layout_160.runtime_width + 1 == 160
+
