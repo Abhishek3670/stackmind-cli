@@ -99,6 +99,19 @@ from validators.kernel.tui.views import (
     session_header,
     verification_matrix,
 )
+from cli.tui.glyphs import (
+    get_glyph,
+    get_glyphs,
+    is_ascii_mode,
+    sanitize_text,
+    status_glyph,
+    tree_branch,
+)
+from cli.tui.keyboard import (
+    GLOBAL_HISTORY,
+    Key,
+    raw_prompt_input,
+)
 
 
 # ─── VIEW RENDERERS ───────────────────────────────────────────────────────────
@@ -354,11 +367,11 @@ def render_top_header_bar(
     # Format status indicator
     st = str(status or "online").lower()
     if st == "online":
-        glyph, glyph_style, st_name = "●", "bold #22c55e", "online"
+        glyph, glyph_style, st_name = status_glyph("online"), "bold #22c55e", "online"
     elif st in {"reconnecting", "reconnect"}:
-        glyph, glyph_style, st_name = "○", "bold yellow", "reconnecting"
+        glyph, glyph_style, st_name = status_glyph("waiting"), "bold yellow", "reconnecting"
     else:
-        glyph, glyph_style, st_name = "✗", "bold red", "offline"
+        glyph, glyph_style, st_name = status_glyph("failed"), "bold red", "offline"
 
     # Assemble right-side components based on available width
     right_items: list[str] = []
@@ -428,6 +441,7 @@ def render_composer_box(
     width: int = 80,
     content: str | list[str] | None = None,
     is_active: bool = False,
+    has_content: bool = False,
 ) -> Panel:
     """Render the rounded input composer box matching image.png:
     > Type a message...               Ctrl+K commands | Ctrl+L clear
@@ -439,7 +453,7 @@ def render_composer_box(
     inner_width = max(40, width - 4)
     border_color = "#60a5fa" if is_active else "#475569"
 
-    if not content:
+    if not content and not has_content:
         left_plain = f"> {placeholder}"
         right_plain = shortcuts
         spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
@@ -453,8 +467,10 @@ def render_composer_box(
     else:
         if isinstance(content, str):
             lines = content.splitlines() or [""]
-        else:
+        elif content:
             lines = list(content) or [""]
+        else:
+            lines = [""]
 
         rendered_lines: list[Text] = []
         first_text = lines[0]
@@ -491,11 +507,19 @@ def render_composer_box_str(
     width: int = 80,
     content: str | list[str] | None = None,
     is_active: bool = False,
+    has_content: bool = False,
 ) -> str:
     """Render input composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_box(placeholder=placeholder, shortcuts=shortcuts, width=width, content=content, is_active=is_active))
+    console.print(render_composer_box(
+        placeholder=placeholder,
+        shortcuts=shortcuts,
+        width=width,
+        content=content,
+        is_active=is_active,
+        has_content=has_content,
+    ))
     return console.export_text().rstrip()
 
 
@@ -541,19 +565,43 @@ def render_composer_top_border(
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
     is_active: bool = False,
+    has_content: bool = False,
+    content: str | list[str] | None = None,
 ) -> RenderableType:
-    """Render the top border of the composer box with placeholder and shortcuts."""
+    """Render the top border of the composer box with placeholder and shortcuts.
+
+    Dynamically swaps placeholder for '[Active Input]' or hides it when
+    input characters are present in the buffer (PLAN_TUI_BUGFIX_ROUND2.md §3.2).
+    """
     border_color = "#60a5fa" if is_active else "#475569"
-    fixed_len = len("╭─ ") + len(placeholder) + len(" ") + len(" ") + len(shortcuts) + len(" ─╮")
-    if width >= fixed_len + 2:
-        fill_count = width - fixed_len
-        text = Text()
-        text.append("╭─ ", style=border_color)
-        text.append(placeholder, style="dim #94a3b8")
-        text.append(" " + "─" * fill_count + " ", style=border_color)
-        text.append(shortcuts, style="dim #64748b")
-        text.append(" ─╮", style=border_color)
-        return text
+    active_content = has_content or bool(content)
+
+    if active_content:
+        label = "[Active Input]" if placeholder == "Type a message..." else placeholder
+    else:
+        label = placeholder
+
+    if label:
+        fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(shortcuts) + len(" ─╮")
+        if width >= fixed_len + 2:
+            fill_count = width - fixed_len
+            text = Text()
+            text.append("╭─ ", style=border_color)
+            text.append(label, style="bold #38bdf8" if active_content else "dim #94a3b8")
+            text.append(" " + "─" * fill_count + " ", style=border_color)
+            text.append(shortcuts, style="dim #64748b")
+            text.append(" ─╮", style=border_color)
+            return text
+    else:
+        fixed_len = len("╭─ ") + len(shortcuts) + len(" ─╮")
+        if width >= fixed_len + 2:
+            fill_count = width - fixed_len
+            text = Text()
+            text.append("╭─" + "─" * fill_count + " ", style=border_color)
+            text.append(shortcuts, style="dim #64748b")
+            text.append(" ─╮", style=border_color)
+            return text
+
     text = Text()
     text.append("╭" + "─" * max(2, width - 2) + "╮", style=border_color)
     return text
@@ -564,11 +612,20 @@ def render_composer_top_border_str(
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
     is_active: bool = False,
+    has_content: bool = False,
+    content: str | list[str] | None = None,
 ) -> str:
     """Render top border of the composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_top_border(placeholder=placeholder, shortcuts=shortcuts, width=width, is_active=is_active))
+    console.print(render_composer_top_border(
+        placeholder=placeholder,
+        shortcuts=shortcuts,
+        width=width,
+        is_active=is_active,
+        has_content=has_content,
+        content=content,
+    ))
     return console.export_text().rstrip()
 
 
@@ -595,10 +652,14 @@ def prompt_composer_input(
     initial_text: str = "",
     multiline: bool = False,
     state: Any | None = None,
+    on_ctrl_k: Callable[[], None] | None = None,
+    on_ctrl_l: Callable[[], None] | None = None,
+    history: list[str] | None = None,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
-    Supports multiline expansion, active typing state tracking, and preserves
+    Supports native raw keyboard interception (msvcrt / termios), real Ctrl+K & Ctrl+L,
+    multiline expansion, active typing state tracking, and preserves
     partially typed input buffer across background events (§28-§30).
     """
     if state is not None:
@@ -607,13 +668,57 @@ def prompt_composer_input(
         state.is_typing = True
         state.focus_target = "composer"
 
-    click.echo(render_composer_top_border_str(placeholder=placeholder, shortcuts=shortcuts, width=width, is_active=True))
-    if sys.stdin.isatty():
-        prompt_str = "\033[90m│\033[0m \033[1;36m>\033[0m "
-        cont_prompt_str = "\033[90m│\033[0m   "
-    else:
-        prompt_str = "│ > "
-        cont_prompt_str = "│   "
+    is_tty = False
+    try:
+        is_tty = sys.stdin.isatty()
+    except Exception:
+        pass
+
+    if is_tty:
+        click.echo(render_composer_top_border_str(
+            placeholder=placeholder,
+            shortcuts=shortcuts,
+            width=width,
+            is_active=True,
+            has_content=bool(initial_text),
+        ))
+        try:
+            val = raw_prompt_input(
+                placeholder=placeholder,
+                shortcuts=shortcuts,
+                width=width,
+                initial_text=initial_text,
+                history=history,
+                state=state,
+                on_ctrl_k=on_ctrl_k,
+                on_ctrl_l=on_ctrl_l,
+                top_border_renderer=lambda has_c: render_composer_top_border_str(
+                    placeholder=placeholder,
+                    shortcuts=shortcuts,
+                    width=width,
+                    is_active=True,
+                    has_content=has_c,
+                ),
+            )
+        finally:
+            if state is not None:
+                state.is_typing = False
+                state.composer_buffer = ""
+
+        click.echo(render_composer_bottom_border_str(width=width, is_active=True))
+        click.echo(render_bottom_footer_bar_str(width=width))
+        return val
+
+    # Non-TTY / test fallback: standard input() with multiline support
+    click.echo(render_composer_top_border_str(
+        placeholder=placeholder,
+        shortcuts=shortcuts,
+        width=width,
+        is_active=True,
+        has_content=bool(initial_text),
+    ))
+    prompt_str = "│ > "
+    cont_prompt_str = "│   "
 
     lines: list[str] = []
     try:
@@ -1419,7 +1524,43 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             try:
                 term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
                 conv_width = compute_layout(term_cols).conversation_width if term_cols >= NARROW_THRESHOLD else term_cols
-                text = prompt_composer_input(width=conv_width, state=state)
+
+                def _handle_ctrl_k() -> None:
+                    _show_help()
+
+                def _handle_ctrl_l() -> None:
+                    click.echo(render_top_header_bar_str(session, width=term_cols))
+                    l_layout = compute_layout(term_cols)
+                    if l_layout.show_runtime:
+                        l_str = render_landing_block_str(
+                            session=session,
+                            status=state.connection_status,
+                            width=l_layout.conversation_width,
+                        )
+                        click.echo(
+                            render_workspace_layout_str(
+                                l_str,
+                                width=term_cols,
+                                state=state,
+                                scroll=state.scroll,
+                                conversation_scroll=state.conversation_scroll,
+                            )
+                        )
+                    else:
+                        click.echo(
+                            render_landing_block_str(
+                                session=session,
+                                status=state.connection_status,
+                                width=term_cols,
+                            )
+                        )
+
+                text = prompt_composer_input(
+                    width=conv_width,
+                    state=state,
+                    on_ctrl_k=_handle_ctrl_k,
+                    on_ctrl_l=_handle_ctrl_l,
+                )
             except (EOFError, KeyboardInterrupt):
                 click.echo()
                 break
