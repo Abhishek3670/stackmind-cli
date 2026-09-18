@@ -293,6 +293,7 @@ def format_current_operation(
 
 def render_runtime_panel(
     width: int | None = None,
+    height: int | None = None,
     *,
     agents: list[dict[str, Any]] | list[Any] | None = None,
     work_orders: list[dict[str, Any]] | list[Any] | None = None,
@@ -370,11 +371,13 @@ def render_runtime_panel(
         border_style="dim #334155",
         padding=(0, 1),
         width=width,
+        height=height,
     )
 
 
 def render_runtime_panel_str(
     width: int = 30,
+    height: int | None = None,
     *,
     agents: list[dict[str, Any]] | list[Any] | None = None,
     work_orders: list[dict[str, Any]] | list[Any] | None = None,
@@ -390,6 +393,7 @@ def render_runtime_panel_str(
     console.print(
         render_runtime_panel(
             width=width,
+            height=height,
             agents=agents,
             work_orders=work_orders,
             current_operation=current_operation,

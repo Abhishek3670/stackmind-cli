@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import click
 from rich import box
@@ -77,8 +77,10 @@ from cli.tui.landing import (
 from cli.tui.layout import (
     NARROW_THRESHOLD,
     compute_layout,
+    render_full_screen_workspace,
     render_runtime_panel_str,
     render_workspace_layout_str,
+    slice_conversation_viewport,
 )
 from cli.tui.state import (
     ActivityEntry,
@@ -545,19 +547,95 @@ def preserve_composer_buffer(state: Any | None, text: str) -> None:
         state.composer_buffer = text
 
 
-def restore_terminal_state() -> None:
-    """Restore terminal cursor and modes cleanly on exit and uncaught exceptions (§43, §44)."""
+def enter_alternate_screen(stream: Any = None) -> None:
+    """Enter alternate screen buffer, clear screen, and home cursor (WO-053).
+
+    Emits \\x1b[?1049h (alternate buffer) and \\x1b[2J\\x1b[H (clear screen, home cursor).
+    """
+    target = stream or sys.stdout
+    try:
+        if target and hasattr(target, "write"):
+            target.write("\x1b[?1049h\x1b[2J\x1b[H")
+            target.flush()
+    except Exception:
+        pass
+
+
+def exit_alternate_screen(stream: Any = None) -> None:
+    """Exit alternate screen buffer (WO-053).
+
+    Emits \\x1b[?1049l (restore primary buffer).
+    """
+    target = stream or sys.stdout
+    try:
+        if target and hasattr(target, "write"):
+            target.write("\x1b[?1049l")
+            target.flush()
+    except Exception:
+        pass
+
+
+def restore_terminal_state(stream: Any = None) -> None:
+    """Restore terminal cursor and modes cleanly on exit and uncaught exceptions (§43, §44, WO-053).
+
+    Emits \\x1b[?1049l (exit alternate buffer), \\x1b[?25h (show cursor), and \\x1b[0m (reset attributes).
+    """
     try:
         Console().show_cursor(True)
     except Exception:
         pass
+    target = stream or sys.stdout
     try:
-        if sys.stdout and hasattr(sys.stdout, "write"):
-            # Standard ANSI escape to show cursor (\x1b[?25h) and reset attributes (\x1b[0m)
-            sys.stdout.write("\x1b[?25h\x1b[0m")
-            sys.stdout.flush()
+        if target and hasattr(target, "write"):
+            target.write("\x1b[?1049l\x1b[?25h\x1b[0m")
+            target.flush()
     except Exception:
         pass
+
+
+def redraw_full_screen(
+    session: Mapping[str, Any] | None = None,
+    state: Any | None = None,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    clear: bool = False,
+    stream: Any = None,
+    conversation_content: str | RenderableType | None = None,
+    composer_content: str | None = None,
+    composer_is_active: bool = False,
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+) -> str:
+    """Redraw the full-screen TUI workspace (WO-053).
+
+    Renders top header, two-column workspace (with conversation viewport and
+    anchored runtime panel), and pinned bottom composer box.
+    """
+    term_size = shutil.get_terminal_size(fallback=(80, 24))
+    cols = width if width is not None else term_size.columns
+    lines = height if height is not None else term_size.lines
+
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        conversation_content=conversation_content,
+        width=cols,
+        height=lines,
+        composer_content=composer_content,
+        composer_is_active=composer_is_active,
+        shortcuts=shortcuts,
+    )
+
+    target = stream or sys.stdout
+    try:
+        if target and hasattr(target, "write"):
+            prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H"
+            target.write(f"{prefix}{frame}")
+            target.flush()
+    except Exception:
+        pass
+
+    return frame
 
 
 def render_composer_top_border(
@@ -1492,33 +1570,43 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             _run_demo(client, session)
             return
 
-        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-        click.echo(render_top_header_bar_str(session, width=term_cols))
+        is_tty = False
+        try:
+            is_tty = sys.stdout.isatty()
+        except Exception:
+            pass
 
-        layout = compute_layout(term_cols)
-        if layout.show_runtime:
-            landing_str = render_landing_block_str(
-                session=session,
-                status=state.connection_status,
-                width=layout.conversation_width,
-            )
-            click.echo(
-                render_workspace_layout_str(
-                    landing_str,
-                    width=term_cols,
-                    state=state,
-                    scroll=state.scroll,
-                    conversation_scroll=state.conversation_scroll,
-                )
-            )
+        if is_tty:
+            enter_alternate_screen()
+            redraw_full_screen(session, state, clear=True)
         else:
-            click.echo(
-                render_landing_block_str(
+            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+            click.echo(render_top_header_bar_str(session, width=term_cols))
+
+            layout = compute_layout(term_cols)
+            if layout.show_runtime:
+                landing_str = render_landing_block_str(
                     session=session,
                     status=state.connection_status,
-                    width=term_cols,
+                    width=layout.conversation_width,
                 )
-            )
+                click.echo(
+                    render_workspace_layout_str(
+                        landing_str,
+                        width=term_cols,
+                        state=state,
+                        scroll=state.scroll,
+                        conversation_scroll=state.conversation_scroll,
+                    )
+                )
+            else:
+                click.echo(
+                    render_landing_block_str(
+                        session=session,
+                        status=state.connection_status,
+                        width=term_cols,
+                    )
+                )
 
         while True:
             try:
@@ -1529,31 +1617,34 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
                     _show_help()
 
                 def _handle_ctrl_l() -> None:
-                    click.echo(render_top_header_bar_str(session, width=term_cols))
-                    l_layout = compute_layout(term_cols)
-                    if l_layout.show_runtime:
-                        l_str = render_landing_block_str(
-                            session=session,
-                            status=state.connection_status,
-                            width=l_layout.conversation_width,
-                        )
-                        click.echo(
-                            render_workspace_layout_str(
-                                l_str,
-                                width=term_cols,
-                                state=state,
-                                scroll=state.scroll,
-                                conversation_scroll=state.conversation_scroll,
-                            )
-                        )
+                    if is_tty:
+                        redraw_full_screen(session, state, clear=True)
                     else:
-                        click.echo(
-                            render_landing_block_str(
+                        click.echo(render_top_header_bar_str(session, width=term_cols))
+                        l_layout = compute_layout(term_cols)
+                        if l_layout.show_runtime:
+                            l_str = render_landing_block_str(
                                 session=session,
                                 status=state.connection_status,
-                                width=term_cols,
+                                width=l_layout.conversation_width,
                             )
-                        )
+                            click.echo(
+                                render_workspace_layout_str(
+                                    l_str,
+                                    width=term_cols,
+                                    state=state,
+                                    scroll=state.scroll,
+                                    conversation_scroll=state.conversation_scroll,
+                                )
+                            )
+                        else:
+                            click.echo(
+                                render_landing_block_str(
+                                    session=session,
+                                    status=state.connection_status,
+                                    width=term_cols,
+                                )
+                            )
 
                 text = prompt_composer_input(
                     width=conv_width,
@@ -1567,6 +1658,8 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             session, should_exit = dispatch_delivery_command(adapter, client, session, text, state)
             if should_exit:
                 break
+            if is_tty:
+                redraw_full_screen(session, state)
     finally:
         restore_terminal_state()
         if daemon is not None:
