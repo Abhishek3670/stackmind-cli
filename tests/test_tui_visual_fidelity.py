@@ -671,3 +671,30 @@ def test_phase10_terminal_state_restoration(monkeypatch):
     monkeypatch.setattr("sys.stdout", None)
     restore_terminal_state()  # Must not raise
 
+
+def test_full_width_composer_expansion():
+    """Verify composer container expands to full terminal width (WO-054)."""
+    box_80 = render_composer_box_str(width=80)
+    assert len(box_80.splitlines()[0]) == 80
+
+    box_120 = render_composer_box_str(width=120)
+    assert len(box_120.splitlines()[0]) == 120
+
+
+def test_prompt_composer_input_footer_suppression(monkeypatch, capsys):
+    """Verify prompt_composer_input suppresses footer bar when show_footer=False (WO-054)."""
+    monkeypatch.setattr("builtins.input", lambda prompt: "input without footer")
+    capsys.readouterr()
+
+    received = prompt_composer_input(width=80, show_footer=False)
+    assert received == "input without footer"
+
+    captured = capsys.readouterr()
+    assert ":help" not in captured.out
+    assert ":status" not in captured.out
+    assert ":events" not in captured.out
+    assert "StackMind" not in captured.out
+    assert "Type a message..." in captured.out
+    assert "╰" in captured.out
+
+

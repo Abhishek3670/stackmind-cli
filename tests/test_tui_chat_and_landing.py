@@ -11,12 +11,15 @@ from cli.main import cli as main_cli
 from cli.tui.app import dispatch_delivery_command
 from cli.tui.chat import (
     extract_internal_reasoning,
+    is_stray_command_bar,
     render_actions_group,
     render_actions_group_str,
     render_assistant_message,
     render_assistant_message_str,
     render_chat_transcript,
     render_chat_transcript_str,
+    render_system_message,
+    render_system_message_str,
     render_user_message,
     render_user_message_str,
 )
@@ -644,6 +647,77 @@ def test_extract_assistant_thinking_from_structured_payloads(tmp_path: Path):
     # 5. Payload without thinking returns None (never fabricates fake reasoning)
     assert extract_assistant_thinking({"response": "Clean text only"}) is None
     assert extract_assistant_thinking({}) is None
+
+
+def test_assistant_message_left_aligned_model_attribution():
+    """Verify assistant message header left-aligns model attribution inline (WO-054)."""
+    # 1. Direct model parameter
+    out_direct = render_assistant_message_str("Response text.", model="qwen2.5-coder:7b", width=80)
+    lines_direct = out_direct.splitlines()
+    assert "✦ StackMind (qwen2.5-coder:7b)" in lines_direct[0]
+    assert lines_direct[0].startswith("✦ StackMind (qwen2.5-coder:7b)")
+
+    # 2. Auto-extraction from heading / leading text
+    content_with_hdr = "# Response from qwen2.5-coder:7b\n\nDirect response body without centering."
+    out_extracted = render_assistant_message_str(content_with_hdr, width=80)
+    lines_extracted = out_extracted.splitlines()
+    # Left-aligned header contains model
+    assert "✦ StackMind (qwen2.5-coder:7b)" in lines_extracted[0]
+    # Centered markdown heading removed from body
+    assert "# Response from" not in out_extracted
+    assert "Direct response body without centering." in out_extracted
+
+
+def test_operational_telemetry_dimming_in_chat():
+    """Verify operational telemetry lines are styled with dim secondary coloring (WO-054)."""
+    content = "Final response content.\n\nKnowledge revision: 4"
+    rendered = _extract_plain(render_assistant_message(content))
+    assert "Final response content." in rendered
+    assert "Knowledge revision: 4" in rendered
+
+    # System message rendering
+    sys_out = render_system_message_str("● Thinking... Turn submitted\nKnowledge revision: 12\nBackground sync done.")
+    assert "✦ System" in sys_out
+    assert "● Thinking... Turn submitted" in sys_out
+    assert "Knowledge revision: 12" in sys_out
+
+
+def test_stray_command_bar_filtering_in_chat_transcript():
+    """Verify stray command footer / shortcut remnants are filtered out of conversational stream (WO-054)."""
+    # Detection helper
+    assert is_stray_command_bar(":help   :status   :diff   :events   :roles   :landing   StackMind v3.3.0")
+    assert is_stray_command_bar("Ctrl+K commands | Ctrl+L clear")
+    assert not is_stray_command_bar("Can you explain the diff in auth.py?")
+
+    # Filtering in transcript
+    messages = [
+        ChatMessage(role="user", content="Show me the changes"),
+        ChatMessage(role="assistant", content=":help   :status   :diff   :events   :roles   :landing   StackMind v3.3.0"),
+        ChatMessage(role="assistant", content="Here are the actual changes."),
+    ]
+    transcript = render_chat_transcript_str(messages, width=80)
+    assert "Show me the changes" in transcript
+    assert "Here are the actual changes." in transcript
+    assert ":help   :status   :diff" not in transcript
+
+
+def test_landing_block_metadata_deduplication_and_tight_padding():
+    """Verify landing block de-duplicates full UUIDs to short IDs and tightens vertical dead space (WO-054)."""
+    session = {
+        "session_id": "b49209fd-1234-5678-abcd-9876543210ef",
+        "project": "~/projects/stackmind",
+        "status": "online",
+    }
+    rendered = render_landing_block_str(session=session, width=80)
+    # Full UUID should be abbreviated to short 8-char id
+    assert "b49209fd" in rendered
+    assert "b49209fd-1234-5678-abcd-9876543210ef" not in rendered
+
+    # Verify no dead space (tight vertical layout)
+    lines = [line.strip() for line in rendered.splitlines() if line.strip()]
+    assert any("✦" in line for line in lines)
+    assert any("PLAN · BUILD · VERIFY · GOVERN" in line for line in lines)
+    assert any("Status:" in line for line in lines)
 
 
 

@@ -733,6 +733,7 @@ def prompt_composer_input(
     on_ctrl_k: Callable[[], None] | None = None,
     on_ctrl_l: Callable[[], None] | None = None,
     history: list[str] | None = None,
+    show_footer: bool = True,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
@@ -784,7 +785,8 @@ def prompt_composer_input(
                 state.composer_buffer = ""
 
         click.echo(render_composer_bottom_border_str(width=width, is_active=True))
-        click.echo(render_bottom_footer_bar_str(width=width))
+        if show_footer:
+            click.echo(render_bottom_footer_bar_str(width=width))
         return val
 
     # Non-TTY / test fallback: standard input() with multiline support
@@ -826,7 +828,8 @@ def prompt_composer_input(
             state.composer_buffer = ""
 
     click.echo(render_composer_bottom_border_str(width=width, is_active=True))
-    click.echo(render_bottom_footer_bar_str(width=width))
+    if show_footer:
+        click.echo(render_bottom_footer_bar_str(width=width))
     return "\n".join(lines)
 
 
@@ -1364,7 +1367,7 @@ def dispatch_delivery_command(
         if op_id and op_id not in state.operations:
             state.operations[op_id] = OperationNode(op_id, "Turn", role="Backend", backend="Codex", status="RUNNING")
         # This is a local wait indicator, not a claim about daemon state.
-        status_line = Text("● Thinking… Turn submitted to the governed daemon.", style="dim #64748b")
+        status_line = Text("● Thinking... Turn submitted to the governed daemon.", style="dim cyan")
         click.echo(status_line)
 
         # Synchronously await turn completion while consuming events
@@ -1647,10 +1650,11 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
                             )
 
                 text = prompt_composer_input(
-                    width=conv_width,
+                    width=term_cols,
                     state=state,
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
+                    show_footer=not getattr(state, "has_conversation", False),
                 )
             except (EOFError, KeyboardInterrupt):
                 click.echo()

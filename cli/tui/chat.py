@@ -161,6 +161,16 @@ def render_actions_group_str(
     return console.export_text().rstrip()
 
 
+def is_stray_command_bar(content: str) -> bool:
+    """Detect unformatted command bar / footer remnants that bled into messages."""
+    stripped = content.strip()
+    if ":help" in stripped and ":status" in stripped and (":events" in stripped or ":landing" in stripped or ":diff" in stripped):
+        return True
+    if "Ctrl+K commands" in stripped and "Ctrl+L clear" in stripped:
+        return True
+    return False
+
+
 def render_assistant_message(
     content: str,
     timestamp: str | None = None,
@@ -169,9 +179,20 @@ def render_assistant_message(
     inline_diffs: bool = True,
     actions: Any | None = None,
     thinking: str | None = None,
+    model: str | None = None,
 ) -> RenderableType:
-    """Render an assistant message with '✦ StackMind' header (§15), dynamic turn regions (§18, §20, §24), and rich Markdown (§32)."""
+    """Render an assistant message with '✦ StackMind' header (§15), dynamic turn regions (§18, §20, §24), left-aligned model attribution, and rich Markdown (§32)."""
+    model_val = model
+    working_content = content
+    if not model_val and working_content:
+        m = re.match(r"^\s*#*\s*Response from\s+([^\n\r]+?)\s*:?\s*(?:\n+|$)", working_content, flags=re.IGNORECASE)
+        if m:
+            model_val = m.group(1).strip()
+            working_content = working_content[m.end():]
+
     hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
+    if model_val:
+        hdr.append(f" ({model_val})", style="dim #94a3b8")
 
     # Per §17: Suppress timestamps from normal chat rows unless explicitly enabled
     show_ts = show_timestamp if show_timestamp is not None else (timestamp is not None and show_timestamp is not False)
@@ -212,20 +233,34 @@ def render_assistant_message(
                 think_text.append(f"  {tline}\n", style="dim #cbd5e1")
         elements.append(think_text)
 
-    cleaned = strip_internal_reasoning(content)
+    cleaned = strip_internal_reasoning(working_content)
 
-    # Dynamic Region 3: Final assistant response (§18, §32)
+    # Dynamic Region 3: Final assistant response (§18, §32) with operational telemetry dimming
     if cleaned:
-        elements.append(Text(""))
-        if inline_diffs and (
-            cleaned.startswith("diff --git ")
-            or (cleaned.startswith("--- ") and "\n+++ " in cleaned)
-        ):
-            from cli.tui.diff import render_unified_diff
-            body: RenderableType = render_unified_diff(cleaned)
-        else:
-            body = Markdown(cleaned, code_theme="monokai")
-        elements.append(body)
+        telemetry_lines: list[str] = []
+        body_lines: list[str] = []
+        for line in cleaned.splitlines():
+            if re.match(r"^\s*Knowledge revision:\s*.*$", line, flags=re.IGNORECASE):
+                telemetry_lines.append(line.strip())
+            else:
+                body_lines.append(line)
+        cleaned_body = "\n".join(body_lines).strip()
+
+        if cleaned_body:
+            elements.append(Text(""))
+            if inline_diffs and (
+                cleaned_body.startswith("diff --git ")
+                or (cleaned_body.startswith("--- ") and "\n+++ " in cleaned_body)
+            ):
+                from cli.tui.diff import render_unified_diff
+                body: RenderableType = render_unified_diff(cleaned_body)
+            else:
+                body = Markdown(cleaned_body, code_theme="monokai")
+            elements.append(body)
+
+        for tline in telemetry_lines:
+            elements.append(Text(""))
+            elements.append(Text(tline, style="dim #64748b"))
 
     return Group(*elements)
 
@@ -239,6 +274,7 @@ def render_assistant_message_str(
     inline_diffs: bool = True,
     actions: Any | None = None,
     thinking: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Render an assistant message as plain formatted string using in-memory capture."""
     buf = io.StringIO()
@@ -251,6 +287,59 @@ def render_assistant_message_str(
             inline_diffs=inline_diffs,
             actions=actions,
             thinking=thinking,
+            model=model,
+        )
+    )
+    return console.export_text().rstrip()
+
+
+def render_system_message(
+    content: str,
+    timestamp: str | None = None,
+    *,
+    show_timestamp: bool | None = None,
+) -> RenderableType:
+    """Render a system message with '✦ System' header and dimmed secondary styling."""
+    hdr = Text("✦ ", style="dim cyan").append("System", style="dim #94a3b8")
+    show_ts = show_timestamp if show_timestamp is not None else (timestamp is not None and show_timestamp is not False)
+    if show_timestamp is False:
+        show_ts = False
+
+    if show_ts and timestamp:
+        grid = Table.grid(expand=True)
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+        grid.add_row(hdr, Text(timestamp, style="dim #64748b"))
+        top_elem: RenderableType = grid
+    else:
+        top_elem = hdr
+
+    lines: list[RenderableType] = [top_elem]
+    for line in content.splitlines():
+        if re.match(r"^\s*Knowledge revision:\s*.*$", line, flags=re.IGNORECASE):
+            lines.append(Text(line, style="dim #64748b"))
+        elif "thinking" in line.lower() or "turn submitted" in line.lower():
+            lines.append(Text(line, style="dim cyan"))
+        else:
+            lines.append(Text(line, style="dim #64748b"))
+    return Group(*lines)
+
+
+def render_system_message_str(
+    content: str,
+    width: int = 80,
+    timestamp: str | None = None,
+    *,
+    show_timestamp: bool | None = None,
+) -> str:
+    """Render a system message as plain formatted string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(
+        render_system_message(
+            content,
+            timestamp=timestamp,
+            show_timestamp=show_timestamp,
         )
     )
     return console.export_text().rstrip()
@@ -271,6 +360,8 @@ def render_chat_transcript(
 
     elements: list[RenderableType] = []
     for msg in messages:
+        if is_stray_command_bar(msg.content):
+            continue
         role = msg.role.lower()
         if role == "user":
             elements.append(
@@ -289,6 +380,15 @@ def render_chat_transcript(
                     show_timestamp=show_timestamps,
                     actions=getattr(msg, "actions", None),
                     thinking=getattr(msg, "thinking", None),
+                    model=getattr(msg, "model", None),
+                )
+            )
+        elif role == "system":
+            elements.append(
+                render_system_message(
+                    msg.content,
+                    timestamp=msg.timestamp if show_timestamps else None,
+                    show_timestamp=show_timestamps,
                 )
             )
         elif role == "tool":
@@ -339,12 +439,15 @@ def render_chat_transcript_str(
 
 __all__ = [
     "extract_internal_reasoning",
+    "is_stray_command_bar",
     "render_actions_group",
     "render_actions_group_str",
     "render_assistant_message",
     "render_assistant_message_str",
     "render_chat_transcript",
     "render_chat_transcript_str",
+    "render_system_message",
+    "render_system_message_str",
     "strip_internal_reasoning",
     "render_user_message",
     "render_user_message_str",

@@ -168,6 +168,8 @@ def render_landing_block(
             stat = session.get("status") or session.get("state")
 
     sid_val = str(sid) if sid is not None else "a295c255"
+    if len(sid_val) > 8 and ("-" in sid_val or len(sid_val) == 36 or len(sid_val) == 32):
+        sid_val = sid_val.split("-")[0] if "-" in sid_val else sid_val[:8]
     if proj is not None:
         proj_val = str(proj)
     else:
@@ -209,14 +211,10 @@ def render_landing_block(
     padded_meta = Padding(meta_table, (0, 0, 0, left_pad))
 
     items: list[RenderableType] = [
-        Text(""),
         title_line,
-        Text(""),
         tagline_text,
         pillars_text,
-        Text(""),
         motto_text,
-        Text(""),
     ]
 
     # Legacy hints hook for test_responsive_terminal_sizing_landing
@@ -245,13 +243,10 @@ def render_landing_block(
             hints_table.add_row(b0, Text(LANDING_HINTS[0][1], style="white"), b1, Text(LANDING_HINTS[1][1], style="white"))
             hints_table.add_row(b2, Text(LANDING_HINTS[2][1], style="white"), b3, Text(LANDING_HINTS[3][1], style="white"))
         items.append(Align.center(hints_table))
-        items.append(Text(""))
 
     items.extend([
         divider,
-        Text(""),
         padded_meta,
-        Text(""),
     ])
 
     return Panel(
