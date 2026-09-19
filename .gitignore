@@ -16,7 +16,7 @@ docs/STACKMIND_ARCHITECTURE.md
 docs/rfcs/
 docs/SMPOC/
 
-
+.freebuff/
 .sync/
 
 .venv/
@@ -46,3 +46,5 @@ StackMind_Agent_Runtime.md
 
 tui.py
 
+image.png
+tui-checklist.md
