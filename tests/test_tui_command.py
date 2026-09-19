@@ -176,3 +176,99 @@ def test_tui_with_explicit_daemon_url(tmp_path: Path):
         )
         assert result.exit_code == 0, result.output
         assert "Session" in result.output
+
+
+def test_dispatch_delivery_command_routes_colon_commands_to_conversation_viewport():
+    """Verify colon commands append user message and system response to state.messages (WO-055)."""
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus, WorkOrderItem
+
+    client = _RecordingClient()
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    session = {"session_id": "session-1", "workspace": ".", "contract": {"allow": ["src/*"]}}
+    state = AutonomousDeliveryState(session_id="session-1")
+    state.roles["Backend"] = RoleStatus("Backend", "Codex", state="ACTIVE")
+    state.work_orders.append(WorkOrderItem(id="WO-055", title="TUI Fixes", status="ACTIVE"))
+
+    # 1. Test :help
+    dispatch_delivery_command(adapter, client, session, ":help", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":help"
+    assert state.messages[-1].role == "system"
+    assert "Available commands:" in state.messages[-1].content
+
+    # 2. Test :roles
+    dispatch_delivery_command(adapter, client, session, ":roles", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":roles"
+    assert state.messages[-1].role == "system"
+    assert "AGENT ROLES" in state.messages[-1].content
+    assert "Backend" in state.messages[-1].content
+
+    # 3. Test :status
+    dispatch_delivery_command(adapter, client, session, ":status", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":status"
+    assert state.messages[-1].role == "system"
+    assert "session-1" in state.messages[-1].content
+
+    # 4. Test :contract
+    dispatch_delivery_command(adapter, client, session, ":contract", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":contract"
+    assert state.messages[-1].role == "system"
+    assert "CONTRACT BOUNDARY HUD" in state.messages[-1].content
+
+    # 5. Test :wo
+    dispatch_delivery_command(adapter, client, session, ":wo", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":wo"
+    assert state.messages[-1].role == "system"
+    assert "WORK ORDERS" in state.messages[-1].content
+    assert "WO-055" in state.messages[-1].content
+
+    # 6. Test :matrix
+    dispatch_delivery_command(adapter, client, session, ":matrix", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":matrix"
+    assert state.messages[-1].role == "system"
+    assert "VERIFICATION MATRIX" in state.messages[-1].content or "Scope:" in state.messages[-1].content
+
+    # 7. Test :diff
+    dispatch_delivery_command(adapter, client, session, ":diff", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":diff"
+    assert state.messages[-1].role == "system"
+
+    # 8. Test :tree
+    dispatch_delivery_command(adapter, client, session, ":tree", state)
+    assert state.messages[-2].role == "user"
+    assert state.messages[-2].content == ":tree"
+    assert state.messages[-1].role == "system"
+    assert "Architecture" in state.messages[-1].content
+
+
+def test_colon_commands_suppress_stdout_echo_in_tty_mode(monkeypatch):
+    """Verify that when sys.stdout.isatty() is True, raw click.echo is suppressed to keep layout intact (WO-055)."""
+    import sys
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState
+
+    client = _RecordingClient()
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    session = {"session_id": "session-1", "workspace": "."}
+    state = AutonomousDeliveryState(session_id="session-1")
+
+    # Simulate TTY environment
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    echoed: list[str] = []
+    monkeypatch.setattr("click.echo", lambda *args, **kwargs: echoed.append(str(args)))
+
+    dispatch_delivery_command(adapter, client, session, ":roles", state)
+    # Output must be stored in state.messages
+    assert len(state.messages) == 2
+    assert state.messages[0].content == ":roles"
+    assert "AGENT ROLES" in state.messages[1].content
+    # But click.echo must NOT have been called in TTY mode
+    assert len(echoed) == 0

@@ -605,6 +605,7 @@ def redraw_full_screen(
     composer_content: str | None = None,
     composer_is_active: bool = False,
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    include_composer: bool = True,
 ) -> str:
     """Redraw the full-screen TUI workspace (WO-053).
 
@@ -624,13 +625,14 @@ def redraw_full_screen(
         composer_content=composer_content,
         composer_is_active=composer_is_active,
         shortcuts=shortcuts,
+        include_composer=include_composer,
     )
 
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
             prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H"
-            target.write(f"{prefix}{frame}")
+            target.write(f"{prefix}{frame}\n" if not include_composer else f"{prefix}{frame}")
             target.flush()
     except Exception:
         pass
@@ -894,18 +896,32 @@ def reconnect_and_sync(
         return False, []
 
 
+def get_status_str(
+    session: dict[str, Any],
+    state: AutonomousDeliveryState | None = None,
+    width: int = 80,
+) -> str:
+    """Build status header, contract HUD, and delivery view as a formatted string."""
+    conn_status = state.connection_status if state else "online"
+    parts = [
+        format_session_header(session, width=width, status=conn_status),
+        render_contract_hud_str(session.get("contract", {}), width=width),
+    ]
+    if state is not None:
+        state.update_from_session(session)
+        parts.append("")
+        parts.append(render_project_delivery_view(state))
+    return "\n".join(parts)
+
+
 def _show_status(
     session: dict[str, Any],
     state: AutonomousDeliveryState | None = None,
     width: int = 80,
-) -> None:
-    conn_status = state.connection_status if state else "online"
-    click.echo(format_session_header(session, width=width, status=conn_status))
-    click.echo(render_contract_hud_str(session.get("contract", {}), width=width))
-    if state is not None:
-        state.update_from_session(session)
-        click.echo("")
-        click.echo(render_project_delivery_view(state))
+) -> str:
+    out = get_status_str(session, state=state, width=width)
+    click.echo(out)
+    return out
 
 
 def _ensure_utf8() -> None:
@@ -919,8 +935,9 @@ def _ensure_utf8() -> None:
                 pass
 
 
-def _show_help() -> None:
-    click.echo(
+def get_help_str() -> str:
+    """Return available commands and shortcuts help text."""
+    return (
         "Available commands:\n"
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
@@ -944,8 +961,19 @@ def _show_help() -> None:
         "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
         "  :exit, :quit, q   Gracefully stop daemon and exit\n"
-        "  <prompt text>     Submit a governed turn to the agent"
+        "  <prompt text>     Submit a governed turn to the agent\n\n"
+        "Shortcuts:\n"
+        "  Ctrl+K            Open this help menu\n"
+        "  Ctrl+L            Redraw full screen\n"
+        "  Ctrl+C / Ctrl+D   Cancel turn or exit\n"
+        "  Esc               Cancel current prompt"
     )
+
+
+def _show_help() -> str:
+    out = get_help_str()
+    click.echo(out)
+    return out
 
 
 def _run_demo(client: DaemonClient, session: dict[str, Any]) -> None:
@@ -1043,24 +1071,40 @@ def dispatch_delivery_command(
     if normalized in {":exit", ":quit", "q"}:
         return session, True
 
+    is_tty = False
+    try:
+        is_tty = sys.stdout.isatty()
+    except Exception:
+        pass
+
     if normalized == ":help":
-        _show_help()
+        output_str = get_help_str()
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":reconnect":
-        click.echo(render_connection_status_str("reconnecting"))
+        output_parts = [render_connection_status_str("reconnecting")]
         ok, missed = reconnect_and_sync(client, adapter, state, session)
         if ok:
-            click.echo(f"{render_connection_status_str('online')} (reconnected, {len(missed)} missed events synced)")
+            output_parts.append(f"{render_connection_status_str('online')} (reconnected, {len(missed)} missed events synced)")
         else:
-            click.echo(render_error_box_str(
+            output_parts.append(render_error_box_str(
                 f"Could not reconnect to daemon at {client.url}",
                 title="RECONNECTION FAILED",
                 hint="Verify that the daemon process is running and reachable.",
             ))
+        output_str = "\n".join(output_parts)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":status":
+        error_str = None
         try:
             session = adapter.command(":status", session_id=session["session_id"])
             state.connection_status = "online"
@@ -1073,19 +1117,33 @@ def dispatch_delivery_command(
         except Exception as err:
             if is_connection_error(err):
                 state.connection_status = "reconnecting"
-                click.echo(render_error_box_str(
+                error_str = render_error_box_str(
                     f"Daemon connection failed: {err}",
                     title="CONNECTION ERROR",
                     hint="Daemon appears unreachable. Use :reconnect or check daemon status.",
-                ))
+                )
             else:
-                click.echo(render_error_box_str(str(err), title="STATUS ERROR"))
-        _show_status(session, state=state)
+                error_str = render_error_box_str(str(err), title="STATUS ERROR")
+
+        output_parts = []
+        if error_str:
+            output_parts.append(error_str)
+        output_parts.append(get_status_str(session, state=state))
+        output_str = "\n".join(output_parts)
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":contract":
         contract_data = session.get("contract", {})
-        click.echo(render_contract_hud_str(contract_data))
+        output_str = render_contract_hud_str(contract_data)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":roles":
@@ -1101,7 +1159,11 @@ def dispatch_delivery_command(
                         state.roles[normalized_key].model = rd.get("model")
         except Exception:
             pass
-        click.echo(render_roles_panel(state, detailed=True))
+        output_str = render_roles_panel(state, detailed=True)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized.startswith(":rebind") or normalized.startswith(":configure"):
@@ -1118,15 +1180,23 @@ def dispatch_delivery_command(
                     state.roles[normalized_key].backend = backend_arg
                     if model_arg:
                         state.roles[normalized_key].model = model_arg
-                click.echo(f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'" + (f" (model: {model_arg})" if model_arg else ""))
+                output_str = f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'" + (f" (model: {model_arg})" if model_arg else "")
             except Exception as err:
-                click.echo(f"[ERROR] Failed to rebind role '{role_arg}': {err}")
+                output_str = f"[ERROR] Failed to rebind role '{role_arg}': {err}"
         else:
-            click.echo("Usage: :rebind <role> <backend> [model]  (e.g., :rebind gitops ollama llama3)")
+            output_str = "Usage: :rebind <role> <backend> [model]  (e.g., :rebind gitops ollama llama3)"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":wo":
-        click.echo(render_work_orders_panel(state))
+        output_str = render_work_orders_panel(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized in {":tree", ":agents"}:
@@ -1147,7 +1217,11 @@ def dispatch_delivery_command(
                         state.operations[parent_id].children.append(op_id)
         except Exception:
             pass
-        click.echo(render_operation_tree(state))
+        output_str = render_operation_tree(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":plan":
@@ -1159,7 +1233,11 @@ def dispatch_delivery_command(
                     state.phase = ProjectPhase.AWAITING_APPROVAL
         except Exception:
             pass
-        click.echo(render_plan_panel_str(state))
+        output_str = render_plan_panel_str(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized.startswith(":approve"):
@@ -1177,16 +1255,24 @@ def dispatch_delivery_command(
                 if state.plan_revisions:
                     state.plan_revisions[-1].state = "APPROVED"
                 feedback_msg = f"Plan '{plan_id}' approved. Approval recorded."
-                click.echo(feedback_msg)
+                state.add_message("user", normalized)
                 state.add_message("assistant", f"✓ {feedback_msg} (reason: {clean_reason})")
+                if not is_tty:
+                    click.echo(feedback_msg)
                 return session, False
             except Exception as e:
-                click.echo(f"Plan approval error: {e}")
+                err_msg = f"Plan approval error: {e}"
+                state.add_message("user", normalized)
+                state.add_message("system", err_msg)
+                if not is_tty:
+                    click.echo(err_msg)
                 return session, False
         # Fallback to standard HITL approval
         adapter.command(f":approve {clean_reason}".strip(), session_id=session["session_id"])
-        click.echo("Approval recorded.")
+        state.add_message("user", normalized)
         state.add_message("assistant", f"✓ HITL Approval recorded: {clean_reason}")
+        if not is_tty:
+            click.echo("Approval recorded.")
         return session, False
 
     if normalized.startswith(":reject"):
@@ -1204,20 +1290,32 @@ def dispatch_delivery_command(
                     state.plan_revisions[-1].state = "REJECTED"
                     state.plan_revisions[-1].feedback = clean_feedback
                 feedback_msg = f"Plan '{plan_id}' rejected. Rejection recorded."
-                click.echo(feedback_msg)
+                state.add_message("user", normalized)
                 state.add_message("assistant", f"✗ {feedback_msg} (feedback: {clean_feedback})")
+                if not is_tty:
+                    click.echo(feedback_msg)
                 return session, False
             except Exception as e:
-                click.echo(f"Plan rejection error: {e}")
+                err_msg = f"Plan rejection error: {e}"
+                state.add_message("user", normalized)
+                state.add_message("system", err_msg)
+                if not is_tty:
+                    click.echo(err_msg)
                 return session, False
         # Fallback to standard HITL rejection
         adapter.command(f":reject {clean_feedback}".strip(), session_id=session["session_id"])
-        click.echo("Rejection recorded.")
+        state.add_message("user", normalized)
         state.add_message("assistant", f"✗ HITL Rejection recorded: {clean_feedback}")
+        if not is_tty:
+            click.echo("Rejection recorded.")
         return session, False
 
     if normalized == ":completion":
-        click.echo(render_completion_surface(state))
+        output_str = render_completion_surface(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized.startswith(":cancel"):
@@ -1231,32 +1329,43 @@ def dispatch_delivery_command(
                 for role_key, role_obj in state.roles.items():
                     if role_key.lower() == clean_target.lower() or getattr(role_obj, "agent_id", "") == clean_target:
                         role_obj.state = "CANCELLED"
-                click.echo(f"Agent/Operation {clean_target} CANCELLED")
-                return session, False
+                output_str = f"Agent/Operation {clean_target} CANCELLED"
             except Exception:
                 try:
                     client.operation_cancel(clean_target)
                     if clean_target in state.operations:
                         state.operations[clean_target].status = "CANCELLED"
-                    click.echo(f"Operation {clean_target} CANCELLED")
-                    return session, False
+                    output_str = f"Operation {clean_target} CANCELLED"
                 except Exception as e:
-                    click.echo(render_error_box_str(f"Cancellation error: {e}", title="CANCEL ERROR"))
-                    return session, False
-        # General session turn cancellation
-        session = adapter.command(":cancel", session_id=session["session_id"])
-        state.update_from_session(session)
-        click.echo(f"Session {session.get('state', 'CANCELLED')}")
+                    output_str = render_error_box_str(f"Cancellation error: {e}", title="CANCEL ERROR")
+        else:
+            # General session turn cancellation
+            session = adapter.command(":cancel", session_id=session["session_id"])
+            state.update_from_session(session)
+            output_str = f"Session {session.get('state', 'CANCELLED')}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":pause":
         session = adapter.command(":pause", session_id=session["session_id"])
-        click.echo(f"Session {session.get('state', 'PAUSED')}")
+        output_str = f"Session {session.get('state', 'PAUSED')}"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":resume":
         session = adapter.command(":resume", session_id=session["session_id"])
-        click.echo(f"Session {session.get('state', 'RUNNING')}")
+        output_str = f"Session {session.get('state', 'RUNNING')}"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized.startswith(":diff"):
@@ -1266,15 +1375,24 @@ def dispatch_delivery_command(
             raw_diff = adapter.command(f":diff diff={diff_val}", session_id=session["session_id"], diff=diff_val)
         else:
             raw_diff = adapter.command(":diff", session_id=session["session_id"])
-        click.echo(render_unified_diff_str(str(raw_diff)))
+        output_str = render_unified_diff_str(str(raw_diff))
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":matrix":
         dims = state.verification_dimensions if state is not None else None
-        click.echo(render_verification_matrix_str(dims))
+        output_str = render_verification_matrix_str(dims)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":events":
+        output_parts = []
         try:
             events = adapter.command(":events", session_id=session["session_id"])
             rendered_any = False
@@ -1284,37 +1402,51 @@ def dispatch_delivery_command(
                 for event in events:
                     ev_str = render_operational_event_str(event)
                     if ev_str:
-                        click.echo(ev_str)
+                        output_parts.append(ev_str)
                         rendered_any = True
                 for msg in recovered_msgs:
                     if msg.role == "assistant":
-                        click.echo(render_assistant_message_str(msg.content, actions=msg.actions, thinking=msg.thinking))
+                        output_parts.append(render_assistant_message_str(msg.content, actions=msg.actions, thinking=msg.thinking))
                         rendered_any = True
             if not rendered_any:
-                click.echo("No new events.")
+                output_parts.append("No new events.")
         except Exception as err:
             if is_connection_error(err):
                 state.connection_status = "reconnecting"
-                click.echo(render_error_box_str(
+                output_parts.append(render_error_box_str(
                     f"Event stream disconnected: {err}",
                     title="CONNECTION ERROR",
                     hint="Use :reconnect to recover missed events once daemon is restored.",
                 ))
             else:
-                click.echo(render_error_box_str(str(err), title="EVENT ERROR"))
+                output_parts.append(render_error_box_str(str(err), title="EVENT ERROR"))
+        output_str = "\n".join(output_parts)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized in {":chat", ":history"}:
-        click.echo(render_chat_transcript_str(state.messages))
+        output_str = render_chat_transcript_str(state.messages)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":landing":
-        click.echo(render_top_header_bar_str(session, width=80))
-        click.echo(render_landing_block_str(session=session, status=state.connection_status, width=80))
+        output_str = f"{render_top_header_bar_str(session, width=80)}\n{render_landing_block_str(session=session, status=state.connection_status, width=80)}"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized == ":runtime":
-        click.echo(render_runtime_panel_str(width=36, state=state))
+        output_str = render_runtime_panel_str(width=36, state=state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized.startswith(":actions"):
@@ -1322,7 +1454,11 @@ def dispatch_delivery_command(
         subcmd = subcmd.strip().lower()
         target_group = state.get_latest_actions_group()
         if not target_group or target_group.is_empty:
-            click.echo("No actions recorded for the current turn.")
+            output_str = "No actions recorded for the current turn."
+            state.add_message("user", normalized)
+            state.add_message("system", output_str)
+            if not is_tty:
+                click.echo(output_str)
             return session, False
 
         if subcmd in {"expand", "open"}:
@@ -1336,7 +1472,11 @@ def dispatch_delivery_command(
         else:
             target_group.toggle()
 
-        click.echo(render_actions_group_str(target_group))
+        output_str = render_actions_group_str(target_group)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if (
@@ -1347,13 +1487,21 @@ def dispatch_delivery_command(
         target_group = state.get_latest_actions_group()
         if target_group and not target_group.is_empty:
             target_group.handle_click()
-            click.echo(render_actions_group_str(target_group))
+            output_str = render_actions_group_str(target_group)
         else:
-            click.echo("No actions to toggle.")
+            output_str = "No actions to toggle."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     if normalized.startswith(":") and not normalized.startswith(":prompt "):
-        click.echo("Unknown command. Type :help.")
+        output_str = "Unknown command. Type :help."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
         return session, False
 
     # Governed turn prompt
@@ -1581,7 +1729,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
 
         if is_tty:
             enter_alternate_screen()
-            redraw_full_screen(session, state, clear=True)
+            redraw_full_screen(session, state, clear=True, include_composer=False)
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
             click.echo(render_top_header_bar_str(session, width=term_cols))
@@ -1617,11 +1765,17 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
                 conv_width = compute_layout(term_cols).conversation_width if term_cols >= NARROW_THRESHOLD else term_cols
 
                 def _handle_ctrl_k() -> None:
-                    _show_help()
+                    out = get_help_str()
+                    state.add_message("user", ":help")
+                    state.add_message("system", out)
+                    if is_tty:
+                        redraw_full_screen(session, state, clear=True, include_composer=False)
+                    else:
+                        click.echo(out)
 
                 def _handle_ctrl_l() -> None:
                     if is_tty:
-                        redraw_full_screen(session, state, clear=True)
+                        redraw_full_screen(session, state, clear=True, include_composer=False)
                     else:
                         click.echo(render_top_header_bar_str(session, width=term_cols))
                         l_layout = compute_layout(term_cols)
@@ -1638,6 +1792,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
                                     state=state,
                                     scroll=state.scroll,
                                     conversation_scroll=state.conversation_scroll,
+                                    height=max(4, shutil.get_terminal_size(fallback=(80, 24)).lines - 4),
                                 )
                             )
                         else:
@@ -1654,7 +1809,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
                     state=state,
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
-                    show_footer=not getattr(state, "has_conversation", False),
+                    show_footer=False if is_tty else not getattr(state, "has_conversation", False),
                 )
             except (EOFError, KeyboardInterrupt):
                 click.echo()
@@ -1663,7 +1818,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             if should_exit:
                 break
             if is_tty:
-                redraw_full_screen(session, state)
+                redraw_full_screen(session, state, include_composer=False)
     finally:
         restore_terminal_state()
         if daemon is not None:

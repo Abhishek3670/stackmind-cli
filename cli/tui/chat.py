@@ -164,8 +164,11 @@ def render_actions_group_str(
 def is_stray_command_bar(content: str) -> bool:
     """Detect unformatted command bar / footer remnants that bled into messages."""
     stripped = content.strip()
+    if stripped.startswith("Available commands:"):
+        return False
     if ":help" in stripped and ":status" in stripped and (":events" in stripped or ":landing" in stripped or ":diff" in stripped):
-        return True
+        if len(stripped.splitlines()) <= 2 or "StackMind v" in stripped:
+            return True
     if "Ctrl+K commands" in stripped and "Ctrl+L clear" in stripped:
         return True
     return False
@@ -316,7 +319,9 @@ def render_system_message(
 
     lines: list[RenderableType] = [top_elem]
     for line in content.splitlines():
-        if re.match(r"^\s*Knowledge revision:\s*.*$", line, flags=re.IGNORECASE):
+        if "\x1b[" in line:
+            lines.append(Text.from_ansi(line))
+        elif re.match(r"^\s*Knowledge revision:\s*.*$", line, flags=re.IGNORECASE):
             lines.append(Text(line, style="dim #64748b"))
         elif "thinking" in line.lower() or "turn submitted" in line.lower():
             lines.append(Text(line, style="dim cyan"))

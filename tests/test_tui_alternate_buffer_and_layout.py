@@ -297,3 +297,61 @@ def test_runtime_panel_reflects_state_mutations_reactively():
     updated_render = render_runtime_panel_str(state=state, width=32)
     assert "implementing" in updated_render
     assert "op-42" in updated_render or "Refactor" in updated_render
+
+
+# ─── 7. COMPOSER DEDUPLICATION & GEOMETRY (WO-055) ──────────────────────────
+
+
+def test_render_full_screen_workspace_without_composer():
+    """Verify include_composer=False omits the bottom composer box (WO-055)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex"}
+
+    frame_with = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=True,
+    )
+    frame_without = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=False,
+    )
+
+    # Frame with composer contains the composer prompt and border
+    assert "Type a message..." in frame_with
+    assert "Ctrl+K commands" in frame_with
+
+    # Frame without composer must NOT contain the static composer box
+    assert "Type a message..." not in frame_without
+    assert "Ctrl+K commands" not in frame_without
+
+    # Height without composer must be exactly 3 lines shorter than frame with composer
+    lines_with = len(frame_with.splitlines())
+    lines_without = len(frame_without.splitlines())
+    assert lines_without == lines_with - 3
+
+
+def test_redraw_full_screen_without_composer_emits_newline_for_prompt_positioning():
+    """Verify redraw_full_screen with include_composer=False appends newline to place cursor at composer row (WO-055)."""
+    buf = io.StringIO()
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex"}
+
+    redraw_full_screen(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=False,
+        stream=buf,
+    )
+
+    out = buf.getvalue()
+    # Must position cursor with newline after frame to ensure prompt_composer_input begins on row (height - 3)
+    assert out.endswith("\n")
+    assert "Type a message..." not in out

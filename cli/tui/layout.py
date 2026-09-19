@@ -274,6 +274,7 @@ def render_full_screen_workspace(
     composer_content: str | list[str] | None = None,
     composer_is_active: bool = False,
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    include_composer: bool = True,
 ) -> str:
     """Render a complete, anchored full-screen terminal frame.
 
@@ -282,6 +283,7 @@ def render_full_screen_workspace(
     - Rows 1 to (height - 4): Two-column workspace layout with viewport slicing
       (Left: conversation viewport; Right: persistent StackMind Runtime panel)
     - Rows (height - 3) to (height - 1): Pinned bottom composer box (3 lines)
+      (omitted when include_composer is False to leave rows open for prompt_composer_input).
     """
     from cli.tui.app import (
         render_composer_box_str,
@@ -320,6 +322,9 @@ def render_full_screen_workspace(
         conversation_scroll=getattr(state, "conversation_scroll", None),
         height=viewport_height,
     )
+
+    if not include_composer:
+        return f"{header_str}\n{workspace_str}"
 
     # 5. Pinned bottom composer box (3 lines)
     composer_str = render_composer_box_str(
