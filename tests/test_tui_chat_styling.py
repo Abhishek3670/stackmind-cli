@@ -135,10 +135,23 @@ def test_user_turn_unaccented_body_styling():
     assert not any("grey19" in str(s.style) for s in body_line.spans)
 
 
+def test_assistant_turn_leading_blank_line_spacing():
+    """Verify render_assistant_message renders Text('') as first element and header as second (WO-005)."""
+    renderable = render_assistant_message("Assistant response body")
+    elements = renderable.renderables
+    assert isinstance(elements[0], Text)
+    assert elements[0].plain == ""
+    assert "✦" in elements[1].plain
+    assert "StackMind" in elements[1].plain
+
+
 def test_assistant_model_badge_italic_styling():
     """Verify assistant model badge is styled with 'italic dim #94a3b8'."""
     renderable = render_assistant_message("Body content", model="qwen2.5-coder:7b")
-    hdr = renderable.renderables[0]
+    assert isinstance(renderable.renderables[0], Text)
+    assert renderable.renderables[0].plain == ""
+
+    hdr = renderable.renderables[1]
     assert isinstance(hdr, Text)
     assert "(qwen2.5-coder:7b)" in hdr.plain
 

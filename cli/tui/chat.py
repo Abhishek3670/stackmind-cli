@@ -267,7 +267,7 @@ def render_assistant_message(
     else:
         top_elem = hdr
 
-    elements: list[RenderableType] = [top_elem]
+    elements: list[RenderableType] = [Text(""), top_elem]
 
     # Dynamic Region 1: Turn Actions disclosure group (§18, §20, §21)
     if actions is not None:
@@ -354,7 +354,7 @@ def render_assistant_message_str(
             model=model,
         )
     )
-    return console.export_text(styles=use_ansi).rstrip()
+    return console.export_text(styles=use_ansi).strip()
 
 
 def render_assistant_stream_header(
