@@ -15,6 +15,7 @@ from live project and daemon state per IMPLEMENTATION_PLAN_TUI.md §7-§10, §37
 from __future__ import annotations
 
 import io
+import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -219,7 +220,7 @@ def format_agent_tree(
         is_active_root = r_status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
         if r_badge and (root.get("model") or is_active_root):
             max_badge_len = max(10, (width or 36) - 8)
-            trunc_badge = r_badge if len(r_badge) <= max_badge_len else r_badge[:max_badge_len - 1] + "…"
+            trunc_badge = textwrap.shorten(r_badge, width=max_badge_len, placeholder="…")
             badge_line = Text()
             badge_line.append("    ")
             badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
@@ -248,7 +249,7 @@ def format_agent_tree(
             if c_badge and (child.get("model") or is_active_child):
                 b_prefix = "      " if is_last else "  │   "
                 max_badge_len = max(10, (width or 36) - len(b_prefix) - 4)
-                trunc_badge = c_badge if len(c_badge) <= max_badge_len else c_badge[:max_badge_len - 1] + "…"
+                trunc_badge = textwrap.shorten(c_badge, width=max_badge_len, placeholder="…")
                 badge_line = Text()
                 badge_line.append(b_prefix, style="dim #475569")
                 badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
@@ -276,7 +277,7 @@ def format_agent_tree(
             is_active_item = status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
             if f_badge and (item.get("model") or is_active_item):
                 max_badge_len = max(10, (width or 36) - 8)
-                trunc_badge = f_badge if len(f_badge) <= max_badge_len else f_badge[:max_badge_len - 1] + "…"
+                trunc_badge = textwrap.shorten(f_badge, width=max_badge_len, placeholder="…")
                 badge_line = Text()
                 badge_line.append("    ")
                 badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
@@ -312,7 +313,7 @@ def format_work_orders(
 
         sym, style, _ = get_status_symbol(status)
 
-        trunc_title = title if len(title) <= max_title_len else title[:max_title_len - 1] + "…"
+        trunc_title = textwrap.shorten(title, width=max_title_len, placeholder="…") if title else ""
         line = Text()
         line.append("  ")
         line.append(f"{sym} ", style=style)

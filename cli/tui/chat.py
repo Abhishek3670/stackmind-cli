@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime
 import io
+import os
 import re
-from typing import TYPE_CHECKING
+import sys
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
@@ -38,6 +40,55 @@ def extract_internal_reasoning(content: str) -> str | None:
     return joined.strip() or None
 
 
+def should_render_ansi(
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
+) -> bool:
+    """Determine whether TUI string rendering should preserve ANSI escape styling."""
+    if force_color is True:
+        return True
+    if force_color is False or no_color is True:
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("STACKMIND_NO_COLOR") in {"1", "true", "yes"}:
+        return False
+    if os.environ.get("FORCE_COLOR") in {"1", "true", "yes"}:
+        return True
+    # Non-TTY environments (redirected / piped stdout) should not force ANSI
+    if hasattr(sys.stdout, "isatty") and not sys.stdout.isatty():
+        return False
+    return True
+
+
+def _make_capture_console(
+    width: int,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
+) -> tuple[Console, bool]:
+    buf = io.StringIO()
+    use_ansi = should_render_ansi(force_color=force_color, no_color=no_color)
+    if use_ansi:
+        console = Console(
+            file=buf,
+            record=True,
+            width=width,
+            force_terminal=True,
+            color_system="truecolor",
+        )
+    else:
+        console = Console(
+            file=buf,
+            record=True,
+            width=width,
+            force_terminal=False,
+            color_system=None,
+        )
+    return console, use_ansi
+
+
 def render_user_message(
     content: str,
     timestamp: str | None = None,
@@ -65,11 +116,11 @@ def render_user_message(
     else:
         top_elem = hdr
 
-    lines: list[RenderableType] = [top_elem]
+    lines: list[RenderableType] = [Text(""), top_elem]
     for line in content.splitlines():
         if accent:
             msg_line = Text("│ ", style="bold #38bdf8")
-            msg_line.append(line, style="white")
+            msg_line.append(line, style="white on grey19")
         else:
             msg_line = Text(line, style="white")
         lines.append(msg_line)
@@ -83,10 +134,15 @@ def render_user_message_str(
     *,
     accent: bool = True,
     show_timestamp: bool | None = None,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
     """Render a user message as plain formatted string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(
         render_user_message(
             content,
@@ -95,7 +151,7 @@ def render_user_message_str(
             show_timestamp=show_timestamp,
         )
     )
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def render_actions_group(
@@ -195,7 +251,7 @@ def render_assistant_message(
 
     hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
     if model_val:
-        hdr.append(f" ({model_val})", style="dim #94a3b8")
+        hdr.append(f" ({model_val})", style="italic dim #94a3b8")
 
     # Per §17: Suppress timestamps from normal chat rows unless explicitly enabled
     show_ts = show_timestamp if show_timestamp is not None else (timestamp is not None and show_timestamp is not False)
@@ -278,10 +334,15 @@ def render_assistant_message_str(
     actions: Any | None = None,
     thinking: str | None = None,
     model: str | None = None,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
     """Render an assistant message as plain formatted string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(
         render_assistant_message(
             content,
@@ -293,21 +354,27 @@ def render_assistant_message_str(
             model=model,
         )
     )
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def render_assistant_stream_header(
     model: str | None = None,
     width: int = 80,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
     """Render the opening header for progressive assistant response streaming."""
     hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
     if model:
-        hdr.append(f" ({model})", style="dim #94a3b8")
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+        hdr.append(f" ({model})", style="italic dim #94a3b8")
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(hdr)
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 
@@ -471,4 +538,5 @@ __all__ = [
     "strip_internal_reasoning",
     "render_user_message",
     "render_user_message_str",
+    "should_render_ansi",
 ]
