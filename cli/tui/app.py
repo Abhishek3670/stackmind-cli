@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -33,6 +34,7 @@ from cli.tui.chat import (
     render_actions_group_str,
     render_assistant_message,
     render_assistant_message_str,
+    render_assistant_stream_header,
     render_chat_transcript,
     render_chat_transcript_str,
     render_user_message,
@@ -49,6 +51,7 @@ from cli.tui.events import (
     ToolStatus,
     extract_assistant_response,
     extract_assistant_thinking,
+    extract_text_delta,
     is_connection_error,
     recover_transcript_from_events,
     render_connection_status,
@@ -76,12 +79,15 @@ from cli.tui.landing import (
 )
 from cli.tui.layout import (
     NARROW_THRESHOLD,
+    LiveWorkspaceManager,
     compute_layout,
+    create_live_workspace,
     render_full_screen_workspace,
     render_runtime_panel_str,
     render_workspace_layout_str,
     slice_conversation_viewport,
 )
+from cli.tui.runtime_panel import format_model_badge
 from cli.tui.state import (
     ActivityEntry,
     AutonomousDeliveryState,
@@ -120,7 +126,7 @@ from cli.tui.keyboard import (
 
 def render_phase_banner(state: AutonomousDeliveryState) -> str:
     """Renders the current project delivery phase banner."""
-    lines = ["PHASE"]
+    lines = [f"=== PROJECT: {state.project_name.upper()} | PHASE: {state.phase.value} ==="]
     if state.phase in {ProjectPhase.INITIALIZING, ProjectPhase.PLAN_PROPOSED, ProjectPhase.AWAITING_APPROVAL}:
         lines.append("● Planning & Architecture (AWAITING_APPROVAL)")
         lines.append("○ Autonomous Execution")
@@ -148,6 +154,13 @@ def render_roles_panel(state: AutonomousDeliveryState, detailed: bool = False) -
             out.append(f"{role_name} Agent")
             out.append(f"  Role: {r.role}")
             out.append(f"  Backend: {r.backend}")
+            if getattr(r, "model", None):
+                out.append(f"  Model: {r.model}")
+            if getattr(r, "quantization", None):
+                out.append(f"  Quantization: {r.quantization}")
+            badge = format_model_badge(r.backend, getattr(r, "model", None), getattr(r, "quantization", None))
+            if badge:
+                out.append(f"  Badge: [{badge}]")
             out.append(f"  Work Order: {r.work_order_id or 'None'}")
             out.append(f"  State: {r.state}")
             out.append("")
@@ -157,7 +170,9 @@ def render_roles_panel(state: AutonomousDeliveryState, detailed: bool = False) -
     lines = ["AGENTS"]
     for role_name, r in state.roles.items():
         marker = "✓" if r.state.upper() in {"COMPLETED", "DONE"} else ("●" if r.state.upper() in {"RUNNING", "ACTIVE"} else "○")
-        lines.append(f"{marker} {role_name:<16} {r.display_state}")
+        badge = format_model_badge(r.backend, getattr(r, "model", None), getattr(r, "quantization", None))
+        badge_str = f" [{badge}]" if (getattr(r, "model", None) and r.state.upper() in {"RUNNING", "ACTIVE", "ORCHESTRATING"}) else ""
+        lines.append(f"{marker} {role_name:<16} {r.display_state}{badge_str}")
     return "\n".join(lines)
 
 
@@ -177,7 +192,6 @@ def render_operation_tree(state: AutonomousDeliveryState) -> str:
     root = state.operations.get("op-root")
     children = root.children if root else [k for k in state.operations if k != "op-root"]
 
-    # Fallback to logical role tree if children list is empty
     if not children:
         entries = [
             ("Backend", state.roles.get("Backend", RoleStatus("Backend", "Codex"))),
@@ -355,6 +369,7 @@ def render_top_header_bar(
     session: Mapping[str, Any],
     width: int = 80,
     status: str | None = "online",
+    context_meter: tuple[str, str] | None = None,
 ) -> RenderableType:
     """Render the top status header bar matching image.png:
     Left: stackmind  |  dev  ~/projects/stackmind
@@ -387,6 +402,19 @@ def render_top_header_bar(
     elif width >= 45:
         right_items.append(f"session: {short_sid}")
 
+    context_text = ""
+    context_style = ""
+    if context_meter and width >= 100:
+        context_text, level = context_meter
+        context_style = {"green": "bold #22c55e", "yellow": "bold yellow", "red": "bold red"}.get(level, "dim white")
+        right_items.append(context_text)
+    elif context_meter and width >= 80:
+        context_text, level = context_meter
+        compact_text = context_text.replace("Context: ", "ctx ").replace(" (", " ").replace(")", "")
+        context_text = compact_text
+        context_style = {"green": "bold #22c55e", "yellow": "bold yellow", "red": "bold red"}.get(level, "dim white")
+        right_items.append(context_text)
+
     status_str = f"{glyph} {st_name}"
     right_plain = " | ".join(right_items + [status_str]) if right_items else status_str
 
@@ -404,7 +432,7 @@ def render_top_header_bar(
     if len(left_plain) + len(right_plain) + 2 > width:
         max_ws = max(6, width - len(left_prefix) - len(right_plain) - 4)
         if len(ws_display) > max_ws:
-            ws_display = ".../" + p.name[-max(1, max_ws - 4):] if workspace else ws_display
+            ws_display = ".../" + p.name[-max(1, max_ws - 4):] if workspace else "~"
         left_plain = left_prefix + ws_display
 
     spaces_count = max(2, width - len(left_plain) - len(right_plain))
@@ -418,7 +446,7 @@ def render_top_header_bar(
     res.append(" " * spaces_count)
 
     for item in right_items:
-        res.append(item, style="dim white")
+        res.append(item, style=context_style if item == context_text else "dim white")
         res.append(" | ", style="dim #475569")
     res.append(f"{glyph} {st_name}", style=glyph_style)
 
@@ -429,11 +457,12 @@ def render_top_header_bar_str(
     session: Mapping[str, Any],
     width: int = 80,
     status: str | None = "online",
+    context_meter: tuple[str, str] | None = None,
 ) -> str:
     """Render top header bar as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_top_header_bar(session, width=width, status=status))
+    console.print(render_top_header_bar(session, width=width, status=status, context_meter=context_meter))
     return console.export_text().rstrip()
 
 
@@ -593,6 +622,36 @@ def restore_terminal_state(stream: Any = None) -> None:
         pass
 
 
+# ── Terminal Resize Management (WO-003) ──────────────────────────────────────
+_terminal_resized: bool = False
+
+
+def _sigwinch_handler(signum: int, frame: Any) -> None:
+    global _terminal_resized
+    _terminal_resized = True
+
+
+def install_resize_handler() -> Any:
+    """Install safe SIGWINCH handler on platforms that support it (POSIX), no-op on Windows."""
+    if hasattr(signal, "SIGWINCH"):
+        try:
+            return signal.signal(signal.SIGWINCH, _sigwinch_handler)
+        except Exception:
+            return None
+    return None
+
+
+def check_terminal_resize(current_cols: int, current_lines: int) -> tuple[bool, int, int]:
+    """Check if terminal dimensions have changed either via SIGWINCH or periodic dimension check."""
+    global _terminal_resized
+    term_size = shutil.get_terminal_size(fallback=(80, 24))
+    cols = term_size.columns
+    lines = term_size.lines
+    resized = _terminal_resized or (cols != current_cols or lines != current_lines)
+    _terminal_resized = False
+    return resized, cols, lines
+
+
 def redraw_full_screen(
     session: Mapping[str, Any] | None = None,
     state: Any | None = None,
@@ -606,11 +665,13 @@ def redraw_full_screen(
     composer_is_active: bool = False,
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     include_composer: bool = True,
+    live_manager: Any | None = None,
 ) -> str:
-    """Redraw the full-screen TUI workspace (WO-053).
+    """Redraw the full-screen TUI workspace (WO-053, WO-003).
 
     Renders top header, two-column workspace (with conversation viewport and
     anchored runtime panel), and pinned bottom composer box.
+    Uses LiveWorkspaceManager if provided to eliminate screen-clearing redraws.
     """
     term_size = shutil.get_terminal_size(fallback=(80, 24))
     cols = width if width is not None else term_size.columns
@@ -627,6 +688,19 @@ def redraw_full_screen(
         shortcuts=shortcuts,
         include_composer=include_composer,
     )
+
+    if live_manager is not None and getattr(live_manager, "is_active", False):
+        try:
+            live_manager.update(
+                conversation_content=conversation_content,
+                composer_content=composer_content,
+                composer_is_active=composer_is_active,
+                shortcuts=shortcuts,
+                include_composer=include_composer,
+            )
+        except Exception:
+            pass
+        return frame
 
     target = stream or sys.stdout
     try:
@@ -909,6 +983,7 @@ def get_status_str(
     ]
     if state is not None:
         state.update_from_session(session)
+        parts.append(state.context_meter_text)
         parts.append("")
         parts.append(render_project_delivery_view(state))
     return "\n".join(parts)
@@ -958,6 +1033,8 @@ def get_help_str() -> str:
         "  :resume           Resume active session\n"
         "  :chat             Display conversation transcript\n"
         "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
+        "  :compact          Compact older transcript turns to protect context window\n"
+        "  :timeout [sec]    Get or set client turn wait timeout (default: 45s)\n"
         "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
         "  :exit, :quit, q   Gracefully stop daemon and exit\n"
@@ -1061,9 +1138,11 @@ def dispatch_delivery_command(
     text: str,
     state: AutonomousDeliveryState,
     *,
-    client_timeout: float = 45.0,
+    client_timeout: float | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Dispatch interactive TUI commands, updating delivery state reactively."""
+    effective_timeout = client_timeout if client_timeout is not None else getattr(state, "client_timeout", 45.0)
+    state.client_timeout = effective_timeout
     normalized = text.strip()
     if not normalized:
         return session, False
@@ -1496,6 +1575,36 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
+    if normalized.startswith(":timeout"):
+        _, _, to_arg = normalized.partition(" ")
+        clean_to = to_arg.strip()
+        if clean_to:
+            try:
+                new_to = float(clean_to)
+                if new_to > 0:
+                    state.client_timeout = new_to
+                    output_str = f"Client timeout set to {new_to:.1f}s."
+                else:
+                    output_str = "Timeout must be a positive number."
+            except ValueError:
+                output_str = f"Invalid timeout '{clean_to}'. Provide seconds (e.g., :timeout 60)."
+        else:
+            cur_to = getattr(state, "client_timeout", effective_timeout)
+            output_str = f"Current client timeout: {cur_to:.1f}s."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":compact":
+        compacted = state.compact_transcript()
+        output_str = "Transcript compacted." if compacted else "Transcript is already within its compact retention window."
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
     if normalized.startswith(":") and not normalized.startswith(":prompt "):
         output_str = "Unknown command. Type :help."
         state.add_message("user", normalized)
@@ -1508,6 +1617,7 @@ def dispatch_delivery_command(
     prompt_text = normalized[8:].strip() if normalized.startswith(":prompt ") else normalized
     state.add_message("user", prompt_text)
     click.echo(render_user_message_str(prompt_text))
+    op_id = "turn"
     try:
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
@@ -1518,34 +1628,191 @@ def dispatch_delivery_command(
         status_line = Text("● Thinking... Turn submitted to the governed daemon.", style="dim cyan")
         click.echo(status_line)
 
-        # Synchronously await turn completion while consuming events
+        # Synchronously await turn completion while consuming events via native SSE
         workspace = Path(session["workspace"]) if session.get("workspace") else None
-        max_wait = client_timeout
+        max_wait = effective_timeout
         start_time = time.time()
         completed = False
         assistant_rendered = False
+        streaming_active = False
+        streamed_chunks: list[str] = []
+        last_progress_time = start_time
+        last_poll_time = start_time
+        latest_act_desc = "Turn submitted"
+        op_rec: dict[str, Any] | None = None
+        op_status: str | None = None
 
-        while time.time() - start_time < max_wait:
-            events = list(adapter.stream(session["session_id"]))
-            for ev in events:
+        # Track terminal dimensions and install resize handler (WO-003)
+        install_resize_handler()
+        init_term = shutil.get_terminal_size(fallback=(80, 24))
+        current_cols, current_lines = init_term.columns, init_term.lines
+
+        try:
+            stream_gen = adapter.stream(session["session_id"], live=True, timeout=1.0)
+            while time.time() - start_time < max_wait and not completed:
+                # Check for dynamic terminal resize during active streaming / turn (WO-003)
+                resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
+                if resized:
+                    current_cols, current_lines = new_cols, new_lines
+                try:
+                    ev = next(stream_gen)
+                except StopIteration:
+                    now = time.time()
+                    if now - last_poll_time >= 0.5:
+                        last_poll_time = now
+                        try:
+                            op_rec = client.operation_get(op_id) if hasattr(client, "operation_get") else None
+                            if op_rec and isinstance(op_rec, dict):
+                                op_status = op_rec.get("status")
+                                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                    completed = True
+                                    break
+                        except Exception:
+                            pass
+                    time.sleep(0.05)
+                    stream_gen = adapter.stream(session["session_id"], live=True, timeout=1.0)
+                    continue
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+
+                now = time.time()
+
+                # 1. Handle heartbeat / keepalive
+                if isinstance(ev, dict) and (ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"):
+                    if not streaming_active and (now - last_progress_time >= 2.0):
+                        elapsed = now - start_time
+                        prog_text = Text(f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})", style="dim cyan")
+                        click.echo(prog_text)
+                        last_progress_time = now
+
+                    if now - last_poll_time >= 1.5:
+                        last_poll_time = now
+                        try:
+                            op_rec = client.operation_get(op_id) if hasattr(client, "operation_get") else None
+                            if op_rec and isinstance(op_rec, dict):
+                                op_status = op_rec.get("status")
+                                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                    completed = True
+                                    break
+                        except Exception:
+                            pass
+                    continue
+
+                # 2. Process concrete domain event
+                if not isinstance(ev, dict):
+                    continue
                 state.process_event(ev)
-                ev_str = "" if ev.get("name") in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
-                if ev_str:
-                    click.echo(ev_str)
-                resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
-                thinking = extract_assistant_thinking(ev.get("payload", {}), workspace=workspace)
-                if resp and not assistant_rendered:
-                    turn_acts = state.current_turn_actions
-                    state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
-                    click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
-                    assistant_rendered = True
+                ev_name = str(ev.get("name", ""))
+                ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
 
+                # Check for incremental text delta (stream/token/chunk)
+                delta = extract_text_delta(ev)
+                if delta:
+                    if not streaming_active:
+                        streaming_active = True
+                        model_name = op_rec.get("model") if op_rec else None
+                        click.echo(render_assistant_stream_header(model=model_name))
+                    click.echo(delta, nl=False)
+                    sys.stdout.flush()
+                    streamed_chunks.append(delta)
+                else:
+                    # Operational event line
+                    ev_str = "" if ev_name in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
+                    if ev_str:
+                        if streaming_active:
+                            click.echo("")  # break line if streaming was active
+                            streaming_active = False
+                        click.echo(ev_str)
+                        latest_act_desc = format_action_description(ev_name) if "format_action_description" in globals() else ev_name
+
+                    # Direct assistant response from event
+                    resp = extract_assistant_response(ev_payload, workspace=workspace)
+                    thinking = extract_assistant_thinking(ev_payload, workspace=workspace)
+                    if resp and not assistant_rendered and not streamed_chunks:
+                        turn_acts = state.current_turn_actions
+                        state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
+                        click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
+                        assistant_rendered = True
+
+                # Check terminal event status
+                if ev_name in {"operation.completed", "operation.failed", "operation.cancelled", "turn.completed"}:
+                    target_op = ev_payload.get("operation_id") or ev.get("operation_id")
+                    if not target_op or target_op == op_id:
+                        completed = True
+                        break
+
+                # Periodic operation check
+                if now - last_poll_time >= 2.0:
+                    last_poll_time = now
+                    try:
+                        op_rec = client.operation_get(op_id) if hasattr(client, "operation_get") else None
+                        if op_rec and isinstance(op_rec, dict):
+                            op_status = op_rec.get("status")
+                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                completed = True
+                                break
+                    except Exception:
+                        pass
+        except KeyboardInterrupt:
+            # Gracefully intercept Ctrl+C during turn execution: Cancel turn, do NOT kill daemon!
             try:
-                op_rec = client.operation_get(op_id)
-                op_status = op_rec.get("status")
-                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                    completed = True
-                    for ev in list(adapter.stream(session["session_id"])):
+                if op_id and op_id != "turn" and hasattr(client, "operation_cancel"):
+                    client.operation_cancel(op_id, cascade=True)
+                elif hasattr(client, "cancel"):
+                    client.cancel(session["session_id"])
+            except Exception:
+                try:
+                    adapter.command(f":cancel {op_id}", session_id=session["session_id"])
+                except Exception:
+                    pass
+
+            if op_id in state.operations:
+                state.operations[op_id].status = "CANCELLED"
+            for role_obj in state.roles.values():
+                if getattr(role_obj, "state", "").upper() in {"RUNNING", "ACTIVE"}:
+                    role_obj.state = "CANCELLED"
+            state.add_activity("User", "interrupted turn", op_id)
+
+            if streaming_active:
+                click.echo("")
+
+            cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
+            turn_acts = state.current_turn_actions
+            state.add_message("assistant", cancel_msg, actions=turn_acts)
+            click.echo(render_error_box_str(
+                cancel_msg,
+                title="TURN INTERRUPTED",
+                hint="In-flight turn operation was cancelled. Daemon process remains running.",
+            ))
+            restore_composer_focus(state)
+            return session, False
+
+        # Finalize streaming if active
+        if streamed_chunks:
+            click.echo("")  # newline after streaming completes
+            full_resp = "".join(streamed_chunks).strip()
+            turn_acts = state.current_turn_actions
+            state.add_message("assistant", full_resp, actions=turn_acts)
+            assistant_rendered = True
+
+        # If assistant was not rendered from streaming or events, fetch final operation status
+        if not assistant_rendered:
+            try:
+                if (op_rec is None or not completed) and hasattr(client, "operation_get"):
+                    op_rec = client.operation_get(op_id)
+                    if op_rec and isinstance(op_rec, dict):
+                        op_status = op_rec.get("status")
+                        if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                            completed = True
+            except Exception:
+                pass
+
+            # Drain any remaining events
+            try:
+                if hasattr(client, "events"):
+                    remaining_events = list(client.events(session["session_id"], after=state.last_sequence))
+                    for ev in remaining_events:
                         state.process_event(ev)
                         ev_str = "" if ev.get("name") in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
                         if ev_str:
@@ -1557,82 +1824,64 @@ def dispatch_delivery_command(
                             state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
                             click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
                             assistant_rendered = True
-
-                    if not assistant_rendered:
-                        res = op_rec.get("result") or {}
-                        summary = res.get("summary") or res.get("reason")
-                        thinking = (
-                            res.get("thinking")
-                            or res.get("thought")
-                            or res.get("reasoning")
-                            or res.get("reasoning_content")
-                            or op_rec.get("thinking")
-                            or op_rec.get("thought")
-                        )
-                        report_path_raw = res.get("report_path")
-                        if report_path_raw:
-                            rp = Path(report_path_raw)
-                            if not rp.is_absolute() and workspace:
-                                rp = workspace / rp
-                            if rp.exists():
-                                try:
-                                    cnt = rp.read_text(encoding="utf-8")
-                                    if "## Thinking" in cnt and not thinking:
-                                        _, _, tp = cnt.partition("## Thinking")
-                                        tb, _, _ = tp.partition("## ")
-                                        thinking = tb.strip() or None
-                                    if "## Report" in cnt:
-                                        _, _, b = cnt.partition("## Report")
-                                        rb, _, _ = b.partition("## Meta")
-                                        summary = rb.strip() or cnt.strip()
-                                    else:
-                                        summary = cnt.strip()
-                                except Exception:
-                                    pass
-                        if summary:
-                            turn_acts = state.current_turn_actions
-                            state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
-                            click.echo(render_assistant_message_str(summary, actions=turn_acts, thinking=thinking))
-                            assistant_rendered = True
-                        elif op_status in {"FAILED", "CANCELLED"}:
-                            err_raw = (
-                                res.get("error")
-                                or res.get("message")
-                                or res.get("reason")
-                                or op_rec.get("error")
-                                or f"Operation {op_status.lower()}."
-                            )
-                            if isinstance(err_raw, dict):
-                                err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
-                            else:
-                                err_msg = str(err_raw)
-                            turn_acts = state.current_turn_actions
-                            state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
-                            click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
-                            assistant_rendered = True
-                    break
             except Exception:
                 pass
-            time.sleep(0.05)
+
+            if not assistant_rendered and op_rec and isinstance(op_rec, dict):
+                res = op_rec.get("result") or {}
+                summary = res.get("summary") or res.get("reason")
+                thinking = (
+                    res.get("thinking")
+                    or res.get("thought")
+                    or res.get("reasoning")
+                    or res.get("reasoning_content")
+                    or op_rec.get("thinking")
+                    or op_rec.get("thought")
+                )
+                report_path_raw = res.get("report_path")
+                if report_path_raw:
+                    rp = Path(report_path_raw)
+                    if not rp.is_absolute() and workspace:
+                        rp = workspace / rp
+                    if rp.exists():
+                        try:
+                            cnt = rp.read_text(encoding="utf-8")
+                            if "## Thinking" in cnt and not thinking:
+                                _, _, tp = cnt.partition("## Thinking")
+                                tb, _, _ = tp.partition("## ")
+                                thinking = tb.strip() or None
+                            if "## Report" in cnt:
+                                _, _, b = cnt.partition("## Report")
+                                rb, _, _ = b.partition("## Meta")
+                                summary = rb.strip() or cnt.strip()
+                            else:
+                                summary = cnt.strip()
+                        except Exception:
+                            pass
+                if summary:
+                    turn_acts = state.current_turn_actions
+                    state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
+                    click.echo(render_assistant_message_str(summary, actions=turn_acts, thinking=thinking))
+                    assistant_rendered = True
+                elif op_status in {"FAILED", "CANCELLED"}:
+                    err_raw = (
+                        res.get("error")
+                        or res.get("message")
+                        or res.get("reason")
+                        or op_rec.get("error")
+                        or f"Operation {op_status.lower()}."
+                    )
+                    if isinstance(err_raw, dict):
+                        err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
+                    else:
+                        err_msg = str(err_raw)
+                    turn_acts = state.current_turn_actions
+                    state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
+                    click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
+                    assistant_rendered = True
 
         if not assistant_rendered:
-            if completed and 'op_status' in locals() and op_status in {"FAILED", "CANCELLED"}:
-                res = (op_rec.get("result") or {}) if 'op_rec' in locals() and op_rec else {}
-                err_raw = (
-                    res.get("error")
-                    or res.get("message")
-                    or res.get("reason")
-                    or (op_rec.get("error") if 'op_rec' in locals() and op_rec else None)
-                    or f"Operation {op_status.lower()}."
-                )
-                if isinstance(err_raw, dict):
-                    err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
-                else:
-                    err_msg = str(err_raw)
-                turn_acts = state.current_turn_actions
-                state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
-                click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
-            elif completed:
+            if completed:
                 completion_msg = f"Turn operation {op_id} completed."
                 turn_acts = state.current_turn_actions
                 state.add_message("assistant", completion_msg, actions=turn_acts)
@@ -1641,6 +1890,10 @@ def dispatch_delivery_command(
                 timeout_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
                 state.add_message("system", timeout_msg)
                 click.echo(render_error_box_str(timeout_msg, title="REQUEST TIMEOUT", hint="Use :status or :events to inspect."))
+    except KeyboardInterrupt:
+        click.echo()
+        restore_composer_focus(state)
+        return session, False
     except Exception as err:
         if is_connection_error(err):
             state.connection_status = "reconnecting"
@@ -1682,7 +1935,8 @@ def _dispatch_command(
 @click.option("--agent", "-a", "agent", default="codex", show_default=True)
 @click.option("--workspace", "-w", "workspace", type=click.Path(path_type=Path), default=Path("."))
 @click.option("--demo", is_flag=True, help="Run the automated daemon-backed walkthrough.")
-def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None:
+@click.option("--timeout", "client_timeout", type=float, default=45.0, show_default=True, help="Turn operation wait timeout in seconds.")
+def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_timeout: float = 45.0) -> None:
     """Start the governed Python-native terminal control plane."""
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
@@ -1704,6 +1958,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
         state = AutonomousDeliveryState(
             project_name=workspace.resolve().name, session_id=session["session_id"]
         )
+        state.client_timeout = client_timeout
         state.update_from_session(session)
         state.populate_from_runtime(client=client, session=session, workspace=workspace.resolve())
 
@@ -1727,12 +1982,16 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
         except Exception:
             pass
 
+        install_resize_handler()
+
         if is_tty:
             enter_alternate_screen()
             redraw_full_screen(session, state, clear=True, include_composer=False)
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-            click.echo(render_top_header_bar_str(session, width=term_cols))
+            click.echo(render_top_header_bar_str(
+                session, width=term_cols, context_meter=(state.context_meter_text, state.context_warning_level)
+            ))
 
             layout = compute_layout(term_cols)
             if layout.show_runtime:
@@ -1777,7 +2036,9 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
                     if is_tty:
                         redraw_full_screen(session, state, clear=True, include_composer=False)
                     else:
-                        click.echo(render_top_header_bar_str(session, width=term_cols))
+                        click.echo(render_top_header_bar_str(
+                            session, width=term_cols, context_meter=(state.context_meter_text, state.context_warning_level)
+                        ))
                         l_layout = compute_layout(term_cols)
                         if l_layout.show_runtime:
                             l_str = render_landing_block_str(
@@ -1814,9 +2075,15 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool) -> None
             except (EOFError, KeyboardInterrupt):
                 click.echo()
                 break
-            session, should_exit = dispatch_delivery_command(adapter, client, session, text, state)
-            if should_exit:
-                break
+            try:
+                session, should_exit = dispatch_delivery_command(
+                    adapter, client, session, text, state, client_timeout=state.client_timeout
+                )
+                if should_exit:
+                    break
+            except KeyboardInterrupt:
+                click.echo()
+                continue
             if is_tty:
                 redraw_full_screen(session, state, include_composer=False)
     finally:

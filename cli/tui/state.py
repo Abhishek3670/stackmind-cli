@@ -8,6 +8,7 @@ dedicated, modular component.
 from __future__ import annotations
 
 import datetime
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
@@ -279,6 +280,10 @@ class AutonomousDeliveryState:
         operations: dict[str, OperationNode] | None = None,
         scroll: RuntimePanelScroll | None = None,
         conversation_scroll: ConversationScroll | None = None,
+        client_timeout: float = 45.0,
+        context_window_tokens: int = 8_192,
+        compaction_threshold: float = 0.85,
+        compaction_keep_recent: int = 6,
     ) -> None:
         self.project_name = project_name
         self.session_id = session_id
@@ -348,6 +353,84 @@ class AutonomousDeliveryState:
         self.seen_message_keys: set[tuple[str, str]] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False)
+        self.client_timeout: float = client_timeout
+        self.context_window_tokens = max(1, context_window_tokens)
+        self.compaction_threshold = min(max(compaction_threshold, 0.1), 1.0)
+        self.compaction_keep_recent = max(1, compaction_keep_recent)
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self.cumulative_turn_tokens: int = 0
+        self.compaction_count: int = 0
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """Return a fast, dependency-free token estimate suitable for local models."""
+        return max(0, math.ceil(len(text or "") / 4))
+
+    @property
+    def context_tokens(self) -> int:
+        """Estimated tokens currently retained in the model-facing transcript."""
+        return sum(self.estimate_tokens(message.content) for message in self.messages)
+
+    @property
+    def context_utilization(self) -> float:
+        return min(1.0, self.context_tokens / self.context_window_tokens)
+
+    @property
+    def context_warning_level(self) -> str:
+        utilization = self.context_utilization
+        if utilization >= self.compaction_threshold:
+            return "red"
+        if utilization >= 0.70:
+            return "yellow"
+        return "green"
+
+    @property
+    def context_meter_text(self) -> str:
+        return f"Context: {self.context_tokens / 1000:.1f}K / {self.context_window_tokens / 1000:.1f}K ({self.context_utilization:.0%})"
+
+    def set_context_window(self, tokens: int) -> None:
+        """Set a detected model context capacity, retaining a safe positive value."""
+        self.context_window_tokens = max(1, int(tokens))
+
+    def record_token_usage(self, prompt: str = "", completion: str = "") -> None:
+        """Accumulate per-session prompt/completion estimates for observability."""
+        prompt_count = self.estimate_tokens(prompt)
+        completion_count = self.estimate_tokens(completion)
+        self.prompt_tokens += prompt_count
+        self.completion_tokens += completion_count
+        self.cumulative_turn_tokens += prompt_count + completion_count
+
+    def compact_transcript(self, keep_recent: int | None = None) -> bool:
+        """Replace older transcript turns with a concise local continuity summary."""
+        keep = self.compaction_keep_recent if keep_recent is None else max(1, keep_recent)
+        if len(self.messages) <= keep:
+            return False
+
+        removed = self.messages[:-keep]
+        retained = self.messages[-keep:]
+        milestones = [
+            f"{message.role}: {' '.join(message.content.split())[:120]}"
+            for message in removed
+            if message.content.strip()
+        ]
+        excerpt = " | ".join(milestones[-3:])
+        summary = (
+            f"[Transcript compacted: {len(removed)} earlier messages preserved as context. "
+            f"Recent milestones: {excerpt}]"
+        )
+        summary_message = ChatMessage(role="system", content=summary, timestamp=self.now_str())
+        self.messages = [summary_message, *retained]
+        self.seen_message_keys = {(message.role, message.content.strip()) for message in self.messages}
+        self.compaction_count += 1
+        self.conversation_scroll.notify_activity()
+        return True
+
+    def maybe_compact_transcript(self) -> bool:
+        """Automatically compact before the transcript exhausts its context budget."""
+        if self.context_utilization >= self.compaction_threshold:
+            return self.compact_transcript()
+        return False
 
     def now_str(self) -> str:
         return datetime.datetime.now().strftime("%H:%M")
@@ -405,8 +488,13 @@ class AutonomousDeliveryState:
             turn_id=turn_id,
         )
         self.messages.append(msg)
+        if role == "user":
+            self.record_token_usage(prompt=msg_content)
+        elif role == "assistant":
+            self.record_token_usage(completion=msg_content)
         if hasattr(self, "conversation_scroll") and self.conversation_scroll is not None:
             self.conversation_scroll.notify_activity()
+        self.maybe_compact_transcript()
         return msg
 
     def scroll_conversation_up(self, lines: int = 1) -> None:
@@ -523,12 +611,18 @@ class AutonomousDeliveryState:
 
     def clear_conversation(self) -> None:
         self.messages.clear()
+        self.seen_message_keys.clear()
         self.current_turn_actions = ActionsGroup(active=False)
 
     def update_from_session(self, session: Mapping[str, Any]) -> None:
         if not session or not isinstance(session, Mapping):
             return
         self.session_id = str(session.get("session_id", self.session_id))
+        for key in ("context_window_tokens", "context_window", "context_length", "num_ctx"):
+            value = session.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                self.set_context_window(int(value))
+                break
         st_raw = str(session.get("state", "")).upper()
         if st_raw == "CANCELLED":
             for op in self.operations.values():

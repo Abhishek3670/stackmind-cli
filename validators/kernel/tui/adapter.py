@@ -53,6 +53,13 @@ class StackMindTuiAdapter:
             target = argument or params.get("session_id")
             if not target:
                 raise ValueError("session_id required for :events")
+            after = self._sequences.get(target, 0)
+            if hasattr(self.client, "events"):
+                evs = self.client.events(target, after)
+                for ev in evs:
+                    if isinstance(ev, dict) and "sequence" in ev and isinstance(ev["sequence"], int):
+                        self._sequences[target] = max(self._sequences.get(target, 0), ev["sequence"])
+                return evs
             return list(self.stream(target))
         if command == ":approve":
             target = params.get("session_id")
@@ -77,12 +84,41 @@ class StackMindTuiAdapter:
         turn_params = {key: value for key, value in params.items() if key != "session_id"}
         return self.client.turn(params["session_id"], prompt, **turn_params)
 
-    def stream(self, session_id: str) -> Iterator[dict[str, Any]]:
-        after = self._sequences.get(session_id, 0)
-        for event in self.client.events(session_id, after):
-            if isinstance(event, dict) and "sequence" in event and isinstance(event["sequence"], int):
-                self._sequences[session_id] = event["sequence"]
-            yield event
+    def stream(
+        self,
+        session_id: str,
+        timeout: float | None = None,
+        after: int | None = None,
+        live: bool = False,
+    ) -> Iterator[dict[str, Any]]:
+        last_seq = self._sequences.get(session_id, 0) if after is None else after
+        # Consume native SSE event streaming if available
+        if hasattr(self.client, "stream_events"):
+            try:
+                for event in self.client.stream_events(session_id=session_id, after=last_seq, timeout=timeout):
+                    if isinstance(event, dict) and event.get("_heartbeat"):
+                        if live:
+                            yield event
+                        else:
+                            break
+                        continue
+                    if isinstance(event, dict):
+                        seq = event.get("sequence")
+                        if isinstance(seq, int):
+                            self._sequences[session_id] = max(self._sequences.get(session_id, 0), seq)
+                    yield event
+                return
+            except Exception:
+                # Fall back to polling client.events if SSE stream is interrupted or unsupported
+                pass
+
+        if hasattr(self.client, "events"):
+            for event in self.client.events(session_id, last_seq):
+                if isinstance(event, dict):
+                    seq = event.get("sequence")
+                    if isinstance(seq, int):
+                        self._sequences[session_id] = max(self._sequences.get(session_id, 0), seq)
+                yield event
 
     def decide(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
         return self.client.approve(session_id, approved, reason)

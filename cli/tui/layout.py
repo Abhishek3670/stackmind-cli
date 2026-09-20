@@ -13,13 +13,16 @@ Layout spec (IMPLEMENTATION_PLAN_TUI.md §6, §12):
 from __future__ import annotations
 
 import io
+import shutil
+import sys
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from rich import box
 from rich.align import Align
 from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
+from rich.live import Live
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
@@ -296,7 +299,12 @@ def render_full_screen_workspace(
     status = getattr(state, "connection_status", "online")
 
     # 1. Top Header Bar (1 line)
-    header_str = render_top_header_bar_str(session, width=width, status=status)
+    header_str = render_top_header_bar_str(
+        session,
+        width=width,
+        status=status,
+        context_meter=(state.context_meter_text, state.context_warning_level),
+    )
 
     # 2. Viewport height (leave 1 line for header, 3 lines for composer box)
     viewport_height = max(4, height - 4)
@@ -338,8 +346,186 @@ def render_full_screen_workspace(
     return f"{header_str}\n{workspace_str}\n{composer_str}"
 
 
+# ── Live Workspace Manager (Rich.Live Integration / WO-003) ───────────────────
+
+class LiveWorkspaceManager:
+    """Manages localized rendering of dynamic TUI regions via Rich.Live (§6, §12, WO-003).
+
+    Eliminates screen-clearing redraw flickering during SSE streaming while
+    keeping the static panels (top header, runtime panel, composer) aligned.
+    Provides automatic fallback for non-TTY / CI environments.
+    """
+
+    def __init__(
+        self,
+        session: Mapping[str, Any] | None = None,
+        state: Any | None = None,
+        *,
+        console: Console | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        auto_refresh: bool = False,
+        refresh_per_second: float = 8.0,
+    ) -> None:
+        self.session = session or {}
+        self.state = state
+        self._custom_console = console
+        term_size = shutil.get_terminal_size(fallback=(80, 24))
+        self.width = width if width is not None else term_size.columns
+        self.height = height if height is not None else term_size.lines
+        self.auto_refresh = auto_refresh
+        self.refresh_per_second = refresh_per_second
+
+        self.is_terminal = self._check_is_terminal()
+        self._live: Live | None = None
+        self._active = False
+
+    def _check_is_terminal(self) -> bool:
+        if self._custom_console is not None:
+            return bool(getattr(self._custom_console, "is_terminal", False))
+        try:
+            return bool(sys.stdout.isatty())
+        except Exception:
+            return False
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    @property
+    def live(self) -> Live | None:
+        return self._live
+
+    def build_renderable(
+        self,
+        conversation_content: str | RenderableType | None = None,
+        composer_content: str | None = None,
+        composer_is_active: bool = False,
+        shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+        include_composer: bool = True,
+    ) -> RenderableType:
+        """Compose the full screen workspace frame as a RenderableType."""
+        frame_str = render_full_screen_workspace(
+            session=self.session,
+            state=self.state,
+            width=self.width,
+            height=self.height,
+            conversation_content=conversation_content,
+            composer_content=composer_content,
+            composer_is_active=composer_is_active,
+            shortcuts=shortcuts,
+            include_composer=include_composer,
+        )
+        return Text.from_ansi(frame_str)
+
+    def start(
+        self,
+        conversation_content: str | RenderableType | None = None,
+        include_composer: bool = False,
+    ) -> LiveWorkspaceManager:
+        """Start the Rich.Live context if running in a real interactive terminal."""
+        if not self.is_terminal:
+            return self
+
+        renderable = self.build_renderable(
+            conversation_content=conversation_content,
+            include_composer=include_composer,
+        )
+        console = self._custom_console or Console(
+            force_terminal=True,
+            width=self.width,
+            height=self.height,
+        )
+        self._live = Live(
+            renderable,
+            console=console,
+            screen=False,
+            auto_refresh=self.auto_refresh,
+            refresh_per_second=self.refresh_per_second,
+            transient=False,
+        )
+        try:
+            self._live.start()
+            self._active = True
+        except Exception:
+            self._live = None
+            self._active = False
+        return self
+
+    def stop(self) -> None:
+        """Stop the Rich.Live context."""
+        if self._live is not None and self._active:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+        self._live = None
+        self._active = False
+
+    def __enter__(self) -> LiveWorkspaceManager:
+        return self.start()
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.stop()
+
+    def update(
+        self,
+        conversation_content: str | RenderableType | None = None,
+        composer_content: str | None = None,
+        composer_is_active: bool = False,
+        shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+        include_composer: bool = False,
+        refresh: bool = True,
+    ) -> None:
+        """Update the localized workspace renderable without screen clearing."""
+        if self._live is not None and self._active:
+            renderable = self.build_renderable(
+                conversation_content=conversation_content,
+                composer_content=composer_content,
+                composer_is_active=composer_is_active,
+                shortcuts=shortcuts,
+                include_composer=include_composer,
+            )
+            self._live.update(renderable, refresh=refresh)
+
+    def handle_resize(self, width: int, height: int) -> None:
+        """Dynamically adapt dimensions upon terminal resize."""
+        self.width = max(20, width)
+        self.height = max(4, height)
+        if self._live is not None and self._custom_console is None:
+            try:
+                self._live.console.width = self.width
+                self._live.console.height = self.height
+            except Exception:
+                pass
+        self.update(refresh=True)
+
+
+def create_live_workspace(
+    session: Mapping[str, Any] | None = None,
+    state: Any | None = None,
+    *,
+    console: Console | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    auto_refresh: bool = False,
+    refresh_per_second: float = 8.0,
+) -> LiveWorkspaceManager:
+    """Convenience factory for LiveWorkspaceManager."""
+    return LiveWorkspaceManager(
+        session=session,
+        state=state,
+        console=console,
+        width=width,
+        height=height,
+        auto_refresh=auto_refresh,
+        refresh_per_second=refresh_per_second,
+    )
+
+
 __all__ = [
     "ConversationScroll",
+    "LiveWorkspaceManager",
     "NARROW_THRESHOLD",
     "RUNTIME_HEADING",
     "RUNTIME_MAX_WIDTH",
@@ -348,6 +534,7 @@ __all__ = [
     "ColumnLayout",
     "RuntimePanelScroll",
     "compute_layout",
+    "create_live_workspace",
     "get_status_symbol",
     "render_conversation_column",
     "render_full_screen_workspace",

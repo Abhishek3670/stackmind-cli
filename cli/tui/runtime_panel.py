@@ -111,15 +111,53 @@ class RuntimePanelScroll:
 
 # ── Formatting Helpers ───────────────────────────────────────────────────────
 
+def format_model_badge(
+    backend: str | None = None,
+    model: str | None = None,
+    quantization: str | None = None,
+) -> str:
+    """Format a compact model and quantization badge for an agent role.
+
+    Examples:
+    - backend='ollama', model='qwen2.5-coder:7b', quantization='q4_k_m' -> 'ollama/qwen2.5-coder:7b (q4_k_m)'
+    - backend='ollama', model='qwen2.5-coder:7b' -> 'ollama/qwen2.5-coder:7b'
+    - backend='openai', model='gpt-4o' -> 'openai/gpt-4o'
+    - backend='Claude', model='claude-3-5-sonnet' -> 'Claude/claude-3-5-sonnet'
+    - backend='Codex', model=None -> 'Codex'
+    """
+    b = str(backend).strip() if backend else ""
+    m = str(model).strip() if model else ""
+    q = str(quantization).strip() if quantization else ""
+
+    if m:
+        if b and not m.lower().startswith(f"{b.lower()}/"):
+            main_id = f"{b}/{m}"
+        else:
+            main_id = m
+    elif b:
+        main_id = b
+    else:
+        main_id = ""
+
+    if not main_id:
+        return ""
+
+    if q and q.lower() not in main_id.lower():
+        return f"{main_id} ({q})"
+    return main_id
+
+
 def format_agent_tree(
     agents: list[dict[str, Any]] | list[Any],
     width: int | None = None,
 ) -> list[Text]:
-    """Format agent hierarchy dynamically into tree lines.
+    """Format agent hierarchy dynamically into tree lines with model badges.
 
     Outputs:
     ◉ Architecture    orchestrating
+        [Claude/claude-3-5-sonnet]
       ├─ ● Backend    running
+      │   [ollama/qwen2.5-coder:7b (q4_k_m)]
       ├─ ○ Frontend   waiting
       └─ ○ GitOps     waiting
     """
@@ -137,6 +175,8 @@ def format_agent_tree(
                 "status": getattr(a, "display_state", getattr(a, "state", "idle")),
                 "role": getattr(a, "role", "Worker"),
                 "backend": getattr(a, "backend", ""),
+                "model": getattr(a, "model", None),
+                "quantization": getattr(a, "quantization", None),
             })
         else:
             normalized.append({"name": str(a), "status": "idle"})
@@ -170,6 +210,21 @@ def format_agent_tree(
         root_line.append(f" {disp}", style="dim #94a3b8")
         lines.append(root_line)
 
+        # Render model/quantization badge for active role or configured model
+        r_badge = format_model_badge(
+            root.get("backend"),
+            root.get("model"),
+            root.get("quantization"),
+        )
+        is_active_root = r_status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
+        if r_badge and (root.get("model") or is_active_root):
+            max_badge_len = max(10, (width or 36) - 8)
+            trunc_badge = r_badge if len(r_badge) <= max_badge_len else r_badge[:max_badge_len - 1] + "…"
+            badge_line = Text()
+            badge_line.append("    ")
+            badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
+            lines.append(badge_line)
+
         for j, child in enumerate(children):
             is_last = (j == len(children) - 1)
             prefix = "  └─ " if is_last else "  ├─ "
@@ -184,6 +239,21 @@ def format_agent_tree(
             child_line.append(f" {cdisp}", style="dim #94a3b8")
             lines.append(child_line)
 
+            c_badge = format_model_badge(
+                child.get("backend"),
+                child.get("model"),
+                child.get("quantization"),
+            )
+            is_active_child = c_status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
+            if c_badge and (child.get("model") or is_active_child):
+                b_prefix = "      " if is_last else "  │   "
+                max_badge_len = max(10, (width or 36) - len(b_prefix) - 4)
+                trunc_badge = c_badge if len(c_badge) <= max_badge_len else c_badge[:max_badge_len - 1] + "…"
+                badge_line = Text()
+                badge_line.append(b_prefix, style="dim #475569")
+                badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
+                lines.append(badge_line)
+
     # Case 2: Flat list with symbols or simple dicts
     else:
         for item in normalized:
@@ -194,10 +264,23 @@ def format_agent_tree(
             line = Text()
             line.append("  ")
             line.append(f"{sym} ", style=style)
-            # Support both "name: status" and aligned tree text
             line.append(f"{name}: ", style="dim white")
             line.append(f"{status}", style="dim #94a3b8")
             lines.append(line)
+
+            f_badge = format_model_badge(
+                item.get("backend"),
+                item.get("model"),
+                item.get("quantization"),
+            )
+            is_active_item = status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
+            if f_badge and (item.get("model") or is_active_item):
+                max_badge_len = max(10, (width or 36) - 8)
+                trunc_badge = f_badge if len(f_badge) <= max_badge_len else f_badge[:max_badge_len - 1] + "…"
+                badge_line = Text()
+                badge_line.append("    ")
+                badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
+                lines.append(badge_line)
 
     return lines
 
@@ -313,7 +396,22 @@ def render_runtime_panel(
     if state is not None:
         if agents is None:
             if hasattr(state, "get_agent_hierarchy"):
-                agents = state.get_agent_hierarchy()
+                raw_agents = state.get_agent_hierarchy()
+                agents = []
+                roles_map = getattr(state, "roles", {}) or {}
+                for a in raw_agents:
+                    if isinstance(a, Mapping):
+                        ad = dict(a)
+                        r_name = ad.get("role") or ad.get("name")
+                        r_obj = roles_map.get(r_name)
+                        if r_obj:
+                            if not ad.get("model"):
+                                ad["model"] = getattr(r_obj, "model", None)
+                            if not ad.get("quantization"):
+                                ad["quantization"] = getattr(r_obj, "quantization", None)
+                        agents.append(ad)
+                    else:
+                        agents.append(a)
             elif hasattr(state, "roles"):
                 agents = list(state.roles.values())
         if work_orders is None:
@@ -411,6 +509,7 @@ __all__ = [
     "RuntimePanelScroll",
     "format_agent_tree",
     "format_current_operation",
+    "format_model_badge",
     "format_work_orders",
     "get_status_symbol",
     "render_runtime_panel",

@@ -5,14 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
 
 class DaemonClient:
-    def __init__(self, url: str) -> None:
-        self.url = url.rstrip("/")
+    def __init__(self, url: str | None = None, base_url: str | None = None) -> None:
+        target = url or base_url or "http://127.0.0.1:9999"
+        self.url = target.rstrip("/")
         self._request_id = 0
         self._opener = build_opener(ProxyHandler({}))
 
@@ -145,22 +146,40 @@ class DaemonClient:
         return []
 
     def stream_events(
-        self, session_id: str | None = None, after: int = 0
+        self,
+        session_id: str | None = None,
+        after: int = 0,
+        timeout: float | None = None,
     ) -> Iterator[dict[str, Any]]:
         params: dict[str, Any] = {"after": after}
         if session_id is not None:
             params["session_id"] = session_id
         request = Request(f"{self.url}/events?{urlencode(params)}")
-        with self._opener.open(request) as response:
-            for raw_line in response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if line.startswith("data: "):
-                    try:
-                        data = json.loads(line[6:])
-                        if isinstance(data, dict):
-                            yield data
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+        open_kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            open_kwargs["timeout"] = timeout
+        try:
+            with self._opener.open(request, **open_kwargs) as response:
+                while True:
+                    raw_line = response.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line.startswith("data: "):
+                        try:
+                            data = json.loads(line[6:])
+                            if isinstance(data, dict):
+                                yield data
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                    elif line.startswith(": keepalive"):
+                        yield {
+                            "name": "system.heartbeat",
+                            "payload": {"status": "alive"},
+                            "_heartbeat": True,
+                        }
+        except (HTTPError, URLError, TimeoutError, OSError, ConnectionError):
+            return
 
     def list_backends(self) -> list[dict[str, Any]]:
         result = self.call("backend.list")

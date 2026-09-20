@@ -416,6 +416,36 @@ def extract_assistant_response(
     return None
 
 
+def extract_text_delta(event: Mapping[str, Any] | Any) -> str | None:
+    """Extract incremental token or text delta from streaming event."""
+    if not isinstance(event, Mapping):
+        return None
+    name = str(event.get("name", "")).lower()
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    if name in {
+        "stream.delta",
+        "token.delta",
+        "content.delta",
+        "message.delta",
+        "text.delta",
+        "turn.delta",
+        "assistant.delta",
+    }:
+        for key in ("delta", "token", "text", "content", "chunk"):
+            val = payload.get(key)
+            if isinstance(val, str) and val:
+                return val
+        if isinstance(event.get("delta"), str) and event["delta"]:
+            return str(event["delta"])
+    # Also check if payload has an explicit delta field
+    if "delta" in payload and isinstance(payload["delta"], str) and payload["delta"]:
+        return payload["delta"]
+    return None
+
+
+
 def extract_assistant_thinking(
     payload: Mapping[str, Any] | Any, workspace: Path | None = None
 ) -> str | None:

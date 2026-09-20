@@ -296,6 +296,21 @@ def render_assistant_message_str(
     return console.export_text().rstrip()
 
 
+def render_assistant_stream_header(
+    model: str | None = None,
+    width: int = 80,
+) -> str:
+    """Render the opening header for progressive assistant response streaming."""
+    hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
+    if model:
+        hdr.append(f" ({model})", style="dim #94a3b8")
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(hdr)
+    return console.export_text().rstrip()
+
+
+
 def render_system_message(
     content: str,
     timestamp: str | None = None,
