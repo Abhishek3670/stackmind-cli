@@ -20,6 +20,7 @@ from rich.console import Console
 
 from cli.tui.app import (
     check_terminal_resize,
+    dispatch_delivery_command,
     install_resize_handler,
     redraw_full_screen,
     render_roles_panel,
@@ -294,3 +295,65 @@ def test_responsive_layout_transitions():
     wide_frame = render_workspace_layout_str("Wide conversation", width=120)
     assert "Wide conversation" in wide_frame
     assert "StackMind Runtime" in wide_frame
+
+
+# ─── 6. STEP 3 & STEP 4 LIFECYCLE & PAUSE/RESUME VERIFICATION ─────────────────
+
+
+def test_dispatch_delivery_command_pauses_and_resumes_live_manager():
+    """Verify dispatch_delivery_command pauses LiveWorkspaceManager during turn streaming and restarts it."""
+    mock_live = MagicMock()
+    mock_live.is_active = True
+    mock_live.stop.side_effect = lambda: setattr(mock_live, "is_active", False)
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-test-1"}
+    mock_adapter.stream.return_value = iter([
+        {"name": "turn.completed", "payload": {"operation_id": "op-test-1", "response": "done"}},
+    ])
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED", "result": {"summary": "done"}}
+
+    state = AutonomousDeliveryState("demo", session_id="test-live-pause")
+    session = {"session_id": "test-live-pause", "agent": "gemini"}
+
+    _, should_exit = dispatch_delivery_command(
+        mock_adapter,
+        mock_client,
+        session,
+        "test turn message",
+        state,
+        client_timeout=5.0,
+        live_manager=mock_live,
+    )
+
+    assert should_exit is False
+    # live_manager.stop() should have been called before streaming starts
+    mock_live.stop.assert_called()
+    # live_manager.start(include_composer=False) should have been called in finally
+    mock_live.start.assert_called_with(include_composer=False)
+
+
+def test_dispatch_delivery_command_stops_live_manager_on_exit():
+    """Verify dispatch_delivery_command stops LiveWorkspaceManager when exit command is received."""
+    mock_live = MagicMock()
+    mock_live.is_active = True
+
+    state = AutonomousDeliveryState("demo", session_id="test-live-exit")
+    session = {"session_id": "test-live-exit", "agent": "gemini"}
+
+    for exit_cmd in [":exit", ":quit", "q"]:
+        mock_live.reset_mock()
+        mock_live.is_active = True
+        _, should_exit = dispatch_delivery_command(
+            None,
+            None,
+            session,
+            exit_cmd,
+            state,
+            live_manager=mock_live,
+        )
+        assert should_exit is True
+        mock_live.stop.assert_called_once()
+

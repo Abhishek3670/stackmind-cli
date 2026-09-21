@@ -705,7 +705,7 @@ def redraw_full_screen(
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
-            prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H"
+            prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H\x1b[0J"
             target.write(f"{prefix}{frame}\n" if not include_composer else f"{prefix}{frame}")
             target.flush()
     except Exception:
@@ -810,6 +810,7 @@ def prompt_composer_input(
     on_ctrl_l: Callable[[], None] | None = None,
     history: list[str] | None = None,
     show_footer: bool = True,
+    live_manager: Any | None = None,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
@@ -823,6 +824,8 @@ def prompt_composer_input(
         state.is_typing = True
         state.focus_target = "composer"
 
+    is_live_active = live_manager is not None and getattr(live_manager, "is_active", False)
+
     is_tty = False
     try:
         is_tty = sys.stdin.isatty()
@@ -830,13 +833,21 @@ def prompt_composer_input(
         pass
 
     if is_tty:
-        click.echo(render_composer_top_border_str(
-            placeholder=placeholder,
-            shortcuts=shortcuts,
-            width=width,
-            is_active=True,
-            has_content=bool(initial_text),
-        ))
+        if is_live_active:
+            live_manager.update(
+                composer_content=initial_text,
+                composer_is_active=True,
+                shortcuts=shortcuts,
+                include_composer=True,
+            )
+        else:
+            click.echo(render_composer_top_border_str(
+                placeholder=placeholder,
+                shortcuts=shortcuts,
+                width=width,
+                is_active=True,
+                has_content=bool(initial_text),
+            ))
         try:
             val = raw_prompt_input(
                 placeholder=placeholder,
@@ -860,19 +871,35 @@ def prompt_composer_input(
                 state.is_typing = False
                 state.composer_buffer = ""
 
-        click.echo(render_composer_bottom_border_str(width=width, is_active=True))
-        if show_footer:
-            click.echo(render_bottom_footer_bar_str(width=width))
+        if is_live_active:
+            live_manager.update(
+                composer_content=val,
+                composer_is_active=False,
+                shortcuts=shortcuts,
+                include_composer=False,
+            )
+        else:
+            click.echo(render_composer_bottom_border_str(width=width, is_active=True))
+            if show_footer:
+                click.echo(render_bottom_footer_bar_str(width=width))
         return val
 
     # Non-TTY / test fallback: standard input() with multiline support
-    click.echo(render_composer_top_border_str(
-        placeholder=placeholder,
-        shortcuts=shortcuts,
-        width=width,
-        is_active=True,
-        has_content=bool(initial_text),
-    ))
+    if is_live_active:
+        live_manager.update(
+            composer_content=initial_text,
+            composer_is_active=True,
+            shortcuts=shortcuts,
+            include_composer=True,
+        )
+    else:
+        click.echo(render_composer_top_border_str(
+            placeholder=placeholder,
+            shortcuts=shortcuts,
+            width=width,
+            is_active=True,
+            has_content=bool(initial_text),
+        ))
     prompt_str = "│ > "
     cont_prompt_str = "│   "
 
@@ -903,9 +930,17 @@ def prompt_composer_input(
             state.is_typing = False
             state.composer_buffer = ""
 
-    click.echo(render_composer_bottom_border_str(width=width, is_active=True))
-    if show_footer:
-        click.echo(render_bottom_footer_bar_str(width=width))
+    if is_live_active:
+        live_manager.update(
+            composer_content="\n".join(lines),
+            composer_is_active=False,
+            shortcuts=shortcuts,
+            include_composer=False,
+        )
+    else:
+        click.echo(render_composer_bottom_border_str(width=width, is_active=True))
+        if show_footer:
+            click.echo(render_bottom_footer_bar_str(width=width))
     return "\n".join(lines)
 
 
@@ -1139,6 +1174,7 @@ def dispatch_delivery_command(
     state: AutonomousDeliveryState,
     *,
     client_timeout: float | None = None,
+    live_manager: Any | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Dispatch interactive TUI commands, updating delivery state reactively."""
     effective_timeout = client_timeout if client_timeout is not None else getattr(state, "client_timeout", 45.0)
@@ -1148,6 +1184,8 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized in {":exit", ":quit", "q"}:
+        if live_manager is not None and getattr(live_manager, "is_active", False):
+            live_manager.stop()
         return session, True
 
     is_tty = False
@@ -1614,6 +1652,9 @@ def dispatch_delivery_command(
         return session, False
 
     # Governed turn prompt
+    if live_manager is not None and getattr(live_manager, "is_active", False):
+        live_manager.stop()
+
     prompt_text = normalized[8:].strip() if normalized.startswith(":prompt ") else normalized
     state.add_message("user", prompt_text)
     click.echo(render_user_message_str(prompt_text))
@@ -1654,6 +1695,8 @@ def dispatch_delivery_command(
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
                 if resized:
                     current_cols, current_lines = new_cols, new_lines
+                    if live_manager is not None and getattr(live_manager, "is_active", False):
+                        live_manager.handle_resize(new_cols, new_lines)
                 try:
                     ev = next(stream_gen)
                 except StopIteration:
@@ -1910,6 +1953,9 @@ def dispatch_delivery_command(
             )
         state.add_message("system", f"[ERROR] Could not submit turn: {err}")
         click.echo(err_box)
+    finally:
+        if live_manager is not None and not getattr(live_manager, "is_active", False):
+            live_manager.start(include_composer=False)
     restore_composer_focus(state)
     return session, False
 
@@ -1940,6 +1986,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
     """Start the governed Python-native terminal control plane."""
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
+    live_ws: Any | None = None
     if daemon_url is None:
         state_dir = workspace.resolve() / ".sync" / "runtime" / "daemon"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -1984,9 +2031,12 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
 
         install_resize_handler()
 
+        live_ws = create_live_workspace(session=session, state=state)
+        live_ws.start(include_composer=False)
+
         if is_tty:
             enter_alternate_screen()
-            redraw_full_screen(session, state, clear=True, include_composer=False)
+            redraw_full_screen(session, state, clear=True, include_composer=False, live_manager=live_ws)
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
             click.echo(render_top_header_bar_str(
@@ -2018,9 +2068,16 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     )
                 )
 
+        term_size = shutil.get_terminal_size(fallback=(80, 24))
+        current_cols, current_lines = term_size.columns, term_size.lines
         while True:
             try:
-                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
+                if resized:
+                    current_cols, current_lines = new_cols, new_lines
+                    if live_ws is not None and getattr(live_ws, "is_active", False):
+                        live_ws.handle_resize(new_cols, new_lines)
+                term_cols = current_cols
                 conv_width = compute_layout(term_cols).conversation_width if term_cols >= NARROW_THRESHOLD else term_cols
 
                 def _handle_ctrl_k() -> None:
@@ -2028,13 +2085,13 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     state.add_message("user", ":help")
                     state.add_message("system", out)
                     if is_tty:
-                        redraw_full_screen(session, state, clear=True, include_composer=False)
+                        redraw_full_screen(session, state, clear=True, include_composer=False, live_manager=live_ws)
                     else:
                         click.echo(out)
 
                 def _handle_ctrl_l() -> None:
                     if is_tty:
-                        redraw_full_screen(session, state, clear=True, include_composer=False)
+                        redraw_full_screen(session, state, clear=True, include_composer=False, live_manager=live_ws)
                     else:
                         click.echo(render_top_header_bar_str(
                             session, width=term_cols, context_meter=(state.context_meter_text, state.context_warning_level)
@@ -2071,22 +2128,35 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
                     show_footer=False if is_tty else not getattr(state, "has_conversation", False),
+                    live_manager=live_ws,
                 )
             except (EOFError, KeyboardInterrupt):
+                if live_ws is not None:
+                    live_ws.stop()
                 click.echo()
                 break
             try:
                 session, should_exit = dispatch_delivery_command(
-                    adapter, client, session, text, state, client_timeout=state.client_timeout
+                    adapter,
+                    client,
+                    session,
+                    text,
+                    state,
+                    client_timeout=state.client_timeout,
+                    live_manager=live_ws,
                 )
                 if should_exit:
+                    if live_ws is not None:
+                        live_ws.stop()
                     break
             except KeyboardInterrupt:
                 click.echo()
                 continue
             if is_tty:
-                redraw_full_screen(session, state, include_composer=False)
+                redraw_full_screen(session, state, include_composer=False, live_manager=live_ws)
     finally:
+        if live_ws is not None:
+            live_ws.stop()
         restore_terminal_state()
         if daemon is not None:
             daemon.stop()
