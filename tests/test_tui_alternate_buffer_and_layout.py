@@ -330,10 +330,10 @@ def test_render_full_screen_workspace_without_composer():
     assert "Type a message..." not in frame_without
     assert "Ctrl+K commands" not in frame_without
 
-    # Height without composer must be exactly 3 lines shorter than frame with composer
+    # Height without composer must be exactly 4 lines shorter than frame with composer (3 lines composer + 1 line status bar)
     lines_with = len(frame_with.splitlines())
     lines_without = len(frame_without.splitlines())
-    assert lines_without == lines_with - 3
+    assert lines_without == lines_with - 4
 
 
 def test_redraw_full_screen_without_composer_emits_newline_for_prompt_positioning():
@@ -355,3 +355,263 @@ def test_redraw_full_screen_without_composer_emits_newline_for_prompt_positionin
     # Must position cursor with newline after frame to ensure prompt_composer_input begins on row (height - 3)
     assert out.endswith("\n")
     assert "Type a message..." not in out
+
+
+# ─── 8. WO-007 ENHANCEMENTS: BOTTOM STATUS BAR, OLLAMA ERROR, IN-VIEWPORT STREAMING ───
+
+
+def test_bottom_status_bar_relocation_in_full_screen_workspace():
+    """Verify status bar is at the bottom below composer, row 0 starts with workspace (WO-007)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
+
+    frame_with = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=True,
+    )
+    lines = frame_with.splitlines()
+    # Row 0 must not be status bar
+    assert "stackmind" not in lines[0]
+    # The last line must contain the status bar
+    assert "stackmind" in lines[-1]
+    assert "codex" in lines[-1]
+    assert "online" in lines[-1]
+
+    # Without composer: bottom rows (composer + status bar) are omitted for prompt_composer_input
+    frame_without = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=False,
+    )
+    lines_wo = frame_without.splitlines()
+    assert "stackmind" not in lines_wo[0]
+    assert "stackmind" not in lines_wo[-1]
+
+
+def test_prompt_composer_input_renders_status_bar_at_bottom(monkeypatch, capsys):
+    """Verify prompt_composer_input renders status bar below composer bottom border (WO-007)."""
+    from cli.tui.app import prompt_composer_input
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "hello")
+    capsys.readouterr()
+
+    session = {"session_id": "sess-abc", "agent": "gemini"}
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-abc")
+    res = prompt_composer_input(width=80, session=session, state=state)
+    assert res == "hello"
+
+    captured = capsys.readouterr()
+    assert "stackmind" in captured.out
+    assert "gemini" in captured.out
+    assert "● online" in captured.out
+
+
+def test_dispatch_delivery_command_ollama_error_transparency(capsys):
+    """Verify failed turn with Ollama error renders OLLAMA ERROR alert and permanently records in messages (WO-007)."""
+    from cli.tui.app import dispatch_delivery_command
+    from unittest.mock import MagicMock
+
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex"}
+
+    adapter = MagicMock()
+    adapter.command.return_value = {"operation_id": "op-err-1"}
+
+    client = MagicMock()
+    client.events.return_value = [
+        {
+            "name": "operation.failed",
+            "sequence": 1,
+            "operation_id": "op-err-1",
+            "payload": {
+                "operation_id": "op-err-1",
+                "error": "Ollama error: model runner crashed: out of memory",
+            },
+        }
+    ]
+    client.operation_get.return_value = {
+        "operation_id": "op-err-1",
+        "status": "FAILED",
+        "error": "Ollama error: model runner crashed: out of memory",
+        "result": {
+            "error": "Ollama error: model runner crashed: out of memory",
+        },
+    }
+
+    capsys.readouterr()
+    dispatch_delivery_command(adapter, client, session, "Generate huge response", state, client_timeout=0.1)
+
+    captured = capsys.readouterr()
+    # Must render OLLAMA ERROR alert box
+    assert "OLLAMA ERROR" in captured.out
+    assert "model runner crashed: out of memory" in captured.out
+    # Must NOT fall back to generic completion message
+    assert "Turn operation op-err-1 completed." not in captured.out
+
+    # Must permanently add to state.messages
+    assert any("model runner crashed: out of memory" in msg.content for msg in state.messages)
+
+
+def test_in_viewport_turn_streaming_clears_composer(monkeypatch):
+    """Verify prompt submit in TTY mode immediately clears composer via redraw_full_screen (WO-007)."""
+    from cli.tui.app import dispatch_delivery_command
+    from unittest.mock import MagicMock
+
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex"}
+
+    adapter = MagicMock()
+    adapter.command.return_value = {"operation_id": "op-stream-1"}
+
+    client = MagicMock()
+    client.events.return_value = []
+    client.operation_get.return_value = {
+        "operation_id": "op-stream-1",
+        "status": "COMPLETED",
+        "result": {"summary": "Done"},
+    }
+
+    redraw_calls = []
+    def mock_redraw(*args, **kwargs):
+        redraw_calls.append(kwargs)
+        return "mock_frame"
+
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.app.redraw_full_screen", mock_redraw)
+
+    dispatch_delivery_command(adapter, client, session, "hello world", state, client_timeout=0.1)
+
+    # First redraw must be called with include_composer=False to clear composer before streaming
+    assert len(redraw_calls) >= 1
+    assert redraw_calls[0].get("include_composer") is False
+
+
+# ─── 9. WO-008: COMPOSER WIDTH ALIGNMENT TO CONVERSATION VIEWPORT ────────────
+
+
+def test_composer_width_aligned_with_conversation_viewport():
+    """Verify composer box width aligns with layout.conversation_width when runtime panel is visible (WO-008)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
+
+    layout_120 = compute_layout(120)
+    assert layout_120.show_runtime is True
+    assert layout_120.conversation_width < 120
+
+    frame_120 = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=True,
+    )
+    lines = frame_120.splitlines()
+    # Pinned bottom composer box is 3 lines before the status bar
+    composer_top = lines[-4]
+    composer_bottom = lines[-2]
+    status_bar = lines[-1]
+
+    # Composer box top and bottom borders must have length matching conversation_width
+    assert len(composer_top) == layout_120.conversation_width
+    assert composer_top[0] in ("╭", "┌")
+    assert composer_top[-1] in ("╮", "┐")
+    assert len(composer_bottom) == layout_120.conversation_width
+    assert composer_bottom[0] in ("╰", "└")
+    assert composer_bottom[-1] in ("╯", "┘")
+
+    # Status bar aligns with conversation_width matching composer box (WO-009)
+    assert len(status_bar) == layout_120.conversation_width
+    assert "stackmind" in status_bar
+    assert "● online" in status_bar
+
+
+def test_composer_width_spans_full_width_when_narrow():
+    """Verify composer box spans full terminal width when runtime panel is hidden (WO-008)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
+
+    layout_80 = compute_layout(80)
+    assert layout_80.show_runtime is False
+
+    frame_80 = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=80,
+        height=24,
+        include_composer=True,
+    )
+    lines = frame_80.splitlines()
+    composer_top = lines[-4]
+    composer_bottom = lines[-2]
+    status_bar = lines[-1]
+
+    assert len(composer_top) == 80
+    assert len(composer_bottom) == 80
+    assert len(status_bar) == 80
+
+
+def test_prompt_composer_input_uses_aligned_composer_width(monkeypatch, capsys):
+    """Verify prompt_composer_input renders composer and status bar at conversation_width (WO-008, WO-009)."""
+    from cli.tui.app import prompt_composer_input
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "hello")
+    capsys.readouterr()
+
+    session = {"session_id": "sess-abc", "agent": "gemini"}
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-abc")
+
+    # Calling with width=120 should automatically resolve comp_width=conversation_width and status bar=conversation_width
+    res = prompt_composer_input(width=120, session=session, state=state)
+    assert res == "hello"
+
+    captured = capsys.readouterr()
+    lines = [ln for ln in captured.out.splitlines() if ln.strip()]
+    # Top border starts with ╭─ and bottom with ╰─
+    top_borders = [l for l in lines if l.startswith("╭─")]
+    bottom_borders = [l for l in lines if l.startswith("╰─")]
+    status_bars = [l for l in lines if "stackmind" in l]
+
+    layout_120 = compute_layout(120)
+    assert len(top_borders) >= 1
+    assert len(top_borders[0]) == layout_120.conversation_width
+    assert len(bottom_borders) >= 1
+    assert len(bottom_borders[0]) == layout_120.conversation_width
+    assert len(status_bars) >= 1
+    assert len(status_bars[0]) == layout_120.conversation_width
+
+
+# ─── 10. WO-009: STATUS BAR WIDTH ALIGNMENT TO CONVERSATION VIEWPORT ──────────
+
+
+def test_status_bar_and_composer_share_identical_right_edge():
+    """Verify both composer box and status bar share the identical conversation_width boundary (WO-009)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
+
+    layout_120 = compute_layout(120)
+    assert layout_120.show_runtime is True
+
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=True,
+    )
+    lines = frame.splitlines()
+    composer_top = lines[-4]
+    composer_bottom = lines[-2]
+    status_bar = lines[-1]
+
+    # Both composer borders and status bar must have the exact same width
+    assert len(composer_top) == layout_120.conversation_width
+    assert len(composer_bottom) == layout_120.conversation_width
+    assert len(status_bar) == layout_120.conversation_width
+    assert len(composer_bottom) == len(status_bar)
+
+

@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import io
 import json
 import socket
 import threading
@@ -254,7 +255,7 @@ def test_live_model_transport_errors_are_typed_and_sanitized(error, expected):
 def test_live_model_malformed_json_is_typed_and_sanitized():
     backend = ModelExecutionBackend(backend_id="live-model", endpoint="http://localhost:11434")
     response = MagicMock()
-    response.read.return_value = b"not valid json"
+    response.__iter__.return_value = [b"not valid json\n"]
     response.__enter__.return_value = response
 
     with patch("urllib.request.urlopen", return_value=response):
@@ -270,6 +271,140 @@ def test_model_without_endpoint_uses_explicit_synthetic_completion():
     completion = backend.complete(_live_model_request())
 
     assert completion.payload["status"] == "completed"
+
+
+def test_default_runner_clones_backend_for_concurrency(tmp_path):
+    """Verify _default_runner provides isolated backend instances across concurrent roles."""
+    reset_default_registry()
+    registry = get_default_registry()
+    try:
+        backend_id = "test-concurrent-ollama"
+        shared_backend = ModelExecutionBackend(
+            backend_id=backend_id,
+            model="shared-llama3",
+            endpoint="http://localhost:11434",
+        )
+        registry.register(shared_backend)
+
+        storage = DaemonStorage(tmp_path)
+        manager = SessionManager(storage)
+        manager.configure_role_backend(role="backend", backend=backend_id, model="custom-coder")
+        manager.configure_role_backend(role="frontend", backend=backend_id, model="custom-ui")
+
+        runner_a = manager._default_runner(str(tmp_path), "backend")
+        runner_b = manager._default_runner(str(tmp_path), "frontend")
+
+        # 1. Assert that the two resulting runners' backends are distinct instances (copy.copy)
+        assert runner_a.backend is not runner_b.backend
+        assert runner_a.backend is not shared_backend
+        assert runner_b.backend is not shared_backend
+
+        # 2. Assert setting on_token on runner A does NOT leak into runner B
+        token_listener = MagicMock()
+        runner_a.backend.on_token = token_listener
+        assert runner_b.backend.on_token is None
+
+        # 3. Assert model customization on runners did not mutate the registry singleton
+        assert runner_a.backend.model == "custom-coder"
+        assert runner_b.backend.model == "custom-ui"
+        assert shared_backend.model == "shared-llama3"
+        assert shared_backend.model_name == "shared-llama3"
+    finally:
+        reset_default_registry()
+
+
+def test_ollama_streaming_token_deltas():
+    # Includes an invalid NDJSON line in the stream to verify per-line parsing resiliency
+    chunks = [
+        {"response": "Hello", "done": False},
+        {"response": " world", "done": False},
+        {"response": "!", "done": True, "eval_count": 15, "eval_duration": 120000000},
+    ]
+    ndjson_lines = [
+        json.dumps(chunks[0]).encode("utf-8") + b"\n",
+        b"malformed json line that should be skipped\n",
+        json.dumps(chunks[1]).encode("utf-8") + b"\n",
+        json.dumps(chunks[2]).encode("utf-8") + b"\n",
+    ]
+
+    # (a) & (b) on_token is called once per fragment with correct text, and payload matches concatenation
+    tokens: list[str] = []
+    backend = ModelExecutionBackend(
+        backend_id="live-model",
+        endpoint="http://localhost:11434",
+        on_token=tokens.append,
+    )
+
+    response = MagicMock()
+    response.__iter__.return_value = iter(ndjson_lines)
+    response.__enter__.return_value = response
+
+    with patch("urllib.request.urlopen", return_value=response):
+        completion = backend.complete(_live_model_request())
+
+    # (a) Assert on_token is called once per fragment with the correct text
+    assert tokens == ["Hello", " world", "!"]
+
+    # (b) Assert final payload's summary/report_markdown matches concatenation
+    assert completion.payload["summary"] == "Hello world!"
+    assert "Hello world!" in completion.payload["report_markdown"]
+    assert completion.payload["_stream_stats"] == {
+        "eval_count": 15,
+        "eval_duration": 120000000,
+    }
+
+    # (c) Assert behavior with on_token=None is unchanged from before this change
+    backend_no_token = ModelExecutionBackend(
+        backend_id="live-model",
+        endpoint="http://localhost:11434",
+        on_token=None,
+    )
+    response_no_token = MagicMock()
+    response_no_token.__iter__.return_value = iter(ndjson_lines)
+    response_no_token.__enter__.return_value = response_no_token
+
+    with patch("urllib.request.urlopen", return_value=response_no_token):
+        completion_no_token = backend_no_token.complete(_live_model_request())
+
+    assert completion_no_token.payload["summary"] == "Hello world!"
+    assert "Hello world!" in completion_no_token.payload["report_markdown"]
+    assert completion_no_token.payload["_stream_stats"] == {
+        "eval_count": 15,
+        "eval_duration": 120000000,
+    }
+
+
+def test_ollama_streaming_cancellation():
+    cancel_event = threading.Event()
+    tokens: list[str] = []
+
+    def cancel_after_first(token: str):
+        tokens.append(token)
+        cancel_event.set()
+
+    backend = ModelExecutionBackend(
+        backend_id="live-model",
+        endpoint="http://localhost:11434",
+        on_token=cancel_after_first,
+    )
+    backend.cancel_event = cancel_event
+
+    chunks = [
+        {"response": "Chunk 1", "done": False},
+        {"response": " Chunk 2", "done": False},
+        {"response": " Chunk 3", "done": True},
+    ]
+    ndjson_lines = [json.dumps(c).encode("utf-8") + b"\n" for c in chunks]
+
+    response = MagicMock()
+    response.__iter__.return_value = iter(ndjson_lines)
+    response.__enter__.return_value = response
+
+    with patch("urllib.request.urlopen", return_value=response):
+        completion = backend.complete(_live_model_request())
+
+    assert tokens == ["Chunk 1"]
+    assert completion.payload["summary"] == "Chunk 1"
 
 
 # -----------------------------------------------------------------------------
@@ -603,3 +738,55 @@ def test_dynamic_role_rebinding_execution(tmp_path):
     assert op2_record["status"] in {"COMPLETED", "FAILED"}
     assert op2_record.get("backend_id") == "mock-model"
     assert op2_record.get("model") == "mock-llama3"
+
+
+# -----------------------------------------------------------------------------
+# 9. Ollama Error & Exception Transparency Tests (WO-007)
+# -----------------------------------------------------------------------------
+
+def test_ollama_midstream_error_chunk():
+    backend = ModelExecutionBackend(backend_id="ollama-live", endpoint="http://localhost:11434")
+    response_mock = MagicMock()
+    response_mock.__iter__.return_value = [
+        b'{"response": "partial ok"}\n',
+        b'{"error": "model runner crashed: out of memory"}\n',
+    ]
+    response_mock.__enter__.return_value = response_mock
+    with patch("urllib.request.urlopen", return_value=response_mock):
+        with pytest.raises(BackendExecutionError) as exc_info:
+            backend.complete(_live_model_request())
+    assert "Ollama error: model runner crashed: out of memory" in str(exc_info.value)
+
+
+def test_ollama_empty_generation_error():
+    backend = ModelExecutionBackend(backend_id="ollama-live", endpoint="http://localhost:11434")
+    response_mock = MagicMock()
+    response_mock.__iter__.return_value = [
+        b'{"response": ""}\n',
+        b'{"done": true}\n',
+    ]
+    response_mock.__enter__.return_value = response_mock
+    with patch("urllib.request.urlopen", return_value=response_mock):
+        with pytest.raises(BackendExecutionError) as exc_info:
+            backend.complete(_live_model_request())
+    assert "Ollama completed without generating a response" in str(exc_info.value)
+
+
+def test_ollama_http_error_body_extraction():
+    backend = ModelExecutionBackend(backend_id="ollama-live", endpoint="http://localhost:11434")
+    body_fp = io.BytesIO(b'{"error": "pull model required before generation"}')
+    http_err = urllib.error.HTTPError("http://localhost:11434/api/generate", 500, "Internal Error", None, body_fp)
+    with patch("urllib.request.urlopen", side_effect=http_err):
+        with pytest.raises(BackendExecutionError) as exc_info:
+            backend.complete(_live_model_request())
+    assert "Ollama HTTP 500: pull model required before generation" in str(exc_info.value)
+
+
+def test_ollama_server_reachability_error():
+    backend = ModelExecutionBackend(backend_id="ollama-live", endpoint="http://localhost:11434")
+    url_err = urllib.error.URLError("[Errno 111] Connection refused")
+    with patch("urllib.request.urlopen", side_effect=url_err):
+        with pytest.raises(BackendUnavailableError) as exc_info:
+            backend.complete(_live_model_request())
+    assert "Could not connect to Ollama at http://localhost:11434: [Errno 111] Connection refused" in str(exc_info.value)
+

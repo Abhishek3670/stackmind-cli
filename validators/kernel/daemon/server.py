@@ -10,9 +10,20 @@ from threading import Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import sys
 from .manager import SessionManager
 from .protocol import JsonRpcProtocol
 from .storage import DaemonStorage
+
+
+class _DaemonHTTPServer(ThreadingHTTPServer):
+    """Threading HTTPServer that gracefully ignores normal client disconnect errors."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc_type, _, _ = sys.exc_info()
+        if exc_type is not None and issubclass(exc_type, (ConnectionError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class LocalDaemon:
@@ -27,7 +38,7 @@ class LocalDaemon:
         self.manager = SessionManager(DaemonStorage(state_dir), runner_factory=runner_factory)
         self.protocol = JsonRpcProtocol(self.manager)
         self.mcp_protocol = mcp_protocol
-        self._server = ThreadingHTTPServer((host, port), self._handler())
+        self._server = _DaemonHTTPServer((host, port), self._handler())
         self._thread: Thread | None = None
 
     @property
@@ -103,7 +114,7 @@ class LocalDaemon:
                             continue
                         self._emit_sse(event)
                         last_sequence = event.sequence
-                except (BrokenPipeError, ConnectionResetError):
+                except (ConnectionError, BrokenPipeError):
                     return
                 finally:
                     unsubscribe()

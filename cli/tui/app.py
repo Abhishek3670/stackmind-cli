@@ -14,6 +14,7 @@ Implements the user-facing control plane for the StackMind governed runtime:
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import signal
 import sys
@@ -371,9 +372,16 @@ def render_top_header_bar(
     status: str | None = "online",
     context_meter: tuple[str, str] | None = None,
 ) -> RenderableType:
-    """Render the top status header bar matching image.png:
-    Left: stackmind  |  dev  ~/projects/stackmind
-    Right: session: <id> | agent: <agent> | provider: <provider> | ● online
+    """Render a single-line, width-safe top status bar.
+
+    The previous implementation calculated a minimum workspace width and then
+    allowed the right-hand metadata to exceed the terminal width. Rich wrapped
+    the final status onto a second line on medium-width Windows terminals.
+    The header is chrome, not document content, so it must *never* wrap.
+
+    Fields are progressively compacted / dropped as width becomes constrained:
+    session id and connection status are retained; optional provider/context
+    metadata yields first.
     """
     sid = str(session.get("session_id", "session"))
     short_sid = sid if len(sid) <= 8 else sid[:8]
@@ -381,7 +389,6 @@ def render_top_header_bar(
     provider = str(session.get("provider") or "daemon")
     workspace = session.get("workspace")
 
-    # Format status indicator
     st = str(status or "online").lower()
     if st == "online":
         glyph, glyph_style, st_name = status_glyph("online"), "bold #22c55e", "online"
@@ -390,65 +397,115 @@ def render_top_header_bar(
     else:
         glyph, glyph_style, st_name = status_glyph("failed"), "bold red", "offline"
 
-    # Assemble right-side components based on available width
+    status_item = f"{glyph} {st_name}"
+
+    def context_item(compact: bool = False) -> str:
+        if not context_meter:
+            return ""
+        value, _level = context_meter
+        if compact:
+            value = (
+                value.replace("Context: ", "ctx ")
+                .replace(" / ", "/")
+                .replace(" (", " ")
+                .replace(")", "")
+            )
+        return value
+
+    # Keep the same visual content on wide terminals, but use a compact
+    # context label before dropping useful metadata on constrained terminals.
     right_items: list[str] = []
     if width >= 90:
-        right_items.append(f"session: {short_sid}")
-        right_items.append(f"agent: {agent}")
-        right_items.append(f"provider: {provider}")
+        right_items.extend([f"session: {short_sid}", f"agent: {agent}", f"provider: {provider}"])
     elif width >= 65:
-        right_items.append(f"session: {short_sid}")
-        right_items.append(f"agent: {agent}")
+        right_items.extend([f"session: {short_sid}", f"agent: {agent}"])
     elif width >= 45:
         right_items.append(f"session: {short_sid}")
 
-    context_text = ""
-    context_style = ""
-    if context_meter and width >= 100:
-        context_text, level = context_meter
-        context_style = {"green": "bold #22c55e", "yellow": "bold yellow", "red": "bold red"}.get(level, "dim white")
-        right_items.append(context_text)
-    elif context_meter and width >= 80:
-        context_text, level = context_meter
-        compact_text = context_text.replace("Context: ", "ctx ").replace(" (", " ").replace(")", "")
-        context_text = compact_text
-        context_style = {"green": "bold #22c55e", "yellow": "bold yellow", "red": "bold red"}.get(level, "dim white")
-        right_items.append(context_text)
+    if context_meter and width >= 80:
+        ctx = context_item(compact=width < 118)
+        if ctx:
+            right_items.append(ctx)
 
-    status_str = f"{glyph} {st_name}"
-    right_plain = " | ".join(right_items + [status_str]) if right_items else status_str
+    def right_text(items: list[str]) -> str:
+        return " | ".join(items + [status_item]) if items else status_item
 
-    # Format workspace path
+    left_prefix = "stackmind  |  dev  "
     if workspace:
         p = Path(str(workspace))
         ws_display = str(p) if width >= 90 else f".../{p.name}"
     else:
+        p = None
         ws_display = "~/projects/stackmind"
 
-    left_prefix = "stackmind  |  dev  "
-    left_plain = left_prefix + ws_display
+    def fit_left(items: list[str]) -> tuple[str, str]:
+        """Return a workspace label that fits alongside right-side metadata."""
+        right_plain = right_text(items)
+        available = width - len(left_prefix) - len(right_plain) - 2
+        if available <= 0:
+            return "", right_plain
 
-    # Adjust workspace display if necessary to fit in width
-    if len(left_plain) + len(right_plain) + 2 > width:
-        max_ws = max(6, width - len(left_prefix) - len(right_plain) - 4)
-        if len(ws_display) > max_ws:
-            ws_display = ".../" + p.name[-max(1, max_ws - 4):] if workspace else "~"
-        left_plain = left_prefix + ws_display
+        if len(ws_display) <= available:
+            return ws_display, right_plain
 
-    spaces_count = max(2, width - len(left_plain) - len(right_plain))
+        if available <= 4:
+            return ws_display[:max(1, available)], right_plain
 
-    # Build styled Text
-    res = Text()
+        if p is not None:
+            # Preserve the project basename because it is more useful than an
+            # arbitrary slice of the absolute path.
+            name = p.name or str(p)
+            if len(name) + 4 <= available:
+                return ".../" + name, right_plain
+
+        return ws_display[: max(1, available - 1)] + "…", right_plain
+
+    # Progressively shed optional right-side metadata until the line fits.
+    # This is deterministic, so resizing cannot cause one-line/two-line jitter.
+    candidates = list(right_items)
+    ws_fit, right_plain = fit_left(candidates)
+
+    if len(left_prefix) + len(ws_fit) + len(right_plain) + 2 > width:
+        # Context is useful telemetry but least important in the header.
+        candidates = [item for item in candidates if item != context_item(compact=True)
+                      and item != context_item(compact=False)]
+        ws_fit, right_plain = fit_left(candidates)
+
+    if len(left_prefix) + len(ws_fit) + len(right_plain) + 2 > width and width < 118:
+        # Provider is redundant with the agent at medium widths.
+        candidates = [item for item in candidates if not item.startswith("provider: ")]
+        ws_fit, right_plain = fit_left(candidates)
+
+    if len(left_prefix) + len(ws_fit) + len(right_plain) + 2 > width:
+        # Last-resort compact left side. Never allow Rich to wrap the chrome.
+        candidates = [item for item in candidates if not item.startswith("agent: ")]
+        ws_fit, right_plain = fit_left(candidates)
+
+    left_plain = left_prefix + ws_fit
+    spaces_count = max(1, width - len(left_plain) - len(right_plain))
+
+    res = Text(no_wrap=True, overflow="crop")
     res.append("stackmind", style="bold #22c55e")
     res.append("  |  ", style="dim #475569")
     res.append("dev  ", style="dim white")
-    res.append(ws_display, style="dim #64748b")
+    res.append(ws_fit, style="dim #64748b")
     res.append(" " * spaces_count)
 
-    for item in right_items:
-        res.append(item, style=context_style if item == context_text else "dim white")
+    for item in candidates:
+        # The context item is the only right-side field that carries a
+        # non-default status style.
+        if context_meter and item in {context_item(True), context_item(False)}:
+            level = context_meter[1]
+            context_style = {
+                "green": "bold #22c55e",
+                "yellow": "bold yellow",
+                "red": "bold red",
+            }.get(level, "dim white")
+            res.append(item, style=context_style)
+        else:
+            res.append(item, style="dim white")
         res.append(" | ", style="dim #475569")
-    res.append(f"{glyph} {st_name}", style=glyph_style)
+    res.append(status_item, style=glyph_style)
 
     return res
 
@@ -811,13 +868,23 @@ def prompt_composer_input(
     history: list[str] | None = None,
     show_footer: bool = True,
     live_manager: Any | None = None,
+    session: Mapping[str, Any] | None = None,
+    terminal_width: int | None = None,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
     Supports native raw keyboard interception (msvcrt / termios), real Ctrl+K & Ctrl+L,
     multiline expansion, active typing state tracking, and preserves
     partially typed input buffer across background events (§28-§30).
+    Aligns composer width to conversation viewport when runtime panel is visible (WO-008).
     """
+    term_width = terminal_width if terminal_width is not None else width
+    layout = compute_layout(term_width)
+    if width != term_width:
+        comp_width = width
+    else:
+        comp_width = layout.conversation_width if layout.show_runtime else term_width
+
     if state is not None:
         if not initial_text and getattr(state, "composer_buffer", ""):
             initial_text = state.composer_buffer
@@ -844,15 +911,31 @@ def prompt_composer_input(
             click.echo(render_composer_top_border_str(
                 placeholder=placeholder,
                 shortcuts=shortcuts,
-                width=width,
+                width=comp_width,
                 is_active=True,
                 has_content=bool(initial_text),
             ))
+            status_bar_line = ""
+            if session is not None:
+                status = getattr(state, "connection_status", "online") if state is not None else "online"
+                context_meter = (
+                    (getattr(state, "context_meter_text", None), getattr(state, "context_warning_level", None))
+                    if state is not None and hasattr(state, "context_meter_text")
+                    else None
+                )
+                status_bar_line = render_top_header_bar_str(session, width=comp_width, status=status, context_meter=context_meter)
+
+            bottom_border = render_composer_bottom_border_str(width=comp_width, is_active=True)
+            if status_bar_line:
+                sys.stdout.write(f"\n{bottom_border}\n{status_bar_line}\x1b[2A\r")
+            else:
+                sys.stdout.write(f"\n{bottom_border}\x1b[1A\r")
+            sys.stdout.flush()
         try:
             val = raw_prompt_input(
                 placeholder=placeholder,
                 shortcuts=shortcuts,
-                width=width,
+                width=comp_width,
                 initial_text=initial_text,
                 history=history,
                 state=state,
@@ -861,7 +944,7 @@ def prompt_composer_input(
                 top_border_renderer=lambda has_c: render_composer_top_border_str(
                     placeholder=placeholder,
                     shortcuts=shortcuts,
-                    width=width,
+                    width=comp_width,
                     is_active=True,
                     has_content=has_c,
                 ),
@@ -879,9 +962,17 @@ def prompt_composer_input(
                 include_composer=False,
             )
         else:
-            click.echo(render_composer_bottom_border_str(width=width, is_active=True))
+            click.echo(render_composer_bottom_border_str(width=comp_width, is_active=False))
             if show_footer:
-                click.echo(render_bottom_footer_bar_str(width=width))
+                click.echo(render_bottom_footer_bar_str(width=comp_width))
+            if session is not None:
+                status = getattr(state, "connection_status", "online") if state is not None else "online"
+                context_meter = (
+                    (getattr(state, "context_meter_text", None), getattr(state, "context_warning_level", None))
+                    if state is not None and hasattr(state, "context_meter_text")
+                    else None
+                )
+                click.echo(render_top_header_bar_str(session, width=comp_width, status=status, context_meter=context_meter))
         return val
 
     # Non-TTY / test fallback: standard input() with multiline support
@@ -896,7 +987,7 @@ def prompt_composer_input(
         click.echo(render_composer_top_border_str(
             placeholder=placeholder,
             shortcuts=shortcuts,
-            width=width,
+            width=comp_width,
             is_active=True,
             has_content=bool(initial_text),
         ))
@@ -938,9 +1029,17 @@ def prompt_composer_input(
             include_composer=False,
         )
     else:
-        click.echo(render_composer_bottom_border_str(width=width, is_active=True))
+        click.echo(render_composer_bottom_border_str(width=comp_width, is_active=False))
         if show_footer:
-            click.echo(render_bottom_footer_bar_str(width=width))
+            click.echo(render_bottom_footer_bar_str(width=comp_width))
+        if session is not None:
+            status = getattr(state, "connection_status", "online") if state is not None else "online"
+            context_meter = (
+                (getattr(state, "context_meter_text", None), getattr(state, "context_warning_level", None))
+                if state is not None and hasattr(state, "context_meter_text")
+                else None
+            )
+            click.echo(render_top_header_bar_str(session, width=comp_width, status=status, context_meter=context_meter))
     return "\n".join(lines)
 
 
@@ -1035,14 +1134,50 @@ def _show_status(
 
 
 def _ensure_utf8() -> None:
-    """Ensure standard streams support UTF-8 encoding without crashing on Windows cp1252."""
+    """Enable UTF-8 and Windows VT processing before emitting TUI ANSI sequences.
+
+    Windows PowerShell / legacy console hosts can support Unicode box-drawing
+    characters while still treating ANSI control sequences as literal text.
+    The TUI relies on ANSI for the alternate screen, cursor positioning and
+    redraws, so enable ENABLE_VIRTUAL_TERMINAL_PROCESSING when available.
+    """
     import sys
+
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_std_handle = kernel32.GetStdHandle
+        get_console_mode = kernel32.GetConsoleMode
+        set_console_mode = kernel32.SetConsoleMode
+
+        # STD_OUTPUT_HANDLE / STD_ERROR_HANDLE
+        for handle_id in (-11, -12):
+            handle = get_std_handle(handle_id)
+            if handle in (0, -1):
+                continue
+
+            mode = ctypes.c_uint32()
+            if not get_console_mode(handle, ctypes.byref(mode)):
+                continue
+
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            set_console_mode(handle, mode.value | 0x0004)
+    except Exception:
+        # Some hosts (redirected pipes, ConEmu-like wrappers, CI) do not
+        # expose a Win32 console API. Their existing stream handling remains
+        # valid, so VT setup is deliberately best-effort.
+        pass
 
 
 def get_help_str() -> str:
@@ -1657,7 +1792,10 @@ def dispatch_delivery_command(
 
     prompt_text = normalized[8:].strip() if normalized.startswith(":prompt ") else normalized
     state.add_message("user", prompt_text)
-    click.echo(render_user_message_str(prompt_text))
+    if is_tty:
+        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_manager)
+    else:
+        click.echo(render_user_message_str(prompt_text))
     op_id = "turn"
     try:
         result = adapter.command(normalized, session_id=session["session_id"])
@@ -1783,6 +1921,14 @@ def dispatch_delivery_command(
                     target_op = ev_payload.get("operation_id") or ev.get("operation_id")
                     if not target_op or target_op == op_id:
                         completed = True
+                        if ev_name in {"operation.failed", "operation.cancelled"}:
+                            op_status = "FAILED" if ev_name == "operation.failed" else "CANCELLED"
+                            if op_rec is None:
+                                op_rec = {"status": op_status, "result": ev_payload}
+                            elif isinstance(op_rec, dict):
+                                op_rec["status"] = op_status
+                                if "result" not in op_rec:
+                                    op_rec["result"] = ev_payload
                         break
 
                 # Periodic operation check
@@ -1906,25 +2052,41 @@ def dispatch_delivery_command(
                     state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
                     click.echo(render_assistant_message_str(summary, actions=turn_acts, thinking=thinking))
                     assistant_rendered = True
-                elif op_status in {"FAILED", "CANCELLED"}:
+                elif op_status in {"FAILED", "CANCELLED"} or res.get("error"):
                     err_raw = (
                         res.get("error")
                         or res.get("message")
                         or res.get("reason")
                         or op_rec.get("error")
-                        or f"Operation {op_status.lower()}."
+                        or f"Operation {op_status.lower() if op_status else 'failed'}."
                     )
                     if isinstance(err_raw, dict):
                         err_msg = err_raw.get("message") or err_raw.get("error") or str(err_raw)
                     else:
                         err_msg = str(err_raw)
+                    err_title = "OLLAMA ERROR" if "ollama" in err_msg.lower() else (f"OPERATION {op_status}" if op_status else "OPERATION FAILED")
                     turn_acts = state.current_turn_actions
-                    state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
-                    click.echo(render_error_box_str(err_msg, title=f"OPERATION {op_status}"))
+                    state.add_message("assistant", f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}", actions=turn_acts)
+                    click.echo(render_error_box_str(err_msg, title=err_title))
                     assistant_rendered = True
 
         if not assistant_rendered:
-            if completed:
+            if op_rec and isinstance(op_rec, dict) and op_rec.get("status") in {"FAILED", "CANCELLED"}:
+                op_status = op_rec.get("status")
+                err_raw = (
+                    (op_rec.get("result") or {}).get("error")
+                    or (op_rec.get("result") or {}).get("message")
+                    or (op_rec.get("result") or {}).get("reason")
+                    or op_rec.get("error")
+                    or f"Operation {op_status.lower()}."
+                )
+                err_msg = err_raw.get("message") if isinstance(err_raw, dict) else str(err_raw)
+                err_title = "OLLAMA ERROR" if "ollama" in err_msg.lower() else f"OPERATION {op_status}"
+                turn_acts = state.current_turn_actions
+                state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
+                click.echo(render_error_box_str(err_msg, title=err_title))
+                assistant_rendered = True
+            elif completed:
                 completion_msg = f"Turn operation {op_id} completed."
                 turn_acts = state.current_turn_actions
                 state.add_message("assistant", completion_msg, actions=turn_acts)
@@ -2031,12 +2193,17 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
 
         install_resize_handler()
 
-        live_ws = create_live_workspace(session=session, state=state)
-        live_ws.start(include_composer=False)
+        # The TUI owns the terminal while it is in the alternate screen.
+        # Do not start Rich.Live here: Live and the raw msvcrt/termios composer
+        # both move the cursor, so running them concurrently causes cursor
+        # races, duplicate frames and broken composer placement. The workspace
+        # is already a fixed-height frame and is redrawn atomically instead.
+        live_ws = None
 
         if is_tty:
+            _ensure_utf8()
             enter_alternate_screen()
-            redraw_full_screen(session, state, clear=True, include_composer=False, live_manager=live_ws)
+            redraw_full_screen(session, state, clear=True, include_composer=False)
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
             click.echo(render_top_header_bar_str(
@@ -2078,7 +2245,9 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     if live_ws is not None and getattr(live_ws, "is_active", False):
                         live_ws.handle_resize(new_cols, new_lines)
                 term_cols = current_cols
-                conv_width = compute_layout(term_cols).conversation_width if term_cols >= NARROW_THRESHOLD else term_cols
+                layout_info = compute_layout(term_cols)
+                conv_width = layout_info.conversation_width if layout_info.show_runtime else term_cols
+                comp_width = conv_width if layout_info.show_runtime else term_cols
 
                 def _handle_ctrl_k() -> None:
                     out = get_help_str()
@@ -2123,8 +2292,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             )
 
                 text = prompt_composer_input(
-                    width=term_cols,
+                    width=comp_width,
+                    terminal_width=term_cols,
                     state=state,
+                    session=session,
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
                     show_footer=False if is_tty else not getattr(state, "has_conversation", False),

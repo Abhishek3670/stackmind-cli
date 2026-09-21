@@ -297,16 +297,22 @@ def render_full_screen_workspace(
 
     layout = compute_layout(width)
     status = getattr(state, "connection_status", "online")
-
-    # 1. Top Header Bar (1 line)
-    header_str = render_top_header_bar_str(
-        session,
-        width=width,
-        status=status,
-        context_meter=(state.context_meter_text, state.context_warning_level),
+    context_meter = (
+        (getattr(state, "context_meter_text", None), getattr(state, "context_warning_level", None))
+        if state is not None and hasattr(state, "context_meter_text")
+        else None
     )
 
-    # 2. Viewport height (leave 1 line for header, 3 lines for composer box)
+    # 1. Bottom Status Bar (1 line, placed below composer, aligned to conversation width / WO-009)
+    status_width = layout.conversation_width if layout.show_runtime else width
+    status_bar_str = render_top_header_bar_str(
+        session or {},
+        width=status_width,
+        status=status,
+        context_meter=context_meter,
+    )
+
+    # 2. Viewport height (reserved 1 line for bottom status bar, plus 3 lines for composer box)
     viewport_height = max(4, height - 4)
 
     # 3. Conversation content
@@ -321,7 +327,7 @@ def render_full_screen_workspace(
             width=layout.conversation_width,
         )
 
-    # 4. Two-column workspace with sliced conversation and persistent runtime panel
+    # 4. Two-column workspace with sliced conversation and persistent runtime panel (starts at row 0)
     workspace_str = render_workspace_layout_str(
         conv_text,
         width=width,
@@ -332,18 +338,19 @@ def render_full_screen_workspace(
     )
 
     if not include_composer:
-        return f"{header_str}\n{workspace_str}"
+        return workspace_str
 
-    # 5. Pinned bottom composer box (3 lines)
+    # 5. Pinned bottom composer box (3 lines) placed above bottom status bar
+    comp_width = layout.conversation_width if layout.show_runtime else width
     composer_str = render_composer_box_str(
         shortcuts=shortcuts,
-        width=width,
+        width=comp_width,
         content=composer_content,
         is_active=composer_is_active,
         has_content=bool(composer_content),
     )
 
-    return f"{header_str}\n{workspace_str}\n{composer_str}"
+    return f"{workspace_str}\n{composer_str}\n{status_bar_str}"
 
 
 # ── Live Workspace Manager (Rich.Live Integration / WO-003) ───────────────────

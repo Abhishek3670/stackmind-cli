@@ -292,6 +292,7 @@ class SessionManager:
         })
 
     def _default_runner(self, workspace: str, agent: str) -> Any:
+        import copy
         from validators.harness.backend import get_default_registry
         from validators.harness.runner import AgentRunner
 
@@ -302,9 +303,11 @@ class SessionManager:
             model_name = role_cfg.get("model")
             registry = get_default_registry()
             backend = registry.get(backend_id) if backend_id in registry else None
-            if backend is not None and model_name:
-                backend.model = model_name
-                backend.model_name = model_name
+            if backend is not None:
+                backend = copy.copy(backend)
+                if model_name:
+                    backend.model = model_name
+                    backend.model_name = model_name
             return AgentRunner(Path(workspace), agent, backend=backend)
         return AgentRunner(Path(workspace), agent)
 
@@ -1089,6 +1092,7 @@ class SessionManager:
             ws_path = Path(workspace)
             _scaffold_protocol_citizenship(ws_path, agent)
             runner = self._runner_factory(workspace, agent)
+            runner.on_token = lambda text: self.events.publish("token.delta", session_id, delta=text, operation_id=operation_id)
             with self._lock:
                 try:
                     _, op_rec = self._operation(operation_id)

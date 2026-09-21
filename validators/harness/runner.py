@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import yaml
 from jsonschema import Draft7Validator
@@ -55,6 +55,8 @@ class LLMRequest:
     task: HarnessTask
     context: ContextBundle
     retrieval: RetrievalBatch
+    on_token: Callable[[str], None] | None = None
+    cancellation: Event | None = None
 
     @property
     def evidence_text(self) -> str:
@@ -155,6 +157,8 @@ class EchoLLMProvider:
 
     provider_name = 'echo'
     model_name = 'stackmind-echo-v1'
+    on_token = None
+    cancel_event = None
 
     def __init__(self, *, default_release_target: str | None = None) -> None:
         self.default_release_target = default_release_target
@@ -210,6 +214,7 @@ class AgentRunner:
         backoff_seconds: float = 0.1,
         now_fn: Any | None = None,
         sleep_fn: Any | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> None:
         self.project_path = project_path.resolve()
         self.sync_path = self.project_path / '.sync'
@@ -236,6 +241,7 @@ class AgentRunner:
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc).astimezone())
         self.sleep_fn = sleep_fn or time.sleep
         self.reader = ResourceReadTracker(max_reads=3)
+        self.on_token = on_token
         self._tree_cache: dict[str, Any] | None = None
 
     @staticmethod
@@ -349,12 +355,18 @@ class AgentRunner:
                 task=task,
                 context=context,
                 retrieval=retrieval,
+                on_token=self.on_token,
+                cancellation=cancellation,
             )
 
             llm_started = time.monotonic()
             try:
                 if self.backend is not None and hasattr(self.backend, 'start_operation'):
                     self.backend.start_operation(task=task, context=context, operation_id=operation_id)
+                if self.backend is not None and hasattr(self.backend, 'on_token'):
+                    self.backend.on_token = self.on_token
+                if self.backend is not None and hasattr(self.backend, 'cancel_event'):
+                    self.backend.cancel_event = cancellation
                 completion = self.llm_provider.complete(request)
                 if self.backend is not None and hasattr(self.backend, 'report_result') and operation_id:
                     self.backend.report_result(operation_id)

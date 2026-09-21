@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -17,7 +18,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from datetime import datetime, timezone
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 from uuid import uuid4
 
 
@@ -38,8 +39,17 @@ _SENSITIVE_KEYS = {
 }
 
 
+def _sanitize_string(s: str) -> str:
+    """Mask credentials and secrets from text messages and URLs."""
+    s = re.sub(r'(?i)(token|password|secret|api[_-]?key|auth\w*)[=:].*?(?=[\s;,&]|$)', '[REDACTED]', s)
+    s = re.sub(r'://[^/@\s:]+(:[^/@\s]*)?@', '://[REDACTED]@', s)
+    return s
+
+
 def sanitize_secrets(value: Any) -> Any:
     """Recursively strip or mask credentials from any data structure."""
+    if isinstance(value, str):
+        return _sanitize_string(value)
     if isinstance(value, dict):
         sanitized = {}
         for k, v in value.items():
@@ -366,6 +376,8 @@ class AgentExecutionBackend(BaseExecutionBackend):
         self.should_fail = should_fail
         self.failure_reason = failure_reason
         self.simulate_timeout = simulate_timeout
+        self.on_token: Callable[[str], None] | None = None
+        self.cancel_event: Any = None
 
     def complete(self, request: Any) -> Any:
         """Satisfies LLMProvider protocol for AgentRunner integration."""
@@ -422,6 +434,8 @@ class ModelExecutionBackend(BaseExecutionBackend):
 
     provider_name: str
     model_name: str
+    on_token: Callable[[str], None] | None = None
+    cancel_event: Any = None
 
     def __init__(
         self,
@@ -439,6 +453,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
         simulate_timeout: bool = False,
         mock_mode: bool = False,
         default_release_target: str | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> None:
         caps = capabilities or ["model", "completion", "streaming", "cancellation", "approval"]
         status = "available" if (available and endpoint) else ("not configured" if not endpoint else "unavailable")
@@ -461,6 +476,8 @@ class ModelExecutionBackend(BaseExecutionBackend):
         self.simulate_timeout = simulate_timeout
         self.mock_mode = mock_mode
         self.default_release_target = default_release_target
+        self.on_token = on_token
+        self.cancel_event = None
 
     def complete(self, request: Any) -> Any:
         """Satisfies LLMProvider protocol for AgentRunner integration."""
@@ -517,34 +534,96 @@ class ModelExecutionBackend(BaseExecutionBackend):
                 data = json.dumps({
                     "model": self.model or "llama3",
                     "prompt": prompt_text,
-                    "stream": False,
+                    "stream": True,
                 }).encode("utf-8")
                 req = urllib.request.Request(req_url, data=data, headers={"Content-Type": "application/json", "User-Agent": "StackMind-CLI/3.3"})
                 with urllib.request.urlopen(req, timeout=max(self.timeout, 300.0)) as resp:
-                    resp_data = json.loads(resp.read().decode("utf-8"))
-                    actual_response = resp_data.get("response", "")
-                    if actual_response:
-                        payload["summary"] = actual_response.strip()
-                        payload["report_markdown"] = (
-                            f"# Response from {self.model}\n\n"
-                            f"{actual_response.strip()}\n\n"
-                            f"Knowledge revision: {getattr(request.context, 'revision', 'unknown')}\n"
+                    accumulator: list[str] = []
+                    token_cb = getattr(request, "on_token", None) or getattr(self, "on_token", None)
+                    cancel = getattr(request, "cancellation", None) or getattr(self, "cancel_event", None)
+                    parsed_any = False
+                    had_lines = False
+                    for raw_line in resp:
+                        if cancel is not None and cancel.is_set():
+                            break
+                        line_str = (
+                            raw_line.decode("utf-8").strip()
+                            if isinstance(raw_line, bytes)
+                            else str(raw_line).strip()
                         )
+                        if not line_str:
+                            continue
+                        had_lines = True
+                        try:
+                            chunk = json.loads(line_str)
+                        except json.JSONDecodeError:
+                            continue
+                        parsed_any = True
+                        if isinstance(chunk, dict) and chunk.get("error"):
+                            raise BackendExecutionError(f"Ollama error: {chunk['error']}")
+                        fragment = chunk.get("response", "")
+                        if fragment:
+                            accumulator.append(fragment)
+                            if token_cb is not None:
+                                try:
+                                    token_cb(fragment)
+                                except Exception:
+                                    pass
+                        if chunk.get("done"):
+                            stats = {}
+                            if "eval_count" in chunk:
+                                stats["eval_count"] = chunk["eval_count"]
+                            if "eval_duration" in chunk:
+                                stats["eval_duration"] = chunk["eval_duration"]
+                            if stats:
+                                payload["_stream_stats"] = stats
+                            break
+                    if had_lines and not parsed_any:
+                        raise BackendExecutionError(
+                            f"Model backend '{self.backend_id}' returned an invalid response"
+                        )
+                    actual_response = "".join(accumulator)
+                    if not actual_response.strip():
+                        raise BackendExecutionError("Ollama completed without generating a response")
+                    payload["summary"] = actual_response.strip()
+                    payload["report_markdown"] = (
+                        f"# Response from {self.model}\n\n"
+                        f"{actual_response.strip()}\n\n"
+                        f"Knowledge revision: {getattr(request.context, 'revision', 'unknown')}\n"
+                    )
             except (TimeoutError, socket.timeout) as exc:
                 raise BackendTimeoutError(
                     f"Model backend '{self.backend_id}' timed out"
                 ) from exc
             except urllib.error.HTTPError as exc:
+                err_body = ""
+                try:
+                    err_body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                err_msg = f"HTTP {exc.code}"
+                try:
+                    err_json = json.loads(err_body)
+                    if isinstance(err_json, dict) and err_json.get("error"):
+                        err_msg = f"{err_msg}: {err_json['error']}"
+                    elif err_body.strip():
+                        err_msg = f"{err_msg}: {err_body.strip()}"
+                except Exception:
+                    if err_body.strip():
+                        err_msg = f"{err_msg}: {err_body.strip()}"
+                clean_err_msg = _sanitize_string(err_msg)
                 raise BackendExecutionError(
-                    f"Model backend '{self.backend_id}' returned HTTP {exc.code}"
+                    f"Ollama {clean_err_msg}"
                 ) from exc
             except urllib.error.URLError as exc:
                 if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                     raise BackendTimeoutError(
                         f"Model backend '{self.backend_id}' timed out"
                     ) from exc
+                endpoint_str = self.endpoint or "local endpoint"
+                clean_reason = _sanitize_string(str(exc.reason))
                 raise BackendUnavailableError(
-                    f"Model backend '{self.backend_id}' is unavailable"
+                    f"Could not connect to Ollama at {endpoint_str}: {clean_reason}"
                 ) from exc
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 raise BackendExecutionError(
