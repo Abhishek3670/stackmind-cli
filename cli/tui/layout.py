@@ -251,9 +251,14 @@ def render_workspace_layout_str(
     console = Console(
         file=buf, record=True, width=width, force_terminal=False, color_system=None
     )
+    conv_renderable = (
+        Text.from_ansi(conversation_text)
+        if "\x1b[" in conversation_text
+        else Text(conversation_text)
+    )
     console.print(
         render_workspace_layout(
-            Text(conversation_text),
+            conv_renderable,
             width=width,
             agents=agents,
             work_orders=work_orders,

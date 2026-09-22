@@ -1817,6 +1817,8 @@ def dispatch_delivery_command(
         streamed_chunks: list[str] = []
         last_progress_time = start_time
         last_poll_time = start_time
+        last_redraw_time: float = -1.0
+        model_name: str | None = None
         latest_act_desc = "Turn submitted"
         op_rec: dict[str, Any] | None = None
         op_status: str | None = None
@@ -1863,8 +1865,23 @@ def dispatch_delivery_command(
                 if isinstance(ev, dict) and (ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"):
                     if not streaming_active and (now - last_progress_time >= 2.0):
                         elapsed = now - start_time
-                        prog_text = Text(f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})", style="dim cyan")
-                        click.echo(prog_text)
+                        prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
+                        # AC-7: Route tick through redraw_full_screen so heartbeat ticks do not corrupt layout
+                        layout = compute_layout(shutil.get_terminal_size().columns)
+                        transcript = (
+                            render_chat_transcript_str(state.messages, width=layout.conversation_width)
+                            if getattr(state, "messages", None)
+                            else ""
+                        )
+                        tick_content = f"{transcript}\n\n{prog_text}" if transcript else prog_text
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=False,
+                            conversation_content=tick_content,
+                            live_manager=live_manager,
+                        )
                         last_progress_time = now
 
                     if now - last_poll_time >= 1.5:
@@ -1892,19 +1909,45 @@ def dispatch_delivery_command(
                 if delta:
                     if not streaming_active:
                         streaming_active = True
-                        model_name = op_rec.get("model") if op_rec else None
-                        click.echo(render_assistant_stream_header(model=model_name))
-                    click.echo(delta, nl=False)
-                    sys.stdout.flush()
+                        if model_name is None:
+                            if op_rec and isinstance(op_rec, dict):
+                                model_name = op_rec.get("model")
+                            elif session and isinstance(session, dict):
+                                model_name = session.get("model")
+
                     streamed_chunks.append(delta)
+
+                    # AC-3: Rate-limit redraw_full_screen calls to ~8-10 Hz (100ms gate)
+                    now_mono = time.monotonic()
+                    if now_mono - last_redraw_time >= 0.1:
+                        layout = compute_layout(shutil.get_terminal_size().columns)
+                        transcript = (
+                            render_chat_transcript_str(state.messages, width=layout.conversation_width)
+                            if getattr(state, "messages", None)
+                            else ""
+                        )
+                        hdr = render_assistant_stream_header(model=model_name, width=layout.conversation_width)
+                        curr_text = "".join(streamed_chunks)
+                        in_progress = f"{hdr}\n{curr_text}" if curr_text else hdr
+                        full_content = f"{transcript}\n\n{in_progress}" if transcript else in_progress
+                        # WO-011 (AC-4, AC-6): Render tokens inside the width-constrained conversation frame.
+                        # Composer is intentionally hidden (include_composer=False) while streaming because
+                        # user input is disabled during generation, conserving vertical space.
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=False,
+                            conversation_content=full_content,
+                            live_manager=live_manager,
+                        )
+                        last_redraw_time = now_mono
                 else:
                     # Operational event line
                     ev_str = "" if ev_name in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
                     if ev_str:
-                        if streaming_active:
-                            click.echo("")  # break line if streaming was active
-                            streaming_active = False
-                        click.echo(ev_str)
+                        if not streaming_active:
+                            click.echo(ev_str)
                         latest_act_desc = format_action_description(ev_name) if "format_action_description" in globals() else ev_name
 
                     # Direct assistant response from event
@@ -1979,11 +2022,20 @@ def dispatch_delivery_command(
 
         # Finalize streaming if active
         if streamed_chunks:
-            click.echo("")  # newline after streaming completes
             full_resp = "".join(streamed_chunks).strip()
             turn_acts = state.current_turn_actions
             state.add_message("assistant", full_resp, actions=turn_acts)
             assistant_rendered = True
+            # WO-011 (AC-3, AC-8): Perform one final redraw_full_screen when the stream completes
+            # so that the complete response is fully rendered in the viewport before composer returns.
+            # Composer is intentionally hidden (include_composer=False) until next input prompt (AC-6).
+            redraw_full_screen(
+                session,
+                state,
+                clear=False,
+                include_composer=False,
+                live_manager=live_manager,
+            )
 
         # If assistant was not rendered from streaming or events, fetch final operation status
         if not assistant_rendered:

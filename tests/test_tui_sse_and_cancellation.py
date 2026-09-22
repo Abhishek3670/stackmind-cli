@@ -156,3 +156,147 @@ def test_timeout_command_and_options():
     # Test :timeout with invalid argument
     dispatch_delivery_command(mock_adapter, mock_client, session, ":timeout -5", state)
     assert any("Timeout must be a positive number" in m.content for m in state.messages)
+
+
+def test_panel_aware_streaming_rate_limiting():
+    """Verify rapid delta events are rate-limited to ~10 Hz and flushed on completion (WO-011)."""
+    session = {"session_id": "sess-stream-1", "model": "claude-3-5-sonnet"}
+    state = AutonomousDeliveryState(session_id="sess-stream-1", client_timeout=5.0)
+
+    # 50 rapid deltas that arrive in a single batch
+    deltas = [
+        {"name": "stream.delta", "payload": {"delta": f"token_{i} "}}
+        for i in range(50)
+    ]
+    completion = {"name": "turn.completed", "payload": {"operation_id": "op-stream"}}
+    all_events = deltas + [completion]
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-stream"}
+    mock_adapter.stream.return_value = iter(all_events)
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED"}
+
+    mock_live = MagicMock()
+
+    with patch("cli.tui.app.redraw_full_screen") as mock_redraw, \
+         patch("click.echo") as mock_echo:
+        dispatch_delivery_command(
+            mock_adapter,
+            mock_client,
+            session,
+            "write a function",
+            state,
+            live_manager=mock_live,
+        )
+
+        # Rate-limiting check: 50 rapid events in <100ms should only trigger
+        # at most 2 redraws: initial delta gate + final post-stream flush
+        assert mock_redraw.call_count <= 2
+        assert mock_redraw.call_count >= 1
+
+        # Verify arguments on the final redraw call:
+        final_call = mock_redraw.call_args_list[-1]
+        assert final_call.kwargs.get("clear") is False
+        assert final_call.kwargs.get("include_composer") is False
+        assert final_call.kwargs.get("live_manager") == mock_live
+
+        # Verify assistant message has accumulated all 50 tokens
+        assistant_msgs = [m for m in state.messages if m.role == "assistant"]
+        assert len(assistant_msgs) == 1
+        for i in range(50):
+            assert f"token_{i}" in assistant_msgs[0].content
+
+        # Verify click.echo was NOT called for individual deltas
+        echoed_text = " ".join(str(call.args[0]) for call in mock_echo.call_args_list if call.args)
+        assert "token_0" not in echoed_text
+        assert "token_49" not in echoed_text
+
+
+def test_panel_aware_streaming_periodic_redraw_at_100ms_intervals():
+    """Verify redraw_full_screen triggers when >=100ms elapses between deltas (WO-011)."""
+    session = {"session_id": "sess-stream-2"}
+    state = AutonomousDeliveryState(session_id="sess-stream-2", client_timeout=5.0)
+
+    # Simulated monotonic timestamps:
+    # 0: initial delta (t=0.0) -> triggers redraw
+    # 1: rapid delta (t=0.03) -> throttled (<0.1s)
+    # 2: rapid delta (t=0.07) -> throttled (<0.1s)
+    # 3: gated delta (t=0.12) -> triggers redraw (>=0.1s)
+    # 4: rapid delta (t=0.18) -> throttled (<0.1s)
+    # 5: gated delta (t=0.25) -> triggers redraw (>=0.1s)
+    timestamps = [0.0, 0.03, 0.07, 0.12, 0.18, 0.25, 0.26]
+    time_iter = iter(timestamps)
+
+    deltas = [
+        {"name": "stream.delta", "payload": {"delta": f"chunk{i} "}}
+        for i in range(len(timestamps) - 1)
+    ]
+    completion = {"name": "turn.completed", "payload": {"operation_id": "op-stream-2"}}
+    all_events = deltas + [completion]
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-stream-2"}
+    mock_adapter.stream.return_value = iter(all_events)
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED"}
+
+    with patch("time.monotonic", side_effect=lambda: next(time_iter, 1.0)), \
+         patch("cli.tui.app.redraw_full_screen") as mock_redraw:
+        dispatch_delivery_command(
+            mock_adapter,
+            mock_client,
+            session,
+            "test interval streaming",
+            state,
+        )
+
+        # Expected redraws:
+        # 1. t=0.0 (initial delta)
+        # 2. t=0.12 (delta 3)
+        # 3. t=0.25 (delta 5)
+        # 4. final completion redraw
+        assert mock_redraw.call_count == 4
+
+        # Verify all streaming redraws have include_composer=False and clear=False
+        for call in mock_redraw.call_args_list:
+            assert call.kwargs.get("clear") is False
+            assert call.kwargs.get("include_composer") is False
+
+
+def test_heartbeat_tick_suppression_during_active_streaming():
+    """Verify heartbeat ticks do not corrupt active streaming output (WO-011 AC-7)."""
+    session = {"session_id": "sess-stream-3"}
+    state = AutonomousDeliveryState(session_id="sess-stream-3", client_timeout=5.0)
+
+    events = [
+        {"name": "stream.delta", "payload": {"delta": "Streaming output..."}},
+        {"name": "system.heartbeat", "_heartbeat": True, "payload": {}},
+        {"name": "system.heartbeat", "_heartbeat": True, "payload": {}},
+        {"name": "stream.delta", "payload": {"delta": " more tokens"}},
+        {"name": "turn.completed", "payload": {"operation_id": "op-stream-3"}},
+    ]
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-stream-3"}
+    mock_adapter.stream.return_value = iter(events)
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED"}
+
+    with patch("click.echo") as mock_echo:
+        dispatch_delivery_command(
+            mock_adapter,
+            mock_client,
+            session,
+            "stream with heartbeats",
+            state,
+        )
+
+        # Heartbeat ticks ('Working...') should NOT have been echoed during active streaming
+        echoed = [str(call.args[0]) for call in mock_echo.call_args_list if call.args]
+        assert not any("Working..." in msg for msg in echoed)
+        assert not any("Streaming output" in msg for msg in echoed)
+

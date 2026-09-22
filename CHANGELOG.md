@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Aligned composer text area width precisely with the conversation viewport, terminating neatly at the vertical divider of the runtime panel.
 - **Status Bar Layout Symmetry (WO-009)**:
   - Aligned bottom status bar width with the conversation viewport and composer box, establishing seamless visual symmetry across left and right panels.
+- **Panel-Aware Rate-Limited Streaming (WO-011)**:
+  - Replaced raw stdout token streaming with rate-limited (100ms / 8–10 Hz) full-frame redraws in the conversation viewport.
+  - Constrained in-progress streaming output to conversation column width, avoiding panel spillover.
+  - Eliminated status tick and streamed text racing corruption by suppressing ticks during active streaming and routing them through redraw.
+  - Intentionally hid composer during active generation to conserve vertical space.
 
 ## [Unreleased]
 - Initial repository scaffolding.
