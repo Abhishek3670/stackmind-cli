@@ -28,6 +28,8 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from cli.tui.chat import _make_capture_console, should_render_ansi
+
 # ── Layout Constants ─────────────────────────────────────────────────────────
 
 # Threshold below which the runtime panel is hidden (§12).
@@ -235,8 +237,10 @@ def render_workspace_layout_str(
     scroll: RuntimePanelScroll | None = None,
     conversation_scroll: ConversationScroll | None = None,
     height: int | None = None,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Render the full workspace layout as plain text."""
+    """Render the full workspace layout as plain or ANSI-styled text."""
     if conversation_content is not None:
         conversation_text = conversation_content
     if height is not None:
@@ -247,9 +251,10 @@ def render_workspace_layout_str(
             pad=True,
         )
 
-    buf = io.StringIO()
-    console = Console(
-        file=buf, record=True, width=width, force_terminal=False, color_system=None
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
     )
     conv_renderable = (
         Text.from_ansi(conversation_text)
@@ -269,7 +274,7 @@ def render_workspace_layout_str(
             height=height,
         )
     )
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def render_full_screen_workspace(
@@ -283,6 +288,8 @@ def render_full_screen_workspace(
     composer_is_active: bool = False,
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     include_composer: bool = True,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
     """Render a complete, anchored full-screen terminal frame.
 
@@ -315,6 +322,8 @@ def render_full_screen_workspace(
         width=status_width,
         status=status,
         context_meter=context_meter,
+        force_color=force_color,
+        no_color=no_color,
     )
 
     # 2. Viewport height (reserved 1 line for bottom status bar, plus 3 lines for composer box)
@@ -324,7 +333,12 @@ def render_full_screen_workspace(
     if conversation_content is not None:
         conv_text = conversation_content
     elif hasattr(state, "messages") and state.messages:
-        conv_text = render_chat_transcript_str(state.messages, width=layout.conversation_width)
+        conv_text = render_chat_transcript_str(
+            state.messages,
+            width=layout.conversation_width,
+            force_color=force_color,
+            no_color=no_color,
+        )
     else:
         conv_text = render_landing_block_str(
             session=session,
@@ -340,6 +354,8 @@ def render_full_screen_workspace(
         scroll=getattr(state, "scroll", None),
         conversation_scroll=getattr(state, "conversation_scroll", None),
         height=viewport_height,
+        force_color=force_color,
+        no_color=no_color,
     )
 
     if not include_composer:
@@ -353,6 +369,8 @@ def render_full_screen_workspace(
         content=composer_content,
         is_active=composer_is_active,
         has_content=bool(composer_content),
+        force_color=force_color,
+        no_color=no_color,
     )
 
     return f"{workspace_str}\n{composer_str}\n{status_bar_str}"
@@ -378,6 +396,8 @@ class LiveWorkspaceManager:
         height: int | None = None,
         auto_refresh: bool = False,
         refresh_per_second: float = 8.0,
+        force_color: bool | None = None,
+        no_color: bool | None = None,
     ) -> None:
         self.session = session or {}
         self.state = state
@@ -387,6 +407,8 @@ class LiveWorkspaceManager:
         self.height = height if height is not None else term_size.lines
         self.auto_refresh = auto_refresh
         self.refresh_per_second = refresh_per_second
+        self.force_color = force_color
+        self.no_color = no_color
 
         self.is_terminal = self._check_is_terminal()
         self._live: Live | None = None
@@ -415,8 +437,12 @@ class LiveWorkspaceManager:
         composer_is_active: bool = False,
         shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
         include_composer: bool = True,
+        force_color: bool | None = None,
+        no_color: bool | None = None,
     ) -> RenderableType:
         """Compose the full screen workspace frame as a RenderableType."""
+        fc = self.force_color if force_color is None else force_color
+        nc = self.no_color if no_color is None else no_color
         frame_str = render_full_screen_workspace(
             session=self.session,
             state=self.state,
@@ -427,6 +453,8 @@ class LiveWorkspaceManager:
             composer_is_active=composer_is_active,
             shortcuts=shortcuts,
             include_composer=include_composer,
+            force_color=fc,
+            no_color=nc,
         )
         return Text.from_ansi(frame_str)
 
@@ -488,6 +516,8 @@ class LiveWorkspaceManager:
         shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
         include_composer: bool = False,
         refresh: bool = True,
+        force_color: bool | None = None,
+        no_color: bool | None = None,
     ) -> None:
         """Update the localized workspace renderable without screen clearing."""
         if self._live is not None and self._active:
@@ -497,6 +527,8 @@ class LiveWorkspaceManager:
                 composer_is_active=composer_is_active,
                 shortcuts=shortcuts,
                 include_composer=include_composer,
+                force_color=force_color,
+                no_color=no_color,
             )
             self._live.update(renderable, refresh=refresh)
 
@@ -522,6 +554,8 @@ def create_live_workspace(
     height: int | None = None,
     auto_refresh: bool = False,
     refresh_per_second: float = 8.0,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> LiveWorkspaceManager:
     """Convenience factory for LiveWorkspaceManager."""
     return LiveWorkspaceManager(
@@ -532,6 +566,8 @@ def create_live_workspace(
         height=height,
         auto_refresh=auto_refresh,
         refresh_per_second=refresh_per_second,
+        force_color=force_color,
+        no_color=no_color,
     )
 
 

@@ -31,6 +31,7 @@ from rich.table import Table
 from rich.text import Text
 
 from cli.tui.chat import (
+    _make_capture_console,
     render_actions_group,
     render_actions_group_str,
     render_assistant_message,
@@ -40,6 +41,7 @@ from cli.tui.chat import (
     render_chat_transcript_str,
     render_user_message,
     render_user_message_str,
+    should_render_ansi,
 )
 from cli.tui.diff import (
     render_file_diff,
@@ -515,12 +517,18 @@ def render_top_header_bar_str(
     width: int = 80,
     status: str | None = "online",
     context_meter: tuple[str, str] | None = None,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Render top header bar as plain string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    """Render top header bar as plain or ANSI-styled string using in-memory capture."""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(render_top_header_bar(session, width=width, status=status, context_meter=context_meter))
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def render_composer_box(
@@ -596,10 +604,16 @@ def render_composer_box_str(
     content: str | list[str] | None = None,
     is_active: bool = False,
     has_content: bool = False,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Render input composer box as plain string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    """Render input composer box as plain or ANSI-styled string using in-memory capture."""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(render_composer_box(
         placeholder=placeholder,
         shortcuts=shortcuts,
@@ -608,7 +622,7 @@ def render_composer_box_str(
         is_active=is_active,
         has_content=has_content,
     ))
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def restore_composer_focus(state: Any | None = None) -> bool:
@@ -723,8 +737,10 @@ def redraw_full_screen(
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     include_composer: bool = True,
     live_manager: Any | None = None,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Redraw the full-screen TUI workspace (WO-053, WO-003).
+    """Redraw the full-screen TUI workspace (WO-053, WO-003, WO-012).
 
     Renders top header, two-column workspace (with conversation viewport and
     anchored runtime panel), and pinned bottom composer box.
@@ -744,6 +760,8 @@ def redraw_full_screen(
         composer_is_active=composer_is_active,
         shortcuts=shortcuts,
         include_composer=include_composer,
+        force_color=force_color,
+        no_color=no_color,
     )
 
     if live_manager is not None and getattr(live_manager, "is_active", False):
@@ -754,6 +772,8 @@ def redraw_full_screen(
                 composer_is_active=composer_is_active,
                 shortcuts=shortcuts,
                 include_composer=include_composer,
+                force_color=force_color,
+                no_color=no_color,
             )
         except Exception:
             pass

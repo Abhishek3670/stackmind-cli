@@ -615,3 +615,104 @@ def test_status_bar_and_composer_share_identical_right_edge():
     assert len(composer_bottom) == len(status_bar)
 
 
+# ─── 11. WO-012: ANSI ESCAPE STYLING PRESERVATION IN WORKSPACE LAYOUT ─────────
+
+
+def test_render_workspace_layout_str_preserves_ansi_when_force_color():
+    """Verify render_workspace_layout_str preserves ANSI escape sequences when force_color=True (WO-012 / AC-1, AC-5)."""
+    styled_conv = "\x1b[38;2;56;189;248m│ \x1b[0m\x1b[38;2;255;255;255;48;2;49;49;49mUser styled query\x1b[0m"
+    rendered = render_workspace_layout_str(styled_conv, width=120, force_color=True)
+    assert "\x1b[" in rendered
+    assert "User styled query" in rendered
+    assert "StackMind Runtime" in rendered
+
+
+def test_render_workspace_layout_str_strips_ansi_when_no_color():
+    """Verify render_workspace_layout_str strips ANSI escape sequences when no_color=True (WO-012 / AC-5)."""
+    styled_conv = "\x1b[38;2;56;189;248m│ \x1b[0m\x1b[38;2;255;255;255;48;2;49;49;49mUser styled query\x1b[0m"
+    rendered = render_workspace_layout_str(styled_conv, width=120, no_color=True)
+    assert "\x1b[" not in rendered
+    assert "User styled query" in rendered
+    assert "StackMind Runtime" in rendered
+
+
+def test_render_full_screen_workspace_preserves_ansi_styling_and_badges():
+    """Verify render_full_screen_workspace preserves message styling, model badges, and ANSI codes (WO-012 / AC-2, AC-4)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Analyze database migrations")
+    asst_msg = state.add_message("assistant", "Database migrations look clean.")
+    asst_msg.model = "claude-3-5-sonnet"
+
+    frame = render_full_screen_workspace(
+        session={"session_id": "sess-001", "agent": "claude"},
+        state=state,
+        width=120,
+        height=26,
+        force_color=True,
+    )
+    assert "\x1b[" in frame
+    assert "Analyze database migrations" in frame
+    assert "Database migrations look clean." in frame
+    assert "claude-3-5-sonnet" in frame
+    assert "StackMind Runtime" in frame
+
+
+def test_render_full_screen_workspace_strips_ansi_when_no_color():
+    """Verify render_full_screen_workspace outputs clean text without ANSI when no_color=True (WO-012 / AC-2)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Analyze database migrations")
+
+    frame = render_full_screen_workspace(
+        session={"session_id": "sess-001", "agent": "claude"},
+        state=state,
+        width=120,
+        height=26,
+        no_color=True,
+    )
+    assert "\x1b[" not in frame
+    assert "Analyze database migrations" in frame
+
+
+def test_redraw_full_screen_passes_force_color_and_no_color():
+    """Verify redraw_full_screen forwards force_color and no_color parameters (WO-012 / AC-2)."""
+    buf = io.StringIO()
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Execute command")
+
+    frame_ansi = redraw_full_screen(
+        session={"session_id": "sess-001"},
+        state=state,
+        width=120,
+        height=24,
+        force_color=True,
+        stream=buf,
+    )
+    assert "\x1b[" in frame_ansi
+    assert "Execute command" in frame_ansi
+
+    buf_plain = io.StringIO()
+    frame_plain = redraw_full_screen(
+        session={"session_id": "sess-001"},
+        state=state,
+        width=120,
+        height=24,
+        no_color=True,
+        stream=buf_plain,
+    )
+    assert "\x1b[" not in frame_plain
+    assert "Execute command" in frame_plain
+
+
+def test_slice_conversation_viewport_with_multiline_ansi():
+    """Verify slice_conversation_viewport preserves ANSI line integrity without breaking escape sequences (WO-012 / AC-3)."""
+    from cli.tui.chat import render_user_message_str
+    user_str = render_user_message_str("Line 1\nLine 2\nLine 3\nLine 4\nLine 5", force_color=True)
+    sliced = slice_conversation_viewport(user_str, viewport_height=3, pad=True)
+    sliced_lines = sliced.split("\n")
+    assert len(sliced_lines) == 3
+    # Sliced lines should contain ANSI escapes and not leak unclosed codes
+    for line in sliced_lines:
+        if line.strip():
+            assert "\x1b[" in line
+
+

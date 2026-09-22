@@ -209,12 +209,18 @@ def render_actions_group(
 def render_actions_group_str(
     group: Any,
     width: int = 80,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Render actions disclosure group as plain formatted string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    """Render actions disclosure group as plain or ANSI formatted string using in-memory capture."""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(render_actions_group(group))
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def is_stray_command_bar(content: str) -> bool:
@@ -418,10 +424,15 @@ def render_system_message_str(
     timestamp: str | None = None,
     *,
     show_timestamp: bool | None = None,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Render a system message as plain formatted string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    """Render a system message as plain or ANSI formatted string using in-memory capture."""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(
         render_system_message(
             content,
@@ -429,7 +440,7 @@ def render_system_message_str(
             show_timestamp=show_timestamp,
         )
     )
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def render_chat_transcript(
@@ -508,10 +519,15 @@ def render_chat_transcript_str(
     padding: tuple[int, int] = (0, 1),
     show_timestamps: bool = False,
     accent: bool = True,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
-    """Render the full conversation transcript as plain string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    """Render the full conversation transcript as plain or ANSI formatted string using in-memory capture."""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(
         render_chat_transcript(
             messages,
@@ -521,10 +537,11 @@ def render_chat_transcript_str(
             accent=accent,
         )
     )
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 __all__ = [
+    "_make_capture_console",
     "extract_internal_reasoning",
     "is_stray_command_bar",
     "render_actions_group",
