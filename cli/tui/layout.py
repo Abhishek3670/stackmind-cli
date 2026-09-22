@@ -290,6 +290,7 @@ def render_full_screen_workspace(
     include_composer: bool = True,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    composer_placeholder: str = "Type a message...",
 ) -> str:
     """Render a complete, anchored full-screen terminal frame.
 
@@ -364,6 +365,7 @@ def render_full_screen_workspace(
     # 5. Pinned bottom composer box (3 lines) placed above bottom status bar
     comp_width = layout.conversation_width if layout.show_runtime else width
     composer_str = render_composer_box_str(
+        placeholder=composer_placeholder,
         shortcuts=shortcuts,
         width=comp_width,
         content=composer_content,
@@ -439,6 +441,7 @@ class LiveWorkspaceManager:
         include_composer: bool = True,
         force_color: bool | None = None,
         no_color: bool | None = None,
+        composer_placeholder: str = "Type a message...",
     ) -> RenderableType:
         """Compose the full screen workspace frame as a RenderableType."""
         fc = self.force_color if force_color is None else force_color
@@ -455,6 +458,7 @@ class LiveWorkspaceManager:
             include_composer=include_composer,
             force_color=fc,
             no_color=nc,
+            composer_placeholder=composer_placeholder,
         )
         return Text.from_ansi(frame_str)
 
@@ -518,6 +522,7 @@ class LiveWorkspaceManager:
         refresh: bool = True,
         force_color: bool | None = None,
         no_color: bool | None = None,
+        composer_placeholder: str = "Type a message...",
     ) -> None:
         """Update the localized workspace renderable without screen clearing."""
         if self._live is not None and self._active:
@@ -529,6 +534,7 @@ class LiveWorkspaceManager:
                 include_composer=include_composer,
                 force_color=force_color,
                 no_color=no_color,
+                composer_placeholder=composer_placeholder,
             )
             self._live.update(renderable, refresh=refresh)
 

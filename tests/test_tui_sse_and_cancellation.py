@@ -196,10 +196,12 @@ def test_panel_aware_streaming_rate_limiting():
         assert mock_redraw.call_count <= 2
         assert mock_redraw.call_count >= 1
 
-        # Verify arguments on the final redraw call:
+        # Verify arguments on the final redraw call (WO-013):
         final_call = mock_redraw.call_args_list[-1]
         assert final_call.kwargs.get("clear") is False
-        assert final_call.kwargs.get("include_composer") is False
+        assert final_call.kwargs.get("include_composer") is True
+        assert final_call.kwargs.get("composer_is_active") is False
+        assert final_call.kwargs.get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
         assert final_call.kwargs.get("live_manager") == mock_live
 
         # Verify assistant message has accumulated all 50 tokens
@@ -215,7 +217,7 @@ def test_panel_aware_streaming_rate_limiting():
 
 
 def test_panel_aware_streaming_periodic_redraw_at_100ms_intervals():
-    """Verify redraw_full_screen triggers when >=100ms elapses between deltas (WO-011)."""
+    """Verify redraw_full_screen triggers when >=100ms elapses between deltas (WO-011, WO-013)."""
     session = {"session_id": "sess-stream-2"}
     state = AutonomousDeliveryState(session_id="sess-stream-2", client_timeout=5.0)
 
@@ -260,10 +262,12 @@ def test_panel_aware_streaming_periodic_redraw_at_100ms_intervals():
         # 4. final completion redraw
         assert mock_redraw.call_count == 4
 
-        # Verify all streaming redraws have include_composer=False and clear=False
+        # Verify all streaming redraws have include_composer=True, composer_is_active=False, clear=False (WO-013)
         for call in mock_redraw.call_args_list:
             assert call.kwargs.get("clear") is False
-            assert call.kwargs.get("include_composer") is False
+            assert call.kwargs.get("include_composer") is True
+            assert call.kwargs.get("composer_is_active") is False
+            assert call.kwargs.get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
 
 
 def test_heartbeat_tick_suppression_during_active_streaming():
@@ -299,4 +303,23 @@ def test_heartbeat_tick_suppression_during_active_streaming():
         echoed = [str(call.args[0]) for call in mock_echo.call_args_list if call.args]
         assert not any("Working..." in msg for msg in echoed)
         assert not any("Streaming output" in msg for msg in echoed)
+
+
+def test_busy_state_composer_rendered_during_active_streaming():
+    """Verify render_full_screen_workspace renders disabled busy composer with placeholder (WO-013)."""
+    from cli.tui.layout import render_full_screen_workspace
+
+    session = {"session_id": "sess-stream-busy"}
+    state = AutonomousDeliveryState(session_id="sess-stream-busy")
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+        include_composer=True,
+        composer_is_active=False,
+        composer_placeholder="Generating response... (Ctrl+C to cancel)",
+    )
+    assert "Generating response... (Ctrl+C to cancel)" in frame
+    assert "Ctrl+K commands" in frame
 

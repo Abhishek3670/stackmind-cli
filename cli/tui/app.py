@@ -739,8 +739,9 @@ def redraw_full_screen(
     live_manager: Any | None = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    composer_placeholder: str = "Type a message...",
 ) -> str:
-    """Redraw the full-screen TUI workspace (WO-053, WO-003, WO-012).
+    """Redraw the full-screen TUI workspace (WO-053, WO-003, WO-012, WO-013).
 
     Renders top header, two-column workspace (with conversation viewport and
     anchored runtime panel), and pinned bottom composer box.
@@ -762,6 +763,7 @@ def redraw_full_screen(
         include_composer=include_composer,
         force_color=force_color,
         no_color=no_color,
+        composer_placeholder=composer_placeholder,
     )
 
     if live_manager is not None and getattr(live_manager, "is_active", False):
@@ -774,6 +776,7 @@ def redraw_full_screen(
                 include_composer=include_composer,
                 force_color=force_color,
                 no_color=no_color,
+                composer_placeholder=composer_placeholder,
             )
         except Exception:
             pass
@@ -1894,11 +1897,14 @@ def dispatch_delivery_command(
                             else ""
                         )
                         tick_content = f"{transcript}\n\n{prog_text}" if transcript else prog_text
+                        # AC-7: Route tick through redraw_full_screen with disabled busy composer (WO-013)
                         redraw_full_screen(
                             session,
                             state,
                             clear=False,
-                            include_composer=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            composer_placeholder="Generating response... (Ctrl+C to cancel)",
                             conversation_content=tick_content,
                             live_manager=live_manager,
                         )
@@ -1950,14 +1956,15 @@ def dispatch_delivery_command(
                         curr_text = "".join(streamed_chunks)
                         in_progress = f"{hdr}\n{curr_text}" if curr_text else hdr
                         full_content = f"{transcript}\n\n{in_progress}" if transcript else in_progress
-                        # WO-011 (AC-4, AC-6): Render tokens inside the width-constrained conversation frame.
-                        # Composer is intentionally hidden (include_composer=False) while streaming because
-                        # user input is disabled during generation, conserving vertical space.
+                        # WO-013 (AC-3): Render tokens inside width-constrained frame with disabled busy-state composer.
+                        # Inactive composer box (#475569) displays busy placeholder while generation is active.
                         redraw_full_screen(
                             session,
                             state,
                             clear=False,
-                            include_composer=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            composer_placeholder="Generating response... (Ctrl+C to cancel)",
                             conversation_content=full_content,
                             live_manager=live_manager,
                         )
@@ -2046,14 +2053,15 @@ def dispatch_delivery_command(
             turn_acts = state.current_turn_actions
             state.add_message("assistant", full_resp, actions=turn_acts)
             assistant_rendered = True
-            # WO-011 (AC-3, AC-8): Perform one final redraw_full_screen when the stream completes
-            # so that the complete response is fully rendered in the viewport before composer returns.
-            # Composer is intentionally hidden (include_composer=False) until next input prompt (AC-6).
+            # WO-013 (AC-3): Perform final settle redraw_full_screen when the stream completes
+            # keeping disabled busy composer visible until the next prompt_composer_input activation.
             redraw_full_screen(
                 session,
                 state,
                 clear=False,
-                include_composer=False,
+                include_composer=True,
+                composer_is_active=False,
+                composer_placeholder="Generating response... (Ctrl+C to cancel)",
                 live_manager=live_manager,
             )
 
