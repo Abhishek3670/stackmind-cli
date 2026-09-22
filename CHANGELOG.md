@@ -27,7 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Replaced raw stdout token streaming with rate-limited (100ms / 8–10 Hz) full-frame redraws in the conversation viewport.
   - Constrained in-progress streaming output to conversation column width, avoiding panel spillover.
   - Eliminated status tick and streamed text racing corruption by suppressing ticks during active streaming and routing them through redraw.
-  - Intentionally hid composer during active generation to conserve vertical space.
+- **Busy-State Composer During Active Generation (WO-013)**:
+  - Rendered rounded composer container visible throughout token generation with inactive border styling (`#475569`) and busy placeholder (`Generating response... (Ctrl+C to cancel)`).
+  - Restores active composer (`Type a message...`, highlighted blue border, active cursor) seamlessly once turn finishes.
+
+### Fixed
+- **ANSI Escape Styling in Workspace Layout (WO-012)**:
+  - Preserved full ANSI styling (user message backgrounds, assistant model badges, markdown syntax highlighting) across the entire conversation viewport by enabling truecolor capture console in `render_workspace_layout_str`.
 
 ## [Unreleased]
 - Initial repository scaffolding.
