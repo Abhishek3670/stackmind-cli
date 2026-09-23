@@ -992,6 +992,7 @@ def prompt_composer_input(
     live_manager: Any | None = None,
     session: Mapping[str, Any] | None = None,
     terminal_width: int | None = None,
+    full_screen: bool = False,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
@@ -999,6 +1000,8 @@ def prompt_composer_input(
     Page Up/Down conversation scroll, multiline expansion, active typing state tracking,
     and preserves partially typed input buffer across background events (§28-§30).
     Aligns composer width to conversation viewport when runtime panel is visible (WO-008).
+    When full_screen=True, borders and status bar are already rendered atomically by
+    redraw_full_screen, so redundant console printing is suppressed (WO-016).
     """
     term_width = terminal_width if terminal_width is not None else width
     layout = compute_layout(term_width)
@@ -1014,6 +1017,7 @@ def prompt_composer_input(
         state.focus_target = "composer"
 
     is_live_active = live_manager is not None and getattr(live_manager, "is_active", False)
+    is_full_screen = full_screen or getattr(state, "full_screen", False)
 
     is_tty = False
     try:
@@ -1029,7 +1033,7 @@ def prompt_composer_input(
                 shortcuts=shortcuts,
                 include_composer=True,
             )
-        else:
+        elif not is_full_screen:
             click.echo(render_composer_top_border_str(
                 placeholder=placeholder,
                 shortcuts=shortcuts,
@@ -1087,7 +1091,7 @@ def prompt_composer_input(
                 shortcuts=shortcuts,
                 include_composer=False,
             )
-        else:
+        elif not is_full_screen:
             click.echo(render_composer_bottom_border_str(width=comp_width, is_active=False))
             if show_footer:
                 click.echo(render_bottom_footer_bar_str(width=comp_width))
@@ -2443,7 +2447,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
             _ensure_utf8()
             enter_alternate_screen()
             enable_mouse_reporting()
-            redraw_full_screen(session, state, clear=True, include_composer=False)
+            redraw_full_screen(session, state, clear=True, include_composer=True, composer_is_active=True)
+            current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+            sys.stdout.write(f"\x1b[{current_lines - 2};1H")
+            sys.stdout.flush()
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
             click.echo(render_top_header_bar_str(
@@ -2630,6 +2637,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     on_wheel_down=_handle_wheel_down,
                     show_footer=False if is_tty else not getattr(state, "has_conversation", False),
                     live_manager=live_ws,
+                    full_screen=is_tty,
                 )
             except (EOFError, KeyboardInterrupt):
                 if live_ws is not None:
@@ -2658,7 +2666,17 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                 click.echo()
                 continue
             if is_tty:
-                redraw_full_screen(session, state, include_composer=False, live_manager=live_ws)
+                redraw_full_screen(
+                    session,
+                    state,
+                    clear=False,
+                    include_composer=True,
+                    composer_is_active=True,
+                    live_manager=live_ws,
+                )
+                current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+                sys.stdout.write(f"\x1b[{current_lines - 2};1H")
+                sys.stdout.flush()
     finally:
         disable_mouse_reporting()
         if live_ws is not None:

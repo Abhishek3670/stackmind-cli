@@ -987,5 +987,167 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     mock_editor.redraw_line.assert_called_once()
 
 
+# ─── 14. WO-016: ELIMINATE DUPLICATE STATUS BAR ON TUI STARTUP ────────────────
+
+
+def test_tui_startup_in_alternate_buffer_renders_single_status_bar_and_composer(monkeypatch, tmp_path):
+    """Verify startup in alternate buffer mode renders atomic frame with 1 status bar and 1 composer (WO-016 AC-1, AC-4)."""
+    import os
+    from unittest.mock import MagicMock
+    from cli.tui.app import tui
+
+    startup_redraw_call = None
+    captured_prompt_kwargs = None
+
+    def mock_redraw(*args, **kwargs):
+        nonlocal startup_redraw_call
+        if startup_redraw_call is None:
+            startup_redraw_call = kwargs
+        return "mock_frame"
+
+    def mock_prompt_input(**kwargs):
+        nonlocal captured_prompt_kwargs
+        captured_prompt_kwargs = kwargs
+        raise KeyboardInterrupt()
+
+    stdout_writes = []
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.app.redraw_full_screen", mock_redraw)
+    monkeypatch.setattr("cli.tui.app.prompt_composer_input", mock_prompt_input)
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=(80, 24): os.terminal_size((120, 24)))
+
+    mock_client = MagicMock()
+    mock_client.create_session.return_value = {
+        "session_id": "sess-startup",
+        "agent": "codex",
+        "provider": "daemon",
+        "workspace": str(tmp_path),
+    }
+    mock_client.events.return_value = []
+    monkeypatch.setattr("cli.tui.app.DaemonClient", lambda url: mock_client)
+    monkeypatch.setattr("cli.tui.app.StackMindTuiAdapter", lambda client: MagicMock())
+    monkeypatch.setattr("cli.tui.app.enter_alternate_screen", lambda: None)
+    monkeypatch.setattr("cli.tui.app.enable_mouse_reporting", lambda: None)
+
+    tui.callback(daemon_url="http://mock", agent="codex", workspace=tmp_path, demo=False, client_timeout=45.0)
+
+    # AC-1: Startup redraw must be atomic with include_composer=True and composer_is_active=True
+    assert startup_redraw_call is not None
+    assert startup_redraw_call.get("clear") is True
+    assert startup_redraw_call.get("include_composer") is True
+    assert startup_redraw_call.get("composer_is_active") is True
+
+    # Cursor positioned at row height - 2 (24 - 2 = 22)
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+
+    # AC-2 & AC-4: prompt_composer_input called with full_screen=True
+    assert captured_prompt_kwargs is not None
+    assert captured_prompt_kwargs.get("full_screen") is True
+
+
+def test_prompt_composer_input_suppresses_redundant_borders_in_full_screen_mode(monkeypatch):
+    """Verify prompt_composer_input does not emit duplicate borders or footers when full_screen=True (WO-016 AC-2, AC-4)."""
+    import sys
+    from cli.tui.app import prompt_composer_input
+    from cli.tui.state import AutonomousDeliveryState
+
+    session = {"session_id": "sess-test", "agent": "codex", "provider": "daemon"}
+    state = AutonomousDeliveryState(session_id="sess-test")
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.app.raw_prompt_input", lambda **kwargs: "entered text")
+
+    stdout_writes = []
+    echoed_lines = []
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+    monkeypatch.setattr("click.echo", lambda s="": echoed_lines.append(s))
+
+    # In full_screen mode, NO border echoes or status bar writes should occur
+    result = prompt_composer_input(
+        width=120,
+        session=session,
+        state=state,
+        full_screen=True,
+    )
+    assert result == "entered text"
+    assert len(echoed_lines) == 0
+    assert not any("\x1b[2A\r" in s for s in stdout_writes)
+    assert not any("stackmind" in str(s) for s in stdout_writes)
+    assert not any("stackmind" in str(s) for s in echoed_lines)
+
+    # When full_screen=False (scrollback mode), border echoes and status bar are emitted as expected
+    stdout_writes.clear()
+    echoed_lines.clear()
+    result_legacy = prompt_composer_input(
+        width=120,
+        session=session,
+        state=state,
+        full_screen=False,
+    )
+    assert result_legacy == "entered text"
+    assert len(echoed_lines) > 0
+    assert any("\x1b[2A\r" in s for s in stdout_writes)
+
+
+def test_post_turn_settle_redraw_maintains_atomic_frame_and_cursor(monkeypatch, tmp_path):
+    """Verify post-turn completion redraws full frame with composer and positions cursor on row height - 2 (WO-016 AC-3)."""
+    import os
+    from unittest.mock import MagicMock
+    from cli.tui.app import tui
+
+    redraw_calls = []
+
+    def mock_redraw(*args, **kwargs):
+        redraw_calls.append(kwargs)
+        return "mock_frame"
+
+    call_count = 0
+    def mock_prompt_input(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return "submit turn"
+        raise KeyboardInterrupt()
+
+    stdout_writes = []
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.app.redraw_full_screen", mock_redraw)
+    monkeypatch.setattr("cli.tui.app.prompt_composer_input", mock_prompt_input)
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=(80, 24): os.terminal_size((120, 24)))
+
+    mock_client = MagicMock()
+    mock_client.create_session.return_value = {
+        "session_id": "sess-post-turn",
+        "agent": "codex",
+        "provider": "daemon",
+        "workspace": str(tmp_path),
+    }
+    mock_client.events.return_value = []
+    monkeypatch.setattr("cli.tui.app.DaemonClient", lambda url: mock_client)
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "turn-1"}
+    monkeypatch.setattr("cli.tui.app.StackMindTuiAdapter", lambda client: mock_adapter)
+    monkeypatch.setattr("cli.tui.app.enter_alternate_screen", lambda: None)
+    monkeypatch.setattr("cli.tui.app.enable_mouse_reporting", lambda: None)
+    monkeypatch.setattr("cli.tui.app.dispatch_delivery_command", lambda *args, **kwargs: ({"session_id": "sess-post-turn"}, False))
+
+    tui.callback(daemon_url="http://mock", agent="codex", workspace=tmp_path, demo=False, client_timeout=45.0)
+
+    # Startup was call 0. Post-turn settle was call 1.
+    assert len(redraw_calls) >= 2
+    post_turn = redraw_calls[1]
+    assert post_turn.get("include_composer") is True
+    assert post_turn.get("composer_is_active") is True
+    assert post_turn.get("clear") is False
+    # Verify cursor positioned on input line (row 22)
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+
+
 
 
