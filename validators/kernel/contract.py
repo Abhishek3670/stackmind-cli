@@ -23,7 +23,15 @@ class AgentContract:
     budget: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def freeze(self) -> "AgentContract":
-        return self
+        return AgentContract(
+            self.agent_id,
+            self.work_order,
+            tuple(self.allow),
+            tuple(self.deny),
+            self.write_mode,
+            self.version,
+            MappingProxyType(dict(self.budget)),
+        )
 
 
 class ContractNormalizer:
@@ -49,7 +57,9 @@ class ContractNormalizer:
                 raise ContractNormalizationError("scope rules must be a list")
             values = []
             for item in value:
-                target = item.get("module") or item.get("target") if isinstance(item, Mapping) else item
+                target = (
+                    item.get("module") or item.get("target") if isinstance(item, Mapping) else item
+                )
                 if not isinstance(target, str) or not target.strip():
                     raise ContractNormalizationError("Each scope rule must name a target")
                 values.append(target.strip().replace("\\", "/"))
@@ -60,16 +70,27 @@ class ContractNormalizer:
         allow = rules(scope.get("allow", scope.get("allowed")))
         deny = rules(scope.get("deny", scope.get("denied")))
         write_mode = scope.get("write", raw.get("write_mode", "read-only"))
-        if not isinstance(agent_id, str) or not agent_id or not isinstance(work_order, str) or not work_order:
+        if (
+            not isinstance(agent_id, str)
+            or not agent_id
+            or not isinstance(work_order, str)
+            or not work_order
+        ):
             raise ContractNormalizationError("agent_id and work_order are required")
         if not allow or write_mode not in {"read-only", "read-write"}:
             raise ContractNormalizationError("Contract requires allow rules and a valid write mode")
         budget = raw.get("budget", {})
         if not isinstance(budget, Mapping):
             raise ContractNormalizationError("budget must be an object")
-        return AgentContract(agent_id, work_order, allow, deny, write_mode,
-                             str(raw.get("version", raw.get("contract_version", "1"))),
-                             MappingProxyType(dict(budget)))
+        return AgentContract(
+            agent_id,
+            work_order,
+            allow,
+            deny,
+            write_mode,
+            str(raw.get("version", raw.get("contract_version", "1"))),
+            MappingProxyType(dict(budget)),
+        )
 
 
 class ContractEvaluator:
@@ -80,9 +101,15 @@ class ContractEvaluator:
     @staticmethod
     def _matches(target: str, rule: str) -> bool:
         normalized = target.replace("\\", "/")
-        return fnmatch.fnmatch(normalized, rule) or normalized == rule or normalized.startswith(rule.rstrip("/") + "/")
+        return (
+            fnmatch.fnmatch(normalized, rule)
+            or normalized == rule
+            or normalized.startswith(rule.rstrip("/") + "/")
+        )
 
-    def authorize(self, contract: AgentContract, operation_type: str, target: str) -> tuple[bool, str]:
+    def authorize(
+        self, contract: AgentContract, operation_type: str, target: str
+    ) -> tuple[bool, str]:
         if not target:
             return False, "missing target"
         if target.startswith(("/", "\\")) or ".." in target.replace("\\", "/").split("/"):

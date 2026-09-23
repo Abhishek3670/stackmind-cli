@@ -5,12 +5,25 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Thread
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+import sys
 from .manager import SessionManager
 from .protocol import JsonRpcProtocol
 from .storage import DaemonStorage
+
+
+class _DaemonHTTPServer(ThreadingHTTPServer):
+    """Threading HTTPServer that gracefully ignores normal client disconnect errors."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc_type, _, _ = sys.exc_info()
+        if exc_type is not None and issubclass(exc_type, (ConnectionError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class LocalDaemon:
@@ -20,11 +33,12 @@ class LocalDaemon:
         host: str = "127.0.0.1",
         port: int = 0,
         mcp_protocol: Any | None = None,
+        runner_factory: Any | None = None,
     ) -> None:
-        self.manager = SessionManager(DaemonStorage(state_dir))
+        self.manager = SessionManager(DaemonStorage(state_dir), runner_factory=runner_factory)
         self.protocol = JsonRpcProtocol(self.manager)
         self.mcp_protocol = mcp_protocol
-        self._server = ThreadingHTTPServer((host, port), self._handler())
+        self._server = _DaemonHTTPServer((host, port), self._handler())
         self._thread: Thread | None = None
 
     @property
@@ -40,6 +54,8 @@ class LocalDaemon:
         daemon = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def _send(self, status: int, body: Any) -> None:
                 encoded = json.dumps(body).encode("utf-8")
                 self.send_response(status)
@@ -49,7 +65,8 @@ class LocalDaemon:
                 self.wfile.write(encoded)
 
             def do_GET(self) -> None:  # noqa: N802
-                if self.path == "/health":
+                parsed = urlparse(self.path)
+                if parsed.path == "/health":
                     self._send(
                         200,
                         {
@@ -57,8 +74,55 @@ class LocalDaemon:
                             "sessions": len(daemon.manager.list_sessions()),
                         },
                     )
+                elif parsed.path == "/events":
+                    query = parse_qs(parsed.query)
+                    session_id = query.get("session_id", [None])[0]
+                    try:
+                        after = int(query.get("after", ["0"])[0])
+                    except ValueError:
+                        self._send(400, {"error": "after must be an integer"})
+                        return
+                    self._stream_events(session_id, after)
                 else:
                     self._send(404, {"error": "not found"})
+
+            def _stream_events(self, session_id: str | None, after: int) -> None:
+                live_events: Queue[Any] = Queue()
+                unsubscribe = daemon.manager.events.subscribe(live_events.put)
+                last_sequence = after
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+
+                    for event in daemon.manager.events.events(session_id, after):
+                        self._emit_sse(event)
+                        last_sequence = event.sequence
+
+                    while True:
+                        try:
+                            event = live_events.get(timeout=0.25)
+                        except Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            continue
+                        if event.sequence <= last_sequence:
+                            continue
+                        if session_id is not None and event.session_id != session_id:
+                            continue
+                        self._emit_sse(event)
+                        last_sequence = event.sequence
+                except (ConnectionError, BrokenPipeError):
+                    return
+                finally:
+                    unsubscribe()
+
+            def _emit_sse(self, event: Any) -> None:
+                payload = json.dumps(event.as_dict(), separators=(",", ":")).encode("utf-8")
+                self.wfile.write(b"data: " + payload + b"\n\n")
+                self.wfile.flush()
 
             def do_POST(self) -> None:  # noqa: N802
                 if self.path not in {"/rpc", "/mcp"}:

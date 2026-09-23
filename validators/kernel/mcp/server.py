@@ -5,11 +5,14 @@ from __future__ import annotations
 import sys
 from typing import TextIO
 
+from .constants import MCP_PROTOCOL_VERSION
 from .protocol import McpProtocol
 from .tools import GovernedToolRegistry
 
 
 class McpServer:
+    protocol_version = MCP_PROTOCOL_VERSION
+
     def __init__(self, tools: GovernedToolRegistry) -> None:
         self.protocol = McpProtocol(tools)
 

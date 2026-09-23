@@ -9,12 +9,14 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from validators.kernel.sandbox import ProcessSandbox
 from validators.kernel.workspace import ScratchWorkspace, WorkspaceEscapeError
 from validators.verification.models import StageResult
 
+if TYPE_CHECKING:
+    from validators.skill.models import SkillRecord
 
 
 class SandboxCanaryVerifier:
@@ -40,7 +42,9 @@ class SandboxCanaryVerifier:
             if s.command_template:
                 vars_found = var_pattern.findall(s.command_template)
                 if vars_found:
-                    messages.append(f"Step {s.step_index} template contains parameterized variables: {vars_found}")
+                    messages.append(
+                        f"Step {s.step_index} template contains parameterized variables: {vars_found}"
+                    )
 
         # 2. Target module applicability boundary check
         invalid_modules = []
@@ -50,12 +54,17 @@ class SandboxCanaryVerifier:
 
         if invalid_modules:
             passed = False
-            messages.append(f"Canary check failed: target_modules contain out-of-boundary paths: {invalid_modules}")
+            messages.append(
+                "Canary check failed: target_modules contain out-of-boundary paths: "
+                f"{invalid_modules}"
+            )
 
         # 3. Execution precondition audit
         if not skill.applicability.preconditions:
             passed = False
-            messages.append("Canary check failed: skill does not declare operational preconditions.")
+            messages.append(
+                "Canary check failed: skill does not declare operational preconditions."
+            )
 
         # 4. Authentic Sandbox Execution
         # Provision isolated scratch workspace and process sandbox
@@ -68,28 +77,30 @@ class SandboxCanaryVerifier:
                 if s.command_template:
                     vars_found = var_pattern.findall(s.command_template)
                     if not vars_found:
-                        try:
-                            test_cmds.append(shlex.split(s.command_template))
-                        except Exception:
-                            pass
+                        test_cmds.append(shlex.split(s.command_template))
 
         if not test_cmds:
-            # Baseline sandbox execution integrity check
             test_cmds.append([sys.executable, "-c", "import sys; sys.exit(0)"])
+            messages.append("Canary executed an explicit sandbox baseline command.")
 
         executed_commands: list[dict[str, Any]] = []
         for cmd in test_cmds:
             try:
                 result = sandbox.run(cmd)
-                executed_commands.append({
-                    "command": list(cmd),
-                    "returncode": result.returncode,
-                    "stdout": result.stdout[:200],
-                    "stderr": result.stderr[:200],
-                })
+                executed_commands.append(
+                    {
+                        "command": list(cmd),
+                        "returncode": result.returncode,
+                        "stdout": result.stdout[:200],
+                        "stderr": result.stderr[:200],
+                    }
+                )
                 if result.returncode != 0:
                     passed = False
-                    messages.append(f"Canary sandbox execution failed (exit code {result.returncode}) for: {' '.join(cmd)}")
+                    messages.append(
+                        f"Canary sandbox execution failed (exit code {result.returncode}) for: "
+                        f"{' '.join(cmd)}"
+                    )
             except WorkspaceEscapeError as ex:
                 passed = False
                 messages.append(f"Canary sandbox containment breach: {ex}")
@@ -99,7 +110,9 @@ class SandboxCanaryVerifier:
 
         score = 1.0 if passed else 0.4
         if passed:
-            messages.append("Canary simulation passed: template parameters, boundaries, and preconditions valid.")
+            messages.append(
+                "Canary simulation passed: template parameters, boundaries, and preconditions valid."
+            )
 
         return StageResult(
             stage_name="canary",

@@ -20,6 +20,7 @@ from .evidence import (
 )
 from .identity import AgentIdentity, AuthorizationPolicy, HumanIdentity, ProviderIdentity
 from .mcp import GovernedToolRegistry, McpProtocol, McpServer, OperatingMode, OperatingModeTracker
+from .multi import AgentRole, EnsembleMember, HandoffRecord, MultiAgentSupervisor, TaskDelegation
 from .operations import OperationJournal, OperationRecord, OperationRequest, OperationType
 from .providers import (
     STANDARD_KERNEL_TOOLS,
@@ -42,6 +43,7 @@ from .providers import (
 )
 from .session import AgentSession, Attempt, LifecycleState
 from .tools import ToolGateway
+from .tui import DaemonClient, StackMindTuiAdapter
 from .verification import SandboxCanaryVerifier
 from .workspace import ScratchWorkspace, WorkspaceEscapeError
 
@@ -49,6 +51,7 @@ __all__ = [
     "AgentContract",
     "AgentIdentity",
     "AgentSession",
+    "AgentRole",
     "Attempt",
     "AuthenticationError",
     "AuthenticEvidenceTracer",
@@ -59,12 +62,15 @@ __all__ = [
     "ContractEvaluator",
     "ContractNormalizer",
     "DaemonStorage",
+    "DaemonClient",
     "EligibilityDecision",
     "EventDispatcher",
+    "EnsembleMember",
     "GovernedToolRegistry",
     "ExperienceEligibilityGate",
     "FileDiffSnapshot",
     "HumanIdentity",
+    "HandoffRecord",
     "LifecycleState",
     "JsonRpcProtocol",
     "LocalDaemon",
@@ -73,6 +79,7 @@ __all__ = [
     "OpenAICompatibleAdapter",
     "McpProtocol",
     "McpServer",
+    "MultiAgentSupervisor",
     "OperationJournal",
     "OperationRecord",
     "OperationRequest",
@@ -87,6 +94,7 @@ __all__ = [
     "RateLimitError",
     "RuntimeBoundary",
     "STANDARD_KERNEL_TOOLS",
+    "StackMindTuiAdapter",
     "RuntimeEvent",
     "SandboxCanaryVerifier",
     "ScratchWorkspace",
@@ -96,6 +104,7 @@ __all__ = [
     "TokenUsage",
     "ToolCallRequest",
     "ToolDefinition",
+    "TaskDelegation",
     "ToolGateway",
     "WorkspaceEscapeError",
     "derive_verification_dimensions",
