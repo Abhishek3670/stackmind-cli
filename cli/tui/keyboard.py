@@ -41,8 +41,8 @@ def set_debug_keys(enabled: bool) -> None:
     """Toggle debug key logging dynamically."""
     global DEBUG_KEYS_ENABLED
     DEBUG_KEYS_ENABLED = enabled
-    legacy_active = os.environ.get("STACKMIND_LEGACY_INPUT") in ("1", "true", "yes")
-    reader_name = "legacy_msvcrt" if legacy_active else "win32_console"
+    win32_active = os.environ.get("STACKMIND_WIN32_INPUT") in ("1", "true", "yes")
+    reader_name = "win32_console" if win32_active else "legacy_msvcrt"
     _log_debug_key(
         f"=== DEBUG KEYS LOGGING {'ENABLED' if enabled else 'DISABLED'} "
         f"(platform={sys.platform}, os={os.name}, reader={reader_name}, log_file={DEBUG_LOG_FILE}) ==="
@@ -62,8 +62,8 @@ def _log_debug_key(msg: str) -> None:
 
 
 if DEBUG_KEYS_ENABLED:
-    _legacy_on = os.environ.get("STACKMIND_LEGACY_INPUT") in ("1", "true", "yes")
-    _reader_name = "legacy_msvcrt" if _legacy_on else "win32_console"
+    _win32_on = os.environ.get("STACKMIND_WIN32_INPUT") in ("1", "true", "yes")
+    _reader_name = "win32_console" if _win32_on else "legacy_msvcrt"
     _log_debug_key(
         f"=== DEBUG KEYS INITIALIZED VIA ENV (platform={sys.platform}, os={os.name}, "
         f"reader={_reader_name}, log_file={DEBUG_LOG_FILE}) ==="
@@ -640,10 +640,10 @@ def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
         return res
 
     if os.name == "nt":
-        if os.environ.get("STACKMIND_LEGACY_INPUT") in ("1", "true", "yes"):
-            res = _read_raw_key_windows()
-        else:
+        if os.environ.get("STACKMIND_WIN32_INPUT") in ("1", "true", "yes"):
             res = _read_raw_key_windows_v2()
+        else:
+            res = _read_raw_key_windows()
     else:
         res = _read_raw_key_posix(fd=0)
     _log_debug_key(f"[read_next_key] final returned {repr(res)}")

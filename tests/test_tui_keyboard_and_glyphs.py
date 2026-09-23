@@ -772,28 +772,28 @@ def test_win32_reader_escape_sequences():
         assert _parse_escape_sequence(seq) == Key.PAGE_UP
 
 
-def test_win32_reader_default_and_legacy_flag():
-    """Verify read_next_key defaults to Win32 reader on NT, falling back to legacy if STACKMIND_LEGACY_INPUT=1."""
+def test_win32_reader_default_and_opt_in_flag():
+    """Verify read_next_key defaults to legacy reader on NT, opting in to Win32 if STACKMIND_WIN32_INPUT=1."""
     import os
     from unittest.mock import patch
     from cli.tui.keyboard import read_next_key
 
     with patch("os.name", "nt"):
-        # Default: calls _read_raw_key_windows_v2
+        # Default: calls _read_raw_key_windows
         with patch.dict(os.environ, {}, clear=True), \
-             patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
-             patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:
-            assert read_next_key() == "v2_key"
-            mock_v2.assert_called_once()
-            mock_legacy.assert_not_called()
-
-        # Opt-out: STACKMIND_LEGACY_INPUT=1 calls _read_raw_key_windows
-        with patch.dict(os.environ, {"STACKMIND_LEGACY_INPUT": "1"}), \
              patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
              patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:
             assert read_next_key() == "legacy_key"
             mock_legacy.assert_called_once()
             mock_v2.assert_not_called()
+
+        # Opt-in: STACKMIND_WIN32_INPUT=1 calls _read_raw_key_windows_v2
+        with patch.dict(os.environ, {"STACKMIND_WIN32_INPUT": "1"}), \
+             patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
+             patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:
+            assert read_next_key() == "v2_key"
+            mock_v2.assert_called_once()
+            mock_legacy.assert_not_called()
 
 
 
