@@ -2449,7 +2449,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
             enable_mouse_reporting()
             redraw_full_screen(session, state, clear=True, include_composer=True, composer_is_active=True)
             current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-            sys.stdout.write(f"\x1b[{current_lines - 2};1H")
+            sys.stdout.write(f"\x1b[{current_lines - 2};5H")
             sys.stdout.flush()
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
@@ -2516,7 +2516,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     else:
                         click.echo(render_top_header_bar_str(
@@ -2564,7 +2564,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2583,7 +2583,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2601,7 +2601,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2619,7 +2619,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2675,7 +2675,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     live_manager=live_ws,
                 )
                 current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                sys.stdout.write(f"\x1b[{current_lines - 2};1H")
+                sys.stdout.write(f"\x1b[{current_lines - 2};5H")
                 sys.stdout.flush()
     finally:
         disable_mouse_reporting()

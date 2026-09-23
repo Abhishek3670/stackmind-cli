@@ -543,8 +543,8 @@ def test_composer_width_aligned_with_conversation_viewport():
     assert composer_bottom[0] in ("╰", "└")
     assert composer_bottom[-1] in ("╯", "┘")
 
-    # Status bar aligns with conversation_width matching composer box (WO-009)
-    assert len(status_bar) == layout_120.conversation_width
+    # Status bar spans full terminal width as anchored bottom footer (WO-017 AC-2)
+    assert len(status_bar) == 120
     assert "stackmind" in status_bar
     assert "● online" in status_bar
 
@@ -608,7 +608,7 @@ def test_prompt_composer_input_uses_aligned_composer_width(monkeypatch, capsys):
 
 
 def test_status_bar_and_composer_share_identical_right_edge():
-    """Verify both composer box and status bar share the identical conversation_width boundary (WO-009)."""
+    """Verify composer box aligns to conversation width while status bar spans full terminal width (WO-017 AC-2)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
@@ -627,11 +627,10 @@ def test_status_bar_and_composer_share_identical_right_edge():
     composer_bottom = lines[-2]
     status_bar = lines[-1]
 
-    # Both composer borders and status bar must have the exact same width
+    # Composer borders align to conversation_width, while anchored status bar spans full terminal width
     assert len(composer_top) == layout_120.conversation_width
     assert len(composer_bottom) == layout_120.conversation_width
-    assert len(status_bar) == layout_120.conversation_width
-    assert len(composer_bottom) == len(status_bar)
+    assert len(status_bar) == 120
 
 
 # ─── 11. WO-012: ANSI ESCAPE STYLING PRESERVATION IN WORKSPACE LAYOUT ─────────
@@ -935,7 +934,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
     mock_editor.redraw_line.assert_called_once()
 
     # Test Page Down handler
@@ -947,7 +946,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
     mock_editor.redraw_line.assert_called_once()
 
     # Test Wheel Up handler
@@ -959,7 +958,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
     mock_editor.redraw_line.assert_called_once()
 
     # Test Wheel Down handler
@@ -971,7 +970,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
     mock_editor.redraw_line.assert_called_once()
 
     # Test Ctrl+L handler
@@ -983,7 +982,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is True
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
     mock_editor.redraw_line.assert_called_once()
 
 
@@ -1039,8 +1038,8 @@ def test_tui_startup_in_alternate_buffer_renders_single_status_bar_and_composer(
     assert startup_redraw_call.get("include_composer") is True
     assert startup_redraw_call.get("composer_is_active") is True
 
-    # Cursor positioned at row height - 2 (24 - 2 = 22)
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    # Cursor positioned at row height - 2 (24 - 2 = 22), col 5
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
 
     # AC-2 & AC-4: prompt_composer_input called with full_screen=True
     assert captured_prompt_kwargs is not None
@@ -1145,8 +1144,101 @@ def test_post_turn_settle_redraw_maintains_atomic_frame_and_cursor(monkeypatch, 
     assert post_turn.get("include_composer") is True
     assert post_turn.get("composer_is_active") is True
     assert post_turn.get("clear") is False
-    # Verify cursor positioned on input line (row 22)
-    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    # Verify cursor positioned on input line (row 22, col 5)
+    assert any("\x1b[22;5H" in s for s in stdout_writes)
+
+
+# ─── 15. WO-017: VIEWPORT HEIGHT BUDGET, FULL-WIDTH STATUS BAR, & COMPOSER INTEGRITY ───
+
+
+def test_render_full_screen_workspace_exact_height_across_varied_terminal_sizes():
+    """Verify render_full_screen_workspace produces strictly height lines across varied dimensions (WO-017 AC-1, AC-2, AC-5)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-017")
+    session = {"session_id": "sess-017", "agent": "gemini", "provider": "daemon"}
+
+    for test_height in (24, 30, 40):
+        for test_width in (80, 120):
+            frame = render_full_screen_workspace(
+                session=session,
+                state=state,
+                width=test_width,
+                height=test_height,
+                include_composer=True,
+            )
+            lines = frame.splitlines()
+
+            # (a) Exactly height lines
+            assert len(lines) == test_height, (
+                f"Expected exactly {test_height} lines for width={test_width}, got {len(lines)}"
+            )
+
+            # (b) Bottom status bar spans full terminal width
+            status_bar = lines[-1]
+            assert len(status_bar) == test_width, (
+                f"Expected status bar length {test_width}, got {len(status_bar)}"
+            )
+            assert "stackmind" in status_bar
+
+            # (c) Composer top border, body, and bottom border intact and contiguous
+            composer_top = lines[-4]
+            composer_body = lines[-3]
+            composer_bottom = lines[-2]
+
+            assert composer_top[0] in ("╭", "┌")
+            assert composer_top[-1] in ("╮", "┐")
+            assert composer_bottom[0] in ("╰", "└")
+            assert composer_bottom[-1] in ("╯", "┘")
+            assert composer_body[0] == "│"
+            assert composer_body[-1] == "│"
+
+
+def test_raw_line_editor_redraw_line_preserves_right_border_at_comp_width():
+    """Verify RawLineEditor.redraw_line retains the right border at width and places cursor at column 5+ (WO-017 AC-4, AC-5)."""
+    import io
+    from cli.tui.keyboard import RawLineEditor
+
+    # Test with initial text
+    buf = io.StringIO()
+    editor = RawLineEditor(width=80, initial_text="hello", prompt_prefix="│ > ")
+    editor.redraw_line(out=buf)
+    out = buf.getvalue()
+
+    # The rendered string must end with the right border '│' at width 80
+    assert out.startswith("\r│ > hello")
+    # Verify the line has right border before cursor jump
+    assert "│\x1b[" in out or out.endswith("│")
+    # Cursor absolute jump: 4 (prefix) + 5 (len("hello")) + 1 = 10
+    assert "\x1b[10G" in out
+
+    # Test with empty text
+    buf_empty = io.StringIO()
+    editor_empty = RawLineEditor(width=80, initial_text="", prompt_prefix="│ > ")
+    editor_empty.redraw_line(out=buf_empty)
+    out_empty = buf_empty.getvalue()
+
+    assert "\r│ > " in out_empty
+    # Cursor absolute jump: 4 (prefix) + 0 + 1 = 5
+    assert "\x1b[5G" in out_empty
+
+
+def test_render_workspace_layout_str_preserves_exact_height_rows():
+    """Verify render_workspace_layout_str preserves exact requested height lines even with empty rows (WO-017 AC-1, AC-5)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-017")
+
+    # Short conversation content that leaves lots of trailing empty rows
+    short_content = "Hello StackMind"
+    for target_height in (16, 20, 26):
+        out = render_workspace_layout_str(
+            short_content,
+            width=120,
+            state=state,
+            height=target_height,
+        )
+        lines = out.splitlines()
+        assert len(lines) == target_height, (
+            f"Expected {target_height} lines, got {len(lines)}"
+        )
+
 
 
 
