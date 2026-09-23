@@ -543,8 +543,8 @@ def test_composer_width_aligned_with_conversation_viewport():
     assert composer_bottom[0] in ("╰", "└")
     assert composer_bottom[-1] in ("╯", "┘")
 
-    # Status bar spans full terminal width as anchored bottom footer (WO-017 AC-2)
-    assert len(status_bar) == 120
+    # Status bar aligns with conversation_width matching composer box (WO-018 AC-1)
+    assert len(status_bar) == layout_120.conversation_width
     assert "stackmind" in status_bar
     assert "● online" in status_bar
 
@@ -608,7 +608,7 @@ def test_prompt_composer_input_uses_aligned_composer_width(monkeypatch, capsys):
 
 
 def test_status_bar_and_composer_share_identical_right_edge():
-    """Verify composer box aligns to conversation width while status bar spans full terminal width (WO-017 AC-2)."""
+    """Verify both composer box and status bar share the identical conversation_width boundary (WO-009, WO-018)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
@@ -627,10 +627,11 @@ def test_status_bar_and_composer_share_identical_right_edge():
     composer_bottom = lines[-2]
     status_bar = lines[-1]
 
-    # Composer borders align to conversation_width, while anchored status bar spans full terminal width
+    # Both composer borders and status bar must have the exact same conversation_width
     assert len(composer_top) == layout_120.conversation_width
     assert len(composer_bottom) == layout_120.conversation_width
-    assert len(status_bar) == 120
+    assert len(status_bar) == layout_120.conversation_width
+    assert len(composer_bottom) == len(status_bar)
 
 
 # ─── 11. WO-012: ANSI ESCAPE STYLING PRESERVATION IN WORKSPACE LAYOUT ─────────
@@ -1172,17 +1173,20 @@ def test_render_full_screen_workspace_exact_height_across_varied_terminal_sizes(
                 f"Expected exactly {test_height} lines for width={test_width}, got {len(lines)}"
             )
 
-            # (b) Bottom status bar spans full terminal width
+            # (b) Bottom status bar matches composer text box width (WO-018)
             status_bar = lines[-1]
-            assert len(status_bar) == test_width, (
-                f"Expected status bar length {test_width}, got {len(status_bar)}"
+            layout = compute_layout(test_width)
+            expected_status_width = layout.conversation_width if layout.show_runtime else test_width
+            assert len(status_bar) == expected_status_width, (
+                f"Expected status bar length {expected_status_width} for width={test_width}, got {len(status_bar)}"
             )
+            composer_bottom = lines[-2]
+            assert len(status_bar) == len(composer_bottom)
             assert "stackmind" in status_bar
 
             # (c) Composer top border, body, and bottom border intact and contiguous
             composer_top = lines[-4]
             composer_body = lines[-3]
-            composer_bottom = lines[-2]
 
             assert composer_top[0] in ("╭", "┌")
             assert composer_top[-1] in ("╮", "┐")

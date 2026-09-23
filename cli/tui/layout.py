@@ -358,8 +358,8 @@ def render_full_screen_workspace(
         else None
     )
 
-    # 1. Bottom Status Bar (1 line, placed below composer, spans full terminal width / WO-017)
-    status_width = width
+    # 1. Bottom Status Bar (1 line, placed below composer, matches composer text box width / WO-018)
+    status_width = layout.conversation_width if layout.show_runtime else width
     status_bar_str = render_top_header_bar_str(
         session or {},
         width=status_width,
