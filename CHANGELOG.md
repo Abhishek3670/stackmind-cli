@@ -3,6 +3,31 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-09-23
+
+### Added
+- **Native Win32 Console Input Reader (Windows)**:
+  - Low-level console input reader (`Win32ConsoleReader`) utilizing `kernel32.dll` (`ReadConsoleInputW`, `GetNumberOfConsoleInputEvents`) to bypass `msvcrt` limitations.
+  - Recombination of UTF-16 surrogate pairs (`0xD800`–`0xDFFF`) into complete Unicode code points.
+  - Multi-record VT escape sequence assembly buffer (`_read_escape_sequence`) for parsing escape sequences generated under `ENABLE_VIRTUAL_TERMINAL_INPUT`.
+- **SGR Extended Mouse Scrolling**:
+  - Full support for SGR mouse reporting mode 1006 (`\x1b[<64;...M` / `\x1b[<65;...M`) mapped to `<WHEEL_UP>` and `<WHEEL_DOWN>` across Windows and POSIX.
+  - Conversation viewport vertical scrolling (`scroll_up`, `scroll_down`, Page Up, Page Down) in alternate screen buffer mode.
+  - Non-wheel mouse clicks (`<MOUSE_0_...M>`) filtered to prevent composer buffer corruption.
+- **Escape Sequence Navigation**:
+  - Direct assembly and decoding of Page Up (`\x1b[5~`), Page Down (`\x1b[6~`), Up Arrow (`\x1b[A`), and Down Arrow (`\x1b[B`) VT sequences.
+
+### Changed
+- **Default Windows Console Input Routing**:
+  - Promoted `_read_raw_key_windows_v2` (`Win32ConsoleReader`) to the default input reader on Windows platforms.
+  - Preserved legacy `msvcrt.getwch()` reading path as an explicit fallback via `STACKMIND_LEGACY_INPUT=1`.
+
+### Fixed
+- **Windows Terminal Mouse Wheel Collapse**:
+  - Resolved issue where mouse wheel events collapsed into Up/Down Arrow scan codes (`0xE0 0x48` / `0x50` via `msvcrt.getwch()`), causing stray navigation jumps.
+- **Composer Escape Character Leakage**:
+  - Fixed stray ANSI escape sequence characters (`[A`, `[B`) leaking into the composer prompt buffer by buffering multi-part escape sequences and retaining mouse reporting throughout the TUI lifecycle.
+
 ## [3.3.0] - 2026-09-22
 
 ### Added

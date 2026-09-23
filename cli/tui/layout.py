@@ -45,6 +45,25 @@ RUNTIME_HEADING = "StackMind Runtime"
 # Section headings for the runtime panel.
 RUNTIME_SECTIONS = ("AGENTS", "WORK ORDERS", "CURRENT OPERATION")
 
+# Vertical chrome geometry (§28, §31, WO-009):
+# - 3 lines for the pinned bottom composer box
+# - 1 line for the bottom status bar
+COMPOSER_BOX_HEIGHT = 3
+STATUS_BAR_HEIGHT = 1
+VERTICAL_CHROME_LINES = COMPOSER_BOX_HEIGHT + STATUS_BAR_HEIGHT  # 4 lines total
+MIN_VIEWPORT_HEIGHT = 4
+
+
+def compute_viewport_height(height: int | None = None) -> int:
+    """Calculate the conversation/workspace viewport height for a given terminal height.
+
+    Reserves lines for the pinned bottom composer box (3 lines) and the bottom status bar
+    (1 line), ensuring at least MIN_VIEWPORT_HEIGHT rows remain for the workspace.
+    This is the single canonical source of truth for vertical viewport sizing in the TUI.
+    """
+    lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
+    return max(MIN_VIEWPORT_HEIGHT, lines - VERTICAL_CHROME_LINES)
+
 
 # ── Layout Calculation ───────────────────────────────────────────────────────
 
@@ -147,6 +166,17 @@ def slice_conversation_viewport(
         follow_bottom = scroll <= 0
     elif scroll is not None:
         scroll.viewport_height = viewport_height
+        if total_lines > viewport_height:
+            max_off = total_lines - viewport_height
+            if hasattr(scroll, "max_offset"):
+                scroll.max_offset = max_off
+            if scroll.scroll_offset > max_off:
+                scroll.scroll_offset = max_off
+        else:
+            if hasattr(scroll, "max_offset"):
+                scroll.max_offset = 0
+            if hasattr(scroll, "scroll_offset") and scroll.scroll_offset > 0:
+                scroll.scroll_offset = 0
         offset = max(0, scroll.scroll_offset)
         follow_bottom = scroll.follow_bottom
     else:
@@ -286,7 +316,7 @@ def render_full_screen_workspace(
     conversation_content: str | None = None,
     composer_content: str | list[str] | None = None,
     composer_is_active: bool = False,
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     include_composer: bool = True,
     force_color: bool | None = None,
     no_color: bool | None = None,
@@ -328,7 +358,7 @@ def render_full_screen_workspace(
     )
 
     # 2. Viewport height (reserved 1 line for bottom status bar, plus 3 lines for composer box)
-    viewport_height = max(4, height - 4)
+    viewport_height = compute_viewport_height(height)
 
     # 3. Conversation content
     if conversation_content is not None:
@@ -437,7 +467,7 @@ class LiveWorkspaceManager:
         conversation_content: str | RenderableType | None = None,
         composer_content: str | None = None,
         composer_is_active: bool = False,
-        shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+        shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
         include_composer: bool = True,
         force_color: bool | None = None,
         no_color: bool | None = None,
@@ -517,7 +547,7 @@ class LiveWorkspaceManager:
         conversation_content: str | RenderableType | None = None,
         composer_content: str | None = None,
         composer_is_active: bool = False,
-        shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+        shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
         include_composer: bool = False,
         refresh: bool = True,
         force_color: bool | None = None,
@@ -578,16 +608,21 @@ def create_live_workspace(
 
 
 __all__ = [
+    "COMPOSER_BOX_HEIGHT",
     "ConversationScroll",
     "LiveWorkspaceManager",
+    "MIN_VIEWPORT_HEIGHT",
     "NARROW_THRESHOLD",
     "RUNTIME_HEADING",
     "RUNTIME_MAX_WIDTH",
     "RUNTIME_MIN_WIDTH",
     "RUNTIME_SECTIONS",
+    "STATUS_BAR_HEIGHT",
+    "VERTICAL_CHROME_LINES",
     "ColumnLayout",
     "RuntimePanelScroll",
     "compute_layout",
+    "compute_viewport_height",
     "create_live_workspace",
     "get_status_symbol",
     "render_conversation_column",

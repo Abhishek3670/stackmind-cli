@@ -84,6 +84,7 @@ from cli.tui.layout import (
     NARROW_THRESHOLD,
     LiveWorkspaceManager,
     compute_layout,
+    compute_viewport_height,
     create_live_workspace,
     render_full_screen_workspace,
     render_runtime_panel_str,
@@ -119,8 +120,12 @@ from cli.tui.glyphs import (
     tree_branch,
 )
 from cli.tui.keyboard import (
+    DISABLE_MOUSE_REPORTING_SEQ,
+    ENABLE_MOUSE_REPORTING_SEQ,
     GLOBAL_HISTORY,
     Key,
+    disable_mouse_reporting,
+    enable_mouse_reporting,
     raw_prompt_input,
 )
 
@@ -533,7 +538,7 @@ def render_top_header_bar_str(
 
 def render_composer_box(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     width: int = 80,
     content: str | list[str] | None = None,
     is_active: bool = False,
@@ -551,14 +556,26 @@ def render_composer_box(
 
     if not content and not has_content:
         left_plain = f"> {placeholder}"
-        right_plain = shortcuts
-        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
+        available_shortcuts_width = inner_width - len(left_plain) - 2
+        if available_shortcuts_width >= len(shortcuts):
+            right_plain = shortcuts
+        elif available_shortcuts_width >= len("Ctrl+K commands | Ctrl+L clear"):
+            right_plain = "Ctrl+K commands | Ctrl+L clear"
+        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L | PgUp/PgDn"):
+            right_plain = "Ctrl+K | Ctrl+L | PgUp/PgDn"
+        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L"):
+            right_plain = "Ctrl+K | Ctrl+L"
+        else:
+            right_plain = ""
 
-        line = Text()
+        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
+
+        line = Text(no_wrap=True)
         line.append("> ", style="bold #38bdf8")
         line.append(placeholder, style="dim #94a3b8")
-        line.append(" " * spaces_count)
-        line.append(shortcuts, style="dim #64748b")
+        if right_plain:
+            line.append(" " * spaces_count)
+            line.append(right_plain, style="dim #64748b")
         body: RenderableType = line
     else:
         if isinstance(content, str):
@@ -571,14 +588,26 @@ def render_composer_box(
         rendered_lines: list[Text] = []
         first_text = lines[0]
         left_plain = f"> {first_text}"
-        right_plain = shortcuts
-        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain))
+        available_shortcuts_width = inner_width - len(left_plain) - 2
+        if available_shortcuts_width >= len(shortcuts):
+            right_plain = shortcuts
+        elif available_shortcuts_width >= len("Ctrl+K commands | Ctrl+L clear"):
+            right_plain = "Ctrl+K commands | Ctrl+L clear"
+        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L | PgUp/PgDn"):
+            right_plain = "Ctrl+K | Ctrl+L | PgUp/PgDn"
+        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L"):
+            right_plain = "Ctrl+K | Ctrl+L"
+        else:
+            right_plain = ""
 
-        line1 = Text()
+        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
+
+        line1 = Text(no_wrap=True)
         line1.append("> ", style="bold #38bdf8")
         line1.append(first_text, style="bold white")
-        line1.append(" " * spaces_count)
-        line1.append(shortcuts, style="dim #64748b")
+        if right_plain:
+            line1.append(" " * spaces_count)
+            line1.append(right_plain, style="dim #64748b")
         rendered_lines.append(line1)
 
         for sub_line in lines[1:]:
@@ -599,7 +628,7 @@ def render_composer_box(
 
 def render_composer_box_str(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     width: int = 80,
     content: str | list[str] | None = None,
     is_active: bool = False,
@@ -661,11 +690,40 @@ def enter_alternate_screen(stream: Any = None) -> None:
         pass
 
 
-def exit_alternate_screen(stream: Any = None) -> None:
-    """Exit alternate screen buffer (WO-053).
+def enable_mouse_reporting(stream: Any = None) -> None:
+    """Enable terminal SGR mouse reporting (WO-054).
 
-    Emits \\x1b[?1049l (restore primary buffer).
+    Emits \\x1b[?1000h\\x1b[?1006h (normal tracking + SGR extended coordinates).
     """
+    target = stream or sys.stdout
+    try:
+        if target and hasattr(target, "write"):
+            target.write(ENABLE_MOUSE_REPORTING_SEQ)
+            target.flush()
+    except Exception:
+        pass
+
+
+def disable_mouse_reporting(stream: Any = None) -> None:
+    """Disable terminal SGR mouse reporting (WO-054).
+
+    Emits \\x1b[?1006l\\x1b[?1000l.
+    """
+    target = stream or sys.stdout
+    try:
+        if target and hasattr(target, "write"):
+            target.write(DISABLE_MOUSE_REPORTING_SEQ)
+            target.flush()
+    except Exception:
+        pass
+
+
+def exit_alternate_screen(stream: Any = None) -> None:
+    """Exit alternate screen buffer and disable mouse reporting (WO-053).
+
+    Emits \\x1b[?1006l\\x1b[?1000l (disable mouse reporting) and \\x1b[?1049l (restore primary buffer).
+    """
+    disable_mouse_reporting(stream)
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
@@ -676,14 +734,16 @@ def exit_alternate_screen(stream: Any = None) -> None:
 
 
 def restore_terminal_state(stream: Any = None) -> None:
-    """Restore terminal cursor and modes cleanly on exit and uncaught exceptions (§43, §44, WO-053).
+    """Restore terminal cursor, mouse modes, and attributes cleanly on exit and uncaught exceptions (§43, §44, WO-053).
 
-    Emits \\x1b[?1049l (exit alternate buffer), \\x1b[?25h (show cursor), and \\x1b[0m (reset attributes).
+    Emits \\x1b[?1006l\\x1b[?1000l (disable SGR mouse mode), \\x1b[?1049l (exit alternate buffer),
+    \\x1b[?25h (show cursor), and \\x1b[0m (reset attributes).
     """
     try:
         Console().show_cursor(True)
     except Exception:
         pass
+    disable_mouse_reporting(stream)
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
@@ -691,6 +751,26 @@ def restore_terminal_state(stream: Any = None) -> None:
             target.flush()
     except Exception:
         pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            for h in (k.GetStdHandle(-10), None):
+                target_h = h
+                if target_h is None:
+                    try:
+                        target_h = k.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+                    except Exception:
+                        target_h = 0
+                if target_h not in (0, -1):
+                    m = ctypes.c_uint32()
+                    if k.GetConsoleMode(target_h, ctypes.byref(m)):
+                        # Re-enable Quick Edit mode (0x0040) with extended flags (0x0080)
+                        k.SetConsoleMode(target_h, m.value | 0x0040 | 0x0080)
+        except Exception:
+            pass
 
 
 # ── Terminal Resize Management (WO-003) ──────────────────────────────────────
@@ -723,6 +803,21 @@ def check_terminal_resize(current_cols: int, current_lines: int) -> tuple[bool, 
     return resized, cols, lines
 
 
+def _wrap_text_to_width(text: str, width: int) -> str:
+    """Pre-wrap raw text to *width* columns so each ``\\n``-delimited line maps to
+    exactly one visual row when later placed in a Rich grid column of the same
+    width.  Uses the same Console-capture mechanism as
+    ``render_chat_transcript_str`` so the viewport slicer
+    (``slice_conversation_viewport``) counts lines that correspond 1:1 to
+    rendered rows — fixing the height-budget drift bug where long unwrapped
+    model output caused the runtime panel to scroll upward during streaming.
+    """
+    use_ansi = should_render_ansi()
+    console, _ = _make_capture_console(width=width)
+    console.print(Text(text), end="")
+    return console.export_text(styles=use_ansi).rstrip("\n")
+
+
 def redraw_full_screen(
     session: Mapping[str, Any] | None = None,
     state: Any | None = None,
@@ -734,7 +829,7 @@ def redraw_full_screen(
     conversation_content: str | RenderableType | None = None,
     composer_content: str | None = None,
     composer_is_active: bool = False,
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     include_composer: bool = True,
     live_manager: Any | None = None,
     force_color: bool | None = None,
@@ -796,7 +891,7 @@ def redraw_full_screen(
 
 def render_composer_top_border(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     width: int = 80,
     is_active: bool = False,
     has_content: bool = False,
@@ -843,7 +938,7 @@ def render_composer_top_border(
 
 def render_composer_top_border_str(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     width: int = 80,
     is_active: bool = False,
     has_content: bool = False,
@@ -881,13 +976,17 @@ def render_composer_bottom_border_str(width: int = 80, is_active: bool = False) 
 
 def prompt_composer_input(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
+    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
     width: int = 80,
     initial_text: str = "",
     multiline: bool = False,
     state: Any | None = None,
     on_ctrl_k: Callable[[], None] | None = None,
     on_ctrl_l: Callable[[], None] | None = None,
+    on_page_up: Callable[[], None] | None = None,
+    on_page_down: Callable[[], None] | None = None,
+    on_wheel_up: Callable[[], None] | None = None,
+    on_wheel_down: Callable[[], None] | None = None,
     history: list[str] | None = None,
     show_footer: bool = True,
     live_manager: Any | None = None,
@@ -897,8 +996,8 @@ def prompt_composer_input(
     """Prompt the user for input inside a styled composer box border.
 
     Supports native raw keyboard interception (msvcrt / termios), real Ctrl+K & Ctrl+L,
-    multiline expansion, active typing state tracking, and preserves
-    partially typed input buffer across background events (§28-§30).
+    Page Up/Down conversation scroll, multiline expansion, active typing state tracking,
+    and preserves partially typed input buffer across background events (§28-§30).
     Aligns composer width to conversation viewport when runtime panel is visible (WO-008).
     """
     term_width = terminal_width if terminal_width is not None else width
@@ -964,6 +1063,10 @@ def prompt_composer_input(
                 state=state,
                 on_ctrl_k=on_ctrl_k,
                 on_ctrl_l=on_ctrl_l,
+                on_page_up=on_page_up,
+                on_page_down=on_page_down,
+                on_wheel_up=on_wheel_up,
+                on_wheel_down=on_wheel_down,
                 top_border_renderer=lambda has_c: render_composer_top_border_str(
                     placeholder=placeholder,
                     shortcuts=shortcuts,
@@ -1196,6 +1299,30 @@ def _ensure_utf8() -> None:
 
             # ENABLE_VIRTUAL_TERMINAL_PROCESSING
             set_console_mode(handle, mode.value | 0x0004)
+
+        # STD_INPUT_HANDLE (-10) & CONIN$:
+        # ENABLE_MOUSE_INPUT (0x0010) - report mouse events in console input buffer
+        # ENABLE_EXTENDED_FLAGS (0x0080) - required to modify ENABLE_QUICK_EDIT_MODE
+        # ENABLE_VIRTUAL_TERMINAL_INPUT (0x0200) - VT input sequence translation
+        # Clear ENABLE_QUICK_EDIT_MODE (0x0040) - prevents console host from hijacking mouse for selection
+        handles_to_configure = []
+        std_in = get_std_handle(-10)
+        if std_in not in (0, -1):
+            handles_to_configure.append(std_in)
+        try:
+            conin = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+            if conin not in (0, -1):
+                handles_to_configure.append(conin)
+        except Exception:
+            pass
+
+        for h in handles_to_configure:
+            in_mode = ctypes.c_uint32()
+            if get_console_mode(h, ctypes.byref(in_mode)):
+                # ENABLE_MOUSE_INPUT (0x0010) | ENABLE_EXTENDED_FLAGS (0x0080) | ENABLE_VIRTUAL_TERMINAL_INPUT (0x0200)
+                # clear ENABLE_QUICK_EDIT_MODE (0x0040)
+                new_in_mode = (in_mode.value | 0x0200 | 0x0010 | 0x0080) & ~0x0040
+                set_console_mode(h, new_in_mode)
     except Exception:
         # Some hosts (redirected pipes, ConEmu-like wrappers, CI) do not
         # expose a Win32 console API. Their existing stream handling remains
@@ -1235,6 +1362,7 @@ def get_help_str() -> str:
         "Shortcuts:\n"
         "  Ctrl+K            Open this help menu\n"
         "  Ctrl+L            Redraw full screen\n"
+        "  PgUp / PgDn       Scroll conversation viewport\n"
         "  Ctrl+C / Ctrl+D   Cancel turn or exit\n"
         "  Esc               Cancel current prompt"
     )
@@ -1342,6 +1470,7 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized in {":exit", ":quit", "q"}:
+        disable_mouse_reporting()
         if live_manager is not None and getattr(live_manager, "is_active", False):
             live_manager.stop()
         return session, True
@@ -1358,6 +1487,22 @@ def dispatch_delivery_command(
         state.add_message("system", output_str)
         if not is_tty:
             click.echo(output_str)
+        return session, False
+
+    if normalized == ":debugkeys":
+        from cli.tui.keyboard import DEBUG_KEYS_ENABLED, DEBUG_LOG_FILE, set_debug_keys
+
+        new_state = not DEBUG_KEYS_ENABLED
+        set_debug_keys(new_state)
+        status_str = (
+            f"[DEBUG KEYS] Logging ENABLED -> writing raw key events to {DEBUG_LOG_FILE}"
+            if new_state
+            else "[DEBUG KEYS] Logging DISABLED."
+        )
+        state.add_message("user", normalized)
+        state.add_message("system", status_str)
+        if not is_tty:
+            click.echo(status_str)
         return session, False
 
     if normalized == ":reconnect":
@@ -1896,7 +2041,10 @@ def dispatch_delivery_command(
                             if getattr(state, "messages", None)
                             else ""
                         )
-                        tick_content = f"{transcript}\n\n{prog_text}" if transcript else prog_text
+                        # WO-014: Pre-wrap prog_text to conversation_width for consistent
+                        # viewport line-counting (latest_act_desc is unbounded).
+                        wrapped_prog = _wrap_text_to_width(prog_text, layout.conversation_width)
+                        tick_content = f"{transcript}\n\n{wrapped_prog}" if transcript else wrapped_prog
                         # AC-7: Route tick through redraw_full_screen with disabled busy composer (WO-013)
                         redraw_full_screen(
                             session,
@@ -1954,7 +2102,10 @@ def dispatch_delivery_command(
                         )
                         hdr = render_assistant_stream_header(model=model_name, width=layout.conversation_width)
                         curr_text = "".join(streamed_chunks)
-                        in_progress = f"{hdr}\n{curr_text}" if curr_text else hdr
+                        # WO-014: Pre-wrap raw streaming text to conversation_width
+                        # so slice_conversation_viewport line-count matches visual rows.
+                        wrapped_text = _wrap_text_to_width(curr_text, layout.conversation_width)
+                        in_progress = f"{hdr}\n{wrapped_text}" if wrapped_text else hdr
                         full_content = f"{transcript}\n\n{in_progress}" if transcript else in_progress
                         # WO-013 (AC-3): Render tokens inside width-constrained frame with disabled busy-state composer.
                         # Inactive composer box (#475569) displays busy placeholder while generation is active.
@@ -2283,6 +2434,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
         if is_tty:
             _ensure_utf8()
             enter_alternate_screen()
+            enable_mouse_reporting()
             redraw_full_screen(session, state, clear=True, include_composer=False)
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
@@ -2359,7 +2511,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                                     state=state,
                                     scroll=state.scroll,
                                     conversation_scroll=state.conversation_scroll,
-                                    height=max(4, shutil.get_terminal_size(fallback=(80, 24)).lines - 4),
+                                    height=compute_viewport_height(current_lines),
                                 )
                             )
                         else:
@@ -2371,6 +2523,32 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                                 )
                             )
 
+                def _handle_page_up() -> None:
+                    """Scroll conversation viewport up by half a page."""
+                    vp_height = compute_viewport_height(current_lines)
+                    state.scroll_conversation_up(max(1, vp_height // 2))
+                    if is_tty:
+                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+
+                def _handle_page_down() -> None:
+                    """Scroll conversation viewport down by half a page."""
+                    vp_height = compute_viewport_height(current_lines)
+                    state.scroll_conversation_down(max(1, vp_height // 2))
+                    if is_tty:
+                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+
+                def _handle_wheel_up() -> None:
+                    """Scroll conversation viewport up by wheel step (3 lines)."""
+                    state.scroll_conversation_up(3)
+                    if is_tty:
+                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+
+                def _handle_wheel_down() -> None:
+                    """Scroll conversation viewport down by wheel step (3 lines)."""
+                    state.scroll_conversation_down(3)
+                    if is_tty:
+                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+
                 text = prompt_composer_input(
                     width=comp_width,
                     terminal_width=term_cols,
@@ -2378,6 +2556,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     session=session,
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
+                    on_page_up=_handle_page_up,
+                    on_page_down=_handle_page_down,
+                    on_wheel_up=_handle_wheel_up,
+                    on_wheel_down=_handle_wheel_down,
                     show_footer=False if is_tty else not getattr(state, "has_conversation", False),
                     live_manager=live_ws,
                 )
@@ -2387,6 +2569,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                 click.echo()
                 break
             try:
+                # Auto-return to bottom when user submits a new message.
+                # If they were scrolled up reading history, the new turn starts
+                # at the bottom so the streaming response is visible.
+                state.scroll_conversation_to_bottom()
                 session, should_exit = dispatch_delivery_command(
                     adapter,
                     client,
@@ -2406,6 +2592,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
             if is_tty:
                 redraw_full_screen(session, state, include_composer=False, live_manager=live_ws)
     finally:
+        disable_mouse_reporting()
         if live_ws is not None:
             live_ws.stop()
         restore_terminal_state()

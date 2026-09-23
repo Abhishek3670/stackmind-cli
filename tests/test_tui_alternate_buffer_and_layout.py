@@ -20,6 +20,8 @@ from click.testing import CliRunner
 
 from cli.main import cli as main_cli
 from cli.tui.app import (
+    disable_mouse_reporting,
+    enable_mouse_reporting,
     enter_alternate_screen,
     exit_alternate_screen,
     redraw_full_screen,
@@ -58,20 +60,32 @@ def test_enter_alternate_screen_emits_expected_sequences():
     assert "\x1b[H" in out
 
 
+def test_enable_and_disable_mouse_reporting():
+    """Verify enable_mouse_reporting and disable_mouse_reporting emit correct SGR control sequences."""
+    buf = io.StringIO()
+    enable_mouse_reporting(stream=buf)
+    assert "\x1b[?1000h\x1b[?1006h" in buf.getvalue()
+
+    buf2 = io.StringIO()
+    disable_mouse_reporting(stream=buf2)
+    assert "\x1b[?1006l\x1b[?1000l" in buf2.getvalue()
+
+
 def test_exit_alternate_screen_emits_expected_sequence():
-    """Verify exit_alternate_screen writes primary buffer restore sequence."""
+    """Verify exit_alternate_screen writes mouse disable and primary buffer restore sequence."""
     buf = io.StringIO()
     exit_alternate_screen(stream=buf)
     out = buf.getvalue()
-    # \x1b[?1049l: restore primary screen buffer
+    assert "\x1b[?1006l\x1b[?1000l" in out
     assert "\x1b[?1049l" in out
 
 
 def test_restore_terminal_state_emits_alternate_exit_and_cursor_reset():
-    """Verify restore_terminal_state exits alternate screen, shows cursor, and resets attributes."""
+    """Verify restore_terminal_state disables mouse reporting, exits alternate screen, shows cursor, and resets attributes."""
     buf = io.StringIO()
     restore_terminal_state(stream=buf)
     out = buf.getvalue()
+    assert "\x1b[?1006l\x1b[?1000l" in out
     assert "\x1b[?1049l" in out
     assert "\x1b[?25h" in out
     assert "\x1b[0m" in out
@@ -82,6 +96,8 @@ def test_alternate_screen_functions_handle_broken_or_none_stream(monkeypatch):
     monkeypatch.setattr("sys.stdout", None)
     # Must not raise
     enter_alternate_screen()
+    enable_mouse_reporting()
+    disable_mouse_reporting()
     exit_alternate_screen()
     restore_terminal_state()
 
@@ -714,5 +730,154 @@ def test_slice_conversation_viewport_with_multiline_ansi():
     for line in sliced_lines:
         if line.strip():
             assert "\x1b[" in line
+
+
+# ─── 13. CONVERSATION VIEWPORT SCROLLING & BOUNDS ────────────────────────────
+
+
+def test_conversation_scroll_up_shows_earlier_content():
+    """Verify that scrolling up with ConversationScroll slices earlier lines from the transcript."""
+    from cli.tui.state import ConversationScroll
+    from cli.tui.layout import slice_conversation_viewport
+
+    # 10 lines of transcript, viewport of 4 lines
+    transcript = "\n".join(f"Line {i}" for i in range(1, 11))
+    scroll = ConversationScroll()
+
+    # Default (bottom): displays lines 7 to 10
+    bottom_view = slice_conversation_viewport(transcript, viewport_height=4, scroll=scroll)
+    bottom_lines = bottom_view.split("\n")
+    assert "Line 7" in bottom_lines
+    assert "Line 10" in bottom_lines
+    assert "Line 1" not in bottom_lines
+
+    # Scroll up 3 lines: displays lines 4 to 7
+    scroll.scroll_up(3)
+    up_view = slice_conversation_viewport(transcript, viewport_height=4, scroll=scroll)
+    up_lines = up_view.split("\n")
+    assert "Line 4" in up_lines
+    assert "Line 7" in up_lines
+    assert "Line 10" not in up_lines
+
+
+def test_conversation_scroll_down_returns_toward_bottom():
+    """Verify that scrolling down decreases offset and returns toward bottom, resuming follow_bottom at 0."""
+    from cli.tui.state import ConversationScroll
+    from cli.tui.layout import slice_conversation_viewport
+
+    transcript = "\n".join(f"Line {i}" for i in range(1, 11))
+    scroll = ConversationScroll()
+
+    # Scroll up to the top (offset 6)
+    scroll.scroll_up(6)
+    slice_conversation_viewport(transcript, viewport_height=4, scroll=scroll)
+    assert scroll.follow_bottom is False
+
+    # Scroll down 3 lines
+    scroll.scroll_down(3)
+    assert scroll.scroll_offset == 3
+    assert scroll.follow_bottom is False
+
+    # Scroll down another 3 lines -> reaches 0, resumes follow_bottom
+    scroll.scroll_down(3)
+    assert scroll.scroll_offset == 0
+    assert scroll.follow_bottom is True
+
+    # Sliced output is back at the bottom
+    bottom_view = slice_conversation_viewport(transcript, viewport_height=4, scroll=scroll)
+    assert "Line 10" in bottom_view
+
+
+def test_conversation_scroll_cannot_exceed_bounds():
+    """Verify scrolling cannot scroll past the top of the transcript or below the bottom."""
+    from cli.tui.state import ConversationScroll
+    from cli.tui.layout import slice_conversation_viewport
+
+    # 10 lines, viewport 4 => max_offset is 10 - 4 = 6
+    transcript = "\n".join(f"Line {i}" for i in range(1, 11))
+    scroll = ConversationScroll()
+
+    # Attempt to scroll up past the top by 100 lines
+    scroll.scroll_up(100)
+    top_view = slice_conversation_viewport(transcript, viewport_height=4, scroll=scroll)
+    top_lines = top_view.split("\n")
+    assert len(top_lines) == 4
+    # The top-most lines must be Line 1 .. Line 4
+    assert top_lines[0] == "Line 1"
+    assert top_lines[3] == "Line 4"
+    # scroll_offset is clamped to max_offset (6)
+    assert scroll.scroll_offset == 6
+
+    # Attempt to scroll down past the bottom by 100 lines
+    scroll.scroll_down(100)
+    assert scroll.scroll_offset == 0
+    assert scroll.follow_bottom is True
+
+    bottom_view = slice_conversation_viewport(transcript, viewport_height=4, scroll=scroll)
+    bottom_lines = bottom_view.split("\n")
+    assert len(bottom_lines) == 4
+    assert bottom_lines[0] == "Line 7"
+    assert bottom_lines[3] == "Line 10"
+
+
+def test_new_content_while_scrolled_up_triggers_activity_indicator():
+    """Verify that adding messages while scrolled up sets has_new_activity and renders the activity badge."""
+    from cli.tui.state import AutonomousDeliveryState
+    from cli.tui.layout import render_workspace_layout
+
+    state = AutonomousDeliveryState(session_id="test-scroll")
+    # Populate initial messages
+    for i in range(10):
+        state.add_message("user" if i % 2 == 0 else "assistant", f"Message {i}")
+
+    # User scrolls up
+    state.scroll_conversation_up(5)
+    assert state.conversation_scroll.follow_bottom is False
+    assert state.conversation_scroll.scroll_offset == 5
+    assert state.conversation_scroll.has_new_activity is False
+
+    # New message arrives while scrolled up
+    state.add_message("assistant", "New incoming message")
+    assert state.conversation_scroll.has_new_activity is True
+
+    # Render workspace layout with state and scroll - activity badge must be present
+    rendered = render_workspace_layout("sample conversation", width=120, state=state, conversation_scroll=state.conversation_scroll)
+    from rich.console import Console
+    console = Console()
+    with console.capture() as capture:
+        console.print(rendered)
+    captured_text = capture.get()
+    assert "↓ New activity" in captured_text
+
+    # Submitting a turn auto-returns to bottom (as wired in app.py)
+    state.scroll_conversation_to_bottom()
+    assert state.conversation_scroll.scroll_offset == 0
+    assert state.conversation_scroll.follow_bottom is True
+    assert state.conversation_scroll.has_new_activity is False
+
+
+def test_compute_viewport_height_canonical_calculation():
+    """Verify compute_viewport_height accurately reserves vertical chrome lines (composer + status bar)."""
+    from cli.tui.layout import (
+        COMPOSER_BOX_HEIGHT,
+        MIN_VIEWPORT_HEIGHT,
+        STATUS_BAR_HEIGHT,
+        VERTICAL_CHROME_LINES,
+        compute_viewport_height,
+    )
+
+    assert COMPOSER_BOX_HEIGHT == 3
+    assert STATUS_BAR_HEIGHT == 1
+    assert VERTICAL_CHROME_LINES == 4
+
+    # 24 rows terminal: 24 - 4 = 20
+    assert compute_viewport_height(24) == 20
+    # 30 rows terminal: 30 - 4 = 26
+    assert compute_viewport_height(30) == 26
+    # Narrow/short terminal: clamped to MIN_VIEWPORT_HEIGHT (4)
+    assert compute_viewport_height(6) == MIN_VIEWPORT_HEIGHT
+    assert compute_viewport_height(2) == MIN_VIEWPORT_HEIGHT
+
+
 
 

@@ -240,10 +240,13 @@ class ConversationScroll:
     viewport_height: int | None = None
     has_new_activity: bool = False
     follow_bottom: bool = True
+    max_offset: int | None = None
 
     def scroll_up(self, lines: int = 1) -> None:
         """Scroll view upward, detaching from live-following."""
         self.scroll_offset += max(1, lines)
+        if self.max_offset is not None:
+            self.scroll_offset = min(self.scroll_offset, self.max_offset)
         self.follow_bottom = False
 
     def scroll_down(self, lines: int = 1) -> None:

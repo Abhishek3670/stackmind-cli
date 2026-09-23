@@ -323,3 +323,128 @@ def test_busy_state_composer_rendered_during_active_streaming():
     assert "Generating response... (Ctrl+C to cancel)" in frame
     assert "Ctrl+K commands" in frame
 
+
+# ── WO-014: Height-budget / viewport drift tests ──────────────────────────────
+
+
+def test_wrap_text_to_width_breaks_long_lines():
+    """_wrap_text_to_width must split a long unwrapped line into multiple lines
+    so that each logical '\\n'-delimited line fits within the target width."""
+    from cli.tui.app import _wrap_text_to_width
+
+    # A single 200-char line must be broken when wrapped to 40 columns.
+    long_line = "word " * 40  # 200 chars, no newlines
+    wrapped = _wrap_text_to_width(long_line.strip(), 40)
+    lines = wrapped.split("\n")
+    assert len(lines) > 1, "Long line was not broken into multiple lines"
+    for line in lines:
+        # Each visual line must not exceed target width (Rich may leave
+        # trailing spaces but the visible content should fit).
+        assert len(line.rstrip()) <= 40, f"Line exceeds target width: {line!r}"
+
+
+def test_wrap_text_preserves_short_lines():
+    """Short lines that already fit within width should pass through unchanged."""
+    from cli.tui.app import _wrap_text_to_width
+
+    short = "Hello world\nLine two"
+    wrapped = _wrap_text_to_width(short, 80)
+    assert wrapped.strip() == short.strip()
+
+
+def test_streaming_content_line_count_matches_viewport():
+    """When streaming raw text is pre-wrapped, the line count of full_content
+    passed to slice_conversation_viewport must not exceed what the viewport
+    expects — i.e. long lines must already be broken before slicing.
+
+    This is the regression test for the height-budget drift bug.
+    """
+    from cli.tui.app import _wrap_text_to_width
+    from cli.tui.chat import render_assistant_stream_header
+    from cli.tui.layout import compute_layout, slice_conversation_viewport
+
+    layout = compute_layout(120)
+    viewport_height = 20  # typical
+
+    # Simulate a long streaming response: 10 very long paragraphs
+    paragraphs = [("This is a long sentence that should wrap. " * 6).strip() for _ in range(10)]
+    raw_text = "\n\n".join(paragraphs)
+
+    hdr = render_assistant_stream_header(model="test-model", width=layout.conversation_width)
+
+    # Without the fix: raw text would have few logical lines but many visual rows
+    raw_lines = f"{hdr}\n{raw_text}".split("\n")
+
+    # With the fix: wrapped text line count reflects actual visual rows
+    wrapped_text = _wrap_text_to_width(raw_text, layout.conversation_width)
+    wrapped_content = f"{hdr}\n{wrapped_text}"
+    wrapped_lines = wrapped_content.split("\n")
+
+    # Wrapped must have more lines than raw (since raw has long lines)
+    assert len(wrapped_lines) >= len(raw_lines), \
+        f"Wrapped ({len(wrapped_lines)}) should have >= lines than raw ({len(raw_lines)})"
+
+    # After slicing, the result must have exactly viewport_height lines
+    sliced = slice_conversation_viewport(wrapped_content, viewport_height)
+    sliced_lines = sliced.split("\n")
+    assert len(sliced_lines) == viewport_height, \
+        f"Sliced output has {len(sliced_lines)} lines, expected {viewport_height}"
+
+
+def test_full_frame_height_stable_with_long_streaming_content():
+    """End-to-end: render_full_screen_workspace output height must equal the
+    terminal height regardless of how long the streaming content is.
+
+    Simulates the exact scenario the user described: several long paragraphs
+    plus a wide code block exceeding one screen of height.  The rendered frame
+    must always occupy exactly `height` rows — if it's taller, the runtime
+    panel has drifted.
+    """
+    from cli.tui.app import _wrap_text_to_width
+    from cli.tui.chat import render_assistant_stream_header, render_chat_transcript_str
+    from cli.tui.layout import compute_layout, render_full_screen_workspace
+    from cli.tui.state import AutonomousDeliveryState
+
+    terminal_width = 120
+    terminal_height = 30
+    layout = compute_layout(terminal_width)
+
+    session = {"session_id": "sess-height-test"}
+    state = AutonomousDeliveryState(session_id="sess-height-test")
+    # Add a prior user message so there's a non-empty transcript
+    state.add_message("user", "Write me a long explanation with code examples.")
+
+    # Build a long streaming response: 8 paragraphs + a wide code block
+    paragraphs = [
+        ("This is a detailed explanation of how the system works internally, "
+         "covering multiple subsystems and their interactions in depth. " * 3).strip()
+        for _ in range(8)
+    ]
+    code_block = "    " + "x = some_function(arg1, arg2, arg3, arg4, arg5, arg6)  # this line is intentionally very wide to test wrapping behavior\n" * 12
+    raw_streaming = "\n\n".join(paragraphs) + "\n\n```python\n" + code_block + "```"
+
+    # This is what the fixed streaming loop does:
+    transcript = render_chat_transcript_str(state.messages, width=layout.conversation_width)
+    hdr = render_assistant_stream_header(model="gpt-4o", width=layout.conversation_width)
+    wrapped = _wrap_text_to_width(raw_streaming, layout.conversation_width)
+    in_progress = f"{hdr}\n{wrapped}"
+    full_content = f"{transcript}\n\n{in_progress}"
+
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=terminal_width,
+        height=terminal_height,
+        conversation_content=full_content,
+        include_composer=True,
+        composer_is_active=False,
+        composer_placeholder="Generating response... (Ctrl+C to cancel)",
+    )
+
+    # The frame must have exactly terminal_height lines (workspace + composer + status bar).
+    # If it's taller, the runtime panel has drifted upward — the bug we're fixing.
+    frame_lines = frame.split("\n")
+    assert len(frame_lines) == terminal_height, (
+        f"Frame has {len(frame_lines)} lines but terminal_height is {terminal_height}. "
+        f"Runtime panel would drift by {len(frame_lines) - terminal_height} rows."
+    )
