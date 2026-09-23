@@ -448,3 +448,37 @@ def test_full_frame_height_stable_with_long_streaming_content():
         f"Frame has {len(frame_lines)} lines but terminal_height is {terminal_height}. "
         f"Runtime panel would drift by {len(frame_lines) - terminal_height} rows."
     )
+
+
+def test_prompt_submission_transitions_seamlessly_to_busy_composer(monkeypatch):
+    """Verify prompt submission transitions directly to busy composer without flash (WO-015 AC-1, AC-5)."""
+    from unittest.mock import MagicMock
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState
+
+    session = {"session_id": "sess-submit-test", "workspace": "."}
+    state = AutonomousDeliveryState(session_id="sess-submit-test")
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-submit-1"}
+    mock_adapter.stream.return_value = iter([])
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED"}
+
+    redraw_calls = []
+    def mock_redraw(*args, **kwargs):
+        redraw_calls.append(kwargs)
+        return "mock_frame"
+
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.app.redraw_full_screen", mock_redraw)
+
+    dispatch_delivery_command(mock_adapter, mock_client, session, "user message", state, client_timeout=0.1)
+
+    assert len(redraw_calls) >= 1
+    post_submission = redraw_calls[0]
+    assert post_submission.get("include_composer") is True
+    assert post_submission.get("composer_is_active") is False
+    assert post_submission.get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
+    assert post_submission.get("clear") is False
