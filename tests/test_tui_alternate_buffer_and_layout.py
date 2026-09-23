@@ -346,10 +346,11 @@ def test_render_full_screen_workspace_without_composer():
     assert "Type a message..." not in frame_without
     assert "Ctrl+K commands" not in frame_without
 
-    # Height without composer must be exactly 4 lines shorter than frame with composer (3 lines composer + 1 line status bar)
+    # Height without composer must be exactly 3 lines shorter than frame with composer (3 lines composer omitted, status bar retained per WO-015 AC-4)
     lines_with = len(frame_with.splitlines())
     lines_without = len(frame_without.splitlines())
-    assert lines_without == lines_with - 4
+    assert lines_without == lines_with - 3
+    assert "sess-001" in frame_without
 
 
 def test_redraw_full_screen_without_composer_emits_newline_for_prompt_positioning():
@@ -396,7 +397,7 @@ def test_bottom_status_bar_relocation_in_full_screen_workspace():
     assert "codex" in lines[-1]
     assert "online" in lines[-1]
 
-    # Without composer: bottom rows (composer + status bar) are omitted for prompt_composer_input
+    # Without composer: composer box is omitted, but status bar is retained (WO-015 AC-4)
     frame_without = render_full_screen_workspace(
         session=session,
         state=state,
@@ -406,7 +407,7 @@ def test_bottom_status_bar_relocation_in_full_screen_workspace():
     )
     lines_wo = frame_without.splitlines()
     assert "stackmind" not in lines_wo[0]
-    assert "stackmind" not in lines_wo[-1]
+    assert "stackmind" in lines_wo[-1]
 
 
 def test_prompt_composer_input_renders_status_bar_at_bottom(monkeypatch, capsys):
@@ -502,9 +503,11 @@ def test_in_viewport_turn_streaming_clears_composer(monkeypatch):
 
     dispatch_delivery_command(adapter, client, session, "hello world", state, client_timeout=0.1)
 
-    # First redraw must be called with include_composer=False to clear composer before streaming
+    # First redraw transitions seamlessly to busy-state composer (WO-015 AC-1)
     assert len(redraw_calls) >= 1
-    assert redraw_calls[0].get("include_composer") is False
+    assert redraw_calls[0].get("include_composer") is True
+    assert redraw_calls[0].get("composer_is_active") is False
+    assert redraw_calls[0].get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
 
 
 # ─── 9. WO-008: COMPOSER WIDTH ALIGNMENT TO CONVERSATION VIEWPORT ────────────
@@ -877,6 +880,111 @@ def test_compute_viewport_height_canonical_calculation():
     # Narrow/short terminal: clamped to MIN_VIEWPORT_HEIGHT (4)
     assert compute_viewport_height(6) == MIN_VIEWPORT_HEIGHT
     assert compute_viewport_height(2) == MIN_VIEWPORT_HEIGHT
+
+
+# ─── 13. WO-015: VIEWPORT SCROLL & CTRL+L PRESERVE COMPOSER & STATUS BAR ──────
+
+
+def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch, tmp_path):
+    """Verify scroll and Ctrl+L handlers retain composer and status bar without erasing (WO-015 AC-2, AC-3)."""
+    import os
+    from unittest.mock import MagicMock
+    from click.testing import CliRunner
+    from cli.tui.app import tui
+
+    captured_handlers = {}
+    def mock_prompt_input(**kwargs):
+        captured_handlers.update(kwargs)
+        raise KeyboardInterrupt()
+
+    redraw_calls = []
+    def mock_redraw(*args, **kwargs):
+        redraw_calls.append(kwargs)
+        return "mock_frame"
+
+    stdout_writes = []
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.app.prompt_composer_input", mock_prompt_input)
+    monkeypatch.setattr("cli.tui.app.redraw_full_screen", mock_redraw)
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=(80, 24): os.terminal_size((120, 24)))
+
+    mock_client = MagicMock()
+    mock_client.create_session.return_value = {
+        "session_id": "sess-001",
+        "agent": "codex",
+        "provider": "daemon",
+        "workspace": str(tmp_path),
+    }
+    mock_client.events.return_value = []
+    monkeypatch.setattr("cli.tui.app.DaemonClient", lambda url: mock_client)
+    monkeypatch.setattr("cli.tui.app.StackMindTuiAdapter", lambda client: MagicMock())
+    monkeypatch.setattr("cli.tui.app.enter_alternate_screen", lambda: None)
+    monkeypatch.setattr("cli.tui.app.enable_mouse_reporting", lambda: None)
+
+    tui.callback(daemon_url="http://mock", agent="codex", workspace=tmp_path, demo=False, client_timeout=45.0)
+
+    mock_editor = MagicMock()
+
+    # Test Page Up handler
+    redraw_calls.clear()
+    stdout_writes.clear()
+    captured_handlers["on_page_up"](mock_editor)
+    assert len(redraw_calls) == 1
+    assert redraw_calls[0].get("include_composer") is True
+    assert redraw_calls[0].get("composer_is_active") is True
+    assert redraw_calls[0].get("clear") is False
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    mock_editor.redraw_line.assert_called_once()
+
+    # Test Page Down handler
+    redraw_calls.clear()
+    stdout_writes.clear()
+    mock_editor.reset_mock()
+    captured_handlers["on_page_down"](mock_editor)
+    assert len(redraw_calls) == 1
+    assert redraw_calls[0].get("include_composer") is True
+    assert redraw_calls[0].get("composer_is_active") is True
+    assert redraw_calls[0].get("clear") is False
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    mock_editor.redraw_line.assert_called_once()
+
+    # Test Wheel Up handler
+    redraw_calls.clear()
+    stdout_writes.clear()
+    mock_editor.reset_mock()
+    captured_handlers["on_wheel_up"](mock_editor)
+    assert len(redraw_calls) == 1
+    assert redraw_calls[0].get("include_composer") is True
+    assert redraw_calls[0].get("composer_is_active") is True
+    assert redraw_calls[0].get("clear") is False
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    mock_editor.redraw_line.assert_called_once()
+
+    # Test Wheel Down handler
+    redraw_calls.clear()
+    stdout_writes.clear()
+    mock_editor.reset_mock()
+    captured_handlers["on_wheel_down"](mock_editor)
+    assert len(redraw_calls) == 1
+    assert redraw_calls[0].get("include_composer") is True
+    assert redraw_calls[0].get("composer_is_active") is True
+    assert redraw_calls[0].get("clear") is False
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    mock_editor.redraw_line.assert_called_once()
+
+    # Test Ctrl+L handler
+    redraw_calls.clear()
+    stdout_writes.clear()
+    mock_editor.reset_mock()
+    captured_handlers["on_ctrl_l"](mock_editor)
+    assert len(redraw_calls) == 1
+    assert redraw_calls[0].get("include_composer") is True
+    assert redraw_calls[0].get("composer_is_active") is True
+    assert redraw_calls[0].get("clear") is True
+    assert any("\x1b[22;1H" in s for s in stdout_writes)
+    mock_editor.redraw_line.assert_called_once()
 
 
 

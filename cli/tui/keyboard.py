@@ -954,40 +954,62 @@ def raw_prompt_input(
 
     def wrapped_ctrl_l() -> None:
         """Handle Ctrl+L with screen clear and clean prompt restoration."""
-        sys.stdout.write("\x1b[2J\x1b[H")
-        sys.stdout.flush()
         if on_ctrl_l:
-            on_ctrl_l()
-        if top_border_renderer:
-            sys.stdout.write(top_border_renderer(bool(editor.buffer)) + "\n")
+            try:
+                on_ctrl_l(editor)
+            except TypeError:
+                on_ctrl_l()
+        else:
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+            if top_border_renderer:
+                sys.stdout.write(top_border_renderer(bool(editor.buffer)) + "\n")
         editor.redraw_line()
 
     def wrapped_page_up() -> None:
         """Handle Page Up — scroll conversation viewport up, then restore prompt line."""
         if on_page_up:
-            on_page_up()
+            try:
+                on_page_up(editor)
+            except TypeError:
+                on_page_up()
         editor.redraw_line()
 
     def wrapped_page_down() -> None:
         """Handle Page Down — scroll conversation viewport down, then restore prompt line."""
         if on_page_down:
-            on_page_down()
+            try:
+                on_page_down(editor)
+            except TypeError:
+                on_page_down()
         editor.redraw_line()
 
     def wrapped_wheel_up() -> None:
         """Handle Mouse Wheel Up — scroll conversation viewport up, then restore prompt line."""
         if on_wheel_up:
-            on_wheel_up()
+            try:
+                on_wheel_up(editor)
+            except TypeError:
+                on_wheel_up()
         elif on_page_up:
-            on_page_up()
+            try:
+                on_page_up(editor)
+            except TypeError:
+                on_page_up()
         editor.redraw_line()
 
     def wrapped_wheel_down() -> None:
         """Handle Mouse Wheel Down — scroll conversation viewport down, then restore prompt line."""
         if on_wheel_down:
-            on_wheel_down()
+            try:
+                on_wheel_down(editor)
+            except TypeError:
+                on_wheel_down()
         elif on_page_down:
-            on_page_down()
+            try:
+                on_page_down(editor)
+            except TypeError:
+                on_page_down()
         editor.redraw_line()
 
     editor = RawLineEditor(

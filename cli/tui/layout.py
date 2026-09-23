@@ -390,7 +390,7 @@ def render_full_screen_workspace(
     )
 
     if not include_composer:
-        return workspace_str
+        return f"{workspace_str}\n{status_bar_str}"
 
     # 5. Pinned bottom composer box (3 lines) placed above bottom status bar
     comp_width = layout.conversation_width if layout.show_runtime else width

@@ -1961,7 +1961,15 @@ def dispatch_delivery_command(
     prompt_text = normalized[8:].strip() if normalized.startswith(":prompt ") else normalized
     state.add_message("user", prompt_text)
     if is_tty:
-        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_manager)
+        redraw_full_screen(
+            session,
+            state,
+            clear=False,
+            include_composer=True,
+            composer_is_active=False,
+            composer_placeholder="Generating response... (Ctrl+C to cancel)",
+            live_manager=live_manager,
+        )
     else:
         click.echo(render_user_message_str(prompt_text))
     op_id = "turn"
@@ -2490,9 +2498,19 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     else:
                         click.echo(out)
 
-                def _handle_ctrl_l() -> None:
+                def _handle_ctrl_l(editor: Any = None) -> None:
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     if is_tty:
-                        redraw_full_screen(session, state, clear=True, include_composer=False, live_manager=live_ws)
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=True,
+                            include_composer=True,
+                            composer_is_active=True,
+                            live_manager=live_ws,
+                        )
+                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.flush()
                     else:
                         click.echo(render_top_header_bar_str(
                             session, width=term_cols, context_meter=(state.context_meter_text, state.context_warning_level)
@@ -2511,7 +2529,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                                     state=state,
                                     scroll=state.scroll,
                                     conversation_scroll=state.conversation_scroll,
-                                    height=compute_viewport_height(current_lines),
+                                    height=compute_viewport_height(term_lines),
                                 )
                             )
                         else:
@@ -2522,32 +2540,82 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                                     width=term_cols,
                                 )
                             )
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
 
-                def _handle_page_up() -> None:
+                def _handle_page_up(editor: Any = None) -> None:
                     """Scroll conversation viewport up by half a page."""
-                    vp_height = compute_viewport_height(current_lines)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    vp_height = compute_viewport_height(term_lines)
                     state.scroll_conversation_up(max(1, vp_height // 2))
                     if is_tty:
-                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=True,
+                            live_manager=live_ws,
+                        )
+                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
 
-                def _handle_page_down() -> None:
+                def _handle_page_down(editor: Any = None) -> None:
                     """Scroll conversation viewport down by half a page."""
-                    vp_height = compute_viewport_height(current_lines)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    vp_height = compute_viewport_height(term_lines)
                     state.scroll_conversation_down(max(1, vp_height // 2))
                     if is_tty:
-                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=True,
+                            live_manager=live_ws,
+                        )
+                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
 
-                def _handle_wheel_up() -> None:
+                def _handle_wheel_up(editor: Any = None) -> None:
                     """Scroll conversation viewport up by wheel step (3 lines)."""
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     state.scroll_conversation_up(3)
                     if is_tty:
-                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=True,
+                            live_manager=live_ws,
+                        )
+                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
 
-                def _handle_wheel_down() -> None:
+                def _handle_wheel_down(editor: Any = None) -> None:
                     """Scroll conversation viewport down by wheel step (3 lines)."""
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     state.scroll_conversation_down(3)
                     if is_tty:
-                        redraw_full_screen(session, state, clear=False, include_composer=False, live_manager=live_ws)
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=True,
+                            live_manager=live_ws,
+                        )
+                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
 
                 text = prompt_composer_input(
                     width=comp_width,
