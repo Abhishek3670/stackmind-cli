@@ -79,7 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Dynamic resize transition tests (120→90, 90→160) verifying no geometry drift or border clipping.
 
 ## [Unreleased]
-- Initial repository scaffolding.
+- **Phase A: Governed Agent File I/O Integration (WO-026)**:
+  - Governed Scratch Workspace & Tool Runtime Integration: pre-turn `ScratchWorkspace` instantiation and `ToolGateway` setup in `AgentRunner`.
+  - Connected `AgentRunner` to `ProviderGateway` for model tool loop execution (`read_file`, `write_file`).
+  - First-class file I/O containment: model writes execute in scratch workspace; authoritative project modified only upon passing verification.
+  - Fail-closed contract scope boundary checking and path traversal prevention.
+  - Comprehensive integration test suite in `tests/test_harness_file_io.py` (6/6 tests passing).
 
 ## [3.5.2] - 2026-09-26
 
