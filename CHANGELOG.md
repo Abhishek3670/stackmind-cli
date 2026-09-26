@@ -60,5 +60,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ANSI Escape Styling in Workspace Layout (WO-012)**:
   - Preserved full ANSI styling (user message backgrounds, assistant model badges, markdown syntax highlighting) across the entire conversation viewport by enabling truecolor capture console in `render_workspace_layout_str`.
 
+## [3.5.0] - 2026-09-26
+
+### Added
+- **5-Tier Responsive TUI Layout Engine (WO-019)**:
+  - Constraint-based responsive architecture with 5 breakpoints: Very Narrow (<80 cols), Narrow (80-99), Normal (100-139), Wide (140-179), Very Wide (>=180).
+  - Single-column full-width modes with compact runtime badges (Very Narrow/Narrow).
+  - Proportional 2-column layout with adaptive conversation/runtime panel widths (Normal/Wide).
+  - Centered conversation deck with balanced gutters and max-width constraint (Very Wide).
+  - Adaptive text handling: middle-truncation for paths (`format_responsive_path`), word-aware soft truncation for titles and status messages.
+
+### Changed
+- **Layout Computation (`cli/tui/layout.py`)**:
+  - Replaced single binary `NARROW_THRESHOLD=100` with 5-tier `ColumnLayout` tier system.
+  - Dynamic `render_full_screen_workspace` adapting composer, status bar, and panel rendering per tier.
+- **Testing Coverage**:
+  - Comprehensive regression tests for exact row/column bounds across 5 resolutions (70x20, 90x25, 120x30, 160x40, 200x50).
+  - Dynamic resize transition tests (120→90, 90→160) verifying no geometry drift or border clipping.
+
 ## [Unreleased]
 - Initial repository scaffolding.
