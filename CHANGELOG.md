@@ -81,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 - Initial repository scaffolding.
 
+## [3.5.2] - 2026-09-26
+
+### Added
+- **Unified Daemon Discovery & TUI Auto-Attachment (WO-024)**:
+  - Automatic daemon discovery in `stackmind tui` (probes port 8765, attaches if running, auto-starts with fallback).
+  - Clean detachment on TUI exit (does not terminate pre-existing external daemons).
+  - `stackmind daemon status` command reporting online status, PID, port, and active session count.
+  - Enhanced `stackmind daemon start` and `stop` with reliable PID tracking and process termination.
+
 ## [3.5.1] - 2026-09-26
 
 ### Fixed
