@@ -50,7 +50,7 @@ def test_gateway_and_sandbox_fail_closed_on_escapes_and_journal_commands(tmp_pat
     with pytest.raises(PermissionError):
         tools.write_file("../authoritative/pwned.txt", "blocked")
     with pytest.raises(WorkspaceEscapeError):
-        tools.run_command([sys.executable, "-c", "print('no escape')", "../escape"])
+        tools.run_command([sys.executable, "../escape"])
     assert not (authoritative / "pwned.txt").exists()
     assert journal.records[0].authorized is False
     assert journal.records[0].reason == "target path traversal is forbidden"

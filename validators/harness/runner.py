@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +21,7 @@ from jsonschema import Draft7Validator
 
 from cli.lock import acquire_lock, release_lock
 from cli.validate import validate as validate_runtime
+from validators.knowledge.contract import ContractAccessDenied, ContractExpiredError
 from validators.harness.retrieval import (
     RetrievalBatch,
     RetrievalPolicy,
@@ -299,11 +302,35 @@ class AgentRunner:
 
             run_at = self.now_fn()
             poll_started = time.monotonic()
-            context = KnowledgeAPI(self.project_path).assemble_context(
-                task.query,
-                token_budget=self.token_budget,
-                limit=self.context_limit,
+            # CONTRACT-01: assemble context under the agent's active contract so
+            # scope filtering is genuinely applied to retrieved knowledge. For
+            # inbox/adhoc tasks (no work_order_id) load_harness_contract falls
+            # back to the per-agent contract (.sync/agents/<agent>.contract.yaml)
+            # and returns None when neither exists — assemble_context treats
+            # None exactly as before (unfiltered), so this never blocks the turn.
+            from validators.harness.contract_gate import load_harness_contract
+            task_contract = load_harness_contract(
+                self.project_path, self.agent, task.work_order_id
             )
+            knowledge_api = KnowledgeAPI(self.project_path)
+            try:
+                context = knowledge_api.assemble_context(
+                    task.query,
+                    token_budget=self.token_budget,
+                    limit=self.context_limit,
+                    contract=task_contract,
+                )
+            except (ContractAccessDenied, ContractExpiredError) as contract_error:
+                # Fail closed, gracefully: the pre-execution gate would block
+                # this task anyway; surface the same governance failure without
+                # masking it as an infrastructure crash.
+                return HarnessRunResult(
+                    status='blocked',
+                    persisted=False,
+                    task_id=task.identifier,
+                    reason=f'Pre-execution contract validation failed: {contract_error}',
+                )
+            scope_skips = knowledge_api.pop_scope_filter_stats()
             poll_ms = int((time.monotonic() - poll_started) * 1000)
 
             # 2. Post-context assembly.
@@ -479,6 +506,7 @@ class AgentRunner:
                 'poll_ms': poll_ms,
                 'retrieval': retrieval,
                 'retrieval_ms': retrieval_ms,
+                'scope_skips': scope_skips,
                 'task': task,
                 'llm_ms': llm_ms,
                 'run_at': run_at,
@@ -543,21 +571,9 @@ class AgentRunner:
                     for cmd in decision.commands:
                         if self._is_cancelled(cancellation):
                             return self._cancelled_result(task, operation_id)
-                        try:
-                            command_results.append(
-                                subprocess.run(
-                                    cmd,
-                                    shell=True,
-                                    cwd=str(staged_root),
-                                    check=False,
-                                    capture_output=True,
-                                    text=True,
-                                )
-                            )
-                        except OSError as exc:
-                            command_results.append(
-                                subprocess.CompletedProcess(cmd, returncode=-1, stderr=type(exc).__name__)
-                            )
+                        command_results.append(
+                            self._execute_sandboxed_command(cmd, staged_root)
+                        )
 
                     after_snapshot = WorkspaceSnapshot.capture(staged_root)
                     diff = before_snapshot.diff(after_snapshot)
@@ -584,6 +600,19 @@ class AgentRunner:
                         d025_passed=gate_decision.passed,
                         has_staged_writes=(task.kind == 'inbox' or task.work_order_id is not None),
                     )
+                    # Audit trail (Phase 5): persist every declared command and
+                    # its outcome — the ORIGINAL string the model asked to run,
+                    # never internal shim argv — so the gate verdict and the
+                    # command telemetry are attributable after the fact.
+                    stage_inputs['commands_audit'] = [
+                        {
+                            'command': r.args,
+                            'returncode': r.returncode,
+                            'denied': 'command denied' in (r.stderr or ''),
+                            'stderr_tail': (r.stderr or '')[-200:],
+                        }
+                        for r in command_results
+                    ]
                     if not dimensions.all_passed:
                         failed = [name for name, passed in dimensions.to_dict().items() if name != 'all_passed' and not passed]
                         return HarnessRunResult(
@@ -591,6 +620,7 @@ class AgentRunner:
                             persisted=False,
                             task_id=task.identifier,
                             reason='verification gate failed: ' + ', '.join(failed),
+                            meta={'commands_audit': stage_inputs.get('commands_audit', [])},
                         )
                     self._apply_verified_workspace_diff(staged_root, diff)
 
@@ -811,6 +841,79 @@ class AgentRunner:
             commands=tuple(str(item) for item in payload.get('commands', [])),
         )
 
+    def _execute_sandboxed_command(
+        self, cmd: str, staged_root: Path
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute one LLM-declared command string through the hardened sandbox.
+
+        Phase 5 of the sandbox hardening: the runner's former raw
+        subprocess.run(cmd, shell=True) bypassed every protection that
+        ToolGateway.run_command enforces. This helper routes the same command
+        through the hardened path so it inherits, in order:
+
+        1. shlex tokenization (shell=False, no shell interpolation). A string
+           that cannot be tokenized (unbalanced quote) is refused outright.
+        2. The Phase 2 hard interpreter denylist (bash -c / python -c / ...).
+        3. The Phase 1 scrubbed environment (no daemon secrets) via
+           ProcessSandbox._child_env, including env_extra (picked up by the
+           POSIX limits shim; ignored on Windows).
+        4. The Phase 3 resource limits (512 MB / 60 s by default; per-call
+           overrides remain possible).
+
+        The process tree is killed and marked failed when either the sandbox's
+        wall-clock timeout or a hard limit terminates it; the turn continues
+        (the command result is journaled and visible in the report) exactly as
+        the raw path did for nonzero exits.
+        """
+        from validators.kernel.interpreter_denylist import check_command
+        from validators.kernel.sandbox import ProcessSandbox
+        from validators.kernel.workspace import ScratchWorkspace, WorkspaceEscapeError
+
+        try:
+            if os.name == "nt":
+                # Windows: shlex posix mode mangles backslash paths (\U -> U),
+                # and posix=False preserves quote characters inside tokens.
+                # Windows quoting rules are delimiter-only, so strip the
+                # surrounding quotes from each token manually.
+                argv = [
+                    tok[1:-1] if len(tok) >= 2 and tok[0] == tok[-1] == '"' else tok
+                    for tok in shlex.split(cmd, posix=False)
+                ]
+            else:
+                argv = shlex.split(cmd, posix=True)
+        except ValueError as exc:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f"unparseable command: {exc}")
+        if not argv:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr="empty command")
+
+        denial = check_command(argv)
+        if denial is not None:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f"command denied: {denial}")
+
+        # Read-only scratch mirror of the staged tree: commands run against a
+        # pristine copy of project HEAD (not the live working tree), and the
+        # scratch workspace enforces path containment (no ../escape targets).
+        scratch = ScratchWorkspace.create(staged_root, attempt_id=f"harness-{self.agent}")
+        sandbox = ProcessSandbox(scratch)
+        try:
+            result = sandbox.run(
+                argv,
+                timeout=120.0,
+                env_extra={
+                    "STACKMIND_STAGE_ROOT": str(staged_root),
+                    "STACKMIND_AGENT": self.agent,
+                },
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                cmd, returncode=-9, stderr="command killed: wall-clock timeout (120s), process tree swept"
+            )
+        except WorkspaceEscapeError as exc:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f"command refused: {exc}")
+        except OSError as exc:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f"{type(exc).__name__}: {exc}")
+        return subprocess.CompletedProcess(cmd, result.returncode, result.stdout, result.stderr)
+
     def _validate_staged_state(self, stage_inputs: dict[str, Any]) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp_dir:
             staged_root = Path(tmp_dir) / self.project_path.name
@@ -916,6 +1019,7 @@ class AgentRunner:
         event = {
             'agent': self.agent,
             'benchmark_mode': stage_inputs['retrieval'].mode,
+            'commands_audit': stage_inputs.get('commands_audit', []),
             'context_revision': stage_inputs['context'].revision,
             'declaration_matches': stage_inputs.get('declaration_matches', True),
             'event': 'harness.run',
@@ -965,12 +1069,27 @@ class AgentRunner:
             '## Report',
             decision.report_markdown,
         ]
+        scope_skips = stage_inputs.get('scope_skips', ()) or ()
+        if scope_skips:
+            sections.extend([
+                '',
+                '## Contract-Scope Filtered Context',
+                'Knowledge nodes excluded from the context bundle by the active '
+                'contract (CONTRACT-01):',
+            ])
+            sections.extend(f'- {node_id}: {reason}' for node_id, reason in scope_skips)
         if retrieval.evidence:
             sections.extend(['', '## External Evidence'])
             sections.extend(item.render() for item in retrieval.evidence)
         if decision.blockers:
             sections.extend(['', '## Blockers'])
             sections.extend(f'- {item}' for item in decision.blockers)
+        commands_audit = stage_inputs.get('commands_audit') or []
+        if commands_audit:
+            sections.extend(['', '## Commands'])
+            for item in commands_audit:
+                status = 'DENIED' if item.get('denied') else f"rc={item.get('returncode')}"
+                sections.append(f"- `{item.get('command')}` → {status}")
         sections.extend([
             '',
             '## Meta',
@@ -1004,7 +1123,12 @@ class AgentRunner:
             'confidence': max(0.0, 1.0 - (0.1 * len(decision.uncertainty))),
             'context_revision': context.revision,
             'context_stale': context.stale,
+            'context_scope_filtered': (
+                getattr(context, 'scope_filtered_count', 0)
+                or len(stage_inputs.get('scope_skips', ()) or ())
+            ),
             'cost_estimate': round(completion.cost_estimate + retrieval.cost_estimate, 6),
+            'commands_audit': stage_inputs.get('commands_audit', []),
             'declaration_matches': stage_inputs.get('declaration_matches', True),
             'experience_id': exp_rec.experience_id if exp_rec else None,
             'knowledge_git_commit': context.git_commit,
@@ -1026,6 +1150,10 @@ class AgentRunner:
             'provider': completion.provider,
             'retrieval_cap_exhausted': retrieval.cap_exhausted,
             'searches_used': retrieval.searches_used,
+            'scope_filtered_nodes': [
+                {'node_id': node_id, 'reason': reason}
+                for node_id, reason in (stage_inputs.get('scope_skips', ()) or ())
+            ],
             'trust_level': trust_level.value if hasattr(trust_level, 'value') else str(trust_level or 'OBSERVABLE'),
             'uncertainty': list(decision.uncertainty),
             'verification_dimensions': dimensions.to_dict() if dimensions else {},

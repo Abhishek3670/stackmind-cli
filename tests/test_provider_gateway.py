@@ -296,6 +296,12 @@ def test_provider_adapter_streaming_and_cancellation():
 
 def test_provider_gateway_run_command_and_query_graph(tmp_path):
     authoritative, workspace, tool_gw, journal, attempt, contract = _setup_test_gateway(tmp_path)
+    # Interpreter denylist (Phase 2): code-string flags are denied at the
+    # agent boundary, so the run_command vector executes a script file
+    # (pre-written into the scratch workspace) instead of python -c.
+    (workspace.root / "hello_task.py").write_text(
+        "print('hello-from-sandbox')", encoding="utf-8"
+    )
 
     turn_count = 0
 
@@ -314,7 +320,7 @@ def test_provider_gateway_run_command_and_query_graph(tmp_path):
                                 "type": "function",
                                 "function": {
                                     "name": "run_command",
-                                    "arguments": json.dumps({"command": [sys.executable, "-c", "print('hello-from-sandbox')"]}),
+                                    "arguments": json.dumps({"command": [sys.executable, "hello_task.py"]}),
                                 },
                             },
                             {

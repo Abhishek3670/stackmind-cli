@@ -121,6 +121,7 @@ class ContextBundle:
     truncation_reason: str | None
     entries: tuple[ContextEntry, ...]
     text: str
+    scope_filtered_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +129,7 @@ class ContextBundle:
             'estimated_tokens': self.estimated_tokens,
             'git_commit': self.git_commit,
             'revision': self.revision,
+            'scope_filtered_count': self.scope_filtered_count,
             'semantic': self.semantic,
             'stale': self.stale,
             'text': self.text,
@@ -154,6 +156,8 @@ class KnowledgeAPI:
             self.contract = contract
         self.embedding_backend = embedding_backend
         self._cached_ir = None
+        # Contract-scope exclusions recorded during queries: list[(node_id, reason)].
+        self._scope_skips: list[tuple[str, str]] = []
 
     @property
     def ir(self):
@@ -179,6 +183,16 @@ class KnowledgeAPI:
                     f"Access to node {node_id} is denied by contract {active_contract.work_order}"
                 )
 
+    def pop_scope_filter_stats(self) -> list[tuple[str, str]]:
+        """Return and clear contract-scope exclusions recorded by recent queries.
+
+        Each entry is (node_id, denial_reason). assemble_context consumes this to
+        surface scope-filtered context in ContextBundle.scope_filtered_count.
+        """
+        skips = self._scope_skips
+        self._scope_skips = []
+        return skips
+
     def _check_expiration(self, contract: AgentContract | str | Path | None = None) -> None:
         active_contract = self._resolve_contract(contract)
         if active_contract and active_contract.is_expired():
@@ -190,8 +204,14 @@ class KnowledgeAPI:
         *,
         limit: int = 10,
         contract: AgentContract | str | Path | None = None,
+        on_denied: str = 'raise',
     ) -> KnowledgeEnvelope:
-        """Resolve one symbol by NodeID, birth key, current name, or alias."""
+        """Resolve one symbol by NodeID, birth key, current name, or alias.
+
+        on_denied='raise' (default) fails closed on contract-denied records;
+        on_denied='skip' excludes them and records the exclusion in the scope
+        filter ledger (see pop_scope_filter_stats).
+        """
         self._check_expiration(contract)
         revision, git_commit = self._revision_meta()
         stale = self._is_stale()
@@ -200,13 +220,19 @@ class KnowledgeAPI:
             rank, confidence, alias_matched = _lookup_rank(record, needle)
             if rank < 0:
                 continue
-            result = self._result_from_record(
-                record,
-                confidence=confidence,
-                alias_matched=alias_matched,
-                reason='lookup',
-                contract=contract,
-            )
+            try:
+                result = self._result_from_record(
+                    record,
+                    confidence=confidence,
+                    alias_matched=alias_matched,
+                    reason='lookup',
+                    contract=contract,
+                )
+            except (ContractAccessDenied, ContractExpiredError) as exc:
+                if on_denied != 'skip':
+                    raise
+                self._scope_skips.append((str(record.get('node_id', '')), str(exc)))
+                continue
             candidates.append((rank, result.qualified_name.lower(), result))
         ordered = tuple(item[2] for item in sorted(candidates)[:limit])
         return KnowledgeEnvelope(
@@ -285,8 +311,14 @@ class KnowledgeAPI:
         depth: int = 1,
         limit: int = 25,
         contract: AgentContract | str | Path | None = None,
+        on_denied: str = 'raise',
     ) -> KnowledgeEnvelope:
-        """Traverse inbound or outbound graph edges without reading source files."""
+        """Traverse inbound or outbound graph edges without reading source files.
+
+        on_denied='raise' (default) fails closed on contract-denied neighbors;
+        on_denied='skip' excludes them and records the exclusion in the scope
+        filter ledger (see pop_scope_filter_stats).
+        """
         self._check_expiration(contract)
         revision, git_commit = self._revision_meta()
         stale = self._is_stale()
@@ -313,7 +345,15 @@ class KnowledgeAPI:
                 known_depth = seen_depths.get(neighbor_id)
                 if known_depth is not None and known_depth <= next_depth:
                     continue
-                neighbor = self._lookup_node_by_id(neighbor_id, contract=contract)
+                try:
+                    neighbor = self._lookup_node_by_id(neighbor_id, contract=contract)
+                except (ContractAccessDenied, ContractExpiredError) as exc:
+                    # A single out-of-scope neighbor must not abort traversal
+                    # when the caller opted into skip semantics.
+                    if on_denied != 'skip':
+                        raise
+                    self._scope_skips.append((str(neighbor_id), str(exc)))
+                    continue
                 if neighbor is None:
                     continue
                 seen_depths[neighbor_id] = next_depth
@@ -370,6 +410,7 @@ class KnowledgeAPI:
         query_embedding: Sequence[float] | None = None,
         embedding_backend: EmbeddingBackend | None = None,
         contract: AgentContract | str | Path | None = None,
+        on_denied: str = 'raise',
     ) -> KnowledgeEnvelope:
         """Search by embedding similarity when available, else text-search fallback."""
         self._check_expiration(contract)
@@ -389,6 +430,9 @@ class KnowledgeAPI:
                     ).vector
                 except (ImportError, RuntimeError, ValueError):
                     query_embedding = None
+
+        # Note: scope skips accumulate onto self._scope_skips across lookup and
+        # search; assemble_context consumes them via pop_scope_filter_stats().
         if query_embedding is not None:
             semantic_results = self._semantic_search(query_embedding, limit=limit, contract=contract)
             if semantic_results:
@@ -404,7 +448,13 @@ class KnowledgeAPI:
         results = []
         max_score = max((int(item.get('score', 0)) for item in text_hits), default=1)
         for item in text_hits:
-            node = self._lookup_node_by_id(str(item['node_id']), contract=contract)
+            try:
+                node = self._lookup_node_by_id(str(item['node_id']), contract=contract)
+            except (ContractAccessDenied, ContractExpiredError) as exc:
+                if on_denied != 'skip':
+                    raise
+                self._scope_skips.append((str(item['node_id']), str(exc)))
+                continue
             if node is None:
                 continue
             score = int(item.get('score', 0))
@@ -433,6 +483,7 @@ class KnowledgeAPI:
         limit: int = 25,
         evidence_type: Sequence[str] | None = None,
         contract: AgentContract | str | Path | None = None,
+        on_denied: str = 'raise',
     ) -> KnowledgeEnvelope:
         """Return direct callers of a symbol."""
         envelope = self.traverse(
@@ -442,6 +493,7 @@ class KnowledgeAPI:
             depth=1,
             limit=limit,
             contract=contract,
+            on_denied=on_denied,
         )
         if not evidence_type:
             return envelope
@@ -608,7 +660,11 @@ class KnowledgeAPI:
     ) -> ContextBundle:
         """Assemble a bounded context bundle for agent prompts, including verified active procedural skills."""
         self._check_expiration(contract)
-        seed_hits = self.lookup(query, limit=max(1, limit), contract=contract)
+        self.pop_scope_filter_stats()  # reset exclusion ledger for this assembly
+        # Context assembly is a prompt-builder, not a governed data API: a single
+        # denied node must not abort the bundle. Skip-and-ledger keeps the turn
+        # alive while preserving an inspectable record of exclusions.
+        seed_hits = self.lookup(query, limit=max(1, limit), contract=contract, on_denied='skip')
         if seed_hits.results:
             seed_envelope = seed_hits
         else:
@@ -617,13 +673,14 @@ class KnowledgeAPI:
                 limit=max(3, limit),
                 query_embedding=query_embedding,
                 contract=contract,
+                on_denied='skip',
             )
 
         ranked: dict[str, tuple[int, KnowledgeResult]] = {}
         for index, result in enumerate(seed_envelope.results[: max(1, min(limit, 3))]):
             ranked[result.node_id] = (100 - (index * 5), result)
 
-            inbound = self.callers(result.node_id, limit=3, contract=contract)
+            inbound = self.callers(result.node_id, limit=3, contract=contract, on_denied='skip')
             for neighbor in inbound.results:
                 score = 80 - (10 * int(neighbor.metadata.get('depth', 1))) + _evidence_boost(neighbor.evidence)
                 existing = ranked.get(neighbor.node_id)
@@ -637,6 +694,7 @@ class KnowledgeAPI:
                 depth=1,
                 limit=3,
                 contract=contract,
+                on_denied='skip',
             )
             for neighbor in outbound.results:
                 score = 70 - (10 * int(neighbor.metadata.get('depth', 1))) + _evidence_boost(neighbor.evidence)
@@ -649,6 +707,7 @@ class KnowledgeAPI:
         estimated_tokens = 0
         truncated = False
         truncation_reason = None
+        scope_skips: list[tuple[str, str]] = []
 
         # 1. Retrieve matching verified active skills (Phase 7 Procedural Learning Integration)
         if include_skills:
@@ -681,6 +740,11 @@ class KnowledgeAPI:
             ranked.values(),
             key=lambda item: (-item[0], item[1].path, item[1].qualified_name, item[1].node_id),
         ):
+            # Preserve the bundle's entry-limit semantics while still counting
+            # contract-scope exclusions that were skipped by earlier queries.
+            if len(ranked) >= limit and len(entries) >= limit:
+                scope_skips.extend(self.pop_scope_filter_stats())
+                break
             block = _context_block(result)
             block_tokens = _estimate_tokens(block)
             if estimated_tokens + block_tokens > token_budget:
@@ -706,6 +770,7 @@ class KnowledgeAPI:
                     truncation_reason = f'context entry limit {limit} reached'
                 break
 
+        scope_skips.extend(self.pop_scope_filter_stats())
         return ContextBundle(
             revision=seed_envelope.revision,
             git_commit=seed_envelope.git_commit,
@@ -717,6 +782,7 @@ class KnowledgeAPI:
             truncation_reason=truncation_reason,
             entries=tuple(entries),
             text='\n\n'.join(text_blocks),
+            scope_filtered_count=len(scope_skips),
         )
 
     def _active_records(self) -> list[dict[str, Any]]:
@@ -907,7 +973,8 @@ class KnowledgeAPI:
             try:
                 if node_id:
                     self._enforce_node(node_id, contract)
-            except (ContractAccessDenied, ContractExpiredError):
+            except (ContractAccessDenied, ContractExpiredError) as exc:
+                self._scope_skips.append((node_id, str(exc)))
                 continue
             node = self._load_node_for_record(record, contract=contract)
             if node is None:
@@ -955,7 +1022,12 @@ def _context_block(result: KnowledgeResult) -> str:
     if result.signature:
         lines.append(f'signature: {result.signature}')
     if result.summary:
-        lines.append(f'summary: {result.summary}')
+        # Bound AI-generated summaries so one verbose node cannot consume the
+        # whole context budget (roughly 256 tokens max per block).
+        summary_text = str(result.summary)
+        if len(summary_text) > 1024:
+            summary_text = summary_text[:1021] + '...'
+        lines.append(f'summary: {summary_text}')
     if result.reason:
         lines.append(f'reason: {result.reason}')
     if result.provenance_summary:

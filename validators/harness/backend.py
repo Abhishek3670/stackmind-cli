@@ -26,6 +26,67 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Default prompt budget for knowledge context injected into ModelExecutionBackend
+# prompts. ~1200 tokens of context leaves ample room for the task text and the
+# model response inside the 8K context window the TUI advertises.
+DEFAULT_CONTEXT_TOKEN_BUDGET = 1200
+# Hard character cap as a backstop against pathological, unbounded context text.
+_MAX_CONTEXT_CHARS = DEFAULT_CONTEXT_TOKEN_BUDGET * 4
+
+
+def build_prompt_with_context(
+    task_title: str,
+    task_body: str,
+    context_text: str | None,
+    evidence_text: str | None = None,
+    *,
+    context_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+) -> str:
+    """Compose the Ollama prompt: task plus a budget-capped knowledge section.
+
+    Priority when the budget is exceeded: knowledge entries ranked highest are
+    kept whole (they arrive newline-delimited); the tail of the section is
+    dropped with an explicit truncation notice rather than silently, and the
+    task text itself is never truncated.
+    """
+    parts: list[str] = []
+    if task_title.strip() and (not task_body.strip() or task_title.strip() == task_body.strip()):
+        parts.append(task_title.strip())
+    elif task_title.strip() and not task_body.strip():
+        parts.append(task_title.strip())
+    elif task_title.strip() and task_body.strip():
+        parts.append(f"Task: {task_title}\n\n{task_body}")
+    elif task_body.strip():
+        parts.append(task_body.strip())
+
+    context_section: list[str] = []
+    if context_text and context_text.strip():
+        context_section.append("## Project Knowledge Context (reference material)")
+        max_chars = max(0, context_token_budget * 4 - 96)  # reserve for header/notice
+        trimmed = context_text.strip()
+        kept = trimmed
+        if len(trimmed) > max_chars:
+            kept = trimmed[:max_chars]
+            cut = kept.rfind('\n')
+            if cut > max_chars // 2:
+                kept = kept[:cut]
+            dropped_chars = len(trimmed) - len(kept)
+            kept += (
+                f"\n\n[Project knowledge context truncated: {dropped_chars} characters "
+                f"dropped to fit the {context_token_budget}-token context budget]"
+            )
+        context_section.append(kept)
+
+    if evidence_text and evidence_text.strip():
+        context_section.append("## External Evidence")
+        context_section.append(evidence_text.strip())
+
+    if context_section:
+        parts.append("\n\n".join(context_section))
+
+    return "\n\n".join(part for part in parts if part)
+
+
 _SENSITIVE_KEYS = {
     "api_key",
     "apikey",
@@ -504,6 +565,15 @@ class ModelExecutionBackend(BaseExecutionBackend):
             status = "deferred"
             blockers = ["release_target required for work-order completion"]
 
+        # Budget-capped knowledge context for the real prompt (Phase 2 wiring).
+        prompt_text = build_prompt_with_context(
+            getattr(task, 'title', ''),
+            getattr(task, 'body', ''),
+            getattr(request.context, 'text', None),
+            getattr(request, 'evidence_text', None),
+            context_token_budget=getattr(self, 'context_token_budget', DEFAULT_CONTEXT_TOKEN_BUDGET),
+        )
+
         payload = {
             "status": status,
             "summary": f"Processed {task.identifier}: {task.title} (model: {self.model})",
@@ -523,14 +593,6 @@ class ModelExecutionBackend(BaseExecutionBackend):
         if self.endpoint and not self.mock_mode:
             try:
                 req_url = self.endpoint.rstrip("/") + "/api/generate"
-                task_title = getattr(task, "title", "").strip()
-                task_body = getattr(task, "body", "").strip()
-                if not task_title:
-                    prompt_text = task_body
-                elif not task_body or task_title == task_body:
-                    prompt_text = task_title
-                else:
-                    prompt_text = f"Task: {task_title}\n\n{task_body}"
                 data = json.dumps({
                     "model": self.model or "llama3",
                     "prompt": prompt_text,
@@ -750,7 +812,10 @@ def get_default_registry() -> BackendRegistry:
     if _DEFAULT_REGISTRY is None:
         reg = BackendRegistry()
         reg.register(AgentExecutionBackend(backend_id="echo-agent", model="stackmind-echo-v1"))
-        reg.register(ModelExecutionBackend(backend_id="mock-model", model="mock-llama3", available=True))
+        # mock_mode=True keeps this backend hermetic: it never POSTs to the
+        # default endpoint (localhost:11434), so tests exercise role rebinding
+        # deterministically whether or not a real Ollama server is running.
+        reg.register(ModelExecutionBackend(backend_id="mock-model", model="mock-llama3", available=True, mock_mode=True))
 
         # Auto-detect local Ollama models
         ollama_endpoint = os.environ.get("OLLAMA_HOST", "http://localhost:11434")

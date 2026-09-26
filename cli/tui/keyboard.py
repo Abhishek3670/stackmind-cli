@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterator, Optional
 
 # Persistent session-wide prompt history
 GLOBAL_HISTORY: list[str] = []
+_ANSI_STRIP_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 # Absolute path to repo root debug_keys.log so all directories log to the same file
 _DEFAULT_LOG_PATH = os.path.join(
@@ -666,6 +667,8 @@ class RawLineEditor:
         on_wheel_up: Optional[Callable[[], None]] = None,
         on_wheel_down: Optional[Callable[[], None]] = None,
         on_transition: Optional[Callable[[bool], None]] = None,
+        width: int = 80,
+        right_border: Optional[str] = None,
     ) -> None:
         self.prompt_prefix = prompt_prefix
         self.buffer: list[str] = list(initial_text)
@@ -681,6 +684,14 @@ class RawLineEditor:
         self.on_wheel_up = on_wheel_up
         self.on_wheel_down = on_wheel_down
         self.on_transition = on_transition
+        self.width = width
+        self.has_borders = "│" in self.prompt_prefix
+        if right_border is not None:
+            self.right_border = right_border
+        elif "\033[" in self.prompt_prefix:
+            self.right_border = "\033[90m│\033[0m"
+        else:
+            self.right_border = "│"
 
         self._update_state()
 
@@ -874,16 +885,27 @@ class RawLineEditor:
         return False
 
     def redraw_line(self, out: Any = sys.stdout) -> None:
-        """Redraw current line with exact cursor placement."""
+        """Redraw current line with exact cursor placement and composer border preservation."""
         buf_str = "".join(self.buffer)
-        # \r to start, prompt, line content, \x1b[K to clear remainder of line
-        line_out = f"\r{self.prompt_prefix}{buf_str}\x1b[K"
+        if not getattr(self, "has_borders", False):
+            line_out = f"\r{self.prompt_prefix}{buf_str}\x1b[K"
+            out.write(line_out)
+            offset_back = len(self.buffer) - self.cursor
+            if offset_back > 0:
+                out.write(f"\x1b[{offset_back}D")
+            out.flush()
+            return
+
+        visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+        visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
+        inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
+        spaces_count = max(0, inner_available - len(buf_str))
+        line_out = f"\r{self.prompt_prefix}{buf_str}{' ' * spaces_count}{self.right_border}"
         out.write(line_out)
 
-        # Move cursor back if inside buffer
-        offset_back = len(self.buffer) - self.cursor
-        if offset_back > 0:
-            out.write(f"\x1b[{offset_back}D")
+        # Move cursor to active edit position inside composer box
+        cursor_col = visible_prefix_len + self.cursor + 1
+        out.write(f"\x1b[{cursor_col}G")
         out.flush()
 
 
@@ -1024,6 +1046,7 @@ def raw_prompt_input(
         on_wheel_up=wrapped_wheel_up,
         on_wheel_down=wrapped_wheel_down,
         on_transition=handle_transition,
+        width=width,
     )
 
     with TerminalStateRestorer():

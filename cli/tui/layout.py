@@ -274,9 +274,15 @@ def render_workspace_layout_str(
     if conversation_content is not None:
         conversation_text = conversation_content
     if height is not None:
+        effective_vp_height = height
+        active_scroll = conversation_scroll
+        if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
+            active_scroll = getattr(state, "conversation_scroll")
+        if active_scroll is not None and getattr(active_scroll, "has_new_activity", False):
+            effective_vp_height = max(1, height - 2)
         conversation_text = slice_conversation_viewport(
             conversation_text,
-            viewport_height=height,
+            viewport_height=effective_vp_height,
             scroll=conversation_scroll,
             pad=True,
         )
@@ -304,7 +310,19 @@ def render_workspace_layout_str(
             height=height,
         )
     )
-    return console.export_text(styles=use_ansi).rstrip()
+    raw = console.export_text(styles=use_ansi)
+    if raw.endswith("\r\n"):
+        raw = raw[:-2]
+    elif raw.endswith("\n"):
+        raw = raw[:-1]
+
+    lines = [line.rstrip("\r") for line in raw.split("\n")]
+    if height is not None:
+        if len(lines) < height:
+            lines.extend([""] * (height - len(lines)))
+        elif len(lines) > height:
+            lines = lines[:height]
+    return "\n".join(lines)
 
 
 def render_full_screen_workspace(
@@ -346,7 +364,7 @@ def render_full_screen_workspace(
         else None
     )
 
-    # 1. Bottom Status Bar (1 line, placed below composer, aligned to conversation width / WO-009)
+    # 1. Bottom Status Bar (1 line, placed below composer, matches composer text box width / WO-018)
     status_width = layout.conversation_width if layout.show_runtime else width
     status_bar_str = render_top_header_bar_str(
         session or {},

@@ -245,7 +245,7 @@ class ConversationScroll:
     def scroll_up(self, lines: int = 1) -> None:
         """Scroll view upward, detaching from live-following."""
         self.scroll_offset += max(1, lines)
-        if self.max_offset is not None:
+        if self.max_offset is not None and self.max_offset > 0:
             self.scroll_offset = min(self.scroll_offset, self.max_offset)
         self.follow_bottom = False
 
@@ -427,6 +427,7 @@ class AutonomousDeliveryState:
         self.seen_message_keys = {(message.role, message.content.strip()) for message in self.messages}
         self.compaction_count += 1
         self.conversation_scroll.notify_activity()
+        self.conversation_scroll.max_offset = None
         return True
 
     def maybe_compact_transcript(self) -> bool:
@@ -497,6 +498,7 @@ class AutonomousDeliveryState:
             self.record_token_usage(completion=msg_content)
         if hasattr(self, "conversation_scroll") and self.conversation_scroll is not None:
             self.conversation_scroll.notify_activity()
+            self.conversation_scroll.max_offset = None
         self.maybe_compact_transcript()
         return msg
 
@@ -616,6 +618,9 @@ class AutonomousDeliveryState:
         self.messages.clear()
         self.seen_message_keys.clear()
         self.current_turn_actions = ActionsGroup(active=False)
+        if hasattr(self, "conversation_scroll") and self.conversation_scroll is not None:
+            self.conversation_scroll.scroll_to_bottom()
+            self.conversation_scroll.max_offset = None
 
     def update_from_session(self, session: Mapping[str, Any]) -> None:
         if not session or not isinstance(session, Mapping):

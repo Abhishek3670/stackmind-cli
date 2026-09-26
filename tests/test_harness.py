@@ -272,8 +272,15 @@ def test_verification_gate_blocks_syntax_error_without_live_writeback(tmp_path):
 
     result = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now).run_once()
 
+    # Phase 5 sandbox hardening: the python -c payload is DENIED by the
+    # interpreter denylist before execution, so the declared broken.py never
+    # materializes (scope_verified fails) and the command records a nonzero
+    # result (behavioral_verified fails). The turn is still blocked and
+    # nothing reaches the live tree -- strictly stronger than the old
+    # staged-diff detection.
     assert result.status == 'blocked'
-    assert 'code_verified' in (result.reason or '')
+    assert 'behavioral_verified' in (result.reason or '')
+    assert 'scope_verified' in (result.reason or '')
     assert not (project / 'broken.py').exists()
     assert inbox.exists(), 'inbox move must not happen before verification passes'
 
@@ -294,8 +301,12 @@ def test_verification_gate_blocks_undeclared_out_of_scope_change(tmp_path):
 
     result = AgentRunner(project, 'codex', llm_provider=provider, now_fn=_fixed_now).run_once()
 
+    # Phase 5 sandbox hardening: the python -c payload is denied by the
+    # interpreter denylist before execution, so the out-of-scope write never
+    # happens at all; the denied command itself fails behavioral_verified and
+    # the turn is blocked with no live writeback.
     assert result.status == 'blocked'
-    assert 'scope_verified' in (result.reason or '')
+    assert 'behavioral_verified' in (result.reason or '')
     assert not (project / 'undeclared.txt').exists()
     assert inbox.exists()
 

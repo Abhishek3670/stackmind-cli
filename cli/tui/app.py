@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping
 import click
 from rich import box
 from rich.console import Console, Group, RenderableType
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -811,10 +812,11 @@ def _wrap_text_to_width(text: str, width: int) -> str:
     (``slice_conversation_viewport``) counts lines that correspond 1:1 to
     rendered rows — fixing the height-budget drift bug where long unwrapped
     model output caused the runtime panel to scroll upward during streaming.
+    Renders with Rich Markdown (code_theme="monokai") matching settled messages.
     """
     use_ansi = should_render_ansi()
     console, _ = _make_capture_console(width=width)
-    console.print(Text(text), end="")
+    console.print(Markdown(text, code_theme="monokai"), end="")
     return console.export_text(styles=use_ansi).rstrip("\n")
 
 
@@ -1984,8 +1986,9 @@ def dispatch_delivery_command(
         if op_id and op_id not in state.operations:
             state.operations[op_id] = OperationNode(op_id, "Turn", role="Backend", backend="Codex", status="RUNNING")
         # This is a local wait indicator, not a claim about daemon state.
-        status_line = Text("● Thinking... Turn submitted to the governed daemon.", style="dim cyan")
-        click.echo(status_line)
+        if not is_tty:
+            status_line = Text("● Thinking... Turn submitted to the governed daemon.", style="dim cyan")
+            click.echo(status_line)
 
         # Synchronously await turn completion while consuming events via native SSE
         workspace = Path(session["workspace"]) if session.get("workspace") else None
@@ -2136,7 +2139,7 @@ def dispatch_delivery_command(
                     # Operational event line
                     ev_str = "" if ev_name in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
                     if ev_str:
-                        if not streaming_active:
+                        if not streaming_active and not is_tty:
                             click.echo(ev_str)
                         latest_act_desc = format_action_description(ev_name) if "format_action_description" in globals() else ev_name
 
@@ -2146,7 +2149,17 @@ def dispatch_delivery_command(
                     if resp and not assistant_rendered and not streamed_chunks:
                         turn_acts = state.current_turn_actions
                         state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
-                        click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
+                        if is_tty:
+                            redraw_full_screen(
+                                session,
+                                state,
+                                clear=False,
+                                include_composer=True,
+                                composer_is_active=False,
+                                live_manager=live_manager,
+                            )
+                        else:
+                            click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
                         assistant_rendered = True
 
                 # Check terminal event status
@@ -2196,17 +2209,27 @@ def dispatch_delivery_command(
                     role_obj.state = "CANCELLED"
             state.add_activity("User", "interrupted turn", op_id)
 
-            if streaming_active:
+            if streaming_active and not is_tty:
                 click.echo("")
 
             cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
             turn_acts = state.current_turn_actions
             state.add_message("assistant", cancel_msg, actions=turn_acts)
-            click.echo(render_error_box_str(
-                cancel_msg,
-                title="TURN INTERRUPTED",
-                hint="In-flight turn operation was cancelled. Daemon process remains running.",
-            ))
+            if is_tty:
+                redraw_full_screen(
+                    session,
+                    state,
+                    clear=False,
+                    include_composer=True,
+                    composer_is_active=False,
+                    live_manager=live_manager,
+                )
+            else:
+                click.echo(render_error_box_str(
+                    cancel_msg,
+                    title="TURN INTERRUPTED",
+                    hint="In-flight turn operation was cancelled. Daemon process remains running.",
+                ))
             restore_composer_focus(state)
             return session, False
 
@@ -2247,14 +2270,24 @@ def dispatch_delivery_command(
                     for ev in remaining_events:
                         state.process_event(ev)
                         ev_str = "" if ev.get("name") in {"operation.started", "turn.started", "operation.completed"} else render_operational_event_str(ev)
-                        if ev_str:
+                        if ev_str and not is_tty:
                             click.echo(ev_str)
                         resp = extract_assistant_response(ev.get("payload", {}), workspace=workspace)
                         thinking = extract_assistant_thinking(ev.get("payload", {}), workspace=workspace)
                         if resp and not assistant_rendered:
                             turn_acts = state.current_turn_actions
                             state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
-                            click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
+                            if is_tty:
+                                redraw_full_screen(
+                                    session,
+                                    state,
+                                    clear=False,
+                                    include_composer=True,
+                                    composer_is_active=False,
+                                    live_manager=live_manager,
+                                )
+                            else:
+                                click.echo(render_assistant_message_str(resp, actions=turn_acts, thinking=thinking))
                             assistant_rendered = True
             except Exception:
                 pass
@@ -2293,7 +2326,17 @@ def dispatch_delivery_command(
                 if summary:
                     turn_acts = state.current_turn_actions
                     state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
-                    click.echo(render_assistant_message_str(summary, actions=turn_acts, thinking=thinking))
+                    if is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            live_manager=live_manager,
+                        )
+                    else:
+                        click.echo(render_assistant_message_str(summary, actions=turn_acts, thinking=thinking))
                     assistant_rendered = True
                 elif op_status in {"FAILED", "CANCELLED"} or res.get("error"):
                     err_raw = (
@@ -2310,7 +2353,17 @@ def dispatch_delivery_command(
                     err_title = "OLLAMA ERROR" if "ollama" in err_msg.lower() else (f"OPERATION {op_status}" if op_status else "OPERATION FAILED")
                     turn_acts = state.current_turn_actions
                     state.add_message("assistant", f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}", actions=turn_acts)
-                    click.echo(render_error_box_str(err_msg, title=err_title))
+                    if is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            live_manager=live_manager,
+                        )
+                    else:
+                        click.echo(render_error_box_str(err_msg, title=err_title))
                     assistant_rendered = True
 
         if not assistant_rendered:
@@ -2327,17 +2380,47 @@ def dispatch_delivery_command(
                 err_title = "OLLAMA ERROR" if "ollama" in err_msg.lower() else f"OPERATION {op_status}"
                 turn_acts = state.current_turn_actions
                 state.add_message("assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts)
-                click.echo(render_error_box_str(err_msg, title=err_title))
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_error_box_str(err_msg, title=err_title))
                 assistant_rendered = True
             elif completed:
                 completion_msg = f"Turn operation {op_id} completed."
                 turn_acts = state.current_turn_actions
                 state.add_message("assistant", completion_msg, actions=turn_acts)
-                click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
             else:
                 timeout_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
                 state.add_message("system", timeout_msg)
-                click.echo(render_error_box_str(timeout_msg, title="REQUEST TIMEOUT", hint="Use :status or :events to inspect."))
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_error_box_str(timeout_msg, title="REQUEST TIMEOUT", hint="Use :status or :events to inspect."))
     except KeyboardInterrupt:
         click.echo()
         restore_composer_focus(state)
@@ -2357,7 +2440,17 @@ def dispatch_delivery_command(
                 hint="An operation may already be in flight. Use :status, :cancel, or :reconnect.",
             )
         state.add_message("system", f"[ERROR] Could not submit turn: {err}")
-        click.echo(err_box)
+        if is_tty:
+            redraw_full_screen(
+                session,
+                state,
+                clear=False,
+                include_composer=True,
+                composer_is_active=False,
+                live_manager=live_manager,
+            )
+        else:
+            click.echo(err_box)
     finally:
         if live_manager is not None and not getattr(live_manager, "is_active", False):
             live_manager.start(include_composer=False)
@@ -2449,7 +2542,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
             enable_mouse_reporting()
             redraw_full_screen(session, state, clear=True, include_composer=True, composer_is_active=True)
             current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-            sys.stdout.write(f"\x1b[{current_lines - 2};1H")
+            sys.stdout.write(f"\x1b[{current_lines - 2};5H")
             sys.stdout.flush()
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
@@ -2516,7 +2609,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     else:
                         click.echo(render_top_header_bar_str(
@@ -2564,7 +2657,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2583,7 +2676,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2601,7 +2694,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2619,7 +2712,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2675,7 +2768,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     live_manager=live_ws,
                 )
                 current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                sys.stdout.write(f"\x1b[{current_lines - 2};1H")
+                sys.stdout.write(f"\x1b[{current_lines - 2};5H")
                 sys.stdout.flush()
     finally:
         disable_mouse_reporting()
