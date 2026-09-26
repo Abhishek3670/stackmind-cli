@@ -11,3 +11,6 @@ venv/
 .ruff_cache/
 .coverage
 *.log
+
+# Backups
+.git-backup*/

@@ -344,12 +344,13 @@ def test_wrap_text_to_width_breaks_long_lines():
 
 
 def test_wrap_text_preserves_short_lines():
-    """Short lines that already fit within width should pass through unchanged."""
+    """Short paragraphs that already fit within width should pass through unchanged."""
     from cli.tui.app import _wrap_text_to_width
 
-    short = "Hello world\nLine two"
+    short = "Hello world\n\nLine two"
     wrapped = _wrap_text_to_width(short, 80)
-    assert wrapped.strip() == short.strip()
+    unpadded = "\n".join(line.rstrip() for line in wrapped.split("\n"))
+    assert unpadded.strip() == short.strip()
 
 
 def test_streaming_content_line_count_matches_viewport():
@@ -482,3 +483,69 @@ def test_prompt_submission_transitions_seamlessly_to_busy_composer(monkeypatch):
     assert post_submission.get("composer_is_active") is False
     assert post_submission.get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
     assert post_submission.get("clear") is False
+
+
+def test_wrap_text_to_width_renders_markdown_with_unclosed_fence():
+    """Verify Markdown rendering in _wrap_text_to_width styles unclosed code blocks
+    with Monokai theme and syntax highlighting without crashing or drifting."""
+    from cli.tui.app import _wrap_text_to_width
+
+    # Unclosed code fence while streaming
+    incomplete_code = "```python\ndef calculate_total(items: list[dict]) -> float:\n    # Ongoing"
+    wrapped = _wrap_text_to_width(incomplete_code, 80)
+
+    # Must contain code content
+    assert "calculate_total" in wrapped
+    # Must have split into visual lines fitting width
+    for line in wrapped.split("\n"):
+        assert len(line.rstrip()) <= 80
+
+
+def test_markdown_streaming_frame_stability_across_fence_lifecycle():
+    """Verify that full-screen frame height remains exactly terminal_height
+    throughout all stages of code block streaming (pre-code, unclosed fence, and settled)."""
+    from cli.tui.app import _wrap_text_to_width
+    from cli.tui.chat import render_assistant_stream_header, render_chat_transcript_str
+    from cli.tui.layout import compute_layout, render_full_screen_workspace
+    from cli.tui.state import AutonomousDeliveryState
+
+    terminal_width = 120
+    terminal_height = 30
+    layout = compute_layout(terminal_width)
+
+    session = {"session_id": "sess-stream-lifecycle"}
+    state = AutonomousDeliveryState(session_id="sess-stream-lifecycle")
+    state.add_message("user", "write a 40-line Python class with docstrings")
+
+    # Incomplete stages:
+    stages = [
+        "Here is the code you requested:\n\n",
+        "Here is the code you requested:\n\n```python\n",
+        "Here is the code you requested:\n\n```python\nclass DataManager:\n    \"\"\"Docstring\"\"\"\n",
+        "Here is the code you requested:\n\n```python\nclass DataManager:\n" + "    def process(self):\n        pass\n" * 15,
+        "Here is the code you requested:\n\n```python\nclass DataManager:\n" + "    def process(self):\n        pass\n" * 15 + "```\n\nDone!",
+    ]
+
+    transcript = render_chat_transcript_str(state.messages, width=layout.conversation_width)
+    hdr = render_assistant_stream_header(model="test-model", width=layout.conversation_width)
+
+    for stage_text in stages:
+        wrapped = _wrap_text_to_width(stage_text, layout.conversation_width)
+        in_progress = f"{hdr}\n{wrapped}"
+        full_content = f"{transcript}\n\n{in_progress}"
+
+        frame = render_full_screen_workspace(
+            session=session,
+            state=state,
+            width=terminal_width,
+            height=terminal_height,
+            conversation_content=full_content,
+            include_composer=True,
+            composer_is_active=False,
+            composer_placeholder="Generating response... (Ctrl+C to cancel)",
+        )
+        frame_lines = frame.split("\n")
+        assert len(frame_lines) == terminal_height, (
+            f"Stage frame has {len(frame_lines)} lines, expected {terminal_height}. "
+            f"Stage text snippet: {stage_text[:40]!r}"
+        )

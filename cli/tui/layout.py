@@ -274,9 +274,15 @@ def render_workspace_layout_str(
     if conversation_content is not None:
         conversation_text = conversation_content
     if height is not None:
+        effective_vp_height = height
+        active_scroll = conversation_scroll
+        if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
+            active_scroll = getattr(state, "conversation_scroll")
+        if active_scroll is not None and getattr(active_scroll, "has_new_activity", False):
+            effective_vp_height = max(1, height - 2)
         conversation_text = slice_conversation_viewport(
             conversation_text,
-            viewport_height=height,
+            viewport_height=effective_vp_height,
             scroll=conversation_scroll,
             pad=True,
         )

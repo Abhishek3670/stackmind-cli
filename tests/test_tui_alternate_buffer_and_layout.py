@@ -1244,6 +1244,84 @@ def test_render_workspace_layout_str_preserves_exact_height_rows():
         )
 
 
+def test_scroll_up_unblocked_after_empty_landing_screen():
+    """Verify ConversationScroll allows scrolling up when new messages arrive after an empty landing screen (max_offset=0)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-scroll-fix")
+
+    # 1. Simulate empty/landing screen slice where total_lines <= viewport_height sets max_offset = 0
+    landing_text = "Line 1\nLine 2\nLine 3"
+    slice_conversation_viewport(landing_text, viewport_height=20, scroll=state.conversation_scroll)
+    assert state.conversation_scroll.max_offset == 0
+    assert state.conversation_scroll.scroll_offset == 0
+
+    # 2. Add large message
+    long_msg = "\n".join(f"Message line {i}" for i in range(50))
+    state.add_message("assistant", long_msg)
+
+    # max_offset should be invalidated so old clamp is not applied
+    assert state.conversation_scroll.max_offset is None
+
+    # 3. User scrolls up
+    state.scroll_conversation_up(5)
+    assert state.conversation_scroll.scroll_offset == 5
+    assert state.conversation_scroll.follow_bottom is False
+
+    # 4. Slicing with new content recalculates max_offset and respects scroll_offset
+    all_content = "\n".join(m.content for m in state.messages)
+    sliced = slice_conversation_viewport(all_content, viewport_height=20, scroll=state.conversation_scroll)
+    assert state.conversation_scroll.max_offset == 30  # 50 - 20
+    assert state.conversation_scroll.scroll_offset == 5
+    assert len(sliced.splitlines()) == 20
+
+
+def test_render_workspace_layout_str_activity_badge_preserves_height_budget():
+    """Verify render_workspace_layout_str reserves 2 lines for activity badge and preserves exact height."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-badge-fix")
+    long_content = "\n".join(f"Message line {i}" for i in range(40))
+    state.add_message("assistant", long_content)
+
+    state.conversation_scroll.scroll_up(10)
+    state.conversation_scroll.notify_activity()
+    assert state.conversation_scroll.has_new_activity is True
+
+    target_height = 20
+    out = render_workspace_layout_str(
+        long_content,
+        width=120,
+        state=state,
+        conversation_scroll=state.conversation_scroll,
+        height=target_height,
+    )
+    lines = out.splitlines()
+    assert len(lines) == target_height
+    assert any("↓ New activity" in line for line in lines)
+
+
+def test_full_screen_workspace_exact_height_with_activity_indicator():
+    """Verify render_full_screen_workspace maintains fixed 24 and 30 line budgets when activity indicator is active."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-full-badge")
+    session = {"session_id": "sess-full-badge", "agent": "gemini", "provider": "daemon"}
+    long_content = "\n".join(f"Line {i}" for i in range(50))
+    state.add_message("assistant", long_content)
+
+    state.conversation_scroll.scroll_up(10)
+    state.conversation_scroll.notify_activity()
+    assert state.conversation_scroll.has_new_activity is True
+
+    for test_height in (24, 30):
+        frame = render_full_screen_workspace(
+            session=session,
+            state=state,
+            width=120,
+            height=test_height,
+            include_composer=True,
+        )
+        lines = frame.splitlines()
+        assert len(lines) == test_height
+        assert any("↓ New activity" in line for line in lines)
+        assert len(lines[-1]) == compute_layout(120).conversation_width  # status bar pinned at bottom
+
+
 
 
 
