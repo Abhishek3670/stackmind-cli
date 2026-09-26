@@ -80,3 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 - Initial repository scaffolding.
+
+## [3.5.1] - 2026-09-26
+
+### Fixed
+- **Full-stretched TUI Layout Restoration (WO-022)**:
+  - Eliminated centered conversation deck side gutters on wide screens, restoring full-stretched 2-column layout.
+  - Normalized composer input positioning to column 0 with proper cursor repositioning.
+  - Closed box borders and maintained chrome integrity across all resolution breakpoints.
