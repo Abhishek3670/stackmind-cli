@@ -27,6 +27,7 @@ from cli.tui.app import (
 )
 from cli.tui.layout import (
     NARROW_THRESHOLD,
+    LayoutTier,
     LiveWorkspaceManager,
     compute_layout,
     create_live_workspace,
@@ -356,4 +357,91 @@ def test_dispatch_delivery_command_stops_live_manager_on_exit():
         )
         assert should_exit is True
         mock_live.stop.assert_called_once()
+
+
+# ─── 7. WO-019: MULTI-TIER DYNAMIC RESIZE TRANSITIONS & STABILITY ───────────
+
+
+def test_dynamic_resize_across_all_breakpoint_transitions():
+    """Verify LiveWorkspaceManager cleanly handles repeated multi-tier resize transitions (WO-019 AC-4)."""
+    state = AutonomousDeliveryState("demo", session_id="test-resize-multitier")
+    state.add_message("user", "Testing dynamic resizing across breakpoints")
+    state.add_message("assistant", "Layout adapting cleanly.")
+    session = {"session_id": "test-resize-multitier", "agent": "gemini"}
+
+    # Start manager at standard 120x30 (NORMAL tier)
+    manager = LiveWorkspaceManager(
+        session=session,
+        state=state,
+        width=120,
+        height=30,
+    )
+
+    # Dynamic transition sequence: 120 -> 90 -> 160 -> 70 -> 200 -> 120
+    resize_sequence = [
+        (90, 25, LayoutTier.NARROW, False, True),
+        (160, 40, LayoutTier.WIDE, True, False),
+        (70, 20, LayoutTier.VERY_NARROW, False, False),
+        (200, 50, LayoutTier.VERY_WIDE, True, False),
+        (120, 30, LayoutTier.NORMAL, True, False),
+    ]
+
+    for new_w, new_h, expected_tier, exp_runtime, exp_badge in resize_sequence:
+        manager.handle_resize(new_w, new_h)
+        assert manager.width == new_w
+        assert manager.height == new_h
+
+        layout = compute_layout(new_w)
+        assert layout.tier == expected_tier
+        assert layout.show_runtime is exp_runtime
+        assert layout.show_runtime_badge is exp_badge
+
+        renderable = manager.build_renderable(include_composer=True)
+        frame_text = renderable.plain
+        lines = frame_text.splitlines()
+
+        # Strict height constraint preserved across every resize
+        assert len(lines) == new_h, (
+            f"Resize to {new_w}x{new_h} ({expected_tier.value}) produced {len(lines)} lines, expected {new_h}"
+        )
+
+        # No border clipping or malformed boxes; flush at column 0 (WO-022 AC-4)
+        comp_bottom = lines[-2]
+        assert not comp_bottom.startswith(" ")
+        assert comp_bottom[0] in ("╰", "└")
+        assert comp_bottom[-1] in ("╯", "┘")
+
+
+def test_resize_preserves_conversation_scroll_without_geometry_drift():
+    """Verify dynamic resizing recalculates scroll bounds without overflow or negative offsets (WO-019 AC-4)."""
+    state = AutonomousDeliveryState("demo", session_id="test-resize-scroll")
+    for i in range(50):
+        state.add_message("user" if i % 2 == 0 else "assistant", f"Message line {i}")
+
+    # Start with scroll offset
+    state.conversation_scroll.viewport_height = 20
+    state.scroll_conversation_up(10)
+    assert state.conversation_scroll.scroll_offset == 10
+
+    manager = LiveWorkspaceManager(
+        session={"session_id": "test-resize-scroll"},
+        state=state,
+        width=120,
+        height=30,
+    )
+
+    # Resize from 30 -> 15 (shrinking height)
+    manager.handle_resize(120, 15)
+    renderable_small = manager.build_renderable(include_composer=True)
+    lines_small = renderable_small.plain.splitlines()
+    assert len(lines_small) == 15
+    assert state.conversation_scroll.scroll_offset >= 0
+
+    # Resize from 120x15 -> 80x45 (expanding height, narrowing width)
+    manager.handle_resize(80, 45)
+    renderable_tall = manager.build_renderable(include_composer=True)
+    lines_tall = renderable_tall.plain.splitlines()
+    assert len(lines_tall) == 45
+    assert state.conversation_scroll.scroll_offset >= 0
+
 

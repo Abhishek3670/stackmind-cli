@@ -28,8 +28,12 @@ from cli.tui.app import (
     restore_terminal_state,
 )
 from cli.tui.layout import (
+    LayoutTier,
     compute_layout,
+    format_responsive_path,
+    format_responsive_title,
     render_full_screen_workspace,
+    render_runtime_badge_bar,
     render_runtime_panel,
     render_runtime_panel_str,
     render_workspace_layout_str,
@@ -1320,6 +1324,213 @@ def test_full_screen_workspace_exact_height_with_activity_indicator():
         assert len(lines) == test_height
         assert any("↓ New activity" in line for line in lines)
         assert len(lines[-1]) == compute_layout(120).conversation_width  # status bar pinned at bottom
+
+
+# ─── 16. WO-019: 5-TIER RESPONSIVE BREAKPOINT ARCHITECTURE & EXACT BOUNDS ───
+
+
+def test_compute_layout_5_tiers_resolution():
+    """Verify compute_layout resolves exactly across the 5 breakpoint tiers (WO-019 AC-1)."""
+    # 1. Very Narrow (< 80 cols): Single-column full-width, runtime panel hidden
+    layout_70 = compute_layout(70)
+    assert layout_70.tier == LayoutTier.VERY_NARROW
+    assert not layout_70.show_runtime
+    assert not layout_70.show_runtime_badge
+    assert layout_70.conversation_width == 70
+    assert layout_70.runtime_width == 0
+    assert layout_70.left_margin == 0
+    assert layout_70.right_margin == 0
+
+    # 2. Narrow (80-99 cols): Single-column conversation, 1-line top badge bar enabled
+    layout_90 = compute_layout(90)
+    assert layout_90.tier == LayoutTier.NARROW
+    assert not layout_90.show_runtime
+    assert layout_90.show_runtime_badge is True
+    assert layout_90.conversation_width == 90
+    assert layout_90.runtime_width == 0
+    assert layout_90.left_margin == 0
+    assert layout_90.right_margin == 0
+
+    # 3. Normal (100-139 cols): 2-column split (~28% runtime panel)
+    layout_120 = compute_layout(120)
+    assert layout_120.tier == LayoutTier.NORMAL
+    assert layout_120.show_runtime is True
+    assert not layout_120.show_runtime_badge
+    assert layout_120.runtime_width == 33
+    assert layout_120.conversation_width == 86
+    assert layout_120.conversation_width + layout_120.runtime_width + 1 == 120
+    assert layout_120.left_margin == 0
+    assert layout_120.right_margin == 0
+
+    # 4. Wide (140-179 cols): 2-column flex with runtime width capped at RUNTIME_MAX_WIDTH (42)
+    layout_160 = compute_layout(160)
+    assert layout_160.tier == LayoutTier.WIDE
+    assert layout_160.show_runtime is True
+    assert not layout_160.show_runtime_badge
+    assert layout_160.runtime_width == 42
+    assert layout_160.conversation_width == 117
+    assert layout_160.conversation_width + layout_160.runtime_width + 1 == 160
+    assert layout_160.left_margin == 0
+    assert layout_160.right_margin == 0
+
+    # 5. Very Wide (>= 180 cols): Full-stretch 2-column split, flush at column 0 (WO-022 AC-4)
+    layout_200 = compute_layout(200)
+    assert layout_200.tier == LayoutTier.VERY_WIDE
+    assert layout_200.show_runtime is True
+    assert not layout_200.show_runtime_badge
+    assert layout_200.conversation_width == 161  # 200 - 38 - 1
+    assert layout_200.runtime_width == 38
+    assert layout_200.conversation_width + layout_200.runtime_width + 1 == 200
+    assert layout_200.left_margin == 0
+    assert layout_200.right_margin == 0
+
+
+def test_render_full_screen_workspace_exact_bounds_across_5_tiers():
+    """Verify exact row and column bounds across 70x20, 90x25, 120x30, 160x40, and 200x50 (WO-019 AC-4)."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-019")
+    state.add_message("user", "Hello StackMind")
+    state.add_message("assistant", "Ready to assist.")
+    session = {"session_id": "sess-019", "agent": "gemini", "provider": "daemon"}
+
+    test_matrix = [
+        (70, 20, LayoutTier.VERY_NARROW),
+        (90, 25, LayoutTier.NARROW),
+        (120, 30, LayoutTier.NORMAL),
+        (160, 40, LayoutTier.WIDE),
+        (200, 50, LayoutTier.VERY_WIDE),
+    ]
+
+    for width, height, expected_tier in test_matrix:
+        frame = render_full_screen_workspace(
+            session,
+            state,
+            width=width,
+            height=height,
+            include_composer=True,
+        )
+        lines = frame.splitlines()
+
+        # (a) Strictly exact height rows
+        assert len(lines) == height, (
+            f"Expected {height} lines for {width}x{height} ({expected_tier.value}), got {len(lines)}"
+        )
+
+        layout = compute_layout(width)
+        assert layout.tier == expected_tier
+
+        # (b) Composer geometry and border integrity
+        comp_top = lines[-4]
+        comp_body = lines[-3]
+        comp_bottom = lines[-2]
+        status_line = lines[-1]
+
+        # WO-022 AC-4: zero side padding across every tier — chrome flush at column 0
+        assert not comp_top.startswith(" ")
+        assert not comp_bottom.startswith(" ")
+        assert comp_top[0] in ("╭", "┌")
+        assert comp_top[-1] in ("╮", "┐")
+        assert comp_bottom[0] in ("╰", "└")
+        assert comp_bottom[-1] in ("╯", "┘")
+        assert comp_body[0] == "│"
+        assert comp_body[-1] == "│"
+        expected_comp_width = layout.conversation_width if layout.show_runtime else width
+        assert len(comp_top) == expected_comp_width
+        assert len(status_line) == expected_comp_width
+
+        # (c) Tier-specific visual feature assertions
+        if expected_tier == LayoutTier.NARROW:
+            # Narrow mode: 1-line top badge bar present in workspace
+            assert "AGENTS:" in frame
+            assert "WOs:" in frame
+            assert "OP:" in frame
+        elif expected_tier in (LayoutTier.NORMAL, LayoutTier.WIDE, LayoutTier.VERY_WIDE):
+            # 2-column modes: StackMind Runtime panel present
+            assert "StackMind Runtime" in frame
+
+
+def test_format_responsive_path_adaptive_middle_truncation():
+    """Verify format_responsive_path adaptively middle-truncates paths preserving root and leaf (WO-019 AC-3)."""
+    # 1. Fits within budget -> untruncated
+    short_path = "cli/tui/layout.py"
+    assert format_responsive_path(short_path, 30) == short_path
+
+    # 2. Windows path middle truncation preserving drive and leaf
+    win_path = r"W:\Aatish\Stuff\stackmind-cli\validators\knowledge\compiler"
+    res_35 = format_responsive_path(win_path, 35)
+    assert len(res_35) <= 35
+    assert "..." in res_35
+    assert res_35.startswith(r"W:\Aatish")
+    assert res_35.endswith("compiler")
+
+    # 3. Compact budget: drive + ellipsis + leaf
+    res_20 = format_responsive_path(win_path, 20)
+    assert len(res_20) <= 20
+    assert "..." in res_20
+    assert res_20.endswith("compiler")
+
+    # 4. Tiny budget fallback
+    res_5 = format_responsive_path(win_path, 5)
+    assert len(res_5) <= 5
+
+    # 5. POSIX path truncation
+    posix_path = "/home/developer/workspace/stackmind/cli/tui/app.py"
+    res_posix = format_responsive_path(posix_path, 30)
+    assert len(res_posix) <= 30
+    assert "..." in res_posix
+    assert res_posix.endswith("app.py")
+
+
+def test_format_responsive_title_word_aware_truncation():
+    """Verify format_responsive_title soft-truncates at word boundaries (WO-019 AC-3)."""
+    # 1. Fits within budget -> untruncated
+    title = "Autonomous Delivery"
+    assert format_responsive_title(title, 25) == title
+
+    # 2. Truncates at word boundary with ellipsis
+    long_title = "Responsive TUI Layout Engine & Multi-Tier Breakpoint Architecture"
+    res = format_responsive_title(long_title, 25)
+    assert len(res) <= 25
+    assert res.endswith("…")
+    # Soft truncation should not chop mid-word like "Engi…"
+    assert res == "Responsive TUI Layout…"
+
+    # 3. Single long word fallback
+    long_word = "Supercalifragilisticexpialidocious"
+    res_word = format_responsive_title(long_word, 12)
+    assert len(res_word) <= 12
+    assert res_word.endswith("…")
+
+    # 4. Empty / zero handling
+    assert format_responsive_title("", 10) == ""
+    assert format_responsive_title("title", 0) == ""
+
+
+def test_render_runtime_badge_bar_formatting():
+    """Verify render_runtime_badge_bar produces a clean single-line summary (WO-019 AC-1)."""
+    state = AutonomousDeliveryState(
+        session_id="test-badge-sess",
+        roles={
+            "Backend": RoleStatus("Backend", backend="Codex", state="RUNNING"),
+            "Frontend": RoleStatus("Frontend", backend="AGY", state="WAITING"),
+        },
+        work_orders=[
+            WorkOrderItem(id="WO-001", title="Backend API", status="ACTIVE"),
+            WorkOrderItem(id="WO-002", title="Frontend UI", status="WAITING"),
+        ],
+        operations={
+            "op-1": OperationNode("op-1", "Turn", role="Backend", backend="Codex", status="RUNNING"),
+        },
+    )
+
+    badge = render_runtime_badge_bar(width=90, state=state)
+    badge_str = badge.plain
+
+    # Guaranteed single line
+    assert "\n" not in badge_str
+    assert len(badge_str) == 90
+    assert "AGENTS: 1/2 active" in badge_str
+    assert "WOs: 1/2 active" in badge_str
+    assert "OP: Backend · Codex" in badge_str
 
 
 
