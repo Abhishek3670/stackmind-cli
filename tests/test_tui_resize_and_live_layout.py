@@ -405,16 +405,11 @@ def test_dynamic_resize_across_all_breakpoint_transitions():
             f"Resize to {new_w}x{new_h} ({expected_tier.value}) produced {len(lines)} lines, expected {new_h}"
         )
 
-        # No border clipping or malformed boxes
+        # No border clipping or malformed boxes; flush at column 0 (WO-022 AC-4)
         comp_bottom = lines[-2]
-        if layout.left_margin > 0:
-            assert comp_bottom.startswith(" " * layout.left_margin)
-            stripped_bottom = comp_bottom[layout.left_margin:]
-            assert stripped_bottom[0] in ("╰", "└")
-            assert stripped_bottom[-1] in ("╯", "┘")
-        else:
-            assert comp_bottom[0] in ("╰", "└")
-            assert comp_bottom[-1] in ("╯", "┘")
+        assert not comp_bottom.startswith(" ")
+        assert comp_bottom[0] in ("╰", "└")
+        assert comp_bottom[-1] in ("╯", "┘")
 
 
 def test_resize_preserves_conversation_scroll_without_geometry_drift():

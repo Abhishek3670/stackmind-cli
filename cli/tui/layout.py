@@ -46,8 +46,8 @@ VERY_WIDE_BREAKPOINT = 180
 RUNTIME_MIN_WIDTH = 26
 RUNTIME_MAX_WIDTH = 42
 
-# Ultra-wide centered deck geometry (WO-019)
-VERY_WIDE_CONVERSATION_MAX_WIDTH = 130
+# Very Wide (>=180) runtime panel width (WO-022 AC-1): conversation stretches fully to
+# width - runtime - 1, flush at column 0. No centered-deck gutters or side paddings.
 VERY_WIDE_RUNTIME_WIDTH = 38
 
 # Runtime panel heading.
@@ -85,7 +85,7 @@ class LayoutTier(str, Enum):
     NARROW = "NARROW"            # 80-99 cols: single-col full-width, 1-line top badge bar
     NORMAL = "NORMAL"            # 100-139 cols: 2-column standard split (~72% / ~28%)
     WIDE = "WIDE"                # 140-179 cols: 2-column flex (72% / 28%, runtime max 38)
-    VERY_WIDE = "VERY_WIDE"      # >= 180 cols: centered conversation deck (max 130) + balanced gutters
+    VERY_WIDE = "VERY_WIDE"      # >= 180 cols: full-stretch 2-column split (WO-022)
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ def compute_layout(width: int) -> ColumnLayout:
     - NARROW (80-99 cols): Single-column conversation, runtime collapsed into 1-line top badge bar.
     - NORMAL (100-139 cols): 2-column standard split with ~28% runtime panel.
     - WIDE (140-179 cols): 2-column proportional flex with runtime capped at 38 cols.
-    - VERY_WIDE (>=180 cols): Centered conversation deck (max-width 130) with balanced gutters.
+    - VERY_WIDE (>=180 cols): Full-stretch 2-column split, flush at column 0 (WO-022).
     """
     if width < VERY_NARROW_BREAKPOINT:
         return ColumnLayout(
@@ -174,13 +174,11 @@ def compute_layout(width: int) -> ColumnLayout:
             show_runtime_badge=False,
         )
 
-    # Very Wide (>=180 cols): Centered conversation deck (max 130 cols) with balanced gutters
+    # Very Wide (>=180 cols): Full-stretch 2-column split, flush at column 0 (WO-022 AC-1).
+    # No centered-deck gutters: conversation consumes all remaining width after the
+    # fixed-width runtime panel and divider.
     runtime_w = VERY_WIDE_RUNTIME_WIDTH
-    conversation_w = VERY_WIDE_CONVERSATION_MAX_WIDTH
-    content_w = conversation_w + 1 + runtime_w
-    excess = max(0, width - content_w)
-    left_margin = excess // 2
-    right_margin = excess - left_margin
+    conversation_w = width - runtime_w - 1
 
     return ColumnLayout(
         total_width=width,
@@ -188,8 +186,8 @@ def compute_layout(width: int) -> ColumnLayout:
         runtime_width=runtime_w,
         show_runtime=True,
         tier=LayoutTier.VERY_WIDE,
-        left_margin=left_margin,
-        right_margin=right_margin,
+        left_margin=0,
+        right_margin=0,
         show_runtime_badge=False,
     )
 
@@ -472,7 +470,7 @@ def render_workspace_layout(
       returns Group(badge_bar, conversation_column).
     - If show_runtime is False (VERY_NARROW mode), returns conversation_column.
     - If show_runtime is True (NORMAL, WIDE, VERY_WIDE modes), returns a Table grid
-      with [left_margin] [conversation] [divider] [runtime] [right_margin].
+      with [conversation] [divider] [runtime] — all flush at column 0 (WO-022).
     """
     layout = compute_layout(width)
 
@@ -500,15 +498,11 @@ def render_workspace_layout(
             return Group(badge, conv_column)
         return conv_column
 
-    # Build a grid: [left margin] [conversation] [divider] [runtime] [right margin]
+    # Build a grid: [conversation] [divider] [runtime] — flush at column 0 (WO-022 AC-2)
     grid = Table.grid(padding=0)
-    if layout.left_margin > 0:
-        grid.add_column(width=layout.left_margin)
     grid.add_column(width=layout.conversation_width)
     grid.add_column(width=1)  # vertical divider
     grid.add_column(width=layout.runtime_width)
-    if layout.right_margin > 0:
-        grid.add_column(width=layout.right_margin)
 
     runtime = render_runtime_panel(
         width=layout.runtime_width,
@@ -522,16 +516,7 @@ def render_workspace_layout(
 
     divider_char = Text("│", style="dim #334155")
 
-    row_cells: list[RenderableType] = []
-    if layout.left_margin > 0:
-        row_cells.append(Text(" " * layout.left_margin))
-    row_cells.append(conv_column)
-    row_cells.append(divider_char)
-    row_cells.append(runtime)
-    if layout.right_margin > 0:
-        row_cells.append(Text(" " * layout.right_margin))
-
-    grid.add_row(*row_cells)
+    grid.add_row(conv_column, divider_char, runtime)
     return grid
 
 
@@ -635,9 +620,9 @@ def render_full_screen_workspace(
 
     Layout geometry:
     - Rows 0 to (height - 5): Workspace layout with viewport slicing
-      (Left: conversation viewport; Right: persistent StackMind Runtime panel, or centered deck in VERY_WIDE,
-       or top badge bar in NARROW)
+      (Left: conversation viewport; Right: persistent StackMind Runtime panel, or top badge bar in NARROW)
     - Rows (height - 4) to (height - 2): Pinned bottom composer box (3 lines)
+      (omitted when include_composer is False to leave rows open for prompt_composer_input).
     - Row (height - 1): Bottom status bar (1 line) aligned with conversation column.
     """
     from cli.tui.app import (
@@ -698,11 +683,8 @@ def render_full_screen_workspace(
         no_color=no_color,
     )
 
-    margin_prefix = " " * layout.left_margin if layout.left_margin > 0 else ""
-
     if not include_composer:
-        indented_status = f"{margin_prefix}{status_bar_str}" if margin_prefix else status_bar_str
-        return f"{workspace_str}\n{indented_status}"
+        return f"{workspace_str}\n{status_bar_str}"
 
     # 5. Pinned bottom composer box (3 lines) placed above bottom status bar
     comp_width = layout.conversation_width if layout.show_runtime else width
@@ -716,10 +698,6 @@ def render_full_screen_workspace(
         force_color=force_color,
         no_color=no_color,
     )
-
-    if margin_prefix:
-        composer_str = "\n".join(f"{margin_prefix}{line}" for line in composer_str.splitlines())
-        status_bar_str = f"{margin_prefix}{status_bar_str}"
 
     return f"{workspace_str}\n{composer_str}\n{status_bar_str}"
 
@@ -941,7 +919,6 @@ __all__ = [
     "RuntimePanelScroll",
     "VERY_NARROW_BREAKPOINT",
     "VERY_WIDE_BREAKPOINT",
-    "VERY_WIDE_CONVERSATION_MAX_WIDTH",
     "VERY_WIDE_RUNTIME_WIDTH",
     "WIDE_BREAKPOINT",
     "compute_layout",

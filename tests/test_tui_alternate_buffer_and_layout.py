@@ -1373,24 +1373,16 @@ def test_compute_layout_5_tiers_resolution():
     assert layout_160.left_margin == 0
     assert layout_160.right_margin == 0
 
-    # 5. Very Wide (>= 180 cols): Centered conversation deck (max 130) + balanced gutters
+    # 5. Very Wide (>= 180 cols): Full-stretch 2-column split, flush at column 0 (WO-022 AC-4)
     layout_200 = compute_layout(200)
     assert layout_200.tier == LayoutTier.VERY_WIDE
     assert layout_200.show_runtime is True
     assert not layout_200.show_runtime_badge
-    assert layout_200.conversation_width == 130
+    assert layout_200.conversation_width == 161  # 200 - 38 - 1
     assert layout_200.runtime_width == 38
-    # Content width = 130 + 1 + 38 = 169 cols; excess = 200 - 169 = 31 cols
-    assert layout_200.left_margin == 15
-    assert layout_200.right_margin == 16
-    assert (
-        layout_200.left_margin
-        + layout_200.conversation_width
-        + 1
-        + layout_200.runtime_width
-        + layout_200.right_margin
-        == 200
-    )
+    assert layout_200.conversation_width + layout_200.runtime_width + 1 == 200
+    assert layout_200.left_margin == 0
+    assert layout_200.right_margin == 0
 
 
 def test_render_full_screen_workspace_exact_bounds_across_5_tiers():
@@ -1432,32 +1424,18 @@ def test_render_full_screen_workspace_exact_bounds_across_5_tiers():
         comp_bottom = lines[-2]
         status_line = lines[-1]
 
-        if layout.left_margin > 0:
-            prefix = " " * layout.left_margin
-            assert comp_top.startswith(prefix)
-            assert comp_body.startswith(prefix)
-            assert comp_bottom.startswith(prefix)
-            assert status_line.startswith(prefix)
-            stripped_top = comp_top[layout.left_margin:]
-            stripped_bottom = comp_bottom[layout.left_margin:]
-            stripped_body = comp_body[layout.left_margin:]
-            assert stripped_top[0] in ("╭", "┌")
-            assert stripped_top[-1] in ("╮", "┐")
-            assert stripped_bottom[0] in ("╰", "└")
-            assert stripped_bottom[-1] in ("╯", "┘")
-            assert stripped_body[0] == "│"
-            assert stripped_body[-1] == "│"
-            assert len(stripped_top) == layout.conversation_width
-        else:
-            assert comp_top[0] in ("╭", "┌")
-            assert comp_top[-1] in ("╮", "┐")
-            assert comp_bottom[0] in ("╰", "└")
-            assert comp_bottom[-1] in ("╯", "┘")
-            assert comp_body[0] == "│"
-            assert comp_body[-1] == "│"
-            expected_comp_width = layout.conversation_width if layout.show_runtime else width
-            assert len(comp_top) == expected_comp_width
-            assert len(status_line) == expected_comp_width
+        # WO-022 AC-4: zero side padding across every tier — chrome flush at column 0
+        assert not comp_top.startswith(" ")
+        assert not comp_bottom.startswith(" ")
+        assert comp_top[0] in ("╭", "┌")
+        assert comp_top[-1] in ("╮", "┐")
+        assert comp_bottom[0] in ("╰", "└")
+        assert comp_bottom[-1] in ("╯", "┘")
+        assert comp_body[0] == "│"
+        assert comp_body[-1] == "│"
+        expected_comp_width = layout.conversation_width if layout.show_runtime else width
+        assert len(comp_top) == expected_comp_width
+        assert len(status_line) == expected_comp_width
 
         # (c) Tier-specific visual feature assertions
         if expected_tier == LayoutTier.NARROW:

@@ -83,7 +83,6 @@ from cli.tui.landing import (
 )
 from cli.tui.layout import (
     NARROW_THRESHOLD,
-    LayoutTier,
     LiveWorkspaceManager,
     compute_layout,
     compute_viewport_height,
@@ -2532,11 +2531,9 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
             enter_alternate_screen()
             enable_mouse_reporting()
             redraw_full_screen(session, state, clear=True, include_composer=True, composer_is_active=True)
-            term_init = shutil.get_terminal_size(fallback=(80, 24))
-            current_lines = term_init.lines
-            # WO-019: account for VERY_WIDE left gutter when repositioning the cursor.
-            cur_col = 5 + getattr(compute_layout(term_init.columns), "left_margin", 0)
-            sys.stdout.write(f"\x1b[{current_lines - 2};{cur_col}H")
+            current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+            # WO-022: fixed column — layout is flush at column 0 across all tiers.
+            sys.stdout.write(f"\x1b[{current_lines - 2};5H")
             sys.stdout.flush()
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
@@ -2593,9 +2590,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                         click.echo(out)
 
                 def _handle_ctrl_l(editor: Any = None) -> None:
-                    term_size_now = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_lines = term_size_now.lines
-                    cur_col = 5 + getattr(compute_layout(term_size_now.columns), "left_margin", 0)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     if is_tty:
                         redraw_full_screen(
                             session,
@@ -2605,7 +2600,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cur_col}H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     else:
                         click.echo(render_top_header_bar_str(
@@ -2641,9 +2636,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
 
                 def _handle_page_up(editor: Any = None) -> None:
                     """Scroll conversation viewport up by half a page."""
-                    term_size_now = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_lines = term_size_now.lines
-                    cur_col = 5 + getattr(compute_layout(term_size_now.columns), "left_margin", 0)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     vp_height = compute_viewport_height(term_lines)
                     state.scroll_conversation_up(max(1, vp_height // 2))
                     if is_tty:
@@ -2655,16 +2648,14 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cur_col}H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
                 def _handle_page_down(editor: Any = None) -> None:
                     """Scroll conversation viewport down by half a page."""
-                    term_size_now = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_lines = term_size_now.lines
-                    cur_col = 5 + getattr(compute_layout(term_size_now.columns), "left_margin", 0)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     vp_height = compute_viewport_height(term_lines)
                     state.scroll_conversation_down(max(1, vp_height // 2))
                     if is_tty:
@@ -2676,16 +2667,14 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cur_col}H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
                 def _handle_wheel_up(editor: Any = None) -> None:
                     """Scroll conversation viewport up by wheel step (3 lines)."""
-                    term_size_now = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_lines = term_size_now.lines
-                    cur_col = 5 + getattr(compute_layout(term_size_now.columns), "left_margin", 0)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     state.scroll_conversation_up(3)
                     if is_tty:
                         redraw_full_screen(
@@ -2696,16 +2685,14 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cur_col}H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
                 def _handle_wheel_down(editor: Any = None) -> None:
                     """Scroll conversation viewport down by wheel step (3 lines)."""
-                    term_size_now = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_lines = term_size_now.lines
-                    cur_col = 5 + getattr(compute_layout(term_size_now.columns), "left_margin", 0)
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     state.scroll_conversation_down(3)
                     if is_tty:
                         redraw_full_screen(
@@ -2716,7 +2703,7 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                             composer_is_active=True,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cur_col}H")
+                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2771,10 +2758,8 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
                     composer_is_active=True,
                     live_manager=live_ws,
                 )
-                term_loop = shutil.get_terminal_size(fallback=(80, 24))
-                current_lines = term_loop.lines
-                cur_col = 5 + getattr(compute_layout(term_loop.columns), "left_margin", 0)
-                sys.stdout.write(f"\x1b[{current_lines - 2};{cur_col}H")
+                current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+                sys.stdout.write(f"\x1b[{current_lines - 2};5H")
                 sys.stdout.flush()
     finally:
         disable_mouse_reporting()
