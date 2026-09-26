@@ -8,6 +8,7 @@ from typing import Any
 from .boundary import RuntimeBoundary
 from .contract import AgentContract
 from .identity import AuthorizationPolicy
+from .interpreter_denylist import check_command
 from .operations import OperationRequest, OperationType
 from .sandbox import ProcessSandbox
 from .workspace import ScratchWorkspace
@@ -17,13 +18,14 @@ class ToolGateway:
     def __init__(self, workspace: ScratchWorkspace, boundary: RuntimeBoundary,
                  contract: AgentContract, policy: AuthorizationPolicy, session_id: str,
                  attempt_id: str, actor_id: str, provider_id: str,
-                 graph_query: Callable[[str], Any] | None = None) -> None:
+                 graph_query: Callable[[str], Any] | None = None,
+                 sandbox: ProcessSandbox | None = None) -> None:
         self.workspace, self.boundary = workspace, boundary
         self.contract, self.policy = contract, policy
         self.session_id, self.attempt_id = session_id, attempt_id
         self.actor_id, self.provider_id = actor_id, provider_id
         self.graph_query = graph_query
-        self.sandbox = ProcessSandbox(workspace)
+        self.sandbox = sandbox or ProcessSandbox(workspace)
 
     def _request(self, operation_type: OperationType, target: str) -> OperationRequest:
         return OperationRequest(operation_type, target, self.session_id, self.attempt_id,
@@ -53,6 +55,14 @@ class ToolGateway:
         record = self._authorize(OperationType.RUN_COMMAND, "workspace/command")
         if not record.authorized:
             raise PermissionError(record.reason)
+        # Hard interpreter denylist (Phase 2): shells and string-code
+        # interpreters are denied at the agent-facing boundary regardless of
+        # contract grants. Trusted platform-internal callers (canary verifier,
+        # evidence tracer) construct their own ProcessSandbox and are not
+        # subject to this gate.
+        denial_reason = check_command(command)
+        if denial_reason is not None:
+            raise PermissionError(denial_reason)
         result = self.sandbox.run(command)
         self.boundary.journal.complete(record.request.operation_id, result)
         return result

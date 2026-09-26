@@ -100,11 +100,15 @@ def test_all_governed_tools_are_scratch_journaled_and_reviewable(tmp_path):
     workspace, manager, session, registry, modes = runtime(tmp_path)
     server = McpServer(registry)
     assert call(server, "stackmind.read_file", {"path": "source.txt"}) == "source"
-    assert call(server, "stackmind.write_file", {"path": "result.txt", "content": "scratch"}) == {
+    assert call(server, "stackmind.write_file", {"path": "echo_ok.py", "content": "print('ok')"}) == {
         "written": True
     }
     command = call(
-        server, "stackmind.run_command", {"command": [sys.executable, "-c", "print('ok')"]}
+        server,
+        "stackmind.run_command",
+        # Interpreter denylist (Phase 2): code-string flags are denied at the
+        # agent boundary, so this vector runs a script file instead of -c.
+        {"command": [sys.executable, "echo_ok.py"]},
     )
     assert command["returncode"] == 0 and command["stdout"] == "ok\n"
     assert call(server, "stackmind.query_graph", {"query": "ToolGateway"}) == {
