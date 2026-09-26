@@ -386,7 +386,7 @@ def test_governed_work_order_execution_through_agent_runner(tmp_path):
                     "summary": f"Completed {request.task.identifier}",
                     "report_markdown": "# Done",
                     "blockers": [],
-                    "modified_files": ["src/feature.py"],
+                    "modified_files": [],
                     "release_target": "v1.0.0",
                     "retrieval_queries": [],
                     "uncertainty": [],

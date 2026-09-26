@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +78,14 @@ class CompletionRecord:
     completion_tokens: int = 0
     latency_ms: int = 0
     cost_estimate: float = 0.0
+
+
+@dataclass(frozen=True)
+class GovernedToolRuntime:
+    """Per-attempt model tool boundary and its sole scratch workspace."""
+
+    workspace: Any
+    gateway: Any
 
 
 class LLMProvider(Protocol):
@@ -209,6 +218,7 @@ class AgentRunner:
         *,
         backend: Any | None = None,
         llm_provider: LLMProvider | None = None,
+        provider_adapter: Any | None = None,
         search_provider: SearchProvider | None = None,
         retrieval_policy: RetrievalPolicy | None = None,
         token_budget: int = 1200,
@@ -223,6 +233,7 @@ class AgentRunner:
         self.sync_path = self.project_path / '.sync'
         self.agent = agent
         self.backend = backend
+        self.provider_adapter = provider_adapter
         if backend is not None:
             self.backend_id = getattr(backend, 'backend_id', 'custom-backend')
             self.backend_model = getattr(backend, 'model', None) or 'default'
@@ -236,6 +247,12 @@ class AgentRunner:
             self.llm_provider = llm_provider or EchoLLMProvider()
             self.backend_id = getattr(self.llm_provider, 'provider_name', 'echo')
             self.backend_model = getattr(self.llm_provider, 'model_name', 'stackmind-echo-v1')
+        # Native provider adapters use ProviderGateway.  Keep the established
+        # LLMProvider protocol intact for deterministic legacy providers.
+        if self.provider_adapter is None:
+            from validators.kernel.providers.adapter import ProviderAdapter
+            if isinstance(self.llm_provider, ProviderAdapter):
+                self.provider_adapter = self.llm_provider
         self.search_tool = SessionSearchTool(search_provider, policy=retrieval_policy)
         self.token_budget = token_budget
         self.context_limit = context_limit
@@ -361,8 +378,14 @@ class AgentRunner:
                 evaluate_learning_eligibility,
             )
 
-            # Phase 0: Capture runner-owned before snapshot
-            before_snapshot = WorkspaceSnapshot.capture(self.project_path)
+            # Phase A: model-facing tools and all subsequent observation share
+            # exactly one scratch workspace.  The live project is never passed
+            # to a model-facing tool.
+            tool_runtime = self._build_tool_runtime(task_contract, task, knowledge_api)
+            workspace_root = (
+                tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+            )
+            before_snapshot = WorkspaceSnapshot.capture(workspace_root)
 
             # 4. Post-workspace snapshot.
             if self._is_cancelled(cancellation):
@@ -394,7 +417,7 @@ class AgentRunner:
                     self.backend.on_token = self.on_token
                 if self.backend is not None and hasattr(self.backend, 'cancel_event'):
                     self.backend.cancel_event = cancellation
-                completion = self.llm_provider.complete(request)
+                completion = self._complete_request(request, tool_runtime)
                 if self.backend is not None and hasattr(self.backend, 'report_result') and operation_id:
                     self.backend.report_result(operation_id)
             except Exception as exc:
@@ -511,7 +534,7 @@ class AgentRunner:
                 'llm_ms': llm_ms,
                 'run_at': run_at,
             }
-            staged_errors = self._validate_staged_state(stage_inputs)
+            staged_errors = self._validate_staged_state(stage_inputs, source_root=workspace_root)
             if staged_errors:
                 return HarnessRunResult(
                     status='blocked',
@@ -556,24 +579,31 @@ class AgentRunner:
                         reason=f'D025 validation failed: {gate_decision.reason}',
                     )
 
-                # Run all state-changing work in an isolated copy.  Nothing reaches the
-                # live workspace until its observed diff has passed every verification gate.
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    staged_root = Path(tmp_dir) / self.project_path.name
-                    shutil.copytree(
-                        self.project_path,
-                        staged_root,
-                        dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns('.git', '__pycache__', '.pytest_cache', '.ruff_cache'),
-                    )
+                # For native tool providers, tools have already changed the
+                # governed scratch workspace.  Legacy decision providers retain
+                # the historical disposable staging copy behavior.
+                staging_context = (
+                    nullcontext(workspace_root)
+                    if tool_runtime is not None
+                    else tempfile.TemporaryDirectory()
+                )
+                with staging_context as staging_path:
+                    staged_root = Path(staging_path) if tool_runtime is not None else Path(staging_path) / self.project_path.name
+                    if tool_runtime is None:
+                        shutil.copytree(
+                            self.project_path,
+                            staged_root,
+                            dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns('.git', '__pycache__', '.pytest_cache', '.ruff_cache'),
+                        )
                     self._apply_non_report_writes(stage_inputs, base_path=staged_root)
                     command_results: list[subprocess.CompletedProcess[str]] = []
                     for cmd in decision.commands:
                         if self._is_cancelled(cancellation):
                             return self._cancelled_result(task, operation_id)
-                        command_results.append(
-                            self._execute_sandboxed_command(cmd, staged_root)
-                        )
+                        command_results.append(self._execute_governed_command(
+                            cmd, staged_root, tool_runtime,
+                        ))
 
                     after_snapshot = WorkspaceSnapshot.capture(staged_root)
                     diff = before_snapshot.diff(after_snapshot)
@@ -841,6 +871,115 @@ class AgentRunner:
             commands=tuple(str(item) for item in payload.get('commands', [])),
         )
 
+    def _build_tool_runtime(
+        self, task_contract: Any, task: HarnessTask, knowledge_api: KnowledgeAPI,
+    ) -> GovernedToolRuntime | None:
+        """Compose the existing kernel boundaries for one native provider attempt."""
+        if self.provider_adapter is None:
+            return None
+        if task_contract is None:
+            raise PermissionError('native provider tools require an active contract')
+
+        from validators.kernel.boundary import RuntimeBoundary
+        from validators.kernel.contract import AgentContract as KernelContract
+        from validators.kernel.identity import AuthorizationPolicy
+        from validators.kernel.operations import OperationJournal
+        from validators.kernel.tools import ToolGateway
+        from validators.kernel.workspace import ScratchWorkspace
+
+        def workspace_rules(rules: Any) -> tuple[str, ...]:
+            converted: list[str] = []
+            for rule in rules:
+                module = rule.get('module') if isinstance(rule, dict) else None
+                if module:
+                    converted.append('workspace/' + module.replace('.', '/').rstrip('/') + '/**')
+            return tuple(converted)
+
+        attempt_id = f'harness-{self.agent}-{int(time.time() * 1000)}'
+        workspace = ScratchWorkspace.create(self.project_path, attempt_id)
+        contract = KernelContract(
+            agent_id=task_contract.agent_id,
+            work_order=task_contract.work_order,
+            allow=workspace_rules(task_contract.allow_rules),
+            deny=workspace_rules(task_contract.deny_rules),
+            write_mode=task_contract.write_mode,
+            budget=task_contract.budget,
+        ).freeze()
+        policy = AuthorizationPolicy.permit(
+            f'contract-{contract.work_order}',
+            ('read_file', 'write_file', 'run_command', 'query_graph'),
+        )
+        boundary = RuntimeBoundary(OperationJournal())
+
+        def graph_query(query: str) -> dict[str, Any]:
+            bundle = knowledge_api.assemble_context(
+                query, token_budget=self.token_budget, limit=self.context_limit, contract=task_contract,
+            )
+            return {'revision': bundle.revision, 'entries': [entry.render() for entry in bundle.entries]}
+
+        gateway = ToolGateway(
+            workspace=workspace, boundary=boundary, contract=contract, policy=policy,
+            session_id=f'harness-{self.agent}-{task.identifier}', attempt_id=attempt_id,
+            actor_id=self.agent, provider_id=self.backend_id, graph_query=graph_query,
+        )
+        return GovernedToolRuntime(workspace=workspace, gateway=gateway)
+
+    def _complete_request(
+        self, request: LLMRequest, tool_runtime: GovernedToolRuntime | None,
+    ) -> CompletionRecord:
+        """Run legacy completions or the existing ProviderGateway tool loop."""
+        if tool_runtime is None:
+            return self.llm_provider.complete(request)
+
+        from validators.kernel.providers.gateway import ProviderGateway
+        from validators.kernel.providers.models import Message
+        from validators.kernel.session import Attempt
+
+        kernel_contract = tool_runtime.gateway.contract
+        attempt = Attempt(tool_runtime.workspace.attempt_id, kernel_contract)
+        gateway = ProviderGateway(
+            self.provider_adapter, tool_runtime.gateway, attempt=attempt, contract=kernel_contract,
+        )
+        messages = [
+            Message.system('You are a governed StackMind worker. Use tools for all file I/O. Return the final HarnessDecision as JSON.'),
+            Message.user(
+                f'Task: {request.task.title}\n\n{request.task.body}\n\n'
+                f'Context:\n{request.context.text}'
+            ),
+        ]
+        history = gateway.run_loop(messages, max_turns=10, cancellation_token=request.cancellation)
+        final = history[-1]
+        if final.role != 'assistant' or final.tool_calls:
+            raise ValueError('provider tool loop ended without a final assistant decision')
+        try:
+            payload = json.loads(final.content or '')
+        except json.JSONDecodeError as exc:
+            raise ValueError('provider final response must be a JSON HarnessDecision') from exc
+        return CompletionRecord(
+            provider=getattr(self.provider_adapter, 'provider_name', self.backend_id),
+            model=getattr(self.provider_adapter, 'model_name', self.backend_model),
+            payload=payload,
+            prompt_tokens=gateway.total_usage.prompt_tokens,
+            completion_tokens=gateway.total_usage.completion_tokens,
+        )
+
+    def _execute_governed_command(
+        self, cmd: str, staged_root: Path, tool_runtime: GovernedToolRuntime | None,
+    ) -> subprocess.CompletedProcess[str]:
+        if tool_runtime is None:
+            return self._execute_sandboxed_command(cmd, staged_root)
+        try:
+            argv = shlex.split(cmd, posix=os.name != 'nt')
+        except ValueError as exc:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f'unparseable command: {exc}')
+        if not argv:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr='empty command')
+        try:
+            result = tool_runtime.gateway.run_command(argv)
+            return subprocess.CompletedProcess(cmd, result.returncode, result.stdout, result.stderr)
+        except Exception as exc:
+            return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f'command denied: {exc}')
+
     def _execute_sandboxed_command(
         self, cmd: str, staged_root: Path
     ) -> subprocess.CompletedProcess[str]:
@@ -914,7 +1053,9 @@ class AgentRunner:
             return subprocess.CompletedProcess(cmd, returncode=-1, stderr=f"{type(exc).__name__}: {exc}")
         return subprocess.CompletedProcess(cmd, result.returncode, result.stdout, result.stderr)
 
-    def _validate_staged_state(self, stage_inputs: dict[str, Any]) -> list[str]:
+    def _validate_staged_state(
+        self, stage_inputs: dict[str, Any], *, source_root: Path | None = None,
+    ) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp_dir:
             staged_root = Path(tmp_dir) / self.project_path.name
             shutil.copytree(
@@ -928,6 +1069,19 @@ class AgentRunner:
                     '.ruff_cache',
                 ),
             )
+            if source_root is not None and source_root.resolve() != self.project_path.resolve():
+                shutil.copytree(
+                    source_root,
+                    staged_root,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        '.git',
+                        '.sync',
+                        '__pycache__',
+                        '.pytest_cache',
+                        '.ruff_cache',
+                    ),
+                )
             self._apply_non_report_writes(stage_inputs, base_path=staged_root)
             report_write = self._build_report_write(
                 stage_inputs,
@@ -1202,13 +1356,24 @@ class AgentRunner:
                 raw_contract = self._read_yaml(contract_path)
                 allow_rules = raw_contract.get('scope', {}).get('allow', [])
                 deny_rules = raw_contract.get('scope', {}).get('deny', [])
-                allow_paths = [str(rule.get('path', '')) for rule in allow_rules if isinstance(rule, dict)]
-                deny_paths = [str(rule.get('path', '')) for rule in deny_rules if isinstance(rule, dict)]
+
+                def _rule_to_path(rule: Any) -> str:
+                    if isinstance(rule, dict):
+                        p = rule.get('path') or rule.get('target')
+                        if not p and rule.get('module'):
+                            p = str(rule['module']).replace('.', '/')
+                        return str(p or '')
+                    if isinstance(rule, str):
+                        return rule.replace('.', '/')
+                    return ''
+
+                allow_paths = [p for rule in allow_rules if (p := _rule_to_path(rule))]
+                deny_paths = [p for rule in deny_rules if (p := _rule_to_path(rule))]
                 for relative_path in task_changed_files:
                     normalized = Path(relative_path).as_posix()
                     if normalized.startswith('.sync/'):
                         continue  # Harness-owned bookkeeping writes are authorized separately.
-                    allowed = any(
+                    allowed = not allow_paths or any(
                         normalized == rule or normalized.startswith(rule.rstrip('/') + '/')
                         for rule in allow_paths
                     )
