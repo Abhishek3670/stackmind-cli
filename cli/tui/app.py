@@ -104,6 +104,7 @@ from cli.tui.state import (
     RoleStatus,
     WorkOrderItem,
 )
+from cli.daemon import DEFAULT_DAEMON_PORT, clear_daemon_pid, daemon_health, write_daemon_pid
 from validators.kernel.daemon import LocalDaemon
 from validators.kernel.tui import DaemonClient, StackMindTuiAdapter
 from validators.kernel.tui.views import (
@@ -332,6 +333,31 @@ def render_project_delivery_view(state: AutonomousDeliveryState) -> str:
 def create_tui_adapter(daemon_url: str) -> StackMindTuiAdapter:
     """Create a presentation adapter; all actions remain daemon RPC calls."""
     return StackMindTuiAdapter(DaemonClient(daemon_url))
+
+
+def resolve_tui_daemon(workspace: Path) -> tuple[LocalDaemon | None, str, bool]:
+    """Attach to the default daemon, or start one owned by this TUI instance.
+
+    Returns ``(daemon, url, is_attached)``. A daemon object is returned only
+    when this TUI started it and is therefore responsible for stopping it.
+    """
+    default_url = f"http://127.0.0.1:{DEFAULT_DAEMON_PORT}"
+    if daemon_health(default_url) is not None:
+        return None, default_url, True
+
+    state_dir = workspace.resolve() / ".sync" / "runtime" / "daemon"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        daemon = LocalDaemon(str(state_dir), port=DEFAULT_DAEMON_PORT).start()
+    except OSError:
+        click.echo(
+            f"StackMind daemon port {DEFAULT_DAEMON_PORT} is occupied by a non-daemon service; "
+            "using an ephemeral local daemon.",
+            err=True,
+        )
+        daemon = LocalDaemon(str(state_dir), port=0).start()
+    write_daemon_pid(workspace, daemon.address[1])
+    return daemon, daemon.url, False
 
 
 def _default_contract() -> dict[str, Any]:
@@ -2474,12 +2500,10 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
     """Start the governed Python-native terminal control plane."""
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
+    is_attached = daemon_url is not None
     live_ws: Any | None = None
     if daemon_url is None:
-        state_dir = workspace.resolve() / ".sync" / "runtime" / "daemon"
-        state_dir.mkdir(parents=True, exist_ok=True)
-        daemon = LocalDaemon(str(state_dir), port=0).start()
-        daemon_url = daemon.url
+        daemon, daemon_url, is_attached = resolve_tui_daemon(workspace)
 
     try:
         client = DaemonClient(daemon_url)
@@ -2766,7 +2790,8 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
         if live_ws is not None:
             live_ws.stop()
         restore_terminal_state()
-        if daemon is not None:
+        if daemon is not None and not is_attached:
             daemon.stop()
+            clear_daemon_pid(workspace.resolve(), os.getpid())
         if temporary_state is not None:
             temporary_state.cleanup()
