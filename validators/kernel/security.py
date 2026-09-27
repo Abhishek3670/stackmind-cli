@@ -15,6 +15,7 @@ and PLAN_TUI_v7.md §31-§32:
 
 from __future__ import annotations
 
+import ast
 import re
 import time
 from dataclasses import dataclass, field
@@ -164,13 +165,184 @@ _ALLOWLIST_TOKENS = {
 }
 
 
+def is_test_file(path: str | Path | None) -> bool:
+    """Identify if a file path belongs to a test suite, fixture, or assertion file."""
+    if not path:
+        return False
+    norm = Path(path).as_posix().lower()
+    parts = norm.split("/")
+    if any(p in ("tests", "test", "testing", "fixtures", "__tests__") for p in parts):
+        return True
+    filename = Path(path).name.lower()
+    return (
+        filename.startswith("test_")
+        or filename.endswith("_test.py")
+        or filename.endswith(".spec.ts")
+        or filename.endswith(".test.ts")
+        or filename.endswith(".spec.js")
+        or filename.endswith(".test.js")
+    )
+
+
+_SENSITIVE_VAR_NAMES = {
+    "password", "passwd", "pass", "pwd", "secret", "token",
+    "auth_token", "api_key", "apikey", "credential", "credentials",
+}
+
+_SENSITIVE_DICT_KEYS = {"admin", "user", "root", "guest", "test"}
+_SENSITIVE_DICT_VALUES = {"admin", "password", "admin123", "password123", "123456", "secret", "root", "pass"}
+
+
+class _InsecureAuthASTVisitor(ast.NodeVisitor):
+    def __init__(self, filename: str = "") -> None:
+        self.filename = filename
+        self.findings: list[str] = []
+        self._in_assert = False
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        prev = self._in_assert
+        self._in_assert = True
+        self.generic_visit(node)
+        self._in_assert = prev
+
+    def _is_sensitive_identifier(self, name: str) -> bool:
+        low = name.lower()
+        if low in _SENSITIVE_VAR_NAMES:
+            return True
+        return (
+            low.endswith(("_password", "_token", "_secret", "_key", "_cred", "_passwd"))
+            or low.startswith(("password_", "token_", "secret_", "api_key_"))
+        )
+
+    def _check_pair(self, cand_expr: ast.AST, cand_literal: ast.AST, lineno: int) -> None:
+        if not isinstance(cand_literal, ast.Constant) or not isinstance(cand_literal.value, str):
+            return
+
+        literal_val = cand_literal.value
+
+        # Case 1: ast.Name (e.g. password == 'admin')
+        if isinstance(cand_expr, ast.Name):
+            if self._is_sensitive_identifier(cand_expr.id):
+                self.findings.append(
+                    f"Hardcoded credential comparison detected at line {lineno}: "
+                    f"'{cand_expr.id} == '{literal_val}''"
+                )
+
+        # Case 2: ast.Attribute (e.g. req.password == 'admin')
+        elif isinstance(cand_expr, ast.Attribute):
+            if self._is_sensitive_identifier(cand_expr.attr):
+                self.findings.append(
+                    f"Hardcoded credential comparison detected at line {lineno}: "
+                    f"attribute '{cand_expr.attr} == '{literal_val}''"
+                )
+
+        # Case 3: ast.Subscript (e.g. data['password'] == 'admin')
+        elif isinstance(cand_expr, ast.Subscript):
+            slice_node = cand_expr.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+                if self._is_sensitive_identifier(slice_node.value):
+                    self.findings.append(
+                        f"Hardcoded credential comparison detected at line {lineno}: "
+                        f"key ['{slice_node.value}'] == '{literal_val}'"
+                    )
+
+        # Case 4: ast.Call (e.g. data.get('password') == 'admin')
+        elif isinstance(cand_expr, ast.Call):
+            if isinstance(cand_expr.func, ast.Attribute) and cand_expr.func.attr == "get":
+                if cand_expr.args and isinstance(cand_expr.args[0], ast.Constant) and isinstance(cand_expr.args[0].value, str):
+                    arg_name = cand_expr.args[0].value
+                    if self._is_sensitive_identifier(arg_name):
+                        self.findings.append(
+                            f"Hardcoded credential comparison detected at line {lineno}: "
+                            f".get('{arg_name}') == '{literal_val}'"
+                        )
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        if self._in_assert:
+            self.generic_visit(node)
+            return
+
+        for op, right in zip(node.ops, node.comparators):
+            if isinstance(op, (ast.Eq, ast.NotEq)):
+                self._check_pair(node.left, right, node.lineno)
+                self._check_pair(right, node.left, node.lineno)
+
+        self.generic_visit(node)
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        has_dummy_cred = False
+        for k, v in zip(node.keys, node.values):
+            if (
+                isinstance(k, ast.Constant) and isinstance(k.value, str)
+                and isinstance(v, ast.Constant) and isinstance(v.value, str)
+            ):
+                if k.value.lower() in _SENSITIVE_DICT_KEYS and (
+                    v.value.lower() in _SENSITIVE_DICT_VALUES or len(v.value) <= 12
+                ):
+                    has_dummy_cred = True
+                    break
+        if has_dummy_cred:
+            self.findings.append(
+                f"Hardcoded credential dictionary detected at line {node.lineno}"
+            )
+        self.generic_visit(node)
+
+
+_INSECURE_AUTH_FALLBACK_PATTERNS = [
+    re.compile(r"""(?i)\b(?:password|passwd|pass|secret|api[_-]?key|token|auth[_-]?token)\s*(?:==|!=)\s*['"][^'"]*['"]"""),
+    re.compile(r"""(?i)['"][^'"]*['"]\s*(?:==|!=)\s*\b(?:password|passwd|pass|secret|api[_-]?key|token|auth[_-]?token)\b"""),
+    re.compile(r"""(?i)(?:\[['"](?:password|passwd|secret|token)['"]\]|\.get\(['"](?:password|passwd|secret|token)['"]\))\s*(?:==|!=)\s*['"][^'"]*['"]"""),
+    re.compile(r"""(?i)(?:['"]admin['"]|['"]user['"])\s*:\s*['"](?:admin|password|admin123|123456|pass|secret|root)['"]"""),
+    re.compile(r"""(?i)\b(?:valid_users|users|credentials|passwords|accounts)\s*=\s*\{[^}]*['"](?:admin|user|test)['"]\s*:"""),
+]
+
+
+def scan_for_insecure_auth(text: str, file_path: str | Path | None = None) -> list[str]:
+    """Detect hardcoded credential equality comparisons and dummy credential stores in code."""
+    if not text or is_test_file(file_path):
+        return []
+
+    findings: list[str] = []
+
+    # Attempt AST parsing first for exact semantic inspection without regex false positives
+    try:
+        tree = ast.parse(text)
+        visitor = _InsecureAuthASTVisitor(filename=str(file_path or ""))
+        visitor.visit(tree)
+        findings.extend(visitor.findings)
+        if findings:
+            return findings
+    except (SyntaxError, UnicodeDecodeError):
+        pass
+
+    # Regex fallback when AST is not applicable (e.g. partial syntax or non-python code)
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith(("#", "//", "/*", "*", "assert ")):
+            continue
+        for pat in _INSECURE_AUTH_FALLBACK_PATTERNS:
+            match = pat.search(line)
+            if match:
+                findings.append(
+                    f"Hardcoded credential pattern detected at line {line_no}: '{match.group(0)}'"
+                )
+                break
+
+    return findings
+
+
 class CredentialLeakScanner:
     """Recursive scanner verifying zero credential exposure in payloads, logs, and state."""
 
-    def __init__(self, additional_secrets: Sequence[str] | None = None) -> None:
+    def __init__(
+        self,
+        additional_secrets: Sequence[str] | None = None,
+        check_insecure_auth: bool = True,
+    ) -> None:
         self.known_secrets = set(additional_secrets or [])
+        self.check_insecure_auth = check_insecure_auth
 
-    def scan_text(self, text: str) -> list[str]:
+    def scan_text(self, text: str, file_path: str | Path | None = None) -> list[str]:
         leaks: list[str] = []
         if not text:
             return leaks
@@ -186,6 +358,10 @@ class CredentialLeakScanner:
                 matched_val = match.group(1) if match.groups() else match.group(0)
                 if matched_val.lower() not in _ALLOWLIST_TOKENS:
                     leaks.append(f"Credential pattern matched ({pattern.pattern[:20]}...): '{matched_val[:4]}***'")
+
+        # Insecure credential comparison / hardcoded auth logic check
+        if self.check_insecure_auth and not is_test_file(file_path):
+            leaks.extend(scan_for_insecure_auth(text, file_path=file_path))
 
         return leaks
 
@@ -230,9 +406,12 @@ class CredentialLeakScanner:
         return result
 
 
-def scan_for_credential_leaks(obj: Any) -> list[str]:
+def scan_for_credential_leaks(obj: Any, file_path: str | Path | None = None) -> list[str]:
     """Helper function to scan any data structure for credential leaks."""
-    return CredentialLeakScanner().scan_object(obj)
+    scanner = CredentialLeakScanner()
+    if isinstance(obj, str):
+        return scanner.scan_text(obj, file_path=file_path)
+    return scanner.scan_object(obj)
 
 
 # ─── 3. D025 DESTRUCTIVE SAFEGUARDS ACROSS SUBAGENTS ──────────────────────────

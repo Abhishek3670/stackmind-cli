@@ -65,14 +65,42 @@ class StackMindTuiAdapter:
             target = params.get("session_id")
             if not target:
                 raise ValueError("session_id required for :approve")
-            return self.decide(target, True, argument or "Approved by operator")
+            clean_reason = argument or "Approved by operator"
+            if hasattr(self.client, "plan_get") and hasattr(self.client, "plan_approve"):
+                try:
+                    plan = self.client.plan_get(target)
+                    if isinstance(plan, dict) and plan.get("state") == "AWAITING_APPROVAL":
+                        plan_id = plan.get("plan_id", "PLAN-001")
+                        return self.client.plan_approve(target, plan_id, reason=clean_reason)
+                except Exception:
+                    pass
+            return self.decide(target, True, clean_reason)
         if command == ":reject":
             target = params.get("session_id")
             if not target:
                 raise ValueError("session_id required for :reject")
-            return self.decide(target, False, argument or "Rejected by operator")
+            clean_reason = argument or "Rejected by operator"
+            if hasattr(self.client, "plan_get") and hasattr(self.client, "plan_reject"):
+                try:
+                    plan = self.client.plan_get(target)
+                    if isinstance(plan, dict) and plan.get("state") == "AWAITING_APPROVAL":
+                        plan_id = plan.get("plan_id", "PLAN-001")
+                        return self.client.plan_reject(target, plan_id, reason=clean_reason)
+                except Exception:
+                    pass
+            return self.decide(target, False, clean_reason)
+        turn_params = {key: value for key, value in params.items() if key != "session_id"}
         if command == ":prompt":
             prompt = argument
+        elif command == ":goal":
+            if not argument:
+                raise ValueError("goal description required for :goal")
+            prompt = argument
+            # Convention note: Daemon kernel uses lowercase canonical role names ("architecture", "backend").
+            # The TUI presentation layer (state.roles) maps these to Title-cased display keys ("Architecture", "Q/A").
+            turn_params.setdefault("role", "architecture")
+            turn_params.setdefault("agent_id", "claude")
+            turn_params.setdefault("is_goal", True)
         elif not command.startswith(":"):
             prompt = stripped
         else:
@@ -81,7 +109,6 @@ class StackMindTuiAdapter:
             raise ValueError(
                 "Prompts and tool execution are runtime-owned and require a runtime turn endpoint"
             )
-        turn_params = {key: value for key, value in params.items() if key != "session_id"}
         return self.client.turn(params["session_id"], prompt, **turn_params)
 
     def stream(

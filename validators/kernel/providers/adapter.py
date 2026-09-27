@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from typing import Any, Callable
+from uuid import uuid4
 
 from .errors import (
     AuthenticationError,
@@ -300,3 +302,273 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             finish_reason=finish_reason,
             usage=usage,
         )
+
+
+class OllamaAdapter(ProviderAdapter):
+    """Production provider adapter for Ollama-hosted models via native /api/chat."""
+
+    def __init__(
+        self,
+        *,
+        endpoint: str = "http://localhost:11434",
+        model: str = "qwen2.5-coder:7b",
+        provider_name: str = "ollama",
+        default_timeout: float = 60.0,
+        transport: Callable[[dict[str, Any], bool, float | None], Any] | None = None,
+    ) -> None:
+        super().__init__(provider_name=provider_name, model_name=model)
+        self.endpoint = endpoint.rstrip("/")
+        self.default_timeout = default_timeout
+        self.transport = transport
+
+    def _extract_tool_calls_from_content(self, content: str | None) -> list[ToolCallRequest]:
+        if not content or not content.strip():
+            return []
+        text = content.strip()
+        results: list[ToolCallRequest] = []
+        known_tools = {"read_file", "write_file", "run_command", "query_graph"}
+
+        # 1. <tool_call> tags
+        tags = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+        for tag in tags:
+            try:
+                data = json.loads(tag.strip())
+                if isinstance(data, dict) and data.get("name") in known_tools:
+                    args = data.get("arguments", data.get("parameters", {}))
+                    results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", data["name"], args))
+            except Exception:
+                pass
+        if results:
+            return results
+
+        # 2. Markdown json blocks
+        blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        for b in blocks:
+            try:
+                data = json.loads(b.strip())
+                if isinstance(data, dict) and data.get("name") in known_tools:
+                    args = data.get("arguments", data.get("parameters", {}))
+                    results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", data["name"], args))
+            except Exception:
+                pass
+        if results:
+            return results
+
+        # 3. Streaming json parsing
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(text):
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx >= len(text):
+                break
+            try:
+                obj, end_idx = decoder.raw_decode(text, idx)
+                idx = end_idx
+                if isinstance(obj, dict) and obj.get("name") in known_tools:
+                    args = obj.get("arguments", obj.get("parameters", {}))
+                    results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", obj["name"], args))
+            except Exception:
+                idx += 1
+
+        return results
+
+    def _prepare_payload(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolDefinition] | None,
+        stream: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        payload_messages = []
+        for m in messages:
+            msg_dict: dict[str, Any] = {"role": str(m.role)}
+            if m.content is not None:
+                msg_dict["content"] = m.content
+            if m.tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        },
+                    }
+                    for tc in m.tool_calls
+                ]
+            payload_messages.append(msg_dict)
+
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": payload_messages,
+            "stream": stream,
+        }
+        if tools:
+            payload["tools"] = [t.to_dict() for t in tools]
+        payload.update(kwargs)
+        return payload
+
+    def _execute_request(
+        self,
+        payload: dict[str, Any],
+        stream: bool,
+        timeout: float | None,
+        cancellation_token: Any | None,
+    ) -> Any:
+        if cancellation_token is not None:
+            if hasattr(cancellation_token, "is_set") and cancellation_token.is_set():
+                raise TimeoutError("Operation was cancelled", provider=self.provider_name)
+            if callable(cancellation_token) and cancellation_token():
+                raise TimeoutError("Operation was cancelled", provider=self.provider_name)
+
+        actual_timeout = timeout if timeout is not None else self.default_timeout
+
+        if self.transport is not None:
+            try:
+                return self.transport(payload, stream, actual_timeout)
+            except ProviderError:
+                raise
+            except Exception as ex:
+                raise ProviderError(str(ex), provider=self.provider_name) from ex
+
+        url = f"{self.endpoint}/api/chat"
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+        try:
+            return urllib.request.urlopen(req, timeout=actual_timeout)
+        except urllib.error.HTTPError as ex:
+            body = ex.read().decode("utf-8", errors="replace")
+            raise ProviderError(
+                f"Ollama HTTP error {ex.code}: {body}",
+                status_code=ex.code,
+                provider=self.provider_name,
+            ) from ex
+        except (urllib.error.URLError, TimeoutError) as ex:
+            raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
+        except Exception as ex:
+            raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[ToolDefinition] | None = None,
+        timeout: float | None = None,
+        cancellation_token: Any | None = None,
+        **kwargs: Any,
+    ) -> ProviderResponse:
+        payload = self._prepare_payload(messages, tools, stream=False, **kwargs)
+        raw_result = self._execute_request(
+            payload, stream=False, timeout=timeout, cancellation_token=cancellation_token
+        )
+
+        if isinstance(raw_result, dict):
+            resp_data = raw_result
+        elif hasattr(raw_result, "read"):
+            resp_data = json.loads(raw_result.read().decode("utf-8"))
+        else:
+            raise ProviderError(
+                f"Invalid response type from transport: {type(raw_result)}",
+                provider=self.provider_name,
+            )
+
+        msg = resp_data.get("message", {})
+        raw_content = msg.get("content", "")
+        raw_tool_calls = msg.get("tool_calls", [])
+
+        tool_calls: list[ToolCallRequest] = []
+        for tc in raw_tool_calls:
+            fn = tc.get("function", {})
+            call_id = tc.get("id", f"call_{uuid4().hex[:8]}")
+            fn_name = fn.get("name", "")
+            fn_args = fn.get("arguments", {})
+            tool_calls.append(ToolCallRequest.from_provider_call(call_id, fn_name, fn_args))
+
+        if not tool_calls and raw_content:
+            tool_calls = self._extract_tool_calls_from_content(raw_content)
+
+        assistant_msg = Message.assistant(content=raw_content, tool_calls=tool_calls)
+
+        prompt_tokens = resp_data.get("prompt_eval_count", 0)
+        completion_tokens = resp_data.get("eval_count", 0)
+        usage = TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+
+        return ProviderResponse(
+            message=assistant_msg,
+            usage=usage,
+            finish_reason=resp_data.get("done_reason", "stop") or "stop",
+            model=resp_data.get("model", self.model_name),
+            raw_payload=resp_data,
+        )
+
+    def stream(
+        self,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[ToolDefinition] | None = None,
+        timeout: float | None = None,
+        cancellation_token: Any | None = None,
+        **kwargs: Any,
+    ) -> Iterator[StreamChunk]:
+        payload = self._prepare_payload(messages, tools, stream=True, **kwargs)
+        raw_stream = self._execute_request(
+            payload, stream=True, timeout=timeout, cancellation_token=cancellation_token
+        )
+
+        if isinstance(raw_stream, (list, tuple, Iterator)):
+            for item in raw_stream:
+                if isinstance(item, StreamChunk):
+                    yield item
+                elif isinstance(item, dict):
+                    yield self._parse_stream_dict(item)
+            return
+
+        for line in raw_stream:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                chunk_data = json.loads(line)
+                yield self._parse_stream_dict(chunk_data)
+            except json.JSONDecodeError:
+                continue
+
+    def _parse_stream_dict(self, data: dict[str, Any]) -> StreamChunk:
+        msg = data.get("message", {})
+        delta_content = msg.get("content") or ""
+        raw_tcs = msg.get("tool_calls", [])
+        delta_tool_calls: list[ToolCallRequest] = []
+        for tc in raw_tcs:
+            fn = tc.get("function", {})
+            delta_tool_calls.append(
+                ToolCallRequest.from_provider_call(
+                    tc.get("id", f"call_{uuid4().hex[:8]}"),
+                    fn.get("name", ""),
+                    fn.get("arguments", {}),
+                )
+            )
+        usage = None
+        if "prompt_eval_count" in data or "eval_count" in data:
+            prompt_tok = data.get("prompt_eval_count", 0)
+            comp_tok = data.get("eval_count", 0)
+            usage = TokenUsage(
+                prompt_tokens=prompt_tok,
+                completion_tokens=comp_tok,
+                total_tokens=prompt_tok + comp_tok,
+            )
+
+        return StreamChunk(
+            delta_content=delta_content,
+            delta_tool_calls=tuple(delta_tool_calls),
+            finish_reason=data.get("done_reason") if data.get("done") else None,
+            usage=usage,
+        )
+

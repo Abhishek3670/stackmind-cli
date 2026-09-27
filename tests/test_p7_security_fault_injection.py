@@ -536,3 +536,51 @@ def test_fault_injection_daemon_restart_reconstructs_operation_tree(tmp_path: Pa
         assert child2["operation_id"] in rec_parent["children"]
     finally:
         daemon2.stop()
+
+
+def test_insecure_auth_hardcoded_comparison_detection():
+    """Regression test: hardcoded credential comparisons are caught on non-test files, exempt on test files."""
+    probe_auth_code = (
+        "# This file will be used to implement the Login API Endpoint\n\n"
+        "from flask import Flask, request, jsonify\n\n"
+        "app = Flask(__name__)\n\n"
+        "@app.route('/login', methods=['POST'])\n"
+        "def login():\n"
+        "    data = request.get_json()\n"
+        "    username = data.get('username')\n"
+        "    password = data.get('password')\n\n"
+        "    # Dummy validation for demonstration purposes\n"
+        "    if username == 'admin' and password == 'admin':\n"
+        "        return jsonify({'message': 'Login successful'}), 200\n"
+        "    else:\n"
+        "        return jsonify({'message': 'Invalid credentials'}), 401\n\n"
+        "if __name__ == '__main__':\n"
+        "    app.run(debug=True)\n"
+    )
+
+    # 1. Non-test file: detects hardcoded credential comparison
+    leaks = scan_for_credential_leaks(probe_auth_code, file_path="src/api/auth.py")
+    assert len(leaks) >= 1
+    assert any("password == 'admin'" in l for l in leaks)
+
+    # 2. Hardcoded dict store
+    dict_cred_code = (
+        "VALID_USERS = {\n"
+        "    'admin': 'admin123',\n"
+        "    'user': 'password123',\n"
+        "}\n"
+    )
+    leaks_dict = scan_for_credential_leaks(dict_cred_code, file_path="src/api/auth.py")
+    assert len(leaks_dict) >= 1
+    assert any("dictionary" in l.lower() or "admin" in l.lower() for l in leaks_dict)
+
+    # 3. False positive suppression: test file assertions must NOT be flagged
+    test_code = (
+        "def test_login_success(client):\n"
+        "    response = client.post('/login', json={'username': 'admin', 'password': 'secret'})\n"
+        "    assert response.status_code == 200\n"
+        "    assert response.password == 'admin'\n"
+    )
+    assert len(scan_for_credential_leaks(test_code, file_path="tests/test_auth.py")) == 0
+    assert len(scan_for_credential_leaks(test_code, file_path="tests/api/test_login.py")) == 0
+

@@ -1,6 +1,6 @@
 """Provider adapters, gateway, and native communication models."""
 
-from .adapter import OpenAICompatibleAdapter, ProviderAdapter
+from .adapter import OllamaAdapter, OpenAICompatibleAdapter, ProviderAdapter
 from .errors import (
     AuthenticationError,
     BudgetExceededError,
@@ -26,6 +26,7 @@ __all__ = [
     "ContextLengthExceededError",
     "Message",
     "MessageRole",
+    "OllamaAdapter",
     "OpenAICompatibleAdapter",
     "ProviderAdapter",
     "ProviderError",

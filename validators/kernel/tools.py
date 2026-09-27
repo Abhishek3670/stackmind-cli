@@ -46,6 +46,25 @@ class ToolGateway:
         record = self._authorize(OperationType.WRITE_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
+
+        # Fail-closed authoring gate for governed artifacts (.sync/contracts and .sync/work-orders)
+        normalized_target = target.replace("\\", "/").strip().lstrip("/")
+        if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):
+            from validators.harness.authoring_gate import AuthoringGate
+            gate = getattr(self, "_authoring_gate", None)
+            authoritative_root = getattr(self.workspace, "authoritative_root", None)
+            if gate is None:
+                gate = AuthoringGate(project_root=authoritative_root)
+                self._authoring_gate = gate
+            auth_ok, reason = gate.validate_author_role(self.actor_id, normalized_target)
+            if not auth_ok and reason:
+                raise PermissionError(reason)
+            decision = gate.validate_artifact_content(
+                normalized_target, content, agent=self.actor_id, project_root=authoritative_root
+            )
+            if not decision.passed:
+                raise PermissionError(f"Authoring validation failed for {target}: {'; '.join(decision.errors)}")
+
         path = self.workspace.path_for(target)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")

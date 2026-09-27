@@ -242,3 +242,124 @@ def test_native_tool_creates_new_nested_file(tmp_path):
     assert live_new_file.exists()
     assert live_new_file.read_text(encoding="utf-8") == "NESTED = True\n"
 
+
+def test_ollama_adapter_tool_call_extraction():
+    from validators.kernel.providers.adapter import OllamaAdapter
+    from validators.kernel.providers.models import Message
+
+    # 1. Native tool_calls in message
+    def transport_native(payload, stream, timeout):
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "tc1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "README.md"},
+                    },
+                }],
+            },
+            "done_reason": "stop",
+            "prompt_eval_count": 10,
+            "eval_count": 5,
+        }
+
+    adapter = OllamaAdapter(transport=transport_native)
+    resp = adapter.complete([Message.user("hello")])
+    assert len(resp.message.tool_calls) == 1
+    assert resp.message.tool_calls[0].name == "read_file"
+    assert resp.message.tool_calls[0].arguments == {"path": "README.md"}
+
+    # 2. Content with raw JSON tool calls
+    def transport_content_json(payload, stream, timeout):
+        return {
+            "message": {
+                "role": "assistant",
+                "content": '{"name": "read_file", "arguments": {"path": "foo.txt"}}\n{"name": "write_file", "arguments": {"path": "bar.txt", "content": "hi"}}',
+            },
+            "done_reason": "stop",
+        }
+
+    adapter2 = OllamaAdapter(transport=transport_content_json)
+    resp2 = adapter2.complete([Message.user("hello")])
+    assert len(resp2.message.tool_calls) == 2
+    assert resp2.message.tool_calls[0].name == "read_file"
+    assert resp2.message.tool_calls[1].name == "write_file"
+    assert resp2.message.tool_calls[1].arguments == {"path": "bar.txt", "content": "hi"}
+
+    # 3. Content with <tool_call> tags
+    def transport_tags(payload, stream, timeout):
+        return {
+            "message": {
+                "role": "assistant",
+                "content": '<tool_call>{"name": "write_file", "arguments": {"path": "tagged.txt", "content": "data"}}</tool_call>',
+            },
+            "done_reason": "stop",
+        }
+
+    adapter3 = OllamaAdapter(transport=transport_tags)
+    resp3 = adapter3.complete([Message.user("hello")])
+    assert len(resp3.message.tool_calls) == 1
+    assert resp3.message.tool_calls[0].name == "write_file"
+    assert resp3.message.tool_calls[0].arguments == {"path": "tagged.txt", "content": "data"}
+
+
+def test_daemon_default_runner_wires_ollama_adapter(tmp_path):
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.providers.adapter import OllamaAdapter
+
+    storage = DaemonStorage(tmp_path / "daemon.json")
+    manager = SessionManager(storage)
+    manager.configure_role_backend("backend", "ollama", "qwen2.5-coder:7b")
+
+    runner = manager._default_runner(str(tmp_path), "codex")
+    assert runner.provider_adapter is not None
+    assert isinstance(runner.provider_adapter, OllamaAdapter)
+    assert runner.provider_adapter.model_name == "qwen2.5-coder:7b"
+
+
+def test_runner_with_ollama_adapter_promotes_write_after_verification(tmp_path):
+    from validators.kernel.providers.adapter import OllamaAdapter
+
+    project, fixture = _project_with_work_order(tmp_path)
+    calls = 0
+
+    def transport(payload, stream, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"name": "write_file", "arguments": {"path": "validators/harness/phase_a_fixture.py", "content": "VALUE = \'ollama_after\'\\n"}}',
+                },
+                "done_reason": "stop",
+            }
+        return {
+            "message": {
+                "role": "assistant",
+                "content": json.dumps({
+                    "name": "HarnessDecision",
+                    "arguments": {
+                        "status": "completed",
+                        "summary": "Ollama fixture updated",
+                        "report_markdown": "done",
+                        "modified_files": ["validators/harness/phase_a_fixture.py"],
+                        "blockers": [],
+                    },
+                }),
+            },
+            "done_reason": "stop",
+        }
+
+    adapter = OllamaAdapter(transport=transport, model="qwen2.5-coder:7b")
+    runner = AgentRunner(project, "codex", provider_adapter=adapter)
+    result = runner.run_once()
+
+    assert result.status == "completed", result.reason
+    assert fixture.read_text(encoding="utf-8") == "VALUE = 'ollama_after'\n"
+
+

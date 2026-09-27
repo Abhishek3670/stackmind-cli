@@ -126,9 +126,14 @@ class _MockDaemonClient:
         }
 
     def turn(self, session_id: str, prompt: str, **params: object) -> dict[str, object]:
-        del params
         self.turns.append((session_id, prompt))
+        if not hasattr(self, "turn_calls"):
+            self.turn_calls = []
+        self.turn_calls.append({"session_id": session_id, "prompt": prompt, "params": params})
         return {"operation_id": "op-turn-1"}
+
+    def operation_get(self, operation_id: str) -> dict[str, Any]:
+        return {"operation_id": operation_id, "status": "COMPLETED", "result": {"summary": "Goal planned"}}
 
     def approve(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
         self.approvals.append((session_id, approved, reason))
@@ -406,6 +411,20 @@ def test_dispatch_delivery_commands():
     s, should_exit = dispatch_delivery_command(adapter, mock_client, session, ":cancel codex-backend", state)  # type: ignore[arg-type]
     assert not should_exit
     assert mock_client.cancelled_agents == [("codex-backend", "user_cancelled")]
+
+    # :goal validation (empty)
+    s, should_exit = dispatch_delivery_command(adapter, mock_client, session, ":goal", state)  # type: ignore[arg-type]
+    assert not should_exit
+    assert any("Usage: :goal" in msg.content for msg in state.messages)
+
+    # :goal routing to Architecture
+    s, should_exit = dispatch_delivery_command(adapter, mock_client, session, ":goal Build user authentication", state)  # type: ignore[arg-type]
+    assert not should_exit
+    assert any(op.role == "Architecture" for op in state.operations.values())
+    assert any(a.action == "submitted goal to Architecture" for a in state.activity_log)
+    goal_call = mock_client.turn_calls[-1]
+    assert goal_call["params"]["role"] == "architecture"
+    assert goal_call["params"]["agent_id"] == "claude"
 
     # :exit
     s, should_exit = dispatch_delivery_command(adapter, mock_client, session, ":exit", state)  # type: ignore[arg-type]

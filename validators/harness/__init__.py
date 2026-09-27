@@ -1,10 +1,28 @@
 """Governed Harness Runtime primitives."""
 
+from .authoring_gate import (
+    AuthoringGate,
+    AuthoringGateDecision,
+    AuthoringValidationError,
+)
+from .d024_gate import (
+    D024Gate,
+    D024GateDecision,
+    D024ViolationError,
+)
 from .d025_gate import (
     D025CommandClassification,
     D025Gate,
     D025GateDecision,
     D025ViolationError,
+)
+from .plan import (
+    PLAN_GENERATION_INSTRUCTIONS,
+    PlanMilestone,
+    PlanStructure,
+    PlanValidationError,
+    parse_plan,
+    validate_plan_structure,
 )
 from .retrieval import (
     EvidenceSnippet,
@@ -34,6 +52,12 @@ from .snapshot import (
 
 __all__ = [
     'AgentRunner',
+    'AuthoringGate',
+    'AuthoringGateDecision',
+    'AuthoringValidationError',
+    'D024Gate',
+    'D024GateDecision',
+    'D024ViolationError',
     'D025CommandClassification',
     'D025Gate',
     'D025GateDecision',
@@ -44,6 +68,10 @@ __all__ = [
     'HarnessRunResult',
     'HarnessTask',
     'LLMProvider',
+    'PLAN_GENERATION_INSTRUCTIONS',
+    'PlanMilestone',
+    'PlanStructure',
+    'PlanValidationError',
     'RetrievalBatch',
     'RetrievalPolicy',
     'SearchProvider',
@@ -54,5 +82,7 @@ __all__ = [
     'WorkspaceDiff',
     'WorkspaceSnapshot',
     'evaluate_learning_eligibility',
+    'parse_plan',
     'sanitize_search_results',
+    'validate_plan_structure',
 ]
