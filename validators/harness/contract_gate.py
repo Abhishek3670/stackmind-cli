@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 from typing import Any
 from validators.knowledge.contract import (
@@ -41,7 +42,12 @@ def verify_pre_execution(
     task: Any,  # HarnessTask
     context: ContextBundle,
 ) -> None:
-    """Pre-execution validation: verify contract is valid and not expired."""
+    """Pre-execution validation: verify contract is valid, not expired, and D024 compliant for GitOps."""
+    # D024 QA Gate: Programmatic enforcement preventing GitOps progression without QA approval
+    if getattr(task, "work_order_id", None) and str(agent).lower().strip() in ("local-llm", "gitops"):
+        from validators.harness.d024_gate import D024Gate
+        D024Gate().verify_gitops_preconditions(project_path, task.work_order_id)
+
     contract = load_harness_contract(project_path, agent, task.work_order_id)
     if contract is None:
         return
@@ -96,14 +102,30 @@ def verify_post_execution(
     api = KnowledgeAPI(project_path)
     for file_path in files_to_check:
         mod = path_to_module(file_path)
+        norm_fp = file_path.replace("\\", "/")
+        if norm_fp.startswith("./"):
+            norm_fp = norm_fp[2:]
+        elif norm_fp.startswith("/"):
+            norm_fp = norm_fp[1:]
         
         # Deny check
         for deny_rule in contract.deny_rules:
-            pattern = deny_rule.get("module")
-            if pattern and module_matches(mod, pattern):
-                raise ContractAccessDenied(
-                    f"Modification to file {file_path} is explicitly denied by rule: {pattern}"
-                )
+            pattern = deny_rule.get("module") or deny_rule.get("path") or deny_rule.get("target")
+            if pattern:
+                p_norm = pattern.replace("\\", "/")
+                if p_norm.startswith("./"):
+                    p_norm = p_norm[2:]
+                if (
+                    module_matches(mod, pattern)
+                    or fnmatch.fnmatch(norm_fp, p_norm)
+                    or fnmatch.fnmatch(norm_fp, p_norm.rstrip("/") + "/*")
+                    or fnmatch.fnmatch(norm_fp, p_norm.rstrip("/") + "/**")
+                    or norm_fp == p_norm
+                    or norm_fp.startswith(p_norm.rstrip("/") + "/")
+                ):
+                    raise ContractAccessDenied(
+                        f"Modification to file {file_path} is explicitly denied by rule: {pattern}"
+                    )
                 
         # Allow check
         allowed = False
@@ -113,10 +135,21 @@ def verify_post_execution(
         else:
             # File might be new, check module pattern match directly
             for allow_rule in contract.allow_rules:
-                pattern = allow_rule.get("module")
-                if pattern and module_matches(mod, pattern):
-                    allowed = True
-                    break
+                pattern = allow_rule.get("module") or allow_rule.get("path") or allow_rule.get("target")
+                if pattern:
+                    p_norm = pattern.replace("\\", "/")
+                    if p_norm.startswith("./"):
+                        p_norm = p_norm[2:]
+                    if (
+                        module_matches(mod, pattern)
+                        or fnmatch.fnmatch(norm_fp, p_norm)
+                        or fnmatch.fnmatch(norm_fp, p_norm.rstrip("/") + "/*")
+                        or fnmatch.fnmatch(norm_fp, p_norm.rstrip("/") + "/**")
+                        or norm_fp == p_norm
+                        or norm_fp.startswith(p_norm.rstrip("/") + "/")
+                    ):
+                        allowed = True
+                        break
         if not allowed:
             raise ContractAccessDenied(
                 f"Modification to file {file_path} is outside allowed contract scope"
@@ -132,3 +165,8 @@ def verify_post_execution(
             raise D025ViolationError(
                 f"Command sequence triggered D025 Destructive Operations Safeguard: {gate_decision.reason}"
             )
+
+    # 5. Check D024 QA Gate for GitOps progression
+    if getattr(task, "work_order_id", None) and str(agent).lower().strip() in ("local-llm", "gitops"):
+        from validators.harness.d024_gate import D024Gate
+        D024Gate().verify_gitops_preconditions(project_path, task.work_order_id)

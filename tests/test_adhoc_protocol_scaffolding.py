@@ -168,3 +168,75 @@ def test_tui_renders_descriptive_error_on_operation_failure(capsys):
     assert "OPERATION FAILED" in captured
     assert "Agent 'codex' is not protocol-registered" in captured
     assert "Turn operation op-fail-123 completed" not in captured
+
+
+def test_adhoc_turn_with_provider_adapter_succeeds_without_active_contract(tmp_path: Path):
+    """Test that AgentRunner with provider_adapter completes adhoc chat without PermissionError."""
+    ws = tmp_path / "adhoc-workspace"
+    ws.mkdir()
+
+    def transport(payload, stream, timeout):
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Here is how to build a login page in HTML and CSS.",
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 25, "prompt_tokens": 15, "completion_tokens": 10},
+        }
+
+    from validators.kernel.providers.adapter import OpenAICompatibleAdapter
+    adapter = OpenAICompatibleAdapter(transport=transport)
+    runner = AgentRunner(ws, "codex", provider_adapter=adapter)
+
+    result = runner.run_once(prompt="Build a login page")
+
+    assert result.status == "completed"
+    assert result.persisted is True
+    assert result.report_path is not None
+    assert result.report_path.exists()
+    assert "Here is how to build a login page" in result.report_path.read_text(encoding="utf-8")
+    assert "Here is how to build a login page" in (result.meta or {})["summary"]
+
+
+def test_session_manager_turn_with_provider_adapter_succeeds_without_contract(tmp_path: Path):
+    """Test that SessionManager._run_turn finishes COMPLETED with a configured provider_adapter."""
+    storage = DaemonStorage(tmp_path)
+    manager = SessionManager(storage)
+    session = manager.create_session("codex", "daemon", {}, str(tmp_path))
+    session_id = session["session_id"]
+
+    def transport(payload, stream, timeout):
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Chat reply from provider adapter.",
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 20, "prompt_tokens": 10, "completion_tokens": 10},
+        }
+
+    from validators.kernel.providers.adapter import OpenAICompatibleAdapter
+    adapter = OpenAICompatibleAdapter(transport=transport)
+
+    def custom_runner(ws: str, agent: str):
+        return AgentRunner(Path(ws), agent, provider_adapter=adapter)
+
+    manager._runner_factory = custom_runner
+
+    op = manager.start_turn(session_id, "Build a login page")
+    op_id = op["operation_id"]
+
+    thread = manager._turn_threads.get(op_id)
+    if thread:
+        thread.join(timeout=5.0)
+
+    op_rec = manager.get_operation(op_id)
+    assert op_rec["status"] == "COMPLETED"
+    result = op_rec.get("result") or {}
+    assert "Chat reply from provider adapter" in result.get("summary", "")
+

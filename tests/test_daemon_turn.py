@@ -114,3 +114,34 @@ def test_operation_turn_alias_and_tui_prompt_routing(tmp_path):
         adapter = StackMindTuiAdapter(client)
         prompt = adapter.command("from tui", session_id=session["session_id"])
         assert _wait_for(client, prompt["operation_id"], "COMPLETED")["metadata"]["prompt"] == "from tui"
+
+
+def test_goal_turn_routes_to_architecture_claude(tmp_path):
+    runner = _SuccessfulRunner()
+    spawned_agents: list[str] = []
+
+    def recording_factory(workspace, agent):
+        spawned_agents.append(agent)
+        return runner
+
+    with LocalDaemon(tmp_path, runner_factory=recording_factory) as daemon:
+        client = DaemonClient(daemon.url)
+        session = client.create_session(
+            agent="codex", provider="test", contract=_contract(), workspace=str(tmp_path / "workspace")
+        )
+        assert session["agent"] == "codex"
+
+        adapter = StackMindTuiAdapter(client)
+        operation = adapter.command(":goal Design OAuth2 backend", session_id=session["session_id"])
+        completed = _wait_for(client, operation["operation_id"], "COMPLETED")
+        events = client.events(session["session_id"])
+
+        assert spawned_agents == ["claude"]
+        assert completed["role"] == "architecture"
+        assert completed["agent_id"] == "claude"
+        assert completed["metadata"]["prompt"] == "Design OAuth2 backend"
+
+        turn_started = next(event for event in events if event["name"] == "turn.started")
+        assert turn_started["payload"]["role"] == "architecture"
+        assert turn_started["payload"]["agent_id"] == "claude"
+

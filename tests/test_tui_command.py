@@ -19,6 +19,7 @@ class _RecordingClient:
         self.resumes: list[str] = []
         self.cancels: list[str] = []
         self.approvals: list[tuple[str, bool, str]] = []
+        self.turn_calls: list[dict[str, Any]] = []
         self.sessions: dict[str, dict[str, Any]] = {
             "session-1": {
                 "session_id": "session-1",
@@ -35,8 +36,8 @@ class _RecordingClient:
         ]
 
     def turn(self, session_id: str, prompt: str, **params: object) -> dict[str, object]:
-        del params
         self.turns.append((session_id, prompt))
+        self.turn_calls.append({"session_id": session_id, "prompt": prompt, "params": params})
         return {"operation_id": "operation-1"}
 
     def get_session(self, session_id: str) -> dict[str, Any]:
@@ -92,10 +93,20 @@ def test_adapter_routes_all_interactive_commands():
     # Turns
     adapter.command("hello runtime", session_id="session-1")
     adapter.command(":prompt approved prompt", session_id="session-1")
+    adapter.command(":goal Build user authentication", session_id="session-1")
     assert client.turns == [
         ("session-1", "hello runtime"),
         ("session-1", "approved prompt"),
+        ("session-1", "Build user authentication"),
     ]
+    goal_call = client.turn_calls[2]
+    assert goal_call["params"]["role"] == "architecture"
+    assert goal_call["params"]["agent_id"] == "claude"
+
+    # Empty :goal raises ValueError
+    import pytest
+    with pytest.raises(ValueError, match="goal description required"):
+        adapter.command(":goal", session_id="session-1")
 
     # Status
     status = adapter.command(":status", session_id="session-1")
@@ -136,6 +147,7 @@ def test_adapter_routes_all_interactive_commands():
 def test_tui_repl_interactive_session_execution(tmp_path: Path):
     user_inputs = "\n".join([
         ":help",
+        ":goal",
         ":status",
         ":matrix",
         ":diff",
@@ -144,6 +156,7 @@ def test_tui_repl_interactive_session_execution(tmp_path: Path):
         ":reject needs work",
         ":pause",
         ":resume",
+        ":goal build a secure login feature",
         "do something safe",
         ":cancel",
         ":exit",
@@ -157,6 +170,8 @@ def test_tui_repl_interactive_session_execution(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     assert "Available commands:" in result.output
+    assert ":goal <request>" in result.output
+    assert "Usage: :goal <product goal or feature request>" in result.output
     assert "[CONTRACT BOUNDARY HUD]" in result.output
     assert "Scope: PASS" in result.output
     assert "Approval recorded." in result.output

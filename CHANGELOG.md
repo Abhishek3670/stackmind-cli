@@ -3,6 +3,64 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [3.6.0] - 2026-09-28
+
+### Added
+- **Governed Multi-Agent Runtime & Tool Loop (WO-026, Phases A & B)**:
+  - Connected `AgentRunner` to `ProviderGateway` and `OllamaAdapter` for model tool loop execution (`read_file`, `write_file`).
+  - Pre-turn `ScratchWorkspace` instantiation and `ToolGateway` with fail-closed contract boundary checks and path traversal containment.
+  - In-memory turn tool loop with budget exhaustion tracking and robust tool call argument parsing and repair.
+- **Autonomous Architecture Planning & Turn 1 Synthesizer (Phase C)**:
+  - Integrated `:goal` and user request synthesis in `AgentRunner.discover_next_task` for Architecture role (`claude`).
+  - Implemented `synthesize_bootstrap_planning` generating structured, actionable `PLAN.md` documents grounded in repository knowledge graph context.
+  - Added structural schema validation ensuring required sections (`Objectives`, `Milestones`, `Implementation Scope`, `Risk Analysis`) exist before plan approval.
+- **Governed Work Order & Contract Authoring (Phase D)**:
+  - Implemented Turn 2 architecture authoring gate enabling `claude` to autonomously author `.sync/work-orders/ACTIVE/<WO-ID>.yaml` and `.sync/contracts/<WO-ID>.yaml`.
+  - Added overwrite conflict detection preventing uncoordinated overwrites of existing active work orders and contracts.
+  - Implemented advisory file locking (`AcquireAdvisoryLock`) during authoring to enforce concurrency control.
+  - Automated asynchronous inbox dispatch notice generation for assigned worker agents.
+- **D024 Mandatory QA Gate & Pre-Flight Hardening (Phase E)**:
+  - Enforced programmatic gating in `D024Gate` requiring verified approval verdicts before closing work orders.
+  - Added companion test file presence verification for code deliverables (`deliverable.type == "code"`).
+  - Integrated AST-based hardcoded credential comparison detection (`_InsecureAuthASTVisitor`) in `validators/kernel/security.py` detecting sensitive equality comparisons (`password == "admin"`, dict credential stores) with false-positive suppression for test files.
+
+## [3.5.2] - 2026-09-26
+
+### Added
+- **Unified Daemon Discovery & TUI Auto-Attachment (WO-024)**:
+  - Automatic daemon discovery in `stackmind tui` (probes port 8765, attaches if running, auto-starts with fallback).
+  - Clean detachment on TUI exit (does not terminate pre-existing external daemons).
+  - `stackmind daemon status` command reporting online status, PID, port, and active session count.
+  - Enhanced `stackmind daemon start` and `stop` with reliable PID tracking and process termination.
+
+## [3.5.1] - 2026-09-26
+
+### Fixed
+- **Full-stretched TUI Layout Restoration (WO-022)**:
+  - Eliminated centered conversation deck side gutters on wide screens, restoring full-stretched 2-column layout.
+  - Normalized composer input positioning to column 0 with proper cursor repositioning.
+  - Closed box borders and maintained chrome integrity across all resolution breakpoints.
+
+## [3.5.0] - 2026-09-26
+
+### Added
+- **5-Tier Responsive TUI Layout Engine (WO-019)**:
+  - Constraint-based responsive architecture with 5 breakpoints: Very Narrow (<80 cols), Narrow (80-99), Normal (100-139), Wide (140-179), Very Wide (>=180).
+  - Single-column full-width modes with compact runtime badges (Very Narrow/Narrow).
+  - Proportional 2-column layout with adaptive conversation/runtime panel widths (Normal/Wide).
+  - Centered conversation deck with balanced gutters and max-width constraint (Very Wide).
+  - Adaptive text handling: middle-truncation for paths (`format_responsive_path`), word-aware soft truncation for titles and status messages.
+
+### Changed
+- **Layout Computation (`cli/tui/layout.py`)**:
+  - Replaced single binary `NARROW_THRESHOLD=100` with 5-tier `ColumnLayout` tier system.
+  - Dynamic `render_full_screen_workspace` adapting composer, status bar, and panel rendering per tier.
+- **Testing Coverage**:
+  - Comprehensive regression tests for exact row/column bounds across 5 resolutions (70x20, 90x25, 120x30, 160x40, 200x50).
+  - Dynamic resize transition tests (120→90, 90→160) verifying no geometry drift or border clipping.
+
 ## [3.4.0] - 2026-09-23
 
 ### Added
@@ -59,41 +117,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **ANSI Escape Styling in Workspace Layout (WO-012)**:
   - Preserved full ANSI styling (user message backgrounds, assistant model badges, markdown syntax highlighting) across the entire conversation viewport by enabling truecolor capture console in `render_workspace_layout_str`.
-
-## [3.5.0] - 2026-09-26
-
-### Added
-- **5-Tier Responsive TUI Layout Engine (WO-019)**:
-  - Constraint-based responsive architecture with 5 breakpoints: Very Narrow (<80 cols), Narrow (80-99), Normal (100-139), Wide (140-179), Very Wide (>=180).
-  - Single-column full-width modes with compact runtime badges (Very Narrow/Narrow).
-  - Proportional 2-column layout with adaptive conversation/runtime panel widths (Normal/Wide).
-  - Centered conversation deck with balanced gutters and max-width constraint (Very Wide).
-  - Adaptive text handling: middle-truncation for paths (`format_responsive_path`), word-aware soft truncation for titles and status messages.
-
-### Changed
-- **Layout Computation (`cli/tui/layout.py`)**:
-  - Replaced single binary `NARROW_THRESHOLD=100` with 5-tier `ColumnLayout` tier system.
-  - Dynamic `render_full_screen_workspace` adapting composer, status bar, and panel rendering per tier.
-- **Testing Coverage**:
-  - Comprehensive regression tests for exact row/column bounds across 5 resolutions (70x20, 90x25, 120x30, 160x40, 200x50).
-  - Dynamic resize transition tests (120→90, 90→160) verifying no geometry drift or border clipping.
-
-## [Unreleased]
-- Initial repository scaffolding.
-
-## [3.5.2] - 2026-09-26
-
-### Added
-- **Unified Daemon Discovery & TUI Auto-Attachment (WO-024)**:
-  - Automatic daemon discovery in `stackmind tui` (probes port 8765, attaches if running, auto-starts with fallback).
-  - Clean detachment on TUI exit (does not terminate pre-existing external daemons).
-  - `stackmind daemon status` command reporting online status, PID, port, and active session count.
-  - Enhanced `stackmind daemon start` and `stop` with reliable PID tracking and process termination.
-
-## [3.5.1] - 2026-09-26
-
-### Fixed
-- **Full-stretched TUI Layout Restoration (WO-022)**:
-  - Eliminated centered conversation deck side gutters on wide screens, restoring full-stretched 2-column layout.
-  - Normalized composer input positioning to column 0 with proper cursor repositioning.
-  - Closed box borders and maintained chrome integrity across all resolution breakpoints.

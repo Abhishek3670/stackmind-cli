@@ -196,6 +196,217 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
     (sync_dir / "outbox" / agent).mkdir(parents=True, exist_ok=True)
 
 
+def resolve_bootstrap_work_order_id(workspace: Path | str, preferred_id: str = "WO-000") -> str:
+    """Find a usable work order ID for bootstrap planning.
+
+    Uses preferred_id (default 'WO-000') if available or currently ACTIVE.
+    If preferred_id is COMPLETED or archived, finds the lowest unused WO-xxx ID.
+    """
+    ws = Path(workspace)
+    active_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{preferred_id}.yaml"
+    completed_path = ws / ".sync" / "work-orders" / "COMPLETED" / f"{preferred_id}.yaml"
+    if not active_path.exists() and not completed_path.exists():
+        return preferred_id
+    if active_path.exists():
+        return preferred_id
+
+    for i in range(1, 1000):
+        candidate = f"WO-{i:03d}"
+        cand_active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{candidate}.yaml"
+        cand_comp = ws / ".sync" / "work-orders" / "COMPLETED" / f"{candidate}.yaml"
+        if not cand_active.exists() and not cand_comp.exists():
+            return candidate
+    return preferred_id
+
+
+def synthesize_bootstrap_planning(
+    workspace: Path | str,
+    prompt: str,
+    wo_id: str | None = None,
+    assigned_agent: str = "claude",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Synthesize trusted bootstrap planning work order and contract artifacts.
+
+    Validates all artifacts fail-closed against AuthoringGate and schemas before writing.
+    Updates .sync/work-orders/INDEX.yaml and .sync/runtime/TREE.yaml.
+    """
+    ws = Path(workspace).resolve()
+    _scaffold_protocol_citizenship(ws, assigned_agent)
+    now = _now()
+
+    actual_wo_id = wo_id or resolve_bootstrap_work_order_id(ws, "WO-000")
+
+    # 1. Construct Work Order record
+    title_snippet = prompt.strip()[:80].replace("\n", " ").strip()
+    wo_title = (
+        f"System architecture and execution plan for: {title_snippet}"
+        if title_snippet
+        else "System architecture and execution plan"
+    )
+    wo_record = {
+        "id": actual_wo_id,
+        "type": "RESEARCH",
+        "title": wo_title,
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": [assigned_agent],
+        "dependencies": [],
+        "deliverable": {
+            "type": "doc",
+            "path": "PLAN.md",
+            "description": "System architecture and execution plan",
+        },
+        "description": prompt.strip(),
+        "created": now,
+        "updated": now,
+    }
+
+    # 2. Construct matching Contract record
+    contract_record = {
+        "schema_version": 1,
+        "agent_id": assigned_agent,
+        "work_order": actual_wo_id,
+        "identity": {
+            "role": "architecture",
+            "reports_to": "ceo",
+        },
+        "scope": {
+            "allow": [
+                # Broad read access for codebase research (query_graph, read_file)
+                {"module": "**"},
+                # Explicit write targets (for clarity — subsumed by ** but
+                # documents intent for contract reviewers)
+                {"module": "PLAN.md"},
+                {"module": ".sync/work-orders/**"},
+                {"module": ".sync/contracts/**"},
+            ],
+            "deny": [
+                # Version control internals
+                {"module": ".git/**"},
+                # Agent inboxes — Architecture must not read/write other agents' mail
+                {"module": ".sync/inbox/**"},
+                # Runtime state — managed by daemon, not by agents
+                {"module": ".sync/runtime/**"},
+                # Outbox — managed by daemon
+                {"module": ".sync/outbox/**"},
+                # Agent identity files — managed by daemon
+                {"module": ".sync/agents/**"},
+                # Knowledge store — compiler output, use graph API instead
+                {"module": ".sync/knowledge/**"},
+                # Snapshots — managed by daemon
+                {"module": ".sync/snapshots/**"},
+                # Environment secrets
+                {"module": ".env"},
+                {"module": ".env.*"},
+                # Build/cache artifacts
+                {"module": "__pycache__/**"},
+                {"module": ".venv/**"},
+                {"module": "node_modules/**"},
+            ],
+            "write": "read-write",
+        },
+        "budget": {
+            "max_files_touched": 20,
+            "max_tokens": 50000,
+        },
+    }
+
+    # 3. Fail-closed Authoring Gate validation
+    from validators.harness.authoring_gate import AuthoringGate
+
+    gate = AuthoringGate()
+    wo_yaml = yaml.safe_dump(wo_record, sort_keys=False)
+    contract_yaml = yaml.safe_dump(contract_record, sort_keys=False)
+
+    rel_wo_path = f".sync/work-orders/ACTIVE/{actual_wo_id}.yaml"
+    rel_contract_path = f".sync/contracts/{actual_wo_id}.yaml"
+
+    wo_decision = gate.validate_artifact_content(rel_wo_path, wo_yaml, agent="ceo")
+    if not wo_decision.passed:
+        raise ValueError(
+            f"Synthesized bootstrap work order failed authoring gate: {wo_decision.summary}"
+        )
+
+    contract_decision = gate.validate_artifact_content(
+        rel_contract_path, contract_yaml, agent="ceo"
+    )
+    if not contract_decision.passed:
+        raise ValueError(
+            f"Synthesized bootstrap contract failed authoring gate: {contract_decision.summary}"
+        )
+
+    # 4. Write artifacts to disk
+    wo_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{actual_wo_id}.yaml"
+    wo_path.parent.mkdir(parents=True, exist_ok=True)
+    wo_path.write_text(wo_yaml, encoding="utf-8")
+
+    contract_path = ws / ".sync" / "contracts" / f"{actual_wo_id}.yaml"
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(contract_yaml, encoding="utf-8")
+
+    # 5. Update .sync/work-orders/INDEX.yaml
+    index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
+    index_data: dict[str, Any] = {"schema_version": 1, "next_id": 1, "orders": []}
+    if index_path.exists():
+        try:
+            loaded_index = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_index, dict) and isinstance(loaded_index.get("orders"), list):
+                index_data = loaded_index
+                index_data.setdefault("next_id", 1)
+        except Exception:
+            pass
+
+    existing_order_ids = {
+        item.get("id") for item in index_data["orders"] if isinstance(item, dict)
+    }
+    if actual_wo_id not in existing_order_ids:
+        index_data["orders"].append({
+            "id": actual_wo_id,
+            "type": wo_record["type"],
+            "title": wo_record["title"],
+            "status": wo_record["status"],
+            "priority": wo_record["priority"],
+            "assigned_agents": wo_record["assigned_agents"],
+            "dependencies": wo_record["dependencies"],
+            "deliverable": wo_record["deliverable"],
+            "created": wo_record["created"],
+            "updated": wo_record["updated"],
+            "file": f"work-orders/ACTIVE/{actual_wo_id}.yaml",
+        })
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+
+    # 6. Update .sync/runtime/TREE.yaml
+    tree_path = ws / ".sync" / "runtime" / "TREE.yaml"
+    tree_data: dict[str, Any] = {}
+    if tree_path.exists():
+        try:
+            loaded_tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_tree, dict):
+                tree_data = loaded_tree
+        except Exception:
+            pass
+    tree_data.setdefault("schema_version", 1)
+    tree_data.setdefault("tree_version", 1)
+    tree_data.setdefault("release", "3.1.0")
+    agents = tree_data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        agents = {}
+        tree_data["agents"] = agents
+    agent_info = agents.setdefault(assigned_agent, {
+        "session_count": 0,
+        "status": "idle",
+        "assigned_work_orders": [],
+    })
+    assigned_list = agent_info.setdefault("assigned_work_orders", [])
+    if actual_wo_id not in assigned_list:
+        assigned_list.append(actual_wo_id)
+    tree_path.parent.mkdir(parents=True, exist_ok=True)
+    tree_path.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+
+    return wo_record, contract_record
+
+
 class SessionManager:
     """Owns daemon sessions, their audit journals, and active-operation cancellation."""
 
@@ -308,7 +519,24 @@ class SessionManager:
                 if model_name:
                     backend.model = model_name
                     backend.model_name = model_name
-            return AgentRunner(Path(workspace), agent, backend=backend)
+            provider_adapter = None
+            if backend_id == "ollama":
+                from validators.kernel.providers.adapter import OllamaAdapter
+
+                endpoint = getattr(backend, "endpoint", None) or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+                if endpoint and not endpoint.startswith("http"):
+                    endpoint = f"http://{endpoint}"
+                m = model_name or getattr(backend, "model", "qwen2.5-coder:7b") or "qwen2.5-coder:7b"
+                provider_adapter = OllamaAdapter(endpoint=endpoint, model=m)
+            elif backend_id in ("openai", "openai-compatible"):
+                from validators.kernel.providers.adapter import OpenAICompatibleAdapter
+
+                base_url = getattr(backend, "base_url", None) or "https://api.openai.com/v1"
+                api_key = getattr(backend, "api_key", None) or os.getenv("OPENAI_API_KEY", "")
+                m = model_name or getattr(backend, "model", "gpt-4o") or "gpt-4o"
+                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m)
+
+            return AgentRunner(Path(workspace), agent, backend=backend, provider_adapter=provider_adapter)
         return AgentRunner(Path(workspace), agent)
 
     def list_backends(self) -> list[dict[str, Any]]:
@@ -663,6 +891,7 @@ class SessionManager:
             proposed_wos = plan.get("metadata", {}).get("work_orders", [])
             workspace = Path(session["workspace"])
             wo_dir = workspace / ".sync" / "work-orders" / "ACTIVE"
+            is_goal_plan = bool(plan.get("metadata", {}).get("is_goal"))
 
             for item in proposed_wos:
                 if isinstance(item, dict):
@@ -696,7 +925,8 @@ class SessionManager:
                     }
 
                 created_work_orders.append(wo_record)
-                if (workspace / ".sync").exists():
+                # Only write placeholder files if not a goal plan (goal plans dispatch Architecture to author real files)
+                if not is_goal_plan and (workspace / ".sync").exists():
                     try:
                         wo_dir.mkdir(parents=True, exist_ok=True)
                         wo_path = wo_dir / f"{wo_id}.yaml"
@@ -704,6 +934,7 @@ class SessionManager:
                             yaml.safe_dump(wo_record, handle, sort_keys=False)
                     except Exception:
                         pass
+                if (workspace / ".sync").exists():
                     index_path = workspace / ".sync" / "work-orders" / "INDEX.yaml"
                     if index_path.exists():
                         try:
@@ -743,6 +974,30 @@ class SessionManager:
                 created_records=created_work_orders,
             )
             self._save()
+
+            # For bootstrap goal plans, dispatch Turn 2: Architecture authors child WOs and Contracts
+            if is_goal_plan:
+                authoring_prompt = (
+                    f"The architecture plan '{plan_id}' has been approved by the operator (reason: {reason or 'Approved by operator'}).\n\n"
+                    "Your task now as Senior Architect is to author the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
+                    "1. Review PLAN.md for the approved milestones and tasks.\n"
+                    "2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                    "(e.g. WO-001.yaml) conforming to schemas/work-order.schema.json.\n"
+                    "3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
+                    "conforming to schemas/contract.schema.json.\n"
+                    "4. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
+                    "and modified_files listing all authored files."
+                )
+                turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
+                self.start_turn(
+                    session_id,
+                    authoring_prompt,
+                    role="architecture",
+                    agent_id="claude",
+                    work_order_id=turn_wo_id,
+                    is_authoring=True,
+                )
+
             return [dict(w) for w in created_work_orders]
 
     def reject_plan(
@@ -776,6 +1031,18 @@ class SessionManager:
             )
             self._save()
             return dict(plan)
+
+    def synthesize_bootstrap_planning(
+        self,
+        workspace: Path | str,
+        prompt: str,
+        wo_id: str | None = None,
+        assigned_agent: str = "claude",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Synthesize bootstrap planning work order and contract as trusted daemon bookkeeping."""
+        return synthesize_bootstrap_planning(
+            workspace, prompt, wo_id=wo_id, assigned_agent=assigned_agent
+        )
 
     def begin_operation(
         self,
@@ -1045,6 +1312,36 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
+            role_param = str(params.get("role") or params.get("agent_id") or session.get("agent") or "").lower().strip()
+            if self._canonical_role(role_param) == "gitops" and params.get("work_order_id"):
+                ws_path = Path(session["workspace"])
+                if (ws_path / ".sync" / "work-orders").is_dir():
+                    from validators.harness.d024_gate import D024Gate, D024ViolationError
+                    d024_decision = D024Gate().evaluate_work_order(ws_path, str(params["work_order_id"]))
+                    if not d024_decision.passed:
+                        raise D024ViolationError(f"D024 QA Gate Blocked: {d024_decision.reason}")
+
+            is_goal = bool(params.get("is_goal"))
+            if is_goal:
+                if "role" not in params:
+                    params["role"] = "architecture"
+                if "agent_id" not in params:
+                    params["agent_id"] = "claude"
+                role_param = str(params["role"]).lower().strip()
+                canonical_role = self._canonical_role(role_param)
+                effective_agent = _ROLE_TO_PRIMARY_AGENT.get(
+                    str(params.get("agent_id") or canonical_role).lower().strip(),
+                    "claude",
+                )
+                ws_path = Path(session["workspace"])
+                wo_rec, _ = synthesize_bootstrap_planning(
+                    ws_path,
+                    prompt,
+                    wo_id=str(params.get("work_order_id")) if params.get("work_order_id") else None,
+                    assigned_agent=effective_agent,
+                )
+                params["work_order_id"] = wo_rec["id"]
+
             cancel_event, operation_id = self.begin_operation(
                 session_id,
                 "turn",
@@ -1055,7 +1352,17 @@ class SessionManager:
                 role=params.get("role"),
                 agent_id=params.get("agent_id"),
             )
-            self.events.publish("turn.started", session_id, operation_id=operation_id, prompt=prompt)
+            canonical_role = self._canonical_role(role_param or "backend")
+            agent_id_param = str(params.get("agent_id") or params.get("role") or canonical_role)
+            self.events.publish(
+                "turn.started",
+                session_id,
+                operation_id=operation_id,
+                prompt=prompt,
+                role=canonical_role,
+                agent_id=agent_id_param,
+                work_order_id=params.get("work_order_id"),
+            )
             thread = Thread(
                 target=self._run_turn,
                 args=(session_id, operation_id, cancel_event, prompt),
@@ -1104,10 +1411,19 @@ class SessionManager:
                         op_rec["model"] = b_mod
                 except KeyError:
                     pass
+            wo_id_param = op_rec.get("work_order_id")
             try:
-                result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+                result = runner.run_once(
+                    cancel_event=cancel_event,
+                    operation_id=operation_id,
+                    prompt=prompt,
+                    work_order_id=wo_id_param,
+                )
             except TypeError:
-                result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
+                try:
+                    result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+                except TypeError:
+                    result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
             b_id = getattr(runner, "backend_id", None)
             b_mod = getattr(runner, "backend_model", None)
             result_data = {
@@ -1127,6 +1443,60 @@ class SessionManager:
                 )
                 self.complete_operation(session_id, operation_id, result_data, status="CANCELLED")
             elif result.status in {"completed", "idle"}:
+                # Check if this was a Turn 1 planning turn that generated a valid PLAN.md
+                is_goal_turn = bool(op_rec.get("metadata", {}).get("is_goal"))
+                is_authoring_turn = bool(op_rec.get("metadata", {}).get("is_authoring"))
+                plan_file = ws_path / "PLAN.md"
+                if is_goal_turn and not is_authoring_turn and plan_file.is_file():
+                    try:
+                        from validators.harness.plan import validate_plan_structure, parse_plan
+                        plan_content = plan_file.read_text(encoding="utf-8")
+                        is_valid, _ = validate_plan_structure(plan_content)
+                        if is_valid:
+                            parsed_plan = parse_plan(plan_content)
+                            proposed_wos = []
+                            for idx, m in enumerate(parsed_plan.milestones, start=1):
+                                wo_id = f"WO-{idx:03d}"
+                                assigned = ["codex"]
+                                title_l = m.title.lower()
+                                if any(kw in title_l for kw in ("ui", "frontend", "view", "component", "screen", "css", "html", "react", "client")):
+                                    assigned = ["gemini"]
+                                elif any(kw in title_l for kw in ("qa", "test", "verification", "audit", "review")):
+                                    assigned = ["gemma"]
+                                elif any(kw in title_l for kw in ("release", "git", "deploy", "packaging", "version", "gitops")):
+                                    assigned = ["local-llm"]
+                                proposed_wos.append({
+                                    "id": wo_id,
+                                    "title": m.title,
+                                    "type": "FEATURE",
+                                    "priority": "P1" if idx > 1 else "P0",
+                                    "assigned_agents": assigned,
+                                    "dependencies": [f"WO-{idx-1:03d}"] if idx > 1 else [],
+                                    "deliverable": {
+                                        "type": "code",
+                                        "description": f"Deliverables for {m.title}",
+                                    },
+                                    "description": "\n".join(m.tasks) if m.tasks else m.title,
+                                })
+                            plan_meta = {
+                                "work_orders": proposed_wos,
+                                "plan_structure": parsed_plan.to_dict(),
+                                "prompt": prompt,
+                                "operation_id": operation_id,
+                                "is_goal": True,
+                                "work_order_id": op_rec.get("work_order_id"),
+                            }
+                            plan_id = "PLAN-001"
+                            self.propose_plan(
+                                session_id=session_id,
+                                plan_id=plan_id,
+                                title=parsed_plan.title or f"Plan for: {prompt[:60]}",
+                                content=plan_content,
+                                metadata=plan_meta,
+                            )
+                    except Exception:
+                        pass
+
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "success", operation_id=operation_id,
                     result=result_data,
@@ -1207,6 +1577,15 @@ class SessionManager:
                 if contract_scope is None or contract_scope == "inherit"
                 else contract_scope
             )
+            _verify_contract_scope_narrowing(parent_record.get("contract_scope"), effective_scope)
+
+            if canonical_role == "gitops" and work_order_id:
+                ws_path = Path(parent_session["workspace"])
+                if (ws_path / ".sync" / "work-orders").is_dir():
+                    from validators.harness.d024_gate import D024Gate, D024ViolationError
+                    d024_decision = D024Gate().evaluate_work_order(ws_path, work_order_id)
+                    if not d024_decision.passed:
+                        raise D024ViolationError(f"D024 QA Gate Blocked: {d024_decision.reason}")
         _, op_id = self.begin_operation(
             session_id,
             f"execute.{canonical_role}",

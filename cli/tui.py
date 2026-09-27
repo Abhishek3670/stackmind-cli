@@ -46,6 +46,7 @@ def _show_help() -> None:
         "  :pause            Pause active session turn\n"
         "  :resume           Resume active session\n"
         "  :cancel           Cancel in-flight session turn\n"
+        "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :help             Show this help menu\n"
         "  :exit, :quit, q   Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent"
@@ -120,7 +121,10 @@ def _dispatch_command(
         session = adapter.command(":cancel", session_id=session["session_id"])
         click.echo(f"Session {session.get('state', 'CANCELLED')}")
         return session, False
-    if normalized.startswith(":") and not normalized.startswith(":prompt "):
+    if normalized == ":goal" or (normalized.startswith(":goal ") and not normalized[6:].strip()):
+        click.echo("Usage: :goal <product goal or feature request>")
+        return session, False
+    if normalized.startswith(":") and not normalized.startswith(":prompt ") and not normalized.startswith(":goal "):
         click.echo("Unknown command. Type :help.")
         return session, False
     result = adapter.command(normalized, session_id=session["session_id"])

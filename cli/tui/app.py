@@ -1364,6 +1364,7 @@ def get_help_str() -> str:
         "  :wo               Display Work Orders table and progress\n"
         "  :tree, :agents    Display Hierarchical Operation Tree\n"
         "  :plan             Display Plan Approval surface and revision history\n"
+        "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
         "  :completion       Display Project Complete handover checklist\n"
@@ -1968,7 +1969,15 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized.startswith(":") and not normalized.startswith(":prompt "):
+    if normalized == ":goal" or (normalized.startswith(":goal ") and not normalized[6:].strip()):
+        output_str = "Usage: :goal <product goal or feature request>"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":") and not normalized.startswith(":prompt ") and not normalized.startswith(":goal "):
         output_str = "Unknown command. Type :help."
         state.add_message("user", normalized)
         state.add_message("system", output_str)
@@ -1980,7 +1989,16 @@ def dispatch_delivery_command(
     if live_manager is not None and getattr(live_manager, "is_active", False):
         live_manager.stop()
 
-    prompt_text = normalized[8:].strip() if normalized.startswith(":prompt ") else normalized
+    is_goal = normalized.startswith(":goal ")
+    if is_goal:
+        prompt_text = normalized
+        placeholder = "Routing goal to Architecture (claude)... (Ctrl+C to cancel)"
+    elif normalized.startswith(":prompt "):
+        prompt_text = normalized[8:].strip()
+        placeholder = "Generating response... (Ctrl+C to cancel)"
+    else:
+        prompt_text = normalized
+        placeholder = "Generating response... (Ctrl+C to cancel)"
     state.add_message("user", prompt_text)
     if is_tty:
         redraw_full_screen(
@@ -1989,7 +2007,7 @@ def dispatch_delivery_command(
             clear=False,
             include_composer=True,
             composer_is_active=False,
-            composer_placeholder="Generating response... (Ctrl+C to cancel)",
+            composer_placeholder=placeholder,
             live_manager=live_manager,
         )
     else:
@@ -1998,12 +2016,32 @@ def dispatch_delivery_command(
     try:
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
-        state.add_activity("User", "submitted turn", op_id)
-        if op_id and op_id not in state.operations:
-            state.operations[op_id] = OperationNode(op_id, "Turn", role="Backend", backend="Codex", status="RUNNING")
+        if is_goal:
+            state.add_activity("User", "submitted goal to Architecture", op_id)
+            # Convention note: state.roles keys are Title-cased ("Architecture", "Q/A").
+            # The daemon registers operations under lowercase ("architecture").
+            if op_id and op_id not in state.operations:
+                arch_backend = (
+                    state.roles["Architecture"].backend
+                    if "Architecture" in state.roles and state.roles["Architecture"].backend
+                    else "Claude"
+                )
+                state.operations[op_id] = OperationNode(op_id, "Goal", role="Architecture", backend=arch_backend, status="RUNNING")
+            if "Architecture" in state.roles:
+                state.roles["Architecture"].state = "RUNNING"
+        else:
+            state.add_activity("User", "submitted turn", op_id)
+            if op_id and op_id not in state.operations:
+                backend_role = session.get("agent", "codex").title()
+                state.operations[op_id] = OperationNode(op_id, "Turn", role="Backend", backend="Codex", status="RUNNING")
         # This is a local wait indicator, not a claim about daemon state.
         if not is_tty:
-            status_line = Text("● Thinking... Turn submitted to the governed daemon.", style="dim cyan")
+            msg = (
+                "● Routing goal to Architecture (claude)... Turn submitted to the governed daemon."
+                if is_goal
+                else "● Thinking... Turn submitted to the governed daemon."
+            )
+            status_line = Text(msg, style="dim cyan")
             click.echo(status_line)
 
         # Synchronously await turn completion while consuming events via native SSE
@@ -2083,7 +2121,7 @@ def dispatch_delivery_command(
                             clear=False,
                             include_composer=True,
                             composer_is_active=False,
-                            composer_placeholder="Generating response... (Ctrl+C to cancel)",
+                            composer_placeholder=placeholder,
                             conversation_content=tick_content,
                             live_manager=live_manager,
                         )
@@ -2146,7 +2184,7 @@ def dispatch_delivery_command(
                             clear=False,
                             include_composer=True,
                             composer_is_active=False,
-                            composer_placeholder="Generating response... (Ctrl+C to cancel)",
+                            composer_placeholder=placeholder,
                             conversation_content=full_content,
                             live_manager=live_manager,
                         )
@@ -2263,7 +2301,7 @@ def dispatch_delivery_command(
                 clear=False,
                 include_composer=True,
                 composer_is_active=False,
-                composer_placeholder="Generating response... (Ctrl+C to cancel)",
+                composer_placeholder=placeholder,
                 live_manager=live_manager,
             )
 
