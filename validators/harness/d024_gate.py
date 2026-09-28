@@ -368,6 +368,12 @@ class D024Gate:
                             elif test_file.is_file() and test_file.stat().st_size == 0:
                                 deliverable_issues.append(f"companion test file is empty (0 bytes): {test_file.relative_to(project_path).as_posix()}")
 
+                            if deliv_path_str.endswith(".py") and deliv_file.is_file():
+                                from validators.harness.dependency_gate import check_import_satisfiability
+                                sat_res = check_import_satisfiability(deliv_file, project_root=project_path)
+                                if not sat_res.passed:
+                                    deliverable_issues.append(sat_res.diagnostic or f"import satisfiability failed for {deliv_path_str}")
+
                         if deliverable_issues:
                             decision = D024GateDecision(
                                 passed=False,

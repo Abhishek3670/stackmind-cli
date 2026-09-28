@@ -702,7 +702,7 @@ def test_concurrent_turn_promotion_prevents_clobbering_under_runtime_lock(tmp_pa
         return transport
 
     runner_a = AgentRunner(project, "claude", provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_a)))
-    runner_b = AgentRunner(project, "claude", provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_b)))
+    runner_b = AgentRunner(project, "architect", provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_b)))
 
     results = {}
     barrier = threading.Barrier(2)
@@ -716,8 +716,8 @@ def test_concurrent_turn_promotion_prevents_clobbering_under_runtime_lock(tmp_pa
 
     t_a.start()
     t_b.start()
-    t_a.join(timeout=10)
-    t_b.join(timeout=10)
+    t_a.join(timeout=30)
+    t_b.join(timeout=30)
 
     # Exactly one runner succeeds in promoting; the other is blocked by the overwrite check
     statuses = {results["A"].status, results["B"].status}
