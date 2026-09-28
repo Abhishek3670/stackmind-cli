@@ -5,6 +5,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Import / Dependency Satisfiability Gate**:
+  - Fail-closed import satisfiability verification examining agent deliverables using Python AST.
+  - Manifest parsing (`pyproject.toml`, `requirements*.txt`) with import-to-distribution name mappings.
+  - Detection and explicit diagnostics for undeclared external third-party imports without environment mutation.
+- **Phase B: Governed Tool & Context Hardening**:
+  - Cumulative and per-turn tool-call limit enforcement with deterministic termination.
+  - No-progress and pathological loop detection (identical repetition, ping-pong cycles, signature tracking).
+  - Bounded context output truncation and structured recovery warnings before failure limits.
+  - Single-turn tool-less graceful finalization upon loop guard trip preserving valid deliverable salvage.
+- **No-Op Deliverable Completion Prevention Gate**:
+  - Hardened `outcome_verified` verification dimension to require observable deliverable addition or modification in the staged diff.
+  - Disentangled harness-owned bookkeeping writes from task staged diffs, preventing vacuous completion without deliverable writeback.
+  - Enriched diagnostic blockers when declared deliverables are missing from the turn's staged diff.
+
 ## [3.6.0] - 2026-09-28
 
 ### Added

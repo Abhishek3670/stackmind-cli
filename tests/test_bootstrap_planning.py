@@ -529,7 +529,8 @@ def test_codex_task_with_architecture_in_title_does_not_get_claude_prompt(tmp_pa
     assert system_msg is not None
     assert "Senior Architect" not in system_msg.content
     assert "Claude" not in system_msg.content
-    assert system_msg.content == "You are a governed StackMind worker. Use tools for all file I/O. Return the final HarnessDecision as JSON."
+    assert "You are a governed StackMind worker. Use tools for all file I/O." in system_msg.content
+    assert "Code execution is unavailable; the harness verifies after the final decision." in system_msg.content
 
     # 2. User message must NOT contain Architecture research or authoring instructions
     user_msg = next((m for m in captured_messages if m.role == "user"), None)

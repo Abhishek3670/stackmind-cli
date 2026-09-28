@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -314,11 +315,18 @@ class OllamaAdapter(ProviderAdapter):
         model: str = "qwen2.5-coder:7b",
         provider_name: str = "ollama",
         default_timeout: float = 60.0,
+        options: dict[str, Any] | None = None,
         transport: Callable[[dict[str, Any], bool, float | None], Any] | None = None,
     ) -> None:
         super().__init__(provider_name=provider_name, model_name=model)
         self.endpoint = endpoint.rstrip("/")
         self.default_timeout = default_timeout
+        self.options = dict(options) if options else {}
+        if "num_gpu" not in self.options and "OLLAMA_NUM_GPU" in os.environ:
+            try:
+                self.options["num_gpu"] = int(os.environ["OLLAMA_NUM_GPU"])
+            except ValueError:
+                pass
         self.transport = transport
 
     def _extract_tool_calls_from_content(self, content: str | None) -> list[ToolCallRequest]:
@@ -403,6 +411,8 @@ class OllamaAdapter(ProviderAdapter):
             "messages": payload_messages,
             "stream": stream,
         }
+        if self.options:
+            payload["options"] = dict(self.options)
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
         payload.update(kwargs)

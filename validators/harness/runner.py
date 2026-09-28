@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
@@ -100,6 +100,7 @@ class CompletionRecord:
     completion_tokens: int = 0
     latency_ms: int = 0
     cost_estimate: float = 0.0
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,8 @@ class AgentRunner:
         retrieval_policy: RetrievalPolicy | None = None,
         token_budget: int = 1200,
         context_limit: int = 8,
+        max_tool_calls: int | None = None,
+        max_turns: int | None = None,
         max_lock_retries: int = 3,
         backoff_seconds: float = 0.1,
         now_fn: Any | None = None,
@@ -278,6 +281,9 @@ class AgentRunner:
         self.search_tool = SessionSearchTool(search_provider, policy=retrieval_policy)
         self.token_budget = token_budget
         self.context_limit = context_limit
+        from validators.kernel.providers.gateway import DEFAULT_MAX_TURNS
+        self.max_tool_calls = max_tool_calls
+        self.max_turns = max_turns if max_turns is not None else DEFAULT_MAX_TURNS
         self.max_lock_retries = max_lock_retries
         self.backoff_seconds = backoff_seconds
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc).astimezone())
@@ -468,6 +474,35 @@ class AgentRunner:
                 if self.backend is not None and hasattr(self.backend, 'report_result') and operation_id:
                     self.backend.report_result(operation_id)
             except Exception as exc:
+                from validators.kernel.providers.errors import (
+                    BudgetExceededError,
+                    ConsecutiveToolFailureError,
+                    NoProgressLoopError,
+                    OperationCancelledError,
+                    TimeoutError,
+                    ToolLimitExceededError,
+                    ToolLoopExhaustedError,
+                )
+                if isinstance(exc, OperationCancelledError) or self._is_cancelled(cancellation):
+                    return self._cancelled_result(task, operation_id)
+                if isinstance(exc, (
+                    BudgetExceededError,
+                    ToolLimitExceededError,
+                    ToolLoopExhaustedError,
+                    NoProgressLoopError,
+                    ConsecutiveToolFailureError,
+                    TimeoutError,
+                )):
+                    return HarnessRunResult(
+                        status='blocked',
+                        persisted=False,
+                        task_id=task.identifier,
+                        reason=f"Governed tool loop halted: {exc}",
+                        meta={
+                            'error_type': type(exc).__name__,
+                            'error': str(exc),
+                        },
+                    )
                 return HarnessRunResult(
                     status='failed',
                     persisted=False,
@@ -708,7 +743,8 @@ class AgentRunner:
                         declaration_matches=declaration_matches,
                         command_results=command_results,
                         d025_passed=gate_decision.passed,
-                        has_staged_writes=(task.kind == 'inbox' or task.work_order_id is not None),
+                        has_staged_writes=(task.kind == 'inbox'),
+                        tool_runtime=tool_runtime,
                     )
                     # Audit trail (Phase 5): persist every declared command and
                     # its outcome — the ORIGINAL string the model asked to run,
@@ -725,12 +761,22 @@ class AgentRunner:
                     ]
                     if not dimensions.all_passed:
                         failed = [name for name, passed in dimensions.to_dict().items() if name != 'all_passed' and not passed]
+                        reason_msg = 'verification gate failed: ' + ', '.join(failed)
+                        meta_dict: dict[str, Any] = {'commands_audit': stage_inputs.get('commands_audit', [])}
+                        if not dimensions.outcome_verified and task.work_order_id and task.deliverable_path:
+                            norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
+                            stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
+                            stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
+                            if norm_del not in stg_added and norm_del not in stg_mod:
+                                diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
+                                reason_msg += f" ({diag})"
+                                meta_dict['blocker'] = diag
                         return HarnessRunResult(
                             status='blocked',
                             persisted=False,
                             task_id=task.identifier,
-                            reason='verification gate failed: ' + ', '.join(failed),
-                            meta={'commands_audit': stage_inputs.get('commands_audit', [])},
+                            reason=reason_msg,
+                            meta=meta_dict,
                         )
                     self._apply_verified_workspace_diff(staged_root, diff)
 
@@ -1174,7 +1220,11 @@ class AgentRunner:
                 "Return the final HarnessDecision as JSON."
             )
         else:
-            system_msg = 'You are a governed StackMind worker. Use tools for all file I/O. Return the final HarnessDecision as JSON.'
+            system_msg = (
+                'You are a governed StackMind worker. Use tools for all file I/O. '
+                'Code execution is unavailable; the harness verifies after the final decision. '
+                'Once your files are written, return the final HarnessDecision as JSON.'
+            )
 
         messages = [
             Message.system(system_msg),
@@ -1182,10 +1232,66 @@ class AgentRunner:
                 f'{task_text}Context:\n{request.context.text}'
             ),
         ]
-        history = gateway.run_loop(messages, max_turns=10, cancellation_token=request.cancellation)
+        from validators.kernel.providers.errors import (
+            ConsecutiveToolFailureError,
+            NoProgressLoopError,
+            ToolLimitExceededError,
+            ToolLoopExhaustedError,
+        )
+
+        guard_trip: str | None = None
+        decision_source: str = "model"
+
+        try:
+            history = gateway.run_loop(
+                messages,
+                max_turns=self.max_turns,
+                max_tool_calls=self.max_tool_calls,
+                cancellation_token=request.cancellation,
+            )
+        except (
+            ToolLimitExceededError,
+            ToolLoopExhaustedError,
+            NoProgressLoopError,
+            ConsecutiveToolFailureError,
+        ) as exc:
+            guard_trip = type(exc).__name__
+            # Check what files have been written so far
+            written_files_so_far: list[str] = list(getattr(gateway, "written_files", []))
+            if not written_files_so_far:
+                for msg in messages:
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            if tc.name == 'write_file' and 'path' in tc.arguments:
+                                p = str(tc.arguments['path'])
+                                if p not in written_files_so_far:
+                                    written_files_so_far.append(p)
+
+            # Hard-block only if there are no writes
+            if not written_files_so_far:
+                raise
+
+            # Exactly one tool-less finalization turn
+            fin_prompt = (
+                f"Execution guard '{guard_trip}' was triggered: {exc}. "
+                "Tool execution is now closed. Based on the files you have written, "
+                "please output your final HarnessDecision JSON now."
+            )
+            messages.append(Message.user(fin_prompt))
+            try:
+                fin_resp = gateway.adapter.complete(messages, tools=[])
+                gateway._record_and_check_budget(fin_resp.usage)
+                messages.append(fin_resp.message)
+            except Exception:
+                pass
+            history = messages
+
         assistant_msgs = [m for m in history if m.role == 'assistant']
         if not assistant_msgs:
-            raise ValueError('provider tool loop ended without an assistant message')
+            if guard_trip:
+                assistant_msgs = [Message.assistant("")]
+            else:
+                raise ValueError('provider tool loop ended without an assistant message')
         final = next((m for m in reversed(assistant_msgs) if m.content and m.content.strip()), assistant_msgs[-1])
         raw_text = (final.content or '').strip()
         payload = None
@@ -1238,16 +1344,23 @@ class AgentRunner:
                         p = str(tc.arguments['path'])
                         if p not in written_files:
                             written_files.append(p)
+        for wf in getattr(gateway, "written_files", []):
+            if wf not in written_files:
+                written_files.append(wf)
 
         if not isinstance(payload, dict):
+            if guard_trip:
+                decision_source = "synthesized_after_loop_guard"
             payload = {
                 'status': 'completed',
-                'summary': raw_text[:200] or 'Completed task via tools',
-                'report_markdown': raw_text or 'Completed task via tools',
+                'summary': raw_text[:200] or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                'report_markdown': raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
                 'modified_files': written_files,
                 'blockers': [],
             }
         else:
+            if guard_trip:
+                decision_source = "model"
             payload.setdefault('status', 'completed')
             payload.setdefault('summary', 'Completed task via tools')
             payload.setdefault('report_markdown', payload.get('summary', 'Execution completed via governed tools.'))
@@ -1275,12 +1388,18 @@ class AgentRunner:
             'commands',
         }
         payload = {k: v for k, v in payload.items() if k in allowed_keys}
+        completion_meta: dict[str, Any] = {}
+        if guard_trip:
+            completion_meta['guard_trip'] = guard_trip
+            completion_meta['decision_source'] = decision_source
+
         return CompletionRecord(
             provider=getattr(self.provider_adapter, 'provider_name', self.backend_id),
             model=getattr(self.provider_adapter, 'model_name', self.backend_model),
             payload=payload,
             prompt_tokens=gateway.total_usage.prompt_tokens,
             completion_tokens=gateway.total_usage.completion_tokens,
+            meta=completion_meta,
         )
 
     def _execute_governed_command(
@@ -1641,6 +1760,12 @@ class AgentRunner:
                 {'node_id': node_id, 'reason': reason}
                 for node_id, reason in (stage_inputs.get('scope_skips', ()) or ())
             ],
+            'guard_trip': completion.meta.get('guard_trip') if hasattr(completion, 'meta') else None,
+            'decision_source': (
+                completion.meta.get('decision_source', 'model')
+                if hasattr(completion, 'meta')
+                else 'model'
+            ),
             'trust_level': trust_level.value if hasattr(trust_level, 'value') else str(trust_level or 'OBSERVABLE'),
             'uncertainty': list(decision.uncertainty),
             'verification_dimensions': dimensions.to_dict() if dimensions else {},
@@ -1660,6 +1785,7 @@ class AgentRunner:
         command_results: list[subprocess.CompletedProcess[str]],
         d025_passed: bool,
         has_staged_writes: bool,
+        tool_runtime: Any = None,
     ) -> Any:
         """Derive verification flags from the staged filesystem and command telemetry."""
         from validators.harness.contract_gate import verify_post_execution
@@ -1751,7 +1877,18 @@ class AgentRunner:
                 candidate = staged_root / relative_path
                 if candidate.exists():
                     try:
-                        ast.parse(candidate.read_text(encoding='utf-8'))
+                        source_code = candidate.read_text(encoding='utf-8')
+                        ast.parse(source_code)
+                        from validators.harness.dependency_gate import check_import_satisfiability
+                        sat_result = check_import_satisfiability(
+                            candidate,
+                            project_root=self.project_path,
+                            staged_root=staged_root,
+                            source_code=source_code,
+                        )
+                        if not sat_result.passed:
+                            code_verified = False
+                            staged_errors.append(sat_result.diagnostic or f"import satisfiability failed for {relative_path}")
                     except (OSError, UnicodeDecodeError, SyntaxError):
                         code_verified = False
 
@@ -1817,25 +1954,62 @@ class AgentRunner:
                         security_verified = False
                         break
 
-        deliverable_exists = False
+        deliverable_touched = False
         if task.deliverable_path:
-            deliverable = staged_root / task.deliverable_path
-            deliverable_exists = deliverable.exists()
-        elif task.kind == 'inbox':
+            norm_deliv = Path(task.deliverable_path).as_posix().lstrip('/')
+            staged_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
+            staged_modified = {Path(p).as_posix().lstrip('/') for p in diff.modified}
+            deliverable_touched = (norm_deliv in staged_added or norm_deliv in staged_modified)
+
+        authored_artifacts = any(
+            (p.startswith('.sync/work-orders/') or p.startswith('.sync/contracts/'))
+            for p in task_changed_files
+        )
+
+        if task.kind == 'inbox':
             # Inbox tasks are intentionally archived by the staged operation; the
             # task selected at discovery is itself the completed deliverable.
-            deliverable_exists = True
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+            )
         elif task.kind == 'adhoc':
             # Ad-hoc prompt turns produce conversational completion/report deliverables.
-            deliverable_exists = bool(
-                (decision.summary and decision.summary.strip())
-                or (decision.report_markdown and decision.report_markdown.strip())
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+                and bool(
+                    (decision.summary and decision.summary.strip())
+                    or (decision.report_markdown and decision.report_markdown.strip())
+                )
             )
-        outcome_verified = (
-            decision.status == 'completed'
-            and not decision.blockers
-            and (deliverable_exists or bool(changed_files) or has_staged_writes)
-        )
+        elif task.work_order_id and task.deliverable_path:
+            if tool_runtime is not None:
+                deliverable = staged_root / task.deliverable_path
+                outcome_verified = (
+                    decision.status == 'completed'
+                    and not decision.blockers
+                    and (deliverable_touched or (authored_artifacts and deliverable.exists()))
+                )
+            else:
+                deliverable = staged_root / task.deliverable_path
+                outcome_verified = (
+                    decision.status == 'completed'
+                    and not decision.blockers
+                    and (deliverable_touched or deliverable.exists() or bool(changed_files) or has_staged_writes)
+                )
+        elif task.work_order_id and not task.deliverable_path:
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+                and (bool(task_changed_files) or any(r.returncode == 0 for r in command_results))
+            )
+        else:
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+                and (bool(changed_files) or has_staged_writes)
+            )
         return VerificationDimensions(
             scope_verified=scope_verified,
             state_verified=state_verified,
