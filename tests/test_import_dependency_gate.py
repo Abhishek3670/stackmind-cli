@@ -26,6 +26,7 @@ from validators.harness.dependency_gate import (
     extract_top_level_imports,
     is_import_declared,
     is_local_module,
+    is_manifest_permitted_by_contract,
     is_standard_library,
     normalize_distribution_name,
     read_project_dependencies,
@@ -487,3 +488,406 @@ def test_d024_gate_integration_passes_when_dependencies_declared(tmp_path: Path)
     decision = gate.evaluate_work_order(project, "WO-102")
     assert decision.passed is True
     assert decision.verdict_status == "APPROVED"
+
+
+# ─── 9. Part B: Architecture Dependency Declaration & Scaffolding Tests ───
+
+
+def test_is_manifest_permitted_by_contract_evaluation():
+    """Verify is_manifest_permitted_by_contract correctly evaluates AgentContract and dict contracts."""
+    from validators.kernel.contract import AgentContract
+
+    # Direct booleans
+    assert is_manifest_permitted_by_contract(True) is True
+    assert is_manifest_permitted_by_contract(False) is False
+    assert is_manifest_permitted_by_contract(None) is False
+
+    # AgentContract instances
+    scaffolding_contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-001",
+        allow=("requirements.txt",),
+        deny=(".git/**",),
+        write_mode="read-write",
+    )
+    assert is_manifest_permitted_by_contract(scaffolding_contract) is True
+
+    pyproject_contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-001",
+        allow=("pyproject.toml",),
+        deny=(),
+        write_mode="read-write",
+    )
+    assert is_manifest_permitted_by_contract(pyproject_contract) is True
+
+    worker_code_contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-002",
+        allow=("src/**",),
+        deny=(".git/**",),
+        write_mode="read-write",
+    )
+    assert is_manifest_permitted_by_contract(worker_code_contract) is False
+
+    readonly_manifest_contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-001",
+        allow=("requirements.txt",),
+        deny=(),
+        write_mode="read-only",
+    )
+    assert is_manifest_permitted_by_contract(readonly_manifest_contract) is False
+
+    denied_manifest_contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-001",
+        allow=("*",),
+        deny=(
+            "requirements.txt",
+            "pyproject.toml",
+            "setup.cfg",
+            "setup.py",
+            "requirements*.txt",
+            "*-requirements.txt",
+            "requirements.in",
+            "requirements-dev.txt",
+            "dev-requirements.txt",
+        ),
+        write_mode="read-write",
+    )
+    assert is_manifest_permitted_by_contract(denied_manifest_contract) is False
+
+    # Raw YAML dict contracts
+    scaffolding_dict = {
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "scope": {
+            "allow": [{"module": "requirements.txt"}],
+            "deny": [{"module": ".git/**"}],
+            "write": "read-write",
+        },
+    }
+    assert is_manifest_permitted_by_contract(scaffolding_dict) is True
+
+    worker_dict = {
+        "agent_id": "codex",
+        "work_order": "WO-002",
+        "scope": {
+            "allow": [{"module": "src/**"}],
+            "deny": [{"module": ".git/**"}],
+            "write": "read-write",
+        },
+    }
+    assert is_manifest_permitted_by_contract(worker_dict) is False
+
+    worker_readonly_dict = {
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "scope": {
+            "allow": [{"module": "requirements.txt"}],
+            "deny": [],
+            "write": "read-only",
+        },
+    }
+    assert is_manifest_permitted_by_contract(worker_readonly_dict) is False
+
+
+def test_scope_aware_diagnostics_missing_manifest(tmp_path: Path):
+    """Dependency-gate diagnostic distinguishes permitted vs outside scope when manifest is missing."""
+    project = tmp_path / "project"
+    project.mkdir()
+    deliv = project / "src" / "api" / "auth.py"
+    deliv.parent.mkdir(parents=True)
+    deliv.write_text("import requests\nimport flask\n", encoding="utf-8")
+
+    # 1. Permitted: Worker contract allows manifest writing
+    permitted_contract = {
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "scope": {
+            "allow": [{"module": "requirements.txt"}, {"module": "src/**"}],
+            "deny": [],
+            "write": "read-write",
+        },
+    }
+    res_permitted = check_import_satisfiability(deliv, project_root=project, contract=permitted_contract)
+    assert res_permitted.passed is False
+    assert res_permitted.manifest_permitted is True
+    assert "Your contract permits writing dependency manifests." in str(res_permitted.diagnostic)
+    assert "Use write_file to create requirements.txt or pyproject.toml" in str(res_permitted.diagnostic)
+
+    # 2. Outside Scope: Worker contract confines worker to code deliverables
+    confined_contract = {
+        "agent_id": "codex",
+        "work_order": "WO-002",
+        "scope": {
+            "allow": [{"module": "src/**"}],
+            "deny": [],
+            "write": "read-write",
+        },
+    }
+    res_confined = check_import_satisfiability(deliv, project_root=project, contract=confined_contract)
+    assert res_confined.passed is False
+    assert res_confined.manifest_permitted is False
+    assert "Dependency manifest creation is OUTSIDE your assigned contract scope." in str(res_confined.diagnostic)
+    assert "Architecture (Claude) must provision dependencies via an explicit scaffolding Work Order" in str(res_confined.diagnostic)
+
+    # 3. Neutral: No contract passed
+    res_neutral = check_import_satisfiability(deliv, project_root=project, contract=None)
+    assert res_neutral.passed is False
+    assert res_neutral.manifest_permitted is None
+    assert "Create a dependency manifest or remove undeclared external imports." in str(res_neutral.diagnostic)
+
+
+def test_scope_aware_diagnostics_undeclared_imports_existing_manifest(tmp_path: Path):
+    """Dependency-gate diagnostic distinguishes permitted vs outside scope when imports are undeclared."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
+    deliv = project / "src" / "api" / "db.py"
+    deliv.parent.mkdir(parents=True)
+    deliv.write_text("import flask\nimport sqlalchemy\n", encoding="utf-8")
+
+    # 1. Permitted: Worker contract allows modifying manifest
+    permitted_contract = {
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "scope": {
+            "allow": [{"module": "requirements.txt"}, {"module": "src/**"}],
+            "deny": [],
+            "write": "read-write",
+        },
+    }
+    res_permitted = check_import_satisfiability(deliv, project_root=project, contract=permitted_contract)
+    assert res_permitted.passed is False
+    assert res_permitted.manifest_permitted is True
+    assert res_permitted.undeclared_imports == ("sqlalchemy",)
+    assert "Your contract permits updating dependency manifests." in str(res_permitted.diagnostic)
+    assert "Declare them in pyproject.toml or requirements.txt using write_file." in str(res_permitted.diagnostic)
+
+    # 2. Outside Scope: Worker contract cannot edit manifest
+    confined_contract = {
+        "agent_id": "codex",
+        "work_order": "WO-002",
+        "scope": {
+            "allow": [{"module": "src/**"}],
+            "deny": [],
+            "write": "read-write",
+        },
+    }
+    res_confined = check_import_satisfiability(deliv, project_root=project, contract=confined_contract)
+    assert res_confined.passed is False
+    assert res_confined.manifest_permitted is False
+    assert "Modifying the dependency manifest is OUTSIDE your assigned contract scope." in str(res_confined.diagnostic)
+    assert "Architecture (Claude) must declare these dependencies via a scaffolding Work Order" in str(res_confined.diagnostic)
+
+    # 3. Neutral: No contract passed
+    res_neutral = check_import_satisfiability(deliv, project_root=project, contract=None)
+    assert res_neutral.passed is False
+    assert res_neutral.manifest_permitted is None
+    assert "Declare them in pyproject.toml or requirements.txt, or replace with local/standard library alternatives." in str(res_neutral.diagnostic)
+
+
+def test_architecture_declaring_dependencies_and_scaffolding_work_order(tmp_path: Path):
+    """Architecture explicitly decides stack and dependencies in PLAN.md and generates scaffolding WO."""
+    from validators.harness.authoring_gate import AuthoringGate
+    from validators.harness.plan import validate_plan_structure
+    import yaml
+
+    plan_content = (
+        "# Project Plan: Web Portal\n\n"
+        "## Current Architecture\n"
+        "Web API service requiring Flask web framework, Werkzeug utilities, and Pydantic data models.\n"
+        "Stack & Dependencies: Python 3.11, Flask==3.0.0, Werkzeug==3.0.0, Pydantic>=2.0.0.\n\n"
+        "## Milestones & Roadmap\n"
+        "- [ ] Milestone 1: Environment & Dependency Scaffolding\n"
+        "  - [ ] Task 1.1: Author requirements.txt with declared project dependencies (WO-001)\n"
+        "- [ ] Milestone 2: Authentication Service\n"
+        "  - [ ] Task 2.1: Implement login endpoint consuming Flask (WO-002)\n"
+    )
+    is_valid, errors = validate_plan_structure(plan_content)
+    assert is_valid is True, errors
+
+    # Scaffolding Work Order
+    scaffolding_wo = {
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Configure Project Dependencies",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {
+            "type": "config",
+            "path": "requirements.txt",
+            "description": "Project dependency manifest declaring required packages",
+        },
+        "description": "Create requirements.txt declaring Flask, Werkzeug, and Pydantic.",
+    }
+    scaffolding_contract = {
+        "schema_version": 1,
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "identity": {"role": "backend", "reports_to": "claude"},
+        "scope": {
+            "allow": [{"module": "requirements.txt"}],
+            "deny": [{"module": ".git/**"}],
+            "write": "read-write",
+        },
+        "budget": {"max_files_touched": 5, "max_tokens": 30000},
+    }
+
+    # Implementation Work Order dependent on scaffolding
+    implementation_wo = {
+        "id": "WO-002",
+        "type": "FEATURE",
+        "title": "Implement Login API Endpoint",
+        "status": "ACTIVE",
+        "priority": "P1",
+        "assigned_agents": ["codex"],
+        "dependencies": ["WO-001"],
+        "deliverable": {
+            "type": "code",
+            "path": "src/api/auth.py",
+            "description": "Authentication endpoint handler",
+        },
+        "description": "Implement authentication endpoint handler importing Flask.",
+    }
+    implementation_contract = {
+        "schema_version": 1,
+        "agent_id": "codex",
+        "work_order": "WO-002",
+        "identity": {"role": "backend", "reports_to": "claude"},
+        "scope": {
+            "allow": [{"module": "src/**"}],
+            "deny": [{"module": ".git/**"}],
+            "write": "read-write",
+        },
+        "budget": {"max_files_touched": 10, "max_tokens": 30000},
+    }
+
+    gate = AuthoringGate()
+    # Validate artifacts
+    res_wo1 = gate.validate_artifact_content(".sync/work-orders/ACTIVE/WO-001.yaml", yaml.dump(scaffolding_wo), agent="claude")
+    assert res_wo1.passed is True, res_wo1.errors
+
+    res_c1 = gate.validate_artifact_content(".sync/contracts/WO-001.yaml", yaml.dump(scaffolding_contract), agent="claude")
+    assert res_c1.passed is True, res_c1.errors
+
+    res_wo2 = gate.validate_artifact_content(".sync/work-orders/ACTIVE/WO-002.yaml", yaml.dump(implementation_wo), agent="claude")
+    assert res_wo2.passed is True, res_wo2.errors
+
+    res_c2 = gate.validate_artifact_content(".sync/contracts/WO-002.yaml", yaml.dump(implementation_contract), agent="claude")
+    assert res_c2.passed is True, res_c2.errors
+
+
+def test_scaffolding_work_order_creates_manifest_and_dependent_worker_consumes_it(tmp_path: Path):
+    """Scaffolding worker creates manifest, and dependent worker consumes it successfully."""
+    project = tmp_path / "project"
+    project.mkdir()
+
+    # Step 1: Scaffolding worker creates requirements.txt
+    req_file = project / "requirements.txt"
+    req_file.write_text("flask==3.0.0\nwerkzeug>=3.0.0\npydantic>=2.0.0\n", encoding="utf-8")
+
+    scaffolding_contract = {
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "scope": {
+            "allow": [{"module": "requirements.txt"}],
+            "deny": [{"module": ".git/**"}],
+            "write": "read-write",
+        },
+    }
+    assert is_manifest_permitted_by_contract(scaffolding_contract) is True
+
+    # Verify manifest was read properly
+    declared, manifest_found = read_project_dependencies(project)
+    assert manifest_found is True
+    assert "flask" in declared
+    assert "werkzeug" in declared
+    assert "pydantic" in declared
+
+    # Step 2: Dependent worker executes implementation WO-002
+    auth_file = project / "src" / "api" / "auth.py"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text(
+        "from flask import Flask, request, jsonify\n"
+        "from werkzeug.security import generate_password_hash\n"
+        "from pydantic import BaseModel\n\n"
+        "class LoginModel(BaseModel):\n"
+        "    username: str\n"
+        "    password: str\n\n"
+        "app = Flask(__name__)\n",
+        encoding="utf-8",
+    )
+
+    implementation_contract = {
+        "agent_id": "codex",
+        "work_order": "WO-002",
+        "scope": {
+            "allow": [{"module": "src/**"}],
+            "deny": [{"module": ".git/**"}],
+            "write": "read-write",
+        },
+    }
+    assert is_manifest_permitted_by_contract(implementation_contract) is False
+
+    sat_result = check_import_satisfiability(
+        auth_file,
+        project_root=project,
+        contract=implementation_contract,
+    )
+    assert sat_result.passed is True
+    assert sat_result.undeclared_imports == ()
+    assert sat_result.manifest_found is True
+    assert set(sat_result.external_imports) == {"flask", "werkzeug", "pydantic"}
+
+
+def test_worker_denied_manifest_access_when_outside_contract_scope(tmp_path: Path):
+    """Worker whose contract scope is confined to src/** is denied manifest writes by ToolGateway."""
+    from validators.kernel.contract import AgentContract
+    from validators.kernel.identity import AuthorizationPolicy
+    from validators.kernel.boundary import RuntimeBoundary
+    from validators.kernel.operations import OperationJournal
+    from validators.kernel.workspace import ScratchWorkspace
+    from validators.kernel.tools import ToolGateway
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
+
+    # Implementation contract confined to src/**
+    contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-002",
+        allow=("workspace/src/**", "src/**"),
+        deny=(".git/**",),
+        write_mode="read-write",
+    )
+
+    workspace = ScratchWorkspace.create(project, "attempt-1")
+    policy = AuthorizationPolicy.permit("policy-1", ["write_file", "read_file"])
+    journal = OperationJournal()
+    boundary = RuntimeBoundary(journal=journal)
+    gateway = ToolGateway(
+        workspace=workspace,
+        boundary=boundary,
+        contract=contract,
+        policy=policy,
+        session_id="session-1",
+        attempt_id="attempt-1",
+        actor_id="codex",
+        provider_id="provider-1",
+    )
+
+    # Worker can write within allowed scope
+    gateway.write_file("src/api/auth.py", "# auth code\n")
+    assert (workspace.root / "src" / "api" / "auth.py").exists()
+
+    # Worker CANNOT write or tamper with requirements.txt
+    with pytest.raises(PermissionError) as exc_info:
+        gateway.write_file("requirements.txt", "malicious-pkg==1.0.0\n")
+    assert "outside allowed scope" in str(exc_info.value) or "denied" in str(exc_info.value)
+

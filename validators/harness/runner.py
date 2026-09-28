@@ -1813,6 +1813,7 @@ class AgentRunner:
                 scope_verified = False
 
         # Runtime contracts use path rules; validate those directly when present.
+        raw_contract = None
         if task.work_order_id:
             contract_path = self.sync_path / 'contracts' / f'{task.work_order_id}.yaml'
             if contract_path.exists():
@@ -1885,6 +1886,7 @@ class AgentRunner:
                             project_root=self.project_path,
                             staged_root=staged_root,
                             source_code=source_code,
+                            contract=raw_contract,
                         )
                         if not sat_result.passed:
                             code_verified = False
