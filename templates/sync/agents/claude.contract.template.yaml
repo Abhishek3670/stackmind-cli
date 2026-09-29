@@ -1,0 +1,35 @@
+schema_version: 1
+agent_id: claude
+work_order: WO-000
+identity:
+  role: architecture
+  reports_to: ceo
+scope:
+  allow:
+    - module: PLAN.md
+    - module: .sync/work-orders/**
+    - module: .sync/contracts/**
+    - module: .sync/inbox/local-llm/**
+    - module: .sync/inbox/claude/**
+  deny:
+    - module: .git/**
+    - module: src/**
+    - module: tests/**
+    - module: .sync/inbox/codex/**
+    - module: .sync/inbox/gemini/**
+    - module: .sync/inbox/gemma/**
+    - module: .sync/inbox/CEO/**
+    - module: .sync/runtime/**
+    - module: .sync/outbox/**
+    - module: .sync/agents/**
+    - module: .sync/knowledge/**
+    - module: .sync/snapshots/**
+    - module: .env
+    - module: .env.*
+    - module: __pycache__/**
+    - module: .venv/**
+    - module: node_modules/**
+  write: read-write
+budget:
+  max_files_touched: 20
+  max_tokens: 50000

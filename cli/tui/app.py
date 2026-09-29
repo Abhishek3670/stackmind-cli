@@ -377,20 +377,26 @@ def format_session_header(
     workspace = session.get("workspace")
 
     status_suffix = f" | {render_connection_status_str(status)}" if status else ""
+    phase_val = None
+    if "run" in session and isinstance(session["run"], Mapping):
+        phase_val = session["run"].get("phase")
+    if not phase_val and "phase" in session:
+        phase_val = session.get("phase")
+    phase_info = f" | phase: {phase_val}" if phase_val else ""
 
     if width >= 80:
         agent_info = f" | agent: {agent}" if agent else ""
         ws_info = f" | workspace: {workspace}" if workspace else ""
-        return f"Session {sid} | {state_val} | provider: {provider}{agent_info}{ws_info}{status_suffix}"
+        return f"Session {sid} | {state_val} | provider: {provider}{agent_info}{ws_info}{phase_info}{status_suffix}"
     elif width >= 55:
         ws_short = Path(str(workspace)).name if workspace else ""
         agent_info = f" | {agent}" if agent else ""
         ws_info = f" | ws: {ws_short}" if ws_short else ""
         display_sid = sid if len(sid) <= 12 else sid[:8] + "..."
-        return f"Session {display_sid} | {state_val}{agent_info}{ws_info}{status_suffix}"
+        return f"Session {display_sid} | {state_val}{phase_info}{agent_info}{ws_info}{status_suffix}"
     else:
         display_sid = sid if len(sid) <= 8 else sid[:6] + ".."
-        return f"Session {display_sid} | {state_val}{status_suffix}"
+        return f"Session {display_sid} | {state_val}{phase_info}{status_suffix}"
 
 
 def _get_version() -> str:

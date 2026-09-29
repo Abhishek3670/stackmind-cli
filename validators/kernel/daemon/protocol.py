@@ -157,6 +157,22 @@ class JsonRpcProtocol:
                 )
             except ValueError as error:
                 raise _RpcError(-32003, str(error)) from error
+        if method == "run.get":
+            return self.manager.get_active_run(params["session_id"])
+        if method == "run.approve":
+            try:
+                return self.manager.approve_run(
+                    params["session_id"], reason=str(params.get("reason", ""))
+                )
+            except (KeyError, ValueError) as error:
+                raise _RpcError(-32003, str(error)) from error
+        if method == "run.reject":
+            try:
+                return self.manager.reject_run(
+                    params["session_id"], reason=str(params.get("reason", ""))
+                )
+            except (KeyError, ValueError) as error:
+                raise _RpcError(-32003, str(error)) from error
         if method == "work_order.execute":
             turn_params = {
                 key: value for key, value in params.items() if key not in {"session_id", "prompt", "work_order_id"}

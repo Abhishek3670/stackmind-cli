@@ -1074,3 +1074,56 @@ def test_work_order_without_declared_deliverable_passes_with_task_changes(tmp_pa
     assert (project / "tests" / "audit_notes.txt").is_file() is True
 
 
+def test_preexisting_deliverable_noop_turn_blocked_even_with_bookkeeping(tmp_path: Path):
+    """Pre-existing deliverable untouched in turn is blocked even when harness stages bookkeeping.
+
+    When deliverable exists before turn and the agent turn only executes query_graph
+    or makes no deliverable modifications, outcome_verified must fail closed and
+    return status='blocked', persisted=False, even if harness bookkeeping is staged.
+    """
+    adapter = MockSequenceAdapter([])
+    _, project = _setup_runner_wo001(tmp_path, adapter)
+    auth_file = project / "src" / "api" / "auth.py"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text(AUTH_PY_VALID, encoding="utf-8")
+
+    # Turn only queries graph; does not modify src/api/auth.py
+    responses = [
+        ProviderResponse(
+            message=Message(
+                role="assistant",
+                content=None,
+                tool_calls=[ToolCallRequest(id="c1", name="query_graph", arguments={"query": "auth.py"})],
+            ),
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
+        ),
+        ProviderResponse(
+            message=Message(
+                role="assistant",
+                content=json.dumps({
+                    "status": "completed",
+                    "summary": "Looked up auth endpoint",
+                    "report_markdown": "Did not modify deliverable.",
+                    "modified_files": [],
+                    "release_target": "src/api/auth.py",
+                }),
+            ),
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
+        ),
+    ]
+    runner = AgentRunner(project, "codex", provider_adapter=MockSequenceAdapter(responses))
+    result = runner.run_once()
+
+    assert result.status == "blocked"
+    assert result.persisted is False
+    assert "outcome_verified" in result.reason
+    assert "declared deliverable 'src/api/auth.py' was not added or modified in this turn" in result.reason
+
+    # Ensure live deliverable content was untouched
+    assert auth_file.read_text(encoding="utf-8") == AUTH_PY_VALID
+
+    # Ensure harness bookkeeping was NOT persisted to live tree
+    inbox_reviews = list((project / ".sync" / "inbox" / "gemma").glob("*review.md"))
+    assert len(inbox_reviews) == 0
+
+

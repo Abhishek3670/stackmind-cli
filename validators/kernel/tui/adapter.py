@@ -66,6 +66,15 @@ class StackMindTuiAdapter:
             if not target:
                 raise ValueError("session_id required for :approve")
             clean_reason = argument or "Approved by operator"
+            if hasattr(self.client, "run_approve"):
+                try:
+                    run_info = self.client.run_get(target) if hasattr(self.client, "run_get") else None
+                    if isinstance(run_info, dict) and run_info.get("phase") in {
+                        "AWAITING_APPROVAL", "INIT", "PLANNING", "planning", "awaiting_approval"
+                    }:
+                        return self.client.run_approve(target, reason=clean_reason)
+                except Exception:
+                    pass
             if hasattr(self.client, "plan_get") and hasattr(self.client, "plan_approve"):
                 try:
                     plan = self.client.plan_get(target)
@@ -80,6 +89,15 @@ class StackMindTuiAdapter:
             if not target:
                 raise ValueError("session_id required for :reject")
             clean_reason = argument or "Rejected by operator"
+            if hasattr(self.client, "run_reject"):
+                try:
+                    run_info = self.client.run_get(target) if hasattr(self.client, "run_get") else None
+                    if isinstance(run_info, dict) and run_info.get("phase") in {
+                        "AWAITING_APPROVAL", "INIT", "PLANNING", "planning", "awaiting_approval"
+                    }:
+                        return self.client.run_reject(target, reason=clean_reason)
+                except Exception:
+                    pass
             if hasattr(self.client, "plan_get") and hasattr(self.client, "plan_reject"):
                 try:
                     plan = self.client.plan_get(target)
