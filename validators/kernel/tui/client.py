@@ -141,6 +141,12 @@ class DaemonClient:
     def run_reject(self, session_id: str, reason: str = "") -> dict[str, Any]:
         return self.call("run.reject", session_id=session_id, reason=reason)
 
+    def run_resume(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"session_id": session_id}
+        if run_id is not None:
+            params["run_id"] = run_id
+        return self.call("run.resume", **params)
+
     def approve(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
         return self.call(
             "session.approval", session_id=session_id, approved=approved, reason=reason

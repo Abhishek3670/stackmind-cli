@@ -1,82 +1,114 @@
-# 🚀 StackMind CLI & TUI v3.3.0 GA — Multi-Role Autonomous Engineering Delivery
+# 🚀 StackMind CLI & TUI v3.7.0 — Governed Multi-Agent Engineering Runtime
 
-Welcome to **StackMind v3.3.0 GA**, an **OpenCode-style client control plane (P6)** and **autonomous multi-role engineering delivery runtime (P7)**.
+Welcome to **StackMind v3.7.0**, a compiler-backed, contract-governed multi-agent engineering runtime.
 
-StackMind enables full-stack software development driven by specialized, contract-governed AI agent roles (`claude`, `codex`, `gemini`, `gemma`, `local-llm`), monitored live through an interactive Terminal UI control plane (`stackmind tui`), backed by Code-Graph Intelligence (KNOW-01), Verified Procedural Learning (LEARN-01), zero-leakage security, and deterministic human-in-the-loop plan approvals.
+StackMind enables full-stack software development driven by specialized AI agent roles (`claude`, `codex`, `gemini`, `gemma`, `local-llm`), coordinated continuously by a deterministic **Lifecycle Supervisor**, monitored live through an interactive Terminal UI control plane (`stackmind tui`), and protected by **Code-Graph Intelligence (KNOW-01)**, **Contract Scope Enforcement (CONTRACT-01)**, **Harness Verification (HARNESS-01)**, and **Human-in-the-Loop Governance**.
 
 ---
 
-## 🏛️ Architecture Overview & The Single-Source Rule
+## 🏛️ Architecture & Governance Model
 
 StackMind enforces the non-negotiable **Single-Source Rule**:
 > **There is exactly one authoritative execution path in StackMind: the `AgentRunner` Harness.**  
-> Under no circumstances may a daemon, TUI, orchestrator, or autonomous sub-system introduce an alternative execution engine, direct LLM provider loop, or un-governed tool execution path. All prompt turns, tool invocations, code modifications, and verifications strictly traverse the `AgentRunner` pipeline.
+> Under no circumstances may a daemon, TUI, supervisor, or sub-agent introduce an un-governed tool loop or direct LLM file edit. All prompts, tool invocations, code writes, and verifications strictly traverse the governed `AgentRunner` pipeline within contract boundaries.
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│                   Terminal UI Control Plane (stackmind tui)              │
-│   Phase Banner │ Agent Roles Panel │ Work Orders │ Operation Tree │ Feed │
-│   Interactive REPL: :status, :roles, :wo, :tree, :rebind, :diff, :matrix │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ HTTP JSON-RPC 2.0 (:8765/rpc, SSE /events)
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                LocalDaemon & SessionManager (validators/kernel/daemon)   │
-│   Hierarchical Operation Tree │ Role Normalization │ State Recovery      │
-│   Durable State: workspace/.sync/runtime/daemon/daemon-state.json        │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ Governed Delegation
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│               AgentRunner Harness (validators/harness/runner.py)         │
-│  ├── CONTRACT-01 Scope Enforcement (Glob containment & deny boundary)   │
-│  ├── KNOW-01 Knowledge API & Ranked Context Bundles                     │
-│  ├── 10 Cooperative Cancellation Checkpoints (cancellation_event)        │
-│  ├── Isolated Workspace Copy Staging (tempfile.TemporaryDirectory)      │
-│  ├── Authentic 6D Verification Gate (Scope, State, AST, Behavioral,      │
-│  │   Security, Outcome) — Fail-closed Live Write-back                    │
-│  ├── D025 Destructive Safeguards (Backups, Git cleanliness, CEO approval)│
-│  └── Credential Zero-Leakage & Terminal Sanitization Guard               │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ ExecutionBackend Protocol
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│              BackendRegistry (validators/harness/backend.py)             │
-│  ├── Thread-safe RLock synchronization & defensive snapshot iteration   │
-│  ├── ModelExecutionBackend (Ollama HTTP /api/generate with 300s timeout)│
-│  ├── Typed fault classification (Unavailable, Timeout, Execution errors) │
-│  └── Dynamic live role rebinding (:rebind role backend [model])          │
-└──────────────────────────────────────────────────────────────────────────┘
+                                  USER / CEO
+                                      │
+                                      ▼
+                      Terminal UI Control Plane (:goal / :status)
+                                      │  HTTP JSON-RPC 2.0 (:8765/rpc)
+                                      ▼
+                       LocalDaemon & SessionManager
+                                      │
+                                      ▼
+                         LIFECYCLE SUPERVISOR
+                     (Deterministic Orchestration)
+   INIT → PLANNING → AWAITING_APPROVAL → AUTHORING → DISPATCHING
+   → EXECUTING → INTEGRATION_REVIEW → PRODUCT_READY → GITOPS → COMPLETE
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          ▼                           ▼                           ▼
+    ARCHITECTURE                   BACKEND                     FRONTEND
+       Claude                       Codex                       Gemini
+  (PLAN & Contracts)         (Backend API / DB)           (UI / Web Pages)
+          │                           │                           │
+          └───────────────────────────┼───────────────────────────┘
+                                      ▼
+                                 QA VERIFIER
+                                    Gemma
+                         (AST, Contracts & Tests)
+                                      │
+                                      ▼
+                              GITOPS & RELEASE
+                                  Local-LLM
+                       (Release Commit & Provenance)
 ```
 
 ---
 
 ## 👥 The Governed Team Roster
 
-| Agent Role | Title | Allowed Responsibility | Scope Boundary |
+StackMind enforces strict separation of concerns and process isolation (**IDE-01**):
+
+| Agent | Role | Authority & Permitted Scope | Explicit Denials & Restrictions |
 |---|---|---|---|
-| **Claude** | Senior Architect | Architecture, Work Orders, Contracts, Plan Approvals | `.sync/work-orders/`, `.sync/contracts/`, Plan Management. **No direct source edits.** |
-| **Codex** | Backend Lead | APIs, Databases, Microservices, Python/Go/Rust backend code | Application Backend (`app/`, `api/`, `services/`, `tests/`) |
-| **Gemini** | Frontend Lead | UI/UX, Web Views, Flutter, React, Client-side state | Application Frontend (`src/`, `components/`, `ui/`) |
-| **Gemma** | QA Lead | Quality Gates, Secret Scans, Contract Audits, Test Suites | Audit & Validation (`tests/`, Verification gates) |
-| **Local-LLM** | GitOps & Release Lead | Versioning, CHANGELOG, Release Cuts, Hygiene | Release Metadata (`VERSION.md`, `pyproject.toml`, `CHANGELOG.md`) |
+| **Claude** | Senior Architect | Product planning, `PLAN.md`, dependency stack decisions, `.sync/work-orders/ACTIVE/`, `.sync/contracts/`, inbox notices. | **MUST NEVER write or edit application source code (`src/**`, `tests/**`).** Delegations must go through Work Orders. |
+| **Codex** | Backend Lead | Server-side implementation, APIs, databases, data models, backend scripts (`src/backend.py`, `app/**`). | Denied frontend UI files, contract YAMLs, and dependency manifests unless explicitly assigned by scaffolding WO. |
+| **Gemini** | Frontend Lead | Client-side UI/UX, HTML/CSS/JS, React, Flutter, client state (`src/frontend.html`, `ui/**`). | Denied backend APIs, database models, contract YAMLs, and dependency manifests. |
+| **Gemma** | QA Lead | Precondition verification, contract boundary audits, AST security scans (hardcoded secrets), verification receipts. | May inspect and run validation tests, but cannot modify application source code or close work orders. |
+| **Local-LLM** | GitOps & Release Lead | Package versions (`VERSION.md`, `pyproject.toml`), changelogs, staging verified deliverables, release commits with audit trailers. | May not alter architectural contracts or product scope. Operations subject to D025 safeguards. |
 
 ---
 
-## 🛠️ Step 1: Initialize Project & Knowledge Store
+## 🔄 The 10-Phase Supervised Lifecycle
 
-Initialize StackMind in any workspace to generate governance contracts, runtime snapshots, and build the deterministic Knowledge Graph:
+The StackMind **Lifecycle Supervisor** (`validators/kernel/daemon/supervisor.py`) deterministically advances each product delivery run through 10 explicit phases:
+
+```text
+ 1. INIT               Supervisor registers product goal, generates initial run state and session tracking.
+ 2. PLANNING           Architecture turn (Claude) analyzes codebase with Knowledge API and proposes PLAN.md.
+ 3. AWAITING_APPROVAL  Execution pauses. Human operator reviews proposed plan and stack decisions.
+ 4. AUTHORING          On approval, Claude authors child Work Orders and Contracts in .sync/.
+ 5. DISPATCHING        Supervisor evaluates dependencies and dispatches eligible work orders.
+ 6. EXECUTING          Workers execute concurrently (S6 Concurrency) within their Contract scopes.
+ 7. INTEGRATION_REVIEW Architecture validates combined deliverables against original requirements.
+ 8. PRODUCT_READY      All gates and QA receipts verified; run marked ready for release packaging.
+ 9. GITOPS             Local-LLM stages verified deliverables and creates release commit with trailers.
+10. COMPLETE           Lifecycle finished cleanly; audit receipts recorded in session journal.
+```
+
+---
+
+## 🎓 Step-by-Step Tutorial: Building a Login Page with Backend API
+
+This complete walkthrough demonstrates how to take a simple product goal from concept to a committed, verified feature.
+
+### Goal:
+> **"Create a simple login page with a backend login endpoint."**
+
+Deliverables expected:
+- Dependency manifest: `requirements.txt` (FastAPI, Uvicorn)
+- Backend endpoint: `src/backend.py` (`POST /api/login`)
+- Frontend login UI: `src/frontend.html` (Responsive login form with credential submission)
+
+---
+
+### Step 1: Initialize Workspace & Knowledge Graph
+
+Open your terminal in your workspace directory:
 
 ```powershell
-# 1. Initialize StackMind in your workspace
-python -m cli.main init .
-# Or via CLI binary:
+# 1. Activate your Python virtual environment
+.\.venv\Scripts\activate
+
+# 2. Initialize StackMind runtime structure (.sync/, contracts, agents)
 stackmind init .
 
-# 2. Build the deterministic Code-Graph Intelligence store
+# 3. Build the deterministic Knowledge Graph
 stackmind graph build -p .
 
-# 3. Verify runtime health across all 5 validation layers
+# 4. Verify runtime health across all governance layers
 stackmind validate .
 ```
 
@@ -88,241 +120,271 @@ Expected output:
 [PASS] Boot integrity
 [PASS] Knowledge validation
 
-Runtime is healthy.
+Runtime is healthy. (v3.7.0)
 ```
 
 ---
 
-## 💻 Step 2: Start the StackMind Daemon & Launch TUI Control Plane
+### Step 2: Start the Background Daemon & Launch the TUI
 
-StackMind runs a local background daemon communicating over HTTP JSON-RPC 2.0 with the interactive terminal UI:
+StackMind features an autonomous daemon that communicates with the TUI over JSON-RPC 2.0:
 
 ```powershell
-# Start the Local Runtime Daemon in the background (default port: 8765)
+# Start the Local Runtime Daemon (background process on port 8765)
 stackmind daemon start
 
-# Verify daemon health and active sessions
+# Verify daemon status
 stackmind daemon status
 
-# Launch the redesigned OpenCode-style Terminal Control Plane
+# Launch the interactive Terminal Control Plane
 stackmind tui
-# Or directly via Python module:
-python -m cli.main tui
-
-# Optional flags:
-# stackmind tui --demo                      # Run simulated multi-agent delivery session
-# stackmind tui --daemon-url http://127.0.0.1:8765  # Target a custom daemon endpoint
-# stackmind tui --agent codex               # Bind active conversation directly to a role
 ```
+
+*(Tip: In headless environments or CI, commands can also be driven directly via `stackmind cli` or JSON-RPC API).*
 
 ---
 
-## 🖥️ TUI Architecture & Visual Layout
+### Step 3: Enter the Product Goal
 
-The StackMind TUI provides a distraction-free, chat-first experience inspired by OpenCode while exposing real-time autonomous delivery telemetry:
+In the pinned bottom composer of the TUI, submit the product request:
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  ✦ StackMind v3.3.0                                                                                            │
-│  The AI-native execution kernel for autonomous engineering delivery                                             │
-│  Code-Graph Intelligence (KNOW-01)  │  Procedural Learning (LEARN-01)  │  Governed Runtime (HARNESS-01)             │
-│  "Verify First. Deliver Authentically. Never Hallucinate Progress."                                            │
-│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────  │
-│         Status:  ● online                                                                                       │
-│        Session:  s_9f3b12ce (claude)                                                                            │
-│        Project:  .../stackmind-cli                                                                              │
-├───────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────┤
-│  CONVERSATION AREA (70–75% width)                                 │  STACKMIND RUNTIME (25–30% width)           │
-│                                                                   │                                             │
-│  You                                                              │  AGENTS                                     │
-│  Build a WebSocket notification service with unit tests           │  ├─ ○ claude [Senior Architect] idle        │
-│                                                                   │  ├─ ● codex [Backend Lead] running (2m 14s) │
-│  ✦ StackMind                                                      │  └─ ○ gemma [QA Lead] idle                  │
-│  Thinking... (4.2s) ✓                                             │                                             │
-│                                                                   │  WORK ORDERS                                │
-│  ▸ Actions · 3 completed                                          │  ├─ ✓ WO-024 (Setup WS models)              │
-│                                                                   │  ├─ ▶ WO-025 (WebSocket Service)           │
-│  I'll implement the WebSocket notification service per the active │  └─ ○ WO-026 (Unit Test Suite)              │
-│  architecture plan. Below is the staged implementation:           │                                             │
-│                                                                   │  CURRENT OPERATION                          │
-│  ```python                                                        │  ID: op_88a4c1                              │
-│  # app/notifications/ws.py                                        │  Role: codex                                │
-│  class NotificationChannel:                                       │  Step: Writing app/notifications/ws.py      │
-│      async def broadcast(self, event: Event) -> None: ...         │  Tokens: 1,842 │ Duration: 12.4s            │
-│  ```                                                              │                                             │
-├───────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────┤
-│ ╭─ Type a message... ──────────────────────────────────────────────────────── Ctrl+K commands | Ctrl+L clear ─╮ │
-│ │ >                                                                                                           │ │
-│ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+> :goal Create a login page with a backend login endpoint
 ```
 
-### 1. Branded Landing Card
-- **Header & Motto**: Features the official `✦ StackMind v3.3.0` brand banner, architectural pillars, and verified execution motto.
-- **Strict Metadata Order**: Status (`● online` / `○ reconnecting`) → Session ID → Project directory.
-- **Path Abbreviation**: Long repository paths are automatically abbreviated visually (e.g. `.../stackmind-cli`) to prevent awkward line wraps while keeping essential telemetry readable.
+What happens immediately:
+1. The daemon creates a new tracked run: `run-xxxx` in `Phase.INIT`.
+2. The supervisor synthesizes bootstrap Work Order `WO-000` assigned to **Claude** (Architecture).
+3. The supervisor transitions to **`PLANNING`** and dispatches Turn 1 to Claude through the governed Harness.
 
-### 2. Responsive Two-Column Layout
-- **Left Column — Conversation Viewport (70–75% width)**:
-  - Quiet, unboxed `You` user message blocks.
-  - Subtle `✦ StackMind` assistant identity with breathing room.
-  - **Genuine Provider Reasoning**: Upstream thinking is displayed as `Thinking... (N.Ns) ✓` and automatically strips internal `<think>` delimiters. Synthetic or fake loops are strictly forbidden.
-  - **Turn Actions Disclosure**: Tool calls, file inspections, and AST validations are grouped into a compact disclosure block (`▸ Actions · N completed`). Clicking the header or running `:actions` expands full step-by-step telemetry.
-  - **Syntax Highlighting & Inline Diffs**: Code snippets render with the Monokai palette; staged diffs render with explicit additions (`+` green) and deletions (`-` red).
-- **Right Column — Persistent Runtime Panel (25–30% width)**:
-  - Dynamic agent roster tree (`AGENTS`) showing live status icons and active execution backends.
-  - Live Work Order queue (`WORK ORDERS`) showing completed, in-progress, and queued items.
-  - Authoritative telemetry (`CURRENT OPERATION`) displaying active node IDs, token consumption, and latency.
-- **Narrow Terminal Fallback (< 100 columns)**:
-  - On terminals narrower than 100 columns (e.g. standard 80x24), the right-side runtime panel is gracefully suppressed, giving 100% width to conversation and the composer.
-
-### 3. Pinned Bottom Composer
-- **Visual Hierarchy**: Pinned at the very bottom with the strongest border in the interface (`#475569` idle, highlighted to `#60a5fa` when focused/typing).
-- **Multiline Upward Expansion**: Automatically expands upwards as you type multiline prompts (`Shift+Enter` or paste).
-- **Non-Blocking Operation**: You can prepare your next prompt or query colon commands even while background agents are executing.
-- **Focus Preservation**: Completed background tasks restore focus smoothly without stealing or clearing your active input buffer.
+In the conversation viewport, Claude queries the Knowledge Graph (`stackmind graph context`) to inspect existing project structure and imports without touching source files.
 
 ---
 
-## 🧭 How to Navigate the TUI
+### Step 4: Review and Approve the Architecture Plan (HITL Gate)
 
-StackMind TUI is built for high-velocity keyboard navigation with comprehensive interactive colon commands:
+When Claude completes the planning turn, `PLAN.md` is proposed on disk.  
+The Supervisor automatically transitions to **`AWAITING_APPROVAL`** and **halts execution** waiting for human approval.
 
-### ⌨️ Global Keyboard Shortcuts
+Check the run state at any time in the TUI:
+```text
+> :status
+```
+Output:
+```text
+Phase: AWAITING_APPROVAL
+Run ID: run-9a8b1c2d
+Goal: Create a login page with a backend login endpoint
+Plan ID: PLAN-001 (Architecture Plan for: Create a login page...)
+```
 
-| Shortcut | Action | Description |
-|---|---|---|
-| `Ctrl+K` | **Command Palette** | Open quick command help and shortcut guide |
-| `Ctrl+L` | **Clear Screen** | Redraw screen and clear visible viewport without resetting session |
-| `Ctrl+C` | **Cooperative Cancel** | Cancel the currently running agent operation safely via daemon RPC |
-| `Shift+Enter` | **Multiline Input** | Insert a newline in the composer without submitting |
-| `Up` / `Down` | **Input History** | Cycle through previously submitted prompts and commands |
-| `PageUp` / `PageDown` | **Scroll Viewport** | Scroll conversation history up or down |
-| `Home` / `End` | **Jump Viewport** | Jump directly to the top or bottom of the conversation |
-| `q` | **Quick Quit** | Exit TUI when composer is empty |
+Inspect the proposed architecture plan:
+```text
+> :plan
+```
 
-### 🖱️ Mouse Navigation
-- **Actions Disclosure Toggle**: Click directly on the `▸ Actions · N completed` header line with your mouse to toggle between collapsed summary and expanded telemetry.
+Claude's plan outlines three explicit tasks:
+1. **Scaffolding (`WO-001`)**: Create `requirements.txt` declaring `fastapi` and `uvicorn`.
+2. **Backend (`WO-002`)**: Implement `src/backend.py` with password authentication route `POST /api/login`. Depends on `WO-001`.
+3. **Frontend (`WO-003`)**: Implement `src/frontend.html` with responsive form and fetch handler. Depends on `WO-001`.
 
-### 📜 Scroll Ergonomics & New Activity Indicator
-- **Auto-Follow Mode**: When your viewport is at the bottom, conversation automatically scrolls down to follow new tokens, agent responses, and tool events.
-- **Viewport Lock**: When you scroll up to inspect previous responses or diffs, auto-scroll is paused so your view doesn't jump.
-- **`↓ New activity` Indicator**: If new messages arrive while you are scrolled up, a high-visibility badge appears. Scrolling back to the bottom automatically dismisses the badge and re-engages live follow.
+#### Human Decision:
+- To approve the plan and commence delivery:
+  ```text
+  > :approve Looks good, proceed with FastAPI backend and HTML frontend.
+  ```
+- To request revisions (e.g. if you wanted Flask instead of FastAPI):
+  ```text
+  > :reject Please use Flask instead of FastAPI.
+  ```
+  *(A rejection sends feedback back to Claude, resetting the supervisor to `PLANNING` for a revised plan).*
 
 ---
 
-## 📋 Comprehensive Colon Commands Reference
+### Step 5: Autonomous Work Order & Contract Authoring
 
-Type `:` in the composer to enter command mode:
+Upon receiving `:approve`, the supervisor transitions to **`AUTHORING`**.
 
-| Command | Aliases | Category | Description |
+Claude executes Turn 2, authoring the formal work orders and contracts in `.sync/`:
+- `.sync/work-orders/ACTIVE/WO-001.yaml` + `.sync/contracts/WO-001.yaml` (Scaffolding)
+- `.sync/work-orders/ACTIVE/WO-002.yaml` + `.sync/contracts/WO-002.yaml` (Backend Lead: `codex`)
+- `.sync/work-orders/ACTIVE/WO-003.yaml` + `.sync/contracts/WO-003.yaml` (Frontend Lead: `gemini`)
+
+Notice the Contract Layer (**CONTRACT-01**):
+- `WO-001` contract grants write access **only** to `requirements.txt`.
+- `WO-002` contract grants write access **only** to `src/backend.py` and `tests/test_backend.py`.
+- `WO-003` contract grants write access **only** to `src/frontend.html`.
+
+The supervisor verifies all work orders exist on disk, transitions to **`DISPATCHING`**, and evaluates the dependency graph.
+
+---
+
+### Step 6: Scaffolding Execution & Dependency Manifest Gate
+
+Because `WO-002` and `WO-003` depend on `WO-001`, the supervisor strictly dispatches **`WO-001` first**:
+
+1. **Codex** runs in the governed harness to write `requirements.txt`:
+   ```text
+   fastapi>=0.100.0
+   uvicorn>=0.22.0
+   ```
+2. **Dependency Satisfiability Gate**: The harness verifies that `requirements.txt` is authorized by `WO-001`'s contract.
+3. **6D Verification Gate**: Validates clean diff writeback.
+4. `WO-001` completes and is marked `COMPLETED`.
+
+---
+
+### Step 7: Concurrent Backend & Frontend Worker Execution (S6 Concurrency)
+
+With `WO-001` completed, the supervisor detects that **both `WO-002` (Backend) and `WO-003` (Frontend) are now simultaneously eligible**:
+
+1. **Parallel Dispatch Batching**: The supervisor opens a parent batch operation in `SessionManager`:
+   ```text
+   batch_operation_id = bd30b93e-0bc4-419f-a530-1ae92ab889ee
+   ```
+2. **Concurrent Workers Running**:
+   - **Codex** launches on thread 1 executing `WO-002`: writes `src/backend.py` (FastAPI login route with credential check).
+   - **Gemini** launches on thread 2 executing `WO-003`: writes `src/frontend.html` (interactive login form with clean styling and async fetch).
+3. Both operations execute concurrently in the daemon's live operation journal:
+   ```text
+   op_996e4786 (codex)  -> RUNNING (work_order: WO-002)
+   op_c94428fe (gemini) -> RUNNING (work_order: WO-003)
+   ```
+4. **Contract Scope Enforcement**:
+   - If `gemini` attempts to touch `src/backend.py`, the write is rejected with `PermissionError: Path 'src/backend.py' is outside allowed contract scope`.
+   - If `codex` attempts to modify `requirements.txt`, the write is blocked: manifest ownership belongs strictly to the scaffolding turn.
+5. **No-Op Prevention Gate**: The harness verifies that both workers produce real additions to their declared deliverables; empty bookkeeping turns fail closed.
+
+---
+
+### Step 8: QA Verification & Security Checks (Gemma)
+
+Upon turn completion, **Gemma (QA Lead)** performs 3-stage validation:
+1. **Preconditions & Dependency Check**: Checks that required packages in `requirements.txt` satisfy the AST imports (`import fastapi`).
+2. **Contract Compliance**: Confirms all modified files match the contract's `allow` boundary.
+3. **AST Security Audit**: Scans `src/backend.py` for hardcoded sensitive comparisons (`password == "admin"`). If insecure patterns are detected, a `NEEDS_CHANGES` verdict is written to Codex's inbox, triggering the supervisor's governed retry loop (**S7**).
+4. When validation passes, Gemma issues an `APPROVED` verdict.
+
+---
+
+### Step 9: Architecture Integration Review & Product Ready
+
+Once all worker WOs are verified:
+1. Supervisor transitions to **`INTEGRATION_REVIEW`**.
+2. **Claude** executes an integration turn:
+   - Validates that `src/frontend.html` targets the endpoint defined in `src/backend.py` (`POST /api/login`).
+   - Verifies the user's original product goal has been completely achieved.
+3. Claude emits the `PRODUCT READY` verdict.
+4. Supervisor transitions to **`PRODUCT_READY`**.
+
+---
+
+### Step 10: GitOps Release & Provenance Commit (Local-LLM)
+
+The supervisor transitions to **`GITOPS`** and dispatches **Local-LLM**:
+1. Staging isolation: Only intended application deliverables (`requirements.txt`, `src/backend.py`, `src/frontend.html`) are staged for release.
+2. Runtime state, `.sync/inbox/` notices, and knowledge caches are excluded via release policy.
+3. Local-LLM executes the governed release commit with **immutable audit trailers**:
+
+```bash
+git show --stat HEAD
+```
+
+```text
+commit 98b9acfd92c656d892ff4987db44d8c6ae80ae6a
+Author: Local-LLM <gitops@stackmind.local>
+Date:   Tue Sep 29 18:41:29 2026 +0530
+
+    feat(auth): implement login page with backend authentication endpoint
+
+    - Scaffolding: declared fastapi and uvicorn dependencies
+    - Backend: implemented POST /api/login endpoint in src/backend.py
+    - Frontend: created responsive login interface in src/frontend.html
+    - Verified via Gemma QA Gate and Architecture Integration Review
+
+    Work-Order: WO-002, WO-003
+    Released-By: local-llm
+    Approved-By: gemma
+    Architect: claude
+```
+
+4. Supervisor transitions to **`COMPLETE`**.
+5. The TUI notifies the user:
+   ```text
+   ✦ StackMind: Product goal completed successfully. Release commit created.
+   ```
+
+---
+
+## 🎮 TUI Commands Reference
+
+Type `:` in the composer to access interactive controls:
+
+| Command | Shortcut | Purpose | Example |
 |---|---|---|---|
-| `:help` | `:?`, `Ctrl+K` | General | Show interactive command guide and keyboard shortcuts |
-| `:status` | `:s` | Telemetry | Display overall delivery phase, session metadata, and connection health |
-| `:landing` | | View | Re-render the branded landing card at the top of the conversation |
-| `:roles` | `:agents`, `:a` | Runtime | View real-time agent status tree (`idle`, `running`, `completed`) and model bindings |
-| `:wo` | `:workorders`, `:w` | Runtime | Inspect active, pending, and completed Work Orders |
-| `:tree` | | Runtime | Inspect hierarchical parent-child operation tree (`Session` → `Plan` → `Task`) |
-| `:actions` | | Chat | Toggle expansion of the most recent turn's tool action disclosure group |
-| `:diff` | `:d` | Inspection | View real-time unified diffs for staged files in the staging workspace |
-| `:matrix` | `:m` | Governance | Inspect authentic 6-dimensional verification flags (`scope`, `state`, `code`, `behavior`, `security`, `outcome`) |
-| `:plan` | `:p` | Governance | View the current architectural plan proposed by Senior Architect (`claude`) |
-| `:approve` | `Ctrl+A` | HITL | Formally approve the proposed architecture plan to commence worker dispatch |
-| `:reject` | `Ctrl+R` | HITL | Reject the proposed plan with feedback and trigger revision loop |
-| `:rebind <role> <backend> [model]` | | Runtime | Dynamically switch backend model for a role (e.g. `:rebind codex ollama qwen2.5-coder:14b`) |
-| `:reconnect` | | Network | Re-synchronize session state and recover missing events past `last_sequence` |
-| `:events` | `:e` | Debug | Stream raw sequenced events from the daemon journal |
-| `:clear` | `:cls`, `Ctrl+L` | View | Clear conversation viewport while preserving active runtime session |
-| `:quit` | `:exit`, `:q`, `q` | General | Exit the TUI cleanly, restoring terminal cursor and ANSI modes |
+| `:status` | `:s` | View current supervisor phase, active run ID, and pending operations | `:status` |
+| `:plan` | `:p` | View proposed architecture plan (`PLAN.md`) | `:plan` |
+| `:approve` | `Ctrl+A` | Formally approve the proposed plan to start worker execution | `:approve Looks good` |
+| `:reject` | `Ctrl+R` | Reject the plan with feedback to trigger re-planning | `:reject Use SQLite` |
+| `:wo` | `:w` | Inspect active, queued, and completed Work Orders | `:wo` |
+| `:roles` | `:a` | Display live agent status (`claude`, `codex`, `gemini`, `gemma`, `local-llm`) | `:roles` |
+| `:diff` | `:d` | View live unified diffs for staged files | `:diff` |
+| `:matrix` | `:m` | Inspect authentic 6D verification results (Scope, AST, Security, etc.) | `:matrix` |
+| `:tree` | | Display hierarchical operation tree (`Session` → `Plan` → `Task`) | `:tree` |
+| `:actions` | | Toggle expandable tool actions disclosure group | `:actions` |
+| `:rebind <role> <backend> [model]` | | Dynamically switch LLM backend for any agent role | `:rebind codex ollama qwen2.5-coder:14b` |
+| `:clear` | `Ctrl+L` | Redraw screen and clear conversation viewport | `:clear` |
+| `:quit` | `:q` | Cleanly exit TUI (daemon continues running in background) | `:quit` |
 
 ---
 
-## 🔄 Step 3: End-to-End Autonomous Engineering Delivery Walkthrough
+## ⚡ Reliability & Fault Recovery
 
-### 1. Submit an Engineering Goal
-In the composer box, enter your prompt:
-```text
-> Build a secure real-time notification service with WebSocket backend and unit tests
-```
-The prompt appears immediately under `You`, the composer border highlights to `#60a5fa`, and the assistant begins processing.
+StackMind is built for high-reliability production environments:
 
-### 2. Observe Upstream Reasoning & Tool Actions
-- StackMind displays `Thinking... (3.8s) ✓` as the architect analyzes the codebase.
-- As the agent runs graph searches, an actions card appears:
-  ```text
-  ▸ Actions · 4 completed
-  ```
-- Click the card or type `:actions` to unfold individual operations:
-  ```text
-  ▾ Actions · 4 completed
-    ✓ Query Knowledge Graph for existing notification routes (0.3s)
-    ✓ Check WebSocket protocol conventions in validators/kernel/ (0.5s)
-    ✓ Formulate contract scope boundary app/notifications/ (0.2s)
-    ✓ Author WO-025 and Contract WO-025.yaml (0.8s)
-  ```
+### 1. Cooperative Cancellation (`Ctrl+C`)
+Pressing `Ctrl+C` sends an authenticated JSON-RPC cancellation event to the active operation. The runner terminates cleanly at the nearest checkpoint without leaving corrupted state or dirty file handles.
 
-### 3. Review & Approve the Architecture Plan (HITL)
-When Claude formulates the plan, the TUI presents the Plan Approval Surface:
-- Review the proposed files (`app/notifications/ws.py`, `tests/test_notifications.py`).
-- Check the assigned agent (`codex`) and budget limits.
-- Type **`:approve`** (or press `Ctrl+A`) to approve, or **`:reject`** to request adjustments.
+### 2. Double-Bounded Operation Contention
+If the supervisor encounters transient operation lock contention (another operation winding down), it yields and retries up to `max_contention_retries=50` attempts. If an operation remains stuck longer than 300 seconds, the driver automatically halts and transitions to `Phase.BLOCKED` with an explicit diagnostic message rather than hanging in an infinite loop.
 
-### 4. Monitor Live Worker Execution in the Runtime Panel
-Once approved, watch the right-side **StackMind Runtime** panel update dynamically:
-- **`codex`** transitions to `● running`.
-- **`CURRENT OPERATION`** tracks the active step: `Writing app/notifications/ws.py`.
-- **`WORK ORDERS`** marks `WO-025` as in-progress.
+### 3. Crash Recovery & Resumability (S8)
+If the machine restarts or the daemon crashes while an operation is running:
+- Run state is persisted on disk in `.sync/runtime/runs/<run_id>.json`.
+- On daemon restart, the supervisor inspects the session journal, re-adopts in-flight operations, and resumes from the exact phase without re-executing completed work orders.
 
-### 5. Inspect Real-Time Diffs & 6D Verification
-- Type **`:diff`** to inspect staged changes before they are finalized.
-- When implementation finishes, the **6D Verification Gate (HARNESS-01)** validates all six dimensions:
-  - `scope_verified`: All modified files lie strictly inside `app/notifications/` and `tests/`.
-  - `code_verified`: AST parsing clean, pytest suite passes 100%.
-  - `security_verified`: Zero leaked credentials or forbidden path traversals.
-- Type **`:matrix`** to view the full verification receipt.
-
-### 6. Clean Exit & Session Resumption
-- Type **`:quit`** or press `Ctrl+C` when done.
-- The TUI cleanly restores cursor visibility and terminal ANSI attributes via `restore_terminal_state()`.
-- The background daemon keeps session state intact. Launching `stackmind tui` again will immediately reconnect and recover your session seamlessly.
+### 4. QA Retry Loop (S7)
+If a worker's implementation fails a test or contract gate:
+- Gemma generates a `NEEDS_CHANGES` verdict with detailed logs.
+- The supervisor automatically re-dispatches the worker with the feedback.
+- Retries are bounded by `max_retries=2`. If all retries fail, the supervisor transitions to `Phase.FAILED` with a diagnostic summary.
 
 ---
 
-## 💡 Key CLI Commands Quick Reference
+## 📦 Key CLI Commands Summary
 
 ```powershell
 # --- Daemon Management ---
-stackmind daemon start --port 8765        # Launch background JSON-RPC daemon
-stackmind daemon status                   # Check active daemon status and session count
-stackmind daemon stop                     # Gracefully stop the running daemon
-stackmind daemon restart                  # Restart the daemon process
+stackmind daemon start                    # Start background daemon on port 8765
+stackmind daemon status                   # Inspect daemon health and active runs
+stackmind daemon stop                     # Gracefully stop the daemon process
 
-# --- Terminal User Interface ---
-stackmind tui                             # Open Terminal Control Plane UI
-stackmind tui --demo                      # Run simulated multi-agent demo session
+# --- Control Plane ---
+stackmind tui                             # Launch interactive Terminal UI
+stackmind tui --demo                      # Run simulated multi-agent demonstration
 
-# --- Knowledge Graph Operations ---
-stackmind graph build -p .                # Initial deterministic graph compilation
-stackmind graph update -p .               # Incremental update after code edits
-stackmind graph query "WebSocketManager"  # Find exact symbol definition
-stackmind graph callers "send_event"      # Discover all caller locations
-stackmind graph impact "send_event"       # Analyze blast radius of changes across graph
-stackmind graph context "auth flow"       # Retrieve token-bounded, ranked prompt context bundle
+# --- Code-Graph Intelligence ---
+stackmind graph build -p .                # Compile full repository symbol graph
+stackmind graph update -p .               # Fast incremental update after edits
+stackmind graph query "login"             # Locate symbol definitions
+stackmind graph context "auth endpoint"   # Retrieve ranked context bundle for prompt
 
-# --- Harness & Procedural Learning ---
-stackmind harness run-once                # Run single governed harness turn
-stackmind learn mine -p .                 # Mine candidate procedural skills from verified runs
-stackmind skill list                      # List procedural skills and confidence scores
-stackmind skill test <name>               # Execute 3-stage skill verification pipeline
-stackmind experience search "<query>"     # Search past verified execution episodes (EXP-*)
-
-# --- Repository Validation & Lifecycle ---
-stackmind validate .                      # Validate all 5 runtime integrity layers
-stackmind validate --fix .                # Auto-fix canonical drift in TREE.yaml
-stackmind doctor .                        # Diagnostics, dependency integrity, and agent health
-stackmind shutdown <agent>                # Run clean agent session shutdown with handoff archiving
+# --- Verification & Health ---
+stackmind validate .                      # Validate all 5 integrity layers
+stackmind doctor .                        # Check interpreter, venv, and agent tools
+stackmind shutdown <agent>                # Run clean agent shutdown and write handoff
 ```
 
 ---
 
-*StackMind CLI & TUI v3.3.0 GA — Autonomous Multi-Role Engineering Delivery Built for Production.*
+*StackMind CLI & TUI v3.7.0 — Autonomous Multi-Role Engineering Delivery Built for Production.*

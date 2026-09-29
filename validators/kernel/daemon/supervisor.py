@@ -442,16 +442,29 @@ class LifecycleSupervisor:
             status = str(op.get("status", "")).upper()
             if status not in _OPERATION_TERMINAL:
                 return AdvanceResult.WAITING_FOR_OPERATION
-            if status == "FAILED":
-                state.error = f"Authoring turn failed: {op.get('result', {}).get('error', 'unknown')}"
-                self._transition(state, Phase.FAILED)
-                return AdvanceResult.FAILED
-            # Authoring completed — discover worker WOs from disk
+
+            # 1. Discover worker WOs from disk
             self._discover_worker_wos(state)
+
+            # 2. If no worker WOs found on disk (e.g. Turn 2 was conversational or failed tool loop),
+            # autonomously synthesize child work orders and contracts from the approved PLAN.md
             if not state.worker_wo_ids:
-                state.error = "Authoring completed but no worker Work Orders found on disk"
+                ws = Path(state.workspace)
+                try:
+                    plan = self.manager.get_plan(state.session_id, state.plan_id) if state.plan_id else {}
+                    from .authoring import synthesize_child_work_orders
+                    synthesize_child_work_orders(ws, plan, session_id=state.session_id)
+                    self._discover_worker_wos(state)
+                except Exception:
+                    pass
+
+            if not state.worker_wo_ids:
+                err_detail = op.get('result', {}).get('error') or op.get('result', {}).get('reason') or 'no worker Work Orders found on disk'
+                state.error = f"Authoring failed: {err_detail}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED
+
+            state.error = None
             self._transition(state, Phase.DISPATCHING)
             return AdvanceResult.TRANSITIONED
 

@@ -1808,9 +1808,22 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized == ":resume":
-        session = adapter.command(":resume", session_id=session["session_id"])
-        output_str = f"Session {session.get('state', 'RUNNING')}"
+    if normalized.startswith(":resume"):
+        _, _, run_arg = normalized.partition(" ")
+        run_id_clean = run_arg.strip() or None
+        run_resumed_msg = ""
+        try:
+            resumed_run = client.run_resume(session["session_id"], run_id=run_id_clean)
+            if resumed_run:
+                run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {resumed_run.get('phase')}"
+                state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+        except Exception as run_err:
+            run_resumed_msg = f" (supervisor note: {run_err})"
+        try:
+            session = adapter.command(":resume", session_id=session["session_id"])
+        except Exception:
+            pass
+        output_str = f"Session {session.get('state', 'RUNNING')}{run_resumed_msg}"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

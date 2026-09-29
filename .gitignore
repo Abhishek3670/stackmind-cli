@@ -15,3 +15,7 @@ scratch/
 
 # Backups
 .git-backup*/
+
+# Agent internal scratch
+__agent__/
+

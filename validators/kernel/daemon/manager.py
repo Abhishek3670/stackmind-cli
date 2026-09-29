@@ -533,6 +533,31 @@ class SessionManager:
         self._active_runs: dict[str, Any] = {}
         self._run_driver_threads: dict[str, Thread] = {}
         self._run_stop_events: dict[str, Event] = {}
+        for session in self._sessions.values():
+            ws_str = session.get("workspace")
+            if ws_str:
+                ws = Path(ws_str)
+                sup_dir = ws / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    from .supervisor import Phase
+                    for run_file in sup_dir.glob("run-*.yaml"):
+                        try:
+                            r_id = run_file.stem
+                            loaded_state = self.supervisor.load_run_state(r_id, ws)
+                            if loaded_state and loaded_state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+                                self._active_runs[r_id] = loaded_state
+                                stop_ev = Event()
+                                self._run_stop_events[r_id] = stop_ev
+                                drv_thread = Thread(
+                                    target=self._drive_run,
+                                    args=(r_id, stop_ev),
+                                    name=f"stackmind-supervisor-{r_id}",
+                                    daemon=True,
+                                )
+                                self._run_driver_threads[r_id] = drv_thread
+                                drv_thread.start()
+                        except Exception:
+                            pass
         self._save()
 
     def _persist_event(self, _: RuntimeEvent) -> None:
@@ -976,8 +1001,16 @@ class SessionManager:
                     }
 
                 created_work_orders.append(wo_record)
-                # Only write placeholder files if not a goal plan (goal plans dispatch Architecture to author real files)
-                if not is_goal_plan and (workspace / ".sync").exists():
+                # For goal plans, autonomously synthesize validated child work orders and contracts to disk
+                if is_goal_plan and (workspace / ".sync").exists():
+                    try:
+                        from .authoring import synthesize_child_work_orders
+                        synthesized = synthesize_child_work_orders(workspace, plan, session_id=session_id)
+                        if synthesized:
+                            created_work_orders = synthesized
+                    except Exception:
+                        pass
+                elif not is_goal_plan and (workspace / ".sync").exists():
                     try:
                         wo_dir.mkdir(parents=True, exist_ok=True)
                         wo_path = wo_dir / f"{wo_id}.yaml"
@@ -1136,6 +1169,61 @@ class SessionManager:
             )
             self._save()
             return active_run.to_dict()
+
+    def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+        """Resume an active, paused, or failed supervisor run."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            ws = Path(session.get("workspace", ""))
+            target_run_id = run_id
+            if not target_run_id:
+                sup_dir = ws / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    run_files = sorted(sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True)
+                    if run_files:
+                        target_run_id = run_files[0].stem
+            if not target_run_id:
+                raise KeyError("no supervisor run found to resume")
+
+            state = self._active_runs.get(target_run_id)
+            if state is None:
+                state = self.supervisor.load_run_state(target_run_id, ws)
+            if state is None:
+                raise KeyError(f"run '{target_run_id}' not found")
+
+            from .supervisor import Phase
+            if state.phase in (Phase.FAILED, Phase.BLOCKED):
+                state.error = None
+                if state.worker_wo_ids:
+                    self.supervisor._transition(state, Phase.DISPATCHING)
+                elif state.plan_id:
+                    self.supervisor._transition(state, Phase.AUTHORING)
+                else:
+                    self.supervisor._transition(state, Phase.PLANNING)
+
+            self._active_runs[target_run_id] = state
+            if target_run_id not in self._run_stop_events or self._run_stop_events[target_run_id].is_set():
+                stop_event = Event()
+                self._run_stop_events[target_run_id] = stop_event
+                driver_thread = Thread(
+                    target=self._drive_run,
+                    args=(target_run_id, stop_event),
+                    name=f"stackmind-supervisor-{target_run_id}",
+                    daemon=True,
+                )
+                self._run_driver_threads[target_run_id] = driver_thread
+                driver_thread.start()
+
+            self.events.publish(
+                "run.resumed",
+                session_id,
+                run_id=target_run_id,
+                phase=state.phase.value,
+            )
+            self._save()
+            return state.to_dict()
 
     def synthesize_bootstrap_planning(
         self,
@@ -1648,18 +1736,28 @@ class SessionManager:
                 except KeyError:
                     pass
             wo_id_param = op_rec.get("work_order_id")
+            is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
             try:
                 result = runner.run_once(
                     cancel_event=cancel_event,
                     operation_id=operation_id,
                     prompt=prompt,
                     work_order_id=wo_id_param,
+                    is_authoring=is_authoring_param,
                 )
             except TypeError:
                 try:
-                    result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+                    result = runner.run_once(
+                        cancel_event=cancel_event,
+                        operation_id=operation_id,
+                        prompt=prompt,
+                        work_order_id=wo_id_param,
+                    )
                 except TypeError:
-                    result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
+                    try:
+                        result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+                    except TypeError:
+                        result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
             b_id = getattr(runner, "backend_id", None)
             b_mod = getattr(runner, "backend_model", None)
             result_data = {

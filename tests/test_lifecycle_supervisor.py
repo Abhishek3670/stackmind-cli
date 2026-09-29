@@ -1396,3 +1396,197 @@ def test_manager_drive_run_times_out_when_operation_stuck(tmp_path: Path) -> Non
     assert "Timed out waiting for operations" in state.error
 
 
+def test_supervisor_authoring_synthesis_fallback_when_model_emits_text(tmp_path: Path) -> None:
+    """When an authoring turn finishes without tool writes (e.g. local LLM),
+    supervisor autonomously synthesizes validated child WOs and contracts from PLAN.md
+    and transitions to DISPATCHING.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # 1. Create PLAN.md on disk
+    plan_content = (
+        "# Project Plan: Login System Implementation\n\n"
+        "## Current Architecture\n"
+        "Stack: Python, FastAPI, React\n\n"
+        "## Milestones & Roadmap\n"
+        "- [ ] Milestone 1: Project Scaffolding & Dependencies\n"
+        "  - [ ] Task 1.1: Configure project dependency manifest (requirements.txt)\n"
+        "- [ ] Milestone 2: Backend Authentication API\n"
+        "  - [ ] Task 2.1: Implement POST /login endpoint (src/backend.py)\n"
+        "- [ ] Milestone 3: Frontend Login Interface\n"
+        "  - [ ] Task 3.1: Create Login Page (src/frontend.html)\n"
+    )
+    (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+
+    # 2. Propose plan in mock manager
+    mock_mgr.propose_plan(
+        "sess-001",
+        "PLAN-001",
+        title="Login System",
+        content=plan_content,
+    )
+    plan = mock_mgr.get_plan("sess-001", "PLAN-001")
+    plan["state"] = "APPROVED"
+
+    # 3. Create supervised run at AUTHORING phase
+    state = supervisor.start_run("run-auth-test", "Login System", tmp_path, "sess-001")
+    state.phase = Phase.AUTHORING
+    state.plan_id = "PLAN-001"
+
+    # 4. Simulate authoring operation that completed without writing files
+    op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
+    state.authoring_operation_id = op["operation_id"]
+    mock_mgr.complete_operation(
+        op["operation_id"],
+        status="COMPLETED",
+        result={"status": "completed", "summary": "I have reviewed PLAN.md."},
+    )
+
+    # 5. Advance supervisor
+    res = supervisor.advance(state)
+
+    # Must transition to DISPATCHING with discovered worker WOs
+    assert res == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.DISPATCHING
+    assert state.worker_wo_ids == ["WO-001", "WO-002", "WO-003"]
+    assert state.error is None
+
+    # Check that files exist on disk and pass validation
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contract_dir = tmp_path / ".sync" / "contracts"
+
+    assert (wo_dir / "WO-001.yaml").is_file()
+    assert (wo_dir / "WO-002.yaml").is_file()
+    assert (wo_dir / "WO-003.yaml").is_file()
+    assert (contract_dir / "WO-001.yaml").is_file()
+    assert (contract_dir / "WO-002.yaml").is_file()
+    assert (contract_dir / "WO-003.yaml").is_file()
+
+    # Verify deliverable paths were intelligently derived
+    wo1 = yaml.safe_load((wo_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert wo1["deliverable"]["path"] == "requirements.txt"
+
+    wo2 = yaml.safe_load((wo_dir / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert wo2["deliverable"]["path"] == "src/backend.py"
+
+    wo3 = yaml.safe_load((wo_dir / "WO-003.yaml").read_text(encoding="utf-8"))
+    assert wo3["deliverable"]["path"] == "src/frontend.html"
+
+
+def test_runner_authoring_turn_does_not_require_plan_md_modification(tmp_path: Path) -> None:
+    """AgentRunner.run_once with is_authoring=True does not require PLAN.md to be modified."""
+    from validators.harness.runner import AgentRunner, HarnessRunResult
+    from validators.kernel.providers.models import ProviderResponse, Message, TokenUsage
+
+    # Write initial PLAN.md
+    (tmp_path / "PLAN.md").write_text("# Project Plan\n\n## Architecture\nTest\n\n## Roadmap\n- [ ] Task 1\n", encoding="utf-8")
+
+    from cli.init import init
+    from validators.kernel.daemon.manager import synthesize_bootstrap_planning
+
+    init(tmp_path, name="Test Project", no_git=True)
+    synthesize_bootstrap_planning(tmp_path, "Create login plan")
+
+    class ConversationalAuthoringAdapter:
+        provider_name = "test"
+        model_name = "test-model"
+
+        def complete(self, messages: Any, **kwargs: Any) -> Any:
+            return ProviderResponse(
+                message=Message.assistant(
+                    content='{"status": "completed", "summary": "Authored child work orders based on PLAN.md", "modified_files": []}'
+                ),
+                usage=TokenUsage(prompt_tokens=50, completion_tokens=20, total_tokens=70),
+            )
+
+    runner = AgentRunner(tmp_path, "claude", provider_adapter=ConversationalAuthoringAdapter())
+    result = runner.run_once(
+        prompt="Author the implementation Work Orders and Contracts for the tasks in PLAN.md",
+        work_order_id="WO-000",
+        is_authoring=True,
+    )
+
+    # Must complete successfully without failing outcome_verified / deliverable 'PLAN.md'
+    assert result.status == "completed", f"Runner failed with reason: {result.reason}"
+    assert result.persisted is True
+    assert "PLAN.md" not in (result.reason or "")
+
+
+def test_manager_resume_run_recovers_failed_run(tmp_path: Path):
+    """Verify that manager.resume_run revives a FAILED or BLOCKED supervisor run."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-testresume"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build login",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.FAILED,
+        worker_wo_ids=["WO-001"],
+        error="Previous authoring gate failure",
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    # Resume without run_id discovers most recent run
+    resumed = mgr.resume_run(sid)
+    assert resumed["run_id"] == run_id
+    assert resumed["phase"] == "DISPATCHING"
+    assert resumed["error"] is None
+    assert run_id in mgr._active_runs
+    assert run_id in mgr._run_driver_threads
+
+    # Clean up driver thread
+    if run_id in mgr._run_stop_events:
+        mgr._run_stop_events[run_id].set()
+
+
+def test_manager_recovers_persisted_runs_on_boot(tmp_path: Path):
+    """Verify that SessionManager.__init__ automatically recovers non-terminal runs from disk."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr1 = SessionManager(storage)
+    session = mgr1.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+    mgr1.propose_plan(sid, "PLAN-001", "Auth Plan", "Details")
+
+    run_id = "run-bootrecovery"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build auth",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.AWAITING_APPROVAL,
+        plan_id="PLAN-001",
+    )
+    mgr1.supervisor.save_run_state(r_state, tmp_path)
+
+    # Stop any background threads from mgr1
+    for stop_ev in mgr1._run_stop_events.values():
+        stop_ev.set()
+
+    # Boot a fresh SessionManager instance recovering from storage
+    mgr2 = SessionManager(storage)
+    assert run_id in mgr2._active_runs
+    assert mgr2._active_runs[run_id].phase == Phase.AWAITING_APPROVAL
+    assert run_id in mgr2._run_driver_threads
+
+    for stop_ev in mgr2._run_stop_events.values():
+        stop_ev.set()
+
+

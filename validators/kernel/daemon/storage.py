@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +28,22 @@ class DaemonStorage:
 
     def save(self, state: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
+        temporary = self.path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, self.path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary, self.path)
+                break
+            except (PermissionError, OSError):
+                if attempt == 4:
+                    try:
+                        # Fallback for Windows file contention: direct write
+                        with self.path.open("w", encoding="utf-8") as handle:
+                            json.dump(state, handle, indent=2, sort_keys=True)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    break
+                time.sleep(0.05)

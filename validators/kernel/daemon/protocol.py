@@ -173,6 +173,13 @@ class JsonRpcProtocol:
                 )
             except (KeyError, ValueError) as error:
                 raise _RpcError(-32003, str(error)) from error
+        if method == "run.resume":
+            try:
+                return self.manager.resume_run(
+                    params["session_id"], run_id=params.get("run_id")
+                )
+            except (KeyError, ValueError) as error:
+                raise _RpcError(-32003, str(error)) from error
         if method == "work_order.execute":
             turn_params = {
                 key: value for key, value in params.items() if key not in {"session_id", "prompt", "work_order_id"}
