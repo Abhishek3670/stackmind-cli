@@ -26,7 +26,7 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
     combined_text = f"{milestone_title}\n" + "\n".join(tasks)
     
     # 1. Search for explicitly mentioned file paths in tasks
-    # Patterns: requirements.txt, src/backend.py, src/frontend.html, etc.
+    # Patterns: requirements.txt, src/backend.py, src/frontend.html, src/landing.html, etc.
     file_pattern = r"(?:`|\"|'|\s|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?:`|\"|'|\s|$)"
     matches = re.findall(file_pattern, combined_text)
     candidate_paths: list[str] = []
@@ -38,20 +38,23 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
 
     role_norm = role.lower().strip()
     
-    # Scaffolding / requirements check
-    if any(kw in combined_text.lower() for kw in ("requirements.txt", "scaffold", "dependency manifest", "dependencies manifest", "setup dependencies")):
-        return {
-            "type": "config",
-            "path": "requirements.txt",
-            "description": "Project dependency manifest declaring required packages",
-        }
-
-    # Role-based extraction with candidate path fallback
+    # Role-based extraction with candidate path matching
     if role_norm in ("gemini", "frontend"):
         target_path = next(
             (p for p in candidate_paths if any(p.endswith(ext) for ext in (".html", ".jsx", ".tsx", ".js", ".ts", ".css"))),
-            "src/frontend.html",
+            None,
         )
+        if not target_path:
+            target_path = next(
+                (p for p in candidate_paths if not p.endswith((".py", ".txt", ".md"))),
+                None,
+            )
+        if not target_path:
+            if "landing" in combined_text.lower():
+                target_path = "src/landing.html"
+            else:
+                target_path = "src/frontend.html"
+
         return {
             "type": "code",
             "path": target_path,
@@ -60,9 +63,11 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
 
     if role_norm in ("gemma", "qa"):
         target_path = next(
-            (p for p in candidate_paths if "test" in p),
-            "tests/test_login.py",
+            (p for p in candidate_paths if "test" in p or p.startswith("tests/")),
+            None,
         )
+        if not target_path:
+            target_path = "tests/test_login.py" if "login" in combined_text.lower() else "tests/test_main.py"
         return {
             "type": "code",
             "path": target_path,
@@ -71,7 +76,7 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
 
     if role_norm in ("local-llm", "gitops"):
         target_path = next(
-            (p for p in candidate_paths if p in ("VERSION.md", "CHANGELOG.md")),
+            (p for p in candidate_paths if p in ("VERSION.md", "CHANGELOG.md", "package.json")),
             "VERSION.md",
         )
         return {
@@ -81,10 +86,19 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
         }
 
     # Default: Codex / Backend
-    target_path = next(
-        (p for p in candidate_paths if p.endswith(".py") and not p.startswith("test")),
-        "src/backend.py",
+    # Only treat as requirements.txt if explicitly mentioned and no code files are targeted
+    has_req = any(p == "requirements.txt" or p.endswith("requirements.txt") for p in candidate_paths) or any(
+        kw in combined_text.lower() for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")
     )
+    code_path = next((p for p in candidate_paths if p.endswith(".py") and not "test" in p), None)
+    if has_req and not code_path:
+        return {
+            "type": "config",
+            "path": "requirements.txt",
+            "description": "Project dependency manifest declaring required packages",
+        }
+
+    target_path = code_path or "src/backend.py"
     return {
         "type": "code",
         "path": target_path,
@@ -96,16 +110,24 @@ def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
     """Determine (agent_id, role) from milestone title and tasks."""
     combined = (f"{title} " + " ".join(tasks)).lower()
 
-    # Scaffolding / dependencies are always Backend (Codex)
-    if any(kw in combined for kw in ("requirements.txt", "scaffold", "dependency manifest", "dependencies manifest", "setup dependencies")):
-        return "codex", "backend"
-
-    if re.search(r"\b(?:ui|frontend|views?|components?|screens?|css|html|react|client|login page)\b", combined):
+    # Frontend checks: explicit UI files or keywords
+    if re.search(r"\b[a-zA-Z0-9_\-\.\/]+\.(?:html|css|jsx|tsx)\b", combined) or re.search(
+        r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|client|landing page|login page)\b", combined
+    ):
         return "gemini", "frontend"
-    if re.search(r"\b(?:qa|tests?|testing|verification|audit|validation|review)\b", combined):
+
+    # QA checks
+    if re.search(r"\b(?:qa|tests?|testing|verification|audit|validation|review)\b", combined) or "test_" in combined:
         return "gemma", "qa"
+
+    # GitOps checks
     if re.search(r"\b(?:release|git|deploy|packaging|version|gitops|changelog)\b", combined):
         return "local-llm", "gitops"
+
+    # Scaffolding / dependencies specifically for backend
+    if any(kw in combined for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")):
+        return "codex", "backend"
+
     return "codex", "backend"
 
 
@@ -435,9 +457,22 @@ def synthesize_child_work_orders(
         prio = wo.get("priority", "P1")
         deliv = wo.get("deliverable") or {}
 
-        # Ensure deliverable has explicit path
-        if not deliv.get("path"):
-            deliv = extract_deliverable_spec(title, [desc], primary_agent)
+        # Refine agent assignment if defaulted to codex but clearly targets frontend or QA
+        detected_agent, detected_role = determine_assigned_agent(title, [desc])
+        if primary_agent == "codex" and detected_agent in ("gemini", "gemma", "local-llm"):
+            primary_agent = detected_agent
+
+        role = "backend"
+        if primary_agent == "gemini":
+            role = "frontend"
+        elif primary_agent == "gemma":
+            role = "qa"
+        elif primary_agent in ("local-llm", "gitops"):
+            role = "gitops"
+
+        # Ensure deliverable has explicit path matching role
+        if not deliv.get("path") or (primary_agent == "gemini" and str(deliv.get("path")).endswith(".txt")):
+            deliv = extract_deliverable_spec(title, [desc], role)
 
         wo_rec = build_child_work_order(
             wo_id=wo_id,
@@ -448,14 +483,6 @@ def synthesize_child_work_orders(
             priority=prio,
             deliverable=deliv,
         )
-
-        role = "backend"
-        if primary_agent == "gemini":
-            role = "frontend"
-        elif primary_agent == "gemma":
-            role = "qa"
-        elif primary_agent in ("local-llm", "gitops"):
-            role = "gitops"
 
         contract_rec = build_child_contract(
             wo_id=wo_id,

@@ -972,84 +972,83 @@ class SessionManager:
             wo_dir = workspace / ".sync" / "work-orders" / "ACTIVE"
             is_goal_plan = bool(plan.get("metadata", {}).get("is_goal"))
 
-            for item in proposed_wos:
-                if isinstance(item, dict):
-                    wo_id = str(item.get("id") or item.get("wo_id"))
-                    wo_record = {
-                        "id": wo_id,
-                        "title": item.get("title", f"Work order {wo_id}"),
-                        "type": item.get("type", "FEATURE"),
-                        "status": "ACTIVE",
-                        "priority": item.get("priority", "P0"),
-                        "assigned_agents": item.get("assigned_agents", [session["agent"]]),
-                        "description": item.get("description", ""),
-                        "created": now,
-                        "updated": now,
-                    }
-                    for k, v in item.items():
-                        if k not in wo_record:
-                            wo_record[k] = v
-                else:
-                    wo_id = str(item)
-                    wo_record = {
-                        "id": wo_id,
-                        "title": f"Work order {wo_id}",
-                        "type": "FEATURE",
-                        "status": "ACTIVE",
-                        "priority": "P0",
-                        "assigned_agents": [session["agent"]],
-                        "description": "",
-                        "created": now,
-                        "updated": now,
-                    }
+            if is_goal_plan and (workspace / ".sync").exists():
+                try:
+                    from .authoring import synthesize_child_work_orders
+                    synthesized = synthesize_child_work_orders(workspace, plan, session_id=session_id)
+                    if synthesized:
+                        created_work_orders = synthesized
+                except Exception:
+                    pass
+            else:
+                for item in proposed_wos:
+                    if isinstance(item, dict):
+                        wo_id = str(item.get("id") or item.get("wo_id"))
+                        wo_record = {
+                            "id": wo_id,
+                            "title": item.get("title", f"Work order {wo_id}"),
+                            "type": item.get("type", "FEATURE"),
+                            "status": "ACTIVE",
+                            "priority": item.get("priority", "P0"),
+                            "assigned_agents": item.get("assigned_agents", [session["agent"]]),
+                            "description": item.get("description", ""),
+                            "created": now,
+                            "updated": now,
+                        }
+                        for k, v in item.items():
+                            if k not in wo_record:
+                                wo_record[k] = v
+                    else:
+                        wo_id = str(item)
+                        wo_record = {
+                            "id": wo_id,
+                            "title": f"Work order {wo_id}",
+                            "type": "FEATURE",
+                            "status": "ACTIVE",
+                            "priority": "P0",
+                            "assigned_agents": [session["agent"]],
+                            "description": "",
+                            "created": now,
+                            "updated": now,
+                        }
 
-                created_work_orders.append(wo_record)
-                # For goal plans, autonomously synthesize validated child work orders and contracts to disk
-                if is_goal_plan and (workspace / ".sync").exists():
-                    try:
-                        from .authoring import synthesize_child_work_orders
-                        synthesized = synthesize_child_work_orders(workspace, plan, session_id=session_id)
-                        if synthesized:
-                            created_work_orders = synthesized
-                    except Exception:
-                        pass
-                elif not is_goal_plan and (workspace / ".sync").exists():
-                    try:
-                        wo_dir.mkdir(parents=True, exist_ok=True)
-                        wo_path = wo_dir / f"{wo_id}.yaml"
-                        with wo_path.open("w", encoding="utf-8") as handle:
-                            yaml.safe_dump(wo_record, handle, sort_keys=False)
-                    except Exception:
-                        pass
-                if (workspace / ".sync").exists():
-                    index_path = workspace / ".sync" / "work-orders" / "INDEX.yaml"
-                    if index_path.exists():
+                    created_work_orders.append(wo_record)
+                    if (workspace / ".sync").exists():
                         try:
-                            index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
-                            if isinstance(index_data, dict) and "orders" in index_data:
-                                existing_ids = {
-                                    o.get("id")
-                                    for o in index_data["orders"]
-                                    if isinstance(o, dict)
-                                }
-                                if wo_id not in existing_ids:
-                                    index_data["orders"].append({
-                                        "id": wo_id,
-                                        "type": wo_record.get("type", "FEATURE"),
-                                        "title": wo_record.get("title", f"Work order {wo_id}"),
-                                        "status": wo_record.get("status", "ACTIVE"),
-                                        "priority": wo_record.get("priority", "P0"),
-                                        "assigned_agents": wo_record.get("assigned_agents", [session["agent"]]),
-                                        "dependencies": wo_record.get("dependencies", []),
-                                        "deliverable": wo_record.get("deliverable"),
-                                        "created": wo_record.get("created"),
-                                        "updated": wo_record.get("updated"),
-                                        "file": f"work-orders/ACTIVE/{wo_id}.yaml",
-                                    })
-                                    with index_path.open("w", encoding="utf-8") as handle:
-                                        yaml.safe_dump(index_data, handle, sort_keys=False)
+                            wo_dir.mkdir(parents=True, exist_ok=True)
+                            wo_path = wo_dir / f"{wo_id}.yaml"
+                            with wo_path.open("w", encoding="utf-8") as handle:
+                                yaml.safe_dump(wo_record, handle, sort_keys=False)
                         except Exception:
                             pass
+                        index_path = workspace / ".sync" / "work-orders" / "INDEX.yaml"
+                        if index_path.exists():
+                            try:
+                                index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+                                if isinstance(index_data, dict) and "orders" in index_data:
+                                    existing_ids = {
+                                        o.get("id")
+                                        for o in index_data["orders"]
+                                        if isinstance(o, dict)
+                                    }
+                                    if wo_id not in existing_ids:
+                                        index_data["orders"].append({
+                                            "id": wo_id,
+                                            "type": wo_record.get("type", "FEATURE"),
+                                            "title": wo_record.get("title", f"Work order {wo_id}"),
+                                            "status": wo_record.get("status", "ACTIVE"),
+                                            "priority": wo_record.get("priority", "P0"),
+                                            "assigned_agents": wo_record.get("assigned_agents", [session["agent"]]),
+                                            "dependencies": wo_record.get("dependencies", []),
+                                            "deliverable": wo_record.get("deliverable"),
+                                            "created": wo_record.get("created"),
+                                            "updated": wo_record.get("updated"),
+                                            "file": f"work-orders/ACTIVE/{wo_id}.yaml",
+                                        })
+                                        with index_path.open("w", encoding="utf-8") as handle:
+                                            yaml.safe_dump(index_data, handle, sort_keys=False)
+                            except Exception:
+                                pass
 
             plan["created_work_orders"] = created_work_orders
             self.events.publish(
@@ -1807,31 +1806,22 @@ class SessionManager:
                         is_valid, _ = validate_plan_structure(plan_content)
                         if is_valid:
                             parsed_plan = parse_plan(plan_content)
-                            from .authoring import get_next_work_order_int
+                            from .authoring import get_next_work_order_int, determine_assigned_agent, extract_deliverable_spec
                             start_idx = get_next_work_order_int(ws_path)
                             proposed_wos = []
                             for offset, m in enumerate(parsed_plan.milestones):
                                 idx = start_idx + offset
                                 wo_id = f"WO-{idx:03d}"
-                                assigned = ["codex"]
-                                title_l = m.title.lower()
-                                if any(kw in title_l for kw in ("ui", "frontend", "view", "component", "screen", "css", "html", "react", "client")):
-                                    assigned = ["gemini"]
-                                elif any(kw in title_l for kw in ("qa", "test", "verification", "audit", "review")):
-                                    assigned = ["gemma"]
-                                elif any(kw in title_l for kw in ("release", "git", "deploy", "packaging", "version", "gitops")):
-                                    assigned = ["local-llm"]
+                                agent_id, role = determine_assigned_agent(m.title, m.tasks)
+                                deliv = extract_deliverable_spec(m.title, m.tasks, role)
                                 proposed_wos.append({
                                     "id": wo_id,
                                     "title": m.title,
                                     "type": "FEATURE",
                                     "priority": "P1" if offset > 0 else "P0",
-                                    "assigned_agents": assigned,
+                                    "assigned_agents": [agent_id],
                                     "dependencies": [f"WO-{idx-1:03d}"] if offset > 0 else [],
-                                    "deliverable": {
-                                        "type": "code",
-                                        "description": f"Deliverables for {m.title}",
-                                    },
+                                    "deliverable": deliv,
                                     "description": "\n".join(m.tasks) if m.tasks else m.title,
                                 })
                             plan_meta = {

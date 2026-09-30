@@ -1018,3 +1018,23 @@ def test_step4_tui_adapter_approve_reject_delegates_to_plan(tmp_path: Path) -> N
     assert res_rej["reason"] == "Needs revisions"
 
 
+def test_landing_page_deliverable_extraction():
+    """Verify that frontend tasks mentioning HTML/landing are assigned to gemini with html deliverable."""
+    from validators.kernel.daemon.authoring import determine_assigned_agent, extract_deliverable_spec
+
+    title = "Frontend Infrastructure"
+    tasks = [
+        "Create `src/landing.html` with Tailwind CSS layout.",
+        "Implement JWT storage and redirection logic in `src/frontend.html`.",
+    ]
+    agent_id, role = determine_assigned_agent(title, tasks)
+    assert agent_id == "gemini"
+    assert role == "frontend"
+
+    deliv = extract_deliverable_spec(title, tasks, role)
+    assert deliv["type"] == "code"
+    assert deliv["path"] == "src/landing.html"
+    assert deliv["path"] != "requirements.txt"
+
+
+
