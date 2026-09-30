@@ -551,9 +551,11 @@ class LifecycleSupervisor:
                     parent_operation_id=parent_op_id,
                 )
                 dispatched_any = True
-            except Exception:
+            except Exception as exc:
                 # D024 gate or other pre-check might block — record and continue
-                state.blocked_wo_ids.append(wo_id)
+                if wo_id not in state.blocked_wo_ids:
+                    state.blocked_wo_ids.append(wo_id)
+                state.error = f"Dispatch failed for {wo_id}: {exc}"
 
         self._transition(state, Phase.EXECUTING)
         if dispatched_any:

@@ -545,6 +545,9 @@ class SessionManager:
                             r_id = run_file.stem
                             loaded_state = self.supervisor.load_run_state(r_id, ws)
                             if loaded_state and loaded_state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+                                if session.get("state") == "WAITING":
+                                    session["state"] = "RUNNING"
+                                    session["updated_at"] = _now()
                                 self._active_runs[r_id] = loaded_state
                                 stop_ev = Event()
                                 self._run_stop_events[r_id] = stop_ev
@@ -840,8 +843,8 @@ class SessionManager:
     def resume_session(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
-            if not session or session["state"] != "PAUSED":
-                raise ValueError("only paused sessions can be resumed")
+            if not session or session["state"] not in {"PAUSED", "WAITING"}:
+                raise ValueError("only paused or waiting sessions can be resumed")
             return self._set_state(session_id, "RUNNING", "session.resumed")
 
     def propose_plan(
@@ -1176,6 +1179,11 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
+            if session.get("state") in {"PAUSED", "WAITING"}:
+                session["state"] = "RUNNING"
+                session["updated_at"] = _now()
+                self.events.publish("session.resumed", session_id)
+
             ws = Path(session.get("workspace", ""))
             target_run_id = run_id
             if not target_run_id:
@@ -1196,6 +1204,7 @@ class SessionManager:
             from .supervisor import Phase
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
                 state.error = None
+                state.blocked_wo_ids.clear()
                 if state.worker_wo_ids:
                     self.supervisor._transition(state, Phase.DISPATCHING)
                 elif state.plan_id:
@@ -1251,8 +1260,12 @@ class SessionManager:
     ) -> tuple[Event, str]:
         with self._lock:
             session = self._sessions.get(session_id)
-            if not session or session["state"] != "RUNNING":
+            if not session or session.get("state") not in {"RUNNING", "WAITING"}:
                 raise ValueError("session is not running")
+            if session.get("state") == "WAITING":
+                session["state"] = "RUNNING"
+                session["updated_at"] = _now()
+                self.events.publish("session.resumed", session_id)
 
             parent_record = None
             if parent_operation_id is not None:

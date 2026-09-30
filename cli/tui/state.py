@@ -1043,6 +1043,22 @@ class AutonomousDeliveryState:
                 self.roles[normalized_role].state = "CANCELLED"
             self.add_activity(normalized_role, "cancelled", payload.get("reason", ""))
 
+        elif name in {"operation.failed", "turn.failed"}:
+            op_name = payload.get("operation") or payload.get("name") or ""
+            role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
+            normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
+            op_id = payload.get("operation_id")
+            err_msg = payload.get("error") or payload.get("reason") or "failed"
+            if op_id and op_id in self.operations:
+                self.operations[op_id].status = "FAILED"
+            else:
+                for op in self.operations.values():
+                    if (op.role == normalized_role or (op_name and op.name == op_name)) and op.status == "RUNNING":
+                        op.status = "FAILED"
+            if normalized_role in self.roles:
+                self.roles[normalized_role].state = "FAILED"
+            self.add_activity(normalized_role, "failed", str(err_msg))
+
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")
             role = (payload.get("role") or "Backend").title()
