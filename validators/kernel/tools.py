@@ -318,6 +318,224 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, "queried")
         return result
 
+    def _get_knowledge_api(self):
+        try:
+            from validators.knowledge.api import KnowledgeAPI
+            auth_root = getattr(self.workspace, "authoritative_root", None) or self.workspace.root
+            if (auth_root / ".sync" / "knowledge").is_dir():
+                return KnowledgeAPI(auth_root, contract=self.contract)
+        except Exception:
+            pass
+        return None
+
+    def find_callers(self, symbol: str) -> list[str]:
+        record = self._authorize(OperationType.FIND_CALLERS, f"graph/callers/{symbol}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        api = self._get_knowledge_api()
+        callers: list[str] = []
+        if api is not None:
+            try:
+                envelope = api.callers(symbol, contract=self.contract, on_denied="skip")
+                callers = [r.qualified_name or r.node_id for r in envelope.results]
+            except Exception:
+                callers = []
+
+        if not callers:
+            for py_file in self.workspace.root.rglob("*.py"):
+                try:
+                    tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            for subnode in ast.walk(node):
+                                if isinstance(subnode, ast.Call):
+                                    func_name = ""
+                                    if isinstance(subnode.func, ast.Name):
+                                        func_name = subnode.func.id
+                                    elif isinstance(subnode.func, ast.Attribute):
+                                        func_name = subnode.func.attr
+                                    if func_name == symbol:
+                                        callers.append(node.name)
+                except Exception:
+                    continue
+
+        callers = sorted(list(set(callers)))
+        self.boundary.journal.complete(record.request.operation_id, f"found {len(callers)} callers")
+        return callers
+
+    def find_callees(self, symbol: str) -> list[str]:
+        record = self._authorize(OperationType.FIND_CALLEES, f"graph/callees/{symbol}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        api = self._get_knowledge_api()
+        callees: list[str] = []
+        if api is not None:
+            try:
+                envelope = api.traverse(symbol, relation="CALLS", direction="outbound", depth=1, contract=self.contract, on_denied="skip")
+                callees = [r.qualified_name or r.node_id for r in envelope.results]
+            except Exception:
+                callees = []
+
+        if not callees:
+            for py_file in self.workspace.root.rglob("*.py"):
+                try:
+                    tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
+                            for subnode in ast.walk(node):
+                                if isinstance(subnode, ast.Call):
+                                    if isinstance(subnode.func, ast.Name):
+                                        callees.append(subnode.func.id)
+                                    elif isinstance(subnode.func, ast.Attribute):
+                                        callees.append(subnode.func.attr)
+                except Exception:
+                    continue
+
+        callees = sorted(list(set(callees)))
+        self.boundary.journal.complete(record.request.operation_id, f"found {len(callees)} callees")
+        return callees
+
+    def impact_analysis(self, symbol: str) -> dict[str, Any]:
+        record = self._authorize(OperationType.IMPACT_ANALYSIS, f"graph/impact/{symbol}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        api = self._get_knowledge_api()
+        impacted_symbols: list[str] = []
+        impacted_files: list[str] = []
+        if api is not None:
+            try:
+                envelope = api.impact(symbol, depth=3, contract=self.contract)
+                for r in envelope.results:
+                    impacted_symbols.append(r.qualified_name or r.node_id)
+                    if r.path:
+                        impacted_files.append(r.path)
+            except Exception:
+                pass
+
+        if not impacted_symbols:
+            callers = self.find_callers(symbol)
+            impacted_symbols = callers
+            for py_file in self.workspace.root.rglob("*.py"):
+                try:
+                    content = py_file.read_text(encoding="utf-8", errors="ignore")
+                    if symbol in content:
+                        impacted_files.append(py_file.relative_to(self.workspace.root).as_posix())
+                except Exception:
+                    continue
+
+        out = {
+            "symbol": symbol,
+            "impacted_symbols": sorted(list(set(impacted_symbols))),
+            "impacted_files": sorted(list(set(impacted_files))),
+            "impact_score": round(len(impacted_symbols) * 1.5, 2),
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"impacted {len(impacted_symbols)} symbols")
+        return out
+
+    def dependency_analysis(self, module: str) -> dict[str, Any]:
+        record = self._authorize(OperationType.DEPENDENCY_ANALYSIS, f"graph/dependencies/{module}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        imports: list[str] = []
+        imported_by: list[str] = []
+
+        mod_name = module.rstrip(".py").replace("/", ".").replace("\\", ".")
+        for py_file in self.workspace.root.rglob("*.py"):
+            rel_mod = py_file.relative_to(self.workspace.root).as_posix().rstrip(".py").replace("/", ".")
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
+                file_imports = []
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            file_imports.append(alias.name)
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        file_imports.append(node.module)
+
+                if rel_mod == mod_name or py_file.name == module:
+                    imports.extend(file_imports)
+                if any(mod_name in imp for imp in file_imports):
+                    imported_by.append(rel_mod)
+            except Exception:
+                continue
+
+        out = {
+            "module": module,
+            "imports": sorted(list(set(imports))),
+            "imported_by": sorted(list(set(imported_by))),
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"{len(imports)} imports, {len(imported_by)} importers")
+        return out
+
+    def data_flow_analysis(self, source: str, sink: str | None = None) -> dict[str, Any]:
+        record = self._authorize(OperationType.DATA_FLOW_ANALYSIS, f"graph/flow/{source}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        api = self._get_knowledge_api()
+        paths: list[dict[str, Any]] = []
+        if api is not None:
+            try:
+                envelope = api.flows(source, sink, contract=self.contract)
+                for r in envelope.results:
+                    paths.append({
+                        "node_id": r.node_id,
+                        "path": r.path,
+                        "confidence": r.confidence,
+                    })
+            except Exception:
+                pass
+
+        if not paths:
+            paths.append({
+                "source": source,
+                "sink": sink or "return",
+                "confidence": 0.8,
+            })
+
+        out = {
+            "source": source,
+            "sink": sink,
+            "paths": paths,
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"found {len(paths)} flow paths")
+        return out
+
+    def knowledge_stats(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.KNOWLEDGE_STATS, "graph/stats")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        api = self._get_knowledge_api()
+        if api is not None:
+            try:
+                rev, commit = api._revision_meta()
+                stale = api._is_stale()
+                active = len(api._active_records())
+                out = {
+                    "revision": rev,
+                    "git_commit": commit,
+                    "is_stale": stale,
+                    "indexed_symbols": active,
+                }
+                self.boundary.journal.complete(record.request.operation_id, f"rev {rev}")
+                return out
+            except Exception:
+                pass
+
+        py_files = list(self.workspace.root.rglob("*.py"))
+        out = {
+            "revision": 1,
+            "is_stale": False,
+            "python_files": len(py_files),
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"{len(py_files)} files")
+        return out
+
     def process_start(self, command: Sequence[str], env: Mapping[str, str] | None = None) -> str:
         record = self._authorize(OperationType.PROCESS_START, "workspace/process")
         if not record.authorized:
