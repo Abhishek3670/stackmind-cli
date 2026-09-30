@@ -7,10 +7,11 @@ import re
 import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
+import yaml
 from typing import Any
 
 from .boundary import RuntimeBoundary
-from .contract import AgentContract
+from .contract import AgentContract, ContractEvaluator
 from .identity import AuthorizationPolicy
 from .interpreter_denylist import check_command
 from .operations import OperationRequest, OperationType
@@ -32,6 +33,8 @@ class ToolGateway:
         self.graph_query = graph_query
         self.sandbox = sandbox or ProcessSandbox(workspace)
         self.process_manager = ProcessManager(workspace, self.sandbox)
+        self._todo_list: list[dict[str, Any]] = []
+        self._plan_mode: bool = False
 
     def _request(self, operation_type: OperationType, target: str) -> OperationRequest:
         return OperationRequest(operation_type, target, self.session_id, self.attempt_id,
@@ -668,4 +671,189 @@ class ToolGateway:
         """Cleanup guarantee: stop any running background processes."""
         if hasattr(self, "process_manager"):
             self.process_manager.stop_all()
+
+    def todo(self, action: str, task_text: str = "", status: str = "pending", item_id: int | None = None) -> list[dict[str, Any]]:
+        record = self._authorize(OperationType.TODO, "session/todo")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        action = action.lower().strip()
+        if action == "add":
+            new_id = len(self._todo_list) + 1
+            item = {"id": new_id, "task": task_text, "status": status}
+            self._todo_list.append(item)
+        elif action in ("update", "set"):
+            for item in self._todo_list:
+                if (item_id is not None and item["id"] == item_id) or (task_text and task_text in item["task"]):
+                    item["status"] = status
+        elif action == "delete":
+            self._todo_list = [item for item in self._todo_list if not ((item_id is not None and item["id"] == item_id) or (task_text and item["task"] == task_text))]
+        elif action == "clear":
+            self._todo_list.clear()
+
+        self.boundary.journal.complete(record.request.operation_id, f"{len(self._todo_list)} items")
+        return list(self._todo_list)
+
+    def ask_user(self, question: str, choices: Sequence[str] | None = None) -> str:
+        record = self._authorize(OperationType.ASK_USER, "session/ask_user")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        res = choices[0] if choices else "acknowledged"
+        self.boundary.journal.complete(record.request.operation_id, f"prompt: {question}")
+        return res
+
+    def enter_plan_mode(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.ENTER_PLAN_MODE, "session/plan_mode")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        self._plan_mode = True
+        self.boundary.journal.complete(record.request.operation_id, "active")
+        return {"status": "plan_mode_active", "actor": self.actor_id}
+
+    def exit_plan_mode(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.EXIT_PLAN_MODE, "session/plan_mode")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        self._plan_mode = False
+        self.boundary.journal.complete(record.request.operation_id, "inactive")
+        return {"status": "plan_mode_inactive", "actor": self.actor_id}
+
+    def create_work_order(
+        self,
+        title: str,
+        deliverable: dict[str, Any],
+        assigned_agent: str,
+        dependencies: Sequence[str] | None = None,
+        wo_id: str | None = None,
+    ) -> str:
+        record = self._authorize(OperationType.CREATE_WORK_ORDER, "workspace/work-orders")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        from validators.harness.authoring_gate import AuthoringGate
+        gate = getattr(self, "_authoring_gate", None)
+        authoritative_root = getattr(self.workspace, "authoritative_root", None)
+        if gate is None:
+            gate = AuthoringGate(project_root=authoritative_root)
+            self._authoring_gate = gate
+
+        auth_ok, reason = gate.validate_author_role(self.actor_id, ".sync/work-orders/ACTIVE/new.yaml")
+        if not auth_ok and reason:
+            raise PermissionError(reason)
+
+        if not wo_id:
+            import time
+            wo_id = f"WO-{int(time.time() * 1000) % 1000:03d}"
+
+        wo_data = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": title,
+            "status": "PENDING",
+            "priority": "P1",
+            "assigned_agents": [assigned_agent] if isinstance(assigned_agent, str) else list(assigned_agent),
+            "dependencies": list(dependencies or []),
+            "deliverables": [deliverable] if isinstance(deliverable, dict) else deliverable,
+        }
+        wo_yaml = yaml.dump(wo_data, sort_keys=False)
+        target_path = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+
+        decision = gate.validate_artifact_content(target_path, wo_yaml, agent=self.actor_id, project_root=authoritative_root)
+        if not decision.passed:
+            raise PermissionError(f"Work order authoring validation failed: {'; '.join(decision.errors)}")
+
+        path = self.workspace.path_for(target_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(wo_yaml, encoding="utf-8")
+        self.boundary.journal.complete(record.request.operation_id, f"created {wo_id}")
+        return wo_id
+
+    def update_work_order(self, wo_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        record = self._authorize(OperationType.UPDATE_WORK_ORDER, f"workspace/work-orders/{wo_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        from validators.harness.authoring_gate import AuthoringGate
+        gate = getattr(self, "_authoring_gate", None)
+        authoritative_root = getattr(self.workspace, "authoritative_root", None)
+        if gate is None:
+            gate = AuthoringGate(project_root=authoritative_root)
+            self._authoring_gate = gate
+
+        target_path = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+        auth_ok, reason = gate.validate_author_role(self.actor_id, target_path)
+        if not auth_ok and reason:
+            raise PermissionError(reason)
+
+        path = self.workspace.path_for(target_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Work order file '{target_path}' not found")
+
+        current = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        current.update(updates)
+        new_yaml = yaml.dump(current, sort_keys=False)
+
+        decision = gate.validate_artifact_content(target_path, new_yaml, agent=self.actor_id, project_root=authoritative_root)
+        if not decision.passed:
+            raise PermissionError(f"Work order update validation failed: {'; '.join(decision.errors)}")
+
+        path.write_text(new_yaml, encoding="utf-8")
+        self.boundary.journal.complete(record.request.operation_id, f"updated {wo_id}")
+        return current
+
+    def get_contract(self, wo_id: str | None = None) -> dict[str, Any]:
+        record = self._authorize(OperationType.GET_CONTRACT, f"session/contract/{wo_id or self.contract.work_order}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        if wo_id is None or wo_id == self.contract.work_order:
+            res = {
+                "agent_id": self.contract.agent_id,
+                "work_order": self.contract.work_order,
+                "allow": list(self.contract.allow),
+                "deny": list(self.contract.deny),
+                "write_mode": self.contract.write_mode,
+                "version": self.contract.version,
+                "budget": dict(self.contract.budget),
+            }
+        else:
+            contract_path = self.workspace.path_for(f".sync/contracts/{wo_id}.yaml")
+            if contract_path.is_file():
+                res = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+            else:
+                raise FileNotFoundError(f"Contract file for {wo_id} not found")
+
+        self.boundary.journal.complete(record.request.operation_id, "retrieved")
+        return res
+
+    def verify_scope(self, path: str, operation: str = "read_file") -> bool:
+        record = self._authorize(OperationType.VERIFY_SCOPE, f"workspace/{path}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        evaluator = ContractEvaluator()
+        ok, reason = evaluator.authorize(self.contract, operation, path)
+        self.boundary.journal.complete(record.request.operation_id, "in_scope" if ok else "denied")
+        return ok
+
+    def explain_denial(self, path: str, operation: str = "read_file") -> str:
+        record = self._authorize(OperationType.EXPLAIN_DENIAL, f"workspace/{path}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        evaluator = ContractEvaluator()
+        ok, reason = evaluator.authorize(self.contract, operation, path)
+        res = "Target is in scope and authorized" if ok else f"Scope denial: {reason}"
+        self.boundary.journal.complete(record.request.operation_id, res)
+        return res
+
+    def inspect_budget(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.INSPECT_BUDGET, "session/budget")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        budget_info = dict(self.contract.budget)
+        self.boundary.journal.complete(record.request.operation_id, f"{len(budget_info)} budget fields")
+        return budget_info
+
 

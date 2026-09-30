@@ -103,6 +103,12 @@ class ContractEvaluator:
         "create_work_order", "update_work_order", "checkpoint", "restore_checkpoint",
     }
 
+    _SESSION_OPERATIONS = {
+        "todo", "ask_user", "enter_plan_mode", "exit_plan_mode",
+        "get_contract", "verify_scope", "explain_denial", "inspect_budget",
+        "knowledge_stats",
+    }
+
     @staticmethod
     def _matches(target: str, rule: str) -> bool:
         normalized = target.replace("\\", "/")
@@ -123,6 +129,8 @@ class ContractEvaluator:
             return False, "contract is read-only"
         if any(self._matches(target, rule) for rule in contract.deny):
             return False, "target is explicitly denied"
+        if operation_type in self._SESSION_OPERATIONS or target.startswith("session/"):
+            return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
             return False, "target is outside allowed scope"
         return True, "authorized"
