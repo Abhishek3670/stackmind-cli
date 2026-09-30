@@ -908,3 +908,28 @@ def test_fastapi_and_auth_ecosystem_import_mappings():
     # 3. passlib satisfies bcrypt
     assert is_import_declared("bcrypt", {"passlib"}) is True
 
+
+def test_test_file_importing_pytest_passes(tmp_path: Path):
+    """Deliverables in tests/ or matching test_*.py can import pytest without undeclared failure."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+    
+    # Create a test deliverable importing pytest and local backend
+    test_dir = project / "tests"
+    test_dir.mkdir()
+    test_file = test_dir / "test_login.py"
+    test_file.write_text(
+        "import pytest\n"
+        "from fastapi import FastAPI\n"
+        "\n"
+        "def test_example():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    result = check_import_satisfiability(test_file, project_root=project)
+    assert result.passed is True
+    assert "pytest" not in result.external_imports
+    assert result.undeclared_imports == ()
+

@@ -247,6 +247,29 @@ FALLBACK_STDLIB_MODULES: frozenset[str] = frozenset({
     "zoneinfo",
 })
 
+STANDARD_TEST_MODULES: frozenset[str] = frozenset({
+    "pytest",
+    "_pytest",
+})
+
+
+def is_test_file_path(path: str | Path | None) -> bool:
+    """Identify if a path belongs to a test suite, fixture, or assertion file."""
+    if not path:
+        return False
+    norm = Path(path).as_posix().lower()
+    parts = norm.split("/")
+    if any(p in ("tests", "test", "testing", "fixtures", "__tests__") for p in parts):
+        return True
+    filename = Path(path).name.lower()
+    return (
+        filename.startswith("test_")
+        or filename.endswith("_test.py")
+        or filename.endswith(".spec.ts")
+        or filename.endswith(".test.ts")
+    )
+
+
 # Explicit mapping from Python import name to set of known distribution package names.
 # Normalized according to PEP 503 (lowercase, dashes instead of underscores).
 KNOWN_IMPORT_TO_DISTRIBUTIONS: dict[str, set[str]] = {
@@ -843,9 +866,12 @@ def check_import_satisfiability(
 
     all_imports = extract_top_level_imports(source_code)
     external_imports: set[str] = set()
+    is_test = is_test_file_path(rel_path)
 
     for mod in all_imports:
         if is_standard_library(mod):
+            continue
+        if is_test and mod in STANDARD_TEST_MODULES:
             continue
         if is_local_module(
             mod,
