@@ -1312,6 +1312,174 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, f"valid={out['valid']}")
         return out
 
+    def checkpoint(self, label: str | None = None) -> str:
+        record = self._authorize(OperationType.CHECKPOINT, "workspace/checkpoint")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        import time
+        import json
+        cp_id = f"cp-{int(time.time() * 1000)}"
+        cp_dir = self.workspace.path_for(f".sync/checkpoints/{cp_id}")
+        cp_dir.mkdir(parents=True, exist_ok=True)
+
+        files_saved = []
+        for f in self.workspace.root.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(self.workspace.root).as_posix()
+            if rel.startswith(".sync/checkpoints") or any(p in (".git", "__pycache__", ".venv") for p in f.parts):
+                continue
+            dest = cp_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
+            files_saved.append(rel)
+
+        meta = {
+            "checkpoint_id": cp_id,
+            "label": label or "manual",
+            "timestamp": time.time(),
+            "actor": self.actor_id,
+            "files_count": len(files_saved),
+        }
+        (cp_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        self.boundary.journal.complete(record.request.operation_id, f"created {cp_id}")
+        return cp_id
+
+    def restore_checkpoint(self, checkpoint_id: str) -> bool:
+        record = self._authorize(OperationType.RESTORE_CHECKPOINT, f"workspace/checkpoint/{checkpoint_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        cp_dir = self.workspace.path_for(f".sync/checkpoints/{checkpoint_id}")
+        if not cp_dir.is_dir():
+            raise FileNotFoundError(f"Checkpoint '{checkpoint_id}' not found")
+
+        for f in cp_dir.rglob("*"):
+            if not f.is_file() or f.name == "metadata.json":
+                continue
+            rel = f.relative_to(cp_dir).as_posix()
+            dest = self.workspace.path_for(rel)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
+
+        self.boundary.journal.complete(record.request.operation_id, f"restored {checkpoint_id}")
+        return True
+
+    def list_checkpoints(self) -> list[dict[str, Any]]:
+        record = self._authorize(OperationType.COMPARE_SNAPSHOTS, "workspace/checkpoints")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        import json
+        cps_dir = self.workspace.path_for(".sync/checkpoints")
+        results = []
+        if cps_dir.is_dir():
+            for child in sorted(cps_dir.iterdir(), reverse=True):
+                meta_file = child / "metadata.json"
+                if meta_file.is_file():
+                    try:
+                        results.append(json.loads(meta_file.read_text(encoding="utf-8")))
+                    except Exception:
+                        results.append({"checkpoint_id": child.name})
+
+        self.boundary.journal.complete(record.request.operation_id, f"{len(results)} checkpoints")
+        return results
+
+    def inspect_logs(self, filter_term: str | None = None, tail_lines: int = 100) -> str:
+        record = self._authorize(OperationType.INSPECT_LOGS, "session/logs")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        lines = []
+        for rec in self.boundary.journal.records:
+            line = f"[{rec.recorded_at.isoformat()}] {rec.request.operation_type.value} -> {rec.request.target} (auth={rec.authorized}, reason={rec.reason})"
+            if not filter_term or filter_term.lower() in line.lower():
+                lines.append(line)
+
+        if tail_lines > 0 and len(lines) > tail_lines:
+            lines = lines[-tail_lines:]
+
+        out = "\n".join(lines)
+        self.boundary.journal.complete(record.request.operation_id, f"{len(lines)} log lines")
+        return out
+
+    def inspect_processes(self) -> list[dict[str, Any]]:
+        record = self._authorize(OperationType.INSPECT_PROCESSES, "session/processes")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        results = []
+        if hasattr(self, "process_manager"):
+            with self.process_manager._lock:
+                for proc in self.process_manager._processes.values():
+                    results.append(proc.status())
+
+        self.boundary.journal.complete(record.request.operation_id, f"{len(results)} processes")
+        return results
+
+    def collect_test_artifacts(self, target_dir: str | None = None) -> list[str]:
+        target = target_dir or "artifacts"
+        record = self._authorize(OperationType.COLLECT_TEST_ARTIFACTS, f"workspace/{target}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        artifacts = []
+        for f in self.workspace.root.rglob("*"):
+            if not f.is_file():
+                continue
+            name_lower = f.name.lower()
+            rel = f.relative_to(self.workspace.root).as_posix()
+            if any(term in name_lower for term in ("test-report", "coverage", "pytest", ".log", "screenshot")):
+                artifacts.append(rel)
+
+        self.boundary.journal.complete(record.request.operation_id, f"{len(artifacts)} test artifacts")
+        return sorted(artifacts)
+
+    def inspect_environment(self) -> dict[str, Any]:
+        return self.system_metrics()
+
+    def system_metrics(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.INSPECT_ENVIRONMENT, "system/metrics")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        import platform
+        import threading
+        metrics = {
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "active_threads": threading.active_count(),
+            "actor": self.actor_id,
+            "session_id": self.session_id,
+            "attempt_id": self.attempt_id,
+        }
+        self.boundary.journal.complete(record.request.operation_id, "retrieved")
+        return metrics
+
+    def diagnostics_summary(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.INSPECT_ENVIRONMENT, "system/diagnostics")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        journal_records = self.boundary.journal.records
+        denials = [r for r in journal_records if not r.authorized]
+        running_procs = [p for p in self.inspect_processes() if p.get("status") == "running"]
+        checkpoints_list = self.list_checkpoints()
+
+        summary = {
+            "total_operations": len(journal_records),
+            "denied_operations": len(denials),
+            "running_processes": len(running_procs),
+            "checkpoints_count": len(checkpoints_list),
+            "plan_mode": self._plan_mode,
+            "todo_items": len(self._todo_list),
+        }
+        self.boundary.journal.complete(record.request.operation_id, "summary_ready")
+        return summary
+
+
 
 
 

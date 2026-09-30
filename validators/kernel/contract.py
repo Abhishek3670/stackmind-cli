@@ -107,6 +107,8 @@ class ContractEvaluator:
         "todo", "ask_user", "enter_plan_mode", "exit_plan_mode",
         "get_contract", "verify_scope", "explain_denial", "inspect_budget",
         "knowledge_stats", "skill_test", "skill_audit", "validate_release_metadata",
+        "inspect_logs", "inspect_processes", "system_metrics", "diagnostics_summary", "list_checkpoints",
+        "inspect_environment", "compare_snapshots",
     }
 
     @staticmethod
