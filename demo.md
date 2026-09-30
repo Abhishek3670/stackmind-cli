@@ -2,7 +2,7 @@
 
 Welcome to **StackMind v3.7.0**, a compiler-backed, contract-governed multi-agent engineering runtime.
 
-StackMind enables full-stack software development driven by specialized AI agent roles (`claude`, `codex`, `gemini`, `gemma`, `local-llm`), coordinated continuously by a deterministic **Lifecycle Supervisor**, monitored live through an interactive Terminal UI control plane (`stackmind tui`), and protected by **Code-Graph Intelligence (KNOW-01)**, **Contract Scope Enforcement (CONTRACT-01)**, **Harness Verification (HARNESS-01)**, and **Human-in-the-Loop Governance**.
+StackMind enables full-stack software development driven by specialized AI agent roles (`claude`, `codex`, `gemini`, `gemma`, `local-llm`), coordinated continuously by a deterministic **Lifecycle Supervisor**, monitored live through an interactive Terminal UI control plane (`stackmind tui`), and powered by an expanded **92-Tool Governed Capability Layer** spanning 14 capability domains, protected by **Code-Graph Intelligence (KNOW-01)**, **Contract Scope Enforcement (CONTRACT-01)**, **Harness Verification (HARNESS-01)**, and **Human-in-the-Loop Governance**.
 
 ---
 
@@ -58,6 +58,53 @@ StackMind enforces strict separation of concerns and process isolation (**IDE-01
 | **Gemini** | Frontend Lead | Client-side UI/UX, HTML/CSS/JS, React, Flutter, client state (`src/frontend.html`, `ui/**`). | Denied backend APIs, database models, contract YAMLs, and dependency manifests. |
 | **Gemma** | QA Lead | Precondition verification, contract boundary audits, AST security scans (hardcoded secrets), verification receipts. | May inspect and run validation tests, but cannot modify application source code or close work orders. |
 | **Local-LLM** | GitOps & Release Lead | Package versions (`VERSION.md`, `pyproject.toml`), changelogs, staging verified deliverables, release commits with audit trailers. | May not alter architectural contracts or product scope. Operations subject to D025 safeguards. |
+
+---
+
+## 🛠️ Governed Agent Capability Matrix & 92-Tool Catalog
+
+StackMind v3.7.0 expands agent capabilities from 4 primitive operations to a comprehensive **92-tool capability surface** across 14 distinct functional domains.
+
+### The 3-Tier Security & Governance Chain
+Every tool invocation initiated by any agent must traverse StackMind's invariant verification pipeline before execution:
+1. **Role Filtering (`get_tools_for_role`)**: Tool schemas provided in LLM tool-calling prompts are strictly filtered by the agent's role policy. Forbidden tools are omitted from the prompt schema entirely.
+2. **Kernel Policy Check (`AuthorizationPolicy.permits(op)`)**: If a model generates an unpermitted tool call, the kernel rejects it with a fail-closed `PermissionError`.
+3. **Contract Boundary Check (`ContractEvaluator.authorize(contract, op, target)`)**: Workspace file writes, patches, and command executions must fall strictly within the Work Order's `allow` pattern and outside its `deny` pattern.
+4. **Audit Journal (`OperationJournal`)**: Every call (attempt, authorization status, runtime duration, output summary, or denial reason) is immutably journaled.
+
+```text
+  LLM Prompt (Role-Filtered Schemas)
+                │
+                ▼
+  Kernel Tool Gateway Dispatcher
+                │
+                ├─► [Gate 1] Role Authorization Policy   ──► REJECT (if unpermitted for role)
+                │
+                ├─► [Gate 2] Contract Scope Evaluator    ──► REJECT (if target outside allow/in deny)
+                │
+                ├─► [Gate 3] Execution Sandbox / Process  ──► EXECUTE (isolated scratch workspace)
+                │
+                └─► [Gate 4] Operation Audit Journal     ──► RECORD (unforgeable provenance log)
+```
+
+### The 14 Capability Domains
+
+| Domain | Description | Canonical Tools | Permitted Roles |
+|---|---|---|---|
+| **1. Repository & File Discovery** | High-speed multi-file reading, directory trees, glob pattern matching, and regex grep. | `read_file`, `read_many_files`, `list_directory`, `glob`, `grep`, `find_symbol`, `find_references` | Universal (`claude`, `codex`, `gemini`, `gemma`, `local-llm`) |
+| **2. Structured Editing & Patching** | Unified diff patching with fuzzy hunk matching, file creation, movement, deletion, and formatting. | `write_file`, `apply_patch`, `move_file`, `delete_file`, `format_file` | `codex`, `gemini`, `local-llm` (metadata only). **Forbidden:** `claude`, `gemma`. |
+| **3. Process & Execution Lifecycle** | Managed background processes, status tracking, non-blocking tailing, and test runners. | `run_command`, `process_start`, `process_status`, `process_output`, `process_stop`, `run_tests`, `run_lint`, `run_typecheck`, `run_security_scan`, `cleanup` | `codex`, `gemini`, `gemma`, `local-llm`. Read-only inspect: `claude`. |
+| **4. Knowledge Graph Intelligence** | AST symbol lookup, caller/callee graphs, blast-radius impact analysis, and context assembly. | `query_graph`, `get_context`, `find_callers`, `find_callees`, `impact_analysis`, `dependency_analysis`, `semantic_search`, `runtime_evidence`, `data_flow_analysis`, `knowledge_stats` | Universal (Read-only) |
+| **5. Planning & Task Orchestration** | Structured task checklists, user clarification modals, plan mode toggles, and work order authoring. | `todo`, `ask_user`, `enter_plan_mode`, `exit_plan_mode`, `create_work_order`, `update_work_order`, `inspect_work_order`, `dispatch_subagent` | Authoring: `claude`. Task tracking & user interaction: `codex`, `gemini`, `gemma`. |
+| **6. Governance & Contract Introspection** | Inspecting active contracts, validating scope boundaries, explaining denials, and checking budgets. | `get_contract`, `verify_contract`, `verify_scope`, `explain_denial`, `inspect_budget`, `inspect_agent` | Universal |
+| **7. Git Working Tree Inspection** | Status, diffs, blame, commit logs, branch checking, and changed file discovery without mutation. | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_changed_files`, `git_branch` | Universal (Read-only) |
+| **8. GitOps & Release Mutations** | Staging deliverables, creating branches, committing with audit trailers, tagging, and releases. | `git_stage`, `git_restore`, `git_create_branch`, `git_commit`, `git_tag`, `git_push`, `create_release`, `rollback_release`, `validate_release_metadata` | **`local-llm` Exclusive**. All other roles strictly denied. |
+| **9. QA Verification & Verdicts** | Evaluating deliverables, executing test suites, validating scope diffs, and issuing signed verdicts. | `verify_deliverable`, `verify_tests`, `verify_diff`, `verify_provenance`, `submit_verdict`, `request_changes`, `approve_work_order`, `submit_for_review` | **`gemma` Exclusive** (Verdicts/Approvals). Review requests: `codex`, `gemini`. |
+| **10. Procedural Learning & Skills** | Experience search, candidate pattern mining, canary verification, and skill promotion. | `experience_search`, `skill_retrieve`, `skill_list`, `skill_mine`, `skill_promote`, `skill_test`, `skill_audit` | Mining: `claude`. Verification: `gemma`. Retrieval: `codex`, `gemini`. |
+| **11. Diagnostics & Checkpointing** | Workspace snapshots, rollback points, process inspection, system metrics, and session summaries. | `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `inspect_logs`, `inspect_processes`, `collect_test_artifacts`, `system_metrics`, `diagnostics_summary`, `inspect_environment`, `compare_snapshots` | Universal |
+| **12. Browser & UI Automation** | Headless browser management, navigation, element interaction, and viewport screenshots. | `browser_open`, `browser_navigate`, `browser_click`, `browser_type`, `browser_screenshot`, `inspect_screenshot` | **`gemini` Exclusive** (Frontend Lead) |
+| **13. Web & Documentation Retrieval** | Sandboxed external search and documentation fetching. | `web_search`, `web_fetch`, `search_docs` | `claude`, `codex`, `gemini`, `gemma` |
+| **14. Versioning & Package Hygiene** | Reading and updating version declarations in `pyproject.toml`, `package.json`, and `CHANGELOG.md`. | `inspect_version`, `update_version`, `update_changelog`, `generate_release_notes`, `prepare_release` | Mutations: **`local-llm` Exclusive**. Inspect: Universal. |
 
 ---
 
@@ -157,7 +204,7 @@ What happens immediately:
 2. The supervisor synthesizes bootstrap Work Order `WO-000` assigned to **Claude** (Architecture).
 3. The supervisor transitions to **`PLANNING`** and dispatches Turn 1 to Claude through the governed Harness.
 
-In the conversation viewport, Claude queries the Knowledge Graph (`stackmind graph context`) to inspect existing project structure and imports without touching source files.
+In the conversation viewport, Claude calls `get_context` and `find_symbol` on the Knowledge Graph to inspect existing project structure and dependencies without touching source files. Claude initializes structured planning using `enter_plan_mode` and tracks planning milestones with `todo`.
 
 ---
 
@@ -205,10 +252,12 @@ Claude's plan outlines three explicit tasks:
 
 Upon receiving `:approve`, the supervisor transitions to **`AUTHORING`**.
 
-Claude executes Turn 2, authoring the formal work orders and contracts in `.sync/`:
+Claude executes Turn 2, invoking `create_work_order` and `verify_contract` to author the formal work orders and contracts in `.sync/`:
 - `.sync/work-orders/ACTIVE/WO-001.yaml` + `.sync/contracts/WO-001.yaml` (Scaffolding)
 - `.sync/work-orders/ACTIVE/WO-002.yaml` + `.sync/contracts/WO-002.yaml` (Backend Lead: `codex`)
 - `.sync/work-orders/ACTIVE/WO-003.yaml` + `.sync/contracts/WO-003.yaml` (Frontend Lead: `gemini`)
+
+Claude dispatches assignment notices asynchronously to worker inboxes using `dispatch_subagent`.
 
 Notice the Contract Layer (**CONTRACT-01**):
 - `WO-001` contract grants write access **only** to `requirements.txt`.
@@ -243,27 +292,37 @@ With `WO-001` completed, the supervisor detects that **both `WO-002` (Backend) a
    batch_operation_id = bd30b93e-0bc4-419f-a530-1ae92ab889ee
    ```
 2. **Concurrent Workers Running**:
-   - **Codex** launches on thread 1 executing `WO-002`: writes `src/backend.py` (FastAPI login route with credential check).
-   - **Gemini** launches on thread 2 executing `WO-003`: writes `src/frontend.html` (interactive login form with clean styling and async fetch).
+   - **Codex** launches on thread 1 executing `WO-002`:
+     - Calls `read_many_files(["requirements.txt"])` to inspect available frameworks.
+     - Calls `write_file("src/backend.py", ...)` or `apply_patch` (using unified diffs with fuzzy hunk matching) to implement the FastAPI login route.
+     - Formats code with `format_file("src/backend.py")`.
+     - Executes local unit tests with `run_tests("tests/test_backend.py")`.
+     - Submits completion notice via `submit_for_review("WO-002", summary="FastAPI login endpoint")`.
+   - **Gemini** launches on thread 2 executing `WO-003`:
+     - Calls `write_file("src/frontend.html", ...)` to implement the responsive login interface.
+     - Calls `browser_open("file://src/frontend.html")` and `browser_screenshot("artifacts/login_preview.png")` to verify UI rendering.
+     - Submits completion notice via `submit_for_review("WO-003", summary="Responsive login form")`.
 3. Both operations execute concurrently in the daemon's live operation journal:
    ```text
    op_996e4786 (codex)  -> RUNNING (work_order: WO-002)
    op_c94428fe (gemini) -> RUNNING (work_order: WO-003)
    ```
 4. **Contract Scope Enforcement**:
-   - If `gemini` attempts to touch `src/backend.py`, the write is rejected with `PermissionError: Path 'src/backend.py' is outside allowed contract scope`.
-   - If `codex` attempts to modify `requirements.txt`, the write is blocked: manifest ownership belongs strictly to the scaffolding turn.
+   - If `gemini` attempts to call `write_file` or `apply_patch` on `src/backend.py`, the write is rejected with `PermissionError: Path 'src/backend.py' is outside allowed contract scope`.
+   - If `codex` attempts to call `git_commit`, the call is immediately blocked by the `codex` role policy.
 5. **No-Op Prevention Gate**: The harness verifies that both workers produce real additions to their declared deliverables; empty bookkeeping turns fail closed.
 
 ---
 
 ### Step 8: QA Verification & Security Checks (Gemma)
 
-Upon turn completion, **Gemma (QA Lead)** performs 3-stage validation:
-1. **Preconditions & Dependency Check**: Checks that required packages in `requirements.txt` satisfy the AST imports (`import fastapi`).
-2. **Contract Compliance**: Confirms all modified files match the contract's `allow` boundary.
-3. **AST Security Audit**: Scans `src/backend.py` for hardcoded sensitive comparisons (`password == "admin"`). If insecure patterns are detected, a `NEEDS_CHANGES` verdict is written to Codex's inbox, triggering the supervisor's governed retry loop (**S7**).
-4. When validation passes, Gemma issues an `APPROVED` verdict.
+Upon turn completion, **Gemma (QA Lead)** performs 3-stage validation using dedicated verification tools:
+1. **Preconditions & Deliverables**: Calls `verify_deliverable(wo_id="WO-002")` and `verify_deliverable(wo_id="WO-003")` confirming files exist and are non-empty.
+2. **Contract Compliance**: Calls `verify_diff(wo_id="WO-002")` to confirm all changed files fall strictly within the contract's `allow` boundary.
+3. **Automated Test Verification**: Calls `verify_tests()` and `run_tests()` to execute test suites and collect provenance evidence via `verify_provenance()`.
+4. **AST Security Audit**: Scans `src/backend.py` for hardcoded sensitive comparisons (`password == "admin"`). If insecure patterns are detected, Gemma calls `request_changes(wo_id="WO-002", issues=[...])`, triggering the supervisor's governed retry loop (**S7**).
+5. **Approval Verdict**: When all gates pass, Gemma signs off by invoking `approve_work_order("WO-002")` and `submit_verdict("WO-002", verdict="APPROVED", report="...")`.
+   *(Note: Gemma is strictly an evaluator; any attempt by Gemma to invoke `write_file` or `apply_patch` is immediately blocked by policy).*
 
 ---
 
@@ -282,9 +341,9 @@ Once all worker WOs are verified:
 ### Step 10: GitOps Release & Provenance Commit (Local-LLM)
 
 The supervisor transitions to **`GITOPS`** and dispatches **Local-LLM**:
-1. Staging isolation: Only intended application deliverables (`requirements.txt`, `src/backend.py`, `src/frontend.html`) are staged for release.
-2. Runtime state, `.sync/inbox/` notices, and knowledge caches are excluded via release policy.
-3. Local-LLM executes the governed release commit with **immutable audit trailers**:
+1. Staging isolation: Local-LLM calls `git_status()` and `git_diff()` to inspect the workspace, then calls `git_stage(paths=["requirements.txt", "src/backend.py", "src/frontend.html"])` to stage only intended application deliverables.
+2. Version hygiene: Calls `validate_release_metadata()` and `update_changelog()` to record the release entry in `CHANGELOG.md`.
+3. Provenance commit: Local-LLM invokes `git_commit()` to generate the governed release commit with **immutable audit trailers**:
 
 ```bash
 git show --stat HEAD
