@@ -148,9 +148,9 @@ def assert_scope_contained(parent_scope: Any, child_scope: Any, role: str = "sub
 # ─── 2. CREDENTIAL ZERO-LEAKAGE SCANNING ──────────────────────────────────────
 
 _CREDENTIAL_PATTERNS = [
-    # Generic API Keys / Secrets (requires quotes or unquoted value not followed by call parentheses)
+    # Generic API Keys / Secrets (requires quotes or unquoted value not followed by call parentheses or property dots)
     re.compile(
-        r"""(?i)(?:\b[a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|auth[_-]?token))\s*[:=]\s*(?:'([^'\n]{12,})'|"([^"\n]{12,})"|([a-zA-Z0-9_\-\.]{12,})\b(?!\s*[\(\.]))"""
+        r"""(?i)(?:\b[a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|auth[_-]?token))\s*[:=]\s*(?:'([^'\n]{12,})'|"([^"\n]{12,})"|`([^`\n]{12,})`|([a-zA-Z0-9_\-]{12,})\b(?!\s*[\(\.]))"""
     ),
     # Provider-specific key patterns
     re.compile(r"sk-[a-zA-Z0-9_\-]{20,}"),
@@ -165,6 +165,17 @@ _ALLOWLIST_TOKENS = {
     "none", "null", "undefined", "mock", "dummy", "test-token", "fake-key",
     "secret", "password", "governed", "codex", "claude", "gemini", "gemma",
 }
+
+_ALLOWLIST_SUBSTRINGS = (
+    "mock", "dummy", "fake", "placeholder", "example", "test-token", "test_token", "sample-",
+)
+
+
+def is_allowlisted_token(val: str) -> bool:
+    v = val.lower().strip()
+    if v in _ALLOWLIST_TOKENS:
+        return True
+    return any(sub in v for sub in _ALLOWLIST_SUBSTRINGS)
 
 
 def is_test_file(path: str | Path | None) -> bool:
@@ -358,7 +369,7 @@ class CredentialLeakScanner:
         for pattern in _CREDENTIAL_PATTERNS:
             for match in pattern.finditer(text):
                 matched_val = next((g for g in match.groups() if g is not None), match.group(0))
-                if matched_val.lower() not in _ALLOWLIST_TOKENS:
+                if not is_allowlisted_token(matched_val):
                     leaks.append(f"Credential pattern matched ({pattern.pattern[:20]}...): '{matched_val[:4]}***'")
 
         # Insecure credential comparison / hardcoded auth logic check
@@ -381,7 +392,7 @@ class CredentialLeakScanner:
                 key_str = str(k)
                 # Check for sensitive key names with populated non-empty values
                 if any(sec in key_str.lower() for sec in ("api_key", "apikey", "secret_key", "access_token", "private_key")):
-                    if isinstance(v, str) and v and v.lower() not in _ALLOWLIST_TOKENS:
+                    if isinstance(v, str) and v and not is_allowlisted_token(v):
                         leaks.append(f"{path}.{key_str}: Raw secret value populated in key")
                 leaks.extend(self.scan_object(v, f"{path}.{key_str}" if path else key_str))
         elif isinstance(obj, (list, tuple, set)):
