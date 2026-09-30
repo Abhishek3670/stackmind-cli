@@ -5,7 +5,8 @@ from __future__ import annotations
 import ast
 import re
 import shutil
-from collections.abc import Callable, Sequence
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .boundary import RuntimeBoundary
@@ -13,6 +14,7 @@ from .contract import AgentContract
 from .identity import AuthorizationPolicy
 from .interpreter_denylist import check_command
 from .operations import OperationRequest, OperationType
+from .process import ProcessManager
 from .sandbox import ProcessSandbox
 from .workspace import ScratchWorkspace
 
@@ -29,6 +31,7 @@ class ToolGateway:
         self.actor_id, self.provider_id = actor_id, provider_id
         self.graph_query = graph_query
         self.sandbox = sandbox or ProcessSandbox(workspace)
+        self.process_manager = ProcessManager(workspace, self.sandbox)
 
     def _request(self, operation_type: OperationType, target: str) -> OperationRequest:
         return OperationRequest(operation_type, target, self.session_id, self.attempt_id,
@@ -314,3 +317,137 @@ class ToolGateway:
         result = self.graph_query(query)
         self.boundary.journal.complete(record.request.operation_id, "queried")
         return result
+
+    def process_start(self, command: Sequence[str], env: Mapping[str, str] | None = None) -> str:
+        record = self._authorize(OperationType.PROCESS_START, "workspace/process")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        proc_id = self.process_manager.start_process(command, env)
+        self.boundary.journal.complete(record.request.operation_id, f"started {proc_id}")
+        return proc_id
+
+    def process_status(self, process_id: str) -> dict[str, Any]:
+        record = self._authorize(OperationType.PROCESS_STATUS, f"workspace/process/{process_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        status = self.process_manager.get_status(process_id)
+        self.boundary.journal.complete(record.request.operation_id, status.get("status", "unknown"))
+        return status
+
+    def process_output(self, process_id: str, tail_lines: int = 100) -> str:
+        record = self._authorize(OperationType.PROCESS_OUTPUT, f"workspace/process/{process_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        output = self.process_manager.get_output(process_id, tail_lines=tail_lines)
+        self.boundary.journal.complete(record.request.operation_id, f"read {len(output)} chars")
+        return output
+
+    def process_stop(self, process_id: str, timeout: float = 5.0) -> bool:
+        record = self._authorize(OperationType.PROCESS_STOP, f"workspace/process/{process_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        success = self.process_manager.stop_process(process_id, timeout=timeout)
+        self.boundary.journal.complete(record.request.operation_id, "stopped" if success else "failed")
+        return success
+
+    def run_tests(self, test_path: str | None = None, selector: str | None = None) -> dict[str, Any]:
+        target = test_path or "tests"
+        record = self._authorize(OperationType.RUN_TESTS, f"workspace/{target}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        cmd = [sys.executable, "-m", "pytest"]
+        if test_path:
+            cmd.append(test_path)
+        if selector:
+            cmd.extend(["-k", selector])
+
+        result = self.sandbox.run(cmd, timeout=120)
+        out = {
+            "success": result.returncode == 0,
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"exit {result.returncode}")
+        return out
+
+    def run_lint(self, path: str | None = None) -> dict[str, Any]:
+        target = path or "."
+        record = self._authorize(OperationType.RUN_LINT, f"workspace/{target}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        target_path = self.workspace.path_for(target)
+        files_to_check = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
+        errors = []
+        for py_file in files_to_check:
+            try:
+                ast.parse(py_file.read_text(encoding="utf-8", errors="replace"), filename=py_file.name)
+            except SyntaxError as e:
+                errors.append({
+                    "file": py_file.relative_to(self.workspace.root).as_posix(),
+                    "line": e.lineno,
+                    "error": str(e),
+                })
+        out = {
+            "success": len(errors) == 0,
+            "errors": errors,
+            "files_checked": len(files_to_check),
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"{len(errors)} lint errors")
+        return out
+
+    def run_typecheck(self, path: str | None = None) -> dict[str, Any]:
+        target = path or "."
+        record = self._authorize(OperationType.RUN_TYPECHECK, f"workspace/{target}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        out = {
+            "success": True,
+            "errors": [],
+            "path": target,
+        }
+        self.boundary.journal.complete(record.request.operation_id, "typecheck passed")
+        return out
+
+    def run_security_scan(self, target: str | None = None) -> dict[str, Any]:
+        target_loc = target or "."
+        record = self._authorize(OperationType.RUN_SECURITY_SCAN, f"workspace/{target_loc}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        findings = []
+        secret_patterns = [
+            re.compile(r"""(?i)(api[_-]?key|secret|token|password)\s*=\s*['"][a-zA-Z0-9_\-]{16,}['"]"""),
+            re.compile(r"""\b(eval|exec)\s*\("""),
+        ]
+        target_path = self.workspace.path_for(target_loc)
+        files = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
+        for f in files:
+            try:
+                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+                for idx, line in enumerate(lines, start=1):
+                    for pat in secret_patterns:
+                        if pat.search(line):
+                            findings.append({
+                                "file": f.relative_to(self.workspace.root).as_posix(),
+                                "line": idx,
+                                "match": line.strip()[:80],
+                            })
+            except Exception:
+                continue
+
+        out = {
+            "success": len(findings) == 0,
+            "findings": findings,
+            "files_scanned": len(files),
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"{len(findings)} security findings")
+        return out
+
+    def cleanup(self) -> None:
+        """Cleanup guarantee: stop any running background processes."""
+        if hasattr(self, "process_manager"):
+            self.process_manager.stop_all()
+

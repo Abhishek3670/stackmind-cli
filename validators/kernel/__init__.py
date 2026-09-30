@@ -22,6 +22,7 @@ from .identity import AgentIdentity, AuthorizationPolicy, HumanIdentity, Provide
 from .mcp import GovernedToolRegistry, McpProtocol, McpServer, OperatingMode, OperatingModeTracker
 from .multi import AgentRole, EnsembleMember, HandoffRecord, MultiAgentSupervisor, TaskDelegation
 from .operations import OperationJournal, OperationRecord, OperationRequest, OperationType
+from .process import ProcessError, ProcessManager
 from .providers import (
     STANDARD_KERNEL_TOOLS,
     AuthenticationError,
@@ -86,6 +87,8 @@ __all__ = [
     "OperationType",
     "OperatingMode",
     "OperatingModeTracker",
+    "ProcessError",
+    "ProcessManager",
     "ProviderAdapter",
     "ProviderError",
     "ProviderGateway",
