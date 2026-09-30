@@ -93,7 +93,7 @@ def daemon_start(port: int, workspace: Path):
     console.print(f"[bold green][+] Starting StackMind LocalDaemon on port {port}...[/bold green]")
     srv = LocalDaemon(str(daemon_state_dir(workspace)), port=port).start()
     write_daemon_pid(workspace, srv.address[1])
-    console.print(f"[bold green]✓ Daemon listening at {srv.url}[/bold green]")
+    console.print(f"[bold green][OK] Daemon listening at {srv.url}[/bold green]")
     console.print("[dim]Press Ctrl+C to stop daemon.[/dim]")
     try:
         while True:
