@@ -1050,7 +1050,7 @@ class AgentRunner:
 
         from validators.kernel.boundary import RuntimeBoundary
         from validators.kernel.contract import AgentContract as KernelContract
-        from validators.kernel.identity import AuthorizationPolicy
+        from validators.kernel.identity import AuthorizationPolicy, get_role_policy
         from validators.kernel.operations import OperationJournal
         from validators.kernel.tools import ToolGateway
         from validators.kernel.workspace import ScratchWorkspace
@@ -1102,10 +1102,7 @@ class AgentRunner:
             write_mode=task_contract.write_mode,
             budget=task_contract.budget,
         ).freeze()
-        policy = AuthorizationPolicy.permit(
-            f'contract-{contract.work_order}',
-            ('read_file', 'write_file', 'run_command', 'query_graph'),
-        )
+        policy = get_role_policy(self.agent)
         boundary = RuntimeBoundary(OperationJournal())
 
         def graph_query(query: str) -> dict[str, Any]:

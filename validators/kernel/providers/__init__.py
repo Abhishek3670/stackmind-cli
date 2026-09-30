@@ -14,7 +14,7 @@ from .errors import (
     ToolLimitExceededError,
     ToolLoopExhaustedError,
 )
-from .gateway import STANDARD_KERNEL_TOOLS, ProviderGateway
+from .gateway import STANDARD_KERNEL_TOOLS, ProviderGateway, get_tools_for_role
 from .models import (
     Message,
     MessageRole,
@@ -49,4 +49,5 @@ __all__ = [
     "ToolDefinition",
     "ToolLimitExceededError",
     "ToolLoopExhaustedError",
+    "get_tools_for_role",
 ]

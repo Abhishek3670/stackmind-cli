@@ -101,6 +101,8 @@ class ContractEvaluator:
         "run_command", "process_start", "git_stage", "git_restore", "git_create_branch",
         "git_commit", "git_tag", "git_push", "create_release", "rollback_release",
         "create_work_order", "update_work_order", "checkpoint", "restore_checkpoint",
+        "update_version", "update_changelog", "prepare_release", "submit_for_review",
+        "submit_verdict", "request_changes", "approve_work_order",
     }
 
     _SESSION_OPERATIONS = {
@@ -109,6 +111,13 @@ class ContractEvaluator:
         "knowledge_stats", "skill_test", "skill_audit", "validate_release_metadata",
         "inspect_logs", "inspect_processes", "system_metrics", "diagnostics_summary", "list_checkpoints",
         "inspect_environment", "compare_snapshots",
+        "get_context", "semantic_search", "runtime_evidence", "verify_contract",
+        "inspect_work_order", "inspect_agent", "dispatch_subagent",
+        "web_search", "web_fetch", "search_docs",
+        "browser_open", "browser_navigate", "browser_click", "browser_type",
+        "browser_screenshot", "inspect_screenshot",
+        "experience_search", "skill_retrieve", "skill_list", "skill_mine", "skill_promote",
+        "inspect_version", "generate_release_notes",
     }
 
     @staticmethod
