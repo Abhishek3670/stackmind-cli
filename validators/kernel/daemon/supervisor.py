@@ -452,8 +452,18 @@ class LifecycleSupervisor:
             ws = Path(state.workspace)
             plan = self.manager.get_plan(state.session_id, state.plan_id) if state.plan_id else {}
 
-            # If authoring failed or worker WOs aren't yet authored for this plan, synthesize them
-            if authoring_failed or not state.worker_wo_ids:
+            # If worker WOs aren't set yet, check if plan already has created work orders on disk
+            if not state.worker_wo_ids:
+                created = plan.get("created_work_orders", [])
+                existing_ids = [
+                    w["id"] for w in created
+                    if isinstance(w, dict) and (ws / ".sync" / "work-orders" / "ACTIVE" / f"{w['id']}.yaml").is_file()
+                ]
+                if existing_ids:
+                    state.worker_wo_ids = existing_ids
+
+            # If still no worker WOs (or authoring failed and nothing was created), synthesize them
+            if not state.worker_wo_ids:
                 from .authoring import synthesize_child_work_orders
                 try:
                     synthesized = synthesize_child_work_orders(ws, plan, session_id=state.session_id)
