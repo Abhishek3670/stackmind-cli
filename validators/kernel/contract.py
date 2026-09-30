@@ -96,7 +96,12 @@ class ContractNormalizer:
 class ContractEvaluator:
     """Fail-closed target and operation authorization evaluator."""
 
-    _WRITE_OPERATIONS = {"write_file", "delete_file", "run_command"}
+    _WRITE_OPERATIONS = {
+        "write_file", "apply_patch", "move_file", "delete_file", "format_file",
+        "run_command", "process_start", "git_stage", "git_restore", "git_create_branch",
+        "git_commit", "git_tag", "git_push", "create_release", "rollback_release",
+        "create_work_order", "update_work_order", "checkpoint", "restore_checkpoint",
+    }
 
     @staticmethod
     def _matches(target: str, rule: str) -> bool:
