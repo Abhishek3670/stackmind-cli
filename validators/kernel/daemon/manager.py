@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, RLock, Thread
@@ -945,6 +946,20 @@ class SessionManager:
                 raise KeyError("unknown session")
             return [dict(p) for p in session.get("plans", {}).values()]
 
+    def get_next_plan_id(self, session_id: str) -> str:
+        """Generate the next monotonically increasing plan ID for a session (e.g. PLAN-001, PLAN-002)."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return "PLAN-001"
+            plans = session.get("plans", {})
+            max_num = 0
+            for pid in plans.keys():
+                m = re.match(r"^PLAN-(\d+)$", str(pid))
+                if m:
+                    max_num = max(max_num, int(m.group(1)))
+            return f"PLAN-{max_num + 1:03d}"
+
     def approve_plan(
         self, session_id: str, plan_id: str, reason: str = ""
     ) -> list[dict[str, Any]]:
@@ -1832,7 +1847,12 @@ class SessionManager:
                                 "is_goal": True,
                                 "work_order_id": op_rec.get("work_order_id"),
                             }
-                            plan_id = "PLAN-001"
+                            existing_plans = self.list_plans(session_id)
+                            if existing_plans and str(existing_plans[-1].get("state", "")).upper() == "REJECTED":
+                                plan_id = existing_plans[-1].get("plan_id")
+                            else:
+                                plan_id = self.get_next_plan_id(session_id)
+
                             self.propose_plan(
                                 session_id=session_id,
                                 plan_id=plan_id,

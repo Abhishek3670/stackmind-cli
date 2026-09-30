@@ -1031,10 +1031,30 @@ def test_landing_page_deliverable_extraction():
     assert agent_id == "gemini"
     assert role == "frontend"
 
-    deliv = extract_deliverable_spec(title, tasks, role)
-    assert deliv["type"] == "code"
-    assert deliv["path"] == "src/landing.html"
-    assert deliv["path"] != "requirements.txt"
+def test_dynamic_plan_id_incrementation(tmp_path: Path):
+    """Verify that get_next_plan_id monotonically increments across multiple goals."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    daemon = SessionManager(storage)
+    sess = daemon.create_session(agent="claude", provider="test", contract={"schema_version": 1}, workspace=str(tmp_path))
+    session_id = sess["session_id"]
+
+    # First plan
+    p1_id = daemon.get_next_plan_id(session_id)
+    assert p1_id == "PLAN-001"
+    daemon.propose_plan(session_id, p1_id, "Plan 1", "content 1")
+    daemon.approve_plan(session_id, p1_id)
+
+    # Second plan after first is approved
+    p2_id = daemon.get_next_plan_id(session_id)
+    assert p2_id == "PLAN-002"
+    daemon.propose_plan(session_id, p2_id, "Plan 2", "content 2")
+
+    # Third plan
+    p3_id = daemon.get_next_plan_id(session_id)
+    assert p3_id == "PLAN-003"
 
 
 

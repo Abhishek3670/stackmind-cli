@@ -373,12 +373,21 @@ class LifecycleSupervisor:
                 state.error = f"Planning turn failed: {op.get('result', {}).get('error', 'unknown')}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED
-            # Planning completed — check if a plan was proposed
+            # Planning completed — check if a plan was proposed for this turn
             plans = self.manager.list_plans(state.session_id)
-            if plans:
-                latest_plan = plans[-1]
-                state.plan_id = latest_plan.get("plan_id")
-                plan_state = str(latest_plan.get("state", "")).upper()
+            matching_plan = None
+            if state.planning_operation_id:
+                for p in reversed(plans):
+                    if p.get("metadata", {}).get("operation_id") == state.planning_operation_id:
+                        matching_plan = p
+                        break
+            if matching_plan is None and plans:
+                if str(plans[-1].get("state", "")).upper() == "AWAITING_APPROVAL":
+                    matching_plan = plans[-1]
+
+            if matching_plan:
+                state.plan_id = matching_plan.get("plan_id")
+                plan_state = str(matching_plan.get("state", "")).upper()
                 if plan_state == "AWAITING_APPROVAL":
                     self._transition(state, Phase.AWAITING_APPROVAL)
                     return AdvanceResult.WAITING_FOR_HUMAN
