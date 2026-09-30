@@ -377,20 +377,26 @@ def format_session_header(
     workspace = session.get("workspace")
 
     status_suffix = f" | {render_connection_status_str(status)}" if status else ""
+    phase_val = None
+    if "run" in session and isinstance(session["run"], Mapping):
+        phase_val = session["run"].get("phase")
+    if not phase_val and "phase" in session:
+        phase_val = session.get("phase")
+    phase_info = f" | phase: {phase_val}" if phase_val else ""
 
     if width >= 80:
         agent_info = f" | agent: {agent}" if agent else ""
         ws_info = f" | workspace: {workspace}" if workspace else ""
-        return f"Session {sid} | {state_val} | provider: {provider}{agent_info}{ws_info}{status_suffix}"
+        return f"Session {sid} | {state_val} | provider: {provider}{agent_info}{ws_info}{phase_info}{status_suffix}"
     elif width >= 55:
         ws_short = Path(str(workspace)).name if workspace else ""
         agent_info = f" | {agent}" if agent else ""
         ws_info = f" | ws: {ws_short}" if ws_short else ""
         display_sid = sid if len(sid) <= 12 else sid[:8] + "..."
-        return f"Session {display_sid} | {state_val}{agent_info}{ws_info}{status_suffix}"
+        return f"Session {display_sid} | {state_val}{phase_info}{agent_info}{ws_info}{status_suffix}"
     else:
         display_sid = sid if len(sid) <= 8 else sid[:6] + ".."
-        return f"Session {display_sid} | {state_val}{status_suffix}"
+        return f"Session {display_sid} | {state_val}{phase_info}{status_suffix}"
 
 
 def _get_version() -> str:
@@ -1802,9 +1808,22 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized == ":resume":
-        session = adapter.command(":resume", session_id=session["session_id"])
-        output_str = f"Session {session.get('state', 'RUNNING')}"
+    if normalized.startswith(":resume"):
+        _, _, run_arg = normalized.partition(" ")
+        run_id_clean = run_arg.strip() or None
+        run_resumed_msg = ""
+        try:
+            resumed_run = client.run_resume(session["session_id"], run_id=run_id_clean)
+            if resumed_run:
+                run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {resumed_run.get('phase')}"
+                state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+        except Exception as run_err:
+            run_resumed_msg = f" (supervisor note: {run_err})"
+        try:
+            session = adapter.command(":resume", session_id=session["session_id"])
+        except Exception:
+            pass
+        output_str = f"Session {session.get('state', 'RUNNING')}{run_resumed_msg}"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -2532,9 +2551,17 @@ def _dispatch_command(
 @click.option("--daemon-url", default=None, help="URL of an existing local daemon.")
 @click.option("--agent", "-a", "agent", default="codex", show_default=True)
 @click.option("--workspace", "-w", "workspace", type=click.Path(path_type=Path), default=Path("."))
+@click.option("--session-id", "-s", "target_session_id", default=None, help="Attach to a specific daemon session ID.")
 @click.option("--demo", is_flag=True, help="Run the automated daemon-backed walkthrough.")
 @click.option("--timeout", "client_timeout", type=float, default=45.0, show_default=True, help="Turn operation wait timeout in seconds.")
-def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_timeout: float = 45.0) -> None:
+def tui(
+    daemon_url: str | None,
+    agent: str,
+    workspace: Path,
+    demo: bool,
+    client_timeout: float = 45.0,
+    target_session_id: str | None = None,
+) -> None:
     """Start the governed Python-native terminal control plane."""
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
@@ -2546,12 +2573,39 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
     try:
         client = DaemonClient(daemon_url)
         adapter = StackMindTuiAdapter(client)
-        session = client.create_session(
-            agent=agent,
-            provider="daemon",
-            contract=_default_contract(),
-            workspace=str(workspace.resolve()),
-        )
+
+        session = None
+        if target_session_id:
+            try:
+                session = client.get_session(target_session_id)
+            except Exception as err:
+                click.echo(f"Warning: could not attach to session '{target_session_id}': {err}", err=True)
+
+        if session is None:
+            try:
+                all_sessions = client.list_sessions()
+                ws_resolved_posix = workspace.resolve().as_posix().lower()
+                matching = [
+                    s for s in all_sessions
+                    if Path(s.get("workspace", "")).resolve().as_posix().lower() == ws_resolved_posix
+                ]
+                active_matching = [
+                    s for s in matching
+                    if str(s.get("state", "")).upper() not in {"COMPLETED", "CANCELLED", "FAILED"}
+                ]
+                candidate = active_matching[-1] if active_matching else None
+                if candidate and "session_id" in candidate:
+                    session = client.get_session(candidate["session_id"])
+            except Exception:
+                session = None
+
+        if session is None:
+            session = client.create_session(
+                agent=agent,
+                provider="daemon",
+                contract=_default_contract(),
+                workspace=str(workspace.resolve()),
+            )
         state = AutonomousDeliveryState(
             project_name=workspace.resolve().name, session_id=session["session_id"]
         )

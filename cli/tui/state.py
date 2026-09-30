@@ -11,7 +11,10 @@ import datetime
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping
+
+import yaml
 
 
 class ProjectPhase(str, Enum):
@@ -675,9 +678,19 @@ class AutonomousDeliveryState:
                     if parent_id and parent_id in self.operations:
                         if op_id not in self.operations[parent_id].children:
                             self.operations[parent_id].children.append(op_id)
-                    else:
-                        if op_id not in self.operations["op-root"].children:
-                            self.operations["op-root"].children.append(op_id)
+        active_op = session.get("active_operation")
+        if not active_op and "op-root" in self.operations:
+            self.operations.pop("op-root", None)
+
+        run_phase = session.get("phase") or (session.get("run", {}).get("phase") if isinstance(session.get("run"), Mapping) else None)
+        if run_phase:
+            rp_str = str(run_phase).upper()
+            if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING"):
+                self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+            elif rp_str == "AWAITING_APPROVAL":
+                self.phase = ProjectPhase.AWAITING_APPROVAL
+            elif rp_str in ("COMPLETE", "PRODUCT_READY"):
+                self.phase = ProjectPhase.PROJECT_COMPLETE
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
         if not isinstance(wo_records, list):
@@ -856,6 +869,34 @@ class AutonomousDeliveryState:
                         wos = plan_obj.get("work_orders") or plan_obj.get("created_work_orders")
                         if isinstance(wos, list):
                             self.sync_work_orders(wos)
+            except Exception:
+                pass
+
+        if workspace is not None:
+            try:
+                ws_path = Path(workspace)
+                active_wos_dir = ws_path / ".sync" / "work-orders" / "ACTIVE"
+                if active_wos_dir.is_dir():
+                    import yaml
+                    disk_wos = []
+                    for wo_file in sorted(active_wos_dir.glob("*.yaml")):
+                        try:
+                            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                            if isinstance(wo_data, dict):
+                                disk_wos.append(wo_data)
+                        except Exception:
+                            pass
+                    if disk_wos:
+                        self.sync_work_orders(disk_wos)
+
+                plan_file = ws_path / ".sync" / "PLAN.md"
+                if not plan_file.exists():
+                    plan_file = ws_path / "PLAN.md"
+                if plan_file.exists():
+                    self.completion_checklist["PLAN.md"] = True
+                    if self.phase in (ProjectPhase.INITIALIZING, ProjectPhase.AWAITING_APPROVAL):
+                        if active_wos_dir.is_dir() and any(active_wos_dir.glob("*.yaml")):
+                            self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
             except Exception:
                 pass
 
@@ -1042,6 +1083,22 @@ class AutonomousDeliveryState:
             if normalized_role in self.roles and name != "session.cancelled":
                 self.roles[normalized_role].state = "CANCELLED"
             self.add_activity(normalized_role, "cancelled", payload.get("reason", ""))
+
+        elif name in {"operation.failed", "turn.failed"}:
+            op_name = payload.get("operation") or payload.get("name") or ""
+            role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
+            normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
+            op_id = payload.get("operation_id")
+            err_msg = payload.get("error") or payload.get("reason") or "failed"
+            if op_id and op_id in self.operations:
+                self.operations[op_id].status = "FAILED"
+            else:
+                for op in self.operations.values():
+                    if (op.role == normalized_role or (op_name and op.name == op_name)) and op.status == "RUNNING":
+                        op.status = "FAILED"
+            if normalized_role in self.roles:
+                self.roles[normalized_role].state = "FAILED"
+            self.add_activity(normalized_role, "failed", str(err_msg))
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")

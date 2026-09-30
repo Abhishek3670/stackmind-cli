@@ -689,3 +689,51 @@ def test_tui_state_modular_extraction_and_backward_compatibility():
     assert "Backend" in line
     assert "edit cli/tui/state.py" in line
 
+
+def test_tui_populate_from_runtime_syncs_disk_work_orders_and_plan(tmp_path: Path) -> None:
+    """populate_from_runtime correctly loads active work orders and PLAN.md from disk."""
+    import yaml
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    (active_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001",
+        "title": "Install dependencies",
+        "assigned_agents": ["codex"],
+        "priority": "P0",
+        "status": "COMPLETED",
+    }), encoding="utf-8")
+    (active_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "title": "Build FastAPI login backend",
+        "assigned_agents": ["codex"],
+        "priority": "P0",
+        "status": "RUNNING",
+    }), encoding="utf-8")
+    (tmp_path / ".sync" / "PLAN.md").write_text("# Project Plan\n\nLogin implementation plan.", encoding="utf-8")
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.populate_from_runtime(workspace=tmp_path)
+
+    assert len(state.work_orders) == 2
+    assert state.work_orders[0].id == "WO-001"
+    assert state.work_orders[0].title == "Install dependencies"
+    assert state.work_orders[1].id == "WO-002"
+    assert state.work_orders[1].title == "Build FastAPI login backend"
+    assert state.completion_checklist["PLAN.md"] is True
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+
+
+def test_tui_update_from_session_clears_idle_op_root() -> None:
+    """When a session has no active_operation, op-root is cleared so current_operation is None."""
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    assert state.get_current_operation() is not None  # Default initial op-root is RUNNING
+
+    # Updating with session that has active_operation: None clears op-root
+    state.update_from_session({"session_id": "sess-123", "state": "RUNNING", "active_operation": None})
+    assert state.get_current_operation() is None
+
+

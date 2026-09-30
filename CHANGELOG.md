@@ -5,7 +5,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-09-29
+
 ### Added
+- **Lifecycle Supervisor & Deterministic Multi-Agent Orchestration**:
+  - Deterministic state machine (`INIT` → `PLANNING` → `AWAITING_APPROVAL` → `AUTHORING` → `DISPATCHING` → `EXECUTING` → `INTEGRATION_REVIEW` → `PRODUCT_READY` → `GITOPS` → `COMPLETE`).
+  - S1 TUI adapter and daemon integration: `:goal` dispatches supervised runs, `:status` renders active run phase, and `:approve`/`:reject` route through supervisor plan resolution.
+  - S2 Human approval gate: halts execution in `AWAITING_APPROVAL`, resuming on operator approval or re-planning on rejection with operator feedback.
+  - S3 Real deliverable disk verification: checks declared deliverable on disk before marking work orders completed.
+  - S4 Blocked turn escalation: transitions to `Phase.BLOCKED` on unrecoverable gate failures without infinite retry loops.
+  - S5 Multi-session run isolation: complete separation of run states and daemon storage per session.
+  - S6 Real SessionManager concurrent worker dispatch: introduces supervisor batch operations (`parent_operation_id`) allowing sibling worker operations (`WO-002`, `WO-003`) to run concurrently in daemon operation tracking.
+  - S7 Governed QA retry loop: automatic retry with structured error feedback up to `max_retries` before transitioning to `Phase.FAILED`.
+  - S8 Crash recovery and resumability: recovers in-flight operations upon daemon restart without duplicate turn dispatch.
+- **Driver Reliability Hardening**:
+  - Dedicated `OperationContentionError` for mutual exclusion collisions in `SessionManager.begin_operation`.
+  - Double-bounded contention handling: bounded consecutive contention attempts (`max_contention_retries=50`) and continuous operation timeout (`max_wait_seconds=300`) escalating cleanly to `Phase.BLOCKED`.
+- **Narrowed Architecture Default Contract**:
+  - Narrowed Claude default contract to minimal legitimate authoring boundary: `PLAN.md`, `.sync/work-orders/**`, `.sync/contracts/**`, and assigned inboxes (`local-llm`, `claude`), with explicit denial of `src/**`, `tests/**`, runtime state, and other agents' inboxes.
+- **GitOps Release Provenance Trailers**:
+  - Standardized commit message trailers for release commits (`Work-Order`, `Released-By`, `Approved-By`, `Architect`, `Target-Work-Orders`).
 - **Import / Dependency Satisfiability Gate**:
   - Fail-closed import satisfiability verification examining agent deliverables using Python AST.
   - Manifest parsing (`pyproject.toml`, `requirements*.txt`) with import-to-distribution name mappings.

@@ -70,6 +70,7 @@ class HarnessTask:
     query: str
     work_order_id: str | None = None
     deliverable_path: str | None = None
+    is_authoring: bool = False
 
 
 @dataclass(frozen=True)
@@ -314,6 +315,7 @@ class AgentRunner:
         cancel_event: Event | None = None,
         prompt: str | None = None,
         work_order_id: str | None = None,
+        is_authoring: bool = False,
     ) -> HarnessRunResult:
         """Run one task, cooperatively stopping at operation lifecycle boundaries."""
         if cancel_event is not None:
@@ -324,6 +326,18 @@ class AgentRunner:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)
             task = self.discover_next_task(tree_data, work_order_id=work_order_id)
+            if task is not None and is_authoring:
+                task = HarnessTask(
+                    kind=task.kind,
+                    identifier=task.identifier,
+                    path=task.path,
+                    title=task.title,
+                    body=task.body,
+                    query=task.query,
+                    work_order_id=task.work_order_id,
+                    deliverable_path=None,
+                    is_authoring=True,
+                )
             if task is None and prompt:
                 adhoc_file = self.sync_path / 'inbox' / self.agent / 'adhoc.md'
                 task = HarnessTask(
@@ -333,6 +347,7 @@ class AgentRunner:
                     title=prompt.strip() or 'User Prompt',
                     body=prompt.strip() or 'User Prompt',
                     query=prompt.strip() or 'User Prompt',
+                    is_authoring=is_authoring,
                 )
             if task is None:
                 return HarnessRunResult(
@@ -354,6 +369,7 @@ class AgentRunner:
                         query=task.query,
                         work_order_id=task.work_order_id,
                         deliverable_path=task.deliverable_path,
+                        is_authoring=task.is_authoring,
                     )
 
             # 1. Post-task discovery.
@@ -728,6 +744,8 @@ class AgentRunner:
                         and (task_wo_rel is None or norm_p != task_wo_rel or norm_p in dec_norm)
                     )
                     declaration_matches = set(observed_task_files) == dec_norm
+                    if getattr(task, 'is_authoring', False) and not observed_task_files:
+                        declaration_matches = True
                     mismatch_reason = (
                         None if declaration_matches
                         else f'declared {sorted(decision.modified_files)} != observed {sorted(observed_task_files)}'
@@ -762,8 +780,10 @@ class AgentRunner:
                     if not dimensions.all_passed:
                         failed = [name for name, passed in dimensions.to_dict().items() if name != 'all_passed' and not passed]
                         reason_msg = 'verification gate failed: ' + ', '.join(failed)
+                        if staged_errors:
+                            reason_msg += f" ({'; '.join(staged_errors)})"
                         meta_dict: dict[str, Any] = {'commands_audit': stage_inputs.get('commands_audit', [])}
-                        if not dimensions.outcome_verified and task.work_order_id and task.deliverable_path:
+                        if not dimensions.outcome_verified and task.work_order_id and task.deliverable_path and not getattr(task, 'is_authoring', False):
                             norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
                             stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
                             stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
@@ -1220,16 +1240,40 @@ class AgentRunner:
                 "Return the final HarnessDecision as JSON."
             )
         else:
+            scope_hints: list[str] = []
+            if kernel_contract is not None:
+                for r in getattr(kernel_contract, "allow", ()):
+                    clean_r = str(r).replace("workspace/", "").replace("workspace\\", "")
+                    if clean_r and not clean_r.startswith(".sync") and clean_r != "PLAN.md":
+                        scope_hints.append(clean_r)
+            scope_line = f" Allowed write scope: {', '.join(scope_hints)}." if scope_hints else ""
+            target_line = f" Target deliverable file: '{request.task.deliverable_path}'." if request.task.deliverable_path else ""
             system_msg = (
                 'You are a governed StackMind worker. Use tools for all file I/O. '
-                'Code execution is unavailable; the harness verifies after the final decision. '
+                f'Code execution is unavailable; the harness verifies after the final decision.{scope_line}{target_line} '
+                'Only create or modify files permitted by your contract scope. '
                 'Once your files are written, return the final HarnessDecision as JSON.'
             )
+
+            existing_files: list[str] = []
+            try:
+                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+                for p in target_dir.rglob("*"):
+                    if p.is_file() and not any(part in (".git", ".sync", "__pycache__", ".venv", "node_modules") for part in p.parts):
+                        existing_files.append(p.relative_to(target_dir).as_posix())
+            except Exception:
+                pass
+            files_context = ""
+            if existing_files:
+                files_context = f"\nExisting workspace files:\n" + "\n".join(f"- {f}" for f in sorted(existing_files)[:30]) + "\n"
+
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = f"{raw_context}\n{files_context}" if raw_context else files_context
 
         messages = [
             Message.system(system_msg),
             Message.user(
-                f'{task_text}Context:\n{request.context.text}'
+                f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
             ),
         ]
         from validators.kernel.providers.errors import (
@@ -1813,6 +1857,7 @@ class AgentRunner:
                 scope_verified = False
 
         # Runtime contracts use path rules; validate those directly when present.
+        raw_contract = None
         if task.work_order_id:
             contract_path = self.sync_path / 'contracts' / f'{task.work_order_id}.yaml'
             if contract_path.exists():
@@ -1885,6 +1930,7 @@ class AgentRunner:
                             project_root=self.project_path,
                             staged_root=staged_root,
                             source_code=source_code,
+                            contract=raw_contract,
                         )
                         if not sat_result.passed:
                             code_verified = False
@@ -1966,7 +2012,19 @@ class AgentRunner:
             for p in task_changed_files
         )
 
-        if task.kind == 'inbox':
+        if getattr(task, 'is_authoring', False):
+            # Authoring turns produce governed work orders and contracts (or synthesis).
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+                and (
+                    authored_artifacts
+                    or bool(task_changed_files)
+                    or bool(decision.summary and decision.summary.strip())
+                    or bool(decision.report_markdown and decision.report_markdown.strip())
+                )
+            )
+        elif task.kind == 'inbox':
             # Inbox tasks are intentionally archived by the staged operation; the
             # task selected at discovery is itself the completed deliverable.
             outcome_verified = (

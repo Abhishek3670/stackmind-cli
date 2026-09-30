@@ -16,11 +16,12 @@ Enforces:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     import tomllib
@@ -246,6 +247,29 @@ FALLBACK_STDLIB_MODULES: frozenset[str] = frozenset({
     "zoneinfo",
 })
 
+STANDARD_TEST_MODULES: frozenset[str] = frozenset({
+    "pytest",
+    "_pytest",
+})
+
+
+def is_test_file_path(path: str | Path | None) -> bool:
+    """Identify if a path belongs to a test suite, fixture, or assertion file."""
+    if not path:
+        return False
+    norm = Path(path).as_posix().lower()
+    parts = norm.split("/")
+    if any(p in ("tests", "test", "testing", "fixtures", "__tests__") for p in parts):
+        return True
+    filename = Path(path).name.lower()
+    return (
+        filename.startswith("test_")
+        or filename.endswith("_test.py")
+        or filename.endswith(".spec.ts")
+        or filename.endswith(".test.ts")
+    )
+
+
 # Explicit mapping from Python import name to set of known distribution package names.
 # Normalized according to PEP 503 (lowercase, dashes instead of underscores).
 KNOWN_IMPORT_TO_DISTRIBUTIONS: dict[str, set[str]] = {
@@ -255,7 +279,8 @@ KNOWN_IMPORT_TO_DISTRIBUTIONS: dict[str, set[str]] = {
     "dotenv": {"python-dotenv"},
     "dateutil": {"python-dateutil"},
     "pil": {"pillow"},
-    "jwt": {"pyjwt"},
+    "jwt": {"pyjwt", "python-jose"},
+    "bcrypt": {"bcrypt", "passlib"},
     "sklearn": {"scikit-learn"},
     "openssl": {"pyopenssl"},
     "serial": {"pyserial"},
@@ -266,7 +291,7 @@ KNOWN_IMPORT_TO_DISTRIBUTIONS: dict[str, set[str]] = {
     "git": {"gitpython"},
     "multipart": {"python-multipart"},
     "bio": {"biopython"},
-    "pydantic_core": {"pydantic", "pydantic-core"},
+    "pydantic_core": {"pydantic", "pydantic-core", "fastapi"},
     "fitz": {"pymupdf"},
     "docx": {"python-docx"},
     "pptx": {"python-pptx"},
@@ -294,8 +319,8 @@ KNOWN_IMPORT_TO_DISTRIBUTIONS: dict[str, set[str]] = {
     "jinja2": {"jinja2"},
     "click": {"click"},
     "fastapi": {"fastapi"},
-    "starlette": {"starlette"},
-    "pydantic": {"pydantic"},
+    "starlette": {"starlette", "fastapi"},
+    "pydantic": {"pydantic", "fastapi"},
     "uvicorn": {"uvicorn"},
     "pytest": {"pytest"},
 }
@@ -327,6 +352,7 @@ class ImportSatisfiabilityResult:
     manifest_found: bool
     declared_dependencies: tuple[str, ...]
     diagnostic: str | None = None
+    manifest_permitted: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -338,6 +364,7 @@ class ImportSatisfiabilityResult:
             "manifest_found": self.manifest_found,
             "declared_dependencies": list(self.declared_dependencies),
             "diagnostic": self.diagnostic,
+            "manifest_permitted": self.manifest_permitted,
         }
 
 
@@ -684,12 +711,120 @@ def is_import_declared(
     return False
 
 
+MANIFEST_CANDIDATE_TARGETS: tuple[str, ...] = (
+    "requirements.txt",
+    "requirements-dev.txt",
+    "dev-requirements.txt",
+    "requirements.in",
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+)
+
+
+def is_manifest_permitted_by_contract(contract: Any) -> bool:
+    """Determine whether an agent contract authorizes creating or modifying dependency manifests.
+
+    Supports:
+    - bool (direct override)
+    - dict (raw contract parsed from .sync/contracts/WO-xxx.yaml)
+    - AgentContract instances (validators.kernel.contract.AgentContract)
+    - None (returns False)
+    """
+    if isinstance(contract, bool):
+        return contract
+    if contract is None:
+        return False
+
+    write_mode = "read-only"
+    raw_allow: Any = []
+    raw_deny: Any = []
+
+    if hasattr(contract, "write_mode") and hasattr(contract, "allow") and hasattr(contract, "deny"):
+        write_mode = getattr(contract, "write_mode", "read-only")
+        raw_allow = getattr(contract, "allow", ())
+        raw_deny = getattr(contract, "deny", ())
+    elif isinstance(contract, dict):
+        raw_scope = contract.get("scope")
+        if isinstance(raw_scope, dict):
+            write_mode = raw_scope.get("write", contract.get("write_mode", "read-only"))
+            raw_allow = raw_scope.get("allow", [])
+            raw_deny = raw_scope.get("deny", [])
+        else:
+            write_mode = contract.get("write_mode", "read-only")
+            raw_allow = contract.get("allow", [])
+            raw_deny = contract.get("deny", [])
+    else:
+        return False
+
+    if write_mode != "read-write":
+        return False
+
+    def _extract_rule_strings(rules: Any) -> list[str]:
+        result: list[str] = []
+        if isinstance(rules, (str, dict)):
+            rules = [rules]
+        if isinstance(rules, (list, tuple)):
+            for r in rules:
+                if isinstance(r, dict):
+                    target = r.get("module") or r.get("target") or r.get("path")
+                    if target and isinstance(target, str):
+                        result.append(target.strip().replace("\\", "/"))
+                elif isinstance(r, str) and r.strip():
+                    result.append(r.strip().replace("\\", "/"))
+        return result
+
+    allow_list = _extract_rule_strings(raw_allow)
+    deny_list = _extract_rule_strings(raw_deny)
+
+    if not allow_list:
+        return False
+
+    def _matches_rule(target: str, rule: str) -> bool:
+        norm_target = target.replace("\\", "/").strip().lstrip("/")
+        norm_rule = rule.replace("\\", "/").strip().lstrip("/")
+        if norm_rule.startswith("./"):
+            norm_rule = norm_rule[2:]
+        if norm_target.startswith("./"):
+            norm_target = norm_target[2:]
+
+        if norm_rule in ("*", "**"):
+            return True
+        if fnmatch.fnmatch(norm_target, norm_rule):
+            return True
+        if norm_target == norm_rule:
+            return True
+        if norm_target.startswith(norm_rule.rstrip("/") + "/"):
+            return True
+        if norm_rule.startswith("workspace/"):
+            sub_rule = norm_rule[len("workspace/") :]
+            if (
+                fnmatch.fnmatch(norm_target, sub_rule)
+                or norm_target == sub_rule
+                or norm_target.startswith(sub_rule.rstrip("/") + "/")
+            ):
+                return True
+        return False
+
+    for candidate in MANIFEST_CANDIDATE_TARGETS:
+        denied = any(_matches_rule(candidate, d) for d in deny_list)
+        if denied:
+            continue
+        allowed = any(_matches_rule(candidate, a) for a in allow_list)
+        if allowed:
+            return True
+
+    return False
+
+
 def check_import_satisfiability(
     target_file: Path,
     project_root: Path,
     staged_root: Path | None = None,
     source_code: str | None = None,
     custom_mapping: dict[str, set[str]] | None = None,
+    contract: Any = None,
+    manifest_permitted: bool | None = None,
 ) -> ImportSatisfiabilityResult:
     """Evaluate whether all external imports in target_file are declared in the project's dependencies.
 
@@ -697,7 +832,14 @@ def check_import_satisfiability(
     - If external imports exist but no manifest exists -> fails closed.
     - If external imports exist that are not declared in manifests -> fails closed.
     - If file only imports standard library or local modules -> passes.
+
+    Scope-aware diagnostics:
+    - Distinguishes whether dependency manifest authoring is permitted by the worker contract
+      or outside assigned contract scope (requiring Architecture scaffolding).
     """
+    if manifest_permitted is None and contract is not None:
+        manifest_permitted = is_manifest_permitted_by_contract(contract)
+
     try:
         rel_path = target_file.relative_to(project_root).as_posix()
     except ValueError:
@@ -719,13 +861,17 @@ def check_import_satisfiability(
                 manifest_found=False,
                 declared_dependencies=(),
                 diagnostic=f"Cannot read deliverable '{rel_path}': {e}",
+                manifest_permitted=manifest_permitted,
             )
 
     all_imports = extract_top_level_imports(source_code)
     external_imports: set[str] = set()
+    is_test = is_test_file_path(rel_path)
 
     for mod in all_imports:
         if is_standard_library(mod):
+            continue
+        if is_test and mod in STANDARD_TEST_MODULES:
             continue
         if is_local_module(
             mod,
@@ -749,16 +895,32 @@ def check_import_satisfiability(
             manifest_found=manifest_found,
             declared_dependencies=tuple(sorted(declared_deps)),
             diagnostic=None,
+            manifest_permitted=manifest_permitted,
         )
 
     # Case 2: External imports exist, but NO manifest exists -> fail closed
     if not manifest_found:
         sorted_ext = sorted(external_imports)
-        diagnostic = (
-            f"Deliverable '{rel_path}' imports external module(s) {sorted_ext} "
-            f"but no dependency manifest (pyproject.toml, requirements*.txt) was found in project. "
-            f"Create a dependency manifest or remove undeclared external imports."
-        )
+        if manifest_permitted is True:
+            diagnostic = (
+                f"Deliverable '{rel_path}' imports external module(s) {sorted_ext} "
+                f"but no dependency manifest (pyproject.toml, requirements*.txt) was found in project. "
+                f"Your contract permits writing dependency manifests. "
+                f"Use write_file to create requirements.txt or pyproject.toml declaring these dependencies."
+            )
+        elif manifest_permitted is False:
+            diagnostic = (
+                f"Deliverable '{rel_path}' imports external module(s) {sorted_ext} "
+                f"but no dependency manifest (pyproject.toml, requirements*.txt) was found in project. "
+                f"Dependency manifest creation is OUTSIDE your assigned contract scope. "
+                f"Architecture (Claude) must provision dependencies via an explicit scaffolding Work Order before implementation."
+            )
+        else:
+            diagnostic = (
+                f"Deliverable '{rel_path}' imports external module(s) {sorted_ext} "
+                f"but no dependency manifest (pyproject.toml, requirements*.txt) was found in project. "
+                f"Create a dependency manifest or remove undeclared external imports."
+            )
         return ImportSatisfiabilityResult(
             passed=False,
             file_path=rel_path,
@@ -768,6 +930,7 @@ def check_import_satisfiability(
             manifest_found=False,
             declared_dependencies=(),
             diagnostic=diagnostic,
+            manifest_permitted=manifest_permitted,
         )
 
     # Case 3: External imports exist, verify against declared dependencies
@@ -778,10 +941,23 @@ def check_import_satisfiability(
 
     if undeclared:
         sorted_und = sorted(undeclared)
-        diagnostic = (
-            f"Deliverable '{rel_path}' imports undeclared third-party module(s): {', '.join(sorted_und)}. "
-            f"Declare them in pyproject.toml or requirements.txt, or replace with local/standard library alternatives."
-        )
+        if manifest_permitted is True:
+            diagnostic = (
+                f"Deliverable '{rel_path}' imports undeclared third-party module(s): {', '.join(sorted_und)}. "
+                f"Your contract permits updating dependency manifests. "
+                f"Declare them in pyproject.toml or requirements.txt using write_file."
+            )
+        elif manifest_permitted is False:
+            diagnostic = (
+                f"Deliverable '{rel_path}' imports undeclared third-party module(s): {', '.join(sorted_und)}. "
+                f"Modifying the dependency manifest is OUTSIDE your assigned contract scope. "
+                f"Architecture (Claude) must declare these dependencies via a scaffolding Work Order, or replace them with local/standard library alternatives."
+            )
+        else:
+            diagnostic = (
+                f"Deliverable '{rel_path}' imports undeclared third-party module(s): {', '.join(sorted_und)}. "
+                f"Declare them in pyproject.toml or requirements.txt, or replace with local/standard library alternatives."
+            )
         return ImportSatisfiabilityResult(
             passed=False,
             file_path=rel_path,
@@ -791,6 +967,7 @@ def check_import_satisfiability(
             manifest_found=True,
             declared_dependencies=tuple(sorted(declared_deps)),
             diagnostic=diagnostic,
+            manifest_permitted=manifest_permitted,
         )
 
     return ImportSatisfiabilityResult(
@@ -802,6 +979,7 @@ def check_import_satisfiability(
         manifest_found=True,
         declared_dependencies=tuple(sorted(declared_deps)),
         diagnostic=None,
+        manifest_permitted=manifest_permitted,
     )
 
 
@@ -810,6 +988,8 @@ def check_multiple_deliverables(
     project_root: Path,
     staged_root: Path | None = None,
     custom_mapping: dict[str, set[str]] | None = None,
+    contract: Any = None,
+    manifest_permitted: bool | None = None,
 ) -> tuple[bool, list[ImportSatisfiabilityResult]]:
     """Check import satisfiability across multiple deliverable files."""
     results: list[ImportSatisfiabilityResult] = []
@@ -820,6 +1000,8 @@ def check_multiple_deliverables(
             project_root=project_root,
             staged_root=staged_root,
             custom_mapping=custom_mapping,
+            contract=contract,
+            manifest_permitted=manifest_permitted,
         )
         results.append(res)
         if not res.passed:

@@ -192,6 +192,53 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             encoding="utf-8",
         )
 
+    if agent == "claude":
+        claude_contract = sync_dir / "agents" / "claude.contract.yaml"
+        if not claude_contract.exists():
+            claude_contract.parent.mkdir(parents=True, exist_ok=True)
+            claude_contract.write_text(yaml.safe_dump({
+                "schema_version": 1,
+                "agent_id": "claude",
+                "work_order": "WO-000",
+                "identity": {
+                    "role": "architecture",
+                    "reports_to": "ceo",
+                },
+                "scope": {
+                    "allow": [
+                        {"module": "PLAN.md"},
+                        {"module": ".sync/work-orders/**"},
+                        {"module": ".sync/contracts/**"},
+                        {"module": ".sync/inbox/local-llm/**"},
+                        {"module": ".sync/inbox/claude/**"},
+                    ],
+                    "deny": [
+                        {"module": ".git/**"},
+                        {"module": "src/**"},
+                        {"module": "tests/**"},
+                        {"module": ".sync/inbox/codex/**"},
+                        {"module": ".sync/inbox/gemini/**"},
+                        {"module": ".sync/inbox/gemma/**"},
+                        {"module": ".sync/inbox/CEO/**"},
+                        {"module": ".sync/runtime/**"},
+                        {"module": ".sync/outbox/**"},
+                        {"module": ".sync/agents/**"},
+                        {"module": ".sync/knowledge/**"},
+                        {"module": ".sync/snapshots/**"},
+                        {"module": ".env"},
+                        {"module": ".env.*"},
+                        {"module": "__pycache__/**"},
+                        {"module": ".venv/**"},
+                        {"module": "node_modules/**"},
+                    ],
+                    "write": "read-write",
+                },
+                "budget": {
+                    "max_files_touched": 20,
+                    "max_tokens": 50000,
+                },
+            }, sort_keys=False), encoding="utf-8")
+
     (sync_dir / "inbox" / agent / "_read").mkdir(parents=True, exist_ok=True)
     (sync_dir / "outbox" / agent).mkdir(parents=True, exist_ok=True)
 
@@ -272,33 +319,27 @@ def synthesize_bootstrap_planning(
         },
         "scope": {
             "allow": [
-                # Broad read access for codebase research (query_graph, read_file)
-                {"module": "**"},
-                # Explicit write targets (for clarity — subsumed by ** but
-                # documents intent for contract reviewers)
                 {"module": "PLAN.md"},
                 {"module": ".sync/work-orders/**"},
                 {"module": ".sync/contracts/**"},
+                {"module": ".sync/inbox/local-llm/**"},
+                {"module": ".sync/inbox/claude/**"},
             ],
             "deny": [
-                # Version control internals
                 {"module": ".git/**"},
-                # Agent inboxes — Architecture must not read/write other agents' mail
-                {"module": ".sync/inbox/**"},
-                # Runtime state — managed by daemon, not by agents
+                {"module": "src/**"},
+                {"module": "tests/**"},
+                {"module": ".sync/inbox/codex/**"},
+                {"module": ".sync/inbox/gemini/**"},
+                {"module": ".sync/inbox/gemma/**"},
+                {"module": ".sync/inbox/CEO/**"},
                 {"module": ".sync/runtime/**"},
-                # Outbox — managed by daemon
                 {"module": ".sync/outbox/**"},
-                # Agent identity files — managed by daemon
                 {"module": ".sync/agents/**"},
-                # Knowledge store — compiler output, use graph API instead
                 {"module": ".sync/knowledge/**"},
-                # Snapshots — managed by daemon
                 {"module": ".sync/snapshots/**"},
-                # Environment secrets
                 {"module": ".env"},
                 {"module": ".env.*"},
-                # Build/cache artifacts
                 {"module": "__pycache__/**"},
                 {"module": ".venv/**"},
                 {"module": "node_modules/**"},
@@ -487,6 +528,39 @@ class SessionManager:
                             "result": r.get("result"),
                             "completed_at": r.get("completed_at"),
                         }
+        from .supervisor import LifecycleSupervisor
+        self.supervisor = LifecycleSupervisor(self)
+        self._active_runs: dict[str, Any] = {}
+        self._run_driver_threads: dict[str, Thread] = {}
+        self._run_stop_events: dict[str, Event] = {}
+        for session in self._sessions.values():
+            ws_str = session.get("workspace")
+            if ws_str:
+                ws = Path(ws_str)
+                sup_dir = ws / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    from .supervisor import Phase
+                    for run_file in sup_dir.glob("run-*.yaml"):
+                        try:
+                            r_id = run_file.stem
+                            loaded_state = self.supervisor.load_run_state(r_id, ws)
+                            if loaded_state and loaded_state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+                                if session.get("state") == "WAITING":
+                                    session["state"] = "RUNNING"
+                                    session["updated_at"] = _now()
+                                self._active_runs[r_id] = loaded_state
+                                stop_ev = Event()
+                                self._run_stop_events[r_id] = stop_ev
+                                drv_thread = Thread(
+                                    target=self._drive_run,
+                                    args=(r_id, stop_ev),
+                                    name=f"stackmind-supervisor-{r_id}",
+                                    daemon=True,
+                                )
+                                self._run_driver_threads[r_id] = drv_thread
+                                drv_thread.start()
+                        except Exception:
+                            pass
         self._save()
 
     def _persist_event(self, _: RuntimeEvent) -> None:
@@ -724,7 +798,12 @@ class SessionManager:
     def get_session(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             try:
-                return self._view(self._sessions[session_id])
+                view = self._view(self._sessions[session_id])
+                active_run = self.get_active_run(session_id)
+                if active_run:
+                    view["run"] = active_run
+                    view["phase"] = active_run.get("phase")
+                return view
             except KeyError as error:
                 raise KeyError("unknown session") from error
 
@@ -764,8 +843,8 @@ class SessionManager:
     def resume_session(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
-            if not session or session["state"] != "PAUSED":
-                raise ValueError("only paused sessions can be resumed")
+            if not session or session["state"] not in {"PAUSED", "WAITING"}:
+                raise ValueError("only paused or waiting sessions can be resumed")
             return self._set_state(session_id, "RUNNING", "session.resumed")
 
     def propose_plan(
@@ -925,8 +1004,16 @@ class SessionManager:
                     }
 
                 created_work_orders.append(wo_record)
-                # Only write placeholder files if not a goal plan (goal plans dispatch Architecture to author real files)
-                if not is_goal_plan and (workspace / ".sync").exists():
+                # For goal plans, autonomously synthesize validated child work orders and contracts to disk
+                if is_goal_plan and (workspace / ".sync").exists():
+                    try:
+                        from .authoring import synthesize_child_work_orders
+                        synthesized = synthesize_child_work_orders(workspace, plan, session_id=session_id)
+                        if synthesized:
+                            created_work_orders = synthesized
+                    except Exception:
+                        pass
+                elif not is_goal_plan and (workspace / ".sync").exists():
                     try:
                         wo_dir.mkdir(parents=True, exist_ok=True)
                         wo_path = wo_dir / f"{wo_id}.yaml"
@@ -977,26 +1064,32 @@ class SessionManager:
 
             # For bootstrap goal plans, dispatch Turn 2: Architecture authors child WOs and Contracts
             if is_goal_plan:
-                authoring_prompt = (
-                    f"The architecture plan '{plan_id}' has been approved by the operator (reason: {reason or 'Approved by operator'}).\n\n"
-                    "Your task now as Senior Architect is to author the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
-                    "1. Review PLAN.md for the approved milestones and tasks.\n"
-                    "2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
-                    "(e.g. WO-001.yaml) conforming to schemas/work-order.schema.json.\n"
-                    "3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
-                    "conforming to schemas/contract.schema.json.\n"
-                    "4. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
-                    "and modified_files listing all authored files."
-                )
-                turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
-                self.start_turn(
-                    session_id,
-                    authoring_prompt,
-                    role="architecture",
-                    agent_id="claude",
-                    work_order_id=turn_wo_id,
-                    is_authoring=True,
-                )
+                already_authoring = False
+                for r in session.get("journal", []):
+                    if r.get("metadata", {}).get("is_authoring") and r.get("status") not in _OPERATION_TERMINAL:
+                        already_authoring = True
+                        break
+                if not already_authoring:
+                    authoring_prompt = (
+                        f"The architecture plan '{plan_id}' has been approved by the operator (reason: {reason or 'Approved by operator'}).\n\n"
+                        "Your task now as Senior Architect is to author the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
+                        "1. Review PLAN.md for the approved milestones and tasks.\n"
+                        "2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                        "(e.g. WO-001.yaml) conforming to schemas/work-order.schema.json.\n"
+                        "3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
+                        "conforming to schemas/contract.schema.json.\n"
+                        "4. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
+                        "and modified_files listing all authored files."
+                    )
+                    turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
+                    self.start_turn(
+                        session_id,
+                        authoring_prompt,
+                        role="architecture",
+                        agent_id="claude",
+                        work_order_id=turn_wo_id,
+                        is_authoring=True,
+                    )
 
             return [dict(w) for w in created_work_orders]
 
@@ -1032,6 +1125,121 @@ class SessionManager:
             self._save()
             return dict(plan)
 
+    def approve_run(self, session_id: str, reason: str = "") -> dict[str, Any]:
+        """Approve an active supervisor run awaiting operator approval."""
+        with self._lock:
+            active_run = None
+            for state in self._active_runs.values():
+                if state.session_id == session_id:
+                    active_run = state
+                    break
+            if not active_run:
+                raise KeyError("no active supervisor run for session")
+
+            # Route through approve_plan to unify the approval path
+            if active_run.plan_id:
+                self.approve_plan(session_id, active_run.plan_id, reason=reason)
+
+            self.events.publish(
+                "run.approved",
+                session_id,
+                run_id=active_run.run_id,
+                reason=reason,
+            )
+            self._save()
+            return active_run.to_dict()
+
+    def reject_run(self, session_id: str, reason: str = "") -> dict[str, Any]:
+        """Reject an active supervisor run awaiting operator approval."""
+        with self._lock:
+            active_run = None
+            for state in self._active_runs.values():
+                if state.session_id == session_id:
+                    active_run = state
+                    break
+            if not active_run:
+                raise KeyError("no active supervisor run for session")
+
+            # Route through reject_plan to unify the rejection path
+            if active_run.plan_id:
+                self.reject_plan(session_id, active_run.plan_id, reason=reason)
+
+            self.events.publish(
+                "run.rejected",
+                session_id,
+                run_id=active_run.run_id,
+                reason=reason,
+            )
+            self._save()
+            return active_run.to_dict()
+
+    def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+        """Resume an active, paused, or failed supervisor run."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            if session.get("state") in {"PAUSED", "WAITING"}:
+                session["state"] = "RUNNING"
+                session["updated_at"] = _now()
+                self.events.publish("session.resumed", session_id)
+
+            ws = Path(session.get("workspace", ""))
+            target_run_id = run_id
+            if not target_run_id:
+                sup_dir = ws / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    run_files = sorted(sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True)
+                    if run_files:
+                        target_run_id = run_files[0].stem
+            if not target_run_id:
+                raise KeyError("no supervisor run found to resume")
+
+            state = self._active_runs.get(target_run_id)
+            if state is None:
+                state = self.supervisor.load_run_state(target_run_id, ws)
+            if state is None:
+                raise KeyError(f"run '{target_run_id}' not found")
+
+            from .supervisor import Phase
+            if state.session_id != session_id:
+                state.session_id = session_id
+                try:
+                    self.supervisor.save_run_state(state, ws)
+                except Exception:
+                    pass
+            if state.phase in (Phase.FAILED, Phase.BLOCKED):
+                state.error = None
+                state.blocked_wo_ids.clear()
+                if state.worker_wo_ids:
+                    self.supervisor._transition(state, Phase.DISPATCHING)
+                elif state.plan_id:
+                    self.supervisor._transition(state, Phase.AUTHORING)
+                else:
+                    self.supervisor._transition(state, Phase.PLANNING)
+
+            self._active_runs[target_run_id] = state
+            if target_run_id not in self._run_stop_events or self._run_stop_events[target_run_id].is_set():
+                stop_event = Event()
+                self._run_stop_events[target_run_id] = stop_event
+                driver_thread = Thread(
+                    target=self._drive_run,
+                    args=(target_run_id, stop_event),
+                    name=f"stackmind-supervisor-{target_run_id}",
+                    daemon=True,
+                )
+                self._run_driver_threads[target_run_id] = driver_thread
+                driver_thread.start()
+
+            self.events.publish(
+                "run.resumed",
+                session_id,
+                run_id=target_run_id,
+                phase=state.phase.value,
+            )
+            self._save()
+            return state.to_dict()
+
     def synthesize_bootstrap_planning(
         self,
         workspace: Path | str,
@@ -1058,8 +1266,12 @@ class SessionManager:
     ) -> tuple[Event, str]:
         with self._lock:
             session = self._sessions.get(session_id)
-            if not session or session["state"] != "RUNNING":
+            if not session or session.get("state") not in {"RUNNING", "WAITING"}:
                 raise ValueError("session is not running")
+            if session.get("state") == "WAITING":
+                session["state"] = "RUNNING"
+                session["updated_at"] = _now()
+                self.events.publish("session.resumed", session_id)
 
             parent_record = None
             if parent_operation_id is not None:
@@ -1078,7 +1290,8 @@ class SessionManager:
                 _verify_contract_scope_narrowing(parent_record.get("contract_scope"), contract_scope)
             else:
                 if session.get("active_operation"):
-                    raise ValueError("session already has an active operation")
+                    from .supervisor import OperationContentionError
+                    raise OperationContentionError("session already has an active operation")
 
             operation_id = str(uuid4())
             cancel = Event()
@@ -1322,6 +1535,7 @@ class SessionManager:
                         raise D024ViolationError(f"D024 QA Gate Blocked: {d024_decision.reason}")
 
             is_goal = bool(params.get("is_goal"))
+            created_run_id = None
             if is_goal:
                 if "role" not in params:
                     params["role"] = "architecture"
@@ -1342,6 +1556,16 @@ class SessionManager:
                 )
                 params["work_order_id"] = wo_rec["id"]
 
+                # S1 Wiring: register run with supervisor and launch background driver
+                created_run_id = f"run-{uuid4().hex[:8]}"
+                from .supervisor import Phase
+                run_state = self.supervisor.start_run(created_run_id, prompt, ws_path, session_id)
+                run_state.planning_wo_id = wo_rec["id"]
+                self._active_runs[created_run_id] = run_state
+                stop_event = Event()
+                self._run_stop_events[created_run_id] = stop_event
+                params["run_id"] = created_run_id
+
             cancel_event, operation_id = self.begin_operation(
                 session_id,
                 "turn",
@@ -1352,6 +1576,19 @@ class SessionManager:
                 role=params.get("role"),
                 agent_id=params.get("agent_id"),
             )
+            if created_run_id and created_run_id in self._active_runs:
+                r_state = self._active_runs[created_run_id]
+                r_state.planning_operation_id = operation_id
+                r_state.phase = Phase.PLANNING
+                driver_thread = Thread(
+                    target=self._drive_run,
+                    args=(created_run_id, self._run_stop_events[created_run_id]),
+                    name=f"stackmind-supervisor-{created_run_id}",
+                    daemon=True,
+                )
+                self._run_driver_threads[created_run_id] = driver_thread
+                driver_thread.start()
+
             canonical_role = self._canonical_role(role_param or "backend")
             agent_id_param = str(params.get("agent_id") or params.get("role") or canonical_role)
             self.events.publish(
@@ -1362,6 +1599,7 @@ class SessionManager:
                 role=canonical_role,
                 agent_id=agent_id_param,
                 work_order_id=params.get("work_order_id"),
+                run_id=created_run_id,
             )
             thread = Thread(
                 target=self._run_turn,
@@ -1372,7 +1610,10 @@ class SessionManager:
             self._turn_threads[operation_id] = thread
             self._save()
         thread.start()
-        return self.get_operation(operation_id)
+        turn_op = self.get_operation(operation_id)
+        if created_run_id:
+            turn_op["run_id"] = created_run_id
+        return turn_op
 
     def execute_work_order(
         self, session_id: str, work_order_id: str, prompt: str | None = None, **params: Any
@@ -1380,6 +1621,108 @@ class SessionManager:
         """Start a turn to execute an assigned work order via the AgentRunner harness."""
         p = prompt or f"Execute work order {work_order_id}"
         return self.start_turn(session_id, p, work_order_id=work_order_id, **params)
+
+    def _drive_run(
+        self,
+        run_id: str,
+        stop_event: Event,
+        max_wait_seconds: float = 300.0,
+    ) -> None:
+        """Background driver loop continuously advancing the supervisor run until completion."""
+        import time
+        from .supervisor import AdvanceResult, Phase
+
+        state = self._active_runs.get(run_id)
+        if not state:
+            return
+        ws = Path(state.workspace)
+        waiting_operation_started_at: float | None = None
+
+        while not stop_event.is_set() and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+            prev_phase = state.phase
+            try:
+                result = self.supervisor.advance(state)
+            except Exception as exc:
+                state.error = f"Supervisor advance exception: {exc}"
+                self.supervisor._transition(state, Phase.FAILED)
+                result = AdvanceResult.FAILED
+
+            if state.phase != prev_phase:
+                waiting_operation_started_at = None
+                self.events.publish(
+                    "run.phase",
+                    state.session_id,
+                    run_id=run_id,
+                    phase=state.phase.value,
+                    goal=state.product_goal,
+                )
+                try:
+                    self.supervisor.save_run_state(state, ws)
+                except Exception:
+                    pass
+
+            if result == AdvanceResult.WAITING_FOR_HUMAN:
+                waiting_operation_started_at = None
+                time.sleep(0.2)
+                continue
+            if result == AdvanceResult.WAITING_FOR_OPERATION:
+                now_mono = time.monotonic()
+                if waiting_operation_started_at is None:
+                    waiting_operation_started_at = now_mono
+                elif now_mono - waiting_operation_started_at > max_wait_seconds:
+                    state.error = (
+                        f"Timed out waiting for operations in phase {state.phase.value} "
+                        f"after {max_wait_seconds:.0f}s"
+                    )
+                    self.supervisor._transition(state, Phase.BLOCKED)
+                    result = AdvanceResult.BLOCKED
+                    try:
+                        self.supervisor.save_run_state(state, ws)
+                    except Exception:
+                        pass
+                    self.events.publish(
+                        "run.blocked",
+                        state.session_id,
+                        run_id=run_id,
+                        phase=state.phase.value,
+                        error=state.error,
+                    )
+                    break
+                time.sleep(0.2)
+                continue
+            if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
+                try:
+                    self.supervisor.save_run_state(state, ws)
+                except Exception:
+                    pass
+                self.events.publish(
+                    f"run.{state.phase.value.lower()}",
+                    state.session_id,
+                    run_id=run_id,
+                    phase=state.phase.value,
+                    error=state.error,
+                )
+                break
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        """Get the state dictionary for an active or persisted run."""
+        state = self._active_runs.get(run_id)
+        if state is not None:
+            return state.to_dict()
+        for session in self._sessions.values():
+            ws = Path(session.get("workspace", ""))
+            persisted = self.supervisor.load_run_state(run_id, ws)
+            if persisted is not None:
+                return persisted.to_dict()
+        return None
+
+    def get_active_run(self, session_id: str) -> dict[str, Any] | None:
+        """Get the currently active run for a session, if any."""
+        from .supervisor import Phase
+        for state in self._active_runs.values():
+            if state.session_id == session_id and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+                return state.to_dict()
+        return None
 
     def _run_turn(
         self, session_id: str, operation_id: str, cancel_event: Event, prompt: str
@@ -1412,18 +1755,28 @@ class SessionManager:
                 except KeyError:
                     pass
             wo_id_param = op_rec.get("work_order_id")
+            is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
             try:
                 result = runner.run_once(
                     cancel_event=cancel_event,
                     operation_id=operation_id,
                     prompt=prompt,
                     work_order_id=wo_id_param,
+                    is_authoring=is_authoring_param,
                 )
             except TypeError:
                 try:
-                    result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+                    result = runner.run_once(
+                        cancel_event=cancel_event,
+                        operation_id=operation_id,
+                        prompt=prompt,
+                        work_order_id=wo_id_param,
+                    )
                 except TypeError:
-                    result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
+                    try:
+                        result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id, prompt=prompt)
+                    except TypeError:
+                        result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
             b_id = getattr(runner, "backend_id", None)
             b_mod = getattr(runner, "backend_model", None)
             result_data = {

@@ -21,6 +21,7 @@ from .dependency_gate import (
     check_import_satisfiability,
     check_multiple_deliverables,
     extract_top_level_imports,
+    is_manifest_permitted_by_contract,
     read_project_dependencies,
 )
 from .plan import (
@@ -78,6 +79,7 @@ __all__ = [
     'HarnessRunResult',
     'HarnessTask',
     'ImportSatisfiabilityResult',
+    'is_manifest_permitted_by_contract',
     'LLMProvider',
     'PLAN_GENERATION_INSTRUCTIONS',
     'PlanMilestone',

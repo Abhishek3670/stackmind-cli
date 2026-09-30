@@ -5,8 +5,18 @@ from .manager import SessionManager
 from .protocol import JsonRpcProtocol
 from .server import LocalDaemon
 from .storage import DaemonStorage
+from .supervisor import AdvanceResult, LifecycleSupervisor, OperationContentionError, Phase, RunState
 
 __all__ = [
-    "DaemonStorage", "EventDispatcher", "JsonRpcProtocol", "LocalDaemon",
-    "RuntimeEvent", "SessionManager",
+    "AdvanceResult",
+    "DaemonStorage",
+    "EventDispatcher",
+    "JsonRpcProtocol",
+    "LifecycleSupervisor",
+    "LocalDaemon",
+    "OperationContentionError",
+    "Phase",
+    "RunState",
+    "RuntimeEvent",
+    "SessionManager",
 ]

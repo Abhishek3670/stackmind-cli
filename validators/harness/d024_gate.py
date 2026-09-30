@@ -370,7 +370,18 @@ class D024Gate:
 
                             if deliv_path_str.endswith(".py") and deliv_file.is_file():
                                 from validators.harness.dependency_gate import check_import_satisfiability
-                                sat_res = check_import_satisfiability(deliv_file, project_root=project_path)
+                                wo_contract = None
+                                contract_path = project_path / ".sync" / "contracts" / f"{target_wo}.yaml"
+                                if contract_path.is_file():
+                                    try:
+                                        wo_contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+                                    except Exception:
+                                        pass
+                                sat_res = check_import_satisfiability(
+                                    deliv_file,
+                                    project_root=project_path,
+                                    contract=wo_contract,
+                                )
                                 if not sat_res.passed:
                                     deliverable_issues.append(sat_res.diagnostic or f"import satisfiability failed for {deliv_path_str}")
 

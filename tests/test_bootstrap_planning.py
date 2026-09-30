@@ -59,7 +59,10 @@ def test_synthesize_bootstrap_planning_artifacts(tmp_path: Path) -> None:
     # Verify narrowed deny list covers operationally sensitive paths
     deny_modules = {d["module"] for d in contract_rec["scope"]["deny"]}
     assert ".git/**" in deny_modules
-    assert ".sync/inbox/**" in deny_modules
+    assert "src/**" in deny_modules
+    assert "tests/**" in deny_modules
+    assert ".sync/inbox/codex/**" in deny_modules
+    assert ".sync/inbox/gemma/**" in deny_modules
     assert ".sync/runtime/**" in deny_modules
     assert ".sync/outbox/**" in deny_modules
     assert ".sync/agents/**" in deny_modules
@@ -284,20 +287,90 @@ def test_narrowed_scope_with_arbitrary_file_extension(tmp_path: Path) -> None:
     assert tool_runtime is not None
     gateway = tool_runtime.gateway
 
-    # Reads of arbitrary file types are permitted (broad allow via **)
-    # Files must be in the scratch workspace (not tmp_path), since ToolGateway reads from there
+    # Reads of allowed non-Python paths are permitted
     ws_root = tool_runtime.workspace.root
-    (ws_root / "README.md").write_text("# README", encoding="utf-8")
-    assert gateway.read_file("README.md") == "# README"
-
-    (ws_root / "config.json").write_text('{"key": "val"}', encoding="utf-8")
-    assert gateway.read_file("config.json") == '{"key": "val"}'
+    (ws_root / "PLAN.md").write_text("# Plan", encoding="utf-8")
+    assert gateway.read_file("PLAN.md") == "# Plan"
 
     # Denied paths are blocked regardless of file extension
     with pytest.raises(PermissionError):
-        gateway.write_file(".sync/inbox/claude/notice.json", '{"msg": "injected"}')
+        gateway.write_file(".sync/inbox/gemma/notice.json", '{"msg": "injected"}')
     with pytest.raises(PermissionError):
         gateway.read_file(".sync/runtime/drafts/claude.boot.draft.yaml")
+
+
+def test_claude_narrowed_contract_denies_source_tests_and_other_inboxes(tmp_path: Path) -> None:
+    """Claude under the narrowed contract cannot write to src/**, tests/**, or other agents' inboxes.
+
+    Verifies the true minimum contract boundaries:
+    - Forbidden: src/**, tests/**, .sync/inbox/codex/**, .sync/inbox/gemini/**, .sync/inbox/gemma/**, .sync/runtime/**
+    - Permitted: PLAN.md, .sync/work-orders/**, .sync/contracts/**, .sync/inbox/local-llm/**, .sync/inbox/claude/**
+    """
+    wo_rec, contract_rec = synthesize_bootstrap_planning(tmp_path, "Build auth microservice")
+    runner = AgentRunner(tmp_path, "claude", provider_adapter=DummyProviderAdapter())
+    tree_data = runner._load_tree()
+    task = runner.discover_next_task(tree_data)
+    contract = load_harness_contract(tmp_path, "claude", task.work_order_id)
+    k_api = KnowledgeAPI(tmp_path)
+    tool_runtime = runner._build_tool_runtime(contract, task, k_api)
+    assert tool_runtime is not None
+    gateway = tool_runtime.gateway
+
+    # 1. Claude CANNOT write to src/**
+    with pytest.raises(PermissionError) as exc:
+        gateway.write_file("src/api/auth.py", "def login(): pass")
+    assert "denied" in str(exc.value).lower() or "outside" in str(exc.value).lower()
+
+    # 2. Claude CANNOT write to tests/**
+    with pytest.raises(PermissionError) as exc:
+        gateway.write_file("tests/test_auth.py", "def test_login(): pass")
+    assert "denied" in str(exc.value).lower() or "outside" in str(exc.value).lower()
+
+    # 3. Claude CANNOT write to other agents' inboxes
+    for other_agent in ("codex", "gemini", "gemma", "CEO"):
+        with pytest.raises(PermissionError) as exc:
+            gateway.write_file(f".sync/inbox/{other_agent}/assignment.md", "# Work Order")
+        assert "denied" in str(exc.value).lower() or "outside" in str(exc.value).lower()
+
+    # 4. Claude CANNOT write to runtime state
+    with pytest.raises(PermissionError) as exc:
+        gateway.write_file(".sync/runtime/TREE.yaml", "tampered: true")
+    assert "denied" in str(exc.value).lower() or "outside" in str(exc.value).lower()
+
+    # 5. Permitted writes still succeed
+    gateway.write_file("PLAN.md", "# Project Plan\n\nArchitecture verified.\n")
+    assert "Architecture verified" in gateway.read_file("PLAN.md")
+
+    child_wo = {
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Scaffolding",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "description": "Scaffolding task",
+    }
+    gateway.write_file(
+        ".sync/work-orders/ACTIVE/WO-001.yaml",
+        yaml.safe_dump(child_wo, sort_keys=False),
+    )
+    child_contract = {
+        "schema_version": 1,
+        "agent_id": "codex",
+        "work_order": "WO-001",
+        "identity": {"role": "backend", "reports_to": "claude"},
+        "scope": {"allow": [{"module": "requirements.txt"}], "deny": [], "write": "read-write"},
+        "budget": {"max_files_touched": 5, "max_tokens": 10000},
+    }
+    gateway.write_file(
+        ".sync/contracts/WO-001.yaml",
+        yaml.safe_dump(child_contract, sort_keys=False),
+    )
+    gateway.write_file(
+        ".sync/inbox/local-llm/release_auth.md",
+        "# Release Authorization\nApproved for release.\n",
+    )
 
 
 def test_daemon_start_turn_goal_synthesizes_and_discovers(tmp_path: Path) -> None:
@@ -532,6 +605,9 @@ def test_codex_task_with_architecture_in_title_does_not_get_claude_prompt(tmp_pa
     assert "You are a governed StackMind worker. Use tools for all file I/O." in system_msg.content
     assert "Code execution is unavailable; the harness verifies after the final decision." in system_msg.content
 
+    assert "Allowed write scope: src/**" in system_msg.content
+    assert "Target deliverable file: 'src/db/repository.py'" in system_msg.content
+
     # 2. User message must NOT contain Architecture research or authoring instructions
     user_msg = next((m for m in captured_messages if m.role == "user"), None)
     assert user_msg is not None
@@ -539,6 +615,34 @@ def test_codex_task_with_architecture_in_title_does_not_get_claude_prompt(tmp_pa
     assert "Work Order Schema Specification" not in user_msg.content
     assert "Contract Schema Specification" not in user_msg.content
     assert "PLAN.md formatting requirement" not in user_msg.content
+
+
+def test_build_child_contract_allow_scopes() -> None:
+    """Child contracts synthesized for backend/frontend workers must include
+    standard application and web directory scopes (app/**, api/**, etc.).
+    """
+    from validators.kernel.daemon.authoring import build_child_contract
+
+    # Backend / Codex
+    contract_b = build_child_contract("WO-001", "codex", "backend", deliverable_path="app/auth/routes.py")
+    modules_b = [r["module"] for r in contract_b["scope"]["allow"]]
+    assert "src/**" in modules_b
+    assert "app/**" in modules_b
+    assert "api/**" in modules_b
+    assert "backend/**" in modules_b
+    assert "*.py" in modules_b
+    assert "app/auth/routes.py" in modules_b
+
+    # Frontend / Gemini
+    contract_f = build_child_contract("WO-002", "gemini", "frontend", deliverable_path="frontend/index.html")
+    modules_f = [r["module"] for r in contract_f["scope"]["allow"]]
+    assert "src/**" in modules_f
+    assert "public/**" in modules_f
+    assert "frontend/**" in modules_f
+    assert "*.html" in modules_f
+    assert "*.tsx" in modules_f
+    assert "frontend/index.html" in modules_f
+
 
 
 def test_step4_prompt_and_schema_injection_for_authoring_turn(tmp_path: Path) -> None:

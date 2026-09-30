@@ -8,7 +8,13 @@ from typing import Any, Mapping
 def session_header(session: Mapping[str, Any]) -> str:
     agent_info = f" | agent: {session['agent']}" if "agent" in session else ""
     ws_info = f" | workspace: {session['workspace']}" if "workspace" in session else ""
-    return f"Session {session['session_id']} | {session['state']} | provider: {session['provider']}{agent_info}{ws_info}"
+    phase_val = None
+    if "run" in session and isinstance(session["run"], Mapping):
+        phase_val = session["run"].get("phase")
+    if not phase_val and "phase" in session:
+        phase_val = session.get("phase")
+    phase_info = f" | phase: {phase_val}" if phase_val else ""
+    return f"Session {session['session_id']} | {session['state']} | provider: {session['provider']}{agent_info}{ws_info}{phase_info}"
 
 
 def contract_panel(contract: Mapping[str, Any]) -> str:
