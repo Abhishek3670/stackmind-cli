@@ -605,6 +605,9 @@ def test_codex_task_with_architecture_in_title_does_not_get_claude_prompt(tmp_pa
     assert "You are a governed StackMind worker. Use tools for all file I/O." in system_msg.content
     assert "Code execution is unavailable; the harness verifies after the final decision." in system_msg.content
 
+    assert "Allowed write scope: src/**" in system_msg.content
+    assert "Target deliverable file: 'src/db/repository.py'" in system_msg.content
+
     # 2. User message must NOT contain Architecture research or authoring instructions
     user_msg = next((m for m in captured_messages if m.role == "user"), None)
     assert user_msg is not None
@@ -612,6 +615,34 @@ def test_codex_task_with_architecture_in_title_does_not_get_claude_prompt(tmp_pa
     assert "Work Order Schema Specification" not in user_msg.content
     assert "Contract Schema Specification" not in user_msg.content
     assert "PLAN.md formatting requirement" not in user_msg.content
+
+
+def test_build_child_contract_allow_scopes() -> None:
+    """Child contracts synthesized for backend/frontend workers must include
+    standard application and web directory scopes (app/**, api/**, etc.).
+    """
+    from validators.kernel.daemon.authoring import build_child_contract
+
+    # Backend / Codex
+    contract_b = build_child_contract("WO-001", "codex", "backend", deliverable_path="app/auth/routes.py")
+    modules_b = [r["module"] for r in contract_b["scope"]["allow"]]
+    assert "src/**" in modules_b
+    assert "app/**" in modules_b
+    assert "api/**" in modules_b
+    assert "backend/**" in modules_b
+    assert "*.py" in modules_b
+    assert "app/auth/routes.py" in modules_b
+
+    # Frontend / Gemini
+    contract_f = build_child_contract("WO-002", "gemini", "frontend", deliverable_path="frontend/index.html")
+    modules_f = [r["module"] for r in contract_f["scope"]["allow"]]
+    assert "src/**" in modules_f
+    assert "public/**" in modules_f
+    assert "frontend/**" in modules_f
+    assert "*.html" in modules_f
+    assert "*.tsx" in modules_f
+    assert "frontend/index.html" in modules_f
+
 
 
 def test_step4_prompt_and_schema_injection_for_authoring_turn(tmp_path: Path) -> None:

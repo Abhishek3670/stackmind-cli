@@ -1238,9 +1238,18 @@ class AgentRunner:
                 "Return the final HarnessDecision as JSON."
             )
         else:
+            scope_hints: list[str] = []
+            if kernel_contract is not None:
+                for r in getattr(kernel_contract, "allow", ()):
+                    clean_r = str(r).replace("workspace/", "").replace("workspace\\", "")
+                    if clean_r and not clean_r.startswith(".sync") and clean_r != "PLAN.md":
+                        scope_hints.append(clean_r)
+            scope_line = f" Allowed write scope: {', '.join(scope_hints)}." if scope_hints else ""
+            target_line = f" Target deliverable file: '{request.task.deliverable_path}'." if request.task.deliverable_path else ""
             system_msg = (
                 'You are a governed StackMind worker. Use tools for all file I/O. '
-                'Code execution is unavailable; the harness verifies after the final decision. '
+                f'Code execution is unavailable; the harness verifies after the final decision.{scope_line}{target_line} '
+                'Only create or modify files permitted by your contract scope. '
                 'Once your files are written, return the final HarnessDecision as JSON.'
             )
 

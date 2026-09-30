@@ -158,21 +158,36 @@ def build_child_contract(
     if role_norm in ("backend", "codex"):
         allow_rules.extend([
             {"module": "src/**"},
+            {"module": "app/**"},
+            {"module": "api/**"},
+            {"module": "backend/**"},
             {"module": "tests/**"},
             {"module": "requirements.txt"},
+            {"module": "requirements*.txt"},
             {"module": "pyproject.toml"},
+            {"module": "*.py"},
         ])
     elif role_norm in ("frontend", "gemini"):
         allow_rules.extend([
             {"module": "src/**"},
+            {"module": "app/**"},
             {"module": "public/**"},
             {"module": "frontend/**"},
             {"module": "index.html"},
+            {"module": "*.html"},
+            {"module": "*.js"},
+            {"module": "*.ts"},
+            {"module": "*.tsx"},
+            {"module": "*.jsx"},
+            {"module": "*.css"},
         ])
     elif role_norm in ("qa", "gemma"):
         allow_rules.extend([
             {"module": "tests/**"},
+            {"module": "test/**"},
             {"module": "src/**"},
+            {"module": "app/**"},
+            {"module": "*.py"},
         ])
     elif role_norm in ("gitops", "local-llm"):
         allow_rules.extend([
@@ -182,7 +197,11 @@ def build_child_contract(
             {"module": "package.json"},
         ])
     else:
-        allow_rules.append({"module": "src/**"})
+        allow_rules.extend([
+            {"module": "src/**"},
+            {"module": "app/**"},
+            {"module": "*.py"},
+        ])
 
     # Deduplicate allow rules preserving structure
     seen = set()
