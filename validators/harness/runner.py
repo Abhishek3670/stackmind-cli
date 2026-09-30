@@ -1255,10 +1255,25 @@ class AgentRunner:
                 'Once your files are written, return the final HarnessDecision as JSON.'
             )
 
+            existing_files: list[str] = []
+            try:
+                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+                for p in target_dir.rglob("*"):
+                    if p.is_file() and not any(part in (".git", ".sync", "__pycache__", ".venv", "node_modules") for part in p.parts):
+                        existing_files.append(p.relative_to(target_dir).as_posix())
+            except Exception:
+                pass
+            files_context = ""
+            if existing_files:
+                files_context = f"\nExisting workspace files:\n" + "\n".join(f"- {f}" for f in sorted(existing_files)[:30]) + "\n"
+
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = f"{raw_context}\n{files_context}" if raw_context else files_context
+
         messages = [
             Message.system(system_msg),
             Message.user(
-                f'{task_text}Context:\n{request.context.text}'
+                f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
             ),
         ]
         from validators.kernel.providers.errors import (

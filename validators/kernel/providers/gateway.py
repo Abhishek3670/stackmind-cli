@@ -327,7 +327,17 @@ class ProviderGateway:
             self.consecutive_failures += 1
             if isinstance(ex, FileNotFoundError):
                 target_str = args.get("path") or args.get("target") or args.get("file") or ""
-                res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace. Check paths using query_graph or verify directory contents."
+                existing_files: list[str] = []
+                try:
+                    ws_root = getattr(getattr(self.tool_gateway, "workspace", None), "root", None)
+                    if ws_root and ws_root.is_dir():
+                        for p in ws_root.rglob("*"):
+                            if p.is_file() and not any(part in (".git", ".sync", "__pycache__", ".venv", "node_modules") for part in p.parts):
+                                existing_files.append(p.relative_to(ws_root).as_posix())
+                except Exception:
+                    pass
+                files_hint = f" Existing workspace files: {', '.join(sorted(existing_files)[:25])}." if existing_files else ""
+                res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace.{files_hint}"
             elif isinstance(ex, PermissionError):
                 if name == "run_command":
                     cmd_val = args.get("command") or args.get("cmd") or args.get("args") or ""
