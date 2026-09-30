@@ -2551,9 +2551,17 @@ def _dispatch_command(
 @click.option("--daemon-url", default=None, help="URL of an existing local daemon.")
 @click.option("--agent", "-a", "agent", default="codex", show_default=True)
 @click.option("--workspace", "-w", "workspace", type=click.Path(path_type=Path), default=Path("."))
+@click.option("--session-id", "-s", "target_session_id", default=None, help="Attach to a specific daemon session ID.")
 @click.option("--demo", is_flag=True, help="Run the automated daemon-backed walkthrough.")
 @click.option("--timeout", "client_timeout", type=float, default=45.0, show_default=True, help="Turn operation wait timeout in seconds.")
-def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_timeout: float = 45.0) -> None:
+def tui(
+    daemon_url: str | None,
+    agent: str,
+    workspace: Path,
+    demo: bool,
+    client_timeout: float = 45.0,
+    target_session_id: str | None = None,
+) -> None:
     """Start the governed Python-native terminal control plane."""
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
@@ -2565,12 +2573,39 @@ def tui(daemon_url: str | None, agent: str, workspace: Path, demo: bool, client_
     try:
         client = DaemonClient(daemon_url)
         adapter = StackMindTuiAdapter(client)
-        session = client.create_session(
-            agent=agent,
-            provider="daemon",
-            contract=_default_contract(),
-            workspace=str(workspace.resolve()),
-        )
+
+        session = None
+        if target_session_id:
+            try:
+                session = client.get_session(target_session_id)
+            except Exception as err:
+                click.echo(f"Warning: could not attach to session '{target_session_id}': {err}", err=True)
+
+        if session is None:
+            try:
+                all_sessions = client.list_sessions()
+                ws_resolved_posix = workspace.resolve().as_posix().lower()
+                matching = [
+                    s for s in all_sessions
+                    if Path(s.get("workspace", "")).resolve().as_posix().lower() == ws_resolved_posix
+                ]
+                active_matching = [
+                    s for s in matching
+                    if str(s.get("state", "")).upper() not in {"COMPLETED", "CANCELLED", "FAILED"}
+                ]
+                candidate = active_matching[-1] if active_matching else None
+                if candidate and "session_id" in candidate:
+                    session = client.get_session(candidate["session_id"])
+            except Exception:
+                session = None
+
+        if session is None:
+            session = client.create_session(
+                agent=agent,
+                provider="daemon",
+                contract=_default_contract(),
+                workspace=str(workspace.resolve()),
+            )
         state = AutonomousDeliveryState(
             project_name=workspace.resolve().name, session_id=session["session_id"]
         )

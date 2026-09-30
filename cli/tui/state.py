@@ -11,7 +11,10 @@ import datetime
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping
+
+import yaml
 
 
 class ProjectPhase(str, Enum):
@@ -675,9 +678,19 @@ class AutonomousDeliveryState:
                     if parent_id and parent_id in self.operations:
                         if op_id not in self.operations[parent_id].children:
                             self.operations[parent_id].children.append(op_id)
-                    else:
-                        if op_id not in self.operations["op-root"].children:
-                            self.operations["op-root"].children.append(op_id)
+        active_op = session.get("active_operation")
+        if not active_op and "op-root" in self.operations:
+            self.operations.pop("op-root", None)
+
+        run_phase = session.get("phase") or (session.get("run", {}).get("phase") if isinstance(session.get("run"), Mapping) else None)
+        if run_phase:
+            rp_str = str(run_phase).upper()
+            if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING"):
+                self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+            elif rp_str == "AWAITING_APPROVAL":
+                self.phase = ProjectPhase.AWAITING_APPROVAL
+            elif rp_str in ("COMPLETE", "PRODUCT_READY"):
+                self.phase = ProjectPhase.PROJECT_COMPLETE
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
         if not isinstance(wo_records, list):
@@ -856,6 +869,34 @@ class AutonomousDeliveryState:
                         wos = plan_obj.get("work_orders") or plan_obj.get("created_work_orders")
                         if isinstance(wos, list):
                             self.sync_work_orders(wos)
+            except Exception:
+                pass
+
+        if workspace is not None:
+            try:
+                ws_path = Path(workspace)
+                active_wos_dir = ws_path / ".sync" / "work-orders" / "ACTIVE"
+                if active_wos_dir.is_dir():
+                    import yaml
+                    disk_wos = []
+                    for wo_file in sorted(active_wos_dir.glob("*.yaml")):
+                        try:
+                            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                            if isinstance(wo_data, dict):
+                                disk_wos.append(wo_data)
+                        except Exception:
+                            pass
+                    if disk_wos:
+                        self.sync_work_orders(disk_wos)
+
+                plan_file = ws_path / ".sync" / "PLAN.md"
+                if not plan_file.exists():
+                    plan_file = ws_path / "PLAN.md"
+                if plan_file.exists():
+                    self.completion_checklist["PLAN.md"] = True
+                    if self.phase in (ProjectPhase.INITIALIZING, ProjectPhase.AWAITING_APPROVAL):
+                        if active_wos_dir.is_dir() and any(active_wos_dir.glob("*.yaml")):
+                            self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
             except Exception:
                 pass
 

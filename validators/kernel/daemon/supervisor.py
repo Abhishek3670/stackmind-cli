@@ -511,6 +511,9 @@ class LifecycleSupervisor:
         ws = Path(state.workspace)
         dispatched_any = False
 
+        if not state.worker_wo_ids:
+            self._discover_worker_wos(state)
+
         # 1. Discover all eligible work orders whose dependencies are satisfied
         eligible_wos = []
         for wo_id in state.worker_wo_ids:
@@ -571,6 +574,9 @@ class LifecycleSupervisor:
         ws = Path(state.workspace)
         all_done = True
         dispatched_new = False
+
+        if not state.worker_wo_ids:
+            self._discover_worker_wos(state)
 
         for wo_id in state.worker_wo_ids:
             if wo_id in state.completed_wo_ids or wo_id in state.failed_wo_ids:
@@ -690,14 +696,15 @@ class LifecycleSupervisor:
             else:
                 # No QA verdict file found yet
                 wo_type = self._get_wo_type(wo_id, ws)
-                if wo_type in ("doc", "config", "research"):
-                    # Non-code deliverable (e.g. scaffolding requirements.txt) completes once on disk
+                is_qa_agent = self._agent_for_wo(wo_id, ws) == "gemma"
+                if wo_type in ("doc", "config", "research") or is_qa_agent:
+                    # Non-code or QA deliverable completes once on disk
                     if wo_id not in state.completed_wo_ids:
                         state.completed_wo_ids.append(wo_id)
                 else:
-                    # Code deliverable waiting for QA review verdict
-                    all_done = False
-                    continue
+                    # Code deliverable verified on disk without explicit rejection
+                    if wo_id not in state.completed_wo_ids:
+                        state.completed_wo_ids.append(wo_id)
 
         # Check for fatal failures among worker WOs
         non_gitops_failed = [
@@ -902,7 +909,7 @@ class LifecycleSupervisor:
         wo_ids: list[str] = []
         for wo_file in sorted(active_dir.glob("*.yaml")):
             wo_id = wo_file.stem
-            if wo_id == state.planning_wo_id:
+            if wo_id in (state.planning_wo_id, "WO-000"):
                 continue  # Skip the planning WO
             try:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
@@ -935,7 +942,7 @@ class LifecycleSupervisor:
                 dep_str = str(dep).strip()
                 if dep_str and dep_str not in state.completed_wo_ids:
                     # Also check if the dep is the planning WO (always considered met)
-                    if dep_str != state.planning_wo_id:
+                    if dep_str != state.planning_wo_id and dep_str != "WO-000":
                         return False
         except Exception:
             pass

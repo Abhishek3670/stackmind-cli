@@ -1202,6 +1202,12 @@ class SessionManager:
                 raise KeyError(f"run '{target_run_id}' not found")
 
             from .supervisor import Phase
+            if state.session_id != session_id:
+                state.session_id = session_id
+                try:
+                    self.supervisor.save_run_state(state, ws)
+                except Exception:
+                    pass
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
                 state.error = None
                 state.blocked_wo_ids.clear()
