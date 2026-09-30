@@ -127,7 +127,7 @@ def daemon_stop(workspace: Path):
     if not _wait_until_offline(url):
         raise click.ClickException(f"Daemon PID {pid} did not release port {port}.")
     clear_daemon_pid(workspace, pid)
-    console.print(f"[green]✓ Daemon PID {pid} stopped and port {port} released.[/green]")
+    console.print(f"[green][OK] Daemon PID {pid} stopped and port {port} released.[/green]")
 
 
 @daemon_group.command("status")
