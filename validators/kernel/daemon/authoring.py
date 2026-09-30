@@ -250,6 +250,53 @@ def build_child_contract(
     }
 
 
+def get_next_work_order_int(workspace: Path | str) -> int:
+    """Find the next monotonically increasing integer ID for work orders.
+
+    Scans:
+    1. .sync/work-orders/ACTIVE/
+    2. .sync/work-orders/COMPLETED/
+    3. .sync/work-orders/INDEX.yaml
+
+    Returns max(existing_ids) + 1, starting at 1 if no existing worker WOs.
+    """
+    ws = Path(workspace).resolve()
+    max_id = 0
+    pattern = re.compile(r"^WO-([0-9]{3,})$")
+
+    # 1. Check INDEX.yaml
+    index_file = ws / ".sync" / "work-orders" / "INDEX.yaml"
+    if index_file.is_file():
+        try:
+            data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                next_id = data.get("next_id")
+                if isinstance(next_id, int) and next_id > max_id:
+                    max_id = next_id - 1
+                for o in data.get("orders", []):
+                    if isinstance(o, dict) and o.get("id"):
+                        m = pattern.match(str(o["id"]))
+                        if m:
+                            val = int(m.group(1))
+                            if val > max_id:
+                                max_id = val
+        except Exception:
+            pass
+
+    # 2. Check ACTIVE, COMPLETED, and BLOCKED directories
+    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+        d = ws / ".sync" / "work-orders" / sub
+        if d.is_dir():
+            for f in d.glob("*.yaml"):
+                m = pattern.match(f.stem)
+                if m:
+                    val = int(m.group(1))
+                    if val > max_id:
+                        max_id = val
+
+    return max_id + 1
+
+
 def synthesize_child_work_orders(
     workspace: Path | str,
     plan: dict[str, Any] | str,
@@ -267,6 +314,7 @@ def synthesize_child_work_orders(
     contracts_dir.mkdir(parents=True, exist_ok=True)
 
     gate = AuthoringGate(project_root=ws)
+    start_idx = get_next_work_order_int(ws)
 
     # 1. Extract plan structure and proposed work orders
     proposed_wos: list[dict[str, Any]] = []
@@ -281,18 +329,19 @@ def synthesize_child_work_orders(
         elif plan.get("content"):
             try:
                 parsed = parse_plan(plan["content"])
-                for idx, m in enumerate(parsed.milestones, start=1):
+                for offset, m in enumerate(parsed.milestones):
+                    idx = start_idx + offset
                     agent, role = determine_assigned_agent(m.title, m.tasks)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
-                    deps = [f"WO-{idx-1:03d}"] if idx > 1 else []
+                    deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
                     wo = build_child_work_order(
                         wo_id=wo_id,
                         title=m.title,
                         description="\n".join(m.tasks) if m.tasks else m.title,
                         assigned_agents=[agent],
                         dependencies=deps,
-                        priority="P0" if idx == 1 else "P1",
+                        priority="P0" if offset == 0 else "P1",
                         deliverable=deliv,
                     )
                     proposed_wos.append(wo)
@@ -301,18 +350,19 @@ def synthesize_child_work_orders(
     elif isinstance(plan, str):
         try:
             parsed = parse_plan(plan)
-            for idx, m in enumerate(parsed.milestones, start=1):
+            for offset, m in enumerate(parsed.milestones):
+                idx = start_idx + offset
                 agent, role = determine_assigned_agent(m.title, m.tasks)
                 deliv = extract_deliverable_spec(m.title, m.tasks, role)
                 wo_id = f"WO-{idx:03d}"
-                deps = [f"WO-{idx-1:03d}"] if idx > 1 else []
+                deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
                 wo = build_child_work_order(
                     wo_id=wo_id,
                     title=m.title,
                     description="\n".join(m.tasks) if m.tasks else m.title,
                     assigned_agents=[agent],
                     dependencies=deps,
-                    priority="P0" if idx == 1 else "P1",
+                    priority="P0" if offset == 0 else "P1",
                     deliverable=deliv,
                 )
                 proposed_wos.append(wo)
@@ -325,18 +375,19 @@ def synthesize_child_work_orders(
         if plan_file.is_file():
             try:
                 parsed = parse_plan(plan_file.read_text(encoding="utf-8"))
-                for idx, m in enumerate(parsed.milestones, start=1):
+                for offset, m in enumerate(parsed.milestones):
+                    idx = start_idx + offset
                     agent, role = determine_assigned_agent(m.title, m.tasks)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
-                    deps = [f"WO-{idx-1:03d}"] if idx > 1 else []
+                    deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
                     wo = build_child_work_order(
                         wo_id=wo_id,
                         title=m.title,
                         description="\n".join(m.tasks) if m.tasks else m.title,
                         assigned_agents=[agent],
                         dependencies=deps,
-                        priority="P0" if idx == 1 else "P1",
+                        priority="P0" if offset == 0 else "P1",
                         deliverable=deliv,
                     )
                     proposed_wos.append(wo)
@@ -345,6 +396,28 @@ def synthesize_child_work_orders(
 
     if not proposed_wos:
         raise ValueError("Cannot synthesize child work orders: no milestones or tasks could be parsed from plan")
+
+    # Anti-collision check: if any proposed WO conflicts with existing on-disk work order, remap IDs sequentially
+    existing_on_disk = set()
+    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+        d = ws / ".sync" / "work-orders" / sub
+        if d.is_dir():
+            for f in d.glob("*.yaml"):
+                existing_on_disk.add(f.stem)
+
+    if any(w.get("id") in existing_on_disk for w in proposed_wos):
+        id_map: dict[str, str] = {}
+        renumbered_wos: list[dict[str, Any]] = []
+        for offset, w in enumerate(proposed_wos):
+            old_id = str(w.get("id", f"WO-{offset+1:03d}"))
+            new_id = f"WO-{start_idx + offset:03d}"
+            id_map[old_id] = new_id
+            w_copy = dict(w)
+            w_copy["id"] = new_id
+            new_deps = [id_map.get(d, d) for d in w.get("dependencies", [])]
+            w_copy["dependencies"] = new_deps
+            renumbered_wos.append(w_copy)
+        proposed_wos = renumbered_wos
 
     created_records: list[dict[str, Any]] = []
 
@@ -442,6 +515,15 @@ def synthesize_child_work_orders(
                 "file": f"work-orders/ACTIVE/{rec_id}.yaml",
             })
             existing_order_ids.add(rec_id)
+
+    max_id_num = 0
+    pattern = re.compile(r"^WO-([0-9]{3,})$")
+    for item in index_data.get("orders", []):
+        if isinstance(item, dict) and item.get("id"):
+            m = pattern.match(str(item["id"]))
+            if m:
+                max_id_num = max(max_id_num, int(m.group(1)))
+    index_data["next_id"] = max_id_num + 1
 
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")

@@ -1590,3 +1590,80 @@ def test_manager_recovers_persisted_runs_on_boot(tmp_path: Path):
         stop_ev.set()
 
 
+def test_archive_completed_work_orders(tmp_path: Path):
+    """Verify that completed work orders are moved from ACTIVE to COMPLETED and sync files are updated."""
+    from validators.kernel.daemon.supervisor import archive_completed_work_orders
+    from validators.kernel.daemon.authoring import get_next_work_order_int
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    tree_dir = tmp_path / ".sync" / "runtime"
+    tree_dir.mkdir(parents=True, exist_ok=True)
+
+    wo1 = {
+        "id": "WO-001",
+        "title": "Backend Scaffolding",
+        "status": "ACTIVE",
+        "assigned_agents": ["codex"],
+    }
+    wo2 = {
+        "id": "WO-002",
+        "title": "Auth API",
+        "status": "ACTIVE",
+        "assigned_agents": ["codex"],
+    }
+    (active_dir / "WO-001.yaml").write_text(yaml.safe_dump(wo1), encoding="utf-8")
+    (active_dir / "WO-002.yaml").write_text(yaml.safe_dump(wo2), encoding="utf-8")
+
+    index_data = {
+        "schema_version": 1,
+        "next_id": 3,
+        "total_active": 2,
+        "total_completed": 0,
+        "orders": [
+            {"id": "WO-001", "status": "ACTIVE", "file": "work-orders/ACTIVE/WO-001.yaml"},
+            {"id": "WO-002", "status": "ACTIVE", "file": "work-orders/ACTIVE/WO-002.yaml"},
+        ],
+    }
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(yaml.safe_dump(index_data), encoding="utf-8")
+
+    tree_data = {
+        "schema_version": 1,
+        "tree_version": 1,
+        "work_orders": {"total_active": 2, "total_completed": 0, "total_blocked": 0},
+        "agents": {
+            "codex": {"assigned_work_orders": ["WO-001", "WO-002"]},
+        },
+    }
+    tree_file = tree_dir / "TREE.yaml"
+    tree_file.write_text(yaml.safe_dump(tree_data), encoding="utf-8")
+
+    archived = archive_completed_work_orders(tmp_path, ["WO-001", "WO-002"])
+    assert "WO-001" in archived
+    assert "WO-002" in archived
+
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    assert (completed_dir / "WO-001.yaml").is_file()
+    assert (completed_dir / "WO-002.yaml").is_file()
+    assert not (active_dir / "WO-001.yaml").exists()
+    assert not (active_dir / "WO-002.yaml").exists()
+
+    # Check INDEX.yaml
+    idx_updated = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    assert idx_updated["total_active"] == 0
+    assert idx_updated["total_completed"] == 2
+    assert idx_updated["orders"][0]["file"] == "work-orders/COMPLETED/WO-001.yaml"
+    assert idx_updated["orders"][0]["status"] == "COMPLETED"
+
+    # Check TREE.yaml
+    tree_updated = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
+    assert tree_updated["work_orders"]["total_active"] == 0
+    assert tree_updated["work_orders"]["total_completed"] == 2
+    assert tree_updated["agents"]["codex"]["assigned_work_orders"] == []
+
+    # Check next integer ID
+    assert get_next_work_order_int(tmp_path) == 3
+
+
+

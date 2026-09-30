@@ -1807,8 +1807,11 @@ class SessionManager:
                         is_valid, _ = validate_plan_structure(plan_content)
                         if is_valid:
                             parsed_plan = parse_plan(plan_content)
+                            from .authoring import get_next_work_order_int
+                            start_idx = get_next_work_order_int(ws_path)
                             proposed_wos = []
-                            for idx, m in enumerate(parsed_plan.milestones, start=1):
+                            for offset, m in enumerate(parsed_plan.milestones):
+                                idx = start_idx + offset
                                 wo_id = f"WO-{idx:03d}"
                                 assigned = ["codex"]
                                 title_l = m.title.lower()
@@ -1822,9 +1825,9 @@ class SessionManager:
                                     "id": wo_id,
                                     "title": m.title,
                                     "type": "FEATURE",
-                                    "priority": "P1" if idx > 1 else "P0",
+                                    "priority": "P1" if offset > 0 else "P0",
                                     "assigned_agents": assigned,
-                                    "dependencies": [f"WO-{idx-1:03d}"] if idx > 1 else [],
+                                    "dependencies": [f"WO-{idx-1:03d}"] if offset > 0 else [],
                                     "deliverable": {
                                         "type": "code",
                                         "description": f"Deliverables for {m.title}",

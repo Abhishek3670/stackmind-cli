@@ -443,20 +443,27 @@ class LifecycleSupervisor:
             if status not in _OPERATION_TERMINAL:
                 return AdvanceResult.WAITING_FOR_OPERATION
 
-            # 1. Discover worker WOs from disk
-            self._discover_worker_wos(state)
+            # 1. Check if the authoring operation succeeded or if we need synthesis
+            authoring_failed = (status == "FAILED") or (
+                isinstance(op.get("result"), dict)
+                and str(op.get("result", {}).get("status", "")).lower() in ("blocked", "failed")
+            )
 
-            # 2. If no worker WOs found on disk (e.g. Turn 2 was conversational or failed tool loop),
-            # autonomously synthesize child work orders and contracts from the approved PLAN.md
-            if not state.worker_wo_ids:
-                ws = Path(state.workspace)
+            ws = Path(state.workspace)
+            plan = self.manager.get_plan(state.session_id, state.plan_id) if state.plan_id else {}
+
+            # If authoring failed or worker WOs aren't yet authored for this plan, synthesize them
+            if authoring_failed or not state.worker_wo_ids:
+                from .authoring import synthesize_child_work_orders
                 try:
-                    plan = self.manager.get_plan(state.session_id, state.plan_id) if state.plan_id else {}
-                    from .authoring import synthesize_child_work_orders
-                    synthesize_child_work_orders(ws, plan, session_id=state.session_id)
-                    self._discover_worker_wos(state)
+                    synthesized = synthesize_child_work_orders(ws, plan, session_id=state.session_id)
+                    if synthesized:
+                        state.worker_wo_ids = [w["id"] for w in synthesized]
                 except Exception:
                     pass
+
+            if not state.worker_wo_ids:
+                self._discover_worker_wos(state)
 
             if not state.worker_wo_ids:
                 err_detail = op.get('result', {}).get('error') or op.get('result', {}).get('reason') or 'no worker Work Orders found on disk'
@@ -806,6 +813,14 @@ class LifecycleSupervisor:
                 return AdvanceResult.FAILED
             # GitOps completed — if workspace has a git repository, perform governed release commit
             ws = Path(state.workspace)
+            # Before committing, archive completed work orders to .sync/work-orders/COMPLETED/
+            to_archive = list(state.completed_wo_ids)
+            if state.gitops_wo_id and state.gitops_wo_id not in to_archive:
+                to_archive.append(state.gitops_wo_id)
+            try:
+                archive_completed_work_orders(ws, to_archive)
+            except Exception:
+                pass
             if (ws / ".git").is_dir():
                 try:
                     sha = create_gitops_commit(
@@ -914,6 +929,8 @@ class LifecycleSupervisor:
             try:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    if str(data.get("status", "")).upper() == "COMPLETED":
+                        continue
                     assigned = data.get("assigned_agents", [])
                     # Classify: if assigned to local-llm/gitops, it's the GitOps WO
                     if isinstance(assigned, list) and any(
@@ -1193,11 +1210,113 @@ def create_gitops_commit(
     return sha
 
 
+def archive_completed_work_orders(
+    workspace: Path | str,
+    completed_wo_ids: list[str] | None = None,
+) -> list[str]:
+    """Archive completed work orders from ACTIVE to COMPLETED and update INDEX.yaml/TREE.yaml.
+
+    Returns the list of work order IDs that were successfully archived.
+    """
+    ws = Path(workspace).resolve()
+    sync_dir = ws / ".sync"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    completed_dir = sync_dir / "work-orders" / "COMPLETED"
+    index_file = sync_dir / "work-orders" / "INDEX.yaml"
+    tree_file = sync_dir / "runtime" / "TREE.yaml"
+
+    if not active_dir.is_dir():
+        return []
+
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    target_ids = set(completed_wo_ids or [])
+
+    archived: list[str] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for wo_file in sorted(active_dir.glob("*.yaml")):
+        wo_id = wo_file.stem
+        try:
+            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            wo_data = {}
+
+        is_completed = (
+            wo_id in target_ids
+            or str(wo_data.get("status", "")).upper() == "COMPLETED"
+        )
+        if not is_completed:
+            continue
+
+        wo_data["status"] = "COMPLETED"
+        wo_data["updated"] = now_iso
+        target_file = completed_dir / wo_file.name
+        target_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+        try:
+            wo_file.unlink()
+        except OSError:
+            pass
+        archived.append(wo_id)
+
+    if not archived:
+        return []
+
+    # Update INDEX.yaml
+    if index_file.is_file():
+        try:
+            index_data = yaml.safe_load(index_file.read_text(encoding="utf-8")) or {}
+            orders = index_data.get("orders", [])
+            for o in orders:
+                if isinstance(o, dict) and o.get("id") in archived:
+                    o["status"] = "COMPLETED"
+                    o["file"] = f"work-orders/COMPLETED/{o.get('id')}.yaml"
+                    o["updated"] = now_iso
+            index_data["total_active"] = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+            )
+            index_data["total_completed"] = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+            )
+            index_data["total_blocked"] = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
+            )
+            index_data["last_updated"] = now_iso
+            index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # Update TREE.yaml
+    if tree_file.is_file():
+        try:
+            tree_data = yaml.safe_load(tree_file.read_text(encoding="utf-8")) or {}
+            if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+                if index_file.is_file():
+                    tree_data["work_orders"]["total_active"] = index_data.get("total_active", 0)
+                    tree_data["work_orders"]["total_completed"] = index_data.get("total_completed", 0)
+                    tree_data["work_orders"]["total_blocked"] = index_data.get("total_blocked", 0)
+            if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                archived_set = set(archived)
+                for _agent_name, agent_info in tree_data["agents"].items():
+                    if isinstance(agent_info, dict) and "assigned_work_orders" in agent_info:
+                        assigned = agent_info["assigned_work_orders"]
+                        if isinstance(assigned, list):
+                            agent_info["assigned_work_orders"] = [
+                                w for w in assigned if w not in archived_set
+                            ]
+            tree_data["last_updated"] = now_iso
+            tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    return archived
+
+
 __all__ = [
     "AdvanceResult",
     "LifecycleSupervisor",
     "Phase",
     "RunState",
+    "archive_completed_work_orders",
     "create_gitops_commit",
     "format_release_commit_message",
 ]
