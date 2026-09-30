@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 import yaml
@@ -855,5 +856,260 @@ class ToolGateway:
         budget_info = dict(self.contract.budget)
         self.boundary.journal.complete(record.request.operation_id, f"{len(budget_info)} budget fields")
         return budget_info
+
+    def _run_git(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        target_dir = self.workspace.root
+        if not (target_dir / ".git").exists() and hasattr(self.workspace, "authoritative_root"):
+            auth = getattr(self.workspace, "authoritative_root", None)
+            if auth and (auth / ".git").exists():
+                target_dir = auth
+        return subprocess.run(
+            ["git", *args],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def git_status(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.GIT_STATUS, "workspace/git/status")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["status", "--porcelain"])
+        staged: list[str] = []
+        unstaged: list[str] = []
+        untracked: list[str] = []
+
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if len(line) < 3:
+                    continue
+                code = line[:2]
+                fname = line[3:].strip()
+                if code == "??":
+                    untracked.append(fname)
+                else:
+                    if code[0] != " ":
+                        staged.append(fname)
+                    if code[1] != " ":
+                        unstaged.append(fname)
+
+        out = {
+            "clean": len(staged) == 0 and len(unstaged) == 0 and len(untracked) == 0,
+            "staged": staged,
+            "unstaged": unstaged,
+            "untracked": untracked,
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"clean={out['clean']}")
+        return out
+
+    def git_diff(self, path: str | None = None) -> str:
+        target = f"workspace/git/diff/{path or '*'}"
+        record = self._authorize(OperationType.GIT_DIFF, target)
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        cmd = ["diff"]
+        if path:
+            cmd.append(path)
+        proc = self._run_git(cmd)
+        diff_text = proc.stdout if proc.returncode == 0 else ""
+        self.boundary.journal.complete(record.request.operation_id, f"{len(diff_text)} chars")
+        return diff_text
+
+    def git_log(self, max_count: int = 10) -> list[dict[str, Any]]:
+        record = self._authorize(OperationType.GIT_LOG, "workspace/git/log")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["log", f"-n{max_count}", "--pretty=format:%H|%an|%ad|%s"])
+        commits: list[dict[str, Any]] = []
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                parts = line.split("|", 3)
+                if len(parts) == 4:
+                    commits.append({
+                        "commit": parts[0],
+                        "author": parts[1],
+                        "date": parts[2],
+                        "message": parts[3],
+                    })
+
+        self.boundary.journal.complete(record.request.operation_id, f"{len(commits)} commits")
+        return commits
+
+    def git_show(self, commit_or_path: str = "HEAD") -> str:
+        record = self._authorize(OperationType.GIT_SHOW, f"workspace/git/show/{commit_or_path}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["show", commit_or_path])
+        out = proc.stdout if proc.returncode == 0 else ""
+        self.boundary.journal.complete(record.request.operation_id, f"{len(out)} chars")
+        return out
+
+    def git_blame(self, path: str) -> list[dict[str, Any]]:
+        record = self._authorize(OperationType.GIT_BLAME, f"workspace/{path}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["blame", "-s", path])
+        lines: list[dict[str, Any]] = []
+        if proc.returncode == 0:
+            for line_no, raw_line in enumerate(proc.stdout.splitlines(), start=1):
+                parts = raw_line.split(" ", 2)
+                commit_hash = parts[0] if parts else ""
+                lines.append({
+                    "line": line_no,
+                    "commit": commit_hash,
+                    "content": parts[2] if len(parts) > 2 else "",
+                })
+
+        self.boundary.journal.complete(record.request.operation_id, f"{len(lines)} lines blamed")
+        return lines
+
+    def git_changed_files(self, base_branch: str | None = None) -> list[str]:
+        record = self._authorize(OperationType.GIT_CHANGED_FILES, "workspace/git/changed")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        ref = base_branch or "HEAD"
+        proc = self._run_git(["diff", "--name-only", ref])
+        files = [f.strip() for f in proc.stdout.splitlines() if f.strip()] if proc.returncode == 0 else []
+        self.boundary.journal.complete(record.request.operation_id, f"{len(files)} files changed")
+        return files
+
+    def git_branch(self) -> dict[str, Any]:
+        record = self._authorize(OperationType.GIT_BRANCH, "workspace/git/branch")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["branch", "--list"])
+        branches = []
+        current = "main"
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                name = line.strip()
+                if line.startswith("*"):
+                    name = line.lstrip("* ").strip()
+                    current = name
+                branches.append(name)
+
+        out = {"current": current, "branches": branches}
+        self.boundary.journal.complete(record.request.operation_id, f"current={current}")
+        return out
+
+    def git_stage(self, paths: Sequence[str]) -> list[str]:
+        record = self._authorize(OperationType.GIT_STAGE, "workspace/git/stage")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["add", *paths])
+        if proc.returncode != 0 and proc.stderr:
+            raise RuntimeError(f"git add failed: {proc.stderr}")
+        self.boundary.journal.complete(record.request.operation_id, f"staged {len(paths)} paths")
+        return list(paths)
+
+    def git_restore(self, paths: Sequence[str]) -> list[str]:
+        record = self._authorize(OperationType.GIT_RESTORE, "workspace/git/restore")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["restore", *paths])
+        self.boundary.journal.complete(record.request.operation_id, f"restored {len(paths)} paths")
+        return list(paths)
+
+    def git_create_branch(self, branch_name: str) -> str:
+        record = self._authorize(OperationType.GIT_CREATE_BRANCH, f"workspace/git/branch/{branch_name}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        proc = self._run_git(["checkout", "-b", branch_name])
+        self.boundary.journal.complete(record.request.operation_id, f"branch {branch_name}")
+        return branch_name
+
+    def git_commit(self, message: str, author: str | None = None) -> str:
+        record = self._authorize(OperationType.GIT_COMMIT, "workspace/git/commit")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        if not message.strip():
+            raise ValueError("Commit message cannot be empty")
+
+        cmd = ["commit", "-m", message]
+        if author:
+            cmd.extend(["--author", author])
+        proc = self._run_git(cmd)
+        if proc.returncode != 0 and "nothing to commit" not in proc.stdout:
+            raise RuntimeError(f"git commit failed: {proc.stderr or proc.stdout}")
+
+        head_proc = self._run_git(["rev-parse", "HEAD"])
+        commit_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else "unknown"
+        self.boundary.journal.complete(record.request.operation_id, f"commit {commit_sha}")
+        return commit_sha
+
+    def git_tag(self, tag_name: str, message: str | None = None) -> str:
+        record = self._authorize(OperationType.GIT_TAG, f"workspace/git/tag/{tag_name}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        cmd = ["tag", "-a", tag_name, "-m", message or tag_name]
+        proc = self._run_git(cmd)
+        if proc.returncode != 0:
+            raise RuntimeError(f"git tag failed: {proc.stderr or proc.stdout}")
+        self.boundary.journal.complete(record.request.operation_id, f"tag {tag_name}")
+        return tag_name
+
+    def git_push(self, remote: str = "origin", branch: str | None = None) -> dict[str, Any]:
+        record = self._authorize(OperationType.GIT_PUSH, "workspace/git/push")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        cmd = ["push", remote]
+        if branch:
+            cmd.append(branch)
+        proc = self._run_git(cmd)
+        out = {
+            "success": proc.returncode == 0,
+            "remote": remote,
+            "branch": branch,
+            "output": proc.stdout or proc.stderr,
+        }
+        self.boundary.journal.complete(record.request.operation_id, "pushed" if proc.returncode == 0 else "push_failed")
+        return out
+
+    def create_release(self, tag: str, changelog: str) -> dict[str, Any]:
+        record = self._authorize(OperationType.CREATE_RELEASE, f"workspace/release/{tag}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        changelog_path = self.workspace.path_for("CHANGELOG.md")
+        existing = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else "# Changelog\n\n"
+        new_changelog = f"# Changelog\n\n## [{tag}]\n{changelog}\n\n" + existing.replace("# Changelog\n\n", "")
+        changelog_path.write_text(new_changelog, encoding="utf-8")
+
+        self.git_stage(["CHANGELOG.md"])
+        commit_sha = self.git_commit(f"chore(release): bump version to {tag}")
+        self.git_tag(tag, message=f"Release {tag}")
+
+        out = {
+            "tag": tag,
+            "commit": commit_sha,
+            "status": "release_created",
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"release {tag}")
+        return out
+
+    def rollback_release(self, tag: str) -> dict[str, Any]:
+        record = self._authorize(OperationType.ROLLBACK_RELEASE, f"workspace/release/{tag}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        self._run_git(["tag", "-d", tag])
+        out = {"tag": tag, "status": "release_rolled_back"}
+        self.boundary.journal.complete(record.request.operation_id, f"rolled back {tag}")
+        return out
+
 
 
