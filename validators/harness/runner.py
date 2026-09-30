@@ -780,6 +780,8 @@ class AgentRunner:
                     if not dimensions.all_passed:
                         failed = [name for name, passed in dimensions.to_dict().items() if name != 'all_passed' and not passed]
                         reason_msg = 'verification gate failed: ' + ', '.join(failed)
+                        if staged_errors:
+                            reason_msg += f" ({'; '.join(staged_errors)})"
                         meta_dict: dict[str, Any] = {'commands_audit': stage_inputs.get('commands_audit', [])}
                         if not dimensions.outcome_verified and task.work_order_id and task.deliverable_path and not getattr(task, 'is_authoring', False):
                             norm_del = Path(task.deliverable_path).as_posix().lstrip('/')

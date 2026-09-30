@@ -891,3 +891,20 @@ def test_worker_denied_manifest_access_when_outside_contract_scope(tmp_path: Pat
         gateway.write_file("requirements.txt", "malicious-pkg==1.0.0\n")
     assert "outside allowed scope" in str(exc_info.value) or "denied" in str(exc_info.value)
 
+
+def test_fastapi_and_auth_ecosystem_import_mappings():
+    """Verify that importing pydantic or starlette is satisfied by fastapi,
+    and jwt is satisfied by python-jose, and bcrypt is satisfied by passlib.
+    """
+    from validators.harness.dependency_gate import is_import_declared
+
+    # 1. fastapi satisfies pydantic and starlette
+    assert is_import_declared("pydantic", {"fastapi"}) is True
+    assert is_import_declared("starlette", {"fastapi"}) is True
+
+    # 2. python-jose satisfies jwt
+    assert is_import_declared("jwt", {"python-jose"}) is True
+
+    # 3. passlib satisfies bcrypt
+    assert is_import_declared("bcrypt", {"passlib"}) is True
+

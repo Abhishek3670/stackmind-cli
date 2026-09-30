@@ -137,6 +137,13 @@ def test_credential_leak_scanner_pattern_detection():
     # Configured secret
     assert len(scanner.scan_text("Encountered token my-custom-super-secret-12345 in header")) > 0
 
+    # Function calls returning tokens must not be flagged as credential leaks
+    assert len(scanner.scan_text("access_token = create_access_token(data={'sub': user['username']})")) == 0
+    assert len(scanner.scan_text("token = generate_jwt_token(payload)")) == 0
+    assert len(scanner.scan_text("user_password = get_password()")) == 0
+    assert len(scanner.scan_text("auth_token = service.fetch_token()")) == 0
+    assert len(scanner.scan_text("access_token = 'super-secret-token-12345678'")) > 0
+
     # Redaction helper
     redacted = scanner.redact("API: sk-1234567890abcdefghijklmnopq and my-custom-super-secret-12345")
     assert "sk-" not in redacted

@@ -148,8 +148,10 @@ def assert_scope_contained(parent_scope: Any, child_scope: Any, role: str = "sub
 # ─── 2. CREDENTIAL ZERO-LEAKAGE SCANNING ──────────────────────────────────────
 
 _CREDENTIAL_PATTERNS = [
-    # Generic API Keys / Secrets
-    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|auth[_-]?token)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.]{12,})['\"]?"),
+    # Generic API Keys / Secrets (requires quotes or unquoted value not followed by call parentheses)
+    re.compile(
+        r"""(?i)(?:\b[a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|auth[_-]?token))\s*[:=]\s*(?:'([^'\n]{12,})'|"([^"\n]{12,})"|([a-zA-Z0-9_\-\.]{12,})\b(?!\s*[\(\.]))"""
+    ),
     # Provider-specific key patterns
     re.compile(r"sk-[a-zA-Z0-9_\-]{20,}"),
     re.compile(r"ghp_[a-zA-Z0-9]{20,}"),
@@ -355,7 +357,7 @@ class CredentialLeakScanner:
         # Check regex patterns
         for pattern in _CREDENTIAL_PATTERNS:
             for match in pattern.finditer(text):
-                matched_val = match.group(1) if match.groups() else match.group(0)
+                matched_val = next((g for g in match.groups() if g is not None), match.group(0))
                 if matched_val.lower() not in _ALLOWLIST_TOKENS:
                     leaks.append(f"Credential pattern matched ({pattern.pattern[:20]}...): '{matched_val[:4]}***'")
 
