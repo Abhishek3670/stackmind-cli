@@ -29,6 +29,21 @@ class StackMindTuiAdapter:
             target = argument or params.get("session_id")
             if not target:
                 raise ValueError("session_id required for :resume")
+            if hasattr(self.client, "run_resume"):
+                try:
+                    self.client.run_resume(target)
+                except Exception:
+                    pass
+            if hasattr(self.client, "resume"):
+                try:
+                    self.client.resume(target)
+                except Exception:
+                    pass
+            if hasattr(self.client, "get_session"):
+                try:
+                    return self.client.get_session(target)
+                except Exception:
+                    pass
             return self.client.resume(target)
         if command == ":pause":
             target = argument or params.get("session_id")

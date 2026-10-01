@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Live Autonomous Lifecycle & Integration Review Hardening**:
+  - Dedicated read-only integration review contract (`WO-005`) binding Claude's review turn strictly to declared deliverables and tests without write permissions.
+  - Integration review harness schema validation with structured JSON failure feedback and bounded retries.
+  - Supervisor auto-recovery on daemon restart supporting both `Phase.BLOCKED` and `Phase.FAILED` runs with pre-failure phase restoration.
+  - GitOps turn retry mechanism in `_advance_gitops` to absorb transient network hiccups before transitioning to `Phase.FAILED`.
+  - TUI `:resume` unblocking integration calling `run_resume` to re-drive supervisor runs.
+  - Section 7 in `STACKMIND-CLI.md` documenting verified tools and lifecycle test results.
+
 ## [3.7.0] - 2026-09-29
 
 ### Added

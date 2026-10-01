@@ -1119,8 +1119,8 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     policy = get_role_policy(role_or_agent)
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
 
-DEFAULT_MAX_TURNS: int = 10
-DEFAULT_MAX_TOOL_CALLS: int = 25
+DEFAULT_MAX_TURNS: int = 20
+DEFAULT_MAX_TOOL_CALLS: int = 35
 DEFAULT_MAX_TOOL_CALLS_PER_TURN: int = 10
 DEFAULT_MAX_TOOL_OUTPUT_CHARS: int = 16_000
 DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS: int = 3

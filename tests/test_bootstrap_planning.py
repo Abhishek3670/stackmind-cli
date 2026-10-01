@@ -1057,4 +1057,75 @@ def test_dynamic_plan_id_incrementation(tmp_path: Path):
     assert p3_id == "PLAN-003"
 
 
+def test_architect_explicit_agent_assignment_priority():
+    """Verify that Claude's explicit agent/role designation in PLAN.md is honored over heuristics."""
+    from validators.kernel.daemon.authoring import determine_assigned_agent
+
+    # Explicit agent tags in various formats
+    assert determine_assigned_agent("Milestone 1: Rate Limiter (Agent: codex)", ["Run tests"]) == ("codex", "backend")
+    assert determine_assigned_agent("Milestone 1: Rate Limiter [Agent: codex]", ["Run tests"]) == ("codex", "backend")
+    assert determine_assigned_agent("Milestone 1: Rate Limiter (codex)", ["Run tests"]) == ("codex", "backend")
+    assert determine_assigned_agent("Milestone 1: Rate Limiter [codex]", ["Run tests"]) == ("codex", "backend")
+    assert determine_assigned_agent("Milestone 1: Rate Limiter (Agent: gemini)", ["Write UI"]) == ("gemini", "frontend")
+    assert determine_assigned_agent("Milestone 2: Coverage Check (Agent: gemma)", ["Verify tests"]) == ("gemma", "qa")
+    assert determine_assigned_agent("Milestone 3: Release Version (Agent: local-llm)", ["Commit"]) == ("local-llm", "gitops")
+
+    # Explicit role tags
+    assert determine_assigned_agent("Milestone 1: Rate Limiter (Role: backend)", ["Run tests"]) == ("codex", "backend")
+    assert determine_assigned_agent("Milestone 1: UI View (Role: frontend)", []) == ("gemini", "frontend")
+    assert determine_assigned_agent("Milestone 2: Test Suite (Role: qa)", []) == ("gemma", "qa")
+    assert determine_assigned_agent("Milestone 3: Version Bump (Role: gitops)", []) == ("local-llm", "gitops")
+
+    # Generic or missing tag falls back to keyword heuristics
+    assert determine_assigned_agent("Milestone 1: Implementation of Rate Limiter (Role: Worker)", ["Add tests"]) == ("codex", "backend")
+    assert determine_assigned_agent("Milestone 2: QA verification and review", []) == ("gemma", "qa")
+
+
+def test_rate_limiter_multi_agent_plan_synthesis(tmp_path: Path):
+    """Verify end-to-end synthesis for rate limiter goal with codex, gemma, and local-llm."""
+    from validators.kernel.daemon.authoring import synthesize_child_work_orders
+
+    plan_content = """# Project Plan: Rate Limiter Service
+
+## Current Architecture
+Self-contained token bucket rate limiter module with pytest verification.
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Implement Token Bucket Rate Limiter (Agent: codex)
+  - [ ] Task 1.1: Build token bucket rate limiter in `app/rate_limiter.py`
+  - [ ] Task 1.2: Add unit tests in `tests/test_rate_limiter.py`
+- [ ] Milestone 2: Verify Test Suite Coverage (Agent: gemma)
+  - [ ] Task 2.1: Run pytest and confirm 100% coverage
+- [ ] Milestone 3: Release Commit and Version Bump (Agent: local-llm)
+  - [ ] Task 3.1: Bump version in `VERSION.md` and record git release commit
+"""
+    wos = synthesize_child_work_orders(tmp_path, plan_content)
+
+    assert len(wos) == 3
+
+    # Milestone 1: Codex
+    assert wos[0]["id"] == "WO-001"
+    assert wos[0]["assigned_agents"] == ["codex"]
+    assert wos[0]["deliverable"]["path"] == "app/rate_limiter.py"
+    c1 = yaml.safe_load((tmp_path / ".sync" / "contracts" / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert c1["agent_id"] == "codex"
+    assert c1["identity"]["role"] == "backend"
+
+    # Milestone 2: Gemma
+    assert wos[1]["id"] == "WO-002"
+    assert wos[1]["assigned_agents"] == ["gemma"]
+    c2 = yaml.safe_load((tmp_path / ".sync" / "contracts" / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert c2["agent_id"] == "gemma"
+    assert c2["identity"]["role"] == "qa"
+
+    # Milestone 3: Local-LLM
+    assert wos[2]["id"] == "WO-003"
+    assert wos[2]["assigned_agents"] == ["local-llm"]
+    assert wos[2]["deliverable"]["path"] == "VERSION.md"
+    c3 = yaml.safe_load((tmp_path / ".sync" / "contracts" / "WO-003.yaml").read_text(encoding="utf-8"))
+    assert c3["agent_id"] == "local-llm"
+    assert c3["identity"]["role"] == "gitops"
+
+
+
 

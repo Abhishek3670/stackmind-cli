@@ -25,8 +25,9 @@ _OPERATION_STATES = {
     "FAILED",
     "CANCEL_REQUESTED",
     "CANCELLED",
+    "BLOCKED",
 }
-_OPERATION_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
+_OPERATION_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
 
 _LOGICAL_ROLES = ["architecture", "backend", "frontend", "qa", "gitops"]
 _ROLE_ALIASES = {
@@ -449,6 +450,22 @@ def synthesize_bootstrap_planning(
     return wo_record, contract_record
 
 
+def _reset_phase_operation_id(state: Any, phase: Any) -> None:
+    """Clear stale operation references when resuming into a phase so a fresh turn is dispatched."""
+    from .supervisor import Phase
+
+    if phase == Phase.GITOPS:
+        state.gitops_operation_id = None
+    elif phase == Phase.INTEGRATION_REVIEW:
+        state.integration_operation_id = None
+    elif phase == Phase.PLANNING:
+        state.planning_operation_id = None
+    elif phase == Phase.AUTHORING:
+        state.authoring_operation_id = None
+    elif phase in (Phase.DISPATCHING, Phase.EXECUTING):
+        state.batch_operation_id = None
+
+
 class SessionManager:
     """Owns daemon sessions, their audit journals, and active-operation cancellation."""
 
@@ -545,21 +562,47 @@ class SessionManager:
                         try:
                             r_id = run_file.stem
                             loaded_state = self.supervisor.load_run_state(r_id, ws)
-                            if loaded_state and loaded_state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
-                                if session.get("state") == "WAITING":
-                                    session["state"] = "RUNNING"
-                                    session["updated_at"] = _now()
+                            if loaded_state:
                                 self._active_runs[r_id] = loaded_state
-                                stop_ev = Event()
-                                self._run_stop_events[r_id] = stop_ev
-                                drv_thread = Thread(
-                                    target=self._drive_run,
-                                    args=(r_id, stop_ev),
-                                    name=f"stackmind-supervisor-{r_id}",
-                                    daemon=True,
-                                )
-                                self._run_driver_threads[r_id] = drv_thread
-                                drv_thread.start()
+                                if loaded_state.phase != Phase.COMPLETE:
+                                    if session.get("state") == "WAITING":
+                                        session["state"] = "RUNNING"
+                                        session["updated_at"] = _now()
+                                    if loaded_state.phase in (Phase.BLOCKED, Phase.FAILED):
+                                        loaded_state.error = None
+                                        loaded_state.blocked_wo_ids.clear()
+                                        prev_phase = None
+                                        if loaded_state.transitions:
+                                            for t in reversed(loaded_state.transitions):
+                                                p_from = t.get("from")
+                                                try:
+                                                    candidate = Phase(p_from) if p_from else None
+                                                except ValueError:
+                                                    candidate = None
+                                                if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
+                                                    prev_phase = candidate
+                                                    break
+                                        target_phase = prev_phase or (
+                                            Phase.DISPATCHING if loaded_state.worker_wo_ids
+                                            else Phase.AUTHORING if loaded_state.plan_id
+                                            else Phase.PLANNING
+                                        )
+                                        _reset_phase_operation_id(loaded_state, target_phase)
+                                        self.supervisor._transition(loaded_state, target_phase)
+                                        try:
+                                            self.supervisor.save_run_state(loaded_state, ws)
+                                        except Exception:
+                                            pass
+                                    stop_ev = Event()
+                                    self._run_stop_events[r_id] = stop_ev
+                                    drv_thread = Thread(
+                                        target=self._drive_run,
+                                        args=(r_id, stop_ev),
+                                        name=f"stackmind-supervisor-{r_id}",
+                                        daemon=True,
+                                    )
+                                    self._run_driver_threads[r_id] = drv_thread
+                                    drv_thread.start()
                         except Exception:
                             pass
         self._save()
@@ -1193,11 +1236,6 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
-            if session.get("state") in {"PAUSED", "WAITING"}:
-                session["state"] = "RUNNING"
-                session["updated_at"] = _now()
-                self.events.publish("session.resumed", session_id)
-
             ws = Path(session.get("workspace", ""))
             target_run_id = run_id
             if not target_run_id:
@@ -1215,6 +1253,11 @@ class SessionManager:
             if state is None:
                 raise KeyError(f"run '{target_run_id}' not found")
 
+            if session.get("state") in {"PAUSED", "WAITING"}:
+                session["state"] = "RUNNING"
+                session["updated_at"] = _now()
+                self.events.publish("session.resumed", session_id)
+
             from .supervisor import Phase
             if state.session_id != session_id:
                 state.session_id = session_id
@@ -1225,12 +1268,24 @@ class SessionManager:
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
                 state.error = None
                 state.blocked_wo_ids.clear()
-                if state.worker_wo_ids:
-                    self.supervisor._transition(state, Phase.DISPATCHING)
-                elif state.plan_id:
-                    self.supervisor._transition(state, Phase.AUTHORING)
-                else:
-                    self.supervisor._transition(state, Phase.PLANNING)
+                prev_phase = None
+                if state.transitions:
+                    for t in reversed(state.transitions):
+                        p_from = t.get("from")
+                        try:
+                            candidate = Phase(p_from) if p_from else None
+                        except ValueError:
+                            candidate = None
+                        if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
+                            prev_phase = candidate
+                            break
+                target_phase = prev_phase or (
+                    Phase.DISPATCHING if state.worker_wo_ids
+                    else Phase.AUTHORING if state.plan_id
+                    else Phase.PLANNING
+                )
+                _reset_phase_operation_id(state, target_phase)
+                self.supervisor._transition(state, target_phase)
 
             self._active_runs[target_run_id] = state
             if target_run_id not in self._run_stop_events or self._run_stop_events[target_run_id].is_set():
@@ -1464,7 +1519,7 @@ class SessionManager:
                 if record["status"] == "CANCEL_REQUESTED" or (cancel is not None and cancel.is_set())
                 else status
             )
-            if final_status not in {"COMPLETED", "FAILED", "CANCELLED"}:
+            if final_status not in _OPERATION_TERMINAL:
                 raise ValueError("operation completion status must be terminal")
 
             if final_status == "COMPLETED":
@@ -1514,9 +1569,25 @@ class SessionManager:
             event = (
                 "operation.cancelled" if final_status == "CANCELLED"
                 else "operation.failed" if final_status == "FAILED"
+                else "operation.blocked" if final_status == "BLOCKED"
                 else "operation.completed"
             )
-            self.events.publish(event, session["session_id"], operation_id=target_op_id, status=final_status)
+            op_role = record.get("role") or session.get("role")
+            op_agent = record.get("agent_id") or session.get("agent_id")
+            op_wo = record.get("work_order_id") or session.get("work_order_id")
+            op_name = record.get("operation") or "operation"
+            op_err = record.get("error")
+            self.events.publish(
+                event,
+                session["session_id"],
+                operation_id=target_op_id,
+                status=final_status,
+                role=op_role,
+                agent_id=op_agent,
+                work_order_id=op_wo,
+                operation=op_name,
+                error=op_err,
+            )
             self._save()
             return dict(record)
 
@@ -1734,25 +1805,38 @@ class SessionManager:
         """Get the currently active run for a session, if any."""
         from .supervisor import Phase
         for state in self._active_runs.values():
-            if state.session_id == session_id and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+            if state.session_id == session_id and state.phase != Phase.COMPLETE:
                 return state.to_dict()
+        session = self._sessions.get(session_id)
+        if session:
+            ws = Path(session.get("workspace", ""))
+            sup_dir = ws / ".sync" / "runtime" / "supervisor"
+            if sup_dir.is_dir():
+                run_files = sorted(sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True)
+                for rf in run_files:
+                    persisted = self.supervisor.load_run_state(rf.stem, ws)
+                    if persisted and persisted.session_id == session_id and persisted.phase != Phase.COMPLETE:
+                        self._active_runs[rf.stem] = persisted
+                        return persisted.to_dict()
         return None
 
     def _run_turn(
         self, session_id: str, operation_id: str, cancel_event: Event, prompt: str
     ) -> None:
         """Run outside the manager lock; terminal state is resolved under it."""
+        with self._lock:
+            session = self._sessions[session_id]
+            workspace = str(session["workspace"])
+            _, op_rec = self._operation(operation_id)
+            raw_agent = str(op_rec.get("agent_id") or op_rec.get("role") or session.get("agent") or "codex").lower().strip()
+            agent = _ROLE_TO_PRIMARY_AGENT.get(raw_agent, raw_agent)
+            op_role = op_rec.get("role") or self._canonical_role(agent)
         tool_name = "harness.run_once"
         self.events.tool_call(
-            session_id, tool_name, operation_id, {"prompt": prompt}, operation_id
+            session_id, tool_name, operation_id, {"prompt": prompt}, operation_id,
+            role=op_role, agent_id=agent,
         )
         try:
-            with self._lock:
-                session = self._sessions[session_id]
-                workspace = str(session["workspace"])
-                _, op_rec = self._operation(operation_id)
-                raw_agent = str(op_rec.get("agent_id") or op_rec.get("role") or session.get("agent") or "codex").lower().strip()
-                agent = _ROLE_TO_PRIMARY_AGENT.get(raw_agent, raw_agent)
             ws_path = Path(workspace)
             _scaffold_protocol_citizenship(ws_path, agent)
             runner = self._runner_factory(workspace, agent)
@@ -1793,20 +1877,25 @@ class SessionManager:
                         result = runner.run_once(cancel_event=cancel_event, operation_id=operation_id)
             b_id = getattr(runner, "backend_id", None)
             b_mod = getattr(runner, "backend_model", None)
+            res_meta = getattr(result, "meta", None) or {}
+            res_reason = getattr(result, "reason", None)
+            res_status = getattr(result, "status", "completed")
             result_data = {
-                "status": result.status,
-                "persisted": result.persisted,
-                "task_id": result.task_id,
-                "reason": result.reason,
-                "error": result.reason or result.status,
+                "status": res_status,
+                "persisted": getattr(result, "persisted", False),
+                "task_id": getattr(result, "task_id", None),
+                "reason": res_reason,
+                "error": res_reason or res_status,
                 "report_path": str(result.report_path) if getattr(result, "report_path", None) else None,
-                "summary": (result.meta or {}).get("summary") if getattr(result, "meta", None) else None,
+                "summary": res_meta.get("summary"),
+                "blockers": res_meta.get("blockers") or ([res_reason] if res_reason else []),
                 "backend_id": b_id if isinstance(b_id, str) else None,
                 "model": b_mod if isinstance(b_mod, str) else None,
             }
             if result.status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
-                    session_id, tool_name, operation_id, "cancelled", operation_id=operation_id
+                    session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,
+                    role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data, status="CANCELLED")
             elif result.status in {"completed", "idle"}:
@@ -1865,13 +1954,19 @@ class SessionManager:
 
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "success", operation_id=operation_id,
-                    result=result_data,
+                    result=result_data, role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data)
+            elif result.status == "blocked":
+                self.events.tool_result(
+                    session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                    result=result_data, role=op_role, agent_id=agent,
+                )
+                self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
             else:
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "failure", operation_id=operation_id,
-                    error=result_data,
+                    error=result_data, role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data, status="FAILED")
         except Exception as error:
@@ -1882,7 +1977,7 @@ class SessionManager:
             }
             self.events.tool_result(
                 session_id, tool_name, operation_id, "failure", operation_id=operation_id,
-                error=err_dict,
+                error=err_dict, role=op_role, agent_id=agent,
             )
             self.complete_operation(
                 session_id, operation_id, err_dict, status="FAILED"

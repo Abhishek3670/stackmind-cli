@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .interpreter_denylist import check_command
-from .sandbox import ProcessSandbox, WorkspaceEscapeError
+from .sandbox import (
+    ProcessSandbox,
+    WorkspaceEscapeError,
+    _setup_windows_job,
+    _assign_windows_job,
+    _ensure_posix_shim,
+    _CREATE_SUSPENDED,
+)
 from .workspace import ScratchWorkspace
 
 
@@ -93,20 +100,50 @@ class ProcessManager:
             self._counter += 1
             proc_id = f"proc-{self._counter}"
 
-        env = self.sandbox._child_env(env_extra)
+        mem_limit = self.sandbox.memory_limit_bytes
+        cpu_limit = self.sandbox.cpu_time_limit_seconds
+
+        job = None
+        shim: str | None = None
+        if sys.platform == "win32":
+            job = _setup_windows_job(mem_limit, cpu_limit)
+        else:
+            if (mem_limit is not None and mem_limit > 0) or (
+                cpu_limit is not None and cpu_limit > 0
+            ):
+                shim = _ensure_posix_shim()
+
+        limit_env = self.sandbox._child_env(env_extra)
+        if shim is not None:
+            if mem_limit is not None and mem_limit > 0:
+                limit_env["STACKMIND_RLIMIT_BYTES"] = str(int(mem_limit))
+            if cpu_limit is not None and cpu_limit > 0:
+                limit_env["STACKMIND_RLIMIT_CPU"] = str(int(max(1, cpu_limit)))
+
+        argv = [shim, *cmd_list] if shim is not None else cmd_list
+        creationflags = _CREATE_SUSPENDED if (sys.platform == "win32" and job is not None) else 0
 
         # Start process with pipes for stdout and stderr combined
         proc = subprocess.Popen(
-            cmd_list,
+            argv,
             cwd=self.workspace.root,
-            env=env,
+            env=limit_env,
             shell=False,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,  # Line buffered
+            creationflags=creationflags,
             start_new_session=(sys.platform != "win32"),
         )
+
+        if sys.platform == "win32" and job is not None:
+            if not _assign_windows_job(job, proc):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise ProcessError("Failed to attach background process to Windows job object limits")
 
         managed = ManagedProcess(
             process_id=proc_id,
@@ -190,3 +227,5 @@ class ProcessManager:
                         proc.proc.kill()
                     except Exception:
                         pass
+
+    cleanup_all = stop_all

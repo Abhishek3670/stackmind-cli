@@ -62,16 +62,9 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
         }
 
     if role_norm in ("gemma", "qa"):
-        target_path = next(
-            (p for p in candidate_paths if "test" in p or p.startswith("tests/")),
-            None,
-        )
-        if not target_path:
-            target_path = "tests/test_login.py" if "login" in combined_text.lower() else "tests/test_main.py"
         return {
-            "type": "code",
-            "path": target_path,
-            "description": f"Test suite and validation for {milestone_title}",
+            "type": "doc",
+            "description": f"Test verification and QA sign-off for {milestone_title}",
         }
 
     if role_norm in ("local-llm", "gitops"):
@@ -91,6 +84,8 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
         kw in combined_text.lower() for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")
     )
     code_path = next((p for p in candidate_paths if p.endswith(".py") and not "test" in p), None)
+    if not code_path:
+        code_path = next((p for p in candidate_paths if p.endswith(".py")), None)
     if has_req and not code_path:
         return {
             "type": "config",
@@ -107,22 +102,71 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
 
 
 def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
-    """Determine (agent_id, role) from milestone title and tasks."""
-    combined = (f"{title} " + " ".join(tasks)).lower()
+    """Determine (agent_id, role) from milestone title and tasks.
 
+    The Architect's explicit designation in PLAN.md takes top priority.
+    """
+    combined = (f"{title} " + " ".join(tasks)).lower()
+    title_lower = title.lower()
+
+    # 1. Top priority: Explicit agent designation by the Architect in title or tasks
+    # Patterns: (Agent: codex), [Agent: codex], Agent: codex, Assigned: codex, Owner: codex,
+    #           (codex), [codex], @codex
+    target_header = f"{title} " + (tasks[0] if tasks else "")
+
+    agent_match = (
+        re.search(r"(?:agent|assigned|owner)\s*[:=]\s*([a-zA-Z0-9_\-]+)", target_header, re.IGNORECASE)
+        or re.search(r"[\(\[]\s*(?:agent:\s*)?(codex|gemini|gemma|local-llm|claude)\s*[\)\]]", target_header, re.IGNORECASE)
+        or re.search(r"@([a-zA-Z0-9_\-]+)", target_header)
+    )
+    if agent_match:
+        explicit_agent = agent_match.group(1).lower().strip()
+        role_map = {
+            "codex": "backend",
+            "gemini": "frontend",
+            "gemma": "qa",
+            "local-llm": "gitops",
+            "claude": "architecture",
+        }
+        if explicit_agent in role_map:
+            return explicit_agent, role_map[explicit_agent]
+
+    # 2. Explicit role designation by the Architect
+    # Patterns: (Role: backend), [Role: frontend], Role: qa, Role: gitops
+    role_match = re.search(r"\brole\s*[:=]\s*([a-zA-Z0-9_\-]+)", target_header, re.IGNORECASE)
+    if role_match:
+        explicit_role = role_match.group(1).lower().strip()
+        agent_role_map = {
+            "backend": ("codex", "backend"),
+            "frontend": ("gemini", "frontend"),
+            "qa": ("gemma", "qa"),
+            "gitops": ("local-llm", "gitops"),
+            "release": ("local-llm", "gitops"),
+            "architecture": ("claude", "architecture"),
+        }
+        if explicit_role in agent_role_map:
+            return agent_role_map[explicit_role]
+
+    # 3. Fallback: Semantic heuristics based on title and task keywords
     # Frontend checks: explicit UI files or keywords
     if re.search(r"\b[a-zA-Z0-9_\-\.\/]+\.(?:html|css|jsx|tsx)\b", combined) or re.search(
         r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|client|landing page|login page)\b", combined
     ):
         return "gemini", "frontend"
 
-    # QA checks
-    if re.search(r"\b(?:qa|tests?|testing|verification|audit|validation|review)\b", combined) or "test_" in combined:
-        return "gemma", "qa"
-
     # GitOps checks
     if re.search(r"\b(?:release|git|deploy|packaging|version|gitops|changelog)\b", combined):
         return "local-llm", "gitops"
+
+    # Implementation / backend logic belongs to Codex (even if tasks include unit tests)
+    if re.search(r"\b(?:implement|implementation|backend|feature|logic|module|service|core|tokenbucket|token_bucket|api)\b", title_lower):
+        return "codex", "backend"
+
+    # QA checks: pure verification, test suite execution, audit, or review
+    if re.search(r"\b(?:qa|verification|audit|validation|review)\b", title_lower) or re.search(
+        r"\b(?:qa|tests?|testing|verification|audit|validation|review)\b", combined
+    ):
+        return "gemma", "qa"
 
     # Scaffolding / dependencies specifically for backend
     if any(kw in combined for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")):
@@ -142,6 +186,13 @@ def build_child_work_order(
 ) -> dict[str, Any]:
     """Construct a schema-conforming Work Order record."""
     now = _now()
+    deliv_spec: dict[str, Any] = {
+        "type": deliverable.get("type", "code"),
+        "description": deliverable.get("description", f"Deliverables for {title}"),
+    }
+    if deliverable.get("path"):
+        deliv_spec["path"] = deliverable["path"]
+
     return {
         "id": wo_id,
         "type": "FEATURE",
@@ -150,11 +201,7 @@ def build_child_work_order(
         "priority": priority,
         "assigned_agents": list(assigned_agents),
         "dependencies": list(dependencies),
-        "deliverable": {
-            "type": deliverable.get("type", "code"),
-            "path": deliverable.get("path"),
-            "description": deliverable.get("description", f"Deliverables for {title}"),
-        },
+        "deliverable": deliv_spec,
         "description": description.strip() or title.strip(),
         "created": now,
         "updated": now,
@@ -217,6 +264,11 @@ def build_child_contract(
             {"module": "CHANGELOG.md"},
             {"module": "pyproject.toml"},
             {"module": "package.json"},
+            {"module": "src/**"},
+            {"module": "app/**"},
+            {"module": "tests/**"},
+            {"module": "test/**"},
+            {"module": "*.py"},
         ])
     else:
         allow_rules.extend([
@@ -247,10 +299,24 @@ def build_child_contract(
         {"module": ".venv/**"},
         {"module": "node_modules/**"},
     ]
-    # Deny other agents' private inboxes
-    for other_agent in ("claude", "codex", "gemini", "gemma", "local-llm", "CEO"):
-        if other_agent != agent_id:
-            deny_rules.append({"module": f".sync/inbox/{other_agent}/**"})
+    # Protect executive inbox from unauthorized worker access
+    if agent_id != "CEO":
+        deny_rules.append({"module": ".sync/inbox/CEO/**"})
+    # Preserve protocol message routing channels (AGENTS.md):
+    # - Workers need to drop review requests to .sync/inbox/gemma/
+    # - Gemma needs to drop verdicts to .sync/inbox/claude/ and .sync/inbox/codex/
+    # - Claude needs to dispatch to worker inboxes
+    for other_agent in ("claude", "codex", "gemini", "gemma", "local-llm"):
+        if other_agent == agent_id:
+            continue
+        # Exclude permitted protocol routing channels
+        if role_norm in ("qa", "gemma") and other_agent in ("claude", "codex", "gemini"):
+            continue
+        if role_norm in ("backend", "frontend", "codex", "gemini") and other_agent in ("gemma", "claude"):
+            continue
+        if role_norm in ("architecture", "claude"):
+            continue
+        deny_rules.append({"module": f".sync/inbox/{other_agent}/**"})
 
     return {
         "schema_version": 1,

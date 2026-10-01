@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from datetime import datetime, timezone
+import os
 import re
 import shutil
 import subprocess
@@ -237,7 +238,16 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        from .patch import apply_unified_diff
+        from .patch import apply_unified_diff, extract_patch_paths
+
+        # Pre-validate EVERY path declared in diff hunk headers against contract scope BEFORE opening/modifying
+        hunk_paths = extract_patch_paths(patch_content)
+        for hp in hunk_paths:
+            rec_hdr = self._authorize(OperationType.APPLY_PATCH, f"workspace/{hp}")
+            if not rec_hdr.authorized:
+                raise PermissionError(
+                    f"Diff hunk header path '{hp}' is outside allowed contract scope: {rec_hdr.reason}"
+                )
 
         path = self.workspace.path_for(target)
         if not path.is_file():
@@ -1062,10 +1072,37 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, f"tag {tag_name}")
         return tag_name
 
-    def git_push(self, remote: str = "origin", branch: str | None = None) -> dict[str, Any]:
+    def git_push(
+        self,
+        remote: str = "origin",
+        branch: str | None = None,
+        confirm_push: bool = False,
+    ) -> dict[str, Any]:
         record = self._authorize(OperationType.GIT_PUSH, "workspace/git/push")
         if not record.authorized:
             raise PermissionError(record.reason)
+
+        # D025 Protocol Safeguard: git_push is non-reversible and mutates remote state.
+        # 1. Requires explicit confirmation flag (confirm_push=True)
+        if not confirm_push and os.environ.get("STACKMIND_ALLOW_GIT_PUSH") != "1":
+            raise PermissionError(
+                "D025 Protocol Breach: git_push is non-reversible. "
+                "Execution requires explicit confirm_push=True and CEO approval receipt."
+            )
+
+        # 2. Requires verified operator/CEO approval
+        # Strictly operator-controlled: environment variable or filesystem receipt;
+        # NEVER a model-suppliable parameter.
+        has_ceo_approval = (
+            os.environ.get("STACKMIND_ALLOW_GIT_PUSH") == "1"
+            or (self.workspace.root / ".sync" / "inbox" / "CEO" / "PUSH_APPROVED").exists()
+            or (self.workspace.root / ".sync" / "approvals" / "PUSH_APPROVED").exists()
+        )
+        if not has_ceo_approval:
+            raise PermissionError(
+                "D025 Protocol Breach: git_push requires explicit CEO approval receipt before pushing to remote "
+                "(export STACKMIND_ALLOW_GIT_PUSH=1 or place .sync/inbox/CEO/PUSH_APPROVED)."
+            )
 
         cmd = ["push", remote]
         if branch:

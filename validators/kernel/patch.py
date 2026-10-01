@@ -10,6 +10,33 @@ class PatchError(ValueError):
     pass
 
 
+def extract_patch_paths(patch_text: str) -> list[str]:
+    """Extract all file paths declared in unified diff headers (---, +++, diff --git)."""
+    paths: list[str] = []
+    for line in patch_text.splitlines():
+        line = line.strip()
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                for p in (parts[2], parts[3]):
+                    clean = re.sub(r"^[ab]/", "", p).strip()
+                    if clean and clean != "/dev/null":
+                        paths.append(clean)
+        elif line.startswith(("--- ", "+++ ")):
+            raw = line[4:].strip().split("\t")[0]
+            clean = re.sub(r"^[ab]/", "", raw).strip()
+            if clean and clean != "/dev/null":
+                paths.append(clean)
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        norm = p.replace("\\", "/").strip().lstrip("/")
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
 def apply_unified_diff(original_text: str, patch_text: str) -> str:
     """Apply a unified diff patch to original_text and return the modified text.
 

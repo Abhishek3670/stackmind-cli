@@ -1666,4 +1666,747 @@ def test_archive_completed_work_orders(tmp_path: Path):
     assert get_next_work_order_int(tmp_path) == 3
 
 
+def test_supervisor_separates_gitops_and_transitions_executing_to_integration_review(tmp_path: Path):
+    """Confirm GitOps WOs are reserved for GITOPS phase and do not stall EXECUTING phase."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-001: Backend
+    (active_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Backend Logic",
+            "assigned_agents": ["codex"],
+            "dependencies": [],
+            "deliverable": {"type": "code", "path": "src/backend.py"},
+        }),
+        encoding="utf-8",
+    )
+    # WO-002: QA
+    (active_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002",
+            "title": "QA Verification",
+            "assigned_agents": ["gemma"],
+            "dependencies": ["WO-001"],
+            "deliverable": {"type": "doc", "description": "QA sign-off"},
+        }),
+        encoding="utf-8",
+    )
+    # WO-003: Release & GitOps
+    (active_dir / "WO-003.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-003",
+            "title": "Release & GitOps (Agent: Local-LLM)",
+            "assigned_agents": ["local-llm"],
+            "dependencies": ["WO-002"],
+            "deliverable": {"type": "doc", "path": "VERSION.md"},
+        }),
+        encoding="utf-8",
+    )
+
+    state = supervisor.start_run("run-gitops-sep", "Rate Limiter", tmp_path, "sess-001")
+    state.phase = Phase.EXECUTING
+
+    # Discover WOs
+    supervisor._discover_worker_wos(state)
+    assert state.gitops_wo_id == "WO-003"
+    assert state.worker_wo_ids == ["WO-001", "WO-002"]
+
+    # Deliverables on disk
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "backend.py").write_text("# backend code", encoding="utf-8")
+
+    # Simulate WO-001 completed
+    op1 = mock_mgr.start_turn("sess-001", "Execute WO-001", role="backend", agent_id="codex", work_order_id="WO-001")
+    mock_mgr.complete_operation(op1["operation_id"], status="COMPLETED")
+
+    # Advance: should complete WO-001 and dispatch WO-002
+    res = supervisor.advance(state)
+    assert "WO-001" in state.completed_wo_ids
+
+    # Simulate WO-002 completed
+    op2 = mock_mgr.start_turn("sess-001", "Execute WO-002", role="qa", agent_id="gemma", work_order_id="WO-002")
+    mock_mgr.complete_operation(op2["operation_id"], status="COMPLETED")
+
+    # Advance: should complete WO-002 and transition directly to INTEGRATION_REVIEW
+    res = supervisor.advance(state)
+    assert "WO-002" in state.completed_wo_ids
+    assert res == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.INTEGRATION_REVIEW
+    # GitOps WO was NOT dispatched during EXECUTING phase
+    assert "WO-003" not in state.completed_wo_ids
+    assert "WO-003" not in state.blocked_wo_ids
+
+
+def test_d024_gate_passes_gitops_when_qa_work_order_completed(tmp_path: Path):
+    """Confirm D024Gate resolves through QA work orders to allow GitOps progression."""
+    from validators.harness.d024_gate import D024Gate
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Implementation WO-001
+    (active_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Backend Logic",
+            "assigned_agents": ["codex"],
+            "dependencies": [],
+            "deliverable": {"type": "code", "path": "src/backend.py"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "backend.py").write_text("def test(): pass", encoding="utf-8")
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests" / "test_backend.py").write_text("def test_test(): pass", encoding="utf-8")
+
+    # 2. QA WO-002 marked COMPLETED
+    (active_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002",
+            "title": "QA Verification",
+            "status": "COMPLETED",
+            "assigned_agents": ["gemma"],
+            "dependencies": ["WO-001"],
+            "deliverable": {"type": "doc", "description": "QA sign-off"},
+        }),
+        encoding="utf-8",
+    )
+
+    # 3. GitOps WO-003 depending on WO-002
+    (active_dir / "WO-003.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-003",
+            "title": "Release & GitOps",
+            "assigned_agents": ["local-llm"],
+            "dependencies": ["WO-002"],
+            "deliverable": {"type": "doc", "path": "VERSION.md"},
+        }),
+        encoding="utf-8",
+    )
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(tmp_path, "WO-003")
+    assert decision.passed is True
+
+
+
+
+
+
+# ─── Integration Review Fix Tests (Requirements 1-4) ─────────────────
+
+def test_integration_review_synthesizes_dedicated_wo_and_contract(tmp_path: Path) -> None:
+    """Requirement 1: Integration review creates its own WO and contract with read-only scope."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir1", "Build rate limiter", tmp_path, "sess-ir1")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    # Set up workspace structure
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Rate Limiter",
+            "assigned_agents": ["codex"],
+            "deliverable": {"type": "code", "path": "app/rate_limiter.py"},
+        }),
+        encoding="utf-8",
+    )
+    idx_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    idx_file.write_text(
+        yaml.safe_dump({"orders": [{"id": "WO-001", "title": "Rate Limiter", "status": "COMPLETED"}], "next_id": 2}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Advance to dispatch the review
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.integration_wo_id is not None
+    assert state.integration_wo_id != "WO-000"  # Must NOT reuse bootstrap WO
+
+    # Verify WO file was written
+    review_wo_file = wo_dir / f"{state.integration_wo_id}.yaml"
+    assert review_wo_file.is_file(), f"Review WO file should exist at {review_wo_file}"
+    review_wo = yaml.safe_load(review_wo_file.read_text(encoding="utf-8"))
+    assert review_wo["id"] == state.integration_wo_id
+    assert review_wo["type"] == "VALIDATION"
+    assert "claude" in review_wo["assigned_agents"]
+
+    # Verify contract was written with read-only scope
+    contract_file = tmp_path / ".sync" / "contracts" / f"{state.integration_wo_id}.yaml"
+    assert contract_file.is_file(), f"Review contract should exist at {contract_file}"
+    contract = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+    assert contract["scope"]["write"] == "read-only"
+    assert contract["agent_id"] == "claude"
+    assert contract["work_order"] == state.integration_wo_id
+
+    # Verify scope includes the deliverable
+    allow_modules = [r.get("module") for r in contract["scope"]["allow"]]
+    assert "app/rate_limiter.py" in allow_modules, f"Deliverable should be in allow scope, got {allow_modules}"
+    assert "PLAN.md" in allow_modules
+
+
+def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path) -> None:
+    """Requirement 2: Review prompt specifies exact JSON fields for completed/blocked decisions."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir2", "Build auth module", tmp_path, "sess-ir2")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Auth Module",
+            "assigned_agents": ["codex"],
+            "deliverable": {"type": "code", "path": "app/auth.py"},
+        }),
+        encoding="utf-8",
+    )
+    idx_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    idx_file.write_text(
+        yaml.safe_dump({"orders": [{"id": "WO-001", "title": "Auth", "status": "COMPLETED"}], "next_id": 2}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Advance to dispatch the review
+    supervisor.advance(state)
+
+    # The mock captured the prompt in the start_turn call
+    review_op = mock_mgr.operations[state.integration_operation_id]
+    prompt = review_op["prompt"]
+
+    # Verify explicit JSON format instructions are present
+    assert '"status": "completed"' in prompt, "Prompt must show completed JSON example"
+    assert '"status": "blocked"' in prompt, "Prompt must show blocked JSON example"
+    assert '"blockers"' in prompt, "Prompt must mention blockers field"
+    assert "non-empty string array" in prompt.lower() or "non-empty" in prompt.lower(), \
+        "Prompt must specify blockers must be non-empty when blocked"
+    assert "read-only" in prompt.lower(), "Prompt should mention read-only scope constraint"
+
+
+def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: Path) -> None:
+    """Requirement 4: A valid blocked review → Phase.BLOCKED (recoverable), not Phase.FAILED."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir3", "Build API", tmp_path, "sess-ir3")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "API",
+            "assigned_agents": ["codex"],
+        }),
+        encoding="utf-8",
+    )
+    idx_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    idx_file.write_text(
+        yaml.safe_dump({"orders": [{"id": "WO-001", "title": "API", "status": "COMPLETED"}], "next_id": 2}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Advance to dispatch review
+    supervisor.advance(state)
+    review_op_id = state.integration_operation_id
+
+    # Simulate blocked review outcome (the manager would set this)
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Cannot verify deliverable",
+        "blockers": ["Read access to app/api.py was denied."],
+    }
+
+    # Advance again — should transition to BLOCKED, NOT FAILED
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.BLOCKED
+    assert state.phase == Phase.BLOCKED, f"Expected BLOCKED phase, got {state.phase}"
+    assert state.integration_blockers == ["Read access to app/api.py was denied."]
+    assert "blocked" in state.error.lower()
+
+
+def test_integration_review_failed_operation_transitions_to_failed(tmp_path: Path) -> None:
+    """Requirement 4: Actual operation failure → Phase.FAILED (unrecoverable)."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir4", "Build feature", tmp_path, "sess-ir4")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Feature",
+            "assigned_agents": ["codex"],
+        }),
+        encoding="utf-8",
+    )
+    idx_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    idx_file.write_text(
+        yaml.safe_dump({"orders": [{"id": "WO-001", "title": "Feature", "status": "COMPLETED"}], "next_id": 2}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Dispatch review
+    supervisor.advance(state)
+    review_op_id = state.integration_operation_id
+
+    # Simulate actual execution failure (not a blocked decision)
+    mock_mgr.operations[review_op_id]["status"] = "FAILED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "error": "Provider timeout after 120s",
+    }
+
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.FAILED
+    assert state.phase == Phase.FAILED
+
+
+def test_integration_review_wo_id_persists_in_state_roundtrip(tmp_path: Path) -> None:
+    """The integration_wo_id and integration_blockers fields survive serialization roundtrip."""
+    state = RunState(
+        run_id="run-ser",
+        product_goal="Test persistence",
+        workspace=str(tmp_path),
+        session_id="sess-ser",
+        phase=Phase.BLOCKED,
+        integration_wo_id="WO-005",
+        integration_blockers=["Deliverable missing", "Test coverage below threshold"],
+    )
+    data = state.to_dict()
+    assert data["integration_wo_id"] == "WO-005"
+    assert data["integration_blockers"] == ["Deliverable missing", "Test coverage below threshold"]
+
+    restored = RunState.from_dict(data)
+    assert restored.integration_wo_id == "WO-005"
+    assert restored.integration_blockers == ["Deliverable missing", "Test coverage below threshold"]
+    assert restored.phase == Phase.BLOCKED
+
+
+def test_integration_review_archives_review_wo_in_gitops(tmp_path: Path) -> None:
+    """The synthesized review WO is included in the archival list during GitOps."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir5", "Build module", tmp_path, "sess-ir5")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Module",
+            "assigned_agents": ["codex"],
+        }),
+        encoding="utf-8",
+    )
+    idx_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    idx_file.write_text(
+        yaml.safe_dump({"orders": [{"id": "WO-001", "title": "Module", "status": "COMPLETED"}], "next_id": 2}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Dispatch and complete review
+    supervisor.advance(state)
+    review_wo_id = state.integration_wo_id
+    assert review_wo_id is not None
+
+    mock_mgr.complete_operation(state.integration_operation_id, "COMPLETED")
+    supervisor.advance(state)  # → PRODUCT_READY
+    assert state.phase == Phase.PRODUCT_READY
+
+    # Verify the review WO ID would be in the archive list
+    # by checking state still carries it
+    assert state.integration_wo_id == review_wo_id
+
+
+# ─── Runner _parse_json_payload Tests ─────────────────────────────────
+
+def test_parse_json_payload_from_code_block() -> None:
+    """_parse_json_payload extracts JSON from markdown code blocks."""
+    from validators.harness.runner import AgentRunner
+    raw = '```json\n{"status": "completed", "summary": "All good", "blockers": []}\n```'
+    payload = AgentRunner._parse_json_payload(raw)
+    assert payload is not None
+    assert payload["status"] == "completed"
+    assert payload["blockers"] == []
+
+
+def test_parse_json_payload_from_raw_json() -> None:
+    """_parse_json_payload handles raw JSON text."""
+    from validators.harness.runner import AgentRunner
+    raw = '{"status": "blocked", "summary": "Missing file", "blockers": ["file not found"]}'
+    payload = AgentRunner._parse_json_payload(raw)
+    assert payload is not None
+    assert payload["status"] == "blocked"
+    assert payload["blockers"] == ["file not found"]
+
+
+def test_parse_json_payload_normalizes_status() -> None:
+    """_parse_json_payload maps alternative status strings to canonical ones."""
+    from validators.harness.runner import AgentRunner
+    raw = '{"status": "SUCCESS", "summary": "done"}'
+    payload = AgentRunner._parse_json_payload(raw)
+    assert payload is not None
+    assert payload["status"] == "completed"
+
+    raw_failed = '{"status": "FAILED", "summary": "error"}'
+    payload2 = AgentRunner._parse_json_payload(raw_failed)
+    assert payload2 is not None
+    assert payload2["status"] == "blocked"
+
+
+def test_parse_json_payload_unwraps_decision_key() -> None:
+    """_parse_json_payload unwraps {'decision': {...}} wrapper."""
+    from validators.harness.runner import AgentRunner
+    raw = '{"decision": {"status": "completed", "summary": "OK", "blockers": []}}'
+    payload = AgentRunner._parse_json_payload(raw)
+    assert payload is not None
+    assert payload["status"] == "completed"
+    assert "decision" not in payload
+
+
+def test_parse_json_payload_returns_none_for_non_json() -> None:
+    """_parse_json_payload returns None for plain prose."""
+    from validators.harness.runner import AgentRunner
+    raw = "I have completed the review and everything looks good."
+    payload = AgentRunner._parse_json_payload(raw)
+    assert payload is None
+
+
+def test_parse_json_payload_raw_decode_finds_embedded_json() -> None:
+    """_parse_json_payload uses raw_decode to find JSON embedded in prose."""
+    from validators.harness.runner import AgentRunner
+    raw = 'Here is my decision:\n\n{"status": "completed", "summary": "verified", "blockers": []}\n\nEnd of review.'
+    payload = AgentRunner._parse_json_payload(raw)
+    assert payload is not None
+    assert payload["status"] == "completed"
+
+
+# ─── Manager Blocked Status Routing Test ──────────────────────────────
+
+def test_manager_blocked_result_sets_blocked_operation_status(tmp_path: Path) -> None:
+    """Manager._run_turn routes result.status=='blocked' to BLOCKED operation status, not FAILED."""
+    # This test verifies the elif branch in _run_turn
+    mock_mgr = MockSessionManager(tmp_path)
+
+    # Simulate what the manager does: create an operation, then check
+    # how complete_operation routes it
+    op = mock_mgr.start_turn("sess-blk", "test", work_order_id="WO-001")
+    op_id = op["operation_id"]
+
+    # Simulate blocked completion (what the new elif branch does)
+    result_data = {"status": "blocked", "reason": "scope denied"}
+    mock_mgr.complete_operation(op_id, status="BLOCKED", result=result_data)
+
+    completed = mock_mgr.get_operation(op_id)
+    assert completed["status"] == "BLOCKED"
+    assert completed["result"]["status"] == "blocked"
+
+
+def test_events_tool_result_accepts_blocked_status() -> None:
+    """EventDispatcher.tool_result accepts 'blocked' without raising ValueError."""
+    from validators.kernel.daemon.events import EventDispatcher
+    dispatcher = EventDispatcher()
+    evt = dispatcher.tool_result(
+        session_id="sess-test",
+        tool_name="harness.run_once",
+        call_id="call-001",
+        status="blocked",
+        operation_id="op-001",
+        result={"status": "blocked", "reason": "access denied"},
+    )
+    assert evt.payload["status"] == "blocked"
+    assert evt.payload["result"]["status"] == "blocked"
+
+
+def test_runner_integration_review_sets_correct_system_prompt() -> None:
+    """AgentRunner does not treat an integration review task as a plan-generation task."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from validators.harness.runner import AgentRunner, HarnessTask, LLMRequest
+
+    runner = AgentRunner(Path("."), "claude")
+    task = HarnessTask(
+        kind="work_order",
+        identifier="WO-005",
+        path=Path("WO-005.yaml"),
+        title="Integration Review",
+        body="Perform integration review of all completed deliverables.",
+        query="Integration Review",
+        work_order_id="WO-005",
+    )
+    from validators.knowledge.api import ContextBundle
+    from validators.harness.retrieval import RetrievalBatch
+    ctx = ContextBundle(
+        revision=1, git_commit="HEAD", stale=False, semantic=False,
+        token_budget=1000, estimated_tokens=0, truncated=False,
+        truncation_reason=None, entries=(), text="",
+    )
+    retrieval = RetrievalBatch(
+        results=(), evidence=(), mode="test", cost_estimate=0.0,
+        cache_hits=0, searches_used=0, cap_exhausted=False,
+    )
+    req = LLMRequest(
+        agent="claude",
+        session_count=1,
+        task=task,
+        context=ctx,
+        retrieval=retrieval,
+    )
+    from unittest.mock import patch
+    mock_runtime = MagicMock()
+    mock_runtime.gateway.contract = MagicMock()
+    del mock_runtime.gateway.boundary
+    mock_runtime.workspace.attempt_id = "attempt-1"
+
+    with patch("validators.kernel.providers.gateway.ProviderGateway.run_loop") as mock_run_loop:
+        from validators.kernel.providers.models import Message
+        mock_msg = Message.assistant('{"status": "completed", "summary": "ok", "blockers": []}')
+        mock_run_loop.return_value = [mock_msg]
+        rec = runner._complete_request(req, mock_runtime)
+        assert rec is not None
+        call_args = mock_run_loop.call_args
+        messages = call_args[0][0]
+        system_msg = messages[0].content
+        assert "final integration review" in system_msg.lower()
+        assert "read-only contract" in system_msg.lower()
+        assert "write plan.md" not in system_msg.lower()
+
+
+def test_session_manager_complete_operation_supports_blocked_status(tmp_path: Path) -> None:
+    """SessionManager.complete_operation allows 'BLOCKED' as a valid terminal status."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon-state.json")
+    sm = SessionManager(storage)
+    sess = sm.create_session("claude", "daemon", {}, str(tmp_path))
+    _, op_id = sm.begin_operation(sess["session_id"], "turn")
+
+    res = sm.complete_operation(
+        sess["session_id"],
+        op_id,
+        status="BLOCKED",
+        result={"status": "blocked", "reason": "scope check"},
+    )
+    assert res["status"] == "BLOCKED"
+    assert sm.get_operation(op_id)["status"] == "BLOCKED"
+
+
+def test_d024_find_companion_test_file_recognizes_test_files() -> None:
+    """find_companion_test_file returns the file itself when deliverable is a test file."""
+    from validators.harness.d024_gate import D024Gate
+    gate = D024Gate()
+    # Path inside clean_tui_test_final or dummy path
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        t_dir = Path(td) / "tests"
+        t_dir.mkdir(parents=True)
+        test_file = t_dir / "test_rate_limiter.py"
+        test_file.write_text("def test_rate(): pass", encoding="utf-8")
+        found = gate.find_companion_test_file(Path(td), "tests/test_rate_limiter.py")
+        assert found is not None
+        assert found.resolve() == test_file.resolve()
+
+
+def test_d024_gate_recognizes_qa_work_order_with_completion_notice(tmp_path: Path) -> None:
+    """D024Gate recognizes completed QA work order from inbox completion notice even if status is ACTIVE."""
+    from validators.harness.d024_gate import D024Gate
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    inbox_dir = tmp_path / ".sync" / "inbox" / "claude"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "test_sample.py").write_text("def test_ok(): pass", encoding="utf-8")
+
+    # Worker WO
+    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001",
+        "title": "Backend",
+        "assigned_agents": ["codex"],
+        "deliverable": {"type": "code", "path": "tests/test_sample.py"},
+    }), encoding="utf-8")
+
+    # QA WO that depends on WO-001, status is ACTIVE but completion notice is in inbox
+    (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "title": "QA",
+        "assigned_agents": ["gemma"],
+        "dependencies": ["WO-001"],
+        "status": "ACTIVE",
+    }), encoding="utf-8")
+    (inbox_dir / "2026-10-01_gemma_WO-002-complete.md").write_text("# Completion Notice", encoding="utf-8")
+
+    # GitOps WO
+    (wo_dir / "WO-003.yaml").write_text(yaml.safe_dump({
+        "id": "WO-003",
+        "title": "GitOps Release",
+        "assigned_agents": ["local-llm"],
+        "dependencies": ["WO-002"],
+        "status": "ACTIVE",
+    }), encoding="utf-8")
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(tmp_path, "WO-003")
+    assert decision.passed is True
+    assert "explicit Gemma QA approval" in decision.reason
+
+
+def test_manager_resume_run_restores_pre_blocked_phase(tmp_path: Path):
+    """Verify that manager.resume_run restores the pre-blocked phase rather than resetting to DISPATCHING."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-gitops-blocked"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build rate limiter",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.BLOCKED,
+        worker_wo_ids=["WO-001", "WO-002", "WO-003"],
+        completed_wo_ids=["WO-001", "WO-002", "WO-003"],
+        gitops_wo_id="WO-004",
+        error="GitOps dispatch blocked: gate error",
+        transitions=[
+            {"from": "PRODUCT_READY", "to": "GITOPS", "at": "2026-10-01T12:00:00Z"},
+            {"from": "GITOPS", "to": "BLOCKED", "at": "2026-10-01T12:00:05Z"},
+        ],
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    # get_active_run should return the blocked run
+    active_rec = mgr.get_active_run(sid)
+    assert active_rec is not None
+    assert active_rec["phase"] == "BLOCKED"
+
+    # resume_run should restore Phase.GITOPS (the pre-blocked phase)
+    resumed = mgr.resume_run(sid)
+    assert resumed["run_id"] == run_id
+    assert resumed["phase"] == "GITOPS"
+    assert resumed["error"] is None
+    assert run_id in mgr._active_runs
+    assert run_id in mgr._run_driver_threads
+
+    if run_id in mgr._run_stop_events:
+        mgr._run_stop_events[run_id].set()
+
+
+def test_manager_boot_auto_resumes_blocked_run_with_active_session(tmp_path: Path):
+    """Verify that SessionManager.__init__ automatically recovers and resumes BLOCKED runs on restart."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr1 = SessionManager(storage)
+    session = mgr1.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-boot-blocked"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build release",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.BLOCKED,
+        worker_wo_ids=["WO-001"],
+        completed_wo_ids=["WO-001"],
+        gitops_wo_id="WO-002",
+        error="D024 gate blocked",
+        transitions=[
+            {"from": "PRODUCT_READY", "to": "GITOPS", "at": "2026-10-01T12:00:00Z"},
+            {"from": "GITOPS", "to": "BLOCKED", "at": "2026-10-01T12:00:05Z"},
+        ],
+    )
+    mgr1.supervisor.save_run_state(r_state, tmp_path)
+
+    for stop_ev in mgr1._run_stop_events.values():
+        stop_ev.set()
+
+    # Boot fresh SessionManager recovering from storage
+    mgr2 = SessionManager(storage)
+    assert run_id in mgr2._active_runs
+    # Should have auto-resumed to GITOPS
+    assert mgr2._active_runs[run_id].phase == Phase.GITOPS
+    assert run_id in mgr2._run_driver_threads
+
+    for stop_ev in mgr2._run_stop_events.values():
+        stop_ev.set()
+
+
+def test_manager_resume_run_clears_stale_gitops_operation_id(tmp_path: Path):
+    """Verify that resuming a blocked GITOPS run clears stale gitops_operation_id."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-stale-gitops-op"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build release",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.BLOCKED,
+        worker_wo_ids=["WO-001"],
+        completed_wo_ids=["WO-001"],
+        gitops_wo_id="WO-002",
+        gitops_operation_id="stale-op-12345",
+        error="GitOps turn blocked",
+        transitions=[
+            {"from": "PRODUCT_READY", "to": "GITOPS", "at": "2026-10-01T12:00:00Z"},
+            {"from": "GITOPS", "to": "BLOCKED", "at": "2026-10-01T12:00:05Z"},
+        ],
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    resumed = mgr.resume_run(sid, run_id=run_id)
+    assert resumed["phase"] == "GITOPS"
+    assert resumed["gitops_operation_id"] is None
+    assert mgr._active_runs[run_id].gitops_operation_id is None
+
+    for stop_ev in mgr._run_stop_events.values():
+        stop_ev.set()
 

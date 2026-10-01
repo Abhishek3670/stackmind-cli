@@ -1813,16 +1813,20 @@ def dispatch_delivery_command(
         run_id_clean = run_arg.strip() or None
         run_resumed_msg = ""
         try:
+            session = adapter.command(":resume", session_id=session["session_id"])
+        except Exception:
+            try:
+                session = client.get_session(session["session_id"])
+            except Exception:
+                pass
+        try:
             resumed_run = client.run_resume(session["session_id"], run_id=run_id_clean)
             if resumed_run:
                 run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {resumed_run.get('phase')}"
                 state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
         except Exception as run_err:
-            run_resumed_msg = f" (supervisor note: {run_err})"
-        try:
-            session = adapter.command(":resume", session_id=session["session_id"])
-        except Exception:
-            pass
+            if run_id_clean:
+                run_resumed_msg = f" (supervisor note: {run_err})"
         output_str = f"Session {session.get('state', 'RUNNING')}{run_resumed_msg}"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
@@ -2236,12 +2240,12 @@ def dispatch_delivery_command(
                         assistant_rendered = True
 
                 # Check terminal event status
-                if ev_name in {"operation.completed", "operation.failed", "operation.cancelled", "turn.completed"}:
+                if ev_name in {"operation.completed", "operation.failed", "operation.cancelled", "operation.blocked", "turn.completed", "turn.blocked"}:
                     target_op = ev_payload.get("operation_id") or ev.get("operation_id")
                     if not target_op or target_op == op_id:
                         completed = True
-                        if ev_name in {"operation.failed", "operation.cancelled"}:
-                            op_status = "FAILED" if ev_name == "operation.failed" else "CANCELLED"
+                        if ev_name in {"operation.failed", "operation.cancelled", "operation.blocked", "turn.blocked"}:
+                            op_status = "FAILED" if ev_name == "operation.failed" else "BLOCKED" if ev_name in {"operation.blocked", "turn.blocked"} else "CANCELLED"
                             if op_rec is None:
                                 op_rec = {"status": op_status, "result": ev_payload}
                             elif isinstance(op_rec, dict):
