@@ -773,21 +773,41 @@ def test_win32_reader_escape_sequences():
 
 
 def test_win32_reader_default_and_opt_in_flag():
-    """Verify read_next_key defaults to legacy reader on NT, opting in to Win32 if STACKMIND_WIN32_INPUT=1."""
+    """Verify read_next_key defaults to Win32 reader on NT when console available, with graceful fallback and opt-out."""
     import os
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
     from cli.tui.keyboard import read_next_key
 
     with patch("os.name", "nt"):
-        # Default: calls _read_raw_key_windows
+        # 1. Default on interactive console: calls _read_raw_key_windows_v2
         with patch.dict(os.environ, {}, clear=True), \
+             patch("cli.tui.keyboard._win32_reader._get_input_handle", return_value=123), \
+             patch("ctypes.WinDLL") as mock_windll, \
+             patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
+             patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:
+            mock_windll.return_value.GetConsoleMode.return_value = 1
+            assert read_next_key() == "v2_key"
+            mock_v2.assert_called_once()
+            mock_legacy.assert_not_called()
+
+        # 2. Explicit opt-out: STACKMIND_WIN32_INPUT=0 forces legacy msvcrt reader
+        with patch.dict(os.environ, {"STACKMIND_WIN32_INPUT": "0"}), \
              patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
              patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:
             assert read_next_key() == "legacy_key"
             mock_legacy.assert_called_once()
             mock_v2.assert_not_called()
 
-        # Opt-in: STACKMIND_WIN32_INPUT=1 calls _read_raw_key_windows_v2
+        # 3. Fallback when console handle unavailable: calls _read_raw_key_windows
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("cli.tui.keyboard._win32_reader._get_input_handle", return_value=None), \
+             patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
+             patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:
+            assert read_next_key() == "legacy_key"
+            mock_legacy.assert_called_once()
+            mock_v2.assert_not_called()
+
+        # 4. Explicit opt-in: STACKMIND_WIN32_INPUT=1 calls _read_raw_key_windows_v2
         with patch.dict(os.environ, {"STACKMIND_WIN32_INPUT": "1"}), \
              patch("cli.tui.keyboard._read_raw_key_windows_v2", return_value="v2_key") as mock_v2, \
              patch("cli.tui.keyboard._read_raw_key_windows", return_value="legacy_key") as mock_legacy:

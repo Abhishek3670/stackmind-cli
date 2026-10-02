@@ -36,7 +36,7 @@ class StackMindTuiAdapter:
                     pass
             if hasattr(self.client, "resume"):
                 try:
-                    self.client.resume(target)
+                    return self.client.resume(target)
                 except Exception:
                     pass
             if hasattr(self.client, "get_session"):

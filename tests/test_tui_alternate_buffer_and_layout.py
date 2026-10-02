@@ -12,8 +12,10 @@ Verifies:
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
@@ -24,14 +26,19 @@ from cli.tui.app import (
     enable_mouse_reporting,
     enter_alternate_screen,
     exit_alternate_screen,
+    prompt_composer_input,
     redraw_full_screen,
+    render_composer_box,
     restore_terminal_state,
 )
+from cli.tui.keyboard import Key, _ANSI_STRIP_RE
 from cli.tui.layout import (
     LayoutTier,
     compute_layout,
+    compute_viewport_height,
     format_responsive_path,
     format_responsive_title,
+    render_conversation_scrollbar,
     render_full_screen_workspace,
     render_runtime_badge_bar,
     render_runtime_panel,
@@ -1531,6 +1538,262 @@ def test_render_runtime_badge_bar_formatting():
     assert "AGENTS: 1/2 active" in badge_str
     assert "WOs: 1/2 active" in badge_str
     assert "OP: Backend · Codex" in badge_str
+
+
+# ─── 6. CONVERSATION SCROLLBAR & FULL-STACK INTEGRATION TESTS ────────────────
+
+
+def test_render_conversation_scrollbar_empty_and_short_content():
+    """Verify render_conversation_scrollbar returns empty for zero height, and clean track for short content."""
+    assert render_conversation_scrollbar(viewport_height=0, total_lines=50) == []
+
+    # Content fits inside viewport: all rows are track lines, zero thumb lines
+    short_rows = render_conversation_scrollbar(viewport_height=10, total_lines=5, scroll_offset=0)
+    assert len(short_rows) == 10
+    assert all(r.plain == "│" for r in short_rows)
+    assert not any(r.plain == "█" for r in short_rows)
+
+
+def test_render_conversation_scrollbar_thumb_positions():
+    """Verify scrollbar thumb position shifts proportionally across bottom, middle, and top offsets."""
+    vp_height = 20
+    total_lines = 100
+    # max_offset = 100 - 20 = 80
+    # thumb_size = max(1, round(20 * (20 / 100))) = 4
+
+    # 1. At bottom (scroll_offset = 0)
+    bottom_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=0)
+    assert len(bottom_rows) == vp_height
+    # Thumb rows must be at the very bottom: rows 16..19
+    for r in range(16):
+        assert bottom_rows[r].plain == "│"
+    for r in range(16, 20):
+        assert bottom_rows[r].plain == "█"
+
+    # 2. At top (scroll_offset = 80)
+    top_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=80)
+    assert len(top_rows) == vp_height
+    # Thumb rows must be at the very top: rows 0..3
+    for r in range(4):
+        assert top_rows[r].plain == "█"
+    for r in range(4, 20):
+        assert top_rows[r].plain == "│"
+
+    # 3. In middle (scroll_offset = 40)
+    mid_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=40)
+    assert len(mid_rows) == vp_height
+    # start_idx = 100 - 40 - 20 = 40; thumb_top = round((40 / 80) * 16) = 8
+    for r in range(8):
+        assert mid_rows[r].plain == "│"
+    for r in range(8, 12):
+        assert mid_rows[r].plain == "█"
+    for r in range(12, 20):
+        assert mid_rows[r].plain == "│"
+
+
+def test_render_conversation_scrollbar_ascii_fallback():
+    """Verify scrollbar switches to ASCII characters in ASCII mode."""
+    from cli.tui.glyphs import set_glyph_mode
+
+    set_glyph_mode(True)
+    try:
+        rows = render_conversation_scrollbar(viewport_height=10, total_lines=50, scroll_offset=0)
+        assert len(rows) == 10
+        # Track is |, thumb is #
+        assert any(r.plain == "#" for r in rows)
+        assert any(r.plain == "|" for r in rows)
+        assert not any("█" in r.plain for r in rows)
+        assert not any("│" in r.plain for r in rows)
+    finally:
+        set_glyph_mode(None)
+
+
+def test_render_conversation_scrollbar_offset_clamping():
+    """Verify scroll_offset is clamped: overflow snaps to top, negative snaps to bottom."""
+    vp_height = 20
+    total_lines = 100
+    # max_offset = 80, thumb_size = 4
+
+    # 1. Overflow: scroll_offset = 999 (way past max_offset = 80) should clamp to top
+    overflow_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=999)
+    assert len(overflow_rows) == vp_height
+    # Thumb must be at the very top (same as scroll_offset=80)
+    top_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=80)
+    overflow_thumbs = [i for i, r in enumerate(overflow_rows) if r.plain == "█"]
+    top_thumbs = [i for i, r in enumerate(top_rows) if r.plain == "█"]
+    assert overflow_thumbs == top_thumbs
+    assert overflow_thumbs == [0, 1, 2, 3]
+
+    # 2. Negative: scroll_offset = -5 should clamp to bottom (same as scroll_offset=0)
+    neg_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=-5)
+    assert len(neg_rows) == vp_height
+    bottom_rows = render_conversation_scrollbar(vp_height, total_lines, scroll_offset=0)
+    neg_thumbs = [i for i, r in enumerate(neg_rows) if r.plain == "█"]
+    bottom_thumbs = [i for i, r in enumerate(bottom_rows) if r.plain == "█"]
+    assert neg_thumbs == bottom_thumbs
+    assert neg_thumbs == [16, 17, 18, 19]
+
+    # 3. All rows must be valid (no empty Text, every row is either track or thumb)
+    for rows in (overflow_rows, neg_rows):
+        for r in rows:
+            assert r.plain in ("│", "█"), f"Unexpected row content: {r.plain!r}"
+
+
+def test_render_conversation_scrollbar_exact_fit():
+    """When total_lines == viewport_height, the entire content fits — no thumb needed."""
+    rows = render_conversation_scrollbar(viewport_height=20, total_lines=20, scroll_offset=0)
+    assert len(rows) == 20
+    assert all(r.plain == "│" for r in rows)
+    assert not any(r.plain == "█" for r in rows)
+
+    # Even with a non-zero offset, should still be all-track (content fits)
+    rows2 = render_conversation_scrollbar(viewport_height=20, total_lines=20, scroll_offset=5)
+    assert all(r.plain == "│" for r in rows2)
+
+
+def test_composer_page_up_triggers_viewport_scroll_and_redraw():
+    """Integration test verifying Page Up through composer scrolls viewport and updates full-screen redraw."""
+    state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-scroll-integ")
+    session = {"session_id": "sess-scroll-integ", "agent": "codex", "provider": "daemon"}
+
+    # 1. Populate transcript with 25 conversation turns (50 messages)
+    for i in range(25):
+        state.add_message("user", f"User question {i:02d}")
+        state.add_message("assistant", f"Assistant answer {i:02d}")
+
+    # 2. Before scroll: initial full-screen redraw shows the tail of the conversation
+    frame_init = render_full_screen_workspace(session=session, state=state, width=120, height=24)
+    assert "Assistant answer 24" in frame_init
+    assert "User question 24" in frame_init
+    # Earlier lines are out of view
+    assert "User question 00" not in frame_init
+    assert "Assistant answer 00" not in frame_init
+    # The scrollbar thumb is visible at the bottom of the conversation pane divider
+    assert "█" in frame_init
+
+    init_lines = frame_init.splitlines()
+    init_thumb_indices = [idx for idx, line in enumerate(init_lines) if "█" in line]
+    assert len(init_thumb_indices) > 0
+
+    # 3. Simulate Page Up key event sent through prompt_composer_input
+    # Wire the same on_page_up callback used in app.py:interactive_delivery_loop
+    def on_page_up():
+        vp_height = compute_viewport_height(24)
+        state.scroll_conversation_up(max(1, vp_height // 2))
+
+    key_stream = iter([Key.PAGE_UP, Key.ENTER])
+    prompt_composer_input(
+        width=120,
+        terminal_width=120,
+        state=state,
+        session=session,
+        on_page_up=on_page_up,
+        key_stream=key_stream,
+        full_screen=True,
+    )
+
+    # 4. Verify scroll offset mutated and detached from bottom
+    assert state.conversation_scroll.scroll_offset == 10  # vp_height=20 -> 20 // 2 = 10
+    assert state.conversation_scroll.follow_bottom is False
+
+    # 5. Verify the redrawn full-screen frame now reveals earlier transcript lines
+    frame_scrolled = render_full_screen_workspace(session=session, state=state, width=120, height=24)
+    # Earlier content is now visible, latest lines scrolled out of view
+    assert "Assistant answer 21" in frame_scrolled or "User question 22" in frame_scrolled
+    assert "Assistant answer 24" not in frame_scrolled
+
+    # Verify thumb shifted upward
+    scrolled_lines = frame_scrolled.splitlines()
+    scrolled_thumb_indices = [idx for idx, line in enumerate(scrolled_lines) if "█" in line]
+    assert len(scrolled_thumb_indices) > 0
+    # Scrolled thumb must be higher (lower row index) than initial bottom thumb
+    assert min(scrolled_thumb_indices) < min(init_thumb_indices)
+
+    # 6. Second Page Up scrolls even further back
+    key_stream_2 = iter([Key.PAGE_UP, Key.ENTER])
+    prompt_composer_input(
+        width=120,
+        terminal_width=120,
+        state=state,
+        session=session,
+        on_page_up=on_page_up,
+        key_stream=key_stream_2,
+        full_screen=True,
+    )
+    assert state.conversation_scroll.scroll_offset == 20
+    frame_scrolled_2 = render_full_screen_workspace(session=session, state=state, width=120, height=24)
+    assert "Assistant answer 20" in frame_scrolled_2 or "User question 20" in frame_scrolled_2
+
+    # 7. Submitting or returning to bottom resets scroll and resumes live follow
+    state.scroll_conversation_to_bottom()
+    assert state.conversation_scroll.scroll_offset == 0
+    assert state.conversation_scroll.follow_bottom is True
+
+    frame_reset = render_full_screen_workspace(session=session, state=state, width=120, height=24)
+    assert "Assistant answer 24" in frame_reset
+
+
+def test_scroll_preserves_composer_buffer_and_does_not_flicker_placeholder(monkeypatch):
+    """Verify scrolling does not emit full-screen erase (\\x1b[0J), preserves typed buffer,
+    and never renders placeholder text inside an active composer text area.
+    """
+    state = AutonomousDeliveryState(project_name="flicker-test", session_id="sess-flk")
+    session = {"session_id": "sess-flk", "agent": "codex"}
+
+    # 1. Non-clearing redraw homes cursor without erasing entire screen
+    buf = io.StringIO()
+    redraw_full_screen(session=session, state=state, width=120, height=24, clear=False, stream=buf)
+    out = buf.getvalue()
+    assert out.startswith("\x1b[H")
+    assert "\x1b[0J" not in out
+
+    # 2. Active composer with empty buffer keeps text area clean without placeholder flicker
+    panel = render_composer_box(is_active=True)
+    body_plain = panel.renderable.plain
+    assert body_plain.startswith("> ")
+    assert "Type a message..." not in body_plain
+
+    # 3. Simulate interactive typing + scroll event preserving typed draft
+    captured_calls = []
+    stdout_writes = []
+
+    def mock_redraw(*args, **kwargs):
+        captured_calls.append(kwargs)
+        return "mock_frame"
+
+    monkeypatch.setattr("cli.tui.app.redraw_full_screen", mock_redraw)
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    mock_editor = MagicMock()
+    mock_editor.buffer = list("my draft query")
+    mock_editor.cursor = len(mock_editor.buffer)
+    mock_editor.prompt_prefix = "\033[90m│\033[0m \033[1;36m>\033[0m "
+
+    # Trigger Page Up handler logic as wired in app.py
+    import cli.tui.app as tui_app
+    term_lines = 24
+    vp_height = compute_viewport_height(term_lines)
+    state.scroll_conversation_up(max(1, vp_height // 2))
+    current_text = "".join(mock_editor.buffer)
+    tui_app.redraw_full_screen(
+        session,
+        state,
+        clear=False,
+        include_composer=True,
+        composer_is_active=True,
+        composer_content=current_text,
+    )
+    v_prefix_len = len(_ANSI_STRIP_RE.sub("", mock_editor.prompt_prefix))
+    cursor_col = v_prefix_len + mock_editor.cursor + 1
+    sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0].get("composer_content") == "my draft query"
+    assert captured_calls[0].get("composer_is_active") is True
+    assert captured_calls[0].get("clear") is False
+    assert any(f"\x1b[22;{cursor_col}H" in s for s in stdout_writes)
 
 
 

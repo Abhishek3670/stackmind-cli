@@ -127,6 +127,7 @@ from cli.tui.keyboard import (
     ENABLE_MOUSE_REPORTING_SEQ,
     GLOBAL_HISTORY,
     Key,
+    _ANSI_STRIP_RE,
     disable_mouse_reporting,
     enable_mouse_reporting,
     raw_prompt_input,
@@ -578,28 +579,36 @@ def render_composer_box(
     border_color = "#60a5fa" if is_active else "#475569"
 
     if not content and not has_content:
-        left_plain = f"> {placeholder}"
-        available_shortcuts_width = inner_width - len(left_plain) - 2
-        if available_shortcuts_width >= len(shortcuts):
-            right_plain = shortcuts
-        elif available_shortcuts_width >= len("Ctrl+K commands | Ctrl+L clear"):
-            right_plain = "Ctrl+K commands | Ctrl+L clear"
-        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L | PgUp/PgDn"):
-            right_plain = "Ctrl+K | Ctrl+L | PgUp/PgDn"
-        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L"):
-            right_plain = "Ctrl+K | Ctrl+L"
+        if is_active:
+            # When active, composer input line is dedicated to interactive editing.
+            # Shortcuts and placeholder remain in top border and prompt prefix,
+            # avoiding double-render mismatch and placeholder flicker with RawLineEditor.
+            line = Text(no_wrap=True)
+            line.append("> ", style="bold #38bdf8")
+            body: RenderableType = line
         else:
-            right_plain = ""
+            left_plain = f"> {placeholder}"
+            available_shortcuts_width = inner_width - len(left_plain) - 2
+            if available_shortcuts_width >= len(shortcuts):
+                right_plain = shortcuts
+            elif available_shortcuts_width >= len("Ctrl+K commands | Ctrl+L clear"):
+                right_plain = "Ctrl+K commands | Ctrl+L clear"
+            elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L | PgUp/PgDn"):
+                right_plain = "Ctrl+K | Ctrl+L | PgUp/PgDn"
+            elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L"):
+                right_plain = "Ctrl+K | Ctrl+L"
+            else:
+                right_plain = ""
 
-        spaces_count = max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
+            spaces_count = max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
 
-        line = Text(no_wrap=True)
-        line.append("> ", style="bold #38bdf8")
-        line.append(placeholder, style="dim #94a3b8")
-        if right_plain:
-            line.append(" " * spaces_count)
-            line.append(right_plain, style="dim #64748b")
-        body: RenderableType = line
+            line = Text(no_wrap=True)
+            line.append("> ", style="bold #38bdf8")
+            line.append(placeholder, style="dim #94a3b8")
+            if right_plain:
+                line.append(" " * spaces_count)
+                line.append(right_plain, style="dim #64748b")
+            body = line
     else:
         if isinstance(content, str):
             lines = content.splitlines() or [""]
@@ -675,6 +684,23 @@ def render_composer_box_str(
         has_content=has_content,
     ))
     return console.export_text(styles=use_ansi).rstrip()
+
+
+def _compute_cursor_col(editor: Any, default: int = 5) -> int:
+    """Compute the visible cursor column for the composer prompt line.
+
+    Strips ANSI escape sequences from the editor's prompt_prefix to get the
+    visible prefix width, then adds the cursor position.  Falls back to
+    *default* if the editor is None or lacks the expected attributes.
+    """
+    if editor is None:
+        return default
+    cursor = getattr(editor, "cursor", None)
+    prefix = getattr(editor, "prompt_prefix", None)
+    if not isinstance(cursor, int) or not isinstance(prefix, str):
+        return default
+    v_prefix_len = len(_ANSI_STRIP_RE.sub("", prefix))
+    return v_prefix_len + cursor + 1
 
 
 def restore_composer_focus(state: Any | None = None) -> bool:
@@ -870,6 +896,9 @@ def redraw_full_screen(
     cols = width if width is not None else term_size.columns
     lines = height if height is not None else term_size.lines
 
+    if composer_content is None and state is not None and getattr(state, "composer_buffer", ""):
+        composer_content = state.composer_buffer
+
     frame = render_full_screen_workspace(
         session=session,
         state=state,
@@ -904,7 +933,7 @@ def redraw_full_screen(
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
-            prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H\x1b[0J"
+            prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H"
             target.write(f"{prefix}{frame}\n" if not include_composer else f"{prefix}{frame}")
             target.flush()
     except Exception:
@@ -1017,6 +1046,7 @@ def prompt_composer_input(
     session: Mapping[str, Any] | None = None,
     terminal_width: int | None = None,
     full_screen: bool = False,
+    key_stream: Optional[Iterator[str]] = None,
 ) -> str:
     """Prompt the user for input inside a styled composer box border.
 
@@ -1045,9 +1075,9 @@ def prompt_composer_input(
 
     is_tty = False
     try:
-        is_tty = sys.stdin.isatty()
+        is_tty = sys.stdin.isatty() or (key_stream is not None)
     except Exception:
-        pass
+        is_tty = key_stream is not None
 
     if is_tty:
         if is_live_active:
@@ -1095,6 +1125,7 @@ def prompt_composer_input(
                 on_page_down=on_page_down,
                 on_wheel_up=on_wheel_up,
                 on_wheel_down=on_wheel_down,
+                key_stream=key_stream,
                 top_border_renderer=lambda has_c: render_composer_top_border_str(
                     placeholder=placeholder,
                     shortcuts=shortcuts,
@@ -2712,15 +2743,18 @@ def tui(
                 def _handle_ctrl_l(editor: Any = None) -> None:
                     term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     if is_tty:
+                        current_text = "".join(editor.buffer) if (editor is not None and isinstance(getattr(editor, "buffer", None), list)) else None
                         redraw_full_screen(
                             session,
                             state,
                             clear=True,
                             include_composer=True,
                             composer_is_active=True,
+                            composer_content=current_text,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
+                        cursor_col = _compute_cursor_col(editor)
+                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
                         sys.stdout.flush()
                     else:
                         click.echo(render_top_header_bar_str(
@@ -2760,15 +2794,18 @@ def tui(
                     vp_height = compute_viewport_height(term_lines)
                     state.scroll_conversation_up(max(1, vp_height // 2))
                     if is_tty:
+                        current_text = "".join(editor.buffer) if (editor is not None and isinstance(getattr(editor, "buffer", None), list)) else None
                         redraw_full_screen(
                             session,
                             state,
                             clear=False,
                             include_composer=True,
                             composer_is_active=True,
+                            composer_content=current_text,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
+                        cursor_col = _compute_cursor_col(editor)
+                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2779,15 +2816,18 @@ def tui(
                     vp_height = compute_viewport_height(term_lines)
                     state.scroll_conversation_down(max(1, vp_height // 2))
                     if is_tty:
+                        current_text = "".join(editor.buffer) if (editor is not None and isinstance(getattr(editor, "buffer", None), list)) else None
                         redraw_full_screen(
                             session,
                             state,
                             clear=False,
                             include_composer=True,
                             composer_is_active=True,
+                            composer_content=current_text,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
+                        cursor_col = _compute_cursor_col(editor)
+                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2797,15 +2837,18 @@ def tui(
                     term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     state.scroll_conversation_up(3)
                     if is_tty:
+                        current_text = "".join(editor.buffer) if (editor is not None and isinstance(getattr(editor, "buffer", None), list)) else None
                         redraw_full_screen(
                             session,
                             state,
                             clear=False,
                             include_composer=True,
                             composer_is_active=True,
+                            composer_content=current_text,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
+                        cursor_col = _compute_cursor_col(editor)
+                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -2815,15 +2858,18 @@ def tui(
                     term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
                     state.scroll_conversation_down(3)
                     if is_tty:
+                        current_text = "".join(editor.buffer) if (editor is not None and isinstance(getattr(editor, "buffer", None), list)) else None
                         redraw_full_screen(
                             session,
                             state,
                             clear=False,
                             include_composer=True,
                             composer_is_active=True,
+                            composer_content=current_text,
                             live_manager=live_ws,
                         )
-                        sys.stdout.write(f"\x1b[{term_lines - 2};5H")
+                        cursor_col = _compute_cursor_col(editor)
+                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()

@@ -605,11 +605,26 @@ def _read_raw_key_windows_v2(handle: Any = None) -> str:
     if handle is not None and _win32_reader.handle != handle:
         _win32_reader = Win32ConsoleReader(handle)
 
+    err_count = 0
     while True:
         key = _win32_reader.read_key(timeout=0.1)
         if key is not None:
             _log_debug_key(f"[_read_raw_key_windows_v2] decoded={repr(key)}")
             return key
+        h = _win32_reader._get_input_handle()
+        if not h or h in (0, -1):
+            return _read_raw_key_windows()
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            num_events = ctypes.c_uint32()
+            if not kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
+                err_count += 1
+                if err_count > 3:
+                    return _read_raw_key_windows()
+            else:
+                err_count = 0
+        except Exception:
+            return _read_raw_key_windows()
 
 
 def _read_raw_key_posix(fd: int = 0) -> str:
@@ -641,8 +656,27 @@ def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
         return res
 
     if os.name == "nt":
-        if os.environ.get("STACKMIND_WIN32_INPUT") in ("1", "true", "yes"):
-            res = _read_raw_key_windows_v2()
+        use_v2 = False
+        opt = os.environ.get("STACKMIND_WIN32_INPUT")
+        if opt is not None:
+            use_v2 = opt.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            # Default to Win32ConsoleReader if an interactive Win32 console handle is available
+            try:
+                h = _win32_reader._get_input_handle()
+                if h and h not in (0, -1):
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    mode = ctypes.c_uint32()
+                    if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                        use_v2 = True
+            except Exception:
+                use_v2 = False
+
+        if use_v2:
+            try:
+                res = _read_raw_key_windows_v2()
+            except Exception:
+                res = _read_raw_key_windows()
         else:
             res = _read_raw_key_windows()
     else:
@@ -995,7 +1029,6 @@ def raw_prompt_input(
                 on_page_up(editor)
             except TypeError:
                 on_page_up()
-        editor.redraw_line()
 
     def wrapped_page_down() -> None:
         """Handle Page Down — scroll conversation viewport down, then restore prompt line."""
@@ -1004,7 +1037,6 @@ def raw_prompt_input(
                 on_page_down(editor)
             except TypeError:
                 on_page_down()
-        editor.redraw_line()
 
     def wrapped_wheel_up() -> None:
         """Handle Mouse Wheel Up — scroll conversation viewport up, then restore prompt line."""
@@ -1018,7 +1050,6 @@ def raw_prompt_input(
                 on_page_up(editor)
             except TypeError:
                 on_page_up()
-        editor.redraw_line()
 
     def wrapped_wheel_down() -> None:
         """Handle Mouse Wheel Down — scroll conversation viewport down, then restore prompt line."""
@@ -1032,7 +1063,6 @@ def raw_prompt_input(
                 on_page_down(editor)
             except TypeError:
                 on_page_down()
-        editor.redraw_line()
 
     editor = RawLineEditor(
         prompt_prefix=prompt_prefix,

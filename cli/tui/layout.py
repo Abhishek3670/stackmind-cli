@@ -369,24 +369,105 @@ from cli.tui.runtime_panel import (
 from cli.tui.state import ConversationScroll
 
 
-# ── Conversation Column & Activity Indicator ──────────────────────────────────
+# ── Conversation Scrollbar & Column Indicator ─────────────────────────────────
+
+def render_conversation_scrollbar(
+    viewport_height: int,
+    total_lines: int,
+    scroll_offset: int = 0,
+    *,
+    track_char: str | None = None,
+    thumb_char: str | None = None,
+    thumb_style: str = "bold #38bdf8",
+    track_style: str = "dim #334155",
+) -> list[Text]:
+    """Derive and render a vertical scrollbar thumb and track for the conversation viewport.
+
+    Calculates proportional thumb size and position based on:
+    - total_lines: Total lines in the conversation transcript
+    - viewport_height: Visible height of the conversation viewport
+    - scroll_offset: Offset from the bottom (0 = follow bottom, >0 = scrolled up)
+
+    Returns a list of Text elements of length viewport_height.
+    """
+    from cli.tui.glyphs import is_ascii_mode
+
+    ascii_mode = is_ascii_mode()
+
+    if viewport_height <= 0:
+        return []
+
+    if track_char is None:
+        track_char = "|" if ascii_mode else "│"
+    if thumb_char is None:
+        thumb_char = "#" if ascii_mode else "█"
+
+    if total_lines <= viewport_height:
+        return [Text(track_char, style=track_style) for _ in range(viewport_height)]
+
+    max_offset = max(1, total_lines - viewport_height)
+    effective_offset = min(max(0, scroll_offset), max_offset)
+
+    # Proportional thumb size (at least 1 row, at most viewport_height)
+    thumb_size = max(1, int(round(viewport_height * (viewport_height / total_lines))))
+    thumb_size = min(thumb_size, viewport_height)
+
+    # Position: start_idx is 0 at top (effective_offset == max_offset),
+    # and max_offset at bottom (effective_offset == 0).
+    start_idx = total_lines - effective_offset - viewport_height
+    if max_offset > 0:
+        thumb_top = int(round((start_idx / max_offset) * (viewport_height - thumb_size)))
+    else:
+        thumb_top = 0
+    thumb_top = max(0, min(thumb_top, viewport_height - thumb_size))
+    thumb_rows = set(range(thumb_top, thumb_top + thumb_size))
+
+    rows: list[Text] = []
+    for r in range(viewport_height):
+        if r in thumb_rows:
+            rows.append(Text(thumb_char, style=thumb_style))
+        else:
+            rows.append(Text(track_char, style=track_style))
+    return rows
+
 
 def render_conversation_column(
     conversation_renderable: RenderableType,
     *,
     scroll: ConversationScroll | None = None,
     state: Any | None = None,
+    show_scrollbar: bool = False,
+    viewport_height: int | None = None,
+    width: int | None = None,
 ) -> RenderableType:
-    """Wrap conversation column with scroll badge when new activity arrived outside viewport (§31)."""
+    """Wrap conversation column with scrollbar thumb and scroll badge when new activity arrived (§31)."""
     if scroll is None and state is not None and hasattr(state, "conversation_scroll"):
         scroll = getattr(state, "conversation_scroll")
+
+    result = conversation_renderable
+    if show_scrollbar and scroll is not None:
+        tot_l = getattr(scroll, "total_lines", None)
+        vp_h = viewport_height or getattr(scroll, "viewport_height", None)
+        off = getattr(scroll, "scroll_offset", 0)
+        if tot_l is not None and vp_h is not None and tot_l > vp_h and vp_h > 0:
+            s_rows = render_conversation_scrollbar(vp_h, tot_l, off)
+            s_bar = Text("\n").join(s_rows)
+            grid = Table.grid(padding=0)
+            if width is not None and width > 1:
+                grid.add_column(width=width - 1)
+            else:
+                grid.add_column()
+            grid.add_column(width=1)
+            grid.add_row(result, s_bar)
+            result = grid
+
     if scroll is not None and scroll.has_new_activity:
         return Group(
-            conversation_renderable,
+            result,
             Text(""),
             Text("↓ New activity", style="bold #38bdf8", justify="center"),
         )
-    return conversation_renderable
+    return result
 
 
 # ── Viewport Slicing & Scroll Offset ──────────────────────────────────────────
@@ -414,6 +495,8 @@ def slice_conversation_viewport(
         follow_bottom = scroll <= 0
     elif scroll is not None:
         scroll.viewport_height = viewport_height
+        if hasattr(scroll, "total_lines"):
+            scroll.total_lines = total_lines
         if total_lines > viewport_height:
             max_off = total_lines - viewport_height
             if hasattr(scroll, "max_offset"):
@@ -474,10 +557,17 @@ def render_workspace_layout(
     """
     layout = compute_layout(width)
 
+    active_scroll = conversation_scroll
+    if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
+        active_scroll = getattr(state, "conversation_scroll")
+
     conv_column = render_conversation_column(
         conversation_renderable,
-        scroll=conversation_scroll,
+        scroll=active_scroll,
         state=state,
+        show_scrollbar=(not layout.show_runtime),
+        viewport_height=height,
+        width=width,
     )
 
     if not layout.show_runtime:
@@ -501,7 +591,7 @@ def render_workspace_layout(
     # Build a grid: [conversation] [divider] [runtime] — flush at column 0 (WO-022 AC-2)
     grid = Table.grid(padding=0)
     grid.add_column(width=layout.conversation_width)
-    grid.add_column(width=1)  # vertical divider
+    grid.add_column(width=1)  # vertical divider / conversation scrollbar
     grid.add_column(width=layout.runtime_width)
 
     runtime = render_runtime_panel(
@@ -514,7 +604,19 @@ def render_workspace_layout(
         scroll=scroll,
     )
 
-    divider_char = Text("│", style="dim #334155")
+    tot_l = getattr(active_scroll, "total_lines", None)
+    vp_h = height or getattr(active_scroll, "viewport_height", None)
+    off = getattr(active_scroll, "scroll_offset", 0)
+
+    if vp_h is not None and tot_l is not None and tot_l > vp_h and vp_h > 0:
+        s_rows = render_conversation_scrollbar(
+            viewport_height=vp_h,
+            total_lines=tot_l,
+            scroll_offset=off,
+        )
+        divider_char = Text("\n").join(s_rows)
+    else:
+        divider_char = Text("│", style="dim #334155")
 
     grid.add_row(conv_column, divider_char, runtime)
     return grid
@@ -545,21 +647,22 @@ def render_workspace_layout_str(
         or bool(work_orders)
         or bool(current_operation)
     )
+    active_scroll = conversation_scroll
+    if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
+        active_scroll = getattr(state, "conversation_scroll")
+
     if height is not None:
         # WO-019: reserve 1 line for the NARROW-tier top badge bar when runtime data exists.
         effective_vp_height = (
             max(1, height - 1) if (layout.show_runtime_badge and has_runtime_data) else height
         )
         # 1806659: reserve 2 lines for the scroll activity badge when active (§31).
-        active_scroll = conversation_scroll
-        if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
-            active_scroll = getattr(state, "conversation_scroll")
         if active_scroll is not None and getattr(active_scroll, "has_new_activity", False):
             effective_vp_height = max(1, effective_vp_height - 2)
         conversation_text = slice_conversation_viewport(
             conversation_text,
             viewport_height=effective_vp_height,
-            scroll=conversation_scroll,
+            scroll=active_scroll,
             pad=True,
         )
 
@@ -582,7 +685,7 @@ def render_workspace_layout_str(
             current_operation=current_operation,
             state=state,
             scroll=scroll,
-            conversation_scroll=conversation_scroll,
+            conversation_scroll=active_scroll,
             height=height,
         )
     )

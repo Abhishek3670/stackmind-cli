@@ -244,6 +244,7 @@ class ConversationScroll:
     has_new_activity: bool = False
     follow_bottom: bool = True
     max_offset: int | None = None
+    total_lines: int | None = None
 
     def scroll_up(self, lines: int = 1) -> None:
         """Scroll view upward, detaching from live-following."""
@@ -502,6 +503,7 @@ class AutonomousDeliveryState:
         if hasattr(self, "conversation_scroll") and self.conversation_scroll is not None:
             self.conversation_scroll.notify_activity()
             self.conversation_scroll.max_offset = None
+            self.conversation_scroll.total_lines = None
         self.maybe_compact_transcript()
         return msg
 
