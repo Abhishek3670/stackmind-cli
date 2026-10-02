@@ -707,6 +707,8 @@ class RawLineEditor:
         self.prompt_prefix = prompt_prefix
         self.buffer: list[str] = list(initial_text)
         self.cursor: int = len(self.buffer)
+        self.displayed_cursor: int = self.cursor
+        self._viewport_start: int = 0
         self.history: list[str] = list(history) if history is not None else list(GLOBAL_HISTORY)
         self.history_index: int = len(self.history)
         self.temp_buffer: str = initial_text
@@ -933,12 +935,53 @@ class RawLineEditor:
         visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
         visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
         inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
-        spaces_count = max(0, inner_available - len(buf_str))
-        line_out = f"\r{self.prompt_prefix}{buf_str}{' ' * spaces_count}{self.right_border}"
+
+        # Show text around cursor position (like typical input fields)
+        # Use a stable viewport that only shifts when cursor goes out of bounds
+        if len(buf_str) > inner_available:
+            if inner_available <= 3:
+                # Terminal too narrow for ellipsis prefix; show raw slice clamped to cursor
+                start = max(0, min(self.cursor, len(buf_str) - inner_available))
+                displayed = buf_str[start:start + inner_available]
+                displayed_cursor = max(0, min(self.cursor - start, inner_available))
+                self._viewport_start = start
+            else:
+                viewport_width = inner_available - 3
+
+                # Shift viewport to keep cursor visible
+                if self.cursor < self._viewport_start:
+                    # Cursor moved left of viewport - shift left
+                    self._viewport_start = max(0, self.cursor)
+                elif self.cursor >= self._viewport_start + viewport_width:
+                    # Cursor moved right of viewport - shift right
+                    self._viewport_start = self.cursor - viewport_width + 1
+
+                self._viewport_start = max(0, min(self._viewport_start, len(buf_str)))
+                start = self._viewport_start
+                end = min(start + viewport_width, len(buf_str))
+
+                if start > 0:
+                    displayed = "..." + buf_str[start:end]
+                    displayed_cursor = self.cursor - start + 3
+                else:
+                    if end < len(buf_str):
+                        displayed = buf_str[:end] + "..."
+                    else:
+                        displayed = buf_str[:end]
+                    displayed_cursor = self.cursor
+        else:
+            displayed = buf_str
+            displayed_cursor = self.cursor
+            # Reset viewport when buffer fits
+            self._viewport_start = 0
+
+        self.displayed_cursor = displayed_cursor
+        spaces_count = max(0, inner_available - len(displayed))
+        line_out = f"\r{self.prompt_prefix}{displayed}{' ' * spaces_count}{self.right_border}"
         out.write(line_out)
 
         # Move cursor to active edit position inside composer box
-        cursor_col = visible_prefix_len + self.cursor + 1
+        cursor_col = visible_prefix_len + displayed_cursor + 1
         out.write(f"\x1b[{cursor_col}G")
         out.flush()
 

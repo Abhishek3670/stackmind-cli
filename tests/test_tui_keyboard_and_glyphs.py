@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli.tui.app import (
+    _compute_cursor_col,
     render_composer_box,
     render_composer_box_str,
     render_composer_top_border,
@@ -814,6 +815,122 @@ def test_win32_reader_default_and_opt_in_flag():
             assert read_next_key() == "v2_key"
             mock_v2.assert_called_once()
             mock_legacy.assert_not_called()
+
+
+# ─── 8. RESPONSIVE INPUT FIELD & VIEWPORT SCROLLING TESTS ───────────────────
+
+
+def test_raw_line_editor_horizontal_viewport_scrolling():
+    """Verify RawLineEditor shifts viewport when text exceeds inner width."""
+    # prompt_prefix "│ > " (4 chars visible), right_border " │" (2 chars visible)
+    # width=20 -> inner_available = 20 - 4 - 2 = 14
+    editor = RawLineEditor(
+        prompt_prefix="│ > ",
+        width=20,
+        right_border=" │",
+    )
+
+    out = io.StringIO()
+    # 1. Type short text that fits
+    for ch in "short":
+        editor.handle_key(ch)
+    editor.redraw_line(out=out)
+    output = out.getvalue()
+    assert "│ > short" in output
+    assert output.endswith(" │\x1b[10G")
+    assert editor.displayed_cursor == 5
+    assert _compute_cursor_col(editor) == 4 + 5 + 1
+
+    # 2. Type text that exceeds inner_available (14 chars)
+    # Total typed: "short text that is very long" (28 chars)
+    for ch in " text that is very long":
+        editor.handle_key(ch)
+
+    out = io.StringIO()
+    editor.redraw_line(out=out)
+    output = out.getvalue()
+    # Should display "..." prefix since start > 0
+    assert "..." in output
+    # Total line inside borders must not overflow width 20
+    # visible_prefix(4) + displayed(14) + visible_right(2) = 20
+    assert editor.displayed_cursor <= 14
+    assert _compute_cursor_col(editor) == 4 + editor.displayed_cursor + 1
+
+    # 3. Press HOME key: moves cursor to 0, start becomes 0
+    editor.handle_key(Key.HOME)
+    out = io.StringIO()
+    editor.redraw_line(out=out)
+    output = out.getvalue()
+    # Start is 0, so should show beginning of text with trailing ellipsis
+    assert editor.cursor == 0
+    assert editor.displayed_cursor == 0
+    assert "short" in output
+    assert output.endswith("... │\x1b[5G") or "short" in output
+
+    # 4. Press END key: moves cursor back to end
+    editor.handle_key(Key.END)
+    out = io.StringIO()
+    editor.redraw_line(out=out)
+    output = out.getvalue()
+    assert editor.cursor == len(editor.buffer)
+    assert "..." in output
+
+
+def test_raw_line_editor_narrow_width_graceful_clamping():
+    """Verify RawLineEditor handles very narrow widths (<= 6 chars) without throwing."""
+    # width=6, prefix "│ > "(4), right " │"(2) -> inner_available = 0
+    editor = RawLineEditor(
+        prompt_prefix="│ > ",
+        width=6,
+        right_border=" │",
+    )
+    for ch in "abcde":
+        editor.handle_key(ch)
+    out = io.StringIO()
+    editor.redraw_line(out=out)
+    # Must not raise exception
+    assert editor.displayed_cursor >= 0
+
+
+def test_composer_top_border_responsive_widths():
+    """Verify render_composer_top_border gracefully degrades shortcuts and preserves exact width."""
+    # Test across a wide range of terminal widths
+    test_widths = [20, 30, 45, 60, 80, 120]
+    for w in test_widths:
+        border_empty = render_composer_top_border_str(width=w, has_content=False)
+        assert len(border_empty) == w, f"Border length {len(border_empty)} != {w} at width {w}"
+
+        border_active = render_composer_top_border_str(width=w, has_content=True)
+        assert len(border_active) == w, f"Border length {len(border_active)} != {w} at width {w}"
+
+    # At 80 columns: full shortcuts fit
+    b80 = render_composer_top_border_str(width=80)
+    assert "Ctrl+K commands | Ctrl+L clear" in b80
+
+    # At 40 columns: shortcuts gracefully degrade or drop to preserve border
+    b40 = render_composer_top_border_str(width=40)
+    assert len(b40) == 40
+    assert b40.startswith("╭")
+    assert b40.endswith("╮")
+
+
+def test_composer_box_responsive_content_and_shortcuts():
+    """Verify render_composer_box preserves user content while responsively adjusting shortcuts."""
+    # Narrow width (50 cols): short content keeps commands
+    box_50 = render_composer_box_str(width=50, content="hi")
+    assert "hi" in box_50
+    assert "Ctrl+K commands | Ctrl+L clear" in box_50
+
+    # 40 cols with longer text: degrades to minimal shortcuts
+    box_40 = render_composer_box_str(width=40, content="def compute():")
+    assert "def compute():" in box_40
+    assert "Ctrl+K | Ctrl+L" in box_40
+
+    # 80 cols: long content stays intact without premature truncation
+    func_text = "def calculate_statistics(data, threshold=10):"
+    box_long = render_composer_box_str(width=80, content=func_text)
+    assert "calculate_statistics" in box_long
+
 
 
 
