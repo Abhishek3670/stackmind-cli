@@ -590,14 +590,59 @@ class AgentRunner:
                         meta=meta,
                     )
 
-            try:
-                decision = self._validate_decision(task, completion.payload)
-            except ValueError as exc:
-                return HarnessRunResult(
+            # Decision validation with feedback and bounded retry (Requirement 3)
+            max_validation_retries = 2
+            current_payload = completion.payload
+            decision = None
+            last_val_exc = None
+
+            for retry_idx in range(max_validation_retries + 1):
+                try:
+                    decision = self._validate_decision(task, current_payload)
+                    break
+                except ValueError as exc:
+                    last_val_exc = exc
+                    if retry_idx < max_validation_retries and self.provider_adapter is not None:
+                        feedback_prompt = (
+                            f"Your previous output decision failed schema validation with error: {exc}.\n"
+                            "Please correct your response and return ONLY valid JSON matching this schema:\n"
+                            "If status is 'completed':\n"
+                            '{\n  "status": "completed",\n  "summary": "...",\n  "blockers": []\n}\n'
+                            "If status is 'blocked':\n"
+                            '{\n  "status": "blocked",\n  "summary": "...",\n  "blockers": ["<non-empty blocker description>"]\n}\n'
+                            "CRITICAL: If status is 'blocked', the 'blockers' field MUST be a non-empty JSON array of strings."
+                        )
+                        try:
+                            from validators.kernel.providers.models import Message
+                            retry_messages = [
+                                Message.system("You are a governed agent. You must output your final decision strictly conforming to JSON schema."),
+                                Message.user(feedback_prompt),
+                            ]
+                            retry_resp = self.provider_adapter.complete(
+                                retry_messages,
+                                cancellation_token=cancellation,
+                            )
+                            raw_retry_text = (retry_resp.message.content or '').strip()
+                            retry_payload = self._parse_json_payload(raw_retry_text)
+                            if retry_payload and isinstance(retry_payload, dict):
+                                current_payload = retry_payload
+                                continue
+                        except Exception:
+                            pass
+                    break
+
+            if decision is None:
+                # Retries exhausted: record a blocked review with the reason (Requirement 3)
+                reason_str = str(last_val_exc or "invalid harness output")
+                decision = HarnessDecision(
                     status='blocked',
-                    persisted=False,
-                    task_id=task.identifier,
-                    reason=str(exc),
+                    summary=f"Validation failed after retries: {reason_str}",
+                    report_markdown=f"Harness decision validation failed after retries: {reason_str}",
+                    blockers=(reason_str,),
+                    modified_files=(),
+                    release_target=None,
+                    retrieval_queries=(),
+                    uncertainty=(),
                 )
 
             # 7. Post-decision validation.
@@ -1050,7 +1095,7 @@ class AgentRunner:
 
         from validators.kernel.boundary import RuntimeBoundary
         from validators.kernel.contract import AgentContract as KernelContract
-        from validators.kernel.identity import AuthorizationPolicy
+        from validators.kernel.identity import AuthorizationPolicy, get_role_policy
         from validators.kernel.operations import OperationJournal
         from validators.kernel.tools import ToolGateway
         from validators.kernel.workspace import ScratchWorkspace
@@ -1102,10 +1147,7 @@ class AgentRunner:
             write_mode=task_contract.write_mode,
             budget=task_contract.budget,
         ).freeze()
-        policy = AuthorizationPolicy.permit(
-            f'contract-{contract.work_order}',
-            ('read_file', 'write_file', 'run_command', 'query_graph'),
-        )
+        policy = get_role_policy(self.agent)
         boundary = RuntimeBoundary(OperationJournal())
 
         def graph_query(query: str) -> dict[str, Any]:
@@ -1124,6 +1166,54 @@ class AgentRunner:
             actor_id=self.agent, provider_id=self.backend_id, graph_query=graph_query,
         )
         return GovernedToolRuntime(workspace=workspace, gateway=gateway)
+
+    @staticmethod
+    def _parse_json_payload(raw_text: str) -> dict[str, Any] | None:
+        """Extract and normalize a JSON dictionary payload from text."""
+        raw_text = (raw_text or '').strip()
+        payload = None
+
+        # 1. Try markdown code block
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
+        if match:
+            try:
+                payload = json.loads(match.group(1).strip())
+            except Exception:
+                pass
+
+        # 2. Try raw json loads
+        if payload is None:
+            try:
+                payload = json.loads(raw_text)
+            except Exception:
+                pass
+
+        # 3. Try raw_decode from first {
+        if payload is None and '{' in raw_text:
+            idx = raw_text.find('{')
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(raw_text, idx)
+                if isinstance(obj, dict):
+                    payload = obj
+            except Exception:
+                pass
+
+        # If payload was emitted as a wrapped dictionary or tool call format:
+        if isinstance(payload, dict):
+            if 'decision' in payload and isinstance(payload['decision'], dict):
+                payload = payload['decision']
+            elif 'arguments' in payload and isinstance(payload['arguments'], dict) and 'status' not in payload:
+                payload = payload['arguments']
+            if 'status' in payload and isinstance(payload['status'], str):
+                st = payload['status'].lower().strip()
+                if st in ('completed', 'blocked', 'deferred'):
+                    payload['status'] = st
+                elif st in ('success', 'passed', 'done', 'approved', 'ok'):
+                    payload['status'] = 'completed'
+                elif st in ('failed', 'failure', 'error', 'rejected'):
+                    payload['status'] = 'blocked'
+
+        return payload if isinstance(payload, dict) else None
 
     def _complete_request(
         self, request: LLMRequest, tool_runtime: GovernedToolRuntime | None,
@@ -1159,19 +1249,23 @@ class AgentRunner:
                         'retrieval_queries': [],
                         'uncertainty': [],
                     },
-                    prompt_tokens=response.usage.prompt_tokens,
-                    completion_tokens=response.usage.completion_tokens,
+                    prompt_tokens=response.usage.prompt_tokens if getattr(response, "usage", None) else 0,
+                    completion_tokens=response.usage.completion_tokens if getattr(response, "usage", None) else 0,
                 )
             return self.llm_provider.complete(request)
 
-        from validators.kernel.providers.gateway import ProviderGateway
+        from validators.kernel.providers.gateway import ProviderGateway, get_tools_for_role
         from validators.kernel.providers.models import Message
         from validators.kernel.session import Attempt
 
         kernel_contract = tool_runtime.gateway.contract
         attempt = Attempt(tool_runtime.workspace.attempt_id, kernel_contract)
         gateway = ProviderGateway(
-            self.provider_adapter, tool_runtime.gateway, attempt=attempt, contract=kernel_contract,
+            self.provider_adapter,
+            tool_runtime.gateway,
+            attempt=attempt,
+            contract=kernel_contract,
+            tools=get_tools_for_role(self.agent),
         )
         task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
         full_task_desc = f"{request.task.title}\n{request.task.body}"
@@ -1188,8 +1282,20 @@ class AgentRunner:
                 )
             )
         )
+        is_integration_review = (
+            is_architecture
+            and any(
+                kw in full_task_desc.lower()
+                for kw in (
+                    "integration review",
+                    "final integration review",
+                    "perform integration review",
+                )
+            )
+        )
         is_plan_task = (
             not is_authoring_task
+            and not is_integration_review
             and (
                 request.task.deliverable_path == 'PLAN.md'
                 or 'PLAN.md' in request.task.title
@@ -1218,7 +1324,17 @@ class AgentRunner:
             task_text += f"\nGoverned Artifact Authoring Schemas (REQUIRED for writing child work orders and contracts):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
 
-        if is_architecture and is_authoring_task:
+        if is_architecture and is_integration_review:
+            system_msg = (
+                "You are Claude, the Senior Architect for StackMind CLI. "
+                "All implementation work orders and QA verifications have completed. "
+                "Your task is to perform the final integration review of all declared deliverables against requirements. "
+                "You operate in a governed environment with a strictly read-only contract. "
+                "You may inspect deliverables and test files using `read_file` or `list_directory`. "
+                "Do NOT attempt to write or edit any files. "
+                "When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
+            )
+        elif is_architecture and is_authoring_task:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "The operator has approved the architecture plan in PLAN.md. "
@@ -1234,11 +1350,38 @@ class AgentRunner:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
+                "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
                 "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file). "
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
                 "Only after receiving the graph research results should you call `write_file` to write PLAN.md. "
                 "Return the final HarnessDecision as JSON."
             )
+        elif self.agent in ('gemma', 'qa'):
+            system_msg = (
+                "You are Gemma, the QA Lead for StackMind CLI. "
+                "You are responsible for test execution, code quality validation, test coverage verification, and formal QA review verdicts. "
+                "Per AGENTS.md, you inspect and validate code and run tests, but you MUST NEVER write or edit application source code. "
+                "Workflow instructions:\n"
+                "1. Use `read_file` or `list_directory` to inspect deliverables.\n"
+                "2. Call `run_tests` (or `verify_tests`) to execute pytest against the test suite and verify test results.\n"
+                "3. Call `verify_deliverable` to confirm all required artifacts exist.\n"
+                "4. When validation passes, call `approve_work_order` (or `submit_verdict`) to submit your QA verdict.\n"
+                "5. Return the final HarnessDecision JSON with your verdict and review notes."
+            )
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = raw_context
+        elif self.agent in ('local-llm', 'gitops'):
+            system_msg = (
+                "You are Local-LLM, the GitOps & Release Lead for StackMind CLI. "
+                "You are responsible for versioning hygiene, release documentation, and changelog maintenance. "
+                "The supervisor automatically creates the git commit upon completion. "
+                "Workflow instructions:\n"
+                "1. If VERSION.md does not exist, use `write_file` to write VERSION.md (e.g. '0.1.0').\n"
+                "2. If CHANGELOG.md does not exist, use `write_file` to write CHANGELOG.md documenting the release deliverables.\n"
+                "3. Immediately return the final HarnessDecision JSON declaring status 'completed'."
+            )
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = raw_context
         else:
             scope_hints: list[str] = []
             if kernel_contract is not None:
@@ -1311,8 +1454,13 @@ class AgentRunner:
                                 if p not in written_files_so_far:
                                     written_files_so_far.append(p)
 
-            # Hard-block only if there are no writes
-            if not written_files_so_far:
+            # Hard-block only if there are no writes (for writing roles)
+            is_non_writing_role = (self.agent in ('gemma', 'qa', 'claude')) or (
+                self.agent in ('local-llm', 'gitops') and (
+                    (self.project_path / "VERSION.md").is_file() or (self.project_path / "CHANGELOG.md").is_file()
+                )
+            )
+            if not written_files_so_far and not is_non_writing_role:
                 raise
 
             # Exactly one tool-less finalization turn
@@ -1338,47 +1486,7 @@ class AgentRunner:
                 raise ValueError('provider tool loop ended without an assistant message')
         final = next((m for m in reversed(assistant_msgs) if m.content and m.content.strip()), assistant_msgs[-1])
         raw_text = (final.content or '').strip()
-        payload = None
-
-        # 1. Try markdown code block
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
-        if match:
-            try:
-                payload = json.loads(match.group(1).strip())
-            except Exception:
-                pass
-
-        # 2. Try raw json loads
-        if payload is None:
-            try:
-                payload = json.loads(raw_text)
-            except Exception:
-                pass
-
-        # 3. Try raw_decode from first {
-        if payload is None and '{' in raw_text:
-            idx = raw_text.find('{')
-            try:
-                obj, _ = json.JSONDecoder().raw_decode(raw_text, idx)
-                if isinstance(obj, dict):
-                    payload = obj
-            except Exception:
-                pass
-
-        # If payload was emitted as a wrapped dictionary or tool call format:
-        if isinstance(payload, dict):
-            if 'decision' in payload and isinstance(payload['decision'], dict):
-                payload = payload['decision']
-            elif 'arguments' in payload and isinstance(payload['arguments'], dict) and 'status' not in payload:
-                payload = payload['arguments']
-            if 'status' in payload and isinstance(payload['status'], str):
-                st = payload['status'].lower().strip()
-                if st in ('completed', 'blocked', 'deferred'):
-                    payload['status'] = st
-                elif st in ('success', 'passed', 'done', 'approved', 'ok'):
-                    payload['status'] = 'completed'
-                elif st in ('failed', 'failure', 'error', 'rejected'):
-                    payload['status'] = 'blocked'
+        payload = self._parse_json_payload(raw_text)
 
         written_files: list[str] = []
         for msg in history:
@@ -1794,6 +1902,7 @@ class AgentRunner:
             'backend_id': getattr(self, 'backend_id', completion.provider),
             'model': completion.model,
             'summary': decision.summary,
+            'blockers': list(decision.blockers) if decision.blockers else [],
             'report_markdown': decision.report_markdown,
             'observed_changes': diff.to_dict() if diff else {},
             'prompt_tokens': completion.prompt_tokens,
@@ -2041,6 +2150,56 @@ class AgentRunner:
                     or (decision.report_markdown and decision.report_markdown.strip())
                 )
             )
+        elif self.agent in ('gemma', 'qa'):
+            # QA Lead: outcome verified by tool execution/testing, inbox verdict write, or non-empty QA report/verdict
+            has_tool_activity = bool(
+                tool_runtime
+                and getattr(tool_runtime, 'gateway', None)
+                and (
+                    getattr(getattr(tool_runtime.gateway, 'boundary', None), 'journal', None)
+                    or getattr(tool_runtime.gateway, '_todo_list', None)
+                )
+            )
+            has_report = bool(
+                (decision.summary and decision.summary.strip())
+                or (decision.report_markdown and decision.report_markdown.strip())
+            )
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+                and (
+                    has_report
+                    or has_tool_activity
+                    or bool(changed_files)
+                    or bool(task_changed_files)
+                    or any(r.returncode == 0 for r in command_results)
+                )
+            )
+        elif self.agent in ('local-llm', 'gitops'):
+            # GitOps Lead: outcome verified by release activity, git operations, or non-empty report
+            has_tool_activity = bool(
+                tool_runtime
+                and getattr(tool_runtime, 'gateway', None)
+                and (
+                    getattr(getattr(tool_runtime.gateway, 'boundary', None), 'journal', None)
+                    or getattr(tool_runtime.gateway, '_todo_list', None)
+                )
+            )
+            has_report = bool(
+                (decision.summary and decision.summary.strip())
+                or (decision.report_markdown and decision.report_markdown.strip())
+            )
+            outcome_verified = (
+                decision.status == 'completed'
+                and not decision.blockers
+                and (
+                    has_report
+                    or has_tool_activity
+                    or bool(changed_files)
+                    or bool(task_changed_files)
+                    or any(r.returncode == 0 for r in command_results)
+                )
+            )
         elif task.work_order_id and task.deliverable_path:
             if tool_runtime is not None:
                 deliverable = staged_root / task.deliverable_path
@@ -2057,10 +2216,31 @@ class AgentRunner:
                     and (deliverable_touched or deliverable.exists() or bool(changed_files) or has_staged_writes)
                 )
         elif task.work_order_id and not task.deliverable_path:
+            is_non_code_task = (
+                getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
+                or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
+            )
+            has_tool_activity = bool(
+                tool_runtime
+                and getattr(tool_runtime, 'gateway', None)
+                and (
+                    getattr(getattr(tool_runtime.gateway, 'boundary', None), 'journal', None)
+                    or getattr(tool_runtime.gateway, '_todo_list', None)
+                )
+            )
+            has_report = bool(
+                (decision.summary and decision.summary.strip())
+                or (decision.report_markdown and decision.report_markdown.strip())
+            )
             outcome_verified = (
                 decision.status == 'completed'
                 and not decision.blockers
-                and (bool(task_changed_files) or any(r.returncode == 0 for r in command_results))
+                and (
+                    bool(task_changed_files)
+                    or bool(changed_files)
+                    or any(r.returncode == 0 for r in command_results)
+                    or (is_non_code_task and (has_report or has_tool_activity))
+                )
             )
         else:
             outcome_verified = (

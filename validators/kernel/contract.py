@@ -96,15 +96,71 @@ class ContractNormalizer:
 class ContractEvaluator:
     """Fail-closed target and operation authorization evaluator."""
 
-    _WRITE_OPERATIONS = {"write_file", "delete_file", "run_command"}
+    _WRITE_OPERATIONS = {
+        "write_file", "apply_patch", "move_file", "delete_file", "format_file",
+        "run_command", "process_start", "git_stage", "git_restore", "git_create_branch",
+        "git_commit", "git_tag", "git_push", "create_release", "rollback_release",
+        "create_work_order", "update_work_order", "checkpoint", "restore_checkpoint",
+        "update_version", "update_changelog", "prepare_release", "submit_for_review",
+        "submit_verdict", "request_changes", "approve_work_order",
+        "dispatch_subagent", "browser_screenshot", "browser_click", "browser_type",
+        "skill_mine", "skill_promote",
+    }
+
+    _SESSION_OPERATIONS = {
+        "todo", "ask_user", "enter_plan_mode", "exit_plan_mode",
+        "get_contract", "verify_scope", "explain_denial", "inspect_budget",
+        "knowledge_stats", "skill_test", "skill_audit", "validate_release_metadata",
+        "inspect_logs", "inspect_processes", "system_metrics", "diagnostics_summary", "list_checkpoints",
+        "inspect_environment", "compare_snapshots",
+        "get_context", "semantic_search", "runtime_evidence", "verify_contract",
+        "inspect_work_order", "inspect_agent",
+        "web_search", "web_fetch", "search_docs",
+        "browser_open", "browser_navigate", "inspect_screenshot",
+        "experience_search", "skill_retrieve", "skill_list",
+        "inspect_version", "generate_release_notes",
+    }
+
+    _PROTOCOL_TARGET_PREFIXES = (
+        "workspace/command",
+        "workspace/process",
+        "workspace/verdicts",
+        "workspace/inbox",
+        "workspace/git",
+        "workspace/release",
+        "workspace/checkpoint",
+        "workspace/work-orders",
+        "workspace/diff",
+        "workspace/provenance",
+        "workspace/grep",
+        "workspace/symbol",
+        "workspace/references",
+        "graph/",
+        "skill/",
+    )
+
+    _PROTOCOL_REPORTING_OPERATIONS = {
+        "submit_verdict", "request_changes", "approve_work_order", "submit_for_review",
+    }
 
     @staticmethod
     def _matches(target: str, rule: str) -> bool:
-        normalized = target.replace("\\", "/")
+        normalized = target.replace("\\", "/").strip("/")
+        norm_rule = rule.replace("\\", "/").strip("/")
+        if (
+            fnmatch.fnmatch(normalized, norm_rule)
+            or normalized == norm_rule
+            or normalized.startswith(norm_rule.rstrip("/*") + "/")
+            or normalized == norm_rule.rstrip("/*")
+        ):
+            return True
+        t_clean = normalized[len("workspace/"):] if normalized.startswith("workspace/") else normalized
+        r_clean = norm_rule[len("workspace/"):] if norm_rule.startswith("workspace/") else norm_rule
         return (
-            fnmatch.fnmatch(normalized, rule)
-            or normalized == rule
-            or normalized.startswith(rule.rstrip("/") + "/")
+            fnmatch.fnmatch(t_clean, r_clean)
+            or t_clean == r_clean
+            or t_clean.startswith(r_clean.rstrip("/*") + "/")
+            or t_clean == r_clean.rstrip("/*")
         )
 
     def authorize(
@@ -114,10 +170,19 @@ class ContractEvaluator:
             return False, "missing target"
         if target.startswith(("/", "\\")) or ".." in target.replace("\\", "/").split("/"):
             return False, "target path traversal is forbidden"
-        if operation_type in self._WRITE_OPERATIONS and contract.write_mode != "read-write":
+        if (
+            operation_type in self._WRITE_OPERATIONS
+            and operation_type not in self._PROTOCOL_REPORTING_OPERATIONS
+            and contract.write_mode != "read-write"
+        ):
             return False, "contract is read-only"
         if any(self._matches(target, rule) for rule in contract.deny):
             return False, "target is explicitly denied"
+        if operation_type in self._SESSION_OPERATIONS or target.startswith("session/"):
+            return True, "authorized"
+        normalized = target.replace("\\", "/").strip("/")
+        if any(normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/") for p in self._PROTOCOL_TARGET_PREFIXES):
+            return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
             return False, "target is outside allowed scope"
         return True, "authorized"

@@ -82,16 +82,25 @@ class EventDispatcher:
         call_id: str,
         arguments: dict[str, Any],
         operation_id: str | None = None,
+        role: str | None = None,
+        agent_id: str | None = None,
     ) -> RuntimeEvent:
         """Publish the standardized start event for a tool invocation."""
+        payload: dict[str, Any] = {
+            "status": "running",
+            "tool_name": tool_name,
+            "call_id": call_id,
+            "arguments": arguments,
+            "operation_id": operation_id,
+        }
+        if role is not None:
+            payload["role"] = role
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
         return self.publish(
             "event.toolCall",
             session_id,
-            status="running",
-            tool_name=tool_name,
-            call_id=call_id,
-            arguments=arguments,
-            operation_id=operation_id,
+            **payload,
         )
 
     def tool_result(
@@ -104,17 +113,26 @@ class EventDispatcher:
         operation_id: str | None = None,
         result: Any = None,
         error: Any = None,
+        role: str | None = None,
+        agent_id: str | None = None,
     ) -> RuntimeEvent:
         """Publish a standardized terminal tool outcome."""
-        if status not in {"success", "failure", "cancelled", "denied", "approval_required"}:
+        if status not in {"success", "failure", "cancelled", "denied", "approval_required", "blocked"}:
             raise ValueError("invalid tool result status")
+        payload: dict[str, Any] = {
+            "status": status,
+            "tool_name": tool_name,
+            "call_id": call_id,
+            "operation_id": operation_id,
+            "result": result,
+            "error": error,
+        }
+        if role is not None:
+            payload["role"] = role
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
         return self.publish(
             "event.toolResult",
             session_id,
-            status=status,
-            tool_name=tool_name,
-            call_id=call_id,
-            operation_id=operation_id,
-            result=result,
-            error=error,
+            **payload,
         )

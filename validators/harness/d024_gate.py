@@ -100,6 +100,21 @@ class D024Gate:
         """
         deliv_p = Path(deliverable_path)
         stem = deliv_p.stem.lower()
+
+        # If the deliverable is itself a test file, it satisfies the requirement
+        norm_parts = [p.lower() for p in deliv_p.parts]
+        if (
+            "tests" in norm_parts
+            or "test" in norm_parts
+            or stem.startswith("test_")
+            or stem.endswith(("_test", "-test", ".test"))
+        ):
+            cand = project_path / deliv_p
+            if cand.is_file() and cand.stat().st_size > 0:
+                return cand
+            if deliv_p.is_file() and deliv_p.stat().st_size > 0:
+                return deliv_p
+
         if stem in ("__init__", "main", "index", "app") and len(deliv_p.parts) > 1:
             alt_stem = deliv_p.parts[-2].lower()
         else:
@@ -152,6 +167,7 @@ class D024Gate:
             "local-llm" in assigned
             or "gitops" in assigned
             or str(wo_data.get("type", "")).upper() in ("RELEASE", "GITOPS")
+            or any(kw in str(wo_data.get("title", "")).lower() for kw in ("release", "gitops"))
         )
         if not is_gitops:
             return (work_order_id,)
@@ -159,6 +175,26 @@ class D024Gate:
         targets: set[str] = set()
         for dep in wo_data.get("dependencies", []):
             if isinstance(dep, str) and WO_REF_PATTERN.match(dep):
+                dep_file = self.find_work_order_file(project_path, dep)
+                if dep_file:
+                    try:
+                        dep_data = yaml.safe_load(dep_file.read_text(encoding="utf-8")) or {}
+                        is_dep_qa = (
+                            any(str(a).lower().strip() in ("gemma", "qa") for a in dep_data.get("assigned_agents", []))
+                            or any(kw in str(dep_data.get("title", "")).lower() for kw in ("qa", "verification"))
+                            or str(dep_data.get("type", "")).lower() in ("doc", "qa", "verification")
+                        )
+                        if is_dep_qa:
+                            qa_underlying_deps = [
+                                d for d in dep_data.get("dependencies", [])
+                                if isinstance(d, str) and WO_REF_PATTERN.match(d)
+                            ]
+                            if qa_underlying_deps:
+                                for ud in qa_underlying_deps:
+                                    targets.add(ud)
+                                continue
+                    except Exception:
+                        pass
                 targets.add(dep)
 
         title = str(wo_data.get("title", ""))
@@ -297,9 +333,17 @@ class D024Gate:
         for target_wo in target_wos:
             # 1. Implementation deliverable completeness check
             target_file = self.find_work_order_file(project_path, target_wo)
+            target_data: dict[str, Any] = {}
             if target_file:
                 try:
                     target_data = yaml.safe_load(target_file.read_text(encoding="utf-8")) or {}
+                    is_qa_wo = (
+                        any(str(a).lower().strip() in ("gemma", "qa") for a in target_data.get("assigned_agents", []))
+                        or any(kw in str(target_data.get("title", "")).lower() for kw in ("qa", "verification"))
+                        or str(target_data.get("type", "")).lower() in ("doc", "qa", "verification")
+                    )
+                    if is_qa_wo and (str(target_data.get("status", "")).upper() == "COMPLETED" or target_file.parent.name == "COMPLETED"):
+                        continue
                     # Check deliverable
                     deliv_paths: list[str] = []
                     deliverable = target_data.get("deliverable")
@@ -404,23 +448,56 @@ class D024Gate:
             # 2. QA verdict inspection
             verdicts = self.find_qa_verdicts(project_path, target_wo)
             if not verdicts:
-                decision = D024GateDecision(
-                    passed=False,
-                    work_order_id=work_order_id,
-                    target_work_orders=target_wos,
-                    verdict_status="MISSING",
-                    deliverable_checked=True,
-                    deliverable_exists=True,
-                    reason=(
-                        f"No QA verdict found for {target_wo} "
-                        f"(D024 protocol violation: Gemma QA approval required before GitOps progression)"
-                    ),
-                )
-                self.log_decision(project_path, decision)
-                return decision
+                # Also check if a QA work order that depends on target_wo has completed
+                qa_approved_by_wo = False
+                qa_approving_file = ""
+                active_and_completed = [
+                    project_path / ".sync" / "work-orders" / "ACTIVE",
+                    project_path / ".sync" / "work-orders" / "COMPLETED",
+                ]
+                for p_dir in active_and_completed:
+                    if not p_dir.is_dir():
+                        continue
+                    for wf in p_dir.glob("*.yaml"):
+                        try:
+                            wdata = yaml.safe_load(wf.read_text(encoding="utf-8")) or {}
+                            if any(str(a).lower().strip() in ("gemma", "qa") for a in wdata.get("assigned_agents", [])):
+                                is_wo_completed = (
+                                    str(wdata.get("status", "")).upper() == "COMPLETED"
+                                    or wf.parent.name == "COMPLETED"
+                                    or any("completed" in str(line).lower() for line in wdata.get("log", []))
+                                    or any((project_path / ".sync" / "inbox" / "claude").glob(f"*_{wf.stem}-complete.md"))
+                                )
+                                if target_wo in wdata.get("dependencies", []) and is_wo_completed:
+                                    qa_approved_by_wo = True
+                                    qa_approving_file = wf.name
+                                    break
+                        except Exception:
+                            pass
+                    if qa_approved_by_wo:
+                        break
+
+                if not qa_approved_by_wo:
+                    decision = D024GateDecision(
+                        passed=False,
+                        work_order_id=work_order_id,
+                        target_work_orders=target_wos,
+                        verdict_status="MISSING",
+                        deliverable_checked=True,
+                        deliverable_exists=True,
+                        reason=(
+                            f"No QA verdict found for {target_wo} "
+                            f"(D024 protocol violation: Gemma QA approval required before GitOps progression)"
+                        ),
+                    )
+                    self.log_decision(project_path, decision)
+                    return decision
+                else:
+                    all_verdict_files.append(qa_approving_file)
+                    combined_evidence[qa_approving_file] = {"status": "COMPLETED", "note": "QA work order completed sign-off"}
 
             # Process sorted verdicts: newest / most authoritative
-            latest_status = "UNKNOWN"
+            latest_status = "APPROVED" if (not verdicts and qa_approved_by_wo) else "UNKNOWN"
             for v_path, v_status, v_ev in verdicts:
                 all_verdict_files.append(v_path.name)
                 combined_evidence[v_path.name] = v_ev

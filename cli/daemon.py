@@ -93,7 +93,7 @@ def daemon_start(port: int, workspace: Path):
     console.print(f"[bold green][+] Starting StackMind LocalDaemon on port {port}...[/bold green]")
     srv = LocalDaemon(str(daemon_state_dir(workspace)), port=port).start()
     write_daemon_pid(workspace, srv.address[1])
-    console.print(f"[bold green]✓ Daemon listening at {srv.url}[/bold green]")
+    console.print(f"[bold green][OK] Daemon listening at {srv.url}[/bold green]")
     console.print("[dim]Press Ctrl+C to stop daemon.[/dim]")
     try:
         while True:
@@ -127,7 +127,7 @@ def daemon_stop(workspace: Path):
     if not _wait_until_offline(url):
         raise click.ClickException(f"Daemon PID {pid} did not release port {port}.")
     clear_daemon_pid(workspace, pid)
-    console.print(f"[green]✓ Daemon PID {pid} stopped and port {port} released.[/green]")
+    console.print(f"[green][OK] Daemon PID {pid} stopped and port {port} released.[/green]")
 
 
 @daemon_group.command("status")

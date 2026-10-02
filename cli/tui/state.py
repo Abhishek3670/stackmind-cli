@@ -244,6 +244,7 @@ class ConversationScroll:
     has_new_activity: bool = False
     follow_bottom: bool = True
     max_offset: int | None = None
+    total_lines: int | None = None
 
     def scroll_up(self, lines: int = 1) -> None:
         """Scroll view upward, detaching from live-following."""
@@ -502,6 +503,7 @@ class AutonomousDeliveryState:
         if hasattr(self, "conversation_scroll") and self.conversation_scroll is not None:
             self.conversation_scroll.notify_activity()
             self.conversation_scroll.max_offset = None
+            self.conversation_scroll.total_lines = None
         self.maybe_compact_transcript()
         return msg
 
@@ -1099,6 +1101,22 @@ class AutonomousDeliveryState:
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "FAILED"
             self.add_activity(normalized_role, "failed", str(err_msg))
+
+        elif name in {"operation.blocked", "turn.blocked"}:
+            op_name = payload.get("operation") or payload.get("name") or ""
+            role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
+            normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
+            op_id = payload.get("operation_id")
+            block_msg = payload.get("error") or payload.get("reason") or "blocked"
+            if op_id and op_id in self.operations:
+                self.operations[op_id].status = "BLOCKED"
+            else:
+                for op in self.operations.values():
+                    if (op.role == normalized_role or (op_name and op.name == op_name)) and op.status == "RUNNING":
+                        op.status = "BLOCKED"
+            if normalized_role in self.roles:
+                self.roles[normalized_role].state = "BLOCKED"
+            self.add_activity(normalized_role, "blocked", str(block_msg))
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")

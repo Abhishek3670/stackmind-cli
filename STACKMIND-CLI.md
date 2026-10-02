@@ -1,1228 +1,455 @@
-# StackMind
-
-> **Compiler-Backed Multi-Agent Engineering Runtime**
-
-StackMind is a governed runtime for AI-assisted software engineering.
-
-It combines **multi-agent orchestration, deterministic code intelligence, project knowledge, governed execution, verification, and Git-based delivery** into one runtime.
-
-Instead of allowing an LLM to freely inspect and modify a repository, StackMind gives agents explicit identities, contracts, work orders, execution boundaries, verification gates, persistent runtime state, and access to compiled project knowledge.
-
-```text
-                              STACKMIND
-                                  │
-             ┌────────────────────┼────────────────────┐
-             │                    │                    │
-             ▼                    ▼                    ▼
-       RUNTIME &              KNOWLEDGE             HARNESS &
-       GOVERNANCE             COMPILER              VERIFICATION
-             │                    │                    │
-             ▼                    ▼                    ▼
-       Supervisor             Code Graph           Agent Runner
-       Sessions               Search/RAG           Contracts
-       Work Orders            Analysis             Sandbox
-       Contracts              Embeddings           Tool Gates
-       State                  Learning             Verification
-             │                    │                    │
-             └────────────────────┼────────────────────┘
-                                  ▼
-                           PROJECT WORKSPACE
-```
-
-## Why StackMind?
-
-A conventional coding agent typically operates as:
-
-```text
-User → LLM → Tools → Repository
-```
-
-StackMind introduces a governed execution layer:
-
-```text
-User
- │
- ▼
-TUI / CLI
- │
- ▼
-Daemon
- │
- ▼
-Lifecycle Supervisor
- │
- ├── Planning
- ├── Approval
- ├── Work-order authoring
- ├── Dependency-aware dispatch
- ├── Agent execution
- ├── QA / verification
- ├── Integration review
- └── GitOps
- │
- ▼
-Completed Product
-```
-
-Alongside execution, StackMind continuously provides structured knowledge about the project:
-
-```text
-Source Code
-    │
-    ▼
-Knowledge Compiler
-    │
-    ├── Symbols
-    ├── Dependencies
-    ├── Calls
-    ├── Data Flow
-    ├── Runtime Evidence
-    ├── Domain Models
-    └── Project Structure
-    │
-    ▼
-Knowledge Store
-    │
-    ▼
-Knowledge API / RAG
-    │
-    ▼
-Bounded Agent Context
-```
-
-The result is an engineering runtime where **agents perform work, while the runtime controls how that work is planned, authorized, executed, verified, and integrated**.
-
----
-
-## Core Capabilities
-
-### Multi-Agent Runtime
-
-StackMind supports a structured agent hierarchy with specialized responsibilities.
-
-A typical workflow can contain:
-
-| Role                   | Responsibility                                    |
-| ---------------------- | ------------------------------------------------- |
-| **CEO / User**         | Product goals, priorities and human decisions     |
-| **Architecture Agent** | Architecture, planning, work orders and contracts |
-| **Backend Agent**      | Backend implementation                            |
-| **Frontend Agent**     | Frontend implementation                           |
-| **QA Agent**           | Verification, review and quality gates            |
-| **GitOps Agent**       | Release integration and Git operations            |
-
-Agent responsibilities are backed by runtime contracts rather than relying exclusively on prompt instructions.
-
----
-
-### Lifecycle Supervisor
-
-The Supervisor is the deterministic orchestration layer.
-
-A product run progresses through explicit lifecycle phases:
-
-```text
-INIT
- │
- ▼
-PLANNING
- │
- ▼
-AWAITING_APPROVAL
- │
- ▼
-AUTHORING
- │
- ▼
-DISPATCHING
- │
- ▼
-EXECUTING
- │
- ▼
-INTEGRATION_REVIEW
- │
- ▼
-PRODUCT_READY
- │
- ▼
-GITOPS
- │
- ▼
-COMPLETE
-```
-
-Failure and blocking states are handled explicitly:
-
-```text
-                    ┌─────────────► FAILED
-                    │
-EXECUTING ──────────┤
-                    │
-                    └─────────────► BLOCKED
-```
-
-The Supervisor is responsible for deterministic state transitions. It does not replace the agents.
-
-The agents perform the work; the Supervisor determines **when and under what conditions the next stage may execute**.
-
-The repository tests explicitly cover planning, human approval, dependency-aware dispatch, retry loops, blocked work, persistence, integration review and GitOps completion.
-
----
-
-## Governed Agent Execution
-
-Every agent operation can be constrained by a contract defining:
-
-* Agent identity
-* Role
-* Work order
-* Allowed paths
-* Denied paths
-* File-count budgets
-* Token budgets
-* Runtime boundaries
-
-Example:
-
-```yaml
-schema_version: 1
-
-agent_id: codex
-work_order: WO-001
-
-identity:
-  role: backend
-  reports_to: claude
-
-scope:
-  allow:
-    - src/backend/**
-    - tests/backend/**
-  deny:
-    - .git/**
-    - .sync/runtime/**
-    - .sync/knowledge/**
-    - .env
-
-  write: read-write
-
-budget:
-  max_files_touched: 20
-  max_tokens: 50000
-```
-
-The repository's agent contract templates demonstrate this model, including explicit allow/deny scopes and execution budgets.
-
-The objective is **fail-closed authority**:
-
-```text
-Agent Request
-     │
-     ▼
-Contract Check
-     │
- ┌───┴────┐
- │        │
-ALLOW    DENY
- │        │
- ▼        ▼
-Execute  Block
-```
-
----
-
-# Knowledge Compiler
-
-StackMind contains a project knowledge subsystem that converts source code into a persistent, queryable representation.
-
-```text
-Repository
-    │
-    ▼
-Parse
-    │
-    ▼
-Resolve
-    │
-    ▼
-Intermediate Representation
-    │
-    ├───────────────┐
-    ▼               ▼
-Symbol Registry   Domain Compilers
-    │               │
-    └───────┬───────┘
-            ▼
-      Knowledge Store
-            │
-       ┌────┼────┐
-       ▼    ▼    ▼
-     Search Graph Metrics
-       │    │
-       └────┼────┘
-            ▼
-       Knowledge API
-```
-
-The repository contains dedicated knowledge components for:
-
-* Parsing
-* Symbol resolution
-* Intermediate representation
-* Incremental compilation
-* Storage
-* Registry management
-* Projections
-* Search
-* Embeddings
-* Runtime analysis
-* Data-flow analysis
-* Knowledge validation
-
-The knowledge subsystem is located under `validators/knowledge/`.
-
----
-
-## Code Intelligence
-
-StackMind's knowledge layer can represent more than simple file contents.
-
-It includes components for:
-
-### Static relationships
-
-```text
-Function A
-    │
-    ├── CALLS ──────► Function B
-    ├── DEPENDS_ON ─► Module C
-    └── DEFINES ────► Symbol D
-```
-
-### Runtime evidence
-
-Controlled runtime analysis can capture observed execution relationships.
-
-```text
-A ──CALLS──► B
-     │
-     └── evidence:
-         provider: runtime-tracer
-         evidence_type: runtime-observed
-         confidence: 1.0
-```
-
-### Data flow
-
-StackMind can represent bounded data-flow relationships:
-
-```text
-request.args
-      │
-      ▼
-validate_input()
-      │
-      ▼
-db.execute()
-
-FLOWS_TO
-FLOWS_TO
-```
-
-These capabilities are implemented under the knowledge analysis subsystem.
-
----
-
-# Knowledge API & RAG
-
-Agents should not have to repeatedly rediscover a project by scanning the repository.
-
-StackMind provides a knowledge retrieval layer:
-
-```text
-                    Agent Query
-                        │
-          ┌─────────────┼─────────────┐
-          ▼             ▼             ▼
-       Lexical       Semantic        Graph
-       Search        Search         Traversal
-          │             │             │
-          └─────────────┼─────────────┘
-                        ▼
-                    Reranking
-                        │
-                        ▼
-                Evidence Normalization
-                        │
-                        ▼
-                 Contract Scope Gate
-                        │
-                        ▼
-                Ranked Context Bundle
-```
-
-The retrieval layer can combine:
-
-* Lexical search
-* Semantic search
-* Graph traversal
-* Runtime evidence
-* Data-flow relationships
-* Contract boundaries
-* Evidence normalization
-
-The intended result is **bounded, relevant project context instead of unrestricted repository dumping**.
-
----
-
-## Knowledge Query Primitives
-
-The architecture defines primitives such as:
-
-```text
-lookup(node_id)
-filter(kind, path, ...)
-traverse(start, edge_kind, direction, depth)
-semantic(query, top_k)
-assemble_context(task, token_budget)
-```
-
-These allow an agent to ask questions about the project without rebuilding the project's understanding from scratch.
-
----
-
-# Harness Runtime
-
-The Harness controls how an individual agent executes work.
-
-```text
-Work Order
-    │
-    ▼
-Contract Validation
-    │
-    ▼
-Dependency Checks
-    │
-    ▼
-Context Assembly
-    │
-    ▼
-LLM / Agent
-    │
-    ▼
-Tool Execution
-    │
-    ▼
-Output Validation
-    │
-    ▼
-Diff / Scope Validation
-    │
-    ▼
-Verification
-    │
-    ▼
-Persist Result
-```
-
-The repository contains dedicated harness components for:
-
-* Contract gates
-* Dependency gates
-* Authoring gates
-* Retrieval
-* Execution
-* Snapshots
-* Verification
-* Security boundaries
-
-The harness therefore acts as the controlled execution boundary between an LLM and the project workspace.
-
----
-
-# Work Orders
-
-Work is represented as persistent work orders rather than informal prompts.
-
-A work-order lifecycle can be represented as:
-
-```text
-ACTIVE
-  │
-  ├──────────► BLOCKED
-  │
-  ▼
-COMPLETED
-```
-
-Work orders can contain:
-
-* Assigned agents
-* Dependencies
-* Deliverables
-* Execution state
-* Review state
-* Retry information
-* Completion information
-
-Dependency-aware dispatch prevents a dependent work order from running before its prerequisites are complete.
-
-For example:
-
-```text
-WO-001
-Scaffolding
-    │
-    ▼
-WO-002
-Backend
-    │
-    ▼
-WO-003
-Frontend
-    │
-    ▼
-WO-004
-QA / Integration
-```
-
----
-
-# Verification
-
-Verification is a first-class subsystem.
-
-```text
-                  Agent Work
-                      │
-                      ▼
-                 Deliverable
-                      │
-                      ▼
-                 Verification
-                      │
-             ┌────────┴────────┐
-             ▼                 ▼
-          APPROVED        NEEDS_CHANGES
-             │                 │
-             ▼                 ▼
-         Continue            Retry
-                               │
-                               ▼
-                          Retry Limit
-                               │
-                               ▼
-                             FAILED
-```
-
-The repository contains dedicated verification components for:
-
-* Structural verification
-* Replay
-* Canary verification
-* Verification pipelines
-* Verification models
-
-The Supervisor also validates actual deliverables on disk rather than relying only on an operation status value. The test suite explicitly covers this behavior.
-
----
-
-# Human Approval
-
-StackMind keeps human approval as an explicit lifecycle boundary.
-
-```text
-Planning
-   │
-   ▼
-Plan Proposed
-   │
-   ▼
-AWAITING_APPROVAL
-   │
-   ├──── APPROVE ────► AUTHORING
-   │
-   └──── REJECT ─────► PLANNING
-```
-
-A rejection can feed human feedback back into the planning cycle.
-
-This prevents the runtime from treating an LLM-generated plan as automatically authorized execution.
-
----
-
-# GitOps
-
-Successful work eventually reaches a GitOps stage.
-
-```text
-Workers
-   │
-   ▼
-QA
-   │
-   ▼
-Integration Review
-   │
-   ▼
-Product Ready
-   │
-   ▼
-GitOps
-   │
-   ▼
-Release Commit
-```
-
-Release commits can carry provenance information such as:
-
-```text
-Work-Order: WO-004
-Released-By: local-llm
-Approved-By: gemma
-Architect: claude
-Target-Work-Orders: WO-001, WO-002, WO-003
-```
-
-The test suite verifies creation of Git commits containing this provenance trail.
-
----
-
-# Runtime Architecture
-
-StackMind separates the reusable runtime engine from the project-specific runtime state.
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                     STACKMIND ENGINE                        │
-│                                                             │
-│  CLI          Schemas          Knowledge Compiler            │
-│  Harness      Runtime Kernel   Verification                 │
-│  Provider     TUI              Protocols                    │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  PROJECT RUNTIME INSTANCE                   │
-│                                                             │
-│  .sync/                                                     │
-│   ├── agents/                                               │
-│   ├── inbox/                                                │
-│   ├── outbox/                                               │
-│   ├── reviews/                                              │
-│   ├── runtime/                                              │
-│   ├── state/                                                │
-│   ├── work-orders/                                         │
-│   └── knowledge/                                            │
-└─────────────────────────────────────────────────────────────┘
-```
-
-The repository provides templates for these runtime structures, including agent inboxes/outboxes, reviews, runtime state, work orders and boot configuration.
-
----
-
-# `.sync/`
-
-A governed project instance uses `.sync/` as its runtime state and coordination area.
-
-A typical structure is:
-
-```text
-.sync/
-├── agents/
-├── decisions/
-├── escalations/
-├── inbox/
-│   ├── CEO/
-│   ├── claude/
-│   ├── codex/
-│   ├── gemini/
-│   ├── gemma/
-│   └── local-llm/
-├── outbox/
-├── releases/
-├── reviews/
-├── runtime/
-│   ├── boot/
-│   ├── drafts/
-│   └── receipts/
-├── standup/
-├── state/
-└── work-orders/
-    ├── ACTIVE/
-    ├── BLOCKED/
-    ├── COMPLETED/
-    └── TEMPLATES/
-```
-
-The filesystem therefore acts as a durable coordination surface between the runtime components and agents.
-
----
-
-# CLI
-
-StackMind exposes a CLI for managing the runtime.
-
-Examples include:
-
-```bash
-# Initialize a governed project
-stackmind init ./my-project --name "My App"
-
-# Validate runtime state
-stackmind validate ./my-project
-
-# Diagnose runtime configuration
-stackmind doctor ./my-project
-
-# Build project knowledge
-stackmind graph build -p ./my-project
-
-# Update knowledge incrementally
-stackmind graph update -p ./my-project
-
-# Query project knowledge
-stackmind graph query "AuthService.login" -p ./my-project
-
-# Find callers
-stackmind graph callers "AuthService.login" -p ./my-project
-
-# Analyze impact
-stackmind graph impact "AuthService.login" --depth 3 -p ./my-project
-
-# Assemble bounded context
-stackmind graph context \
-  "How does authentication work?" \
-  --token-budget 2000 \
-  -p ./my-project
-
-# Run a governed harness cycle
-stackmind harness run-once
-```
-
-The CLI source is organized under `cli/`, with dedicated modules for graph operations, contracts, daemon management, harness execution, validation, migration, learning, skills, TUI and other runtime operations.
-
----
-
-# TUI
-
-StackMind includes a terminal user interface connected to the runtime.
-
-The TUI is organized into components for:
-
-```text
-cli/tui/
-├── app.py
-├── chat.py
-├── diff.py
-├── events.py
-├── governance.py
-├── keyboard.py
-├── landing.py
-├── layout.py
-├── runtime_panel.py
-└── state.py
-```
-
-The TUI is intended to expose runtime state rather than act as a separate orchestration engine.
-
-Conceptually:
-
-```text
-             ┌──────────────────────┐
-             │       StackMind TUI   │
-             ├──────────────────────┤
-             │ Session               │
-             │ Runtime               │
-             │ Activity              │
-             │ Work Orders            │
-             │ Contract Boundary      │
-             │ Diff                   │
-             │ Verification           │
-             │ Human Approval         │
-             └───────────┬───────────┘
-                         │
-                         ▼
-                  Runtime Daemon
-```
-
-This keeps the TUI as a client of the runtime rather than allowing UI state to become the source of truth.
-
----
-
-# Learning and Skills
-
-StackMind also contains separate learning and skill subsystems:
-
-```text
-validators/learning/
-├── cluster.py
-├── distiller.py
-├── miner.py
-└── normalizer.py
-
-validators/skill/
-├── decay.py
-├── governor.py
-├── models.py
-├── retriever.py
-└── store.py
-```
-
-The distinction is intentional:
-
-```text
-Knowledge
-    │
-    │ "What exists in the project?"
-    ▼
-Knowledge Compiler
-
-Experience
-    │
-    │ "What patterns have been learned?"
-    ▼
-Learning
-
-Reusable capability
-    │
-    │ "What procedure/capability can be retrieved?"
-    ▼
-Skills
-```
-
-This creates a foundation for agents to become increasingly context-aware without mixing project facts with learned procedural knowledge.
-
----
-
-# Security and Boundaries
-
-StackMind contains explicit runtime security boundaries.
-
-Relevant kernel components include:
-
-```text
-validators/kernel/
-├── boundary.py
-├── contract.py
-├── evidence.py
-├── identity.py
-├── interpreter_denylist.py
-├── operations.py
-├── sandbox.py
-├── security.py
-├── session.py
-├── tools.py
-└── workspace.py
-```
-
-These boundaries are complemented by:
-
-* Contract enforcement
-* Scope validation
-* Workspace isolation
-* Sandbox controls
-* Tool controls
-* Dependency gates
-* Destructive-operation safeguards
-* Human approval
-* Verification
-
-The objective is to make agent authority a runtime property rather than merely a prompt convention.
-
----
-
-# Repository Structure
-
-```text
-stackmind/
-│
-├── cli/
-│   ├── main.py
-│   ├── graph.py
-│   ├── daemon.py
-│   ├── harness.py
-│   ├── contract.py
-│   ├── validate.py
-│   ├── migrate.py
-│   ├── learn.py
-│   ├── skill.py
-│   └── tui/
-│
-├── validators/
-│   │
-│   ├── kernel/
-│   │   ├── daemon/
-│   │   ├── providers/
-│   │   ├── multi/
-│   │   ├── mcp/
-│   │   ├── tui/
-│   │   ├── contract.py
-│   │   ├── sandbox.py
-│   │   ├── security.py
-│   │   └── workspace.py
-│   │
-│   ├── knowledge/
-│   │   ├── analysis/
-│   │   ├── compiler/
-│   │   ├── embedding/
-│   │   ├── projections/
-│   │   ├── api.py
-│   │   ├── registry.py
-│   │   ├── storage.py
-│   │   └── writer.py
-│   │
-│   ├── harness/
-│   │   ├── runner.py
-│   │   ├── backend.py
-│   │   ├── contract_gate.py
-│   │   ├── dependency_gate.py
-│   │   ├── retrieval.py
-│   │   └── snapshot.py
-│   │
-│   ├── learning/
-│   ├── skill/
-│   └── verification/
-│
-├── schemas/
-│   ├── knowledge/
-│   ├── boot.schema.json
-│   ├── contract.schema.json
-│   ├── experience.schema.json
-│   ├── harness-output.schema.json
-│   ├── runtime-version.schema.json
-│   ├── tree.schema.json
-│   └── work-order.schema.json
-│
-├── templates/
-│   └── sync/
-│
-├── migrations/
-│
-├── tests/
-│
-├── docs/
-│   ├── rfcs/
-│   ├── runtime-truth/
-│   ├── diagrams/
-│   └── archive/
-│
-├── AGENTS.md
-├── PLAN.md
-├── STACKMIND.md
-├── pyproject.toml
-└── README.md
-```
-
-The repository contains dedicated tests for daemon behavior, the execution kernel, provider gateway, multi-agent runtime, knowledge API, compiler components, security, TUI behavior, unified RAG, verification and lifecycle supervision.
-
----
-
-# Installation
-
-StackMind is a Python package.
-
-Current package metadata specifies:
-
-```text
-Package: stackmind
-Version: 3.6.0
-Python: >=3.10
-License: MIT
-Build backend: Hatchling
-```
-
-Install from source:
-
-```bash
-git clone https://github.com/Abhishek3670/stackmind.git
-cd stackmind
-
-pip install -e .
-```
-
-For development:
-
-```bash
-pip install -e ".[dev]"
-```
-
----
-
-# Development
-
-Run the test suite:
-
-```bash
-pytest
-```
-
-The repository contains extensive tests covering:
-
-* CLI integration
-* Runtime lifecycle
-* Daemon protocol
-* Multi-agent execution
-* Harness execution
-* Provider gateways
-* Knowledge compilation
-* Knowledge API
-* Storage
-* Learning
-* Skills
-* Verification
-* Security
-* TUI
-* RAG
-* Runtime state
-* Work-order execution
-
----
-
-# Design Principles
-
-StackMind is built around several core principles.
-
-### 1. Deterministic orchestration
-
-The runtime, rather than an LLM, controls lifecycle transitions.
-
-### 2. Explicit authority
-
-Agents receive explicit contracts defining where and how they may operate.
-
-### 3. Durable state
-
-Important runtime state is persisted instead of existing only inside an LLM conversation.
-
-### 4. Project knowledge as infrastructure
-
-Project understanding is compiled and persisted so agents do not need to repeatedly reconstruct it.
-
-### 5. Evidence-backed intelligence
-
-Knowledge can contain static, runtime-observed and data-flow evidence.
-
-### 6. Human-controlled authorization
-
-Important lifecycle decisions can pause for explicit human approval.
-
-### 7. Verification before integration
-
-Agent output is not automatically considered complete because an LLM reported success.
-
-### 8. Separation of planning and implementation
-
-Architecture/planning responsibilities are separated from worker implementation.
-
-### 9. Governed execution
-
-The execution environment enforces contracts, workspace boundaries and safety gates.
-
-### 10. Provenance
-
-Important operations can preserve information about the work order, agents, reviewers and release operations.
-
----
-
-# End-to-End Example
-
-Suppose the user enters:
-
-```text
-Create a login page with a backend login endpoint.
-```
-
-StackMind can conceptually process that goal as:
-
-```text
-USER
- │
- ▼
-TUI / CLI
- │
- ▼
-Supervisor
- │
- ▼
-Architecture Agent
- │
- │ creates plan
- ▼
-AWAITING_APPROVAL
- │
- │ human approves
- ▼
-Authoring
- │
- │ creates work orders
- ├───────────────────┐
- ▼                   ▼
-Backend             Frontend
-Agent               Agent
- │                   │
- ▼                   ▼
-Implementation      Implementation
- │                   │
- └─────────┬─────────┘
-           ▼
-          QA
-           │
-      ┌────┴────┐
-      ▼         ▼
-  APPROVED   NEEDS_CHANGES
-      │         │
-      │         └────► Worker retry
-      ▼
-Integration Review
-      │
-      ▼
-Product Ready
-      │
-      ▼
-GitOps
-      │
-      ▼
-Release Commit
-      │
-      ▼
-COMPLETE
-```
-
-At the same time, the Knowledge Compiler and Knowledge API can provide agents with relevant project structure, symbols, dependencies, call relationships and other indexed context.
-
----
-
-# Architecture at a Glance
-
-```text
-                         ┌──────────────────┐
-                         │       USER       │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │     TUI / CLI    │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │      DAEMON      │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │   LIFECYCLE SUPERVISOR    │
-                    └─────────────┬─────────────┘
-                                  │
-                    ┌─────────────┼─────────────┐
-                    │             │             │
-                    ▼             ▼             ▼
-                PLANNING      WORK ORDERS    APPROVAL
-                    │             │             │
-                    └─────────────┼─────────────┘
-                                  ▼
-                         ┌──────────────────┐
-                         │     HARNESS      │
-                         └────────┬─────────┘
-                                  │
-                    ┌─────────────┼─────────────┐
-                    ▼             ▼             ▼
-                CONTRACT       CONTEXT        TOOLS
-                    │             │             │
-                    │             ▼             │
-                    │      KNOWLEDGE API       │
-                    │             │             │
-                    │      ┌──────┴──────┐      │
-                    │      ▼             ▼      │
-                    │   GRAPH/RAG    PROJECT     │
-                    │                FACTS       │
-                    │             │             │
-                    └─────────────┼─────────────┘
-                                  ▼
-                              AGENT
-                                  │
-                                  ▼
-                            DELIVERABLE
-                                  │
-                                  ▼
-                           VERIFICATION
-                                  │
-                       ┌──────────┴──────────┐
-                       ▼                     ▼
-                    APPROVED             RETRY
-                       │
-                       ▼
-                INTEGRATION REVIEW
-                       │
-                       ▼
-                    GITOPS
-                       │
-                       ▼
-                   COMPLETE
-```
-
----
-
-# Project Documentation
-
-The repository contains a broader architecture and engineering documentation set.
-
-Important areas include:
-
-```text
-docs/
-├── architecture.md
-├── STACKMIND_ARCHITECTURE.md
-├── StackMind_Agent_Runtime.md
-├── STACKMIND_AGENT_RUNTIME_ROADMAP.md
-├── protocols.md
-├── cli-reference.md
-├── getting-started.md
-├── migration-guide.md
-├── rfcs/
-├── runtime-truth/
-└── diagrams/
-```
-
-The RFC series currently covers:
-
-```text
-RFC-001  Symbol Identity and Registry
-RFC-002  Storage and Projection
-RFC-003  Knowledge Compiler
-RFC-004  Knowledge API
-RFC-005  Background Intelligence
-RFC-006  Harness Runtime
-```
-
----
-
-# Status
-
-StackMind is an actively developed engineering runtime with substantial runtime, knowledge, harness, verification and TUI infrastructure.
-
-The repository currently contains:
-
-* Multi-agent runtime infrastructure
-* Lifecycle supervision
-* Persistent work orders
-* Contract enforcement
-* Knowledge compilation
-* Code-graph intelligence
-* Retrieval / RAG infrastructure
-* Agent execution harness
-* Verification pipeline
-* Learning and skill subsystems
-* TUI runtime integration
-* Extensive automated testing
-
-The source tree should be treated as the implementation authority; architectural documents in `docs/` describe individual phases, designs and historical decisions.
-
----
-
-# License
-
-MIT
+ Project understanding
+
+ StackMind is a governed multi-agent engineering runtime, not merely an LLM wrapper. Its central idea is:
+
+ ```text
+   Human goal
+     → CLI/TUI
+     → daemon + deterministic lifecycle supervisor
+     → planning and human approval
+     → work orders/contracts
+     → governed agent execution
+     → QA/verification
+     → GitOps release
+ ```
+
+ The repository currently contains substantial implementation for runtime governance, orchestration, knowledge compilation, harness execution, and the TUI.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 1. Main architectural layers
+
+ ### CLI — cli/
+
+ cli/main.py is the Click entry point. Major command groups include:
+
+ - init — create a governed project instance
+ - validate — schema, structure, protocol, boot, and knowledge checks
+ - doctor — runtime health and compatibility
+ - migrate — runtime migrations
+ - lock — canonical write-lock management
+ - shutdown — governed session shutdown
+ - promote — promote worker boot drafts to canonical snapshots
+ - graph — knowledge compilation and querying
+ - harness — execute one governed worker turn
+ - daemon — manage the local runtime daemon
+ - tui — start the terminal control plane
+ - experience, learn, skill — procedural learning and skill management
+
+ The package metadata identifies the current project version as 3.7.0 in:
+
+ - pyproject.toml
+ - VERSION
+ - VERSION.md
+ - CHANGELOG.md
+
+ The runtime schema itself is version 3.1.0, recorded in .sync/RUNTIME_VERSION. These are separate version concepts: package/release version versus initialized runtime protocol version.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ ### Runtime daemon — validators/kernel/daemon/
+
+ The daemon provides a local JSON-RPC runtime boundary.
+
+ Relevant pieces:
+
+ - server.py — local server
+ - protocol.py — request/response protocol
+ - manager.py — sessions, plans, operations, cancellation, persistence
+ - storage.py — crash-safe JSON state persistence
+ - events.py — runtime events
+ - supervisor.py — product lifecycle state machine
+
+ Daemon state is stored below:
+
+ ```text
+   .sync/runtime/daemon/
+   ├── daemon-state.json
+   └── daemon.pid
+ ```
+
+ The default daemon port is 8765.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ ### Lifecycle Supervisor — validators/kernel/daemon/supervisor.py
+
+ LifecycleSupervisor is the deterministic product-delivery state machine.
+
+ Its phases are:
+
+ ```text
+   INIT
+    → PLANNING
+    → AWAITING_APPROVAL
+    → AUTHORING
+    → DISPATCHING
+    → EXECUTING
+    → INTEGRATION_REVIEW
+    → PRODUCT_READY
+    → GITOPS
+    → COMPLETE
+ ```
+
+ It also supports:
+
+ ```text
+   FAILED
+   BLOCKED
+ ```
+
+ Important behavior implemented in the supervisor includes:
+
+ - human approval and rejection of plans;
+ - work-order dependency checking;
+ - worker dispatch;
+ - concurrent sibling operations;
+ - retry limits;
+ - contention handling;
+ - crash recovery and operation rediscovery;
+ - deliverable existence checks on disk;
+ - QA verdict checks;
+ - integration review;
+ - GitOps completion and release commit tracking.
+
+ The supervisor is intentionally deterministic: it reads persisted state and decides which transition or operation is valid next. It is not itself an LLM agent.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ ### TUI — cli/tui/
+
+ The TUI is a client/control surface over the daemon and supervisor rather than a separate source of truth.
+
+ It includes views for:
+
+ - project phase;
+ - agent roles and execution backends;
+ - work orders;
+ - operation trees;
+ - activity streams;
+ - contracts;
+ - diffs;
+ - verification matrices;
+ - plan approval and rejection;
+ - completion handover;
+ - streamed assistant output.
+
+ The main implementation is cli/tui/app.py, with supporting layout, state, keyboard, event, governance, chat, and runtime-panel modules.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 2. Governance model
+
+ The project’s governing rules are in AGENTS.md.
+
+ The important model is:
+
+ ```text
+   CEO / human
+      ↓
+   Claude — architecture, planning, contracts, work orders
+      ↓
+   Gemma — QA and approval gates
+      ↓
+   Codex / Gemini / Local-LLM — implementation and release work
+ ```
+
+ The runtime uses:
+
+ - identity-specific agents;
+ - work orders;
+ - YAML contracts;
+ - explicit allow/deny path scopes;
+ - file and token budgets;
+ - a canonical write lock;
+ - worker drafts;
+ - validation before and after promotion;
+ - inbox/outbox communication;
+ - handoff reports;
+ - shutdown receipts;
+ - Git-backed runtime state.
+
+ The intended authority boundary is fail-closed: an agent should not be able to write outside its contract or bypass the runtime gates.
+
+ .sync/ is the durable coordination system. It currently contains:
+
+ ```text
+   .sync/
+   ├── agents/
+   ├── contracts/
+   ├── decisions/
+   ├── experience/
+   ├── handoffs/
+   ├── inbox/
+   ├── knowledge/
+   ├── outbox/
+   ├── reports/
+   ├── reviews/
+   ├── runtime/
+   ├── skills/
+   ├── state/
+   └── work-orders/
+ ```
+
+ The main repository and .sync are separate Git repositories, as described in .sync/SYSTEM_CONTEXT.md.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 3. Harness execution
+
+ The governed worker path is centered on:
+
+ ```text
+   cli/harness.py
+     → validators/harness/runner.py
+     → contract/context/tool/runtime gates
+     → staged workspace
+     → verification
+     → validated write-back
+ ```
+
+ AgentRunner handles:
+
+ 1. discovering an inbox item or assigned work order;
+ 2. loading the relevant contract;
+ 3. checking protocol citizenship;
+ 4. assembling graph context;
+ 5. creating a scratch workspace;
+ 6. invoking a provider;
+ 7. processing tool calls;
+ 8. validating the model decision;
+ 9. comparing declared files with actual staged changes;
+ 10. evaluating verification dimensions;
+ 11. applying only verified changes;
+ 12. writing reports and work-order artifacts under governance.
+
+ The provider/tool layer is implemented in:
+
+ - validators/kernel/providers/gateway.py
+ - validators/kernel/providers/adapter.py
+ - validators/kernel/tools.py
+ - validators/kernel/workspace.py
+ - validators/kernel/sandbox.py
+ - validators/kernel/contract.py
+
+ Available governed tools include:
+
+ - read_file
+ - write_file
+ - run_command
+ - query_graph
+
+ Important safeguards include:
+
+ - scratch-only file operations;
+ - path traversal prevention;
+ - contract authorization;
+ - interpreter denylisting;
+ - token budgets;
+ - tool-call limits;
+ - repeated-call and pathological-loop detection;
+ - consecutive failure limits;
+ - staged-diff verification;
+ - no-op deliverable prevention;
+ - contract-specific authoring validation for work orders and contracts.
+
+ The CLI currently constructs AgentRunner with EchoLLMProvider by default. The provider gateway and adapter architecture also supports real model integrations, including the Ollama-related implementation
+ described in the changelog.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 4. Knowledge compiler and Knowledge API
+
+ Unlike some older planning documents suggest, the knowledge subsystem is present in the current source tree under validators/knowledge/.
+
+ ### Compilation pipeline
+
+ The implemented compiler includes:
+
+ ```text
+   Python/source files
+     → parse
+     → symbol resolution
+     → framework-specific augmentation
+     → IR
+     → knowledge node documents
+     → projections and indexes
+ ```
+
+ Relevant modules include:
+
+ - validators/knowledge/compiler/parse.py
+ - resolve.py
+ - ir.py
+ - incremental.py
+ - rename.py
+ - framework compilers for FastAPI, Django, Pydantic, SQLAlchemy, Celery, Alembic, tests, configuration, CI/CD, and others;
+ - storage.py
+ - writer.py
+ - registry.py
+ - projections/
+ - api.py
+ - enricher.py
+ - enricher_queue.py
+
+ ### Symbol registry
+
+ validators/knowledge/registry.py gives symbols stable IDs derived from their first-seen birth key:
+
+ ```text
+   TYPE-<first 16 hex characters of SHA-256(path:qualified_name)>
+ ```
+
+ The registry preserves identity across aliases, renames, and moves. Registry files are sharded under:
+
+ ```text
+   .sync/knowledge/registry/
+ ```
+
+ ### Storage
+
+ The compiled knowledge store uses:
+
+ ```text
+   .sync/knowledge/
+   ├── registry/     # canonical symbol identity
+   ├── nodes/        # compiled symbol/runtime nodes
+   ├── revisions/   # revision and provenance records
+   ├── cache/       # search/reverse-index/metrics caches
+   └── enrichment/  # background enrichment queue
+ ```
+
+ The current workspace contains approximately:
+
+ - 9,989 knowledge nodes
+ - 73,596 edges
+ - 30 revisions
+ - 0 reported diagnostics
+ - reported resolved ratio: 0.7258
+
+ The Knowledge API in validators/knowledge/api.py is read-oriented and supports:
+
+ - lookup;
+ - filtering;
+ - traversal;
+ - callers;
+ - impact;
+ - flows;
+ - search;
+ - context assembly;
+ - contract-scoped access filtering;
+ - revision and Git metadata;
+ - stale-state reporting;
+ - semantic fallback behavior.
+
+ The current graph context output reported:
+
+ ```text
+   revision: 30
+   git_commit: 4223f4c84bc2996037ca4c6e9c3ae59b6a9faa79
+   stale: False
+   semantic: False
+ ```
+
+ semantic: False indicates the particular query used deterministic/text retrieval rather than embedding-based semantic retrieval.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 5. Procedural learning and enrichment
+
+ The repository also contains:
+
+ - validators/experience/
+ - validators/learning/
+ - validators/skill/
+
+ These support experience records, pattern mining, skill storage, retrieval, decay, and verification.
+
+ The enrichment subsystem is separate from deterministic compilation. It maintains queued jobs and budget counters under .sync/knowledge/enrichment/.
+
+ The intended architectural boundary is:
+
+ ```text
+   Deterministic compiler facts
+     → optional AI summaries/embeddings
+ ```
+
+ AI-derived information is meant to remain advisory and separately tagged rather than becoming authoritative graph structure.
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 6. Important documentation caveat
+
+ There is a significant difference between the current source and some architecture documents.
+
+ docs/STACKMIND_ARCHITECTURE.md and docs/SKC-STATUS.md describe the knowledge compiler, harness, TUI, and related systems as planned or pre-implementation. However:
+
+ - the current source contains those implementations;
+ - CHANGELOG.md documents the 3.6.0 and 3.7.0 runtime/harness work;
+ - .sync/knowledge/ contains a populated compiled graph;
+ - stackmind graph commands are registered and operational.
+
+ Therefore:
+
+ - use the architecture handbook for design principles and intended invariants;
+ - use current source, changelog, and runtime artifacts for implementation status;
+ - treat the older SKC/RFC planning documents as design history unless confirmed against code.
+
+ The clearest current mental model is:
+
+ ```text
+   Git repository + governed .sync state
+           ↓
+   knowledge compiler and runtime projections
+           ↓
+   read-only Knowledge API
+           ↓
+   contract-bound harness/agents
+           ↓
+   validated writes back to repository or .sync
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 7. Verified Autonomous Lifecycle & Tool Validation Matrix
+
+ In live end-to-end integration testing against real LLM providers (`ollama/gemma4:31b-cloud`), StackMind demonstrated complete autonomous product delivery:
+ Goal: *"build a self-contained token bucket rate limiter module in app/rate_limiter.py with unit tests in tests/test_rate_limiter.py, verify test coverage with QA, and record a release commit."*
+
+ The complete lifecycle ran through the deterministic Supervisor and TUI, verifying all major tool groups, protocol endpoints, and governance gates:
+
+ ### Tested Tools & Subsystems
+
+ 1. **Governed Agent Tools (`validators/kernel/tools.py`, `gateway.py`, `runner.py`)**:
+    - `write_file`: Scoped write operations bound by contract permissions. Used by Claude to author child WOs/contracts, Codex to implement `app/rate_limiter.py` and `tests/test_rate_limiter.py`, and Local-LLM to generate release notes.
+    - `read_file`: Scoped read operations. Used by Claude to inspect `PLAN.md` and deliverables during integration review, and Gemma to inspect code and tests during QA.
+    - `run_command`: Sandboxed command execution in designated project virtual environment (verified test execution via `pytest tests/test_rate_limiter.py` without environment escape).
+    - `query_graph`: Graph context retrieval and contract-checked symbol scoping.
+
+ 2. **Daemon Protocol & API Endpoints (`validators/kernel/daemon/`)**:
+    - `session.create` / `session.start`: Session scaffolding and protocol citizenship initialization.
+    - `plan.propose`, `plan.get`, `plan.approve`, `plan.reject`: Architecture plan proposal and human approval handling.
+    - `run.get`, `run.approve`, `run.resume`: Lifecycle run state queries, operator sign-offs, and crash-recovery unblocking.
+    - `operation.turn` / `session.turn`: Multi-turn role dispatching with cancellation tokens and audit journaling.
+    - `event.list` / `/events` (SSE): Real-time Server-Sent Events stream with sequence replay and keepalive heartbeats.
+    - `role.configureBackend`, `role.list`, `backend.list`: Dynamic backend rebinding and provider resolution.
+
+ 3. **Lifecycle Supervisor & Deterministic State Machine (`validators/kernel/daemon/supervisor.py`)**:
+    - Complete 10-phase progression: `INIT` → `PLANNING` → `AWAITING_APPROVAL` → `AUTHORING` → `DISPATCHING` → `EXECUTING` → `INTEGRATION_REVIEW` → `PRODUCT_READY` → `GITOPS` → `COMPLETE`.
+    - DAG dependency resolution (topological ordering: `WO-001` → `WO-002` → `WO-003`).
+    - Dedicated synthesized read-only Integration Review scope (`WO-005`) with bounded schema retries.
+    - Transient failure retry logic in GitOps turns and automatic boot recovery from `Phase.BLOCKED`/`Phase.FAILED`.
+    - Work order archiving to `.sync/work-orders/COMPLETED/` upon release.
+
+ 4. **Runtime Governance & Verification Gates**:
+    - `D024Gate`: QA test companion discovery and verdict evaluation.
+    - `AuthoringGate`: Work order and contract schema validation.
+    - `ContractBoundary`: Strict scope enforcement (blocking out-of-scope edits and fail-closed path boundaries).
+    - `stackmind validate`: State-directory collision detection (`ACTIVE` vs `COMPLETED`), ledger consistency (`INDEX.yaml`), and canonical runtime synchronization (`TREE.yaml`).
+    - `create_gitops_commit`: Governed GitOps release commit with canonical provenance trailers (`Work-Order`, `Released-By`, `Approved-By`, `Architect`, `Target-Work-Orders`).
+
+ 5. **TUI Interactive Commands (`cli/tui/`)**:
+    - `:goal`: Autonomous product delivery submission.
+    - `:status`: Real-time HUD displaying active phase, role backends, and work order progress.
+    - `:approve`: Operator plan authorization gate.
+    - `:resume`: Supervisor recovery and unblocking.

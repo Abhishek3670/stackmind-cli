@@ -26,7 +26,7 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
     combined_text = f"{milestone_title}\n" + "\n".join(tasks)
     
     # 1. Search for explicitly mentioned file paths in tasks
-    # Patterns: requirements.txt, src/backend.py, src/frontend.html, etc.
+    # Patterns: requirements.txt, src/backend.py, src/frontend.html, src/landing.html, etc.
     file_pattern = r"(?:`|\"|'|\s|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?:`|\"|'|\s|$)"
     matches = re.findall(file_pattern, combined_text)
     candidate_paths: list[str] = []
@@ -38,20 +38,23 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
 
     role_norm = role.lower().strip()
     
-    # Scaffolding / requirements check
-    if any(kw in combined_text.lower() for kw in ("requirements.txt", "scaffold", "dependency manifest", "dependencies manifest", "setup dependencies")):
-        return {
-            "type": "config",
-            "path": "requirements.txt",
-            "description": "Project dependency manifest declaring required packages",
-        }
-
-    # Role-based extraction with candidate path fallback
+    # Role-based extraction with candidate path matching
     if role_norm in ("gemini", "frontend"):
         target_path = next(
             (p for p in candidate_paths if any(p.endswith(ext) for ext in (".html", ".jsx", ".tsx", ".js", ".ts", ".css"))),
-            "src/frontend.html",
+            None,
         )
+        if not target_path:
+            target_path = next(
+                (p for p in candidate_paths if not p.endswith((".py", ".txt", ".md"))),
+                None,
+            )
+        if not target_path:
+            if "landing" in combined_text.lower():
+                target_path = "src/landing.html"
+            else:
+                target_path = "src/frontend.html"
+
         return {
             "type": "code",
             "path": target_path,
@@ -59,19 +62,14 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
         }
 
     if role_norm in ("gemma", "qa"):
-        target_path = next(
-            (p for p in candidate_paths if "test" in p),
-            "tests/test_login.py",
-        )
         return {
-            "type": "code",
-            "path": target_path,
-            "description": f"Test suite and validation for {milestone_title}",
+            "type": "doc",
+            "description": f"Test verification and QA sign-off for {milestone_title}",
         }
 
     if role_norm in ("local-llm", "gitops"):
         target_path = next(
-            (p for p in candidate_paths if p in ("VERSION.md", "CHANGELOG.md")),
+            (p for p in candidate_paths if p in ("VERSION.md", "CHANGELOG.md", "package.json")),
             "VERSION.md",
         )
         return {
@@ -81,10 +79,21 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
         }
 
     # Default: Codex / Backend
-    target_path = next(
-        (p for p in candidate_paths if p.endswith(".py") and not p.startswith("test")),
-        "src/backend.py",
+    # Only treat as requirements.txt if explicitly mentioned and no code files are targeted
+    has_req = any(p == "requirements.txt" or p.endswith("requirements.txt") for p in candidate_paths) or any(
+        kw in combined_text.lower() for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")
     )
+    code_path = next((p for p in candidate_paths if p.endswith(".py") and not "test" in p), None)
+    if not code_path:
+        code_path = next((p for p in candidate_paths if p.endswith(".py")), None)
+    if has_req and not code_path:
+        return {
+            "type": "config",
+            "path": "requirements.txt",
+            "description": "Project dependency manifest declaring required packages",
+        }
+
+    target_path = code_path or "src/backend.py"
     return {
         "type": "code",
         "path": target_path,
@@ -93,19 +102,76 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
 
 
 def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
-    """Determine (agent_id, role) from milestone title and tasks."""
+    """Determine (agent_id, role) from milestone title and tasks.
+
+    The Architect's explicit designation in PLAN.md takes top priority.
+    """
     combined = (f"{title} " + " ".join(tasks)).lower()
+    title_lower = title.lower()
 
-    # Scaffolding / dependencies are always Backend (Codex)
-    if any(kw in combined for kw in ("requirements.txt", "scaffold", "dependency manifest", "dependencies manifest", "setup dependencies")):
-        return "codex", "backend"
+    # 1. Top priority: Explicit agent designation by the Architect in title or tasks
+    # Patterns: (Agent: codex), [Agent: codex], Agent: codex, Assigned: codex, Owner: codex,
+    #           (codex), [codex], @codex
+    target_header = f"{title} " + (tasks[0] if tasks else "")
 
-    if re.search(r"\b(?:ui|frontend|views?|components?|screens?|css|html|react|client|login page)\b", combined):
+    agent_match = (
+        re.search(r"(?:agent|assigned|owner)\s*[:=]\s*([a-zA-Z0-9_\-]+)", target_header, re.IGNORECASE)
+        or re.search(r"[\(\[]\s*(?:agent:\s*)?(codex|gemini|gemma|local-llm|claude)\s*[\)\]]", target_header, re.IGNORECASE)
+        or re.search(r"@([a-zA-Z0-9_\-]+)", target_header)
+    )
+    if agent_match:
+        explicit_agent = agent_match.group(1).lower().strip()
+        role_map = {
+            "codex": "backend",
+            "gemini": "frontend",
+            "gemma": "qa",
+            "local-llm": "gitops",
+            "claude": "architecture",
+        }
+        if explicit_agent in role_map:
+            return explicit_agent, role_map[explicit_agent]
+
+    # 2. Explicit role designation by the Architect
+    # Patterns: (Role: backend), [Role: frontend], Role: qa, Role: gitops
+    role_match = re.search(r"\brole\s*[:=]\s*([a-zA-Z0-9_\-]+)", target_header, re.IGNORECASE)
+    if role_match:
+        explicit_role = role_match.group(1).lower().strip()
+        agent_role_map = {
+            "backend": ("codex", "backend"),
+            "frontend": ("gemini", "frontend"),
+            "qa": ("gemma", "qa"),
+            "gitops": ("local-llm", "gitops"),
+            "release": ("local-llm", "gitops"),
+            "architecture": ("claude", "architecture"),
+        }
+        if explicit_role in agent_role_map:
+            return agent_role_map[explicit_role]
+
+    # 3. Fallback: Semantic heuristics based on title and task keywords
+    # Frontend checks: explicit UI files or keywords
+    if re.search(r"\b[a-zA-Z0-9_\-\.\/]+\.(?:html|css|jsx|tsx)\b", combined) or re.search(
+        r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|client|landing page|login page)\b", combined
+    ):
         return "gemini", "frontend"
-    if re.search(r"\b(?:qa|tests?|testing|verification|audit|validation|review)\b", combined):
-        return "gemma", "qa"
+
+    # GitOps checks
     if re.search(r"\b(?:release|git|deploy|packaging|version|gitops|changelog)\b", combined):
         return "local-llm", "gitops"
+
+    # Implementation / backend logic belongs to Codex (even if tasks include unit tests)
+    if re.search(r"\b(?:implement|implementation|backend|feature|logic|module|service|core|tokenbucket|token_bucket|api)\b", title_lower):
+        return "codex", "backend"
+
+    # QA checks: pure verification, test suite execution, audit, or review
+    if re.search(r"\b(?:qa|verification|audit|validation|review)\b", title_lower) or re.search(
+        r"\b(?:qa|tests?|testing|verification|audit|validation|review)\b", combined
+    ):
+        return "gemma", "qa"
+
+    # Scaffolding / dependencies specifically for backend
+    if any(kw in combined for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")):
+        return "codex", "backend"
+
     return "codex", "backend"
 
 
@@ -120,6 +186,13 @@ def build_child_work_order(
 ) -> dict[str, Any]:
     """Construct a schema-conforming Work Order record."""
     now = _now()
+    deliv_spec: dict[str, Any] = {
+        "type": deliverable.get("type", "code"),
+        "description": deliverable.get("description", f"Deliverables for {title}"),
+    }
+    if deliverable.get("path"):
+        deliv_spec["path"] = deliverable["path"]
+
     return {
         "id": wo_id,
         "type": "FEATURE",
@@ -128,11 +201,7 @@ def build_child_work_order(
         "priority": priority,
         "assigned_agents": list(assigned_agents),
         "dependencies": list(dependencies),
-        "deliverable": {
-            "type": deliverable.get("type", "code"),
-            "path": deliverable.get("path"),
-            "description": deliverable.get("description", f"Deliverables for {title}"),
-        },
+        "deliverable": deliv_spec,
         "description": description.strip() or title.strip(),
         "created": now,
         "updated": now,
@@ -195,6 +264,11 @@ def build_child_contract(
             {"module": "CHANGELOG.md"},
             {"module": "pyproject.toml"},
             {"module": "package.json"},
+            {"module": "src/**"},
+            {"module": "app/**"},
+            {"module": "tests/**"},
+            {"module": "test/**"},
+            {"module": "*.py"},
         ])
     else:
         allow_rules.extend([
@@ -225,10 +299,24 @@ def build_child_contract(
         {"module": ".venv/**"},
         {"module": "node_modules/**"},
     ]
-    # Deny other agents' private inboxes
-    for other_agent in ("claude", "codex", "gemini", "gemma", "local-llm", "CEO"):
-        if other_agent != agent_id:
-            deny_rules.append({"module": f".sync/inbox/{other_agent}/**"})
+    # Protect executive inbox from unauthorized worker access
+    if agent_id != "CEO":
+        deny_rules.append({"module": ".sync/inbox/CEO/**"})
+    # Preserve protocol message routing channels (AGENTS.md):
+    # - Workers need to drop review requests to .sync/inbox/gemma/
+    # - Gemma needs to drop verdicts to .sync/inbox/claude/ and .sync/inbox/codex/
+    # - Claude needs to dispatch to worker inboxes
+    for other_agent in ("claude", "codex", "gemini", "gemma", "local-llm"):
+        if other_agent == agent_id:
+            continue
+        # Exclude permitted protocol routing channels
+        if role_norm in ("qa", "gemma") and other_agent in ("claude", "codex", "gemini"):
+            continue
+        if role_norm in ("backend", "frontend", "codex", "gemini") and other_agent in ("gemma", "claude"):
+            continue
+        if role_norm in ("architecture", "claude"):
+            continue
+        deny_rules.append({"module": f".sync/inbox/{other_agent}/**"})
 
     return {
         "schema_version": 1,
@@ -245,9 +333,56 @@ def build_child_contract(
         },
         "budget": {
             "max_files_touched": 10,
-            "max_tokens": 40000,
+            "max_tokens": 150000,
         },
     }
+
+
+def get_next_work_order_int(workspace: Path | str) -> int:
+    """Find the next monotonically increasing integer ID for work orders.
+
+    Scans:
+    1. .sync/work-orders/ACTIVE/
+    2. .sync/work-orders/COMPLETED/
+    3. .sync/work-orders/INDEX.yaml
+
+    Returns max(existing_ids) + 1, starting at 1 if no existing worker WOs.
+    """
+    ws = Path(workspace).resolve()
+    max_id = 0
+    pattern = re.compile(r"^WO-([0-9]{3,})$")
+
+    # 1. Check INDEX.yaml
+    index_file = ws / ".sync" / "work-orders" / "INDEX.yaml"
+    if index_file.is_file():
+        try:
+            data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                next_id = data.get("next_id")
+                if isinstance(next_id, int) and next_id > max_id:
+                    max_id = next_id - 1
+                for o in data.get("orders", []):
+                    if isinstance(o, dict) and o.get("id"):
+                        m = pattern.match(str(o["id"]))
+                        if m:
+                            val = int(m.group(1))
+                            if val > max_id:
+                                max_id = val
+        except Exception:
+            pass
+
+    # 2. Check ACTIVE, COMPLETED, and BLOCKED directories
+    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+        d = ws / ".sync" / "work-orders" / sub
+        if d.is_dir():
+            for f in d.glob("*.yaml"):
+                m = pattern.match(f.stem)
+                if m:
+                    val = int(m.group(1))
+                    if val > max_id:
+                        max_id = val
+
+    return max_id + 1
 
 
 def synthesize_child_work_orders(
@@ -267,6 +402,7 @@ def synthesize_child_work_orders(
     contracts_dir.mkdir(parents=True, exist_ok=True)
 
     gate = AuthoringGate(project_root=ws)
+    start_idx = get_next_work_order_int(ws)
 
     # 1. Extract plan structure and proposed work orders
     proposed_wos: list[dict[str, Any]] = []
@@ -281,18 +417,19 @@ def synthesize_child_work_orders(
         elif plan.get("content"):
             try:
                 parsed = parse_plan(plan["content"])
-                for idx, m in enumerate(parsed.milestones, start=1):
+                for offset, m in enumerate(parsed.milestones):
+                    idx = start_idx + offset
                     agent, role = determine_assigned_agent(m.title, m.tasks)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
-                    deps = [f"WO-{idx-1:03d}"] if idx > 1 else []
+                    deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
                     wo = build_child_work_order(
                         wo_id=wo_id,
                         title=m.title,
                         description="\n".join(m.tasks) if m.tasks else m.title,
                         assigned_agents=[agent],
                         dependencies=deps,
-                        priority="P0" if idx == 1 else "P1",
+                        priority="P0" if offset == 0 else "P1",
                         deliverable=deliv,
                     )
                     proposed_wos.append(wo)
@@ -301,18 +438,19 @@ def synthesize_child_work_orders(
     elif isinstance(plan, str):
         try:
             parsed = parse_plan(plan)
-            for idx, m in enumerate(parsed.milestones, start=1):
+            for offset, m in enumerate(parsed.milestones):
+                idx = start_idx + offset
                 agent, role = determine_assigned_agent(m.title, m.tasks)
                 deliv = extract_deliverable_spec(m.title, m.tasks, role)
                 wo_id = f"WO-{idx:03d}"
-                deps = [f"WO-{idx-1:03d}"] if idx > 1 else []
+                deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
                 wo = build_child_work_order(
                     wo_id=wo_id,
                     title=m.title,
                     description="\n".join(m.tasks) if m.tasks else m.title,
                     assigned_agents=[agent],
                     dependencies=deps,
-                    priority="P0" if idx == 1 else "P1",
+                    priority="P0" if offset == 0 else "P1",
                     deliverable=deliv,
                 )
                 proposed_wos.append(wo)
@@ -325,18 +463,19 @@ def synthesize_child_work_orders(
         if plan_file.is_file():
             try:
                 parsed = parse_plan(plan_file.read_text(encoding="utf-8"))
-                for idx, m in enumerate(parsed.milestones, start=1):
+                for offset, m in enumerate(parsed.milestones):
+                    idx = start_idx + offset
                     agent, role = determine_assigned_agent(m.title, m.tasks)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
-                    deps = [f"WO-{idx-1:03d}"] if idx > 1 else []
+                    deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
                     wo = build_child_work_order(
                         wo_id=wo_id,
                         title=m.title,
                         description="\n".join(m.tasks) if m.tasks else m.title,
                         assigned_agents=[agent],
                         dependencies=deps,
-                        priority="P0" if idx == 1 else "P1",
+                        priority="P0" if offset == 0 else "P1",
                         deliverable=deliv,
                     )
                     proposed_wos.append(wo)
@@ -345,6 +484,28 @@ def synthesize_child_work_orders(
 
     if not proposed_wos:
         raise ValueError("Cannot synthesize child work orders: no milestones or tasks could be parsed from plan")
+
+    # Anti-collision check: if any proposed WO conflicts with existing on-disk work order, remap IDs sequentially
+    existing_on_disk = set()
+    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+        d = ws / ".sync" / "work-orders" / sub
+        if d.is_dir():
+            for f in d.glob("*.yaml"):
+                existing_on_disk.add(f.stem)
+
+    if any(w.get("id") in existing_on_disk for w in proposed_wos):
+        id_map: dict[str, str] = {}
+        renumbered_wos: list[dict[str, Any]] = []
+        for offset, w in enumerate(proposed_wos):
+            old_id = str(w.get("id", f"WO-{offset+1:03d}"))
+            new_id = f"WO-{start_idx + offset:03d}"
+            id_map[old_id] = new_id
+            w_copy = dict(w)
+            w_copy["id"] = new_id
+            new_deps = [id_map.get(d, d) for d in w.get("dependencies", [])]
+            w_copy["dependencies"] = new_deps
+            renumbered_wos.append(w_copy)
+        proposed_wos = renumbered_wos
 
     created_records: list[dict[str, Any]] = []
 
@@ -362,9 +523,22 @@ def synthesize_child_work_orders(
         prio = wo.get("priority", "P1")
         deliv = wo.get("deliverable") or {}
 
-        # Ensure deliverable has explicit path
-        if not deliv.get("path"):
-            deliv = extract_deliverable_spec(title, [desc], primary_agent)
+        # Refine agent assignment if defaulted to codex but clearly targets frontend or QA
+        detected_agent, detected_role = determine_assigned_agent(title, [desc])
+        if primary_agent == "codex" and detected_agent in ("gemini", "gemma", "local-llm"):
+            primary_agent = detected_agent
+
+        role = "backend"
+        if primary_agent == "gemini":
+            role = "frontend"
+        elif primary_agent == "gemma":
+            role = "qa"
+        elif primary_agent in ("local-llm", "gitops"):
+            role = "gitops"
+
+        # Ensure deliverable has explicit path matching role
+        if not deliv.get("path") or (primary_agent == "gemini" and str(deliv.get("path")).endswith(".txt")):
+            deliv = extract_deliverable_spec(title, [desc], role)
 
         wo_rec = build_child_work_order(
             wo_id=wo_id,
@@ -375,14 +549,6 @@ def synthesize_child_work_orders(
             priority=prio,
             deliverable=deliv,
         )
-
-        role = "backend"
-        if primary_agent == "gemini":
-            role = "frontend"
-        elif primary_agent == "gemma":
-            role = "qa"
-        elif primary_agent in ("local-llm", "gitops"):
-            role = "gitops"
 
         contract_rec = build_child_contract(
             wo_id=wo_id,
@@ -442,6 +608,15 @@ def synthesize_child_work_orders(
                 "file": f"work-orders/ACTIVE/{rec_id}.yaml",
             })
             existing_order_ids.add(rec_id)
+
+    max_id_num = 0
+    pattern = re.compile(r"^WO-([0-9]{3,})$")
+    for item in index_data.get("orders", []):
+        if isinstance(item, dict) and item.get("id"):
+            m = pattern.match(str(item["id"]))
+            if m:
+                max_id_num = max(max_id_num, int(m.group(1)))
+    index_data["next_id"] = max_id_num + 1
 
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
