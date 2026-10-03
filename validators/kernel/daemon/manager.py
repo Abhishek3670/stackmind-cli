@@ -1739,7 +1739,7 @@ class SessionManager:
         from .supervisor import AdvanceResult, Phase
 
         if max_wait_seconds is None:
-            max_wait_seconds = float(os.environ.get("SUPERVISOR_OPERATION_TIMEOUT", 900.0))
+            max_wait_seconds = float(os.environ.get("SUPERVISOR_OPERATION_TIMEOUT", 1800.0))
 
         state = self._active_runs.get(run_id)
         if not state:
@@ -1780,6 +1780,12 @@ class SessionManager:
                     if waiting_operation_started_at is None:
                         waiting_operation_started_at = now_mono
                     elif now_mono - waiting_operation_started_at > max_wait_seconds:
+                        has_alive_threads = False
+                        with self._lock:
+                            has_alive_threads = any(t.is_alive() for t in self._turn_threads.values())
+                        if has_alive_threads and (now_mono - waiting_operation_started_at < max_wait_seconds * 2):
+                            time.sleep(0.5)
+                            continue
                         state.error = (
                             f"Timed out waiting for operations in phase {state.phase.value} "
                             f"after {max_wait_seconds:.0f}s"

@@ -305,7 +305,7 @@ class LifecycleSupervisor:
         state: RunState,
         max_steps: int = 100,
         poll_interval: float = 0.5,
-        max_wait_seconds: float = 900.0,
+        max_wait_seconds: float = 1800.0,
         on_transition: Any = None,
     ) -> AdvanceResult:
         """Continuously drive the lifecycle until a pause or terminal phase is reached.

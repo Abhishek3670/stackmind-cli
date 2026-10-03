@@ -792,7 +792,9 @@ class AgentRunner:
                         and not (any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes) and norm_p not in dec_norm)
                         and (task_wo_rel is None or norm_p != task_wo_rel or norm_p in dec_norm)
                     )
-                    declaration_matches = set(observed_task_files) == dec_norm
+                    phantom_files = {p for p in dec_norm if not (staged_root / p).is_file()}
+                    dec_effective = dec_norm - phantom_files
+                    declaration_matches = set(observed_task_files) == dec_effective
                     if getattr(task, 'is_authoring', False) and not observed_task_files:
                         declaration_matches = True
                     mismatch_reason = (
@@ -1574,6 +1576,21 @@ class AgentRunner:
                 for wf in written_files:
                     if Path(wf).as_posix().lstrip('/') not in current_mods:
                         payload.setdefault('modified_files', []).append(wf)
+
+        # Prune internal scratch/decision paths and non-existent phantom files from modified_files
+        if payload.get('modified_files'):
+            pruned_mods: list[str] = []
+            for p in payload['modified_files']:
+                norm_p = str(p).replace('\\', '/').lstrip('/')
+                if norm_p.startswith(('_scratch', 'scratch', '.sync/state', '.sync/runtime')):
+                    continue
+                if tool_runtime is not None:
+                    is_written = norm_p in written_files or any(Path(wf).as_posix().lstrip('/') == norm_p for wf in written_files)
+                    exists_in_ws = (tool_runtime.workspace.root / norm_p).is_file()
+                    if not is_written and not exists_in_ws:
+                        continue
+                pruned_mods.append(p)
+            payload['modified_files'] = pruned_mods
 
         if request.task.work_order_id and payload.get('status') == 'completed' and not payload.get('release_target'):
             payload['release_target'] = request.task.deliverable_path or 'patch'
