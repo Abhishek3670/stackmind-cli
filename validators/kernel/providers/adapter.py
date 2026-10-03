@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -72,12 +74,14 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         api_key: str = "",
         model: str = "gpt-4o",
         provider_name: str = "openai-compatible",
-        default_timeout: float = 30.0,
+        default_timeout: float | None = None,
         transport: Callable[[dict[str, Any], bool, float | None], Any] | None = None,
     ) -> None:
         super().__init__(provider_name=provider_name, model_name=model)
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        if default_timeout is None:
+            default_timeout = float(os.environ.get("PROVIDER_TIMEOUT", 300.0))
         self.default_timeout = default_timeout
         self.transport = transport
 
@@ -168,7 +172,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         except urllib.error.HTTPError as ex:
             body = ex.read().decode("utf-8", errors="replace")
             raise self._map_http_error(ex.code, body) from ex
-        except (urllib.error.URLError, TimeoutError) as ex:
+        except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
             raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
         except Exception as ex:
             raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
@@ -249,22 +253,27 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                     yield self._parse_stream_dict(item)
             return
 
-        for line in raw_stream:
-            self._check_cancellation(cancellation_token)
-            if isinstance(line, bytes):
-                line = line.decode("utf-8")
-            line = line.strip()
-            if not line or line.startswith(":"):
-                continue
-            if line == "data: [DONE]":
-                break
-            if line.startswith("data: "):
-                raw_json = line[6:]
-                try:
-                    chunk_data = json.loads(raw_json)
-                    yield self._parse_stream_dict(chunk_data)
-                except json.JSONDecodeError:
+        try:
+            for line in raw_stream:
+                self._check_cancellation(cancellation_token)
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
+                line = line.strip()
+                if not line or line.startswith(":"):
                     continue
+                if line == "data: [DONE]":
+                    break
+                if line.startswith("data: "):
+                    raw_json = line[6:]
+                    try:
+                        chunk_data = json.loads(raw_json)
+                        yield self._parse_stream_dict(chunk_data)
+                    except json.JSONDecodeError:
+                        continue
+        except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
+            raise TimeoutError(f"Connection or timeout error during stream: {ex}", provider=self.provider_name) from ex
+        except Exception as ex:
+            raise ProviderError(f"Unexpected stream failure: {ex}", provider=self.provider_name) from ex
 
     def _parse_stream_dict(self, data: dict[str, Any]) -> StreamChunk:
         choices = data.get("choices", [])
@@ -314,12 +323,14 @@ class OllamaAdapter(ProviderAdapter):
         endpoint: str = "http://localhost:11434",
         model: str = "qwen2.5-coder:7b",
         provider_name: str = "ollama",
-        default_timeout: float = 60.0,
+        default_timeout: float | None = None,
         options: dict[str, Any] | None = None,
         transport: Callable[[dict[str, Any], bool, float | None], Any] | None = None,
     ) -> None:
         super().__init__(provider_name=provider_name, model_name=model)
         self.endpoint = endpoint.rstrip("/")
+        if default_timeout is None:
+            default_timeout = float(os.environ.get("OLLAMA_TIMEOUT", 300.0))
         self.default_timeout = default_timeout
         self.options = dict(options) if options else {}
         if "num_gpu" not in self.options and "OLLAMA_NUM_GPU" in os.environ:
@@ -455,7 +466,7 @@ class OllamaAdapter(ProviderAdapter):
                 status_code=ex.code,
                 provider=self.provider_name,
             ) from ex
-        except (urllib.error.URLError, TimeoutError) as ex:
+        except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
             raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
         except Exception as ex:
             raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
@@ -477,7 +488,12 @@ class OllamaAdapter(ProviderAdapter):
         if isinstance(raw_result, dict):
             resp_data = raw_result
         elif hasattr(raw_result, "read"):
-            resp_data = json.loads(raw_result.read().decode("utf-8"))
+            try:
+                resp_data = json.loads(raw_result.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
+                raise TimeoutError(f"Connection or timeout error reading response: {ex}", provider=self.provider_name) from ex
+            except Exception as ex:
+                raise ProviderError(f"Failed to read provider response: {ex}", provider=self.provider_name) from ex
         else:
             raise ProviderError(
                 f"Invalid response type from transport: {type(raw_result)}",
@@ -539,17 +555,22 @@ class OllamaAdapter(ProviderAdapter):
                     yield self._parse_stream_dict(item)
             return
 
-        for line in raw_stream:
-            if isinstance(line, bytes):
-                line = line.decode("utf-8")
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                chunk_data = json.loads(line)
-                yield self._parse_stream_dict(chunk_data)
-            except json.JSONDecodeError:
-                continue
+        try:
+            for line in raw_stream:
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk_data = json.loads(line)
+                    yield self._parse_stream_dict(chunk_data)
+                except json.JSONDecodeError:
+                    continue
+        except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
+            raise TimeoutError(f"Connection or timeout error during stream: {ex}", provider=self.provider_name) from ex
+        except Exception as ex:
+            raise ProviderError(f"Unexpected stream failure: {ex}", provider=self.provider_name) from ex
 
     def _parse_stream_dict(self, data: dict[str, Any]) -> StreamChunk:
         msg = data.get("message", {})

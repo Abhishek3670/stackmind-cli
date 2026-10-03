@@ -1110,6 +1110,23 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
             "required": ["version"],
         },
     ),
+    ToolDefinition(
+        name="request_tools",
+        description=(
+            "Dynamically activate additional specialized tools for this session by keyword, "
+            "category, or tool name (e.g. 'git', 'analysis', 'linters', 'graph', or a specific name like 'git_blame')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Category or tool name, e.g. 'git', 'analysis', 'knowledge', or 'git_blame'",
+                }
+            },
+            "required": ["query"],
+        },
+    ),
 )
 
 
@@ -1118,6 +1135,71 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     from validators.kernel.identity import get_role_policy
     policy = get_role_policy(role_or_agent)
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
+
+
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file")
+AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
+ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "list_directory",
+    "query_graph",
+    "find_symbol",
+    "find_references",
+    "git_log",
+    "git_diff",
+    "run_command",
+)
+
+
+def get_curated_tools_for_phase(
+    role_or_agent: str,
+    phase: str | None = None,
+    backend_id: str | None = None,
+) -> list[ToolDefinition]:
+    """Return an optimized, task-appropriate tool palette.
+
+    Prevents context bloat and tool dilution on local models while including
+    the request_tools meta-tool for dynamic on-demand capability expansion.
+    """
+    from validators.kernel.identity import get_role_policy
+    policy = get_role_policy(role_or_agent)
+    all_permitted = [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
+
+    norm_role = str(role_or_agent).lower().strip()
+    is_architect = norm_role in ("claude", "architecture", "architect")
+
+    request_tools_def = next((t for t in STANDARD_KERNEL_TOOLS if t.name == "request_tools"), None)
+
+    if is_architect:
+        if phase == "planning":
+            wanted = set(PLANNING_CORE_TOOL_NAMES)
+        elif phase == "authoring":
+            wanted = set(AUTHORING_CORE_TOOL_NAMES)
+        else:
+            wanted = set(ARCHITECTURE_INVESTIGATION_TOOL_NAMES)
+
+        curated = [t for t in all_permitted if t.name in wanted]
+        if request_tools_def and request_tools_def not in curated:
+            curated.append(request_tools_def)
+        return curated
+
+    # For other roles (codex, gemini, gemma, local-llm):
+    # If running against local Ollama, trim extraneous kernel diagnostic tools
+    if backend_id in ("ollama", "local", "local-llm"):
+        omitted = {
+            "checkpoint", "restore_checkpoint", "inspect_budget", "explain_denial",
+            "verify_scope", "dispatch_subagent", "compare_snapshots", "skill_mine",
+            "skill_promote", "skill_list", "skill_retrieve", "experience_search",
+        }
+        curated = [t for t in all_permitted if t.name not in omitted]
+        if request_tools_def and request_tools_def not in curated:
+            curated.append(request_tools_def)
+        return curated
+
+    if request_tools_def and request_tools_def not in all_permitted:
+        all_permitted.append(request_tools_def)
+    return all_permitted
 
 DEFAULT_MAX_TURNS: int = 20
 DEFAULT_MAX_TOOL_CALLS: int = 35
@@ -1194,6 +1276,10 @@ class ProviderGateway:
                 can_run_cmd, _ = evaluator.authorize(self.contract, "run_command", "workspace/command")
             if not can_run_cmd:
                 active_tools = [t for t in active_tools if t.name != "run_command"]
+        request_tools_def = next((t for t in STANDARD_KERNEL_TOOLS if t.name == "request_tools"), None)
+        if request_tools_def and request_tools_def.name not in {t.name for t in active_tools}:
+            active_tools.append(request_tools_def)
+        self.active_tools_list: list[ToolDefinition] = active_tools
         self.tools = tuple(active_tools)
         self.total_usage = TokenUsage()
         self.total_tool_calls: int = 0
@@ -1356,6 +1442,46 @@ class ProviderGateway:
                 out_str = json.dumps(result) if not isinstance(result, str) else result
                 return truncate_tool_output(out_str, max_chars=self.max_tool_output_chars)
 
+            if name == "request_tools":
+                query = str(args.get("query", "")).lower().strip()
+                if not query:
+                    return "Error: 'request_tools' requires a 'query' argument specifying the tool or category."
+
+                category_tools: dict[str, set[str]] = {
+                    "git": {"git_status", "git_diff", "git_log", "git_show", "git_blame", "git_changed_files", "git_branch"},
+                    "analysis": {"find_callers", "find_callees", "impact_analysis", "dependency_analysis", "data_flow_analysis"},
+                    "knowledge": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
+                    "graph": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
+                    "linter": {"run_command"},
+                    "linters": {"run_command"},
+                    "diagnostics": {"inspect_environment", "inspect_logs", "inspect_version", "checkpoint"},
+                    "search": {"grep", "glob", "semantic_search", "search_docs"},
+                }
+
+                target_names = set(category_tools.get(query, set()))
+                if not target_names:
+                    for t in STANDARD_KERNEL_TOOLS:
+                        if query == t.name.lower() or query in t.name.lower() or query in t.description.lower():
+                            target_names.add(t.name)
+
+                policy = getattr(self.tool_gateway, "policy", None)
+                added_tools: list[str] = []
+                already_active = {t.name for t in self.active_tools_list}
+                for t in STANDARD_KERNEL_TOOLS:
+                    if t.name in target_names and t.name not in already_active:
+                        if policy is None or policy.permits(t.name):
+                            self.active_tools_list.append(t)
+                            added_tools.append(t.name)
+
+                self.tools = tuple(self.active_tools_list)
+                self.consecutive_failures = 0
+                if added_tools:
+                    return f"Successfully activated tool(s): {added_tools}. Their schemas are now available for you to call in your next action."
+                elif any(t in already_active for t in target_names):
+                    return f"Tool(s) matching '{query}' are already active in your session."
+                else:
+                    return f"No permitted tools found matching '{query}'. Available categories: git, analysis, knowledge, search, linters."
+
             if hasattr(self.tool_gateway, name):
                 method = getattr(self.tool_gateway, name)
                 import inspect
@@ -1504,7 +1630,12 @@ class ProviderGateway:
         **kwargs: Any,
     ) -> list[Message]:
         """Execute full autonomous reasoning/tool loop until task completion or limit."""
-        active_tools = tools if tools is not None else self.tools
+        if tools is not None:
+            self.active_tools_list = list(tools)
+            request_tools_def = next((t for t in STANDARD_KERNEL_TOOLS if t.name == "request_tools"), None)
+            if request_tools_def and request_tools_def.name not in {t.name for t in self.active_tools_list}:
+                self.active_tools_list.append(request_tools_def)
+        active_tools = self.active_tools_list
 
         budget_turns = self.contract.budget.get("max_turns") if (self.contract and hasattr(self.contract, "budget") and self.contract.budget) else None
         effective_max_turns = max_turns or budget_turns or DEFAULT_MAX_TURNS

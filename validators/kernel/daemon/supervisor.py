@@ -302,7 +302,7 @@ class LifecycleSupervisor:
         state: RunState,
         max_steps: int = 100,
         poll_interval: float = 0.5,
-        max_wait_seconds: float = 300.0,
+        max_wait_seconds: float = 900.0,
         on_transition: Any = None,
     ) -> AdvanceResult:
         """Continuously drive the lifecycle until a pause or terminal phase is reached.
@@ -413,6 +413,7 @@ class LifecycleSupervisor:
             role="architecture",
             agent_id="claude",
             work_order_id=state.planning_wo_id,
+            run_id=state.run_id,
         )
         state.planning_operation_id = op.get("operation_id")
         state.planning_wo_id = op.get("work_order_id") or state.planning_wo_id
@@ -1124,6 +1125,97 @@ class LifecycleSupervisor:
         })
         state.phase = new_phase
         state.updated_at = now
+
+        # When the run terminates, mark all in-flight work orders on disk
+        # so that rebind and other policy guards don't see stale ACTIVE WOs.
+        if new_phase in (Phase.FAILED, Phase.BLOCKED):
+            self._finalize_in_flight_work_orders(state, new_phase.value)
+
+    # ── Work-order disk cleanup ───────────────────────────────────────
+
+    @staticmethod
+    def _mark_wo_status_on_disk(
+        ws: Path, wo_id: str, target_status: str, error: str | None = None,
+    ) -> bool:
+        """Update a single work order YAML file's status on disk.
+
+        Returns True if the file was updated, False if it was not found or
+        was already in a terminal state.
+        """
+        _WO_TERMINAL = {"COMPLETED", "CANCELLED", "FAILED"}
+        wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+        if not wo_file.is_file():
+            return False
+        try:
+            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False
+            current = str(data.get("status", "")).upper()
+            if current in _WO_TERMINAL:
+                return False  # Already terminal — don't overwrite
+            data["status"] = target_status
+            data["updated"] = _now()
+            if error:
+                data["error"] = str(error)
+                data["blocked_reason"] = str(error)
+            wo_file.write_text(
+                yaml.dump(data, default_flow_style=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            # Also keep INDEX.yaml synchronized if present
+            index_file = ws / ".sync" / "work-orders" / "INDEX.yaml"
+            if index_file.is_file():
+                try:
+                    idx_data = yaml.safe_load(index_file.read_text(encoding="utf-8")) or {}
+                    orders = idx_data.get("orders", [])
+                    for o in orders:
+                        if isinstance(o, dict) and o.get("id") == wo_id:
+                            o["status"] = target_status
+                            o["updated"] = data["updated"]
+                    idx_data["total_active"] = sum(
+                        1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+                    )
+                    idx_data["total_completed"] = sum(
+                        1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+                    )
+                    idx_data["total_blocked"] = sum(
+                        1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
+                    )
+                    idx_data["last_updated"] = data["updated"]
+                    index_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return False
+
+    def _finalize_in_flight_work_orders(
+        self, state: RunState, target_status: str,
+    ) -> None:
+        """Mark all non-terminal work orders associated with this run as
+        *target_status* on disk.  Called when the lifecycle reaches FAILED
+        or BLOCKED so that downstream policy guards (e.g. :rebind) don't
+        see stale ACTIVE records."""
+        ws = Path(state.workspace)
+        error = state.error
+
+        # Collect every WO ID the run knows about
+        candidate_ids: list[str] = []
+        if state.planning_wo_id:
+            candidate_ids.append(state.planning_wo_id)
+        candidate_ids.extend(state.worker_wo_ids)
+        if state.integration_wo_id:
+            candidate_ids.append(state.integration_wo_id)
+        if state.gitops_wo_id:
+            candidate_ids.append(state.gitops_wo_id)
+
+        # De-duplicate while preserving order, skip already-completed
+        seen: set[str] = set(state.completed_wo_ids)
+        for wo_id in candidate_ids:
+            if wo_id in seen:
+                continue
+            seen.add(wo_id)
+            self._mark_wo_status_on_disk(ws, wo_id, target_status, error=error)
 
     def _get_operation(self, operation_id: str) -> dict[str, Any] | None:
         """Safe operation lookup that returns None instead of raising."""

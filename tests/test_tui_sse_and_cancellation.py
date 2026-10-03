@@ -155,7 +155,7 @@ def test_timeout_command_and_options():
 
     # Test :timeout with invalid argument
     dispatch_delivery_command(mock_adapter, mock_client, session, ":timeout -5", state)
-    assert any("Timeout must be a positive number" in m.content for m in state.messages)
+    assert any("Timeout must be zero (no timeout) or a positive number" in m.content for m in state.messages)
 
 
 def test_panel_aware_streaming_rate_limiting():

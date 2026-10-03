@@ -499,6 +499,8 @@ class AgentRunner:
                     ToolLimitExceededError,
                     ToolLoopExhaustedError,
                 )
+                import builtins
+                import socket
                 if isinstance(exc, OperationCancelledError) or self._is_cancelled(cancellation):
                     return self._cancelled_result(task, operation_id)
                 if isinstance(exc, (
@@ -508,6 +510,8 @@ class AgentRunner:
                     NoProgressLoopError,
                     ConsecutiveToolFailureError,
                     TimeoutError,
+                    builtins.TimeoutError,
+                    socket.timeout,
                 )):
                     return HarnessRunResult(
                         status='blocked',
@@ -1254,19 +1258,16 @@ class AgentRunner:
                 )
             return self.llm_provider.complete(request)
 
-        from validators.kernel.providers.gateway import ProviderGateway, get_tools_for_role
+        from validators.kernel.providers.gateway import (
+            ProviderGateway,
+            get_curated_tools_for_phase,
+            get_tools_for_role,
+        )
         from validators.kernel.providers.models import Message
         from validators.kernel.session import Attempt
 
         kernel_contract = tool_runtime.gateway.contract
         attempt = Attempt(tool_runtime.workspace.attempt_id, kernel_contract)
-        gateway = ProviderGateway(
-            self.provider_adapter,
-            tool_runtime.gateway,
-            attempt=attempt,
-            contract=kernel_contract,
-            tools=get_tools_for_role(self.agent),
-        )
         task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
         full_task_desc = f"{request.task.title}\n{request.task.body}"
         is_architecture = (self.agent == 'claude')
@@ -1301,6 +1302,23 @@ class AgentRunner:
                 or 'PLAN.md' in request.task.title
                 or 'PLAN.md' in (request.task.body or '')
             )
+        )
+        task_phase = (
+            "planning" if is_plan_task
+            else "authoring" if is_authoring_task
+            else "integration" if is_integration_review
+            else None
+        )
+        gateway = ProviderGateway(
+            self.provider_adapter,
+            tool_runtime.gateway,
+            attempt=attempt,
+            contract=kernel_contract,
+            tools=get_curated_tools_for_phase(
+                self.agent,
+                phase=task_phase,
+                backend_id=self.backend_id,
+            ),
         )
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
@@ -1499,6 +1517,38 @@ class AgentRunner:
         for wf in getattr(gateway, "written_files", []):
             if wf not in written_files:
                 written_files.append(wf)
+
+        # Plan deliverable fallback: if is_plan_task and PLAN.md was not written via tool call,
+        # extract it from raw text / assistant messages / payload report and persist it to staged root.
+        if is_plan_task and not any(Path(p).name == "PLAN.md" for p in written_files):
+            from validators.harness.plan import extract_plan_from_text, validate_plan_structure
+            staged_plan = (
+                tool_runtime.workspace.root / "PLAN.md"
+                if tool_runtime and getattr(tool_runtime, "workspace", None)
+                else self.project_path / "PLAN.md"
+            )
+            candidates = [raw_text]
+            if isinstance(payload, dict):
+                if payload.get("report_markdown"):
+                    candidates.append(str(payload["report_markdown"]))
+                if payload.get("summary"):
+                    candidates.append(str(payload["summary"]))
+            for msg in reversed(assistant_msgs):
+                if getattr(msg, "content", None) and msg.content.strip():
+                    candidates.append(msg.content.strip())
+
+            for c_text in candidates:
+                extracted = extract_plan_from_text(
+                    c_text, default_title=request.task.title or "Project Architecture"
+                )
+                if extracted:
+                    is_val, _ = validate_plan_structure(extracted)
+                    if is_val:
+                        staged_plan.parent.mkdir(parents=True, exist_ok=True)
+                        staged_plan.write_text(extracted, encoding="utf-8")
+                        if "PLAN.md" not in written_files:
+                            written_files.append("PLAN.md")
+                        break
 
         if not isinstance(payload, dict):
             if guard_trip:

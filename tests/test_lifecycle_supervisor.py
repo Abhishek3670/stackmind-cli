@@ -2410,3 +2410,199 @@ def test_manager_resume_run_clears_stale_gitops_operation_id(tmp_path: Path):
     for stop_ev in mgr._run_stop_events.values():
         stop_ev.set()
 
+
+
+def test_failed_transition_marks_work_orders_on_disk(tmp_path: Path) -> None:
+    """When the supervisor transitions to FAILED, all in-flight work orders
+    on disk must be marked FAILED so that :rebind and other policy guards
+    don't see stale ACTIVE records.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # 1. Set up a workspace with PLAN.md and WO-000 on disk (simulating planning)
+    (tmp_path / "PLAN.md").write_text(
+        "# Project Plan\n\n## Current Architecture\nN/A\n\n"
+        "## Milestones & Roadmap\n- [ ] Milestone 1: Setup\n",
+        encoding="utf-8",
+    )
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    wo_000 = {
+        "id": "WO-000",
+        "type": "RESEARCH",
+        "title": "Planning",
+        "status": "ACTIVE",
+        "assigned_agents": ["claude"],
+        "dependencies": [],
+    }
+    (active_dir / "WO-000.yaml").write_text(
+        yaml.dump(wo_000, default_flow_style=False), encoding="utf-8"
+    )
+
+    # 2. Start a run (INIT → PLANNING)
+    state = supervisor.start_run("run-fail-test", "Test goal", tmp_path, "sess-fail")
+
+    # 3. Simulate planning turn that completed but produced no valid plan
+    op = mock_mgr.start_turn("sess-fail", "Plan", role="architecture",
+                             agent_id="claude", work_order_id="WO-000")
+    state.planning_operation_id = op["operation_id"]
+    mock_mgr.complete_operation(op["operation_id"], status="COMPLETED",
+                                result={"status": "completed"})
+
+    # 4. Advance — supervisor finds no plan proposed → FAILED
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.FAILED
+    assert state.phase == Phase.FAILED
+
+    # 5. CRITICAL: WO-000 on disk must now be FAILED, not ACTIVE
+    data = yaml.safe_load((active_dir / "WO-000.yaml").read_text(encoding="utf-8"))
+    assert data["status"] == "FAILED", (
+        f"Expected WO-000 status 'FAILED' on disk, got '{data['status']}'. "
+        "Stale ACTIVE WOs block :rebind."
+    )
+    assert "error" in data
+
+
+def test_blocked_transition_marks_work_orders_on_disk(tmp_path: Path) -> None:
+    """When the supervisor transitions to BLOCKED, work orders on disk
+    must be marked BLOCKED so that :rebind can proceed after resolution.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # 1. Set up workspace with WO-000 and two worker WOs
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    for wo_id, agent in [("WO-000", "claude"), ("WO-001", "codex"), ("WO-002", "gemini")]:
+        wo_data = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": f"Task {wo_id}",
+            "status": "ACTIVE",
+            "assigned_agents": [agent],
+            "dependencies": [],
+        }
+        (active_dir / f"{wo_id}.yaml").write_text(
+            yaml.dump(wo_data, default_flow_style=False), encoding="utf-8"
+        )
+
+    # 2. Build run state at EXECUTING with worker WOs
+    state = supervisor.start_run("run-block-test", "Test", tmp_path, "sess-block")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001", "WO-002"]
+
+    # 3. Force a BLOCKED transition via contention timeout
+    state.error = "Governance gate blocked WO-001"
+    supervisor._transition(state, Phase.BLOCKED)
+
+    assert state.phase == Phase.BLOCKED
+
+    # 4. All three WOs must be BLOCKED on disk
+    for wo_id in ["WO-000", "WO-001", "WO-002"]:
+        data = yaml.safe_load((active_dir / f"{wo_id}.yaml").read_text(encoding="utf-8"))
+        assert data["status"] == "BLOCKED", (
+            f"Expected {wo_id} status 'BLOCKED', got '{data['status']}'"
+        )
+
+
+def test_already_completed_wos_not_overwritten(tmp_path: Path) -> None:
+    """Work orders that are already in a terminal state (COMPLETED) must NOT
+    be overwritten when the run transitions to FAILED.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-001 is COMPLETED, WO-002 is still ACTIVE
+    for wo_id, status in [("WO-001", "COMPLETED"), ("WO-002", "ACTIVE")]:
+        wo_data = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": f"Task {wo_id}",
+            "status": status,
+            "assigned_agents": ["codex"],
+            "dependencies": [],
+        }
+        (active_dir / f"{wo_id}.yaml").write_text(
+            yaml.dump(wo_data, default_flow_style=False), encoding="utf-8"
+        )
+
+    state = supervisor.start_run("run-no-overwrite", "Test", tmp_path, "sess-noover")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001", "WO-002"]
+    state.completed_wo_ids = ["WO-001"]
+    state.error = "WO-002 failed after max retries"
+
+    supervisor._transition(state, Phase.FAILED)
+
+    # WO-001 must remain COMPLETED (skipped by both completed_wo_ids check and terminal guard)
+    data1 = yaml.safe_load((active_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert data1["status"] == "COMPLETED"
+
+    # WO-002 must now be FAILED
+    data2 = yaml.safe_load((active_dir / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert data2["status"] == "FAILED"
+
+
+def test_mark_wo_handles_missing_file(tmp_path: Path) -> None:
+    """_mark_wo_status_on_disk returns False for non-existent WO files
+    without raising.
+    """
+    result = LifecycleSupervisor._mark_wo_status_on_disk(
+        tmp_path, "WO-999", "FAILED", error="test"
+    )
+    assert result is False
+
+
+def test_manager_resume_run_restarts_dead_thread_even_if_stop_event_not_set(tmp_path: Path):
+    """Verify that manager.resume_run reliably spawns a new driver thread if
+    the previous driver thread has exited, even when stop_event was left unset.
+    """
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-deadthread"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build login",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.FAILED,
+        worker_wo_ids=["WO-001"],
+        error="Previous failure",
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    # Simulate an entry in _run_stop_events that was NOT set (e.g. previous dead thread)
+    from threading import Event, Thread
+    stale_event = Event()  # is_set() == False
+    mgr._run_stop_events[run_id] = stale_event
+    # Simulate a dead thread
+    dead_thread = Thread(target=lambda: None)
+    dead_thread.start()
+    dead_thread.join()
+    mgr._run_driver_threads[run_id] = dead_thread
+    assert not dead_thread.is_alive()
+    assert not stale_event.is_set()
+
+    # Resume run must detect the thread is dead and start a fresh one with a new stop_event
+    resumed = mgr.resume_run(sid, run_id=run_id)
+    assert resumed["run_id"] == run_id
+    new_thread = mgr._run_driver_threads[run_id]
+    assert new_thread is not dead_thread
+    assert new_thread.is_alive()
+    assert mgr._run_stop_events[run_id] is not stale_event
+
+    # Cleanup
+    mgr._run_stop_events[run_id].set()

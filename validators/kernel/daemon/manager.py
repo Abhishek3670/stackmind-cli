@@ -645,14 +645,16 @@ class SessionManager:
                 if endpoint and not endpoint.startswith("http"):
                     endpoint = f"http://{endpoint}"
                 m = model_name or getattr(backend, "model", "qwen2.5-coder:7b") or "qwen2.5-coder:7b"
-                provider_adapter = OllamaAdapter(endpoint=endpoint, model=m)
+                t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
+                provider_adapter = OllamaAdapter(endpoint=endpoint, model=m, default_timeout=float(t_val) if t_val else None)
             elif backend_id in ("openai", "openai-compatible"):
                 from validators.kernel.providers.adapter import OpenAICompatibleAdapter
 
                 base_url = getattr(backend, "base_url", None) or "https://api.openai.com/v1"
                 api_key = getattr(backend, "api_key", None) or os.getenv("OPENAI_API_KEY", "")
                 m = model_name or getattr(backend, "model", "gpt-4o") or "gpt-4o"
-                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m)
+                t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
+                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
 
             return AgentRunner(Path(workspace), agent, backend=backend, provider_adapter=provider_adapter)
         return AgentRunner(Path(workspace), agent)
@@ -1288,7 +1290,12 @@ class SessionManager:
                 self.supervisor._transition(state, target_phase)
 
             self._active_runs[target_run_id] = state
-            if target_run_id not in self._run_stop_events or self._run_stop_events[target_run_id].is_set():
+            try:
+                self.supervisor.save_run_state(state, ws)
+            except Exception:
+                pass
+            existing_thread = self._run_driver_threads.get(target_run_id)
+            if existing_thread is None or not existing_thread.is_alive():
                 stop_event = Event()
                 self._run_stop_events[target_run_id] = stop_event
                 driver_thread = Thread(
@@ -1641,15 +1648,19 @@ class SessionManager:
                 )
                 params["work_order_id"] = wo_rec["id"]
 
-                # S1 Wiring: register run with supervisor and launch background driver
-                created_run_id = f"run-{uuid4().hex[:8]}"
-                from .supervisor import Phase
-                run_state = self.supervisor.start_run(created_run_id, prompt, ws_path, session_id)
-                run_state.planning_wo_id = wo_rec["id"]
-                self._active_runs[created_run_id] = run_state
-                stop_event = Event()
-                self._run_stop_events[created_run_id] = stop_event
-                params["run_id"] = created_run_id
+                existing_run_id = params.get("run_id")
+                if not existing_run_id:
+                    # S1 Wiring: register run with supervisor and launch background driver
+                    created_run_id = f"run-{uuid4().hex[:8]}"
+                    from .supervisor import Phase
+                    run_state = self.supervisor.start_run(created_run_id, prompt, ws_path, session_id)
+                    run_state.planning_wo_id = wo_rec["id"]
+                    self._active_runs[created_run_id] = run_state
+                    stop_event = Event()
+                    self._run_stop_events[created_run_id] = stop_event
+                    params["run_id"] = created_run_id
+                else:
+                    params["run_id"] = existing_run_id
 
             cancel_event, operation_id = self.begin_operation(
                 session_id,
@@ -1711,11 +1722,14 @@ class SessionManager:
         self,
         run_id: str,
         stop_event: Event,
-        max_wait_seconds: float = 300.0,
+        max_wait_seconds: float | None = None,
     ) -> None:
         """Background driver loop continuously advancing the supervisor run until completion."""
         import time
         from .supervisor import AdvanceResult, Phase
+
+        if max_wait_seconds is None:
+            max_wait_seconds = float(os.environ.get("SUPERVISOR_OPERATION_TIMEOUT", 900.0))
 
         state = self._active_runs.get(run_id)
         if not state:
@@ -1723,71 +1737,74 @@ class SessionManager:
         ws = Path(state.workspace)
         waiting_operation_started_at: float | None = None
 
-        while not stop_event.is_set() and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
-            prev_phase = state.phase
-            try:
-                result = self.supervisor.advance(state)
-            except Exception as exc:
-                state.error = f"Supervisor advance exception: {exc}"
-                self.supervisor._transition(state, Phase.FAILED)
-                result = AdvanceResult.FAILED
-
-            if state.phase != prev_phase:
-                waiting_operation_started_at = None
-                self.events.publish(
-                    "run.phase",
-                    state.session_id,
-                    run_id=run_id,
-                    phase=state.phase.value,
-                    goal=state.product_goal,
-                )
+        try:
+            while not stop_event.is_set() and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+                prev_phase = state.phase
                 try:
-                    self.supervisor.save_run_state(state, ws)
-                except Exception:
-                    pass
+                    result = self.supervisor.advance(state)
+                except Exception as exc:
+                    state.error = f"Supervisor advance exception: {exc}"
+                    self.supervisor._transition(state, Phase.FAILED)
+                    result = AdvanceResult.FAILED
 
-            if result == AdvanceResult.WAITING_FOR_HUMAN:
-                waiting_operation_started_at = None
-                time.sleep(0.2)
-                continue
-            if result == AdvanceResult.WAITING_FOR_OPERATION:
-                now_mono = time.monotonic()
-                if waiting_operation_started_at is None:
-                    waiting_operation_started_at = now_mono
-                elif now_mono - waiting_operation_started_at > max_wait_seconds:
-                    state.error = (
-                        f"Timed out waiting for operations in phase {state.phase.value} "
-                        f"after {max_wait_seconds:.0f}s"
+                if state.phase != prev_phase:
+                    waiting_operation_started_at = None
+                    self.events.publish(
+                        "run.phase",
+                        state.session_id,
+                        run_id=run_id,
+                        phase=state.phase.value,
+                        goal=state.product_goal,
                     )
-                    self.supervisor._transition(state, Phase.BLOCKED)
-                    result = AdvanceResult.BLOCKED
+                    try:
+                        self.supervisor.save_run_state(state, ws)
+                    except Exception:
+                        pass
+
+                if result == AdvanceResult.WAITING_FOR_HUMAN:
+                    waiting_operation_started_at = None
+                    time.sleep(0.2)
+                    continue
+                if result == AdvanceResult.WAITING_FOR_OPERATION:
+                    now_mono = time.monotonic()
+                    if waiting_operation_started_at is None:
+                        waiting_operation_started_at = now_mono
+                    elif now_mono - waiting_operation_started_at > max_wait_seconds:
+                        state.error = (
+                            f"Timed out waiting for operations in phase {state.phase.value} "
+                            f"after {max_wait_seconds:.0f}s"
+                        )
+                        self.supervisor._transition(state, Phase.BLOCKED)
+                        result = AdvanceResult.BLOCKED
+                        try:
+                            self.supervisor.save_run_state(state, ws)
+                        except Exception:
+                            pass
+                        self.events.publish(
+                            "run.blocked",
+                            state.session_id,
+                            run_id=run_id,
+                            phase=state.phase.value,
+                            error=state.error,
+                        )
+                        break
+                    time.sleep(0.2)
+                    continue
+                if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
                     try:
                         self.supervisor.save_run_state(state, ws)
                     except Exception:
                         pass
                     self.events.publish(
-                        "run.blocked",
+                        f"run.{state.phase.value.lower()}",
                         state.session_id,
                         run_id=run_id,
                         phase=state.phase.value,
                         error=state.error,
                     )
                     break
-                time.sleep(0.2)
-                continue
-            if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
-                try:
-                    self.supervisor.save_run_state(state, ws)
-                except Exception:
-                    pass
-                self.events.publish(
-                    f"run.{state.phase.value.lower()}",
-                    state.session_id,
-                    run_id=run_id,
-                    phase=state.phase.value,
-                    error=state.error,
-                )
-                break
+        finally:
+            stop_event.set()
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """Get the state dictionary for an active or persisted run."""

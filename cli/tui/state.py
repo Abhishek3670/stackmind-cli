@@ -287,7 +287,7 @@ class AutonomousDeliveryState:
         operations: dict[str, OperationNode] | None = None,
         scroll: RuntimePanelScroll | None = None,
         conversation_scroll: ConversationScroll | None = None,
-        client_timeout: float = 45.0,
+        client_timeout: float = 0.0,
         context_window_tokens: int = 8_192,
         compaction_threshold: float = 0.85,
         compaction_keep_recent: int = 6,
