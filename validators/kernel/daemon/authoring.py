@@ -230,10 +230,21 @@ def build_child_contract(
             if cp and isinstance(cp, str) and not cp.startswith(".git") and not cp.startswith(".sync") and cp != ".env":
                 allow_rules.append({"module": cp})
 
-    # Common repository root files allowed across roles:
+    # Common repository root documentation and config files allowed across roles:
     allow_rules.extend([
+        {"module": "*.md"},
+        {"module": "*.txt"},
+        {"module": "*.toml"},
+        {"module": "*.json"},
+        {"module": "*.yaml"},
+        {"module": "*.yml"},
         {"module": "README*"},
+        {"module": "CHANGELOG*"},
+        {"module": "VERSION*"},
+        {"module": "LICENSE*"},
         {"module": ".gitignore"},
+        {"module": "*ignore"},
+        {"module": "Makefile*"},
     ])
 
     if role_norm in ("backend", "codex"):

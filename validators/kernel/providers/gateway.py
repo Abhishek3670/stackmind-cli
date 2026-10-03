@@ -1557,7 +1557,11 @@ class ProviderGateway:
                         or args.get("q")
                         or ""
                     )
-                    res = f"Error: PermissionError: Operation on '{target_str}' was denied by runtime policy/contract: {ex}"
+                    res = (
+                        f"Error: PermissionError: Operation on '{target_str}' was denied by runtime policy/contract: {ex}. "
+                        f"CRITICAL: Do NOT retry accessing or writing '{target_str}' as it is outside your assigned scope. "
+                        f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
+                    )
             else:
                 res = f"Error executing {name}: {type(ex).__name__}: {ex}"
 
