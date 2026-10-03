@@ -213,6 +213,7 @@ def build_child_contract(
     agent_id: str,
     role: str,
     deliverable_path: str | None = None,
+    candidate_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Contract record bound strictly to the assigned scope."""
     role_norm = role.lower().strip()
@@ -224,17 +225,41 @@ def build_child_contract(
     if deliverable_path:
         allow_rules.append({"module": deliverable_path})
 
+    if candidate_paths:
+        for cp in candidate_paths:
+            if cp and isinstance(cp, str) and not cp.startswith(".git") and not cp.startswith(".sync") and cp != ".env":
+                allow_rules.append({"module": cp})
+
+    # Common repository root files allowed across roles:
+    allow_rules.extend([
+        {"module": "README*"},
+        {"module": ".gitignore"},
+    ])
+
     if role_norm in ("backend", "codex"):
         allow_rules.extend([
             {"module": "src/**"},
             {"module": "app/**"},
             {"module": "api/**"},
             {"module": "backend/**"},
+            {"module": "db/**"},
+            {"module": "models/**"},
+            {"module": "services/**"},
+            {"module": "routes/**"},
+            {"module": "controllers/**"},
             {"module": "tests/**"},
+            {"module": "test/**"},
             {"module": "requirements.txt"},
             {"module": "requirements*.txt"},
             {"module": "pyproject.toml"},
+            {"module": "setup.py"},
+            {"module": "setup.cfg"},
+            {"module": "Makefile"},
             {"module": "*.py"},
+            {"module": "*.sql"},
+            {"module": "*.json"},
+            {"module": "*.yaml"},
+            {"module": "*.yml"},
         ])
     elif role_norm in ("frontend", "gemini"):
         allow_rules.extend([
@@ -242,7 +267,12 @@ def build_child_contract(
             {"module": "app/**"},
             {"module": "public/**"},
             {"module": "frontend/**"},
+            {"module": "static/**"},
+            {"module": "templates/**"},
+            {"module": "views/**"},
+            {"module": "components/**"},
             {"module": "index.html"},
+            {"module": "package.json"},
             {"module": "*.html"},
             {"module": "*.js"},
             {"module": "*.ts"},
@@ -257,13 +287,17 @@ def build_child_contract(
             {"module": "src/**"},
             {"module": "app/**"},
             {"module": "*.py"},
+            {"module": "pytest.ini"},
         ])
     elif role_norm in ("gitops", "local-llm"):
         allow_rules.extend([
             {"module": "VERSION.md"},
             {"module": "CHANGELOG.md"},
+            {"module": "Makefile"},
             {"module": "pyproject.toml"},
             {"module": "package.json"},
+            {"module": "setup.py"},
+            {"module": "setup.cfg"},
             {"module": "src/**"},
             {"module": "app/**"},
             {"module": "tests/**"},
@@ -550,11 +584,25 @@ def synthesize_child_work_orders(
             deliverable=deliv,
         )
 
+        # Extract candidate paths from title and description
+        combined_task_text = f"{title}\n{desc}"
+        cand_matches = re.findall(
+            r"(?:`|\"|'|\s|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?:`|\"|'|\s|$)",
+            combined_task_text,
+        )
+        task_candidates: list[str] = []
+        for cm in cand_matches:
+            c_clean = cm.strip().strip("`\"'.,()")
+            if any(c_clean.endswith(ext) for ext in (".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml", ".sql")):
+                if not c_clean.startswith(".sync") and not c_clean.startswith(".git") and c_clean not in ("PLAN.md", ".env"):
+                    task_candidates.append(c_clean)
+
         contract_rec = build_child_contract(
             wo_id=wo_id,
             agent_id=primary_agent,
             role=role,
             deliverable_path=deliv.get("path"),
+            candidate_paths=task_candidates,
         )
 
         wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
