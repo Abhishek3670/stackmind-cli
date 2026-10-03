@@ -505,7 +505,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
         *,
         endpoint: str | None = "http://localhost:11434",
         credential_ref: str | None = None,
-        timeout: float = 300.0,
+        timeout: float = 900.0,
         budget_policy: dict[str, Any] | None = None,
         capabilities: list[str] | None = None,
         available: bool = True,
@@ -599,7 +599,7 @@ class ModelExecutionBackend(BaseExecutionBackend):
                     "stream": True,
                 }).encode("utf-8")
                 req = urllib.request.Request(req_url, data=data, headers={"Content-Type": "application/json", "User-Agent": "StackMind-CLI/3.3"})
-                with urllib.request.urlopen(req, timeout=max(self.timeout, 300.0)) as resp:
+                with urllib.request.urlopen(req, timeout=max(self.timeout, 900.0)) as resp:
                     accumulator: list[str] = []
                     token_cb = getattr(request, "on_token", None) or getattr(self, "on_token", None)
                     cancel = getattr(request, "cancellation", None) or getattr(self, "cancel_event", None)

@@ -81,7 +81,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         if default_timeout is None:
-            default_timeout = float(os.environ.get("PROVIDER_TIMEOUT", 300.0))
+            default_timeout = float(os.environ.get("PROVIDER_TIMEOUT", 900.0))
         self.default_timeout = default_timeout
         self.transport = transport
 
@@ -330,7 +330,7 @@ class OllamaAdapter(ProviderAdapter):
         super().__init__(provider_name=provider_name, model_name=model)
         self.endpoint = endpoint.rstrip("/")
         if default_timeout is None:
-            default_timeout = float(os.environ.get("OLLAMA_TIMEOUT", 300.0))
+            default_timeout = float(os.environ.get("OLLAMA_TIMEOUT", os.environ.get("PROVIDER_TIMEOUT", 900.0)))
         self.default_timeout = default_timeout
         self.options = dict(options) if options else {}
         if "num_gpu" not in self.options and "OLLAMA_NUM_GPU" in os.environ:

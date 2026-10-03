@@ -393,6 +393,9 @@ class LifecycleSupervisor:
 
             if matching_plan:
                 state.plan_id = matching_plan.get("plan_id")
+                if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
+                    state.completed_wo_ids.append(state.planning_wo_id)
+                    self._mark_wo_status_on_disk(Path(state.workspace), state.planning_wo_id, "COMPLETED")
                 plan_state = str(matching_plan.get("state", "")).upper()
                 if plan_state == "AWAITING_APPROVAL":
                     self._transition(state, Phase.AWAITING_APPROVAL)
@@ -1183,6 +1186,17 @@ class LifecycleSupervisor:
                     )
                     idx_data["last_updated"] = data["updated"]
                     index_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    tree_file = ws / ".sync" / "runtime" / "TREE.yaml"
+                    if tree_file.is_file():
+                        try:
+                            tree_data = yaml.safe_load(tree_file.read_text(encoding="utf-8")) or {}
+                            if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+                                tree_data["work_orders"]["total_active"] = idx_data.get("total_active", 0)
+                                tree_data["work_orders"]["total_completed"] = idx_data.get("total_completed", 0)
+                                tree_data["work_orders"]["total_blocked"] = idx_data.get("total_blocked", 0)
+                                tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             return True

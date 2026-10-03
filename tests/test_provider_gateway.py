@@ -527,10 +527,10 @@ def test_adapter_timeout_handling_and_defaults(monkeypatch):
     monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
     monkeypatch.delenv("PROVIDER_TIMEOUT", raising=False)
     ollama = OllamaAdapter()
-    assert ollama.default_timeout == 300.0
+    assert ollama.default_timeout == 900.0
 
     openai = OpenAICompatibleAdapter()
-    assert openai.default_timeout == 300.0
+    assert openai.default_timeout == 900.0
 
     # Test env overrides
     monkeypatch.setenv("OLLAMA_TIMEOUT", "450.0")
