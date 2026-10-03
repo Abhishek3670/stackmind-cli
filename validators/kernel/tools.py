@@ -14,7 +14,7 @@ import yaml
 from typing import Any
 
 from .boundary import RuntimeBoundary
-from .contract import AgentContract, ContractEvaluator
+from .contract import AgentContract, ContractEvaluator, ContractNormalizer
 from .identity import AuthorizationPolicy
 from .interpreter_denylist import check_command
 from .operations import OperationRequest, OperationType
@@ -82,10 +82,13 @@ class ToolGateway:
         path.write_text(content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "written")
 
-    def run_command(self, command: Sequence[str]):
+    def run_command(self, command: Sequence[str] | str):
         record = self._authorize(OperationType.RUN_COMMAND, "workspace/command")
         if not record.authorized:
             raise PermissionError(record.reason)
+        if isinstance(command, str):
+            import shlex
+            command = shlex.split(command)
         # Hard interpreter denylist (Phase 2): shells and string-code
         # interpreters are denied at the agent-facing boundary regardless of
         # contract grants. Trusted platform-internal callers (canary verifier,
@@ -814,12 +817,16 @@ class ToolGateway:
         return current
 
     def get_contract(self, wo_id: str | None = None) -> dict[str, Any]:
-        record = self._authorize(OperationType.GET_CONTRACT, f"session/contract/{wo_id or self.contract.work_order}")
+        target_wo = wo_id or self.contract.work_order
+        if target_wo:
+            target_wo = os.path.basename(target_wo).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.GET_CONTRACT, f"session/contract/{target_wo}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        if wo_id is None or wo_id == self.contract.work_order:
+        if not wo_id or target_wo == self.contract.work_order:
             res = {
+                "found": True,
                 "agent_id": self.contract.agent_id,
                 "work_order": self.contract.work_order,
                 "allow": list(self.contract.allow),
@@ -829,32 +836,38 @@ class ToolGateway:
                 "budget": dict(self.contract.budget),
             }
         else:
-            contract_path = self.workspace.path_for(f".sync/contracts/{wo_id}.yaml")
+            contract_path = self.workspace.path_for(f".sync/contracts/{target_wo}.yaml")
             if contract_path.is_file():
-                res = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+                try:
+                    loaded = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+                    res = {"found": True, **loaded}
+                except Exception as e:
+                    res = {"found": False, "error": str(e)}
             else:
-                raise FileNotFoundError(f"Contract file for {wo_id} not found")
+                res = {"found": False, "error": f"Contract file for {target_wo} not found"}
 
         self.boundary.journal.complete(record.request.operation_id, "retrieved")
         return res
 
     def verify_scope(self, path: str, operation: str = "read_file") -> bool:
-        record = self._authorize(OperationType.VERIFY_SCOPE, f"workspace/{path}")
+        clean_path = path.replace("\\", "/").strip().lstrip("/")
+        record = self._authorize(OperationType.VERIFY_SCOPE, f"session/verify_scope/{clean_path}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
         evaluator = ContractEvaluator()
-        ok, reason = evaluator.authorize(self.contract, operation, path)
+        ok, reason = evaluator.authorize(self.contract, operation, clean_path)
         self.boundary.journal.complete(record.request.operation_id, "in_scope" if ok else "denied")
         return ok
 
     def explain_denial(self, path: str, operation: str = "read_file") -> str:
-        record = self._authorize(OperationType.EXPLAIN_DENIAL, f"workspace/{path}")
+        clean_path = path.replace("\\", "/").strip().lstrip("/")
+        record = self._authorize(OperationType.EXPLAIN_DENIAL, f"session/explain_denial/{clean_path}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
         evaluator = ContractEvaluator()
-        ok, reason = evaluator.authorize(self.contract, operation, path)
+        ok, reason = evaluator.authorize(self.contract, operation, clean_path)
         res = "Target is in scope and authorized" if ok else f"Scope denial: {reason}"
         self.boundary.journal.complete(record.request.operation_id, res)
         return res
@@ -864,7 +877,7 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        budget_info = dict(self.contract.budget)
+        budget_info = dict(getattr(self.contract, "budget", {}) or {})
         self.boundary.journal.complete(record.request.operation_id, f"{len(budget_info)} budget fields")
         return budget_info
 
@@ -874,13 +887,16 @@ class ToolGateway:
             auth = getattr(self.workspace, "authoritative_root", None)
             if auth and (auth / ".git").exists():
                 target_dir = auth
-        return subprocess.run(
-            ["git", *args],
-            cwd=target_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=target_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception as e:
+            return subprocess.CompletedProcess(["git", *args], returncode=1, stdout="", stderr=str(e))
 
     def git_status(self) -> dict[str, Any]:
         record = self._authorize(OperationType.GIT_STATUS, "workspace/git/status")
@@ -1150,46 +1166,64 @@ class ToolGateway:
         return out
 
     def verify_deliverable(self, wo_id: str) -> dict[str, Any]:
-        record = self._authorize(OperationType.VERIFY_DELIVERABLE, f"workspace/work-orders/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.VERIFY_DELIVERABLE, f"workspace/work-orders/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        wo_path = self.workspace.path_for(f".sync/work-orders/ACTIVE/{wo_id}.yaml")
+        wo_path = self.workspace.path_for(f".sync/work-orders/ACTIVE/{clean_id}.yaml")
         if not wo_path.is_file():
             # Check completed/pending directories
-            for candidate in self.workspace.root.rglob(f"{wo_id}.yaml"):
+            for candidate in self.workspace.root.rglob(f"{clean_id}.yaml"):
                 if candidate.is_file():
                     wo_path = candidate
                     break
 
         if not wo_path.is_file():
-            raise FileNotFoundError(f"Work order '{wo_id}' not found")
+            out = {
+                "wo_id": clean_id,
+                "passed": False,
+                "error": f"Work order '{clean_id}' not found",
+                "deliverables_found": [],
+                "deliverables_missing": [],
+            }
+            self.boundary.journal.complete(record.request.operation_id, "not found")
+            return out
 
-        wo_data = yaml.safe_load(wo_path.read_text(encoding="utf-8")) or {}
-        inner = wo_data.get("work_order", wo_data)
-        deliverables = inner.get("deliverables", [])
-        if isinstance(deliverables, dict):
-            deliverables = [deliverables]
+        try:
+            wo_data = yaml.safe_load(wo_path.read_text(encoding="utf-8")) or {}
+            inner = wo_data.get("work_order", wo_data)
+            deliverables = inner.get("deliverables", [])
+            if isinstance(deliverables, dict):
+                deliverables = [deliverables]
 
-        missing = []
-        found = []
-        for d in deliverables:
-            path_str = d.get("path") or d.get("file") or d.get("target")
-            if path_str:
-                file_path = self.workspace.path_for(path_str)
-                if file_path.exists() and (file_path.is_dir() or file_path.stat().st_size > 0):
-                    found.append(path_str)
-                else:
-                    missing.append(path_str)
+            missing = []
+            found = []
+            for d in deliverables:
+                path_str = d.get("path") or d.get("file") or d.get("target") if isinstance(d, dict) else str(d)
+                if path_str:
+                    file_path = self.workspace.path_for(path_str)
+                    if file_path.exists() and (file_path.is_dir() or file_path.stat().st_size > 0):
+                        found.append(path_str)
+                    else:
+                        missing.append(path_str)
 
-        passed = len(missing) == 0
-        out = {
-            "wo_id": wo_id,
-            "passed": passed,
-            "deliverables_found": found,
-            "deliverables_missing": missing,
-        }
-        self.boundary.journal.complete(record.request.operation_id, f"passed={passed}")
+            passed = len(missing) == 0
+            out = {
+                "wo_id": clean_id,
+                "passed": passed,
+                "deliverables_found": found,
+                "deliverables_missing": missing,
+            }
+        except Exception as e:
+            out = {
+                "wo_id": clean_id,
+                "passed": False,
+                "error": f"Error verifying deliverable: {e}",
+                "deliverables_found": [],
+                "deliverables_missing": [],
+            }
+        self.boundary.journal.complete(record.request.operation_id, f"passed={out.get('passed')}")
         return out
 
     def verify_tests(self, test_path: str | None = None) -> dict[str, Any]:
@@ -1208,25 +1242,29 @@ class ToolGateway:
         return out
 
     def verify_diff(self, wo_id: str) -> dict[str, Any]:
-        record = self._authorize(OperationType.VERIFY_DIFF, f"workspace/diff/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.VERIFY_DIFF, f"workspace/diff/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        # Retrieve contract for wo_id
-        contract_path = self.workspace.path_for(f".sync/contracts/{wo_id}.yaml")
+        # Retrieve contract for clean_id
+        contract_path = self.workspace.path_for(f".sync/contracts/{clean_id}.yaml")
         violations = []
         if contract_path.is_file():
-            contract_data = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
-            c_norm = ContractNormalizer.normalize(contract_data)
-            evaluator = ContractEvaluator()
-            changed_files = self.git_changed_files()
-            for cf in changed_files:
-                ok, reason = evaluator.authorize(c_norm, "write_file", cf)
-                if not ok:
-                    violations.append(f"{cf}: {reason}")
+            try:
+                contract_data = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+                c_norm = ContractNormalizer.normalize(contract_data)
+                evaluator = ContractEvaluator()
+                changed_files = self.git_changed_files()
+                for cf in changed_files:
+                    ok, reason = evaluator.authorize(c_norm, "write_file", cf)
+                    if not ok:
+                        violations.append(f"{cf}: {reason}")
+            except Exception as e:
+                violations.append(f"Contract verification error: {e}")
 
         out = {
-            "wo_id": wo_id,
+            "wo_id": clean_id,
             "in_scope": len(violations) == 0,
             "violations": violations,
         }
@@ -1234,13 +1272,14 @@ class ToolGateway:
         return out
 
     def verify_provenance(self, wo_id: str) -> dict[str, Any]:
-        record = self._authorize(OperationType.VERIFY_PROVENANCE, f"workspace/provenance/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.VERIFY_PROVENANCE, f"workspace/provenance/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
         journal_count = len(self.boundary.journal.records)
         out = {
-            "wo_id": wo_id,
+            "wo_id": clean_id,
             "verified": True,
             "operation_records_count": journal_count,
         }
@@ -1254,7 +1293,8 @@ class ToolGateway:
         report: str,
         metrics: dict[str, Any] | None = None,
     ) -> str:
-        record = self._authorize(OperationType.SUBMIT_VERDICT, f"workspace/verdicts/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.SUBMIT_VERDICT, f"workspace/verdicts/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
@@ -1263,10 +1303,10 @@ class ToolGateway:
         inbox_dir = self.workspace.path_for(f".sync/inbox/{recipient}")
         inbox_dir.mkdir(parents=True, exist_ok=True)
 
-        verdict_file = inbox_dir / f"verdict_{wo_id}.md"
+        verdict_file = inbox_dir / f"verdict_{clean_id}.md"
         content = (
             f"# QA VERDICT: {verdict_norm}\n\n"
-            f"**Work Order**: {wo_id}\n"
+            f"**Work Order**: {clean_id}\n"
             f"**Reviewer**: {self.actor_id}\n\n"
             f"## Report\n{report}\n\n"
             f"## Metrics\n```yaml\n{yaml.dump(metrics or {}, sort_keys=False)}\n```\n"
@@ -1276,26 +1316,28 @@ class ToolGateway:
         return f"Verdict {verdict_norm} submitted to {recipient}"
 
     def request_changes(self, wo_id: str, issues: Sequence[str]) -> str:
-        record = self._authorize(OperationType.REQUEST_CHANGES, f"workspace/verdicts/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.REQUEST_CHANGES, f"workspace/verdicts/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
         issues_md = "\n".join(f"- {issue}" for issue in issues)
         return self.submit_verdict(
-            wo_id=wo_id,
+            wo_id=clean_id,
             verdict="NEEDS_CHANGES",
             report=f"The following issues must be resolved:\n{issues_md}",
             metrics={"issues_count": len(issues)},
         )
 
     def approve_work_order(self, wo_id: str, signature: str | None = None) -> str:
-        record = self._authorize(OperationType.APPROVE_WORK_ORDER, f"workspace/work-orders/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.APPROVE_WORK_ORDER, f"workspace/work-orders/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
 
         sig = signature or f"{self.actor_id}-qa-pass"
         return self.submit_verdict(
-            wo_id=wo_id,
+            wo_id=clean_id,
             verdict="APPROVED",
             report=f"All deliverable checks, scope verification, and test suites passed cleanly.\nSignature: {sig}",
             metrics={"signature": sig, "approved": True},
@@ -1501,18 +1543,31 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        journal_records = self.boundary.journal.records
-        denials = [r for r in journal_records if not r.authorized]
-        running_procs = [p for p in self.inspect_processes() if p.get("status") == "running"]
-        checkpoints_list = self.list_checkpoints()
+        journal_records = getattr(getattr(self.boundary, "journal", None), "records", [])
+        denials = [r for r in journal_records if not getattr(r, "authorized", True)]
+        running_procs = []
+        if hasattr(self, "process_manager"):
+            try:
+                with self.process_manager._lock:
+                    for proc in self.process_manager._processes.values():
+                        st = proc.status()
+                        if st.get("status") == "running":
+                            running_procs.append(st)
+            except Exception:
+                pass
+        checkpoints_list = []
+        try:
+            checkpoints_list = self.list_checkpoints()
+        except Exception:
+            pass
 
         summary = {
             "total_operations": len(journal_records),
             "denied_operations": len(denials),
             "running_processes": len(running_procs),
             "checkpoints_count": len(checkpoints_list),
-            "plan_mode": self._plan_mode,
-            "todo_items": len(self._todo_list),
+            "plan_mode": getattr(self, "_plan_mode", False),
+            "todo_items": len(getattr(self, "_todo_list", [])),
         }
         self.boundary.journal.complete(record.request.operation_id, "summary_ready")
         return summary
@@ -1556,10 +1611,11 @@ class ToolGateway:
         return results
 
     def verify_contract(self, wo_id: str) -> dict[str, Any]:
-        record = self._authorize(OperationType.VERIFY_CONTRACT, f"contracts/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.VERIFY_CONTRACT, f"contracts/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        contract_path = self.workspace.root / ".sync" / "contracts" / f"{wo_id}.yaml"
+        contract_path = self.workspace.root / ".sync" / "contracts" / f"{clean_id}.yaml"
         if not contract_path.exists():
             res = {"valid": False, "error": f"Contract file {contract_path} does not exist"}
         else:
@@ -1572,54 +1628,73 @@ class ToolGateway:
         return res
 
     def submit_for_review(self, wo_id: str, summary: str = "") -> dict[str, Any]:
-        record = self._authorize(OperationType.SUBMIT_FOR_REVIEW, f"inbox/gemma/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.SUBMIT_FOR_REVIEW, f"inbox/gemma/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
         inbox_dir = self.workspace.root / ".sync" / "inbox" / "gemma"
         inbox_dir.mkdir(parents=True, exist_ok=True)
         now_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-        notice_path = inbox_dir / f"{now_str}_{self.actor_id}_{wo_id}-review.md"
-        notice_content = f"# Review Request: {wo_id}\n\n**From:** {self.actor_id}\n\n**Summary:**\n{summary}\n"
+        notice_path = inbox_dir / f"{now_str}_{self.actor_id}_{clean_id}-review.md"
+        notice_content = f"# Review Request: {clean_id}\n\n**From:** {self.actor_id}\n\n**Summary:**\n{summary}\n"
         notice_path.write_text(notice_content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, f"Submitted review to {notice_path.name}")
         return {"submitted": True, "notice_path": str(notice_path.relative_to(self.workspace.root))}
 
     def inspect_work_order(self, wo_id: str) -> dict[str, Any]:
-        record = self._authorize(OperationType.INSPECT_WORK_ORDER, f"work-orders/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.INSPECT_WORK_ORDER, f"work-orders/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
         for folder in ("ACTIVE", "COMPLETED", "READY", "PENDING", "BLOCKED"):
-            wo_path = self.workspace.root / ".sync" / "work-orders" / folder / f"{wo_id}.yaml"
+            wo_path = self.workspace.root / ".sync" / "work-orders" / folder / f"{clean_id}.yaml"
             if wo_path.exists():
-                data = yaml.safe_load(wo_path.read_text(encoding="utf-8"))
-                self.boundary.journal.complete(record.request.operation_id, "found")
-                return {"found": True, "status": folder, "work_order": data}
+                try:
+                    data = yaml.safe_load(wo_path.read_text(encoding="utf-8"))
+                    self.boundary.journal.complete(record.request.operation_id, "found")
+                    return {"found": True, "status": folder, "work_order": data}
+                except Exception as e:
+                    self.boundary.journal.complete(record.request.operation_id, f"error: {e}")
+                    return {"found": True, "status": folder, "error": str(e)}
         self.boundary.journal.complete(record.request.operation_id, "not found")
-        return {"found": False, "error": f"Work order {wo_id} not found"}
+        return {"found": False, "error": f"Work order {clean_id} not found"}
 
     def inspect_agent(self, agent_name: str) -> dict[str, Any]:
         record = self._authorize(OperationType.INSPECT_AGENT, f"agents/{agent_name}")
         if not record.authorized:
             raise PermissionError(record.reason)
         from validators.kernel.identity import get_role_policy
-        policy = get_role_policy(agent_name)
-        info = {
-            "agent": agent_name,
-            "policy_name": policy.name,
-            "permitted_operations_count": len(policy.permitted_operations),
-        }
+        try:
+            policy = get_role_policy(agent_name)
+            policy_name = getattr(policy, "name", getattr(policy, "policy_id", str(policy)))
+            permitted = getattr(policy, "permitted_operations", frozenset())
+            info = {
+                "agent": agent_name,
+                "policy_name": policy_name,
+                "permitted_operations_count": len(permitted),
+                "permitted_operations": sorted(list(permitted)),
+            }
+        except Exception as e:
+            info = {
+                "agent": agent_name,
+                "policy_name": agent_name,
+                "error": str(e),
+                "permitted_operations_count": 0,
+                "permitted_operations": [],
+            }
         self.boundary.journal.complete(record.request.operation_id, "retrieved")
         return info
 
     def dispatch_subagent(self, agent_name: str, wo_id: str, instructions: str = "") -> dict[str, Any]:
-        record = self._authorize(OperationType.DISPATCH_SUBAGENT, f"inbox/{agent_name}/{wo_id}")
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.DISPATCH_SUBAGENT, f"inbox/{agent_name}/{clean_id}")
         if not record.authorized:
             raise PermissionError(record.reason)
         inbox_dir = self.workspace.root / ".sync" / "inbox" / agent_name
         inbox_dir.mkdir(parents=True, exist_ok=True)
         now_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-        dispatch_path = inbox_dir / f"{now_str}_{self.actor_id}_{wo_id}-assignment.md"
-        content = f"# Assignment: {wo_id}\n\n**To:** {agent_name}\n**From:** {self.actor_id}\n\n{instructions}\n"
+        dispatch_path = inbox_dir / f"{now_str}_{self.actor_id}_{clean_id}-assignment.md"
+        content = f"# Assignment: {clean_id}\n\n**To:** {agent_name}\n**From:** {self.actor_id}\n\n{instructions}\n"
         dispatch_path.write_text(content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, f"Dispatched to {agent_name}")
         return {"dispatched": True, "path": str(dispatch_path.relative_to(self.workspace.root))}

@@ -1490,18 +1490,48 @@ class ProviderGateway:
                 for param_name, param in sig.parameters.items():
                     if param_name in args:
                         kwargs[param_name] = args[param_name]
-                    elif param_name == "target" and ("path" in args or "file" in args):
-                        kwargs[param_name] = args.get("path") or args.get("file")
-                    elif param_name == "path" and ("target" in args or "file" in args):
-                        kwargs[param_name] = args.get("target") or args.get("file")
-                    elif param_name == "filter_term" and ("filter" in args or "q" in args):
-                        kwargs[param_name] = args.get("filter") or args.get("q")
-                    elif param_name == "task_text" and ("text" in args or "task" in args):
-                        kwargs[param_name] = args.get("text") or args.get("task")
-                    elif param_name == "checkpoint_id" and ("id" in args or "cp_id" in args):
-                        kwargs[param_name] = args.get("id") or args.get("cp_id")
-                    elif param_name == "patch_content" and ("patch" in args or "diff" in args):
-                        kwargs[param_name] = args.get("patch") or args.get("diff")
+                    elif param_name == "target" and any(k in args for k in ("path", "file", "filename", "filepath")):
+                        kwargs[param_name] = args.get("path") or args.get("file") or args.get("filename") or args.get("filepath")
+                    elif param_name == "path" and any(k in args for k in ("target", "file", "filename", "filepath")):
+                        kwargs[param_name] = args.get("target") or args.get("file") or args.get("filename") or args.get("filepath")
+                    elif param_name == "filter_term" and any(k in args for k in ("filter", "q", "term")):
+                        kwargs[param_name] = args.get("filter") or args.get("q") or args.get("term")
+                    elif param_name == "task_text" and any(k in args for k in ("text", "task", "item")):
+                        kwargs[param_name] = args.get("text") or args.get("task") or args.get("item")
+                    elif param_name == "checkpoint_id" and any(k in args for k in ("id", "cp_id", "label")):
+                        kwargs[param_name] = args.get("id") or args.get("cp_id") or args.get("label")
+                    elif param_name == "patch_content" and any(k in args for k in ("patch", "diff", "content")):
+                        kwargs[param_name] = args.get("patch") or args.get("diff") or args.get("content")
+                    elif param_name == "agent_name" and any(k in args for k in ("agent", "name", "role", "actor")):
+                        kwargs[param_name] = args.get("agent") or args.get("name") or args.get("role") or args.get("actor")
+                    elif param_name == "wo_id" and any(k in args for k in ("work_order_id", "work_order", "id", "wo", "workorder")):
+                        kwargs[param_name] = (
+                            args.get("work_order_id")
+                            or args.get("work_order")
+                            or args.get("id")
+                            or args.get("wo")
+                            or args.get("workorder")
+                        )
+                    elif param_name == "skill_name" and any(k in args for k in ("skill", "name")):
+                        kwargs[param_name] = args.get("skill") or args.get("name")
+                    elif param_name == "command" and any(k in args for k in ("cmd", "args")):
+                        kwargs[param_name] = args.get("cmd") or args.get("args")
+                    elif param_name == "query" and any(k in args for k in ("q", "search", "prompt")):
+                        kwargs[param_name] = args.get("q") or args.get("search") or args.get("prompt")
+                    elif param_name == "symbol" and any(k in args for k in ("name", "target")):
+                        kwargs[param_name] = args.get("name") or args.get("target")
+                    elif param_name == "instructions" and any(k in args for k in ("instruction", "prompt", "message", "task")):
+                        kwargs[param_name] = args.get("instruction") or args.get("prompt") or args.get("message") or args.get("task")
+                    elif param_name == "summary" and any(k in args for k in ("description", "report", "message")):
+                        kwargs[param_name] = args.get("description") or args.get("report") or args.get("message")
+                    elif param_name == "verdict" and any(k in args for k in ("status", "decision")):
+                        kwargs[param_name] = args.get("status") or args.get("decision")
+                    elif param_name == "report" and any(k in args for k in ("summary", "description", "details")):
+                        kwargs[param_name] = args.get("summary") or args.get("description") or args.get("details")
+                    elif param_name == "new_version" and "version" in args:
+                        kwargs[param_name] = args.get("version")
+                    elif param_name == "entry" and any(k in args for k in ("changelog", "text", "content")):
+                        kwargs[param_name] = args.get("changelog") or args.get("text") or args.get("content")
 
                 result = method(**kwargs)
                 self.consecutive_failures = 0

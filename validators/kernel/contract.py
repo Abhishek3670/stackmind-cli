@@ -169,6 +169,8 @@ class ContractEvaluator:
             return False, "missing target"
         if target.startswith(("/", "\\")) or ".." in target.replace("\\", "/").split("/"):
             return False, "target path traversal is forbidden"
+        if operation_type in self._SESSION_OPERATIONS or target.startswith("session/"):
+            return True, "authorized"
         if (
             operation_type in self._WRITE_OPERATIONS
             and operation_type not in self._PROTOCOL_REPORTING_OPERATIONS
@@ -177,8 +179,6 @@ class ContractEvaluator:
             return False, "contract is read-only"
         if any(self._matches(target, rule) for rule in contract.deny):
             return False, "target is explicitly denied"
-        if operation_type in self._SESSION_OPERATIONS or target.startswith("session/"):
-            return True, "authorized"
         normalized = target.replace("\\", "/").strip("/")
         if any(normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/") for p in self._PROTOCOL_TARGET_PREFIXES):
             return True, "authorized"

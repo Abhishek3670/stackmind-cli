@@ -32,6 +32,10 @@ class AuthorizationPolicy:
     permitted_operations: frozenset[str] = field(default_factory=frozenset)
     authorized_by: HumanIdentity | None = None
 
+    @property
+    def name(self) -> str:
+        return self.policy_id
+
     @classmethod
     def permit(cls, policy_id: str, operations: Iterable[str], authorized_by: HumanIdentity | None = None):
         return cls(policy_id, frozenset(operations), authorized_by)
@@ -80,6 +84,8 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
     # Universal diagnostics & learning basics
     universal_diagnostics = {
         OperationType.INSPECT_ENVIRONMENT.value,
+        OperationType.INSPECT_PROCESSES.value,
+        OperationType.INSPECT_LOGS.value,
         OperationType.COMPARE_SNAPSHOTS.value,
         OperationType.CHECKPOINT.value,
         OperationType.RESTORE_CHECKPOINT.value,
@@ -114,7 +120,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         | universal_knowledge
     )
 
-    if norm in ("claude", "architecture", "architect"):
+    if any(k in norm for k in ("claude", "architecture", "architect")):
         ops = base_set | {
             OperationType.WRITE_FILE.value,  # Governed artifacts only
             OperationType.RUN_COMMAND.value,  # Read-only inspect
@@ -134,7 +140,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         }
         return AuthorizationPolicy.permit(f"policy-{norm}", ops)
 
-    if norm in ("codex", "backend"):
+    elif any(k in norm for k in ("codex", "backend")):
         ops = base_set | {
             OperationType.APPLY_PATCH.value,
             OperationType.WRITE_FILE.value,
@@ -165,7 +171,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         }
         return AuthorizationPolicy.permit(f"policy-{norm}", ops)
 
-    if norm in ("gemini", "frontend"):
+    elif any(k in norm for k in ("gemini", "frontend")):
         ops = base_set | {
             OperationType.APPLY_PATCH.value,
             OperationType.WRITE_FILE.value,
@@ -202,7 +208,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         }
         return AuthorizationPolicy.permit(f"policy-{norm}", ops)
 
-    if norm in ("gemma", "qa"):
+    elif any(k in norm for k in ("gemma", "qa")):
         # Note: No source code editing (apply_patch/write_file/move/delete are withheld)
         ops = base_set | {
             OperationType.RUN_COMMAND.value,
@@ -240,7 +246,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         }
         return AuthorizationPolicy.permit(f"policy-{norm}", ops)
 
-    if norm in ("local-llm", "gitops"):
+    elif any(k in norm for k in ("local-llm", "gitops", "release")):
         # Exclusively holds all Git mutations and release management
         ops = base_set | {
             OperationType.APPLY_PATCH.value,  # Version/changelog metadata only
