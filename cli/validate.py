@@ -79,7 +79,7 @@ def _load_yaml(path: Path) -> tuple[dict | None, str | None]:
 
 WORK_ORDER_STATE_DIRS = ("ACTIVE", "BLOCKED", "COMPLETED")
 WORK_ORDER_ALLOWED_STATUSES = {
-    "ACTIVE": {"ACTIVE", "BLOCKED"},
+    "ACTIVE": {"ACTIVE", "BLOCKED", "READY", "PENDING"},
     "BLOCKED": {"BLOCKED"},
     "COMPLETED": {"COMPLETE", "COMPLETED"},
 }

@@ -132,10 +132,16 @@
       "type": "string"
     },
     "blocked_reason": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "error": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "reproduction_steps": {
       "type": "array",
@@ -225,10 +231,16 @@
       ]
     },
     "unblocked": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "unblocked_reason": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "description": {
       "type": "string"
