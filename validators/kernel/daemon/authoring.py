@@ -378,7 +378,7 @@ def build_child_contract(
         },
         "budget": {
             "max_files_touched": 10,
-            "max_tokens": 150000,
+            "max_tokens": 0,
         },
     }
 

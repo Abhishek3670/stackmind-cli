@@ -1288,8 +1288,15 @@ class ProviderGateway:
         self.max_tool_output_chars: int = max_tool_output_chars
 
     def _get_max_tokens(self) -> int | None:
+        # Local models have no token limit (infinite budget)
+        provider = getattr(self.adapter, "provider_name", "") or ""
+        if str(provider).lower() in ("ollama", "local", "llamacpp"):
+            return None
         if self.contract and hasattr(self.contract, "budget") and self.contract.budget:
-            return self.contract.budget.get("max_tokens")
+            mt = self.contract.budget.get("max_tokens")
+            if mt is None or mt <= 0:
+                return None
+            return mt
         return None
 
     def _get_budget_max_tool_calls(self) -> int | None:
