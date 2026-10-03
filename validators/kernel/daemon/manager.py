@@ -569,26 +569,7 @@ class SessionManager:
                                         session["state"] = "RUNNING"
                                         session["updated_at"] = _now()
                                     if loaded_state.phase in (Phase.BLOCKED, Phase.FAILED):
-                                        loaded_state.error = None
-                                        loaded_state.blocked_wo_ids.clear()
-                                        prev_phase = None
-                                        if loaded_state.transitions:
-                                            for t in reversed(loaded_state.transitions):
-                                                p_from = t.get("from")
-                                                try:
-                                                    candidate = Phase(p_from) if p_from else None
-                                                except ValueError:
-                                                    candidate = None
-                                                if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
-                                                    prev_phase = candidate
-                                                    break
-                                        target_phase = prev_phase or (
-                                            Phase.DISPATCHING if loaded_state.worker_wo_ids
-                                            else Phase.AUTHORING if loaded_state.plan_id
-                                            else Phase.PLANNING
-                                        )
-                                        _reset_phase_operation_id(loaded_state, target_phase)
-                                        self.supervisor._transition(loaded_state, target_phase)
+                                        self._prepare_run_for_resume(loaded_state, session, ws)
                                         try:
                                             self.supervisor.save_run_state(loaded_state, ws)
                                         except Exception:
@@ -1232,6 +1213,54 @@ class SessionManager:
             self._save()
             return active_run.to_dict()
 
+    def _prepare_run_for_resume(self, state: Any, session: dict[str, Any], ws: Path) -> Any:
+        """Reset failed/blocked run state, unblock work orders on disk, and invalidate stale operations."""
+        from .supervisor import Phase
+
+        state.error = None
+        state.blocked_wo_ids.clear()
+        state.failed_wo_ids.clear()
+        state.retry_counts.clear()
+
+        # Invalidate any existing non-completed operations in the session journal
+        # so the supervisor does not immediately re-block on stale historical failures.
+        completed_set = set(state.completed_wo_ids)
+        if not hasattr(state, "ignored_operation_ids"):
+            state.ignored_operation_ids = []
+        for op in session.get("journal", []):
+            op_wo = op.get("work_order_id")
+            op_id = op.get("operation_id")
+            if op_id and (op_wo is None or op_wo not in completed_set):
+                if op_id not in state.ignored_operation_ids:
+                    state.ignored_operation_ids.append(op_id)
+
+        # Clear session active_operation if it was pointing to an invalidated operation
+        if session.get("active_operation") in state.ignored_operation_ids:
+            session["active_operation"] = None
+
+        # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
+        self.supervisor.unblock_in_flight_work_orders(state)
+
+        prev_phase = None
+        if state.transitions:
+            for t in reversed(state.transitions):
+                p_from = t.get("from")
+                try:
+                    candidate = Phase(p_from) if p_from else None
+                except ValueError:
+                    candidate = None
+                if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
+                    prev_phase = candidate
+                    break
+        target_phase = prev_phase or (
+            Phase.DISPATCHING if state.worker_wo_ids
+            else Phase.AUTHORING if state.plan_id
+            else Phase.PLANNING
+        )
+        _reset_phase_operation_id(state, target_phase)
+        self.supervisor._transition(state, target_phase)
+        return target_phase
+
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""
         with self._lock:
@@ -1268,26 +1297,7 @@ class SessionManager:
                 except Exception:
                     pass
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
-                state.error = None
-                state.blocked_wo_ids.clear()
-                prev_phase = None
-                if state.transitions:
-                    for t in reversed(state.transitions):
-                        p_from = t.get("from")
-                        try:
-                            candidate = Phase(p_from) if p_from else None
-                        except ValueError:
-                            candidate = None
-                        if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
-                            prev_phase = candidate
-                            break
-                target_phase = prev_phase or (
-                    Phase.DISPATCHING if state.worker_wo_ids
-                    else Phase.AUTHORING if state.plan_id
-                    else Phase.PLANNING
-                )
-                _reset_phase_operation_id(state, target_phase)
-                self.supervisor._transition(state, target_phase)
+                self._prepare_run_for_resume(state, session, ws)
 
             self._active_runs[target_run_id] = state
             try:

@@ -2606,3 +2606,118 @@ def test_manager_resume_run_restarts_dead_thread_even_if_stop_event_not_set(tmp_
 
     # Cleanup
     mgr._run_stop_events[run_id].set()
+
+
+def test_manager_resume_run_invalidates_stale_operations_and_unblocks_work_orders(tmp_path: Path):
+    """Verify that manager.resume_run invalidates prior non-completed operations in the session journal,
+    unblocks in-flight work orders on disk, and clears error states.
+    """
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+    import yaml
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-stale-ops"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Create WO-001 on disk as BLOCKED
+    wo_file = wo_dir / "WO-001.yaml"
+    wo_file.write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Configure Dependencies",
+            "status": "BLOCKED",
+            "error": "timed out",
+            "blocked_reason": "timed out",
+        }),
+        encoding="utf-8",
+    )
+
+    # 2. Create INDEX.yaml and TREE.yaml with total_blocked=1
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "orders": [{"id": "WO-001", "status": "BLOCKED"}],
+            "total_active": 0,
+            "total_blocked": 1,
+            "total_completed": 0,
+        }),
+        encoding="utf-8",
+    )
+    tree_file = tmp_path / ".sync" / "runtime" / "TREE.yaml"
+    tree_file.parent.mkdir(parents=True, exist_ok=True)
+    tree_file.write_text(
+        yaml.safe_dump({
+            "work_orders": {"total_active": 0, "total_blocked": 1, "total_completed": 0},
+        }),
+        encoding="utf-8",
+    )
+
+    # 3. Add stale blocked operation to session journal
+    stale_op_id = "op-stale-blocked-123"
+    session["journal"].append({
+        "operation_id": stale_op_id,
+        "work_order_id": "WO-001",
+        "role": "backend",
+        "status": "BLOCKED",
+        "result": {"status": "blocked", "error": "timed out"},
+    })
+
+    # 4. Save run state as BLOCKED
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build login",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.BLOCKED,
+        worker_wo_ids=["WO-001"],
+        blocked_wo_ids=["WO-001"],
+        error="Work order WO-001 blocked: timed out",
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    # Before resume: supervisor finds the stale BLOCKED operation
+    found_before = mgr.supervisor._find_latest_wo_operation(r_state, "WO-001")
+    assert found_before is not None
+    assert found_before["operation_id"] == stale_op_id
+
+    # 5. Resume the run
+    resumed = mgr.resume_run(sid, run_id=run_id)
+    assert resumed["run_id"] == run_id
+    assert resumed["phase"] in ("EXECUTING", "DISPATCHING")
+    assert not resumed["error"]
+    assert not resumed["blocked_wo_ids"]
+
+    # 6. Verify stale operation is now ignored by supervisor and fresh turn was dispatched
+    reloaded_state = mgr.supervisor.load_run_state(run_id, tmp_path)
+    assert stale_op_id in reloaded_state.ignored_operation_ids
+    found_after = mgr.supervisor._find_latest_wo_operation(reloaded_state, "WO-001")
+    # Must NOT be the stale blocked operation! It may be None or the newly dispatched turn.
+    if found_after is not None:
+        assert found_after["operation_id"] != stale_op_id
+        assert found_after["operation_id"] not in reloaded_state.ignored_operation_ids
+
+    # 7. Verify WO-001 on disk was reset to ACTIVE with errors cleared
+    reloaded_wo = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+    assert reloaded_wo["status"] == "ACTIVE"
+    assert "error" not in reloaded_wo
+    assert "blocked_reason" not in reloaded_wo
+
+    # 8. Verify INDEX.yaml and TREE.yaml counters synced
+    reloaded_idx = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    assert reloaded_idx["total_active"] == 1
+    assert reloaded_idx["total_blocked"] == 0
+    reloaded_tree = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
+    assert reloaded_tree["work_orders"]["total_active"] == 1
+    assert reloaded_tree["work_orders"]["total_blocked"] == 0
+
+    # Cleanup driver thread
+    mgr._run_stop_events[run_id].set()

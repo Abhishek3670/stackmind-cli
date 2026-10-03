@@ -97,6 +97,7 @@ class RunState:
     release_commit_sha: str | None = None
     transitions: list[dict[str, str]] = field(default_factory=list)
     max_retries: int = 2
+    ignored_operation_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +128,7 @@ class RunState:
             "updated_at": self.updated_at,
             "transitions": list(self.transitions),
             "max_retries": self.max_retries,
+            "ignored_operation_ids": list(self.ignored_operation_ids),
         }
 
     @classmethod
@@ -159,6 +161,7 @@ class RunState:
             updated_at=data.get("updated_at", ""),
             transitions=data.get("transitions", []),
             max_retries=data.get("max_retries", 2),
+            ignored_operation_ids=list(data.get("ignored_operation_ids", [])),
         )
 
 
@@ -634,6 +637,9 @@ class LifecycleSupervisor:
                                 work_order_id=wo_id,
                             )
                             dispatched_new = True
+                        except OperationContentionError:
+                            all_done = False
+                            continue
                         except Exception:
                             state.blocked_wo_ids.append(wo_id)
                 all_done = False
@@ -1138,7 +1144,7 @@ class LifecycleSupervisor:
 
     @staticmethod
     def _mark_wo_status_on_disk(
-        ws: Path, wo_id: str, target_status: str, error: str | None = None,
+        ws: Path, wo_id: str, target_status: str, error: str | None = None, clear_error: bool = False,
     ) -> bool:
         """Update a single work order YAML file's status on disk.
 
@@ -1154,13 +1160,16 @@ class LifecycleSupervisor:
             if not isinstance(data, dict):
                 return False
             current = str(data.get("status", "")).upper()
-            if current in _WO_TERMINAL:
+            if current in _WO_TERMINAL and target_status != "ACTIVE":
                 return False  # Already terminal — don't overwrite
             data["status"] = target_status
             data["updated"] = _now()
             if error:
                 data["error"] = str(error)
                 data["blocked_reason"] = str(error)
+            elif clear_error:
+                data.pop("error", None)
+                data.pop("blocked_reason", None)
             wo_file.write_text(
                 yaml.dump(data, default_flow_style=False, allow_unicode=True),
                 encoding="utf-8",
@@ -1231,6 +1240,25 @@ class LifecycleSupervisor:
             seen.add(wo_id)
             self._mark_wo_status_on_disk(ws, wo_id, target_status, error=error)
 
+    def unblock_in_flight_work_orders(self, state: RunState) -> None:
+        """Reset non-completed work orders on disk back to ACTIVE when resuming a run."""
+        ws = Path(state.workspace)
+        candidate_ids: list[str] = []
+        if state.planning_wo_id and state.phase == Phase.PLANNING:
+            candidate_ids.append(state.planning_wo_id)
+        candidate_ids.extend(state.worker_wo_ids)
+        if state.integration_wo_id:
+            candidate_ids.append(state.integration_wo_id)
+        if state.gitops_wo_id:
+            candidate_ids.append(state.gitops_wo_id)
+
+        seen: set[str] = set(state.completed_wo_ids)
+        for wo_id in candidate_ids:
+            if wo_id in seen:
+                continue
+            seen.add(wo_id)
+            self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+
     def _get_operation(self, operation_id: str) -> dict[str, Any] | None:
         """Safe operation lookup that returns None instead of raising."""
         try:
@@ -1246,6 +1274,7 @@ class LifecycleSupervisor:
             ops = self.manager.list_operations(state.session_id)
         except (KeyError, ValueError):
             return None
+        ignored = set(getattr(state, "ignored_operation_ids", []) or [])
         candidates = [
             op for op in ops
             if op.get("work_order_id") == wo_id
@@ -1253,6 +1282,7 @@ class LifecycleSupervisor:
             and op.get("operation_id") != state.authoring_operation_id
             and op.get("operation_id") != state.integration_operation_id
             and op.get("operation_id") != state.batch_operation_id
+            and op.get("operation_id") not in ignored
         ]
         if not candidates:
             return None
