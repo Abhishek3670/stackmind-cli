@@ -1230,7 +1230,10 @@ class SessionManager:
         for op in session.get("journal", []):
             op_wo = op.get("work_order_id")
             op_id = op.get("operation_id")
+            op_status = str(op.get("status", "")).upper()
             if op_id and (op_wo is None or op_wo not in completed_set):
+                if op_status == "COMPLETED":
+                    continue
                 if op_id not in state.ignored_operation_ids:
                     state.ignored_operation_ids.append(op_id)
 
@@ -1739,7 +1742,7 @@ class SessionManager:
         from .supervisor import AdvanceResult, Phase
 
         if max_wait_seconds is None:
-            max_wait_seconds = float(os.environ.get("SUPERVISOR_OPERATION_TIMEOUT", 1800.0))
+            max_wait_seconds = float(os.environ.get("SUPERVISOR_OPERATION_TIMEOUT", 3600.0))
 
         state = self._active_runs.get(run_id)
         if not state:
