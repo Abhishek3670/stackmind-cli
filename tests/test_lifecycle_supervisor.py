@@ -2721,3 +2721,174 @@ def test_manager_resume_run_invalidates_stale_operations_and_unblocks_work_order
 
     # Cleanup driver thread
     mgr._run_stop_events[run_id].set()
+
+
+# ─── Architect Escalation Loop Tests (KNOW-01 / HARNESS-01) ─────────────
+
+
+def test_undeclared_dependency_escalates_to_architecture_and_resumes(tmp_path: Path) -> None:
+    """When a worker blocks on undeclared third-party dependencies, supervisor routes to Claude,
+    which updates dependencies, allowing the worker to be safely re-dispatched."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    deliv_file = tmp_path / "db" / "init_db.py"
+    deliv_file.parent.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "title": "Database Schema",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"path": "db/init_db.py", "type": "code"},
+    }), encoding="utf-8")
+
+    state = RunState(
+        run_id="run-esc-1",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-esc-1",
+        phase=Phase.EXECUTING,
+        worker_wo_ids=["WO-002"],
+    )
+
+    # 1. Worker turn fails with undeclared dependency
+    worker_op = mock_mgr.start_turn("sess-esc-1", "Execute WO-002", work_order_id="WO-002", role="backend", agent_id="codex")
+    mock_mgr.complete_operation(
+        worker_op["operation_id"],
+        status="COMPLETED",
+        result={
+            "status": "blocked",
+            "error": "verification gate failed: code_verified (Deliverable 'db/init_db.py' imports undeclared third-party module(s): werkzeug. Your contract permits updating dependency manifests. Declare them in pyproject.toml or requirements.txt using write_file.)",
+        },
+    )
+
+    # 2. Advance: Supervisor detects undeclared dependency and escalates to Claude (Architecture)
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING  # Does NOT transition to BLOCKED!
+    assert state.dependency_escalation_op_id is not None
+    assert state.dependency_escalation_wo_id == "WO-002"
+    assert worker_op["operation_id"] in state.ignored_operation_ids
+
+    # Verify escalation operation was dispatched to Claude
+    esc_op = mock_mgr.get_operation(state.dependency_escalation_op_id)
+    assert esc_op["agent_id"] == "claude"
+    assert esc_op["role"] == "architecture"
+    assert "werkzeug" in esc_op["prompt"]
+    assert "db/init_db.py" in esc_op["prompt"]
+
+    # 3. Claude resolves the dependency (updates requirements.txt) and completes turn
+    mock_mgr.complete_operation(
+        state.dependency_escalation_op_id,
+        status="COMPLETED",
+        result={"status": "completed", "summary": "Declared werkzeug>=3.0 in requirements.txt"},
+    )
+
+    # 4. Advance: Supervisor notices Claude's turn completed, resets WO-002, and re-dispatches worker (Codex)
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.dependency_escalation_op_id is None
+    assert state.dependency_escalation_wo_id is None
+
+    # Check that a fresh worker operation for WO-002 was dispatched
+    latest_worker_op = supervisor._find_latest_wo_operation(state, "WO-002")
+    assert latest_worker_op is not None
+    assert latest_worker_op["operation_id"] != worker_op["operation_id"]
+    assert latest_worker_op["agent_id"] == "codex"
+
+    # 5. Worker completes deliverable now that dependency is satisfied
+    deliv_file.write_text("# user db schema using werkzeug", encoding="utf-8")
+    mock_mgr.complete_operation(
+        latest_worker_op["operation_id"],
+        status="COMPLETED",
+        result={"status": "completed"},
+    )
+
+    # 6. Final advance: WO-002 completes and lifecycle advances to INTEGRATION_REVIEW
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.INTEGRATION_REVIEW
+    assert "WO-002" in state.completed_wo_ids
+
+
+def test_undeclared_dependency_escalation_bounded_by_max_retries(tmp_path: Path) -> None:
+    """If repeated escalations fail to resolve the dependency, supervisor safely halts at BLOCKED."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "title": "Auth",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+    }), encoding="utf-8")
+
+    state = RunState(
+        run_id="run-esc-fail",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-esc-fail",
+        phase=Phase.EXECUTING,
+        worker_wo_ids=["WO-002"],
+        max_retries=1,  # Set to 1 for quick bounded test
+    )
+
+    # 1. First worker failure
+    op1 = mock_mgr.start_turn("sess-esc-fail", "Execute WO-002", work_order_id="WO-002", role="backend")
+    mock_mgr.complete_operation(
+        op1["operation_id"],
+        status="COMPLETED",
+        result={"status": "blocked", "error": "imports undeclared third-party module(s): bad_pkg"},
+    )
+
+    # Escalates to Claude (attempt 1)
+    res1 = supervisor.advance(state)
+    assert res1 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.dependency_escalation_op_id is not None
+
+    # Claude completes escalation
+    mock_mgr.complete_operation(state.dependency_escalation_op_id, status="COMPLETED", result={"status": "completed"})
+    supervisor.advance(state)
+
+    # 2. Worker runs again and fails again with undeclared dependency
+    op2 = supervisor._find_latest_wo_operation(state, "WO-002")
+    assert op2 is not None
+    mock_mgr.complete_operation(
+        op2["operation_id"],
+        status="COMPLETED",
+        result={"status": "blocked", "error": "imports undeclared third-party module(s): bad_pkg"},
+    )
+
+    # 3. Advance: Since max_retries (1) is reached, supervisor transitions to BLOCKED without looping
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.BLOCKED
+    assert state.phase == Phase.BLOCKED
+    assert "WO-002" in state.blocked_wo_ids
+
+
+def test_undeclared_dependency_state_serialization_roundtrip(tmp_path: Path) -> None:
+    """RunState accurately serializes and deserializes dependency escalation fields."""
+    state = RunState(
+        run_id="run-ser-1",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-ser-1",
+        dependency_escalation_op_id="op-claude-999",
+        dependency_escalation_wo_id="WO-002",
+        dependency_escalation_retries={"WO-002": 1, "WO-003": 2},
+    )
+
+    d = state.to_dict()
+    assert d["dependency_escalation_op_id"] == "op-claude-999"
+    assert d["dependency_escalation_wo_id"] == "WO-002"
+    assert d["dependency_escalation_retries"] == {"WO-002": 1, "WO-003": 2}
+
+    restored = RunState.from_dict(d)
+    assert restored.dependency_escalation_op_id == "op-claude-999"
+    assert restored.dependency_escalation_wo_id == "WO-002"
+    assert restored.dependency_escalation_retries == {"WO-002": 1, "WO-003": 2}
+

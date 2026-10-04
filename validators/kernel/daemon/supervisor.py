@@ -21,6 +21,7 @@ Constraints honoured:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -98,6 +99,9 @@ class RunState:
     transitions: list[dict[str, str]] = field(default_factory=list)
     max_retries: int = 2
     ignored_operation_ids: list[str] = field(default_factory=list)
+    dependency_escalation_op_id: str | None = None
+    dependency_escalation_wo_id: str | None = None
+    dependency_escalation_retries: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +133,9 @@ class RunState:
             "transitions": list(self.transitions),
             "max_retries": self.max_retries,
             "ignored_operation_ids": list(self.ignored_operation_ids),
+            "dependency_escalation_op_id": self.dependency_escalation_op_id,
+            "dependency_escalation_wo_id": self.dependency_escalation_wo_id,
+            "dependency_escalation_retries": dict(self.dependency_escalation_retries),
         }
 
     @classmethod
@@ -162,6 +169,9 @@ class RunState:
             transitions=data.get("transitions", []),
             max_retries=data.get("max_retries", 2),
             ignored_operation_ids=list(data.get("ignored_operation_ids", [])),
+            dependency_escalation_op_id=data.get("dependency_escalation_op_id"),
+            dependency_escalation_wo_id=data.get("dependency_escalation_wo_id"),
+            dependency_escalation_retries=data.get("dependency_escalation_retries", {}),
         )
 
 
@@ -610,6 +620,37 @@ class LifecycleSupervisor:
         all_done = True
         dispatched_new = False
 
+        # Check active dependency escalation turn
+        if state.dependency_escalation_op_id:
+            esc_op = self._get_operation(state.dependency_escalation_op_id)
+            if esc_op is None:
+                state.dependency_escalation_op_id = None
+                state.dependency_escalation_wo_id = None
+            else:
+                esc_status = str(esc_op.get("status", "")).upper()
+                if esc_status not in _OPERATION_TERMINAL:
+                    return AdvanceResult.WAITING_FOR_OPERATION
+
+                esc_result = esc_op.get("result", {}) or {}
+                esc_run_status = str(esc_result.get("status", "")).lower()
+                target_wo = state.dependency_escalation_wo_id
+                state.dependency_escalation_op_id = None
+                state.dependency_escalation_wo_id = None
+
+                if esc_status == "COMPLETED" or esc_run_status == "completed":
+                    if target_wo:
+                        if target_wo in state.blocked_wo_ids:
+                            state.blocked_wo_ids.remove(target_wo)
+                        self._mark_wo_status_on_disk(ws, target_wo, "ACTIVE", clear_error=True)
+                    state.error = None
+                else:
+                    err_detail = esc_result.get("error") or esc_result.get("reason") or "turn failed"
+                    state.error = f"Architecture escalation failed to resolve dependency for {target_wo}: {err_detail}"
+                    if target_wo and target_wo not in state.blocked_wo_ids:
+                        state.blocked_wo_ids.append(target_wo)
+                    self._transition(state, Phase.BLOCKED)
+                    return AdvanceResult.BLOCKED
+
         if not state.worker_wo_ids:
             self._discover_worker_wos(state)
 
@@ -654,9 +695,28 @@ class LifecycleSupervisor:
             run_status = str(result.get("status", "")).lower()
 
             if status == "BLOCKED" or run_status == "blocked":
+                err_msg = str(result.get("error") or result.get("reason") or "governance gate blocked")
+
+                # Check if this blockage is caused by an undeclared third-party dependency
+                dep_info = self._parse_undeclared_dependency_error(err_msg, result)
+                if dep_info:
+                    esc_retries = state.dependency_escalation_retries.get(wo_id, 0)
+                    if esc_retries < state.max_retries:
+                        state.dependency_escalation_retries[wo_id] = esc_retries + 1
+
+                        # Ignore the blocked worker operation so it won't re-block the supervisor
+                        op_id = op.get("operation_id")
+                        if op_id and op_id not in state.ignored_operation_ids:
+                            state.ignored_operation_ids.append(op_id)
+
+                        esc_op = self._dispatch_dependency_escalation(state, wo_id, dep_info, ws)
+                        if esc_op:
+                            state.dependency_escalation_op_id = esc_op.get("operation_id")
+                            state.dependency_escalation_wo_id = wo_id
+                            return AdvanceResult.WAITING_FOR_OPERATION
+
                 if wo_id not in state.blocked_wo_ids:
                     state.blocked_wo_ids.append(wo_id)
-                err_msg = result.get("error") or result.get("reason") or "governance gate blocked"
                 state.error = f"Work order {wo_id} blocked: {err_msg}"
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
@@ -1274,6 +1334,8 @@ class LifecycleSupervisor:
             ops = self.manager.list_operations(state.session_id)
         except (KeyError, ValueError):
             return None
+        ws = Path(state.workspace)
+        expected_agent = self._agent_for_wo(wo_id, ws)
         ignored = set(getattr(state, "ignored_operation_ids", []) or [])
         candidates = [
             op for op in ops
@@ -1282,6 +1344,14 @@ class LifecycleSupervisor:
             and op.get("operation_id") != state.authoring_operation_id
             and op.get("operation_id") != state.integration_operation_id
             and op.get("operation_id") != state.batch_operation_id
+            and op.get("operation_id") != getattr(state, "dependency_escalation_op_id", None)
+            and not (
+                expected_agent != "claude"
+                and (
+                    str(op.get("agent_id", "")).lower() == "claude"
+                    or str(op.get("role", "")).lower() == "architecture"
+                )
+            )
             and op.get("operation_id") not in ignored
         ]
         if not candidates:
@@ -1382,6 +1452,91 @@ class LifecycleSupervisor:
             "local-llm": "gitops",
         }
         return mapping.get(agent.lower().strip(), "backend")
+
+    def _parse_undeclared_dependency_error(
+        self, err_msg: str, result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Detect if an operation failure/block is due to undeclared third-party dependencies."""
+        combined_texts = [err_msg]
+        blockers = result.get("blockers") or []
+        if isinstance(blockers, list):
+            for b in blockers:
+                combined_texts.append(str(b))
+        if result.get("reason"):
+            combined_texts.append(str(result["reason"]))
+        if result.get("error"):
+            combined_texts.append(str(result["error"]))
+
+        full_text = " ".join(combined_texts)
+
+        # Check signature phrases from dependency_gate / runner
+        is_dep_error = any(
+            phrase in full_text.lower()
+            for phrase in (
+                "imports undeclared third-party",
+                "undeclared third-party module",
+                "import satisfiability failed",
+            )
+        )
+        if not is_dep_error:
+            return None
+
+        # Extract module names: pattern "imports undeclared third-party module(s): foo, bar."
+        modules: list[str] = []
+        match = re.search(r"imports undeclared third-party module\(s\):\s*([^.\n]+)", full_text, re.IGNORECASE)
+        if match:
+            raw_mods = match.group(1).split(",")
+            modules = [m.strip() for m in raw_mods if m.strip()]
+
+        # Extract deliverable path: pattern "Deliverable 'foo/bar.py'"
+        deliv_match = re.search(r"Deliverable\s+['\"]([^'\"]+)['\"]", full_text, re.IGNORECASE)
+        deliv_path = deliv_match.group(1) if deliv_match else None
+
+        return {
+            "modules": modules,
+            "deliverable": deliv_path,
+            "raw_error": err_msg,
+        }
+
+    def _dispatch_dependency_escalation(
+        self,
+        state: RunState,
+        wo_id: str,
+        info: dict[str, Any],
+        ws: Path,
+    ) -> dict[str, Any] | None:
+        """Dispatch Architecture (Claude) to review and resolve undeclared third-party dependencies."""
+        agent = self._agent_for_wo(wo_id, ws)
+        modules = info.get("modules") or []
+        modules_str = ", ".join(modules) if modules else "the imported third-party package"
+        deliv = info.get("deliverable") or "deliverable"
+
+        prompt = (
+            f"Architecture Dependency Escalation: Work order {wo_id} assigned to {agent} is blocked "
+            f"because deliverable '{deliv}' imports undeclared third-party module(s): {modules_str}.\n\n"
+            f"As Senior Architect (Claude), resolve this dependency requirement:\n"
+            f"1. Review the requirement: Is this dependency acceptable and safe for the project architecture?\n"
+            f"2. If ACCEPTABLE: Update `requirements.txt` (or `pyproject.toml`) using `write_file` "
+            f"to declare the missing dependency with an appropriate minimum version.\n"
+            f"3. If UNACCEPTABLE: Write an inbox instruction to `.sync/inbox/{agent}/` directing the worker "
+            f"to replace this import with Python standard library or local modules.\n"
+            f"4. Record your architectural decision in your report summary.\n"
+            f"Note: Your contract allows updating dependency manifests and inbox notices. "
+            f"Do NOT write or edit the worker's application code directly."
+        )
+
+        try:
+            op = self.manager.start_turn(
+                state.session_id,
+                prompt,
+                role="architecture",
+                agent_id="claude",
+                work_order_id=wo_id,
+                is_authoring=True,
+            )
+            return op
+        except Exception:
+            return None
 
     def _check_qa_verdict(self, wo_id: str, ws: Path) -> str | None:
         """Check for a QA verdict file for a work order. Returns 'APPROVED', 'NEEDS_CHANGES', or None."""
