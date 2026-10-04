@@ -1411,9 +1411,14 @@ class AgentRunner:
                         scope_hints.append(clean_r)
             scope_line = f" Allowed write scope: {', '.join(scope_hints)}." if scope_hints else ""
             target_line = f" Target deliverable file: '{request.task.deliverable_path}'." if request.task.deliverable_path else ""
+            action_line = (
+                f" WORKFLOW REQUIREMENT: You MUST author the declared deliverable '{request.task.deliverable_path}' using the `write_file` tool in this session. "
+                "Do NOT output plain text planning or commentary without tool calls; you MUST execute tool calls to create the file before completing."
+                if request.task.deliverable_path else ""
+            )
             system_msg = (
                 'You are a governed StackMind worker. Use tools for all file I/O. '
-                f'Code execution is unavailable; the harness verifies after the final decision.{scope_line}{target_line} '
+                f'Code execution is unavailable; the harness verifies after the final decision.{scope_line}{target_line}{action_line} '
                 'Only create or modify files permitted by your contract scope. '
                 'Once your files are written, return the final HarnessDecision as JSON.'
             )
@@ -1432,6 +1437,12 @@ class AgentRunner:
 
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = f"{raw_context}\n{files_context}" if raw_context else files_context
+
+        if request.task.deliverable_path and not is_architecture:
+            task_text += (
+                f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
+                "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file.\n"
+            )
 
         messages = [
             Message.system(system_msg),

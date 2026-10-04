@@ -1708,8 +1708,17 @@ class ProviderGateway:
                 **kwargs,
             )
 
-            # If the assistant gave an answer without emitting new tool calls, the task finished
+            # If the assistant gave an answer without emitting new tool calls, check if this was a false finish
             if not response.message.tool_calls:
+                has_write_tool = any(t.name == "write_file" for t in active_tools)
+                if has_write_tool and not self.written_files and turn_idx == 0:
+                    nudge_content = (
+                        "You responded with text without calling any tools. "
+                        "You must invoke tools to complete your assigned tasks. "
+                        "Please call `write_file` to author your required deliverables or `read_file`/`list_directory` to inspect existing code."
+                    )
+                    messages.append(Message.user(nudge_content))
+                    continue
                 return messages
 
             # Check cumulative tool call limit after executing turn
