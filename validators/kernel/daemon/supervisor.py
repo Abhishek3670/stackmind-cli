@@ -876,7 +876,7 @@ class LifecycleSupervisor:
                 for op in reversed(self.manager.list_operations(state.session_id)):
                     op_wo = op.get("work_order_id")
                     op_role = str(op.get("role", "")).lower()
-                    if (op_wo == state.integration_wo_id or op_role == "architecture" or "WO-007" in str(op_wo)) and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                    if (op_wo == state.integration_wo_id or op_role == "architecture") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
                         state.integration_operation_id = op.get("operation_id")
                         state.integration_wo_id = op_wo or state.integration_wo_id
                         break
@@ -1103,7 +1103,7 @@ class LifecycleSupervisor:
                 for op in reversed(self.manager.list_operations(state.session_id)):
                     op_wo = op.get("work_order_id")
                     op_role = str(op.get("role", "")).lower()
-                    if (op_wo == review_wo_id or op_role == "architecture" or "WO-007" in str(op_wo)) and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                    if (op_wo == review_wo_id or op_role == "architecture") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
                         state.integration_operation_id = op.get("operation_id")
                         state.integration_wo_id = op_wo or review_wo_id
                         state.contention_count = 0
