@@ -657,7 +657,25 @@ class AgentRunner:
             from validators.harness.contract_gate import verify_post_execution
             from validators.harness.d024_gate import D024ViolationError
             try:
-                verify_post_execution(self.project_path, self.agent, task, decision)
+                observed_files_for_gate: tuple[str, ...] | None = None
+                if tool_runtime is not None:
+                    curr_snap = WorkspaceSnapshot.capture(
+                        workspace_root, ignored_patterns=HARNESS_SNAPSHOT_IGNORED,
+                    )
+                    curr_diff = before_snapshot.diff(curr_snap)
+                    bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
+                    observed_files_for_gate = tuple(
+                        norm_p for path in curr_diff.all_changed_files
+                        if (norm_p := Path(path).as_posix().lstrip('/'))
+                        and not any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes)
+                    )
+                verify_post_execution(
+                    self.project_path,
+                    self.agent,
+                    task,
+                    decision,
+                    observed_files=observed_files_for_gate,
+                )
             except D024ViolationError as d024_exc:
                 return HarnessRunResult(
                     status='blocked',
@@ -1072,7 +1090,7 @@ class AgentRunner:
         status = str(payload.get('status', ''))
         release_target = payload.get('release_target')
         blockers = tuple(str(item) for item in payload.get('blockers', []))
-        if task.work_order_id and status == 'completed' and not str(release_target or '').strip():
+        if task.work_order_id and task.deliverable_path and status == 'completed' and not str(release_target or '').strip():
             errors.append('release_target is required for completed work-order tasks')
         if status == 'blocked' and not blockers:
             errors.append('blocked decisions must declare blockers')
@@ -1614,7 +1632,13 @@ class AgentRunner:
                         payload.setdefault('modified_files', []).append(wf)
 
         # Prune internal scratch/decision paths and non-existent phantom files from modified_files
-        if payload.get('modified_files'):
+        is_read_only = (
+            (kernel_contract is not None and getattr(kernel_contract, 'write_mode', None) == 'read-only')
+            or is_integration_review
+        )
+        if is_read_only:
+            payload['modified_files'] = []
+        elif payload.get('modified_files'):
             pruned_mods: list[str] = []
             for p in payload['modified_files']:
                 norm_p = str(p).replace('\\', '/').lstrip('/')
@@ -1622,8 +1646,7 @@ class AgentRunner:
                     continue
                 if tool_runtime is not None:
                     is_written = norm_p in written_files or any(Path(wf).as_posix().lstrip('/') == norm_p for wf in written_files)
-                    exists_in_ws = (tool_runtime.workspace.root / norm_p).is_file()
-                    if not is_written and not exists_in_ws:
+                    if not is_written:
                         continue
                 pruned_mods.append(p)
             payload['modified_files'] = pruned_mods

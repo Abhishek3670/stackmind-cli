@@ -2362,8 +2362,8 @@ def test_manager_boot_auto_resumes_blocked_run_with_active_session(tmp_path: Pat
     # Boot fresh SessionManager recovering from storage
     mgr2 = SessionManager(storage)
     assert run_id in mgr2._active_runs
-    # Should have auto-resumed to GITOPS
-    assert mgr2._active_runs[run_id].phase == Phase.GITOPS
+    # Should have auto-resumed to GITOPS (or already completed via driver thread)
+    assert mgr2._active_runs[run_id].phase in (Phase.GITOPS, Phase.COMPLETE)
     assert run_id in mgr2._run_driver_threads
 
     for stop_ev in mgr2._run_stop_events.values():
