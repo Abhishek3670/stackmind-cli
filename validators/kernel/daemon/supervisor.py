@@ -373,13 +373,19 @@ class LifecycleSupervisor:
             # discover it from session operations rather than re-dispatching a duplicate turn.
             try:
                 for op in reversed(self.manager.list_operations(state.session_id)):
+                    op_id = op.get("operation_id")
+                    if op_id and op_id in getattr(state, "ignored_operation_ids", []):
+                        continue
                     if op.get("work_order_id") == state.planning_wo_id and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
-                        state.planning_operation_id = op.get("operation_id")
+                        state.planning_operation_id = op_id
                         break
             except Exception:
                 pass
 
         if state.planning_operation_id:
+            if hasattr(state, "ignored_operation_ids") and state.planning_operation_id in state.ignored_operation_ids:
+                state.planning_operation_id = None
+                return self._advance_planning(state)
             op = self._get_operation(state.planning_operation_id)
             if op is None:
                 # Operation record lost — re-dispatch
@@ -512,9 +518,12 @@ class LifecycleSupervisor:
         # Check if already running or previously dispatched
         ops = self.manager.list_operations(state.session_id)
         for op in reversed(ops):
+            op_id = op.get("operation_id")
+            if op_id and op_id in getattr(state, "ignored_operation_ids", []):
+                continue
             metadata = op.get("metadata", {})
-            if metadata.get("is_authoring"):
-                state.authoring_operation_id = op.get("operation_id")
+            if metadata.get("is_authoring") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                state.authoring_operation_id = op_id
                 return self._advance_authoring(state)
 
         # Supervisor directly dispatches Turn 2 (Authoring child WOs and Contracts)
@@ -874,16 +883,22 @@ class LifecycleSupervisor:
         if not state.integration_operation_id:
             try:
                 for op in reversed(self.manager.list_operations(state.session_id)):
+                    op_id = op.get("operation_id")
+                    if op_id and op_id in getattr(state, "ignored_operation_ids", []):
+                        continue
                     op_wo = op.get("work_order_id")
                     op_role = str(op.get("role", "")).lower()
                     if (op_wo == state.integration_wo_id or op_role == "architecture") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
-                        state.integration_operation_id = op.get("operation_id")
+                        state.integration_operation_id = op_id
                         state.integration_wo_id = op_wo or state.integration_wo_id
                         break
             except Exception:
                 pass
 
         if state.integration_operation_id:
+            if hasattr(state, "ignored_operation_ids") and state.integration_operation_id in state.ignored_operation_ids:
+                state.integration_operation_id = None
+                return self._advance_integration_review(state)
             op = self._get_operation(state.integration_operation_id)
             if op is None:
                 state.integration_operation_id = None
@@ -1101,10 +1116,13 @@ class LifecycleSupervisor:
         except OperationContentionError:
             try:
                 for op in reversed(self.manager.list_operations(state.session_id)):
+                    op_id = op.get("operation_id")
+                    if op_id and op_id in getattr(state, "ignored_operation_ids", []):
+                        continue
                     op_wo = op.get("work_order_id")
                     op_role = str(op.get("role", "")).lower()
                     if (op_wo == review_wo_id or op_role == "architecture") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
-                        state.integration_operation_id = op.get("operation_id")
+                        state.integration_operation_id = op_id
                         state.integration_wo_id = op_wo or review_wo_id
                         state.contention_count = 0
                         try:

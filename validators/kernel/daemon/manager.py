@@ -465,6 +465,18 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
     elif phase in (Phase.DISPATCHING, Phase.EXECUTING):
         state.batch_operation_id = None
 
+    ignored = set(getattr(state, "ignored_operation_ids", []) or [])
+    if getattr(state, "integration_operation_id", None) in ignored:
+        state.integration_operation_id = None
+    if getattr(state, "planning_operation_id", None) in ignored:
+        state.planning_operation_id = None
+    if getattr(state, "authoring_operation_id", None) in ignored:
+        state.authoring_operation_id = None
+    if getattr(state, "gitops_operation_id", None) in ignored:
+        state.gitops_operation_id = None
+    if getattr(state, "batch_operation_id", None) in ignored:
+        state.batch_operation_id = None
+
 
 class SessionManager:
     """Owns daemon sessions, their audit journals, and active-operation cancellation."""
@@ -1245,10 +1257,28 @@ class SessionManager:
                     continue
                 if op_id not in state.ignored_operation_ids:
                     state.ignored_operation_ids.append(op_id)
+                if op_status not in _OPERATION_TERMINAL:
+                    t = self._turn_threads.get(op_id)
+                    if t is None or not t.is_alive():
+                        op["status"] = "CANCELLED"
+                        op.setdefault("transitions", []).append({
+                            "status": "CANCELLED",
+                            "at": _now(),
+                            "reason": "invalidated_on_resume",
+                        })
+                        c_event = self._active.get(op_id)
+                        if c_event:
+                            c_event.set()
 
-        # Clear session active_operation if it was pointing to an invalidated operation
-        if session.get("active_operation") in state.ignored_operation_ids:
-            session["active_operation"] = None
+        # Clear session active_operation if it was pointing to an invalidated or dead operation
+        active_op_id = session.get("active_operation")
+        if active_op_id:
+            if active_op_id in state.ignored_operation_ids:
+                session["active_operation"] = None
+            else:
+                t = self._turn_threads.get(active_op_id)
+                if t is None or not t.is_alive():
+                    session["active_operation"] = None
 
         # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
         self.supervisor.unblock_in_flight_work_orders(state)
@@ -1273,9 +1303,62 @@ class SessionManager:
         self.supervisor._transition(state, target_phase)
         return target_phase
 
+    def _cleanup_orphaned_operations(self, state: Any, session: dict[str, Any]) -> None:
+        """Mark orphaned non-terminal operations as CANCELLED and clear phase operation IDs."""
+        completed_set = set(getattr(state, "completed_wo_ids", []))
+        if not hasattr(state, "ignored_operation_ids"):
+            state.ignored_operation_ids = []
+        for op in session.get("journal", []):
+            op_wo = op.get("work_order_id")
+            op_id = op.get("operation_id")
+            op_status = str(op.get("status", "")).upper()
+            if op_id and (op_wo is None or op_wo not in completed_set):
+                if op_status == "COMPLETED":
+                    continue
+                if op_status not in _OPERATION_TERMINAL:
+                    t = self._turn_threads.get(op_id)
+                    if t is None or not t.is_alive():
+                        op["status"] = "CANCELLED"
+                        op.setdefault("transitions", []).append({
+                            "status": "CANCELLED",
+                            "at": _now(),
+                            "reason": "cleaned_up_on_resume",
+                        })
+                        c_event = self._active.get(op_id)
+                        if c_event:
+                            c_event.set()
+                        if op_id not in state.ignored_operation_ids:
+                            state.ignored_operation_ids.append(op_id)
+
+        active_op_id = session.get("active_operation")
+        if active_op_id:
+            if active_op_id in state.ignored_operation_ids:
+                session["active_operation"] = None
+            else:
+                t = self._turn_threads.get(active_op_id)
+                if t is None or not t.is_alive():
+                    session["active_operation"] = None
+
+        _reset_phase_operation_id(state, state.phase)
+
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""
         with self._lock:
+            import importlib
+            import sys
+            if "validators.kernel.daemon.supervisor" in sys.modules:
+                try:
+                    reloaded_mod = importlib.reload(sys.modules["validators.kernel.daemon.supervisor"])
+                    if hasattr(self, "supervisor") and self.supervisor is not None:
+                        self.supervisor.__class__ = reloaded_mod.LifecycleSupervisor
+                except Exception:
+                    pass
+            if "validators.harness.runner" in sys.modules:
+                try:
+                    importlib.reload(sys.modules["validators.harness.runner"])
+                except Exception:
+                    pass
+
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
@@ -1310,6 +1393,8 @@ class SessionManager:
                     pass
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
                 self._prepare_run_for_resume(state, session, ws)
+            else:
+                self._cleanup_orphaned_operations(state, session)
 
             self._active_runs[target_run_id] = state
             try:

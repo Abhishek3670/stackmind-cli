@@ -2723,6 +2723,61 @@ def test_manager_resume_run_invalidates_stale_operations_and_unblocks_work_order
     mgr._run_stop_events[run_id].set()
 
 
+def test_manager_resume_run_cancels_orphaned_operations_and_does_not_adopt_in_integration_review(tmp_path: Path) -> None:
+    """When an operation was abandoned in RUNNING state (e.g. server restart), resume_run must cancel it
+    and integration review must NOT adopt it as the active turn."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    created = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = created["session_id"]
+    session = mgr._sessions[sid]
+    run_id = "run-orphan-test"
+    state = mgr.supervisor.start_run(run_id, "Build product", tmp_path, sid)
+    state.completed_wo_ids = ["WO-001"]
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.integration_wo_id = "WO-002"
+
+    # Simulate an orphaned operation left in RUNNING with no alive thread
+    orphan_op_id = "op-orphaned-architecture"
+    session["journal"].append({
+        "operation_id": orphan_op_id,
+        "operation": "turn",
+        "role": "architecture",
+        "agent_id": "claude",
+        "work_order_id": "WO-002",
+        "status": "RUNNING",
+    })
+    session["active_operation"] = orphan_op_id
+    state.integration_operation_id = orphan_op_id
+    mgr._active_runs[run_id] = state
+
+    # Resume the run
+    mgr.resume_run(sid, run_id=run_id)
+
+    # 1. Orphaned operation in journal must be marked CANCELLED
+    op_record = mgr.get_operation(orphan_op_id)
+    assert op_record["status"] == "CANCELLED"
+
+    # 2. session active_operation must be cleared
+    assert session.get("active_operation") is None
+
+    # 3. Orphan op must be in ignored_operation_ids
+    assert orphan_op_id in state.ignored_operation_ids
+
+    # 4. integration_operation_id must NOT be the orphaned operation
+    assert state.integration_operation_id != orphan_op_id
+
+    # Cleanup driver thread
+    if run_id in mgr._run_stop_events:
+        mgr._run_stop_events[run_id].set()
+    if run_id in mgr._run_driver_threads:
+        mgr._run_driver_threads[run_id].join(timeout=1.0)
+
+
 # ─── Architect Escalation Loop Tests (KNOW-01 / HARNESS-01) ─────────────
 
 
