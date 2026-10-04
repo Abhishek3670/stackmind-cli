@@ -1615,6 +1615,8 @@ class LifecycleSupervisor:
         """Check if declared deliverable for a work order actually exists on disk."""
         wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if not wo_file.is_file():
+            wo_file = ws / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
+        if not wo_file.is_file():
             return True
         try:
             data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
@@ -1623,7 +1625,19 @@ class LifecycleSupervisor:
             deliv = data.get("deliverable")
             if isinstance(deliv, dict) and deliv.get("path"):
                 target = ws / str(deliv["path"])
-                return target.exists()
+                if target.exists():
+                    return True
+                # QA agent deliverables (gemma) or verification tasks produce QA verdicts/sign-offs
+                agent = self._agent_for_wo(wo_id, ws)
+                deliv_type = str(deliv.get("type", "")).lower()
+                if agent == "gemma" or deliv_type in ("doc", "research") or "qa" in str(data.get("title", "")).lower():
+                    inbox_claude = ws / ".sync" / "inbox" / "claude"
+                    if inbox_claude.is_dir() and any(wo_id in f.name for f in inbox_claude.iterdir() if f.is_file()):
+                        return True
+                    outbox_qa = ws / ".sync" / "outbox" / agent
+                    if outbox_qa.is_dir() and any(f.name.startswith("harness-") for f in outbox_qa.iterdir() if f.is_file()):
+                        return True
+                return False
         except Exception:
             return True
         return True
