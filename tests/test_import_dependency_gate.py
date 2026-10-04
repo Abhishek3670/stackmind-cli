@@ -246,6 +246,28 @@ def test_declared_dependencies_in_requirements_txt(tmp_path: Path):
     assert result.undeclared_imports == ()
 
 
+def test_flask_satisfies_transitive_werkzeug_and_jinja2(tmp_path: Path):
+    """Flask declaration satisfies core Pallets transitive imports (werkzeug, jinja2, click, itsdangerous)."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("Flask>=3.0\n", encoding="utf-8")
+    deliv = project / "db" / "init_db.py"
+    deliv.parent.mkdir(parents=True)
+    deliv.write_text(
+        "import werkzeug.security\n"
+        "from werkzeug.security import generate_password_hash, check_password_hash\n"
+        "from jinja2 import Template\n"
+        "from itsdangerous import URLSafeTimedSerializer\n",
+        encoding="utf-8",
+    )
+
+    result = check_import_satisfiability(deliv, project_root=project)
+    assert result.passed is True
+    assert result.undeclared_imports == ()
+    assert result.diagnostic is None
+
+
+
 def test_declared_optional_and_poetry_dependencies(tmp_path: Path):
     """Dependencies in optional-dependencies or tool.poetry are recognized."""
     project = tmp_path / "project"
