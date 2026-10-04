@@ -1083,12 +1083,14 @@ class LifecycleSupervisor:
             "{\n"
             '  "status": "completed",\n'
             '  "summary": "Integration review passed: all deliverables verified against requirements.",\n'
+            '  "report_markdown": "Integration review passed: all deliverables verified against requirements.",\n'
             '  "blockers": []\n'
             "}\n\n"
             "If changes are needed or deliverables cannot be verified:\n"
             "{\n"
             '  "status": "blocked",\n'
             '  "summary": "Unable to verify a deliverable.",\n'
+            '  "report_markdown": "Detailed explanation of which deliverable could not be verified and why.",\n'
             '  "blockers": ["Read access to app/rate_limiter.py was denied."]\n'
             "}\n\n"
             "CRITICAL RULES:\n"

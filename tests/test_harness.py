@@ -54,6 +54,7 @@ def _init_project(tmp_path: Path) -> Path:
 
 
 def _write_yaml(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding='utf-8')
 
 
@@ -411,4 +412,138 @@ def test_runner_adhoc_prompt_turn_fails_when_deliverable_empty(tmp_path):
     assert result.status == 'blocked'
     assert not result.persisted
     assert 'outcome_verified' in (result.reason or '')
+
+
+def test_runner_validation_work_order_without_deliverable_path_succeeds(tmp_path):
+    project = _init_project(tmp_path)
+    tree_path = project / '.sync' / 'runtime' / 'TREE.yaml'
+    tree = yaml.safe_load(tree_path.read_text(encoding='utf-8'))
+    tree['agents']['claude'] = {
+        'status': 'assigned',
+        'session_count': 1,
+        'assigned_work_orders': ['WO-007'],
+    }
+    _write_yaml(tree_path, tree)
+
+    work_order = {
+        'id': 'WO-007',
+        'type': 'VALIDATION',
+        'title': 'Integration Review',
+        'status': 'ACTIVE',
+        'priority': 'P0',
+        'assigned_agents': ['claude'],
+        'dependencies': [],
+        'deliverable': {
+            'type': 'doc',
+            'description': 'Integration review report and decision',
+        },
+        'description': 'Perform final integration review.',
+    }
+    _write_yaml(project / '.sync' / 'work-orders' / 'ACTIVE' / 'WO-007.yaml', work_order)
+
+    index_path = project / '.sync' / 'work-orders' / 'INDEX.yaml'
+    index_data = yaml.safe_load(index_path.read_text(encoding='utf-8'))
+    index_data['orders'].append({
+        'id': 'WO-007',
+        'type': 'VALIDATION',
+        'title': 'Integration Review',
+        'status': 'ACTIVE',
+        'priority': 'P0',
+        'assigned_agents': ['claude'],
+        'dependencies': [],
+    })
+    _write_yaml(index_path, index_data)
+
+    contract = {
+        'schema_version': 1,
+        'agent_id': 'claude',
+        'work_order': 'WO-007',
+        'identity': {'role': 'architecture', 'reports_to': 'ceo'},
+        'scope': {'allow': [{'module': 'PLAN.md'}], 'deny': [{'module': '.git/**'}], 'write': 'read-only'},
+        'budget': {'max_files_touched': 1, 'max_tokens': 50000},
+    }
+    _write_yaml(project / '.sync' / 'contracts' / 'WO-007.yaml', contract)
+
+    # Provider outputs payload that only specifies summary, without report_markdown or release_target
+    provider = StaticLLMProvider(
+        {
+            'status': 'completed',
+            'summary': 'Integration review passed: all deliverables verified against requirements.',
+            'blockers': [],
+            'modified_files': [],
+        }
+    )
+    runner = AgentRunner(project, 'claude', llm_provider=provider, now_fn=_fixed_now)
+    result = runner.run_once(work_order_id='WO-007')
+
+    assert result.status == 'completed'
+    assert result.persisted
+    assert result.report_path is not None and result.report_path.exists()
+
+
+def test_runner_blocked_review_decision_persists_with_blocker_reason(tmp_path):
+    project = _init_project(tmp_path)
+    tree_path = project / '.sync' / 'runtime' / 'TREE.yaml'
+    tree = yaml.safe_load(tree_path.read_text(encoding='utf-8'))
+    tree['agents']['claude'] = {
+        'status': 'assigned',
+        'session_count': 1,
+        'assigned_work_orders': ['WO-007'],
+    }
+    _write_yaml(tree_path, tree)
+
+    work_order = {
+        'id': 'WO-007',
+        'type': 'VALIDATION',
+        'title': 'Integration Review',
+        'status': 'ACTIVE',
+        'priority': 'P0',
+        'assigned_agents': ['claude'],
+        'dependencies': [],
+        'deliverable': {
+            'type': 'doc',
+            'description': 'Integration review report and decision',
+        },
+        'description': 'Perform final integration review.',
+    }
+    _write_yaml(project / '.sync' / 'work-orders' / 'ACTIVE' / 'WO-007.yaml', work_order)
+
+    index_path = project / '.sync' / 'work-orders' / 'INDEX.yaml'
+    index_data = yaml.safe_load(index_path.read_text(encoding='utf-8'))
+    index_data['orders'].append({
+        'id': 'WO-007',
+        'type': 'VALIDATION',
+        'title': 'Integration Review',
+        'status': 'ACTIVE',
+        'priority': 'P0',
+        'assigned_agents': ['claude'],
+        'dependencies': [],
+    })
+    _write_yaml(index_path, index_data)
+
+    contract = {
+        'schema_version': 1,
+        'agent_id': 'claude',
+        'work_order': 'WO-007',
+        'identity': {'role': 'architecture', 'reports_to': 'ceo'},
+        'scope': {'allow': [{'module': 'PLAN.md'}], 'deny': [{'module': '.git/**'}], 'write': 'read-only'},
+        'budget': {'max_files_touched': 1, 'max_tokens': 50000},
+    }
+    _write_yaml(project / '.sync' / 'contracts' / 'WO-007.yaml', contract)
+
+    provider = StaticLLMProvider(
+        {
+            'status': 'blocked',
+            'summary': 'Unable to verify deliverable: src/backend.py missing login route.',
+            'blockers': ['src/backend.py missing login route.'],
+            'modified_files': [],
+        }
+    )
+    runner = AgentRunner(project, 'claude', llm_provider=provider, now_fn=_fixed_now)
+    result = runner.run_once(work_order_id='WO-007')
+
+    assert result.status == 'blocked'
+    assert result.persisted
+    assert result.report_path is not None and result.report_path.exists()
+    assert 'src/backend.py missing login route.' in result.meta.get('blockers', [])
 

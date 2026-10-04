@@ -1339,7 +1339,16 @@ class SessionManager:
                 if t is None or not t.is_alive():
                     session["active_operation"] = None
 
-        _reset_phase_operation_id(state, state.phase)
+        # Only clear phase operation ID if it is dead or ignored, never if actively running
+        for attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id", "gitops_operation_id", "batch_operation_id"):
+            phase_op_id = getattr(state, attr, None)
+            if phase_op_id:
+                if phase_op_id in getattr(state, "ignored_operation_ids", []):
+                    setattr(state, attr, None)
+                else:
+                    t = self._turn_threads.get(phase_op_id)
+                    if t is None or not t.is_alive():
+                        setattr(state, attr, None)
 
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""

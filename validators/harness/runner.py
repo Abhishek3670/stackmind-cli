@@ -611,9 +611,9 @@ class AgentRunner:
                             f"Your previous output decision failed schema validation with error: {exc}.\n"
                             "Please correct your response and return ONLY valid JSON matching this schema:\n"
                             "If status is 'completed':\n"
-                            '{\n  "status": "completed",\n  "summary": "...",\n  "blockers": []\n}\n'
+                            '{\n  "status": "completed",\n  "summary": "...",\n  "report_markdown": "...",\n  "blockers": []\n}\n'
                             "If status is 'blocked':\n"
-                            '{\n  "status": "blocked",\n  "summary": "...",\n  "blockers": ["<non-empty blocker description>"]\n}\n'
+                            '{\n  "status": "blocked",\n  "summary": "...",\n  "report_markdown": "...",\n  "blockers": ["<non-empty blocker description>"]\n}\n'
                             "CRITICAL: If status is 'blocked', the 'blockers' field MUST be a non-empty JSON array of strings."
                         )
                         try:
@@ -629,6 +629,8 @@ class AgentRunner:
                             raw_retry_text = (retry_resp.message.content or '').strip()
                             retry_payload = self._parse_json_payload(raw_retry_text)
                             if retry_payload and isinstance(retry_payload, dict):
+                                if 'report_markdown' not in retry_payload and 'summary' in retry_payload:
+                                    retry_payload['report_markdown'] = retry_payload['summary']
                                 current_payload = retry_payload
                                 continue
                         except Exception:
@@ -636,17 +638,14 @@ class AgentRunner:
                     break
 
             if decision is None:
-                # Retries exhausted: record a blocked review with the reason (Requirement 3)
+                # Retries exhausted: fail closed with clear reason immediately
                 reason_str = str(last_val_exc or "invalid harness output")
-                decision = HarnessDecision(
+                return HarnessRunResult(
                     status='blocked',
-                    summary=f"Validation failed after retries: {reason_str}",
-                    report_markdown=f"Harness decision validation failed after retries: {reason_str}",
-                    blockers=(reason_str,),
-                    modified_files=(),
-                    release_target=None,
-                    retrieval_queries=(),
-                    uncertainty=(),
+                    persisted=False,
+                    task_id=task.identifier,
+                    reason=f"Harness decision validation failed after retries: {reason_str}",
+                    meta={'error': reason_str, 'blockers': [reason_str]},
                 )
 
             # 7. Post-decision validation.
@@ -1086,29 +1085,54 @@ class AgentRunner:
         return data
 
     def _validate_decision(self, task: HarnessTask, payload: dict[str, Any]) -> HarnessDecision:
+        cleaned_payload = dict(payload)
+        if 'report_markdown' not in cleaned_payload and 'summary' in cleaned_payload:
+            cleaned_payload['report_markdown'] = cleaned_payload['summary']
+        if 'summary' not in cleaned_payload and 'report_markdown' in cleaned_payload:
+            cleaned_payload['summary'] = cleaned_payload['report_markdown']
+        if 'blockers' not in cleaned_payload:
+            cleaned_payload['blockers'] = []
+        if 'modified_files' not in cleaned_payload:
+            cleaned_payload['modified_files'] = []
+
+        allowed_keys = {
+            'status',
+            'summary',
+            'report_markdown',
+            'blockers',
+            'modified_files',
+            'release_target',
+            'retrieval_queries',
+            'uncertainty',
+            'commands',
+        }
+        filtered_payload = {k: v for k, v in cleaned_payload.items() if k in allowed_keys}
+
         errors = [
             f"{'.'.join(str(part) for part in error.absolute_path) or '(root)'}: {error.message}"
-            for error in _OUTPUT_VALIDATOR.iter_errors(payload)
+            for error in _OUTPUT_VALIDATOR.iter_errors(filtered_payload)
         ]
-        status = str(payload.get('status', ''))
-        release_target = payload.get('release_target')
-        blockers = tuple(str(item) for item in payload.get('blockers', []))
+        status = str(filtered_payload.get('status', ''))
+        release_target = filtered_payload.get('release_target')
+        blockers = tuple(str(item) for item in filtered_payload.get('blockers', []))
         if task.work_order_id and task.deliverable_path and status == 'completed' and not str(release_target or '').strip():
             errors.append('release_target is required for completed work-order tasks')
         if status == 'blocked' and not blockers:
             errors.append('blocked decisions must declare blockers')
         if errors:
             raise ValueError('invalid harness output: ' + '; '.join(errors))
+        if task.work_order_id and status == 'completed' and not str(release_target or '').strip():
+            release_target = task.deliverable_path or 'patch'
         return HarnessDecision(
             status=status,
-            summary=str(payload['summary']).strip(),
-            report_markdown=str(payload['report_markdown']).strip(),
+            summary=str(filtered_payload['summary']).strip(),
+            report_markdown=str(filtered_payload['report_markdown']).strip(),
             blockers=blockers,
-            modified_files=tuple(str(item) for item in payload.get('modified_files', [])),
+            modified_files=tuple(str(item) for item in filtered_payload.get('modified_files', [])),
             release_target=str(release_target).strip() if release_target else None,
-            retrieval_queries=tuple(str(item) for item in payload.get('retrieval_queries', [])),
-            uncertainty=tuple(str(item) for item in payload.get('uncertainty', [])),
-            commands=tuple(str(item) for item in payload.get('commands', [])),
+            retrieval_queries=tuple(str(item) for item in filtered_payload.get('retrieval_queries', [])),
+            uncertainty=tuple(str(item) for item in filtered_payload.get('uncertainty', [])),
+            commands=tuple(str(item) for item in filtered_payload.get('commands', [])),
         )
 
     def _build_tool_runtime(
@@ -2210,7 +2234,7 @@ class AgentRunner:
                 code_verified = False
 
         behavioral_verified = (
-            decision.status == 'completed'
+            (decision.status == 'completed' or (decision.status == 'blocked' and bool(decision.blockers)))
             and all(result.returncode == 0 for result in command_results)
         )
 
@@ -2250,7 +2274,12 @@ class AgentRunner:
             for p in task_changed_files
         )
 
-        if getattr(task, 'is_authoring', False):
+        if decision.status == 'blocked':
+            outcome_verified = bool(decision.blockers) and bool(
+                (decision.summary and decision.summary.strip())
+                or (decision.report_markdown and decision.report_markdown.strip())
+            )
+        elif getattr(task, 'is_authoring', False):
             # Authoring turns produce governed work orders and contracts (or synthesis).
             outcome_verified = (
                 decision.status == 'completed'
