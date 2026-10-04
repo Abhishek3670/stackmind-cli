@@ -264,3 +264,56 @@ def test_supervisor_retries_outcome_verified_failure(tmp_path):
     data = yaml.safe_load(wo_path.read_text(encoding="utf-8"))
     assert data["status"] == "ACTIVE"
     assert "error" not in data
+
+
+def test_supervisor_never_times_out_while_worker_thread_alive(tmp_path: Path):
+    """Supervisor driver stays alive indefinitely while worker threads are running, even if timeout elapsed."""
+    import time
+    from threading import Event, Thread
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+
+    daemon_file = tmp_path / "daemon.json"
+    manager = SessionManager(DaemonStorage(daemon_file))
+    session = manager.create_session("codex", "mock-provider", {"allow": ["*"], "deny": []}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-alive-thread"
+    state = manager.supervisor.start_run(run_id, "Test alive thread bound", tmp_path, sid)
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001"]
+    manager._active_runs[run_id] = state
+
+    # Mock an operation in progress
+    op_id = "op-worker-alive"
+    manager.supervisor._get_operation = lambda _: {"operation_id": op_id, "status": "RUNNING"}
+    manager.supervisor._find_latest_wo_operation = lambda *_: {"operation_id": op_id, "status": "RUNNING"}
+
+    # Simulate an active background worker thread
+    stop_worker = Event()
+    def worker_loop():
+        while not stop_worker.is_set():
+            time.sleep(0.01)
+
+    worker_thread = Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
+    manager._turn_threads[op_id] = worker_thread
+
+    stop_driver = Event()
+
+    def stop_after_delay():
+        time.sleep(0.3)
+        stop_driver.set()
+
+    Thread(target=stop_after_delay, daemon=True).start()
+
+    # Run driver with 0.05s timeout — normally would trip in 50ms, but worker is alive!
+    manager._drive_run(run_id, stop_driver, max_wait_seconds=0.05)
+
+    stop_worker.set()
+    worker_thread.join(timeout=1.0)
+
+    # Supervisor must NOT have transitioned to BLOCKED
+    assert state.phase == Phase.EXECUTING
+    assert state.error is None
+

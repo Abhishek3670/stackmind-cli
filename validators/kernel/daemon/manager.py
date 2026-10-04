@@ -480,6 +480,7 @@ class SessionManager:
         self._sessions: dict[str, dict[str, Any]] = recovered["sessions"]
         self._active: dict[str, Event] = {}
         self._turn_threads: dict[str, Thread] = {}
+        self._operation_event: Event = Event()
         self._roles: dict[str, dict[str, Any]] = {k: dict(v) for k, v in _DEFAULT_ROLE_CONFIG.items()}
         if "PYTEST_CURRENT_TEST" not in os.environ:
             try:
@@ -1131,6 +1132,7 @@ class SessionManager:
                         is_authoring=True,
                     )
 
+            self._operation_event.set()
             return [dict(w) for w in created_work_orders]
 
     def reject_plan(
@@ -1327,6 +1329,7 @@ class SessionManager:
                 phase=state.phase.value,
             )
             self._save()
+            self._operation_event.set()
             return state.to_dict()
 
     def synthesize_bootstrap_planning(
@@ -1609,6 +1612,7 @@ class SessionManager:
                 error=op_err,
             )
             self._save()
+            self._operation_event.set()
             return dict(record)
 
     def cancel_session(self, session_id: str) -> dict[str, Any]:
@@ -1776,19 +1780,33 @@ class SessionManager:
 
                 if result == AdvanceResult.WAITING_FOR_HUMAN:
                     waiting_operation_started_at = None
-                    time.sleep(0.2)
+                    self._operation_event.wait(timeout=0.2)
+                    self._operation_event.clear()
                     continue
                 if result == AdvanceResult.WAITING_FOR_OPERATION:
+                    has_alive_threads = False
+                    with self._lock:
+                        has_alive_threads = any(t.is_alive() for t in self._turn_threads.values())
+
+                    if has_alive_threads:
+                        # As long as worker threads are actively executing, supervisor stays alive
+                        # and never times out (vital for slow local quantized models).
+                        waiting_operation_started_at = None
+                        self._operation_event.wait(timeout=0.5)
+                        self._operation_event.clear()
+                        continue
+
+                    # If timeout is disabled (max_wait_seconds <= 0), wait indefinitely for event
+                    if max_wait_seconds <= 0:
+                        self._operation_event.wait(timeout=0.5)
+                        self._operation_event.clear()
+                        continue
+
+                    # No threads are alive; track whether an orphaned/stuck operation has timed out
                     now_mono = time.monotonic()
                     if waiting_operation_started_at is None:
                         waiting_operation_started_at = now_mono
                     elif now_mono - waiting_operation_started_at > max_wait_seconds:
-                        has_alive_threads = False
-                        with self._lock:
-                            has_alive_threads = any(t.is_alive() for t in self._turn_threads.values())
-                        if has_alive_threads and (now_mono - waiting_operation_started_at < max_wait_seconds * 2):
-                            time.sleep(0.5)
-                            continue
                         state.error = (
                             f"Timed out waiting for operations in phase {state.phase.value} "
                             f"after {max_wait_seconds:.0f}s"
@@ -1807,7 +1825,9 @@ class SessionManager:
                             error=state.error,
                         )
                         break
-                    time.sleep(0.2)
+
+                    self._operation_event.wait(timeout=0.2)
+                    self._operation_event.clear()
                     continue
                 if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
                     try:
