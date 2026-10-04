@@ -89,7 +89,10 @@ def test_phantom_declaration_pruning(tmp_path: Path):
         norm_p for path in diff.all_changed_files
         if (norm_p := Path(path).as_posix().lstrip('/'))
     )
-    phantom_files = {p for p in dec_norm if not (staged_root / p).is_file()}
+    phantom_files = {
+        p for p in dec_norm
+        if not (staged_root / p).is_file() and p.startswith(('_scratch', 'scratch', '.sync/state', '.sync/runtime'))
+    }
     dec_effective = dec_norm - phantom_files
     declaration_matches = set(observed_task_files) == dec_effective
 

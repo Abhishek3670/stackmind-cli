@@ -810,7 +810,10 @@ class AgentRunner:
                         and not (any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes) and norm_p not in dec_norm)
                         and (task_wo_rel is None or norm_p != task_wo_rel or norm_p in dec_norm)
                     )
-                    phantom_files = {p for p in dec_norm if not (staged_root / p).is_file()}
+                    phantom_files = {
+                        p for p in dec_norm
+                        if not (staged_root / p).is_file() and p.startswith(('_scratch', 'scratch', '.sync/state', '.sync/runtime'))
+                    }
                     dec_effective = dec_norm - phantom_files
                     declaration_matches = set(observed_task_files) == dec_effective
                     if getattr(task, 'is_authoring', False) and not observed_task_files:

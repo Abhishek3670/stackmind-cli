@@ -604,6 +604,13 @@ class SessionManager:
 
     def _default_runner(self, workspace: str, agent: str) -> Any:
         import copy
+        import importlib
+        import sys
+        if "validators.harness.runner" in sys.modules:
+            try:
+                importlib.reload(sys.modules["validators.harness.runner"])
+            except Exception:
+                pass
         from validators.harness.backend import get_default_registry
         from validators.harness.runner import AgentRunner
 
