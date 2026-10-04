@@ -871,6 +871,18 @@ class LifecycleSupervisor:
 
     def _advance_integration_review(self, state: RunState) -> AdvanceResult:
         """INTEGRATION_REVIEW: dispatch Architecture with dedicated read-only scope to review deliverables."""
+        if not state.integration_operation_id:
+            try:
+                for op in reversed(self.manager.list_operations(state.session_id)):
+                    op_wo = op.get("work_order_id")
+                    op_role = str(op.get("role", "")).lower()
+                    if (op_wo == state.integration_wo_id or op_role == "architecture" or "WO-007" in str(op_wo)) and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                        state.integration_operation_id = op.get("operation_id")
+                        state.integration_wo_id = op_wo or state.integration_wo_id
+                        break
+            except Exception:
+                pass
+
         if state.integration_operation_id:
             op = self._get_operation(state.integration_operation_id)
             if op is None:
@@ -1071,15 +1083,38 @@ class LifecycleSupervisor:
             "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files."
         )
 
-        op = self.manager.start_turn(
-            state.session_id,
-            review_prompt,
-            role="architecture",
-            agent_id="claude",
-            work_order_id=review_wo_id,
-        )
-        state.integration_operation_id = op.get("operation_id")
-        return AdvanceResult.WAITING_FOR_OPERATION
+        try:
+            op = self.manager.start_turn(
+                state.session_id,
+                review_prompt,
+                role="architecture",
+                agent_id="claude",
+                work_order_id=review_wo_id,
+            )
+            state.integration_operation_id = op.get("operation_id")
+            state.contention_count = 0
+            try:
+                self.save_run_state(state, ws)
+            except Exception:
+                pass
+            return AdvanceResult.WAITING_FOR_OPERATION
+        except OperationContentionError:
+            try:
+                for op in reversed(self.manager.list_operations(state.session_id)):
+                    op_wo = op.get("work_order_id")
+                    op_role = str(op.get("role", "")).lower()
+                    if (op_wo == review_wo_id or op_role == "architecture" or "WO-007" in str(op_wo)) and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                        state.integration_operation_id = op.get("operation_id")
+                        state.integration_wo_id = op_wo or review_wo_id
+                        state.contention_count = 0
+                        try:
+                            self.save_run_state(state, ws)
+                        except Exception:
+                            pass
+                        return AdvanceResult.WAITING_FOR_OPERATION
+            except Exception:
+                pass
+            raise
 
     def _advance_product_ready(self, state: RunState) -> AdvanceResult:
         """PRODUCT_READY: discover or create GitOps WO and dispatch."""
