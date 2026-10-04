@@ -715,6 +715,35 @@ class LifecycleSupervisor:
                             state.dependency_escalation_wo_id = wo_id
                             return AdvanceResult.WAITING_FOR_OPERATION
 
+                # Check if this blockage is a transient outcome_verified / unwritten deliverable failure
+                if "outcome_verified" in err_msg or "declared deliverable" in err_msg:
+                    retries = state.retry_counts.get(wo_id, 0)
+                    if retries < state.max_retries:
+                        state.retry_counts[wo_id] = retries + 1
+                        op_id = op.get("operation_id")
+                        if op_id and op_id not in state.ignored_operation_ids:
+                            state.ignored_operation_ids.append(op_id)
+                        if wo_id in state.blocked_wo_ids:
+                            state.blocked_wo_ids.remove(wo_id)
+                        self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+                        state.error = None
+                        agent = self._agent_for_wo(wo_id, ws)
+                        deliv_path = self._get_wo_deliverable_path(wo_id, ws)
+                        target_str = f" '{deliv_path}'" if deliv_path else ""
+                        try:
+                            self.manager.start_turn(
+                                state.session_id,
+                                f"Retry work order {wo_id}: declared deliverable{target_str} was not created in previous turn. You MUST invoke write_file to author the deliverable code{target_str} (attempt {retries + 2})",
+                                role=self._role_for_agent(agent),
+                                agent_id=agent,
+                                work_order_id=wo_id,
+                            )
+                            dispatched_new = True
+                            all_done = False
+                            continue
+                        except Exception:
+                            pass
+
                 if wo_id not in state.blocked_wo_ids:
                     state.blocked_wo_ids.append(wo_id)
                 state.error = f"Work order {wo_id} blocked: {err_msg}"
@@ -1565,6 +1594,21 @@ class LifecycleSupervisor:
                         return "NEEDS_CHANGES"
                 except Exception:
                     continue
+        return None
+
+    def _get_wo_deliverable_path(self, wo_id: str, ws: Path) -> str | None:
+        """Get declared deliverable path for a work order."""
+        wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+        if not wo_file.is_file():
+            return None
+        try:
+            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                deliv = data.get("deliverable")
+                if isinstance(deliv, dict) and deliv.get("path"):
+                    return str(deliv["path"])
+        except Exception:
+            pass
         return None
 
     def _check_deliverable_exists(self, wo_id: str, ws: Path) -> bool:

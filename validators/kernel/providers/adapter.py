@@ -345,7 +345,16 @@ class OllamaAdapter(ProviderAdapter):
             return []
         text = content.strip()
         results: list[ToolCallRequest] = []
-        known_tools = {"read_file", "write_file", "run_command", "query_graph"}
+        try:
+            from validators.kernel.providers.gateway import STANDARD_KERNEL_TOOLS
+            known_tools = {t.name for t in STANDARD_KERNEL_TOOLS}
+        except ImportError:
+            known_tools = set()
+        known_tools.update({
+            "read_file", "write_file", "apply_patch", "move_file", "delete_file",
+            "format_file", "list_directory", "inspect_file_lines", "search_code",
+            "get_symbol", "run_command", "query_graph", "request_tools",
+        })
 
         # 1. <tool_call> tags
         tags = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)

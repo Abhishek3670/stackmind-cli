@@ -1419,6 +1419,8 @@ class AgentRunner:
             system_msg = (
                 'You are a governed StackMind worker. Use tools for all file I/O. '
                 f'Code execution is unavailable; the harness verifies after the final decision.{scope_line}{target_line}{action_line} '
+                'Environment notice: Virtual environments (.venv), dependencies, and tests are managed externally by the harness and QA lead. '
+                'Do not inspect, search for, or wait for .venv or shell execution. Your sole job is to author the code directly in your assigned deliverable files using write_file. '
                 'Only create or modify files permitted by your contract scope. '
                 'Once your files are written, return the final HarnessDecision as JSON.'
             )
@@ -1466,6 +1468,7 @@ class AgentRunner:
                 max_turns=self.max_turns,
                 max_tool_calls=self.max_tool_calls,
                 cancellation_token=request.cancellation,
+                required_deliverable=request.task.deliverable_path if not is_architecture else None,
             )
         except (
             ToolLimitExceededError,
@@ -1566,13 +1569,35 @@ class AgentRunner:
         if not isinstance(payload, dict):
             if guard_trip:
                 decision_source = "synthesized_after_loop_guard"
-            payload = {
-                'status': 'completed',
-                'summary': raw_text[:200] or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
-                'report_markdown': raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
-                'modified_files': written_files,
-                'blockers': [],
-            }
+
+            # Check if this was an unfulfilled writing task
+            is_unfulfilled_deliverable = False
+            if request.task.deliverable_path and not written_files:
+                deliverable_exists = False
+                try:
+                    target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+                    deliverable_exists = (target_dir / request.task.deliverable_path).exists()
+                except Exception:
+                    pass
+                if not deliverable_exists:
+                    is_unfulfilled_deliverable = True
+
+            if is_unfulfilled_deliverable:
+                payload = {
+                    'status': 'blocked',
+                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {raw_text[:200]}",
+                    'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {raw_text}",
+                    'modified_files': written_files,
+                    'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
+                }
+            else:
+                payload = {
+                    'status': 'completed',
+                    'summary': raw_text[:200] or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                    'report_markdown': raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                    'modified_files': written_files,
+                    'blockers': [],
+                }
         else:
             if guard_trip:
                 decision_source = "model"

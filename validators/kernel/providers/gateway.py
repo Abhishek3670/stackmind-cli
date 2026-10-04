@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import shlex
 import time
 from collections.abc import Sequence
@@ -1668,6 +1669,7 @@ class ProviderGateway:
         tools: Sequence[ToolDefinition] | None = None,
         timeout: float | None = None,
         cancellation_token: Any | None = None,
+        required_deliverable: str | None = None,
         **kwargs: Any,
     ) -> list[Message]:
         """Execute full autonomous reasoning/tool loop until task completion or limit."""
@@ -1687,6 +1689,9 @@ class ProviderGateway:
         deadline = time.monotonic() + timeout if timeout else None
         recent_signatures: list[tuple[str, str]] = []
         signature_counts: dict[tuple[str, str], int] = {}
+
+        empty_tool_nudges = 0
+        max_empty_tool_nudges = 2
 
         for turn_idx in range(effective_max_turns):
             check_cancellation(cancellation_token)
@@ -1710,16 +1715,35 @@ class ProviderGateway:
 
             # If the assistant gave an answer without emitting new tool calls, check if this was a false finish
             if not response.message.tool_calls:
+                norm_del = Path(required_deliverable).as_posix().lstrip("/") if required_deliverable else None
+                norm_written = {Path(p).as_posix().lstrip("/") for p in self.written_files}
+                has_unwritten_deliverable = bool(norm_del and norm_del not in norm_written)
                 has_write_tool = any(t.name == "write_file" for t in active_tools)
-                if has_write_tool and not self.written_files and turn_idx == 0:
+
+                should_nudge = (
+                    (self.total_tool_calls == 0 and has_write_tool and empty_tool_nudges < max_empty_tool_nudges)
+                    or (has_unwritten_deliverable and has_write_tool and empty_tool_nudges < max_empty_tool_nudges)
+                )
+
+                if should_nudge:
+                    empty_tool_nudges += 1
+                    target_hint = f" '{required_deliverable}'" if required_deliverable else ""
                     nudge_content = (
-                        "You responded with text without calling any tools. "
-                        "You must invoke tools to complete your assigned tasks. "
-                        "Please call `write_file` to author your required deliverables or `read_file`/`list_directory` to inspect existing code."
+                        f"You responded with text without calling tools or authoring required deliverable{target_hint}.\n"
+                        f"You MUST invoke `write_file` now to author your required deliverable{target_hint}.\n"
+                        "Note: Code execution, virtual environments, and tests are managed externally by the harness and QA lead. "
+                        "Do not wait or look for a virtual environment (.venv) or shell execution.\n"
+                        "To call write_file, invoke the tool or emit:\n"
+                        "<tool_call>\n"
+                        f'{{"name": "write_file", "arguments": {{"path": "{required_deliverable or "<file_path>"}", "content": "<file_content>"}}}}\n'
+                        "</tool_call>\n"
+                        "Please call `write_file` now."
                     )
                     messages.append(Message.user(nudge_content))
                     continue
                 return messages
+            else:
+                empty_tool_nudges = 0
 
             # Check cumulative tool call limit after executing turn
             if self.total_tool_calls >= effective_max_tool_calls:
