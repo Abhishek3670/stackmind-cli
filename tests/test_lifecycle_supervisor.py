@@ -171,6 +171,72 @@ class MockSessionManager:
 
 # ─── Fixture: git repo that skips if git is unavailable ───────────────
 
+def write_ready_artifact_set(
+    ws: Path,
+    specs: list[tuple[str, str, str, str, str]],
+) -> None:
+    """Write schema-valid WO+contract pairs that pass the authoring readiness gate.
+
+    Each spec is (wo_id, agent, role, deliverable_type, deliverable_path).
+    """
+    wo_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    contract_dir = ws / ".sync" / "contracts"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    now = "2026-01-01T00:00:00+00:00"
+    for wo_id, agent, role, deliv_type, deliv_path in specs:
+        wo_record: dict[str, Any] = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": f"Task {wo_id}",
+            "status": "ACTIVE",
+            "priority": "P1",
+            "assigned_agents": [agent],
+            "dependencies": [],
+            "deliverable": {
+                "type": deliv_type,
+                "description": f"{wo_id} deliverable",
+            },
+            "description": f"Implement {wo_id}",
+            "created": now,
+            "updated": now,
+        }
+        if deliv_path:
+            wo_record["deliverable"]["path"] = deliv_path
+            # Plan the D024 companion test for code deliverables so the
+            # readiness gate's test-coverage check passes.
+            if deliv_type == "code":
+                stem = Path(deliv_path).stem
+                wo_record["implementation_estimate"] = {
+                    "expected_files": [deliv_path, f"tests/test_{stem}.py"],
+                    "max_files_touched": 2,
+                    "rationale": "deliverable plus companion test",
+                }
+                wo_record["description"] = (
+                    f"Implement {wo_id} including companion test tests/test_{stem}.py"
+                )
+        contract_record: dict[str, Any] = {
+            "schema_version": 1,
+            "agent_id": agent,
+            "work_order": wo_id,
+            "identity": {"role": role, "reports_to": "claude"},
+            "scope": {
+                "allow": [{"module": "PLAN.md"}, {"module": ".sync/inbox/claude/**"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 5, "max_tokens": 0},
+        }
+        if deliv_path:
+            contract_record["scope"]["allow"].append({"module": deliv_path})
+        (wo_dir / f"{wo_id}.yaml").write_text(
+            yaml.safe_dump(wo_record, sort_keys=False), encoding="utf-8"
+        )
+        (contract_dir / f"{wo_id}.yaml").write_text(
+            yaml.safe_dump(contract_record, sort_keys=False), encoding="utf-8"
+        )
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Initialize a git repo in tmp_path; skip test if git is unavailable."""
@@ -296,7 +362,8 @@ def test_supervisor_approval_advances_to_authoring(tmp_path: Path) -> None:
 
 
 def test_supervisor_authoring_discovers_worker_wos(tmp_path: Path) -> None:
-    """When authoring completes, supervisor discovers worker WOs on disk and transitions to DISPATCHING."""
+    """When authoring completes, supervisor discovers worker WOs, passes the
+    authoring readiness gate, and transitions to DISPATCHING."""
     mock_mgr = MockSessionManager(tmp_path)
     supervisor = LifecycleSupervisor(mock_mgr)
     state = supervisor.start_run("run-001", "Create login", tmp_path, "sess-001")
@@ -306,21 +373,29 @@ def test_supervisor_authoring_discovers_worker_wos(tmp_path: Path) -> None:
     op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
     state.authoring_operation_id = op["operation_id"]
 
-    # Write worker WOs to disk
-    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
-    wo_dir.mkdir(parents=True, exist_ok=True)
-    (wo_dir / "WO-001.yaml").write_text("id: WO-001\nassigned_agents: [codex]\n", encoding="utf-8")
-    (wo_dir / "WO-002.yaml").write_text("id: WO-002\nassigned_agents: [gemini]\n", encoding="utf-8")
-    (wo_dir / "WO-003.yaml").write_text("id: WO-003\nassigned_agents: [local-llm]\n", encoding="utf-8")
+    # Write schema-valid worker WOs + matching contracts to disk
+    write_ready_artifact_set(tmp_path, [
+        ("WO-001", "codex", "backend", "code", "src/backend.py"),
+        ("WO-002", "gemini", "frontend", "code", "src/frontend.html"),
+        ("WO-003", "local-llm", "gitops", "doc", "VERSION.md"),
+    ])
 
     # Complete authoring op
     mock_mgr.complete_operation(op["operation_id"], "COMPLETED")
 
+    # Advance 1: authoring completion routes through the readiness gate
     res = supervisor.advance(state)
     assert res == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.AUTHORING_READINESS_GATE
+
+    # Advance 2: readiness passes → publishable revision → DISPATCHING
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.DISPATCHING
     assert state.worker_wo_ids == ["WO-001", "WO-002"]
     assert state.gitops_wo_id == "WO-003"
+    # Atomic publication: only readiness-approved WOs are dispatchable
+    assert state.published_wo_ids == ["WO-001", "WO-002"]
 
 
 def test_supervisor_dependency_resolution(tmp_path: Path) -> None:
@@ -1396,15 +1471,11 @@ def test_manager_drive_run_times_out_when_operation_stuck(tmp_path: Path) -> Non
     assert "Timed out waiting for operations" in state.error
 
 
-def test_supervisor_authoring_synthesis_fallback_when_model_emits_text(tmp_path: Path) -> None:
-    """When an authoring turn finishes without tool writes (e.g. local LLM),
-    supervisor autonomously synthesizes validated child WOs and contracts from PLAN.md
-    and transitions to DISPATCHING.
+def test_supervisor_bootstrap_synthesis_only_in_bootstrap_mode(tmp_path: Path) -> None:
+    """Deterministic child-WO synthesis is permitted ONLY in explicit bootstrap
+    mode when the authoring turn completes without authoring artifacts; without
+    bootstrap mode the run fails closed into ARCHITECT_REPAIR instead.
     """
-    mock_mgr = MockSessionManager(tmp_path)
-    supervisor = LifecycleSupervisor(mock_mgr)
-
-    # 1. Create PLAN.md on disk
     plan_content = (
         "# Project Plan: Login System Implementation\n\n"
         "## Current Architecture\n"
@@ -1417,61 +1488,122 @@ def test_supervisor_authoring_synthesis_fallback_when_model_emits_text(tmp_path:
         "- [ ] Milestone 3: Frontend Login Interface\n"
         "  - [ ] Task 3.1: Create Login Page (src/frontend.html)\n"
     )
-    (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
 
-    # 2. Propose plan in mock manager
-    mock_mgr.propose_plan(
-        "sess-001",
-        "PLAN-001",
-        title="Login System",
-        content=plan_content,
+    def _setup(plan_state: str = "APPROVED") -> tuple[MockSessionManager, LifecycleSupervisor, RunState, str]:
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+        mock_mgr.propose_plan("sess-001", "PLAN-001", title="Login System", content=plan_content)
+        plan = mock_mgr.get_plan("sess-001", "PLAN-001")
+        plan["state"] = plan_state
+        state = supervisor.start_run("run-auth-test", "Login System", tmp_path, "sess-001")
+        state.phase = Phase.AUTHORING
+        state.plan_id = "PLAN-001"
+        op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
+        state.authoring_operation_id = op["operation_id"]
+        mock_mgr.complete_operation(
+            op["operation_id"],
+            status="COMPLETED",
+            result={"status": "completed", "summary": "I have reviewed PLAN.md."},
+        )
+        return mock_mgr, supervisor, state, op["operation_id"]
+
+    # 1. Without bootstrap mode: fail closed into ARCHITECT_REPAIR — no synthesis.
+    mock_mgr, supervisor, state, _op_id = _setup()
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.ARCHITECT_REPAIR
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    assert not wo_dir.exists() or not any(wo_dir.glob("*.yaml"))
+    assert state.authoring_operation_failed is False
+    assert any(
+        issue.get("code") == "NO_WORK_ORDERS_AUTHORED" for issue in state.readiness_issues
     )
-    plan = mock_mgr.get_plan("sess-001", "PLAN-001")
-    plan["state"] = "APPROVED"
+    # The repair turn contains bounded diagnostics, not the broad authoring prompt.
+    repair_ops = [
+        o for o in mock_mgr.list_operations() if o.get("metadata", {}).get("is_repair")
+    ]
+    assert len(repair_ops) == 1
+    assert "rejection" in repair_ops[0]["prompt"].lower() or "repair" in repair_ops[0]["prompt"].lower()
 
-    # 3. Create supervised run at AUTHORING phase
-    state = supervisor.start_run("run-auth-test", "Login System", tmp_path, "sess-001")
+    # 2. With explicit bootstrap mode: synthesis still produces validated child WOs.
+    mock_mgr2, supervisor2, state2, _op2 = _setup()
+    state2.bootstrap_mode = True
+    res_a = supervisor2.advance(state2)
+    assert res_a == AdvanceResult.TRANSITIONED
+    assert state2.phase == Phase.AUTHORING_READINESS_GATE
+    res_b = supervisor2.advance(state2)
+    assert res_b == AdvanceResult.TRANSITIONED
+    assert state2.phase == Phase.DISPATCHING
+    assert state2.worker_wo_ids == ["WO-001", "WO-002", "WO-003"]
+    assert state2.published_wo_ids == ["WO-001", "WO-002", "WO-003"]
+    assert state2.error is None
+
+    wo_dir2 = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contract_dir2 = tmp_path / ".sync" / "contracts"
+    assert (wo_dir2 / "WO-001.yaml").is_file()
+    assert (wo_dir2 / "WO-002.yaml").is_file()
+    assert (wo_dir2 / "WO-003.yaml").is_file()
+    assert (contract_dir2 / "WO-001.yaml").is_file()
+    assert (contract_dir2 / "WO-002.yaml").is_file()
+    assert (contract_dir2 / "WO-003.yaml").is_file()
+
+    # Verify deliverable paths were intelligently derived
+    wo1 = yaml.safe_load((wo_dir2 / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert wo1["deliverable"]["path"] == "requirements.txt"
+
+    wo2 = yaml.safe_load((wo_dir2 / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert wo2["deliverable"]["path"] == "src/backend.py"
+
+    wo3 = yaml.safe_load((wo_dir2 / "WO-003.yaml").read_text(encoding="utf-8"))
+    assert wo3["deliverable"]["path"] == "src/frontend.html"
+
+
+def test_supervisor_authoring_failure_never_synthesizes(tmp_path: Path) -> None:
+    """A failed authoring operation transitions to ARCHITECT_REPAIR and never
+    synthesizes or dispatches generic child work orders — even in bootstrap mode.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    (tmp_path / "PLAN.md").write_text(
+        "# Project Plan: Login\n\n## Milestones & Roadmap\n- [ ] Milestone 1: Backend (src/backend.py)\n",
+        encoding="utf-8",
+    )
+    state = supervisor.start_run("run-authfail", "Login System", tmp_path, "sess-001")
     state.phase = Phase.AUTHORING
     state.plan_id = "PLAN-001"
+    state.bootstrap_mode = True  # even operator-approved bootstrap cannot rescue a failure
 
-    # 4. Simulate authoring operation that completed without writing files
     op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
     state.authoring_operation_id = op["operation_id"]
     mock_mgr.complete_operation(
         op["operation_id"],
-        status="COMPLETED",
-        result={"status": "completed", "summary": "I have reviewed PLAN.md."},
+        status="FAILED",
+        result={"status": "failed", "error": "Harness decision validation failed after retries"},
     )
 
-    # 5. Advance supervisor
     res = supervisor.advance(state)
-
-    # Must transition to DISPATCHING with discovered worker WOs
-    assert res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.DISPATCHING
-    assert state.worker_wo_ids == ["WO-001", "WO-002", "WO-003"]
-    assert state.error is None
-
-    # Check that files exist on disk and pass validation
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.ARCHITECT_REPAIR
+    assert state.authoring_operation_failed is True
+    # No child WOs or contracts were synthesized or dispatched
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     contract_dir = tmp_path / ".sync" / "contracts"
-
-    assert (wo_dir / "WO-001.yaml").is_file()
-    assert (wo_dir / "WO-002.yaml").is_file()
-    assert (wo_dir / "WO-003.yaml").is_file()
-    assert (contract_dir / "WO-001.yaml").is_file()
-    assert (contract_dir / "WO-002.yaml").is_file()
-    assert (contract_dir / "WO-003.yaml").is_file()
-
-    # Verify deliverable paths were intelligently derived
-    wo1 = yaml.safe_load((wo_dir / "WO-001.yaml").read_text(encoding="utf-8"))
-    assert wo1["deliverable"]["path"] == "requirements.txt"
-
-    wo2 = yaml.safe_load((wo_dir / "WO-002.yaml").read_text(encoding="utf-8"))
-    assert wo2["deliverable"]["path"] == "src/backend.py"
-
-    wo3 = yaml.safe_load((wo_dir / "WO-003.yaml").read_text(encoding="utf-8"))
-    assert wo3["deliverable"]["path"] == "src/frontend.html"
+    assert not wo_dir.exists() or not any(
+        f.stem != "WO-000" for f in wo_dir.glob("*.yaml")
+    )
+    assert not contract_dir.exists() or not any(
+        f.stem != "WO-000" for f in contract_dir.glob("*.yaml")
+    )
+    assert any(
+        issue.get("code") == "AUTHORING_OPERATION_FAILED" for issue in state.readiness_issues
+    )
+    # No worker dispatch happened — the only new op is the architect repair turn
+    dispatched_worker_ops = [
+        o for o in mock_mgr.list_operations()
+        if o.get("metadata", {}).get("is_repair") is None and o.get("work_order_id") not in (None, "WO-000")
+    ]
+    assert dispatched_worker_ops == []
 
 
 def test_runner_authoring_turn_does_not_require_plan_md_modification(tmp_path: Path) -> None:
@@ -1850,10 +1982,25 @@ def test_integration_review_synthesizes_dedicated_wo_and_contract(tmp_path: Path
     assert contract["agent_id"] == "claude"
     assert contract["work_order"] == state.integration_wo_id
 
-    # Verify scope includes the deliverable
+    # Verify scope includes the deliverable and frontend assets
     allow_modules = [r.get("module") for r in contract["scope"]["allow"]]
     assert "app/rate_limiter.py" in allow_modules, f"Deliverable should be in allow scope, got {allow_modules}"
     assert "PLAN.md" in allow_modules
+    assert "*.html" in allow_modules
+    assert "*.css" in allow_modules
+    assert "*.js" in allow_modules
+    assert "templates/**" in allow_modules
+    assert "static/**" in allow_modules
+
+    # Verify authorization: review contract can read frontend files but cannot write to them
+    from validators.kernel.contract import ContractNormalizer, ContractEvaluator
+    kernel_contract = ContractNormalizer.normalize(contract)
+    evaluator = ContractEvaluator()
+    can_read, _ = evaluator.authorize(kernel_contract, "read_file", "src/web/login.html")
+    assert can_read is True
+    can_write, msg = evaluator.authorize(kernel_contract, "write_file", "src/web/login.html")
+    assert can_write is False
+    assert "read-only" in msg.lower()
 
 
 def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path) -> None:
@@ -2946,4 +3093,62 @@ def test_undeclared_dependency_state_serialization_roundtrip(tmp_path: Path) -> 
     assert restored.dependency_escalation_op_id == "op-claude-999"
     assert restored.dependency_escalation_wo_id == "WO-002"
     assert restored.dependency_escalation_retries == {"WO-002": 1, "WO-003": 2}
+
+
+def test_mark_wo_completed_archives_file(tmp_path: Path) -> None:
+    """_mark_wo_status_on_disk with target_status='COMPLETED' must move file from ACTIVE to COMPLETED."""
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    completed_dir.mkdir(parents=True, exist_ok=True)
+
+    wo_file = active_dir / "WO-000.yaml"
+    wo_file.write_text(
+        yaml.safe_dump({
+            "id": "WO-000",
+            "title": "Planning Work Order",
+            "status": "ACTIVE",
+            "type": "RESEARCH",
+            "assigned_agents": ["claude"],
+        }),
+        encoding="utf-8",
+    )
+
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "total_active": 1,
+            "total_completed": 0,
+            "total_blocked": 0,
+            "orders": [
+                {
+                    "id": "WO-000",
+                    "title": "Planning Work Order",
+                    "status": "ACTIVE",
+                    "file": "work-orders/ACTIVE/WO-000.yaml",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    res = LifecycleSupervisor._mark_wo_status_on_disk(tmp_path, "WO-000", "COMPLETED")
+    assert res is True
+
+    # ACTIVE/WO-000.yaml must be unlinked
+    assert not wo_file.exists()
+
+    # COMPLETED/WO-000.yaml must exist with status COMPLETED
+    archived_file = completed_dir / "WO-000.yaml"
+    assert archived_file.is_file()
+    archived_data = yaml.safe_load(archived_file.read_text(encoding="utf-8"))
+    assert archived_data["status"] == "COMPLETED"
+
+    # INDEX.yaml must be updated
+    index_data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    assert index_data["orders"][0]["status"] == "COMPLETED"
+    assert index_data["orders"][0]["file"] == "work-orders/COMPLETED/WO-000.yaml"
+    assert index_data["total_active"] == 0
+    assert index_data["total_completed"] == 1
+
 

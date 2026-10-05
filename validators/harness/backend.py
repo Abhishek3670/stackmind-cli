@@ -22,8 +22,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 from uuid import uuid4
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from validators.clock import now as _now
 
 
 # Default prompt budget for knowledge context injected into ModelExecutionBackend
@@ -781,6 +780,14 @@ def pick_best_ollama_model(models: list[str]) -> str | None:
     if not models:
         return None
 
+    # Priority 0: Explicit preferred default model (ornith-1.5-16k)
+    for m in models:
+        if m.lower().startswith("ornith-1.5-16k") or "ornith-1.5-16k" in m.lower():
+            return m
+    for m in models:
+        if "ornith" in m.lower():
+            return m
+
     # Priority 1: Dedicated coding models (e.g. qwen2.5-coder:7b)
     for m in models:
         name_lower = m.lower()
@@ -822,7 +829,7 @@ def get_default_registry() -> BackendRegistry:
         discovered_models = discover_ollama_models(ollama_endpoint)
         best_model = pick_best_ollama_model(discovered_models)
         ollama_available = bool(discovered_models)
-        selected_model = best_model or "llama3"
+        selected_model = best_model or "ornith-1.5-16k:latest"
 
         reg.register(
             ModelExecutionBackend(

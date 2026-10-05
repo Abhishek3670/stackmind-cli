@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shlex
 import time
@@ -1286,7 +1287,49 @@ class ProviderGateway:
         self.total_tool_calls: int = 0
         self.consecutive_failures: int = 0
         self.written_files: list[str] = []
+        self.read_counts: dict[str, int] = {}
+        provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
+        is_local = provider in ("ollama", "local", "llamacpp")
+        if max_tool_output_chars == DEFAULT_MAX_TOOL_OUTPUT_CHARS and is_local:
+            max_tool_output_chars = int(os.environ.get("LOCAL_TOOL_OUTPUT_CHARS", "4000"))
         self.max_tool_output_chars: int = max_tool_output_chars
+
+    def has_written_deliverable(self, required_deliverable: str | None) -> bool:
+        if not required_deliverable:
+            return True
+        norm_del = Path(required_deliverable).as_posix().lstrip("/")
+        norm_written = {Path(p).as_posix().lstrip("/") for p in self.written_files}
+        return norm_del in norm_written
+
+    def _compact_messages_for_context(self, messages: list[Message]) -> None:
+        """Compact older tool outputs in multi-turn loops to avoid blowing model context window."""
+        provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
+        is_local = provider in ("ollama", "local", "llamacpp")
+
+        tool_indices = [i for i, m in enumerate(messages) if str(m.role).lower() == "tool"]
+        if not tool_indices:
+            return
+
+        keep_recent = 2
+        older_indices = tool_indices[:-keep_recent] if len(tool_indices) > keep_recent else []
+
+        for idx in older_indices:
+            m = messages[idx]
+            content = m.content or ""
+            max_retain = 250 if is_local else 600
+            if len(content) > max_retain:
+                head = content[:150]
+                tail = content[-80:]
+                compacted = (
+                    f"{head}\n"
+                    f"... [Earlier tool output truncated to preserve context window: {len(content)} chars omitted] ...\n"
+                    f"{tail}"
+                )
+                messages[idx] = Message.tool(
+                    content=compacted,
+                    tool_call_id=m.tool_call_id or "call_unknown",
+                    name=m.name,
+                )
 
     def _get_max_tokens(self) -> int | None:
         # Local models have no token limit (infinite budget)
@@ -1375,7 +1418,15 @@ class ProviderGateway:
 
                 result = self.tool_gateway.read_file(target)
                 self.consecutive_failures = 0
-                return truncate_tool_output(result, max_chars=self.max_tool_output_chars)
+                r_count = self.read_counts.get(target, 0) + 1
+                self.read_counts[target] = r_count
+                out = truncate_tool_output(result, max_chars=self.max_tool_output_chars)
+                if r_count > 1:
+                    out += (
+                        f"\n\n[NOTICE: You have already read '{target}' in this session ({r_count} times). "
+                        f"Do NOT read this file again. Proceed immediately to author your assigned deliverable using write_file.]"
+                    )
+                return out
 
             if name == "write_file":
                 target = args.get("path") or args.get("target") or args.get("filename") or ""
@@ -1593,11 +1644,12 @@ class ProviderGateway:
                         or args.get("file")
                         or args.get("query")
                         or args.get("q")
-                        or ""
+                        or ("." if name in ("list_directory", "glob") else "")
                     )
+                    target_display = f"'{target_str}'" if target_str else f"tool '{name}'"
                     res = (
-                        f"Error: PermissionError: Operation on '{target_str}' was denied by runtime policy/contract: {ex}. "
-                        f"CRITICAL: Do NOT retry accessing or writing '{target_str}' as it is outside your assigned scope. "
+                        f"Error: PermissionError: Operation on {target_display} was denied by runtime policy/contract: {ex}. "
+                        f"CRITICAL: Do NOT retry accessing or writing {target_display} as it is outside your assigned scope. "
                         f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
                     )
             else:
@@ -1692,9 +1744,12 @@ class ProviderGateway:
 
         empty_tool_nudges = 0
         max_empty_tool_nudges = 2
+        loop_nudges = 0
+        max_loop_nudges = 2
 
         for turn_idx in range(effective_max_turns):
             check_cancellation(cancellation_token)
+            self._compact_messages_for_context(messages)
 
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -1768,18 +1823,59 @@ class ProviderGateway:
             if len(recent_signatures) >= DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:
                 last_sig = recent_signatures[-1]
                 if all(s == last_sig for s in recent_signatures[-DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:]):
+                    if (
+                        last_sig[0] in ("read_file", "list_directory", "glob", "grep")
+                        and loop_nudges < max_loop_nudges
+                    ):
+                        loop_nudges += 1
+                        signature_counts[last_sig] = 1
+                        recent_signatures = [s for s in recent_signatures if s != last_sig] + [last_sig]
+                        target_hint = (
+                            f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
+                            if (required_deliverable and not self.has_written_deliverable(required_deliverable))
+                            else " Proceed immediately with your work."
+                        )
+                        messages.append(Message.user(
+                            f"[SYSTEM WARNING: You have called '{last_sig[0]}' {DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS} times in a row without making progress. "
+                            f"Stop repeating this call.{target_hint} Repeated identical calls will abort your turn.]"
+                        ))
+                        continue
                     raise NoProgressLoopError(
                         f"Pathological loop: identical call '{last_sig[0]}' repeated {DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS} times without progress",
                         pattern=last_sig[0],
                     )
 
             # 3. Check per-signature total occurrences across turn
+            triggered_sig = None
+            triggered_count = 0
             for sig, count in signature_counts.items():
                 if count >= DEFAULT_MAX_TOTAL_IDENTICAL_CALLS:
-                    raise NoProgressLoopError(
-                        f"Pathological loop: call '{sig[0]}' with identical arguments repeated {count} times without progress",
-                        pattern=sig[0],
+                    triggered_sig = sig
+                    triggered_count = count
+                    break
+
+            if triggered_sig is not None:
+                if (
+                    triggered_sig[0] in ("read_file", "list_directory", "glob", "grep")
+                    and loop_nudges < max_loop_nudges
+                ):
+                    loop_nudges += 1
+                    signature_counts[triggered_sig] = 1
+                    recent_signatures = [s for s in recent_signatures if s != triggered_sig] + [triggered_sig]
+                    target_hint = (
+                        f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
+                        if (required_deliverable and not self.has_written_deliverable(required_deliverable))
+                        else " Proceed immediately with your work."
                     )
+                    messages.append(Message.user(
+                        f"[SYSTEM WARNING: You have called '{triggered_sig[0]}' with identical arguments {triggered_count} times without making progress. "
+                        f"Stop repeating this call.{target_hint} Repeated identical calls will abort your turn.]"
+                    ))
+                    continue
+                raise NoProgressLoopError(
+                    f"Pathological loop: call '{triggered_sig[0]}' with identical arguments repeated {triggered_count} times without progress",
+                    pattern=triggered_sig[0],
+                )
 
         # If loop exited all turns while still emitting tool calls, it was exhausted
         raise ToolLoopExhaustedError(

@@ -305,7 +305,7 @@ KNOWN_IMPORT_TO_DISTRIBUTIONS: dict[str, set[str]] = {
     "grpc": {"grpcio"},
     "crypto": {"pycryptodome", "pycrypto"},
     "cryptography": {"cryptography"},
-    "sqlalchemy": {"sqlalchemy"},
+    "sqlalchemy": {"sqlalchemy", "flask-sqlalchemy"},
     "tornado": {"tornado"},
     "redis": {"redis"},
     "celery": {"celery"},

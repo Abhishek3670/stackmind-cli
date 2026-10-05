@@ -312,6 +312,11 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def node_hash(node: ast.AST) -> str:
+    """Deterministic hash of an AST node structure."""
+    return hashlib.sha256(ast.dump(node, include_attributes=False).encode("utf-8")).hexdigest()
+
+
 def _rel_path(root: Path, path: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 

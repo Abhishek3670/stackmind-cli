@@ -17,6 +17,25 @@ from typing import Any, Mapping
 import yaml
 
 
+def canonical_blocker_text(block_msg: Any) -> str:
+    """Collapse a blocker payload into one canonical display string.
+
+    Structured evidence packets (failure_code + work order + contract revision)
+    render as a single deduplicated canonical line; raw evidence remains
+    available in the underlying payload instead of being repeated in the list.
+    """
+    text = str(block_msg or "")
+    if isinstance(block_msg, Mapping):
+        failure = block_msg.get("failure")
+        if isinstance(failure, Mapping):
+            code = str(failure.get("failure_code") or "BLOCKED")
+            wo = str(failure.get("work_order_id") or "?")
+            rev = failure.get("contract_revision", 1)
+            msg = str(failure.get("canonical_message") or block_msg.get("error") or "")
+            return f"{code} [{wo} rev {rev}] {msg}".strip()
+    return text
+
+
 class ProjectPhase(str, Enum):
     INITIALIZING = "INITIALIZING"
     PLAN_PROPOSED = "PLAN_PROPOSED"
@@ -670,16 +689,19 @@ class AutonomousDeliveryState:
                 if not isinstance(entry, Mapping):
                     continue
                 op_id = entry.get("operation_id")
-                if op_id and op_id not in self.operations:
-                    role = entry.get("role") or self._infer_role_from_op(entry.get("operation", ""))
-                    backend = entry.get("backend") or "Codex"
+                if op_id:
                     status = entry.get("status", "RUNNING")
-                    parent_id = entry.get("parent_operation_id")
-                    node = OperationNode(op_id, entry.get("operation", role), role=role, backend=backend, status=status, parent_id=parent_id)
-                    self.operations[op_id] = node
-                    if parent_id and parent_id in self.operations:
-                        if op_id not in self.operations[parent_id].children:
-                            self.operations[parent_id].children.append(op_id)
+                    if op_id not in self.operations:
+                        role = entry.get("role") or self._infer_role_from_op(entry.get("operation", ""))
+                        backend = entry.get("backend") or "Codex"
+                        parent_id = entry.get("parent_operation_id")
+                        node = OperationNode(op_id, entry.get("operation", role), role=role, backend=backend, status=status, parent_id=parent_id)
+                        self.operations[op_id] = node
+                        if parent_id and parent_id in self.operations:
+                            if op_id not in self.operations[parent_id].children:
+                                self.operations[parent_id].children.append(op_id)
+                    else:
+                        self.operations[op_id].status = status
         active_op = session.get("active_operation")
         if not active_op and "op-root" in self.operations:
             self.operations.pop("op-root", None)
@@ -687,12 +709,16 @@ class AutonomousDeliveryState:
         run_phase = session.get("phase") or (session.get("run", {}).get("phase") if isinstance(session.get("run"), Mapping) else None)
         if run_phase:
             rp_str = str(run_phase).upper()
-            if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING"):
+            if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
+                          "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION"):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
             elif rp_str == "AWAITING_APPROVAL":
                 self.phase = ProjectPhase.AWAITING_APPROVAL
             elif rp_str in ("COMPLETE", "PRODUCT_READY"):
                 self.phase = ProjectPhase.PROJECT_COMPLETE
+                self.is_complete = True
+                for k in self.completion_checklist:
+                    self.completion_checklist[k] = True
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
         if not isinstance(wo_records, list):
@@ -1116,7 +1142,9 @@ class AutonomousDeliveryState:
                         op.status = "BLOCKED"
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "BLOCKED"
-            self.add_activity(normalized_role, "blocked", str(block_msg))
+            # Canonical blocker display: one entry per (failure_code, work
+            # order, contract revision); raw evidence stays nested in the payload.
+            self.add_activity(normalized_role, "blocked", canonical_blocker_text(block_msg), deduplicate=True)
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")
@@ -1161,12 +1189,36 @@ class AutonomousDeliveryState:
                         self.verification_dimensions[norm_k] = bool(v)
             self.add_activity("StackMind", "recorded 6-D verification matrix")
 
-        elif name == "project.completed" or name == "project.complete":
+        elif name in {"run.complete", "project.completed", "project.complete"}:
             self.phase = ProjectPhase.PROJECT_COMPLETE
             for k in self.completion_checklist:
                 self.completion_checklist[k] = True
             self.is_complete = True
             self.add_activity("StackMind", "delivered project complete handover")
+
+        elif name == "run.phase":
+            phase_val = str(payload.get("phase", "")).upper()
+            if phase_val in ("COMPLETE", "PRODUCT_READY"):
+                self.phase = ProjectPhase.PROJECT_COMPLETE
+                for k in self.completion_checklist:
+                    self.completion_checklist[k] = True
+                self.is_complete = True
+                self.add_activity("StackMind", "project phase complete")
+            elif phase_val in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
+                               "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION"):
+                self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+            elif phase_val == "AWAITING_APPROVAL":
+                self.phase = ProjectPhase.AWAITING_APPROVAL
+            elif phase_val == "BLOCKED":
+                self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+            elif phase_val == "FAILED":
+                self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+
+        elif name == "run.blocked":
+            self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+
+        elif name == "run.failed":
+            self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
 
 
 __all__ = [

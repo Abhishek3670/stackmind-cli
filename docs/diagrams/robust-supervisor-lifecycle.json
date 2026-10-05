@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {"title": "Robust Governed Delivery Lifecycle", "output": "docs/diagrams/robust-supervisor-lifecycle.html", "viewBox": [1080, 760], "quality_profile": "showcase"},
+  "lanes": [
+    {"id": "main", "label": "Authoritative delivery path"},
+    {"id": "recovery", "label": "Architect-owned recovery"},
+    {"id": "terminal", "label": "Controlled outcomes"}
+  ],
+  "states": [
+    {"id": "goal", "type": "start", "label": "Goal accepted", "sublabel": "Supervisor opens run", "lane": "main", "col": 0, "step": "01"},
+    {"id": "plan", "type": "active", "label": "Architecture plan", "sublabel": "Claude owns intent", "lane": "main", "col": 1, "step": "02"},
+    {"id": "author", "type": "active", "label": "Author contracts", "sublabel": "Scope and budget", "lane": "main", "col": 2, "step": "03"},
+    {"id": "validate", "type": "decision", "label": "Validate graph", "sublabel": "Schema and coverage", "lane": "main", "col": 3, "step": "04"},
+    {"id": "dispatch", "type": "active", "label": "Dispatch worker", "sublabel": "Verified WO only", "lane": "main", "col": 4, "step": "05"},
+    {"id": "completed", "type": "success", "label": "Advance", "sublabel": "QA approved", "lane": "main", "col": 4, "yOffset": 180, "step": "06"},
+    {"id": "author-rejected", "type": "failure", "label": "Authoring rejected", "sublabel": "Invalid or incomplete", "lane": "recovery", "col": 0, "yOffset": 0},
+    {"id": "architect-repair", "type": "active", "label": "Architect repair", "sublabel": "Amend or split", "lane": "recovery", "col": 1, "yOffset": 100},
+    {"id": "worker-blocked", "type": "failure", "label": "Worker blocked", "sublabel": "Verified evidence", "lane": "recovery", "col": 2, "yOffset": 280},
+    {"id": "human-decision", "type": "waiting", "label": "Human decision", "sublabel": "New scope or risk", "lane": "terminal", "col": 0},
+    {"id": "terminal-block", "type": "failure", "label": "Terminal block", "sublabel": "Evidence retained", "lane": "terminal", "col": 1}
+  ],
+  "transitions": [
+    {"from": "goal", "to": "plan", "variant": "emphasis"},
+    {"from": "plan", "to": "author"},
+    {"from": "author", "to": "validate"},
+    {"from": "validate", "to": "dispatch", "variant": "emphasis"},
+    {"from": "dispatch", "to": "completed", "route": "drop", "variant": "emphasis"},
+    {"from": "author", "to": "author-rejected", "route": "drop", "variant": "security"},
+    {"from": "author-rejected", "to": "architect-repair", "route": "bottom-channel", "variant": "emphasis"},
+    {"from": "architect-repair", "to": "author", "route": "top-channel", "variant": "emphasis"},
+    {"from": "dispatch", "to": "worker-blocked", "route": "right-channel", "variant": "security"},
+    {"from": "worker-blocked", "to": "architect-repair", "route": "bottom-channel", "variant": "default"},
+    {"from": "architect-repair", "to": "human-decision", "route": "left-channel", "variant": "security"},
+    {"from": "worker-blocked", "to": "terminal-block", "route": "drop", "variant": "security"}
+  ],
+  "cards": [
+    {"dot": "cyan", "title": "Supervisor", "items": ["Owns state, scheduling, validation, and immutable evidence", "Never invents business work after Architect authoring fails"]},
+    {"dot": "violet", "title": "Architect", "items": ["Owns plan quality, contracts, and recovery decisions", "Receives an evidence packet and re-authors affected artifacts"]},
+    {"dot": "emerald", "title": "Workers and QA", "items": ["Workers execute validated contracts only", "QA approval gates downstream advancement"]}
+  ]
+}

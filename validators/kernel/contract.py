@@ -166,7 +166,10 @@ class ContractEvaluator:
         self, contract: AgentContract, operation_type: str, target: str
     ) -> tuple[bool, str]:
         if not target:
-            return False, "missing target"
+            if operation_type in ("list_directory", "glob"):
+                target = "."
+            else:
+                return False, "missing target"
         if target.startswith(("/", "\\")) or ".." in target.replace("\\", "/").split("/"):
             return False, "target path traversal is forbidden"
         if operation_type in self._SESSION_OPERATIONS or target.startswith("session/"):
@@ -183,5 +186,19 @@ class ContractEvaluator:
         if any(normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/") for p in self._PROTOCOL_TARGET_PREFIXES):
             return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
+            # For read-only directory enumeration (list_directory, glob), permit
+            # listing the workspace root or any directory that is an ancestor of
+            # an explicitly allowed rule (so the agent can navigate to its deliverables).
+            if operation_type in ("list_directory", "glob"):
+                import posixpath
+                norm_t = posixpath.normpath(target.replace("\\", "/").strip("/"))
+                if norm_t in ("workspace", ".", ""):
+                    return True, "authorized"
+                norm_t_clean = norm_t[len("workspace/"):] if norm_t.startswith("workspace/") else norm_t
+                for a in contract.allow:
+                    norm_a = posixpath.normpath(a.replace("\\", "/").strip("/"))
+                    norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
+                    if norm_a_clean.startswith(norm_t_clean + "/") or norm_a.startswith(norm_t + "/"):
+                        return True, "authorized"
             return False, "target is outside allowed scope"
         return True, "authorized"

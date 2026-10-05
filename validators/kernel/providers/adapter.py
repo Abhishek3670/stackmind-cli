@@ -321,7 +321,7 @@ class OllamaAdapter(ProviderAdapter):
         self,
         *,
         endpoint: str = "http://localhost:11434",
-        model: str = "qwen2.5-coder:7b",
+        model: str = "ornith-1.5-16k:latest",
         provider_name: str = "ollama",
         default_timeout: float | None = None,
         options: dict[str, Any] | None = None,
@@ -333,6 +333,16 @@ class OllamaAdapter(ProviderAdapter):
             default_timeout = float(os.environ.get("OLLAMA_TIMEOUT", os.environ.get("PROVIDER_TIMEOUT", 900.0)))
         self.default_timeout = default_timeout
         self.options = dict(options) if options else {}
+        if "num_ctx" not in self.options:
+            try:
+                self.options["num_ctx"] = int(os.environ.get("OLLAMA_NUM_CTX", 16384))
+            except ValueError:
+                self.options["num_ctx"] = 16384
+        if "num_predict" not in self.options:
+            try:
+                self.options["num_predict"] = int(os.environ.get("OLLAMA_NUM_PREDICT", 4096))
+            except ValueError:
+                self.options["num_predict"] = 4096
         if "num_gpu" not in self.options and "OLLAMA_NUM_GPU" in os.environ:
             try:
                 self.options["num_gpu"] = int(os.environ["OLLAMA_NUM_GPU"])
@@ -356,16 +366,37 @@ class OllamaAdapter(ProviderAdapter):
             "get_symbol", "run_command", "query_graph", "request_tools",
         })
 
-        # 1. <tool_call> tags
+        # 1. <tool_call> tags (JSON or XML)
         tags = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
         for tag in tags:
+            tag_str = tag.strip()
+            # 1a. Try JSON inside <tool_call>
             try:
-                data = json.loads(tag.strip())
+                data = json.loads(tag_str)
                 if isinstance(data, dict) and data.get("name") in known_tools:
                     args = data.get("arguments", data.get("parameters", {}))
                     results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", data["name"], args))
+                    continue
             except Exception:
                 pass
+
+            # 1b. Try XML function inside <tool_call>: <function=name><parameter=k>v</parameter></function>
+            fn_matches = re.finditer(r"<function=([a-zA-Z0-9_-]+)>(.*?)(?:</function>|$)", tag_str, re.DOTALL)
+            for fn_m in fn_matches:
+                fn_name = fn_m.group(1)
+                fn_body = fn_m.group(2)
+                args = {}
+                for pm in re.finditer(r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</parameter>", fn_body, re.DOTALL):
+                    p_name = pm.group(1)
+                    p_val = pm.group(2)
+                    try:
+                        p_val = json.loads(p_val)
+                    except Exception:
+                        pass
+                    args[p_name] = p_val
+                if fn_name in known_tools or not known_tools:
+                    results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", fn_name, args))
+
         if results:
             return results
 
@@ -382,7 +413,26 @@ class OllamaAdapter(ProviderAdapter):
         if results:
             return results
 
-        # 3. Streaming json parsing
+        # 3. Direct XML function outside <tool_call>
+        fn_matches = re.finditer(r"<function=([a-zA-Z0-9_-]+)>(.*?)(?:</function>|$)", text, re.DOTALL)
+        for fn_m in fn_matches:
+            fn_name = fn_m.group(1)
+            fn_body = fn_m.group(2)
+            args = {}
+            for pm in re.finditer(r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</parameter>", fn_body, re.DOTALL):
+                p_name = pm.group(1)
+                p_val = pm.group(2)
+                try:
+                    p_val = json.loads(p_val)
+                except Exception:
+                    pass
+                args[p_name] = p_val
+            if fn_name in known_tools or not known_tools:
+                results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", fn_name, args))
+        if results:
+            return results
+
+        # 4. Streaming json parsing
         decoder = json.JSONDecoder()
         idx = 0
         while idx < len(text):

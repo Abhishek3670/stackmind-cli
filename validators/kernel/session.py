@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
 from .contract import AgentContract
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+from validators.clock import utc_now
 
 
 class LifecycleState(str, Enum):

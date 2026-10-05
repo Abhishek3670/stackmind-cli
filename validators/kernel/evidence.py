@@ -25,10 +25,11 @@ from validators.kernel.workspace import ScratchWorkspace, WorkspaceEscapeError
 
 
 def _hash_file(path: Path) -> str | None:
-    if not path.exists() or not path.is_file():
+    if not path.is_file():
         return None
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        with open(path, "rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest()
     except (OSError, PermissionError):
         return None
 

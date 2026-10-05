@@ -66,8 +66,7 @@ _DEFAULT_ROLE_CONFIG = {
 }
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from validators.clock import now as _now
 
 
 def _is_narrower_or_equal(child_pat: str, parent_pat: str) -> bool:
@@ -324,6 +323,7 @@ def synthesize_bootstrap_planning(
                 {"module": "PLAN.md"},
                 {"module": ".sync/work-orders/**"},
                 {"module": ".sync/contracts/**"},
+                {"module": ".sync/decisions/**"},
                 {"module": ".sync/inbox/local-llm/**"},
                 {"module": ".sync/inbox/claude/**"},
             ],
@@ -587,6 +587,8 @@ class SessionManager:
                                             self.supervisor.save_run_state(loaded_state, ws)
                                         except Exception:
                                             pass
+                                    else:
+                                        self._cleanup_orphaned_operations(loaded_state, session)
                                     stop_ev = Event()
                                     self._run_stop_events[r_id] = stop_ev
                                     drv_thread = Thread(
@@ -645,7 +647,7 @@ class SessionManager:
                 endpoint = getattr(backend, "endpoint", None) or os.getenv("OLLAMA_HOST", "http://localhost:11434")
                 if endpoint and not endpoint.startswith("http"):
                     endpoint = f"http://{endpoint}"
-                m = model_name or getattr(backend, "model", "qwen2.5-coder:7b") or "qwen2.5-coder:7b"
+                m = model_name or getattr(backend, "model", "ornith-1.5-16k:latest") or "ornith-1.5-16k:latest"
                 t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
                 provider_adapter = OllamaAdapter(endpoint=endpoint, model=m, default_timeout=float(t_val) if t_val else None)
             elif backend_id in ("openai", "openai-compatible"):
@@ -1138,7 +1140,10 @@ class SessionManager:
                         "(e.g. WO-001.yaml) conforming to schemas/work-order.schema.json.\n"
                         "3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
                         "conforming to schemas/contract.schema.json.\n"
-                        "4. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
+                        "4. QA/verification Work Orders (assigned to gemma) MUST declare an executable code deliverable under tests/ "
+                        "— the test suite the QA worker will author and execute end-to-end — and every code deliverable needs a "
+                        "planned companion test (e.g. tests/test_<stem>.py).\n"
+                        "5. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
                         "and modified_files listing all authored files."
                     )
                     turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
@@ -1517,6 +1522,18 @@ class SessionManager:
             else:
                 session["active_operation"] = operation_id
 
+            if work_order_id:
+                try:
+                    ws_dir = Path(session.get("workspace", "."))
+                    c_path = ws_dir / ".sync" / "contracts" / f"{work_order_id}.yaml"
+                    if c_path.exists():
+                        loaded_contract = yaml.safe_load(c_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded_contract, dict):
+                            session["contract"] = loaded_contract
+                            self.events.publish("contract.loaded", session_id, contract=loaded_contract)
+                except Exception:
+                    pass
+
             self._active[operation_id] = cancel
             session["journal"].append(record)
             payload = {
@@ -1771,7 +1788,16 @@ class SessionManager:
                     # S1 Wiring: register run with supervisor and launch background driver
                     created_run_id = f"run-{uuid4().hex[:8]}"
                     from .supervisor import Phase
-                    run_state = self.supervisor.start_run(created_run_id, prompt, ws_path, session_id)
+                    # An operator-dispatched goal is the explicit bootstrap-mode
+                    # approval: deterministic child-WO synthesis stays available
+                    # for this run but is never triggered by an authoring failure.
+                    run_state = self.supervisor.start_run(
+                        created_run_id,
+                        prompt,
+                        ws_path,
+                        session_id,
+                        bootstrap_mode=bool(params.get("bootstrap_mode", True)),
+                    )
                     run_state.planning_wo_id = wo_rec["id"]
                     self._active_runs[created_run_id] = run_state
                     stop_event = Event()
@@ -2037,18 +2063,32 @@ class SessionManager:
             res_meta = getattr(result, "meta", None) or {}
             res_reason = getattr(result, "reason", None)
             res_status = getattr(result, "status", "completed")
+            blocker_list = res_meta.get("blockers") or ([res_reason] if res_reason else [])
+            computed_err = res_reason or ("; ".join(str(b) for b in blocker_list) if blocker_list else None) or res_meta.get("summary") or res_status
             result_data = {
                 "status": res_status,
                 "persisted": getattr(result, "persisted", False),
                 "task_id": getattr(result, "task_id", None),
                 "reason": res_reason,
-                "error": res_reason or res_status,
+                "error": computed_err,
                 "report_path": str(result.report_path) if getattr(result, "report_path", None) else None,
                 "summary": res_meta.get("summary"),
-                "blockers": res_meta.get("blockers") or ([res_reason] if res_reason else []),
+                "blockers": blocker_list,
                 "backend_id": b_id if isinstance(b_id, str) else None,
                 "model": b_mod if isinstance(b_mod, str) else None,
             }
+            # Durable worker-blocker evidence packet (failure_code, observed files…)
+            failure_packet = res_meta.get("failure")
+            if isinstance(failure_packet, dict) and failure_packet.get("failure_code"):
+                result_data["failure"] = failure_packet
+                result_data["failure_code"] = failure_packet.get("failure_code")
+            # Execution telemetry for supervisor acceptance checks (QA evidence).
+            # Keys are attached only when the runner actually reported them so
+            # legacy/mock runners without telemetry keep legacy semantics.
+            if "commands_audit" in res_meta:
+                result_data["commands_audit"] = res_meta.get("commands_audit") or []
+            if "tool_calls_audit" in res_meta:
+                result_data["tool_calls_audit"] = res_meta.get("tool_calls_audit") or []
             if result.status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,
@@ -2108,6 +2148,27 @@ class SessionManager:
                             )
                     except Exception:
                         pass
+
+                # Selectively trigger incremental knowledge graph update if code files were modified
+                try:
+                    obs = res_meta.get("observed_changes", {})
+                    changed_files = list(
+                        set(obs.get("added", []))
+                        | set(obs.get("modified", []))
+                        | set(obs.get("deleted", []))
+                    )
+                    if not changed_files and res_meta.get("modified_files"):
+                        changed_files = list(res_meta.get("modified_files"))
+                    code_changes = [
+                        str(f).replace("\\", "/").strip().lstrip("/")
+                        for f in changed_files
+                        if not str(f).replace("\\", "/").strip().lstrip("/").startswith((".sync", ".git"))
+                    ]
+                    if code_changes:
+                        from validators.knowledge.compiler.incremental import incremental_update
+                        incremental_update(ws_path, agent=agent, changed_paths=tuple(code_changes))
+                except Exception:
+                    pass
 
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "success", operation_id=operation_id,

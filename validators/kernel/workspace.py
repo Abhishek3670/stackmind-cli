@@ -27,8 +27,18 @@ class ScratchWorkspace:
         if not authoritative.is_dir():
             raise ValueError("authoritative_root must be an existing directory")
         root = Path(tempfile.mkdtemp(prefix=f"stackmind-{attempt_id}-"))
-        shutil.copytree(authoritative, root, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".sync"))
+
+        def _ignore(directory: str, files: list[str]) -> set[str]:
+            rel = Path(directory).resolve().relative_to(authoritative)
+            ignored = set()
+            for name in files:
+                if name in (".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".coverage"):
+                    ignored.add(name)
+                elif rel == Path(".sync") and name in ("runtime", "knowledge", "snapshots", "reports", "state", "outbox", "lock", "drafts"):
+                    ignored.add(name)
+            return ignored
+
+        shutil.copytree(authoritative, root, dirs_exist_ok=True, ignore=_ignore)
         return cls(authoritative, root.resolve(), attempt_id)
 
     def path_for(self, relative_target: str) -> Path:
@@ -40,6 +50,17 @@ class ScratchWorkspace:
             resolved.relative_to(self.root)
         except ValueError as exc:
             raise WorkspaceEscapeError("Target escapes the scratch workspace") from exc
+
+        # Read fallback for .sync protocol files that exist in the authoritative repository
+        if not resolved.exists() and candidate.parts and candidate.parts[0] == ".sync":
+            auth_resolved = (self.authoritative_root / Path(candidate)).resolve()
+            try:
+                auth_resolved.relative_to(self.authoritative_root)
+                if auth_resolved.exists():
+                    return auth_resolved
+            except ValueError:
+                pass
+
         return resolved
 
     def verify(self) -> None:

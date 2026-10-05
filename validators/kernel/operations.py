@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+from validators.clock import utc_now
 
 
 class OperationType(str, Enum):

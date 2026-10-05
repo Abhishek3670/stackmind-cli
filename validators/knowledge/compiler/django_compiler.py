@@ -6,7 +6,7 @@ import ast
 import hashlib
 from dataclasses import dataclass
 
-from .parse import ParsedFile, ParsedRelation, ParsedSymbol
+from .parse import ParsedFile, ParsedRelation, ParsedSymbol, node_hash as _node_hash
 
 MODEL_BASES = {'models.Model', 'django.db.models.Model', 'Model'}
 SERIALIZER_BASES = {
@@ -629,9 +629,6 @@ def _location(node: ast.AST) -> dict[str, int]:
         'line': int(getattr(node, 'lineno', 1) or 1),
     }
 
-
-def _node_hash(node: ast.AST) -> str:
-    return hashlib.sha256(ast.dump(node, include_attributes=False).encode('utf-8')).hexdigest()
 
 
 def _safe_unparse(node: ast.AST) -> str:

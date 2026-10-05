@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stackmind Architect Recovery Decision",
+  "description": "Machine-readable decision produced by the Architect when a governed worker execution is blocked. The supervisor validates and applies this decision; it never infers one.",
+  "type": "object",
+  "required": [
+    "work_order",
+    "action",
+    "reason"
+  ],
+  "properties": {
+    "work_order": {
+      "type": "string",
+      "pattern": "^WO-[0-9]{3}$"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "retry_unchanged",
+        "amend_contract",
+        "split_work_order",
+        "create_dependency_work_order",
+        "escalate_human",
+        "terminal_block"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "failure_code": {
+      "type": "string"
+    },
+    "transient": {
+      "type": "boolean",
+      "description": "Must be true and the contract hash must be unchanged for retry_unchanged to be permitted."
+    },
+    "replacement_work_orders": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^WO-[0-9]{3}$"
+      }
+    },
+    "contract_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "New contract revision created by an amend_contract decision."
+    }
+  },
+  "additionalProperties": false
+}

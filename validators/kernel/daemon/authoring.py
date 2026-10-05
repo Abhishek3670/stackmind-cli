@@ -17,8 +17,27 @@ from validators.harness.authoring_gate import AuthoringGate
 from validators.harness.plan import parse_plan, PlanStructure
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from validators.clock import now as _now
+
+
+def _is_test_path(path: str) -> bool:
+    """True when a path denotes a test artifact (tests/ dir or test_ naming)."""
+    norm = str(path).replace("\\", "/").strip().strip("`\"'").lstrip("./")
+    if not norm:
+        return False
+    parts = norm.lower().split("/")
+    if parts[0] in ("tests", "test"):
+        return True
+    stem = Path(norm).stem.lower()
+    return stem.startswith("test_") or stem.endswith("_test")
+
+
+def _slugify(title: str, max_len: int = 48) -> str:
+    words = re.sub(r"[^a-zA-Z0-9]+", "_", str(title or "")).strip("_").lower()
+    words = re.sub(r"_+", "_", words)
+    if len(words) > max_len:
+        words = words[:max_len].rstrip("_")
+    return words or "qa_suite"
 
 
 def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) -> dict[str, str]:
@@ -62,9 +81,18 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
         }
 
     if role_norm in ("gemma", "qa"):
+        # QA work orders deliver an executable test suite the QA worker authors
+        # and runs end-to-end — never a bare sign-off document (D024 requires a
+        # companion test file for every code deliverable at GitOps time).
+        test_path = next((p for p in candidate_paths if _is_test_path(p)), None)
+        if not test_path:
+            test_path = f"tests/test_{_slugify(milestone_title)}.py"
         return {
-            "type": "doc",
-            "description": f"Test verification and QA sign-off for {milestone_title}",
+            "type": "code",
+            "path": test_path,
+            "description": (
+                f"Executable end-to-end test suite and QA sign-off for {milestone_title}"
+            ),
         }
 
     if role_norm in ("local-llm", "gitops"):
@@ -183,6 +211,7 @@ def build_child_work_order(
     dependencies: list[str],
     priority: str,
     deliverable: dict[str, str],
+    implementation_estimate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Work Order record."""
     now = _now()
@@ -193,7 +222,7 @@ def build_child_work_order(
     if deliverable.get("path"):
         deliv_spec["path"] = deliverable["path"]
 
-    return {
+    record: dict[str, Any] = {
         "id": wo_id,
         "type": "FEATURE",
         "title": title.strip(),
@@ -206,6 +235,59 @@ def build_child_work_order(
         "created": now,
         "updated": now,
     }
+    if implementation_estimate:
+        record["implementation_estimate"] = dict(implementation_estimate)
+    return record
+
+
+def derive_implementation_estimate(
+    title: str,
+    description: str,
+    deliverable_path: str | None,
+    candidate_paths: list[str] | None = None,
+    deliverable_type: str | None = None,
+) -> dict[str, Any] | None:
+    """Derive an explicit implementation estimate from the task's expected file set.
+
+    The estimate drives the contract file budget so a scaffold task is never
+    silently blocked by an arbitrary fixed limit, and so a task whose expected
+    footprint grows beyond a small bounded set is flagged for splitting instead
+    of receiving an unbounded budget.
+
+    Every code deliverable also plans its D024 companion test
+    (``tests/test_<stem>.py``) so test authoring is part of the work order's
+    declared footprint instead of being discovered missing at GitOps time.
+    """
+    expected: list[str] = []
+    if deliverable_path:
+        expected.append(str(deliverable_path).replace("\\", "/").strip().lstrip("/"))
+    for cp in candidate_paths or []:
+        clean = str(cp).replace("\\", "/").strip().lstrip("/")
+        if clean and clean not in expected:
+            expected.append(clean)
+    if not expected:
+        return None
+
+    deliv_norm = (deliverable_path or "").replace("\\", "/").strip().lstrip("/")
+    code_exts = (".py", ".ts", ".js", ".go", ".rs", ".dart")
+    is_code_deliverable = (
+        str(deliverable_type or "").lower() == "code"
+        or (bool(deliv_norm) and deliv_norm.endswith(code_exts))
+    )
+    if (
+        is_code_deliverable
+        and deliv_norm
+        and not _is_test_path(deliv_norm)
+        and not any(_is_test_path(f) for f in expected)
+    ):
+        stem = Path(deliv_norm).stem
+        expected.append(f"tests/test_{stem}.py")
+
+    return {
+        "expected_files": expected,
+        "max_files_touched": len(expected),
+        "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
+    }
 
 
 def build_child_contract(
@@ -214,8 +296,15 @@ def build_child_contract(
     role: str,
     deliverable_path: str | None = None,
     candidate_paths: list[str] | None = None,
+    max_files_touched: int | None = None,
 ) -> dict[str, Any]:
-    """Construct a schema-conforming Contract record bound strictly to the assigned scope."""
+    """Construct a schema-conforming Contract record bound strictly to the assigned scope.
+
+    ``max_files_touched`` should come from the work order's plan-derived
+    implementation estimate.  The conservative default is retained only for
+    explicitly designated bootstrap/internal work orders — it must never be
+    used to paper over a failed Architect authoring turn.
+    """
     role_norm = role.lower().strip()
     allow_rules: list[dict[str, Any]] = [
         {"module": "PLAN.md"},
@@ -245,6 +334,8 @@ def build_child_contract(
         {"module": ".gitignore"},
         {"module": "*ignore"},
         {"module": "Makefile*"},
+        # Governance bookkeeping channel: machine-readable recovery decisions
+        {"module": ".sync/decisions/**"},
     ])
 
     if role_norm in ("backend", "codex"):
@@ -377,7 +468,7 @@ def build_child_contract(
             "write": "read-write",
         },
         "budget": {
-            "max_files_touched": 10,
+            "max_files_touched": max_files_touched if max_files_touched and max_files_touched > 0 else 10,
             "max_tokens": 0,
         },
     }
@@ -585,16 +676,6 @@ def synthesize_child_work_orders(
         if not deliv.get("path") or (primary_agent == "gemini" and str(deliv.get("path")).endswith(".txt")):
             deliv = extract_deliverable_spec(title, [desc], role)
 
-        wo_rec = build_child_work_order(
-            wo_id=wo_id,
-            title=title,
-            description=desc,
-            assigned_agents=[primary_agent],
-            dependencies=deps,
-            priority=prio,
-            deliverable=deliv,
-        )
-
         # Extract candidate paths from title and description
         combined_task_text = f"{title}\n{desc}"
         cand_matches = re.findall(
@@ -608,12 +689,34 @@ def synthesize_child_work_orders(
                 if not c_clean.startswith(".sync") and not c_clean.startswith(".git") and c_clean not in ("PLAN.md", ".env"):
                     task_candidates.append(c_clean)
 
+        # Plan-derived file budget: the contract covers exactly the files the
+        # task is expected to create/modify (including its D024 companion test)
+        # instead of a fixed limit.
+        implementation_estimate = derive_implementation_estimate(
+            title, desc, deliv.get("path"), task_candidates,
+            deliverable_type=deliv.get("type"),
+        )
+
         contract_rec = build_child_contract(
             wo_id=wo_id,
             agent_id=primary_agent,
             role=role,
             deliverable_path=deliv.get("path"),
             candidate_paths=task_candidates,
+            max_files_touched=(
+                implementation_estimate["max_files_touched"] if implementation_estimate else None
+            ),
+        )
+
+        wo_rec = build_child_work_order(
+            wo_id=wo_id,
+            title=title,
+            description=desc,
+            assigned_agents=[primary_agent],
+            dependencies=deps,
+            priority=prio,
+            deliverable=deliv,
+            implementation_estimate=implementation_estimate,
         )
 
         wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
