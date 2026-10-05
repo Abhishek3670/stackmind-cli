@@ -38,6 +38,11 @@ import yaml
 logger = logging.getLogger("stackmind.supervisor")
 
 
+def _strip_code_fences(text: str) -> str:
+    """Strip markdown code fences from model output used in run-state messages."""
+    return re.sub(r"```[a-zA-Z]*\n?", "", str(text or "")).strip()
+
+
 # ─── Lifecycle phases ─────────────────────────────────────────────────
 
 class Phase(StrEnum):
@@ -133,6 +138,7 @@ class RunState:
     superseded_wo_ids: list[str] = field(default_factory=list)
     milestone_exemptions: list[str] = field(default_factory=list)
     contract_revisions: dict[str, int] = field(default_factory=dict)
+    integration_rework_rounds: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +190,7 @@ class RunState:
             "superseded_wo_ids": list(self.superseded_wo_ids),
             "milestone_exemptions": list(self.milestone_exemptions),
             "contract_revisions": dict(self.contract_revisions),
+            "integration_rework_rounds": self.integration_rework_rounds,
         }
 
     @classmethod
@@ -237,6 +244,7 @@ class RunState:
             superseded_wo_ids=list(data.get("superseded_wo_ids", [])),
             milestone_exemptions=list(data.get("milestone_exemptions", [])),
             contract_revisions=dict(data.get("contract_revisions", {}) or {}),
+            integration_rework_rounds=int(data.get("integration_rework_rounds", 0)),
         )
 
 
@@ -488,8 +496,15 @@ class LifecycleSupervisor:
             status = str(op.get("status", "")).upper()
             if status not in _OPERATION_TERMINAL:
                 return AdvanceResult.WAITING_FOR_OPERATION
-            if status == "FAILED":
-                state.error = f"Planning turn failed: {op.get('result', {}).get('error', 'unknown')}"
+            if status in ("FAILED", "BLOCKED", "CANCELLED"):
+                op_result = op.get("result", {}) or {}
+                err_detail = (
+                    op_result.get("error")
+                    or op_result.get("reason")
+                    or op.get("error")
+                    or "unknown"
+                )
+                state.error = f"Planning turn failed ({status.lower()}): {err_detail}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED
             # Planning completed — check if a plan was proposed for this turn
@@ -1263,6 +1278,55 @@ class LifecycleSupervisor:
                     state.dependency_escalation_wo_id = wo_id
                     return AdvanceResult.WAITING_FOR_OPERATION
 
+        # A turn that declared writes but produced none is a lazy model turn:
+        # bounded retry with an explicit write instruction instead of a
+        # terminal block. (The block's scope_evidence carries declared vs
+        # observed; observed == [] means no tool was ever invoked.)
+        scope_evidence = result.get("scope_evidence") if isinstance(result.get("scope_evidence"), dict) else None
+        if scope_evidence and scope_evidence.get("observed") == []:
+            retries = state.retry_counts.get(wo_id, 0)
+            if retries < state.max_retries:
+                state.retry_counts[wo_id] = retries + 1
+                op_id = op.get("operation_id")
+                if op_id and op_id not in state.ignored_operation_ids:
+                    state.ignored_operation_ids.append(str(op_id))
+                if wo_id in state.blocked_wo_ids:
+                    state.blocked_wo_ids.remove(wo_id)
+                self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+                state.error = None
+                agent = self._agent_for_wo(wo_id, ws)
+                declared = list(scope_evidence.get("declared") or [])
+                deliv_path = self._get_wo_deliverable_path(wo_id, ws) or (
+                    declared[0] if declared else "the declared deliverable"
+                )
+                if agent == "gemma":
+                    nudge = (
+                        f"QA work order {wo_id} (attempt {retries + 2}): your previous turn "
+                        f"declared '{deliv_path}' but invoked NO tools, so nothing was written. "
+                        f"You MUST invoke the write_file tool to create '{deliv_path}' with the "
+                        f"full test-suite content, then execute it end-to-end with the run_tests "
+                        f"tool (pytest), run the run_security_scan tool over the deliverables, and "
+                        f"only then return your final decision declaring the suite in modified_files."
+                    )
+                else:
+                    nudge = (
+                        f"Retry work order {wo_id} (attempt {retries + 2}): your previous turn "
+                        f"declared {declared} but invoked NO tools, so nothing was written. You "
+                        f"MUST invoke the write_file tool to create '{deliv_path}' with the full "
+                        f"deliverable content, then return your final decision declaring it."
+                    )
+                try:
+                    self.manager.start_turn(
+                        state.session_id,
+                        nudge,
+                        role=self._role_for_agent(agent),
+                        agent_id=agent,
+                        work_order_id=wo_id,
+                    )
+                    return None  # retry dispatched — keep executing
+                except Exception as e:
+                    logger.error(f"Failed to nudge-retry {wo_id}: {e}", exc_info=True)
+
         # Check if this blockage is a transient outcome_verified, unwritten deliverable, or tool loop halt
         err_lower = err_msg.lower()
         is_transient_blockage = (
@@ -1343,6 +1407,7 @@ class LifecycleSupervisor:
 
     def _advance_integration_review(self, state: RunState) -> AdvanceResult:
         """INTEGRATION_REVIEW: dispatch Architecture with dedicated read-only scope to review deliverables."""
+        ws = Path(state.workspace)
         if not state.integration_operation_id:
             adopted = self._adopt_running_integration_operation(state, state.integration_wo_id)
             if adopted is not None:
@@ -1364,12 +1429,68 @@ class LifecycleSupervisor:
             result_status = str(op_result.get("status", "")).lower()
 
             if status == "BLOCKED" or result_status == "blocked":
-                # Valid blocked decision from review — recoverable blocked state per Requirement 4
+                # A valid blocked review routes its blockers back to the
+                # implementation and QA workers for bounded rework; the review
+                # re-runs after they complete. Terminal BLOCKED only when the
+                # rework rounds are exhausted.
                 blockers = op_result.get("blockers") or []
                 if not blockers and op_result.get("reason"):
                     blockers = [op_result["reason"]]
                 state.integration_blockers = list(str(b) for b in blockers)
-                err_msg = "; ".join(state.integration_blockers) if state.integration_blockers else op_result.get("summary", "Blockers reported during integration review")
+                err_msg = (
+                    "; ".join(state.integration_blockers)
+                    if state.integration_blockers
+                    else _strip_code_fences(str(op_result.get("summary", "Blockers reported during integration review")))
+                )
+
+                reworkable = self._reworkable_integration_wos(state, ws, state.integration_blockers)
+                if state.integration_rework_rounds < state.max_retries and reworkable:
+                    state.integration_rework_rounds += 1
+                    if state.integration_operation_id and state.integration_operation_id not in state.ignored_operation_ids:
+                        state.ignored_operation_ids.append(state.integration_operation_id)
+                    state.integration_operation_id = None
+                    feedback = err_msg or "review could not verify the deliverables"
+                    # S6 concurrency: multiple rework turns dispatch under a
+                    # shared batch parent so they don't contend for the root
+                    # operation slot.
+                    parent_op_id = None
+                    if len(reworkable) > 1 and hasattr(self.manager, "begin_operation"):
+                        try:
+                            _, parent_op_id = self.manager.begin_operation(
+                                state.session_id,
+                                "parallel_dispatch",
+                                {"work_orders": reworkable, "rework_round": state.integration_rework_rounds},
+                                role="supervisor",
+                            )
+                            state.batch_operation_id = parent_op_id
+                        except Exception:
+                            parent_op_id = None
+                    for wo_id in reworkable:
+                        self._unarchive_work_order(ws, wo_id)
+                        if wo_id in state.completed_wo_ids:
+                            state.completed_wo_ids.remove(wo_id)
+                        agent = self._agent_for_wo(wo_id, ws)
+                        try:
+                            self.manager.start_turn(
+                                state.session_id,
+                                (
+                                    f"Rework work order {wo_id} (integration review round "
+                                    f"{state.integration_rework_rounds}/{state.max_retries}): the "
+                                    f"integration review blocked release with these blockers: "
+                                    f"{feedback}. Fix your deliverable so every blocker is "
+                                    f"resolved, then resubmit."
+                                ),
+                                role=self._role_for_agent(agent),
+                                agent_id=agent,
+                                work_order_id=wo_id,
+                                parent_operation_id=parent_op_id,
+                            )
+                        except Exception:
+                            state.failed_wo_ids.append(wo_id)
+                    state.error = None
+                    self._transition(state, Phase.EXECUTING)
+                    return AdvanceResult.WAITING_FOR_OPERATION
+
                 state.error = f"Integration review blocked: {err_msg}"
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
@@ -1383,7 +1504,6 @@ class LifecycleSupervisor:
             self._transition(state, Phase.PRODUCT_READY)
             return AdvanceResult.TRANSITIONED
 
-        ws = Path(state.workspace)
         if not state.integration_wo_id:
             from .authoring import get_next_work_order_int
             review_wo_id = f"WO-{get_next_work_order_int(ws):03d}"
@@ -1616,8 +1736,96 @@ class LifecycleSupervisor:
             "- When status is 'blocked', 'blockers' MUST be a non-empty string array listing each blocker. "
             "Do NOT rely on prose in the summary to satisfy the schema.\n"
             "- When status is 'completed', 'blockers' MUST be an empty array [].\n"
-            "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files."
+            "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files.\n\n"
+            "SECURITY & QUALITY CHECKLIST — verify each item while reading the deliverables and list "
+            "any unmet item as a blocker:\n"
+            "- No hardcoded secrets and no hardcoded env-fallback defaults (e.g. SECRET_KEY = "
+            "os.environ.get(..., 'literal') must fail fast instead).\n"
+            "- Debug flags are disabled for production (debug=True / DEBUG = True must not appear).\n"
+            "- Password verification does not re-derive hashes unnecessarily; salts are stored combined "
+            "with the hash (single field), not as separate columns.\n"
+            "- State-changing forms/endpoints are protected against CSRF, and authentication endpoints "
+            "have rate limiting or lockout.\n"
+            "- Client code calls the real API endpoints (no mock/placeholder flows left behind)."
         )
+
+    def _reworkable_integration_wos(
+        self, state: RunState, ws: Path, blockers: list[str],
+    ) -> list[str]:
+        """Implementation and QA work orders that rework should re-run.
+
+        Planning, integration-review, and GitOps work orders are excluded.
+        When the blockers reference deliverable paths, only the accused work
+        orders (plus QA, which must re-verify after code changes) are
+        selected; unmappable blockers fall back to all code-producing WOs.
+        """
+        excluded = {
+            state.planning_wo_id,
+            "WO-000",
+            state.integration_wo_id,
+            state.gitops_wo_id,
+        }
+        blocker_text = " ".join(str(b) for b in blockers).lower()
+        code_wos: list[str] = []
+        qa_wos: list[str] = []
+        accused: list[str] = []
+        for wo_id in state.completed_wo_ids:
+            if wo_id in excluded:
+                continue
+            agent = self._agent_for_wo(wo_id, ws)
+            if agent not in ("codex", "gemini", "gemma"):
+                continue
+            if agent == "gemma":
+                qa_wos.append(wo_id)
+                continue
+            code_wos.append(wo_id)
+            # Rework candidates are archived — resolve the deliverable from
+            # ACTIVE or COMPLETED.
+            deliv = ""
+            for sub in ("ACTIVE", "COMPLETED"):
+                wo_file = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+                if not wo_file.is_file():
+                    continue
+                try:
+                    wdata = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                    d = wdata.get("deliverable") if isinstance(wdata, dict) else None
+                    if isinstance(d, dict) and d.get("path"):
+                        deliv = str(d["path"]).replace("\\", "/").strip().lstrip("/").lower()
+                except Exception:
+                    pass
+                break
+            if not deliv:
+                accused.append(wo_id)  # no mappable footprint — include defensively
+                continue
+            stem = Path(deliv).stem.lower()
+            if (deliv in blocker_text) or (stem and stem in blocker_text):
+                accused.append(wo_id)
+        if accused:
+            return accused + qa_wos
+        return code_wos + qa_wos
+
+    def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
+        """Return a completed work order to ACTIVE so rework can re-dispatch it."""
+        active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+        if active.is_file():
+            return self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+        completed = ws / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
+        if not completed.is_file():
+            return False
+        try:
+            data = yaml.safe_load(completed.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False
+            data["status"] = "ACTIVE"
+            data["updated"] = _now()
+            data.pop("error", None)
+            data.pop("blocked_reason", None)
+            active.parent.mkdir(parents=True, exist_ok=True)
+            active.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+            completed.unlink()
+            return True
+        except Exception:
+            return False
 
     def _advance_product_ready(self, state: RunState) -> AdvanceResult:
         """PRODUCT_READY: discover or create GitOps WO and dispatch."""
@@ -1766,8 +1974,13 @@ class LifecycleSupervisor:
                 f"1. Author the declared test suite '{deliv_path}' with write_file — thorough "
                 f"end-to-end coverage of the deliverables produced by the other work orders.\n"
                 f"2. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
-                f"3. Do not modify application code; if the suite exposes defects, report them as blockers.\n"
-                f"4. Write your QA verdict to .sync/inbox/claude/ and declare '{deliv_path}' in modified_files."
+                f"3. Run the run_security_scan tool over the deliverables (src/) and triage the output; "
+                f"report every unresolved finding as a blocker.\n"
+                f"4. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
+                f"5. Write your QA verdict to .sync/inbox/claude/ and declare '{deliv_path}' in modified_files.\n"
+                "Review against the security checklist: no hardcoded secrets or env-fallback defaults, "
+                "debug flags disabled, authentication logic free of obvious flaws, and forms protected "
+                "against CSRF/replay where applicable."
             )
         return f"Execute work order {wo_id}"
 
@@ -1813,6 +2026,32 @@ class LifecycleSupervisor:
                 f"no test execution was recorded for '{deliv_path}' "
                 f"(run_tests/pytest absent from the turn audit)"
             )
+
+        # QA must also run the deterministic security scan — the report-class
+        # findings (hardcoded secret fallbacks, debug flags) that a model
+        # reviewer routinely misses.
+        def _is_security_scan(entry: Any) -> bool:
+            try:
+                text = (
+                    json.dumps(entry, default=str).lower()
+                    if not isinstance(entry, str) else entry.lower()
+                )
+            except Exception:
+                text = str(entry).lower()
+            return (
+                "run_security_scan" in text
+                or "security_scan" in text
+                or "bandit" in text
+                or "semgrep" in text
+                or "pip-audit" in text
+            )
+
+        if not any(_is_security_scan(e) for e in audit_entries):
+            return (
+                f"no security scan was recorded (run_security_scan absent from "
+                f"the turn audit); run it over the deliverables and report any "
+                f"finding as a blocker"
+            )
         return None
 
     def _handle_qa_evidence_gap(
@@ -1831,9 +2070,10 @@ class LifecycleSupervisor:
                     state.session_id,
                     (
                         f"QA work order {wo_id} (attempt {retries + 2}): {gap}. You MUST author "
-                        f"the test suite '{deliv_path}' with write_file and execute it end-to-end "
-                        f"with the run_tests tool (pytest) before completing. Then write your QA "
-                        f"verdict to .sync/inbox/claude/ and declare the suite in modified_files."
+                        f"the test suite '{deliv_path}' with write_file, execute it end-to-end "
+                        f"with the run_tests tool (pytest), and run the run_security_scan tool "
+                        f"over the deliverables before completing. Then write your QA verdict "
+                        f"to .sync/inbox/claude/ and declare the suite in modified_files."
                     ),
                     role=self._role_for_agent("gemma"),
                     agent_id="gemma",
@@ -2795,15 +3035,21 @@ class LifecycleSupervisor:
                     if str(data.get("status", "")).upper() == "COMPLETED":
                         continue
                     assigned = data.get("assigned_agents", [])
-                    is_gitops = False
                     if isinstance(assigned, list):
-                        is_gitops = any(
-                            any(kw in str(a).lower().strip() for kw in ("local-llm", "local_llm", "gitops", "release"))
-                            for a in assigned
-                        )
+                        assigned_norm = [str(a).lower().strip() for a in assigned]
                     elif isinstance(assigned, str):
-                        is_gitops = any(kw in str(assigned).lower().strip() for kw in ("local-llm", "local_llm", "gitops", "release"))
-                    
+                        assigned_norm = [assigned.lower().strip()]
+                    else:
+                        assigned_norm = []
+                    # Architecture-assigned work orders (integration review)
+                    # are supervisor-orchestrated, never worker dispatches.
+                    if any(a in ("claude", "architecture") for a in assigned_norm):
+                        continue
+                    is_gitops = any(
+                        any(kw in a for kw in ("local-llm", "local_llm", "gitops", "release"))
+                        for a in assigned_norm
+                    )
+
                     wo_title = str(data.get("title", "")).lower()
                     wo_type = str(data.get("type", "")).lower()
                     if any(kw in wo_title for kw in ("gitops", "release")) or wo_type in ("release", "gitops"):
@@ -2840,9 +3086,11 @@ class LifecycleSupervisor:
         return True
 
     def _agent_for_wo(self, wo_id: str, ws: Path) -> str:
-        """Determine the primary agent for a work order."""
-        wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
-        if wo_file.exists():
+        """Determine the primary agent for a work order (ACTIVE or COMPLETED)."""
+        for sub in ("ACTIVE", "COMPLETED"):
+            wo_file = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+            if not wo_file.exists():
+                continue
             try:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict):

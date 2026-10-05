@@ -377,6 +377,13 @@ def validate_authoring_readiness(
             )
             if not qa_ok:
                 _issue(issues, "QA_DELIVERABLE_NOT_EXECUTABLE", "coverage", f"QA work order '{wo_id}' must declare a code deliverable under tests/ " f"(the test suite its worker will author and execute), got " f"type '{deliverable.get('type') if isinstance(deliverable, dict) else '?'}' " f"path '{deliv_path or 'none'}'", work_order_id=wo_id, artifact_path=rel)
+            # The QA verdict channel must be authorized: gemma delivers its
+            # verdict to the Architect's inbox, and the dispatch prompt
+            # instructs exactly that write.
+            if contract is not None and not _scope_allows(
+                contract.data, ".sync/inbox/claude/qa-verdict.md"
+            ):
+                _issue(issues, "QA_VERDICT_CHANNEL_MISSING", "scope", f"Contract '{contract.path}' does not authorize the QA verdict channel " f"'.sync/inbox/claude/**' — the QA worker is instructed to deliver its " f"verdict there and the write would be blocked", work_order_id=wo_id, artifact_path=contract.path)
 
         # Contract scope must authorize the deliverable path
         if contract is not None and deliv_path:

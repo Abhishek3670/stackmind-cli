@@ -653,30 +653,23 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        findings = []
-        secret_patterns = [
-            re.compile(r"""(?i)(api[_-]?key|secret|token|password)\s*=\s*['"][a-zA-Z0-9_\-]{16,}['"]"""),
-            re.compile(r"""\b(eval|exec)\s*\("""),
-        ]
+        from validators.harness.security_scan import scan_directory
+
         target_path = self.workspace.path_for(target_loc)
-        files = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
-        for f in files:
-            try:
-                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
-                for idx, line in enumerate(lines, start=1):
-                    for pat in secret_patterns:
-                        if pat.search(line):
-                            findings.append({
-                                "file": f.relative_to(self.workspace.root).as_posix(),
-                                "line": idx,
-                                "match": line.strip()[:80],
-                            })
-            except Exception:
-                continue
+        if target_path.is_file():
+            rel = target_path.relative_to(self.workspace.root).as_posix()
+            files = [rel]
+        else:
+            files = [
+                f.relative_to(self.workspace.root).as_posix()
+                for f in target_path.rglob("*.py")
+                if not ({p.lower() for p in f.parts} & {".git", ".venv", "venv", "__pycache__", "node_modules", ".sync"})
+            ]
+        findings = scan_directory(self.workspace.root, target_loc)
 
         out = {
             "success": len(findings) == 0,
-            "findings": findings,
+            "findings": [f.to_dict() for f in findings],
             "files_scanned": len(files),
         }
         self.boundary.journal.complete(record.request.operation_id, f"{len(findings)} security findings")

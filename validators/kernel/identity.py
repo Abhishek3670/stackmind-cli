@@ -209,8 +209,13 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         return AuthorizationPolicy.permit(f"policy-{norm}", ops)
 
     elif any(k in norm for k in ("gemma", "qa")):
-        # Note: No source code editing (apply_patch/write_file/move/delete are withheld)
+        # QA authors its executable test suites (deliverable-under-tests
+        # doctrine): write_file is granted, bounded by the WO contract scope
+        # so gemma can only write paths its contract explicitly allows.
+        # Source-code editing/refactoring tools and git mutations remain
+        # withheld (apply_patch/delete_file/move_file/git_* mutations).
         ops = base_set | {
+            OperationType.WRITE_FILE.value,
             OperationType.RUN_COMMAND.value,
             OperationType.PROCESS_START.value,
             OperationType.PROCESS_STATUS.value,

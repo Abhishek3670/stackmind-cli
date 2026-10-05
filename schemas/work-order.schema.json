@@ -197,6 +197,10 @@
     "plan_ref": {
       "type": "string"
     },
+    "synthesized_by": {
+      "type": "string",
+      "description": "Provenance marker for deterministic scaffolding (e.g. 'bootstrap'); an authorized author may supersede such artifacts."
+    },
     "implementation_estimate": {
       "type": "object",
       "description": "Architect-authored estimate of the file footprint of this work order; the contract budget must cover it.",

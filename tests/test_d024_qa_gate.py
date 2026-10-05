@@ -483,3 +483,46 @@ def test_d024_gate_blocks_code_deliverable_when_insecure_credentials_present(tmp
     assert "password == 'admin'" in str(decision.reason)
 
 
+
+
+def test_d024_gate_blocks_on_deterministic_security_findings(tmp_path):
+    """The report-class findings — hardcoded env-fallback secrets and enabled
+    debug flags — are caught deterministically by the deliverable scan."""
+    vulnerable_content = (
+        "import os\n"
+        "from flask import Flask\n"
+        "\n"
+        "SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key-12345')\n"
+        "DEBUG = True\n"
+        "\n"
+        "def create_app():\n"
+        "    app = Flask(__name__)\n"
+        "    app.run(debug=True)\n"
+        "    return app\n"
+    )
+    project = _setup_gate_scenario(
+        tmp_path,
+        deliverable_content=vulnerable_content,
+        verdict_type="APPROVED",
+        create_test_file=True,
+    )
+    gate = D024Gate()
+
+    decision = gate.evaluate_work_order(project, "WO-102")
+    assert decision.passed is False
+    assert decision.verdict_status == "NEEDS_CHANGES"
+    reason = str(decision.reason)
+    assert "security finding HARDCODED_SECRET_FALLBACK" in reason
+    assert "security finding DEBUG_MODE_ENABLED" in reason
+    assert "dev-secret-key-12345" in reason
+
+    # Clean deliverable passes the scan: no security findings in the reason
+    clean_project = _setup_gate_scenario(
+        tmp_path / "clean",
+        deliverable_content="import os\nSECRET_KEY = os.environ['SECRET_KEY']\n",
+        verdict_type="APPROVED",
+        create_test_file=True,
+    )
+    clean_decision = D024Gate().evaluate_work_order(clean_project, "WO-102")
+    assert clean_decision.passed is True
+    assert "security finding" not in str(clean_decision.reason)

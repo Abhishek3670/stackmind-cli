@@ -187,7 +187,7 @@ class AuthoringGate:
         # 4. Overwrite Conflict Check for Active Work Orders and Contracts
         effective_root = Path(project_root).resolve() if project_root is not None else self._project_root
         if effective_root is not None:
-            self._check_overwrite_conflict(norm_path, content, data, effective_root, errors)
+            self._check_overwrite_conflict(norm_path, content, data, effective_root, errors, author=author)
 
         passed = len(errors) == 0
         if passed:
@@ -208,6 +208,7 @@ class AuthoringGate:
         data: Any,
         project_root: Path,
         errors: list[str],
+        author: str | None = None,
     ) -> None:
         """Prevent clobbering an existing active work order or contract from another task."""
         is_active_wo = (
@@ -251,6 +252,16 @@ class AuthoringGate:
             existing_data = None
 
         if isinstance(existing_data, dict) and isinstance(data, dict) and existing_data == data:
+            return
+
+        # Bootstrap-synthesized artifacts are scaffolding: an authorized
+        # author (Architect/CEO) may supersede them with the real authored
+        # artifact. Workers never reach this check (role gate runs first).
+        if (
+            isinstance(existing_data, dict)
+            and str(existing_data.get("synthesized_by", "")) == "bootstrap"
+            and str(author or "").lower() in self.AUTHORIZED_AUTHORS
+        ):
             return
 
         # Conflict: attempting to overwrite an active artifact with different content

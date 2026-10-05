@@ -398,6 +398,13 @@ class D024Gate:
                             if leaks:
                                 deliverable_issues.append(f"insecure credential pattern in deliverable {deliv_path_str}: {leaks[0]}")
 
+                            # Deterministic security scan: hardcoded secret
+                            # fallbacks, enabled debug flags, dynamic exec —
+                            # the findings a model reviewer routinely misses.
+                            from validators.harness.security_scan import scan_file as scan_security
+                            for finding in scan_security(deliv_path_str, content):
+                                deliverable_issues.append(finding.format())
+
                         deliv_type = ""
                         if isinstance(deliverable, dict):
                             deliv_type = str(deliverable.get("type") or "").lower().strip()

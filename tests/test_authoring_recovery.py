@@ -889,6 +889,7 @@ class TestQaTestAuthoringLoop:
         write_contract(tmp_path, make_contract("WO-001"))
         qa_contract = make_contract("WO-002", agent="gemma", extra_allow=["tests/test_module.py"])
         qa_contract["identity"] = {"role": "qa", "reports_to": "claude"}
+        qa_contract["scope"]["allow"].append({"module": ".sync/inbox/claude/**"})
         write_contract(tmp_path, qa_contract)
 
         result = validate_authoring_readiness(tmp_path)
@@ -904,6 +905,7 @@ class TestQaTestAuthoringLoop:
         contract = make_contract("WO-005", agent="gemma", extra_allow=["tests/test_app.py"])
         contract["identity"] = {"role": "qa", "reports_to": "claude"}
         contract["scope"]["allow"].append({"module": "tests/**"})
+        contract["scope"]["allow"].append({"module": ".sync/inbox/claude/**"})
         write_contract(tmp_path, contract)
         (tmp_path / "tests").mkdir(exist_ok=True)
         return mock_mgr, supervisor, state
@@ -916,7 +918,9 @@ class TestQaTestAuthoringLoop:
         prompt = qa_ops[0]["prompt"]
         assert "tests/test_app.py" in prompt
         assert "run_tests" in prompt
+        assert "run_security_scan" in prompt
         assert "author" in prompt.lower()
+        assert "security checklist" in prompt.lower()
 
     def test_qa_completion_requires_test_file_and_execution_evidence(
         self, tmp_path: Path,
@@ -939,7 +943,7 @@ class TestQaTestAuthoringLoop:
         retry_ops = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
         assert retry_ops and "run_tests" in retry_ops[0]["prompt"]
 
-        # Second attempt authors the suite and executes it end-to-end
+        # Second attempt authors the suite, executes it, and runs the scan
         (tmp_path / "tests" / "test_app.py").write_text("def test_app():\n    assert True\n", encoding="utf-8")
         retry_op = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))][-1]
         mock_mgr.complete_operation(retry_op["operation_id"], "COMPLETED", result={
@@ -949,10 +953,36 @@ class TestQaTestAuthoringLoop:
             "tool_calls_audit": [
                 {"tool": "write_file", "path": "tests/test_app.py"},
                 {"tool": "run_tests", "path": "tests/test_app.py"},
+                {"tool": "run_security_scan", "target": "src"},
             ],
         })
         supervisor.advance(state)
         assert "WO-005" in state.completed_wo_ids
+
+    def test_qa_completion_requires_security_scan_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        """A QA turn that ran the tests but skipped the security scan is not
+        accepted — the scan is part of the required evidence."""
+        mock_mgr, supervisor, state = self._gemma_setup(tmp_path)
+        (tmp_path / "tests" / "test_app.py").write_text("def test_app():\n    assert True\n", encoding="utf-8")
+        op = mock_mgr.start_turn("sess-001", "Execute WO-005", work_order_id="WO-005", agent_id="gemma")
+        mock_mgr.complete_operation(op["operation_id"], "COMPLETED", result={
+            "status": "completed",
+            "summary": "QA done",
+            "commands_audit": [],
+            "tool_calls_audit": [
+                {"tool": "write_file", "path": "tests/test_app.py"},
+                {"tool": "run_tests", "path": "tests/test_app.py"},
+            ],
+        })
+        res = supervisor.advance(state)
+        assert state.phase == Phase.EXECUTING
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert "WO-005" not in state.completed_wo_ids
+        assert state.retry_counts.get("WO-005") == 1
+        retry_ops = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
+        assert retry_ops and "run_security_scan" in retry_ops[-1]["prompt"]
 
     def test_qa_evidence_exhaustion_routes_to_architect_recovery(
         self, tmp_path: Path,
@@ -1052,3 +1082,349 @@ def test_run_state_recovery_fields_roundtrip(tmp_path: Path) -> None:
     assert restored.superseded_wo_ids == ["WO-000"]
     assert restored.milestone_exemptions == ["Scaffold"]
     assert restored.contract_revisions == {"WO-001": 2}
+
+
+# ─── Authoring-turn verification robustness ───────────────────────────
+
+class TestAuthoringTurnVerification:
+    """Architect authoring turns are validated by the gate machinery, not by
+    declaration equality: a 31B model's modified_files list is informational."""
+
+    def _init_workspace(self, tmp_path: Path) -> Path:
+        from cli.init import init
+        from validators.kernel.daemon.manager import synthesize_bootstrap_planning
+        init(tmp_path, name="T", no_git=True)
+        synthesize_bootstrap_planning(tmp_path, "Build app")
+        return tmp_path
+
+    VALID_WO_YAML = (
+        "id: WO-001\n"
+        "type: FEATURE\n"
+        "title: Authored Backend\n"
+        "status: ACTIVE\n"
+        "priority: P1\n"
+        "assigned_agents: [codex]\n"
+        "dependencies: []\n"
+        "deliverable:\n"
+        "  type: code\n"
+        "  path: src/backend.py\n"
+        "  description: Backend implementation\n"
+        "description: Implement the backend\n"
+        "created: '2026-01-01T00:00:00+00:00'\n"
+        "updated: '2026-01-01T00:00:00+00:00'\n"
+    )
+
+    def _scripted_authoring_adapter(self, writes: list[tuple[str, str]], declared: list[str]):
+        from validators.kernel.providers.models import (
+            Message, ProviderResponse, ToolCallRequest, TokenUsage,
+        )
+
+        class Adapter:
+            provider_name = "scripted"
+            model_name = "scripted-model"
+
+            def complete(self, messages, **kwargs):
+                if not any(m.role == "tool" for m in messages):
+                    return ProviderResponse(
+                        message=Message.assistant(content="", tool_calls=[
+                            ToolCallRequest(id=f"c{i}", name="write_file",
+                                            arguments={"path": p, "content": c})
+                            for i, (p, c) in enumerate(writes)
+                        ]),
+                        usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+                    )
+                return ProviderResponse(
+                    message=Message.assistant(content=json.dumps({
+                        "status": "completed",
+                        "summary": "Authored artifacts",
+                        "report_markdown": "Authored artifacts.",
+                        "modified_files": declared,
+                        "release_target": "v3.1.0",
+                    })),
+                    usage=TokenUsage(prompt_tokens=8, completion_tokens=3, total_tokens=11),
+                )
+
+        return Adapter()
+
+    def test_authoring_turn_declaration_mismatch_still_completes(self, tmp_path: Path) -> None:
+        """Declared set larger than the observed write set no longer dead-ends
+        the authoring turn (the readiness gate validates the real artifacts)."""
+        from validators.harness.runner import AgentRunner
+
+        ws = self._init_workspace(tmp_path)
+        adapter = self._scripted_authoring_adapter(
+            writes=[(".sync/work-orders/ACTIVE/WO-001.yaml", self.VALID_WO_YAML)],
+            declared=[
+                ".sync/work-orders/ACTIVE/WO-001.yaml",
+                ".sync/contracts/WO-001.yaml",  # declared but never written
+            ],
+        )
+        runner = AgentRunner(ws, "claude", provider_adapter=adapter)
+        result = runner.run_once(
+            prompt="Author the implementation work orders and contracts for the tasks in PLAN.md",
+            work_order_id="WO-000",
+            operation_id="op-authoring",
+            is_authoring=True,
+        )
+        assert result.status == "completed", result.reason
+
+    def test_authoring_turn_out_of_scope_write_blocked_with_evidence(self, tmp_path: Path) -> None:
+        """When the scope gate fails an authoring turn, the block carries the
+        observed/declared evidence. (Out-of-scope writes are usually denied
+        earlier at the tool boundary; this exercises the second net.)"""
+        import validators.harness.contract_gate as cg
+        from validators.harness.runner import AgentRunner
+        from validators.knowledge.contract import ContractAccessDenied
+
+        ws = self._init_workspace(tmp_path)
+        adapter = self._scripted_authoring_adapter(
+            writes=[(".sync/work-orders/ACTIVE/WO-001.yaml", self.VALID_WO_YAML)],
+            declared=[".sync/work-orders/ACTIVE/WO-001.yaml"],
+        )
+
+        real_verify = cg.verify_post_execution
+
+        def _failing_verify(*args, **kwargs):
+            raise ContractAccessDenied(
+                "Modification to file src/hack.py is outside allowed contract scope"
+            )
+
+        cg.verify_post_execution = _failing_verify
+        try:
+            runner = AgentRunner(ws, "claude", provider_adapter=adapter)
+            result = runner.run_once(
+                prompt="Author the implementation work orders and contracts for the tasks in PLAN.md",
+                work_order_id="WO-000",
+                operation_id="op-authoring",
+                is_authoring=True,
+            )
+        finally:
+            cg.verify_post_execution = real_verify
+
+        assert result.status == "blocked"
+        # The primary post-decision contract gate blocks first, with the full
+        # durable evidence packet (observed files, contract hash, failure code).
+        assert "CONTRACT_SCOPE_VIOLATION" in (result.reason or "")
+        failure = (result.meta or {}).get("failure") or {}
+        assert failure.get("failure_code") == "CONTRACT_SCOPE_VIOLATION"
+        assert ".sync/work-orders/ACTIVE/WO-001.yaml" in failure.get("observed_files", [])
+
+
+# ─── Lazy-turn nudge (declared writes, no tool invocations) ───────────
+
+class TestLazyTurnNudge:
+    """A turn that declared writes but invoked no tools is retried with an
+    explicit write instruction instead of dead-ending the run."""
+
+    def _blocked_result(self, declared: list[str]) -> dict[str, Any]:
+        return {
+            "status": "blocked",
+            "reason": (
+                f"verification gate failed: scope_verified "
+                f"(declared {declared}; observed [])"
+            ),
+            "scope_evidence": {"declared": declared, "observed": []},
+        }
+
+    def test_lazy_qa_turn_gets_explicit_write_nudge(self, tmp_path: Path) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-004")
+        state.worker_wo_ids = ["WO-004"]
+        # Swap in a gemma WO with a QA deliverable
+        write_wo(tmp_path, make_wo("WO-004", agent="gemma", deliv_path="tests/test_app.py"))
+        contract = make_contract("WO-004", agent="gemma")
+        contract["identity"] = {"role": "qa", "reports_to": "claude"}
+        write_contract(tmp_path, contract)
+
+        op = mock_mgr.start_turn("sess-001", "Execute WO-004", work_order_id="WO-004", agent_id="gemma")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=self._blocked_result(
+            ["tests/test_quality_assurance_testing_agent_gemma.py"]))
+
+        res = supervisor.advance(state)
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.EXECUTING
+        assert state.retry_counts.get("WO-004") == 1
+        assert op["operation_id"] in state.ignored_operation_ids
+        nudges = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
+        assert len(nudges) == 1
+        prompt = nudges[0]["prompt"]
+        assert "write_file" in prompt
+        assert "tests/test_app.py" in prompt  # deliverable path takes precedence
+        assert "run_tests" in prompt and "run_security_scan" in prompt
+
+    def test_lazy_worker_turn_nudged_with_declared_paths(self, tmp_path: Path) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-001")
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=self._blocked_result(
+            ["src/backend.py", "tests/test_backend.py"]))
+
+        res = supervisor.advance(state)
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.EXECUTING
+        nudges = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
+        assert len(nudges) == 1
+        prompt = nudges[0]["prompt"]
+        assert "invoked NO tools" in prompt
+        assert "src/backend.py" in prompt and "write_file" in prompt
+
+    def test_lazy_turn_exhaustion_blocks_with_evidence(self, tmp_path: Path) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-001")
+        state.max_retries = 1
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=self._blocked_result(["src/backend.py"]))
+        res = supervisor.advance(state)  # nudge (attempt 2)
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+
+        nudges = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
+        mock_mgr.complete_operation(nudges[-1]["operation_id"], "BLOCKED", result=self._blocked_result(["src/backend.py"]))
+        supervisor.advance(state)  # retries exhausted -> terminal block
+        assert state.phase == Phase.BLOCKED
+        assert "scope_verified" in (state.error or "")
+
+    def test_non_lazy_scope_block_still_terminal(self, tmp_path: Path) -> None:
+        """Observed non-empty (real writes, wrong scope) keeps the terminal
+        behavior — the nudge is only for turns that wrote nothing."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-001")
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "reason": "verification gate failed: scope_verified (declared ['src/app.py']; observed ['src/other.py'])",
+            "scope_evidence": {"declared": ["src/app.py"], "observed": ["src/other.py"]},
+        })
+        res = supervisor.advance(state)
+        assert res == AdvanceResult.BLOCKED
+        assert state.phase == Phase.BLOCKED
+
+
+def test_readiness_requires_qa_verdict_channel(tmp_path: Path) -> None:
+    """A QA contract without the Architect-inbox verdict channel fails
+    readiness — the QA worker is instructed to write its verdict there."""
+    write_wo(tmp_path, make_wo("WO-005", agent="gemma", deliv_path="tests/test_auth.py"))
+    contract = make_contract("WO-005", agent="gemma", extra_allow=["tests/test_auth.py"])
+    contract["scope"]["allow"] = [
+        {"module": "PLAN.md"},
+        {"module": "tests/**"},  # no .sync/inbox/claude/**
+    ]
+    write_contract(tmp_path, contract)
+
+    result = validate_authoring_readiness(tmp_path)
+    assert not result.ready
+    assert "QA_VERDICT_CHANNEL_MISSING" in result.issue_codes()
+
+    # With the channel authorized, readiness passes
+    contract["scope"]["allow"].append({"module": ".sync/inbox/claude/**"})
+    write_contract(tmp_path, contract)
+    result2 = validate_authoring_readiness(tmp_path)
+    assert result2.ready, [i.message for i in result2.issues]
+
+
+# ─── Worker declaration direction (write-all-declared; extras scope-gated) ──
+
+class TestWorkerDeclarationDirection:
+    """The declaration gate fails a worker only for claimed-but-unwritten
+    files; extra in-scope writes are authorized by the scope gates."""
+
+    def _worker_fixture(self, tmp_path: Path) -> Path:
+        from cli.init import init
+        init(tmp_path, name="W", no_git=True)
+        wo = {
+            "id": "WO-001", "type": "FEATURE", "title": "Backend", "status": "ACTIVE",
+            "priority": "P1", "assigned_agents": ["codex"], "dependencies": [],
+            "deliverable": {"type": "code", "path": "src/app.py", "description": "app"},
+            "description": "Implement backend",
+            "created": "2026-01-01T00:00:00+00:00", "updated": "2026-01-01T00:00:00+00:00",
+        }
+        wo_path = tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-001.yaml"
+        wo_path.parent.mkdir(parents=True, exist_ok=True)
+        wo_path.write_text(yaml.safe_dump(wo, sort_keys=False), encoding="utf-8")
+        contract = {
+            "schema_version": 1, "agent_id": "codex", "work_order": "WO-001",
+            "identity": {"role": "backend", "reports_to": "claude"},
+            "scope": {
+                "allow": [{"module": "PLAN.md"}, {"module": "src/**"},
+                          {"module": ".sync/decisions/**"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 5, "max_tokens": 0},
+        }
+        cpath = tmp_path / ".sync" / "contracts" / "WO-001.yaml"
+        cpath.parent.mkdir(parents=True, exist_ok=True)
+        cpath.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+        return tmp_path
+
+    def _scripted_worker_adapter(self, writes: list[tuple[str, str]], declared: list[str]):
+        from validators.kernel.providers.models import (
+            Message, ProviderResponse, ToolCallRequest, TokenUsage,
+        )
+
+        class Adapter:
+            provider_name = "scripted"
+            model_name = "scripted-model"
+
+            def complete(self, messages, **kwargs):
+                if not any(m.role == "tool" for m in messages):
+                    return ProviderResponse(
+                        message=Message.assistant(content="", tool_calls=[
+                            ToolCallRequest(id=f"c{i}", name="write_file",
+                                            arguments={"path": p, "content": c})
+                            for i, (p, c) in enumerate(writes)
+                        ]),
+                        usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+                    )
+                return ProviderResponse(
+                    message=Message.assistant(content=json.dumps({
+                        "status": "completed",
+                        "summary": "Implemented",
+                        "report_markdown": "Implemented.",
+                        "modified_files": declared,
+                        "release_target": "v3.1.0",
+                    })),
+                    usage=TokenUsage(prompt_tokens=8, completion_tokens=3, total_tokens=11),
+                )
+
+        return Adapter()
+
+    def test_worker_extra_in_scope_write_still_completes(self, tmp_path: Path) -> None:
+        """A worker that writes its deliverable plus an extra in-scope file but
+        declares only the deliverable completes — extras are scope-gated."""
+        from validators.harness.runner import AgentRunner
+
+        ws = self._worker_fixture(tmp_path)
+        adapter = self._scripted_worker_adapter(
+            writes=[
+                ("src/app.py", "app = True\n"),
+                ("src/helper.py", "helper = True\n"),  # extra, in scope, undeclared
+            ],
+            declared=["src/app.py"],
+        )
+        runner = AgentRunner(ws, "codex", provider_adapter=adapter)
+        result = runner.run_once(
+            prompt="Implement work order WO-001",
+            work_order_id="WO-001",
+            operation_id="op-w",
+        )
+        assert result.status == "completed", result.reason
+
+    def test_worker_claimed_but_unwritten_claims_are_pruned(self, tmp_path: Path) -> None:
+        """Turns with some real writes get unwritten claims pruned by the
+        pre-existing phantom-declaration pruning (the turn completes, and the
+        published decision only lists what was actually written). Turns with
+        NO writes at all keep their declarations and are handled by the
+        supervisor's lazy-turn nudge instead."""
+        from validators.harness.runner import AgentRunner
+
+        ws = self._worker_fixture(tmp_path)
+        adapter = self._scripted_worker_adapter(
+            writes=[("src/app.py", "app = True\n")],
+            declared=["src/app.py", "src/missing.py"],  # never written
+        )
+        runner = AgentRunner(ws, "codex", provider_adapter=adapter)
+        result = runner.run_once(
+            prompt="Implement work order WO-001",
+            work_order_id="WO-001",
+            operation_id="op-w",
+        )
+        assert result.status == "completed"
+        meta = result.meta or {}
+        assert meta.get("modified_files") == ["src/app.py"]
+        assert (ws / "src" / "missing.py").exists() is False

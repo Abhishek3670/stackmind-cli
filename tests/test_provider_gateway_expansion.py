@@ -94,8 +94,8 @@ def test_get_tools_for_role_all_roles() -> None:
     assert "run_tests" in gemma_tools
     assert "skill_test" in gemma_tools
     assert "skill_audit" in gemma_tools
-    # Gemma strictly forbidden from code mutation
-    assert "write_file" not in gemma_tools
+    # QA authors its test suites (deliverable-under-tests doctrine)
+    assert "write_file" in gemma_tools
     assert "apply_patch" not in gemma_tools
     assert "move_file" not in gemma_tools
     assert "delete_file" not in gemma_tools

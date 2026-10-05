@@ -384,6 +384,8 @@ def build_child_contract(
         ])
     elif role_norm in ("qa", "gemma"):
         allow_rules.extend([
+            # QA verdict channel: gemma delivers verdicts to the Architect
+            {"module": ".sync/inbox/claude/**"},
             {"module": "tests/**"},
             {"module": "test/**"},
             {"module": "src/**"},
@@ -718,6 +720,11 @@ def synthesize_child_work_orders(
             deliverable=deliv,
             implementation_estimate=implementation_estimate,
         )
+
+        # Provenance marker: bootstrap-synthesized artifacts are scaffolding an
+        # authorized author may supersede via the authoring gate.
+        wo_rec["synthesized_by"] = "bootstrap"
+        contract_rec["synthesized_by"] = "bootstrap"
 
         wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
         contract_yaml = yaml.safe_dump(contract_rec, sort_keys=False)

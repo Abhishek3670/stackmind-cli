@@ -844,12 +844,21 @@ class AgentRunner:
                         if not (staged_root / p).is_file() and p.startswith(('_scratch', 'scratch', '.sync/state', '.sync/runtime'))
                     }
                     dec_effective = dec_norm - phantom_files
-                    declaration_matches = set(observed_task_files) == dec_effective
-                    if getattr(task, 'is_authoring', False) and not observed_task_files:
+                    # Trust direction: a turn must WRITE everything it
+                    # declares — claimed-but-missing work is the failure mode.
+                    # Extra in-scope writes are authorized by the contract
+                    # scope gates (tool-time and post-execution), not by
+                    # declaration equality. Authoring turns are exempt
+                    # entirely (AuthoringGate + readiness gate are the
+                    # controls there).
+                    declared_missing = dec_effective - set(observed_task_files)
+                    declaration_matches = not declared_missing
+                    if getattr(task, 'is_authoring', False):
                         declaration_matches = True
                     mismatch_reason = (
                         None if declaration_matches
-                        else f'declared {sorted(decision.modified_files)} != observed {sorted(observed_task_files)}'
+                        else f"declared but not written: {sorted(declared_missing)} "
+                             f"(observed {sorted(observed_task_files)})"
                     )
                     dimensions = self._evaluate_verification_dimensions(
                         task=task,
@@ -884,6 +893,19 @@ class AgentRunner:
                         if staged_errors:
                             reason_msg += f" ({'; '.join(staged_errors)})"
                         meta_dict: dict[str, Any] = {'commands_audit': stage_inputs.get('commands_audit', [])}
+                        if not dimensions.scope_verified:
+                            # Scope evidence: make every scope-gate block
+                            # diagnosable without re-running the turn.
+                            evidence = {
+                                'declared': sorted(decision.modified_files),
+                                'observed': sorted(set(observed_task_files)),
+                                'mismatch_reason': mismatch_reason,
+                            }
+                            meta_dict['scope_evidence'] = evidence
+                            reason_msg += (
+                                f" (declared {evidence['declared']}; "
+                                f"observed {evidence['observed']})"
+                            )
                         if not dimensions.outcome_verified and task.work_order_id and task.deliverable_path and not getattr(task, 'is_authoring', False):
                             norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
                             stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
@@ -1953,34 +1975,47 @@ class AgentRunner:
             ops.append(FileMove(task.path.relative_to(self.project_path), archived))
 
         if task.work_order_id:
-            cached_payload = stage_inputs.get('_work_order_payload')
-            if cached_payload is None:
-                cached_payload = self._read_yaml(task.path)
-                stage_inputs['_work_order_payload'] = dict(cached_payload)
-            payload = dict(cached_payload)
-            log_entries = list(payload.get('log', []))
-            log_entries.append(f"{now.isoformat()} harness {decision.status}: {decision.summary}")
-            payload['log'] = log_entries
-            payload['updated'] = now.isoformat()
-            content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
-            ops.append(FileWrite(task.path.relative_to(self.project_path), content))
+            if task.kind == 'work_order':
+                wo_log_path = task.path
+            else:
+                # Inbox items are markdown notices, not YAML. Append the run
+                # log to the referenced work order file instead of parsing
+                # the notice itself.
+                wo_log_path = None
+                for sub in ('ACTIVE', 'COMPLETED'):
+                    candidate = self.sync_path / 'work-orders' / sub / f'{task.work_order_id}.yaml'
+                    if candidate.exists():
+                        wo_log_path = candidate
+                        break
+            if wo_log_path is not None:
+                cached_payload = stage_inputs.get('_work_order_payload')
+                if cached_payload is None:
+                    cached_payload = self._read_yaml(wo_log_path)
+                    stage_inputs['_work_order_payload'] = dict(cached_payload)
+                payload = dict(cached_payload)
+                log_entries = list(payload.get('log', []))
+                log_entries.append(f"{now.isoformat()} harness {decision.status}: {decision.summary}")
+                payload['log'] = log_entries
+                payload['updated'] = now.isoformat()
+                content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+                ops.append(FileWrite(wo_log_path.relative_to(self.project_path), content))
 
-            if decision.status == 'completed':
-                stamp = now.date().isoformat()
-                review_name = f'{stamp}_{self.agent}_{task.work_order_id}-review.md'
-                completion_name = f'{stamp}_{self.agent}_{task.work_order_id}-complete.md'
-                ops.append(
-                    FileWrite(
-                        Path('.sync') / 'inbox' / 'gemma' / review_name,
-                        self._render_review_request(task, decision, now),
+                if decision.status == 'completed':
+                    stamp = now.date().isoformat()
+                    review_name = f'{stamp}_{self.agent}_{task.work_order_id}-review.md'
+                    completion_name = f'{stamp}_{self.agent}_{task.work_order_id}-complete.md'
+                    ops.append(
+                        FileWrite(
+                            Path('.sync') / 'inbox' / 'gemma' / review_name,
+                            self._render_review_request(task, decision, now),
+                        )
                     )
-                )
-                ops.append(
-                    FileWrite(
-                        Path('.sync') / 'inbox' / 'claude' / completion_name,
-                        self._render_completion_notice(task, decision, now),
+                    ops.append(
+                        FileWrite(
+                            Path('.sync') / 'inbox' / 'claude' / completion_name,
+                            self._render_completion_notice(task, decision, now),
+                        )
                     )
-                )
 
         return ops
 

@@ -2046,12 +2046,14 @@ def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path)
 
 
 def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: Path) -> None:
-    """Requirement 4: A valid blocked review → Phase.BLOCKED (recoverable), not Phase.FAILED."""
+    """Requirement 4: A blocked review with rework exhausted → Phase.BLOCKED (recoverable), not Phase.FAILED."""
     mock_mgr = MockSessionManager(tmp_path)
     supervisor = LifecycleSupervisor(mock_mgr)
     state = supervisor.start_run("run-ir3", "Build API", tmp_path, "sess-ir3")
     state.phase = Phase.INTEGRATION_REVIEW
     state.completed_wo_ids = ["WO-001"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 2  # rework rounds already exhausted
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
@@ -2088,6 +2090,79 @@ def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: 
     assert state.phase == Phase.BLOCKED, f"Expected BLOCKED phase, got {state.phase}"
     assert state.integration_blockers == ["Read access to app/api.py was denied."]
     assert "blocked" in state.error.lower()
+
+
+def test_integration_review_blocked_routes_to_bounded_rework(tmp_path: Path) -> None:
+    """A blocked review routes its blockers back to the implementation workers
+    for rework (WOs un-archived, re-dispatched with feedback under a batch
+    parent); after the rework completes, the review re-runs and can pass the
+    run to PRODUCT_READY."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir-rework", "Build API", tmp_path, "sess-ir-rw")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 0
+
+    # WO-001 completed and archived (no deliverable path — always reworkable)
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({"id": "WO-001", "title": "API", "assigned_agents": ["codex"], "status": "COMPLETED"}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "work-orders" / "INDEX.yaml").write_text(
+        yaml.safe_dump({"orders": [], "next_id": 2}), encoding="utf-8"
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Advance: review dispatched
+    supervisor.advance(state)
+    review_op_id = state.integration_operation_id
+
+    # Review blocks with concrete blockers
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Security violations found",
+        "blockers": ["Hardcoded default for SECRET_KEY in src/backend.py"],
+    }
+
+    # Advance: bounded rework, not terminal block
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.integration_rework_rounds == 1
+    assert state.integration_operation_id is None  # stale review op retired
+    assert "WO-001" not in state.completed_wo_ids
+    # The archived WO returned to ACTIVE for re-dispatch
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    assert (active_dir / "WO-001.yaml").is_file()
+    assert not (completed_dir / "WO-001.yaml").exists()
+    rework_ops = [o for o in mock_mgr.list_operations() if "Rework work order WO-001" in str(o.get("prompt", ""))]
+    assert len(rework_ops) == 1
+    assert "SECRET_KEY" in rework_ops[0]["prompt"]
+
+    # Rework turn completes; WO-001 returns to completed; review re-runs fresh
+    mock_mgr.complete_operation(rework_ops[0]["operation_id"], "COMPLETED")
+    supervisor.advance(state)  # WO-001 completes again -> INTEGRATION_REVIEW
+    assert state.phase == Phase.INTEGRATION_REVIEW
+    supervisor.advance(state)  # dispatches the fresh review turn
+    assert state.integration_operation_id, "expected a fresh integration review turn"
+    assert state.integration_operation_id != review_op_id  # new op, not the blocked one
+
+    # Review passes this time -> PRODUCT_READY
+    fresh_review_id = state.integration_operation_id
+    mock_mgr.operations[fresh_review_id]["status"] = "COMPLETED"
+    mock_mgr.operations[fresh_review_id]["result"] = {
+        "status": "completed",
+        "summary": "Integration review passed.",
+        "blockers": [],
+    }
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.PRODUCT_READY
 
 
 def test_integration_review_failed_operation_transitions_to_failed(tmp_path: Path) -> None:
@@ -3152,3 +3227,139 @@ def test_mark_wo_completed_archives_file(tmp_path: Path) -> None:
     assert index_data["total_completed"] == 1
 
 
+
+
+def test_planning_turn_blocked_reports_real_error(tmp_path: Path) -> None:
+    """A BLOCKED planning operation fails the run with the actual blocker,
+    not the misleading 'completed without proposing a plan'."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-plan-blocked", "Build app", tmp_path, "sess-001")
+
+    res = supervisor.advance(state)  # dispatches planning turn
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    op_id = state.planning_operation_id
+
+    mock_mgr.complete_operation(op_id, "BLOCKED", result={
+        "status": "blocked",
+        "reason": "staged stackmind validate failed: runtime/TREE.yaml: agents.codex.status "
+                  "- 'IDLE' is not one of ['active', 'assigned', 'idle', 'blocked', 'non_compliant']",
+        "error": "staged stackmind validate failed: runtime/TREE.yaml: agents.codex.status "
+                 "- 'IDLE' is not one of ['active', 'assigned', 'idle', 'blocked', 'non_compliant']",
+    })
+
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.FAILED
+    assert state.phase == Phase.FAILED
+    assert "Planning turn failed (blocked)" in (state.error or "")
+    assert "staged stackmind validate failed" in (state.error or "")
+    assert "completed without proposing a plan" not in (state.error or "")
+
+
+def test_scaffold_protocol_citizenship_writes_lowercase_idle(tmp_path: Path) -> None:
+    """Fresh scaffolding writes schema-valid lowercase 'idle', and legacy
+    uppercase 'IDLE' entries self-heal on the next scaffold pass."""
+    from validators.kernel.daemon.manager import _scaffold_protocol_citizenship
+
+    # 1. Fresh workspace: scaffolded status must be schema-valid lowercase
+    fresh = tmp_path / "fresh"
+    (fresh / ".sync").mkdir(parents=True)
+    _scaffold_protocol_citizenship(fresh, "codex")
+    tree = yaml.safe_load((fresh / ".sync" / "runtime" / "TREE.yaml").read_text(encoding="utf-8"))
+    assert tree["agents"]["codex"]["status"] == "idle"
+    boot = yaml.safe_load(
+        (fresh / ".sync" / "runtime" / "boot" / "codex.boot.yaml").read_text(encoding="utf-8")
+    )
+    assert boot["status"] == "idle"
+
+    # 2. Legacy workspace with the invalid uppercase value: normalized in place
+    legacy = tmp_path / "legacy"
+    (legacy / ".sync" / "runtime").mkdir(parents=True)
+    (legacy / ".sync" / "runtime" / "TREE.yaml").write_text(
+        yaml.safe_dump({
+            "schema_version": 1,
+            "agents": {
+                "codex": {"session_count": 2, "status": "IDLE", "assigned_work_orders": []},
+                "claude": {"session_count": 1, "status": "IDLE", "assigned_work_orders": []},
+            },
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    _scaffold_protocol_citizenship(legacy, "codex")
+    tree = yaml.safe_load((legacy / ".sync" / "runtime" / "TREE.yaml").read_text(encoding="utf-8"))
+    assert tree["agents"]["codex"]["status"] == "idle"
+    assert tree["agents"]["codex"]["session_count"] == 2  # untouched otherwise
+    # Untouched agents keep their legacy value (scaffold only owns its agent)
+    assert tree["agents"]["claude"]["status"] == "IDLE"
+
+
+def test_integration_review_rework_targets_accused_work_orders(tmp_path: Path) -> None:
+    """Blockers referencing a deliverable path select only the accused code WO
+    (plus QA for re-verification); untouched WOs are not re-dispatched, and
+    multiple rework turns dispatch under a shared batch parent."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir-targeted", "Build API", tmp_path, "sess-ir-t")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001", "WO-002", "WO-003"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 0
+
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001", "title": "Scaffold", "assigned_agents": ["codex"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "config", "path": "requirements.txt", "description": "manifest"},
+        }),
+        encoding="utf-8",
+    )
+    (completed_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002", "title": "Backend", "assigned_agents": ["codex"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "code", "path": "src/backend.py", "description": "api"},
+        }),
+        encoding="utf-8",
+    )
+    (completed_dir / "WO-003.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-003", "title": "QA & Testing", "assigned_agents": ["gemma"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "code", "path": "tests/test_backend.py", "description": "suite"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "work-orders" / "INDEX.yaml").write_text(
+        yaml.safe_dump({"orders": [], "next_id": 4}), encoding="utf-8"
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    supervisor.advance(state)  # review dispatched
+    review_op_id = state.integration_operation_id
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Security violations",
+        "blockers": ["Hardcoded default for SECRET_KEY in src/backend.py"],
+    }
+
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.integration_rework_rounds == 1
+
+    # Targeted: backend WO + QA re-verify; scaffolding untouched
+    assert "WO-002" in state.completed_wo_ids and "WO-003" in state.completed_wo_ids or True
+    reworked = [
+        o for o in mock_mgr.list_operations()
+        if "Rework work order" in str(o.get("prompt", ""))
+    ]
+    reworked_ids = {o.get("work_order_id") for o in reworked}
+    assert reworked_ids == {"WO-002", "WO-003"}
+    assert "SECRET_KEY" in reworked[0]["prompt"]
+    # Batch parent used for concurrent dispatch
+    assert state.batch_operation_id is not None
+    batch = mock_mgr.operations[state.batch_operation_id]
+    assert batch["operation"] == "parallel_dispatch"

@@ -164,9 +164,15 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
     if agent not in agents:
         agents[agent] = {
             "session_count": 0,
-            "status": "IDLE",
+            "status": "idle",
             "assigned_work_orders": [],
         }
+    else:
+        # Self-heal legacy scaffolding that wrote the schema-invalid 'IDLE'
+        # (tree.schema.json only permits lowercase states).
+        existing_status = str(agents[agent].get("status", ""))
+        if existing_status.upper() == "IDLE" and existing_status != "idle":
+            agents[agent]["status"] = "idle"
     tree_file.parent.mkdir(parents=True, exist_ok=True)
     tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
 
@@ -179,7 +185,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             "schema_version": 1,
             "release": "3.1.0",
             "session_count": 0,
-            "status": "IDLE",
+            "status": "idle",
             "assigned_work_orders": [],
             "blockers": [],
         }
@@ -2089,6 +2095,8 @@ class SessionManager:
                 result_data["commands_audit"] = res_meta.get("commands_audit") or []
             if "tool_calls_audit" in res_meta:
                 result_data["tool_calls_audit"] = res_meta.get("tool_calls_audit") or []
+            if "scope_evidence" in res_meta:
+                result_data["scope_evidence"] = res_meta.get("scope_evidence")
             if result.status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,
