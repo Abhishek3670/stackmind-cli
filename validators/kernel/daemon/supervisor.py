@@ -1429,27 +1429,59 @@ class LifecycleSupervisor:
             result_status = str(op_result.get("status", "")).lower()
 
             if status == "BLOCKED" or result_status == "blocked":
-                # A valid blocked review routes its blockers back to the
+                # A valid blocked review routes its blockers — with the
+                # Architect's prescribed fixes when provided — back to the
                 # implementation and QA workers for bounded rework; the review
                 # re-runs after they complete. Terminal BLOCKED only when the
                 # rework rounds are exhausted.
-                blockers = op_result.get("blockers") or []
+                blockers: list[str] = []
+                remediations: dict[str, str] = {}
+                detail_paths: list[str] = []
+                for item in op_result.get("blocker_details") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    finding = str(item.get("finding", "")).strip()
+                    if not finding:
+                        continue
+                    if finding not in blockers:
+                        blockers.append(finding)
+                    remediation = str(item.get("remediation", "")).strip()
+                    if remediation:
+                        remediations[finding] = remediation
+                    if item.get("path"):
+                        detail_paths.append(str(item["path"]))
+                for raw in op_result.get("blockers") or []:
+                    if str(raw) not in blockers:
+                        blockers.append(str(raw))
                 if not blockers and op_result.get("reason"):
                     blockers = [op_result["reason"]]
-                state.integration_blockers = list(str(b) for b in blockers)
+                state.integration_blockers = list(blockers)
                 err_msg = (
-                    "; ".join(state.integration_blockers)
-                    if state.integration_blockers
+                    "; ".join(blockers)
+                    if blockers
                     else _strip_code_fences(str(op_result.get("summary", "Blockers reported during integration review")))
                 )
 
-                reworkable = self._reworkable_integration_wos(state, ws, state.integration_blockers)
+                reworkable = self._reworkable_integration_wos(
+                    state, ws, blockers + detail_paths
+                )
                 if state.integration_rework_rounds < state.max_retries and reworkable:
                     state.integration_rework_rounds += 1
                     if state.integration_operation_id and state.integration_operation_id not in state.ignored_operation_ids:
                         state.ignored_operation_ids.append(state.integration_operation_id)
                     state.integration_operation_id = None
-                    feedback = err_msg or "review could not verify the deliverables"
+                    # Per-blocker feedback with the Architect's prescribed fix.
+                    feedback_lines = []
+                    for b in blockers:
+                        line = f"- Blocker: {b}"
+                        if b in remediations:
+                            line += f"\n  Prescribed fix: {remediations[b]}"
+                        feedback_lines.append(line)
+                    feedback = (
+                        "\n".join(feedback_lines)
+                        if feedback_lines
+                        else "review could not verify the deliverables"
+                    )
                     # S6 concurrency: multiple rework turns dispatch under a
                     # shared batch parent so they don't contend for the root
                     # operation slot.
@@ -1476,9 +1508,11 @@ class LifecycleSupervisor:
                                 (
                                     f"Rework work order {wo_id} (integration review round "
                                     f"{state.integration_rework_rounds}/{state.max_retries}): the "
-                                    f"integration review blocked release with these blockers: "
-                                    f"{feedback}. Fix your deliverable so every blocker is "
-                                    f"resolved, then resubmit."
+                                    f"integration review blocked release with these findings "
+                                    f"and prescribed fixes:\n"
+                                    f"{feedback}\n"
+                                    f"Apply each prescribed fix to your deliverable so every "
+                                    f"blocker is resolved, then resubmit."
                                 ),
                                 role=self._role_for_agent(agent),
                                 agent_id=agent,
@@ -1730,11 +1764,19 @@ class LifecycleSupervisor:
             '  "status": "blocked",\n'
             '  "summary": "Unable to verify a deliverable.",\n'
             '  "report_markdown": "Detailed explanation of which deliverable could not be verified and why.",\n'
-            '  "blockers": ["Read access to app/rate_limiter.py was denied."]\n'
+            '  "blockers": ["Read access to app/rate_limiter.py was denied."],\n'
+            '  "blocker_details": [\n'
+            '    {"finding": "Hardcoded secret key fallback in src/backend.py",\n'
+            '     "remediation": "Replace with SECRET_KEY = os.environ[\'SECRET_KEY\'] so a missing variable fails fast",\n'
+            '     "path": "src/backend.py"}\n'
+            '  ]\n'
             "}\n\n"
             "CRITICAL RULES:\n"
             "- When status is 'blocked', 'blockers' MUST be a non-empty string array listing each blocker. "
             "Do NOT rely on prose in the summary to satisfy the schema.\n"
+            "- When status is 'blocked', 'blocker_details' SHOULD accompany each blocker with a "
+            "'remediation': the concrete fix the worker should apply (you are the prescribing "
+            "architect — prescribe precisely; workers apply your prescription verbatim).\n"
             "- When status is 'completed', 'blockers' MUST be an empty array [].\n"
             "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files.\n\n"
             "SECURITY & QUALITY CHECKLIST — verify each item while reading the deliverables and list "
@@ -1862,6 +1904,44 @@ class LifecycleSupervisor:
                 if not blockers and op_result.get("reason"):
                     blockers = [op_result["reason"]]
                 err_msg = "; ".join(str(b) for b in blockers) if blockers else op_result.get("error", "GitOps turn blocked")
+
+                # Budget-class blocks are self-inflicted: the release turn is
+                # mandated to write the VERSION.md/CHANGELOG.md pair, so the
+                # supervisor raises the contract budget to cover the observed
+                # footprint and retries (bounded) instead of dead-ending.
+                failure = op_result.get("failure") if isinstance(op_result.get("failure"), dict) else None
+                failure_code = str(failure.get("failure_code") or "") if failure else ""
+                wo_id = state.gitops_wo_id or "WO-GITOPS"
+                observed_count = int(failure.get("observed_file_count") or 0) if failure else 0
+                if failure_code == "CONTRACT_FILE_BUDGET_EXCEEDED":
+                    retries = state.retry_counts.get(wo_id, 0)
+                    if retries < state.max_retries:
+                        state.retry_counts[wo_id] = retries + 1
+                        contract_file = Path(state.workspace) / ".sync" / "contracts" / f"{state.gitops_wo_id}.yaml"
+                        if contract_file.is_file():
+                            try:
+                                c_data = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                                if isinstance(c_data, dict):
+                                    budget = c_data.setdefault("budget", {})
+                                    needed = max(2, observed_count)
+                                    current = budget.get("max_files_touched")
+                                    if not isinstance(current, int) or current < needed:
+                                        budget["max_files_touched"] = needed
+                                        contract_file.write_text(
+                                            yaml.safe_dump(c_data, sort_keys=False), encoding="utf-8"
+                                        )
+                            except Exception:
+                                pass
+                        state.gitops_operation_id = None
+                        state.error = None
+                        return self._advance_gitops(state)
+                    state.error = (
+                        f"GitOps turn blocked: {err_msg} — budget retries exhausted "
+                        f"({retries}/{state.max_retries})"
+                    )
+                    self._transition(state, Phase.BLOCKED)
+                    return AdvanceResult.BLOCKED
+
                 state.error = f"GitOps turn blocked: {err_msg}"
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
@@ -1910,7 +1990,9 @@ class LifecycleSupervisor:
         try:
             ws = Path(state.workspace)
             if state.gitops_wo_id:
-                # Ensure the GitOps contract allows reading deliverables
+                # Ensure the GitOps contract allows reading deliverables and
+                # covers the release-documentation pair (VERSION.md +
+                # CHANGELOG.md) the release turn is mandated to write.
                 contract_file = ws / ".sync" / "contracts" / f"{state.gitops_wo_id}.yaml"
                 if contract_file.is_file():
                     try:
@@ -1925,6 +2007,11 @@ class LifecycleSupervisor:
                                 if n not in existing_mods:
                                     allow_list.append({"module": n})
                                     updated = True
+                            budget = c_data.setdefault("budget", {})
+                            current_budget = budget.get("max_files_touched")
+                            if not isinstance(current_budget, int) or current_budget < 2:
+                                budget["max_files_touched"] = 2
+                                updated = True
                             if updated:
                                 contract_file.write_text(yaml.safe_dump(c_data, sort_keys=False), encoding="utf-8")
                     except Exception:
@@ -1934,7 +2021,7 @@ class LifecycleSupervisor:
                 "All implementation work orders are complete, QA-approved, and integration-reviewed.\n\n"
                 "As GitOps Release Lead, finalize the release documentation:\n"
                 "1. Write VERSION.md with version '0.1.0'.\n"
-                "2. Write CHANGELOG.md summarizing the completed deliverables (app/rate_limiter.py and tests/test_rate_limiter.py).\n"
+                "2. Write CHANGELOG.md summarizing the completed deliverables and the release.\n"
                 "3. Return the final HarnessDecision JSON with status 'completed'. Do not run git commands; the supervisor creates the release commit automatically."
             )
             params: dict[str, Any] = {

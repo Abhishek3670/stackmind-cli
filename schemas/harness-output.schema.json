@@ -56,6 +56,33 @@
       "items": {
         "type": "string"
       }
+    },
+    "blocker_details": {
+      "type": "array",
+      "description": "Structured blockers for blocked reviews: each carries the finding and the prescribed remediation.",
+      "items": {
+        "type": "object",
+        "required": [
+          "finding"
+        ],
+        "properties": {
+          "finding": {
+            "type": "string"
+          },
+          "remediation": {
+            "type": "string",
+            "description": "Prescribed concrete fix for the finding."
+          },
+          "path": {
+            "type": "string",
+            "description": "Deliverable path the finding concerns."
+          },
+          "work_order": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

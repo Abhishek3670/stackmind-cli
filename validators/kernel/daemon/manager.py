@@ -1253,6 +1253,10 @@ class SessionManager:
         state.blocked_wo_ids.clear()
         state.failed_wo_ids.clear()
         state.retry_counts.clear()
+        # Operator resume grants a fresh rework budget: the human decided to
+        # continue the run (often after a platform upgrade or manual repair),
+        # so stale exhaustion from previous sessions must not dead-end it.
+        state.integration_rework_rounds = 0
 
         # Invalidate any existing non-completed operations in the session journal
         # so the supervisor does not immediately re-block on stale historical failures.
@@ -2097,6 +2101,8 @@ class SessionManager:
                 result_data["tool_calls_audit"] = res_meta.get("tool_calls_audit") or []
             if "scope_evidence" in res_meta:
                 result_data["scope_evidence"] = res_meta.get("scope_evidence")
+            if res_meta.get("blocker_details"):
+                result_data["blocker_details"] = res_meta.get("blocker_details")
             if result.status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,

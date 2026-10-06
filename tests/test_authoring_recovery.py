@@ -1428,3 +1428,76 @@ class TestWorkerDeclarationDirection:
         meta = result.meta or {}
         assert meta.get("modified_files") == ["src/app.py"]
         assert (ws / "src" / "missing.py").exists() is False
+
+
+def test_blocker_details_plumb_through_decision_and_meta(tmp_path: Path) -> None:
+    """A blocked decision carrying blocker_details survives validation,
+    lands in the run result meta, and the schema accepts the field."""
+    import json as _json
+
+    from validators.harness.runner import AgentRunner, HarnessDecision
+
+    # HarnessDecision carries the details
+    d = HarnessDecision(
+        status="blocked", summary="s", report_markdown="r",
+        blockers=("finding one",),
+        blocker_details=({"finding": "finding one", "remediation": "fix it"},),
+        modified_files=(), release_target=None,
+        retrieval_queries=(), uncertainty=(),
+    )
+    assert d.blocker_details[0]["remediation"] == "fix it"
+
+    # The output schema accepts the optional field
+    from validators.harness.authoring_gate import AuthoringGate
+    gate = AuthoringGate(project_root=tmp_path)
+    schema = gate.get_schema("harness-output.schema.json")
+    assert schema is not None and "blocker_details" in schema["properties"]
+
+    # A full runner turn with a scripted blocked decision exposes the details
+    from validators.kernel.providers.models import (
+        Message, ProviderResponse, ToolCallRequest, TokenUsage,
+    )
+    from cli.init import init
+    from validators.kernel.daemon.manager import synthesize_bootstrap_planning
+    init(tmp_path / "ws2", name="BD", no_git=True)
+    ws2 = tmp_path / "ws2"
+    synthesize_bootstrap_planning(ws2, "Build app")
+
+    class BlockedAdapter:
+        provider_name = "scripted"
+        model_name = "scripted-model"
+
+        def complete(self, messages, **kwargs):
+            if not any(m.role == "tool" for m in messages):
+                return ProviderResponse(
+                    message=Message.assistant(content="", tool_calls=[
+                        ToolCallRequest(id="c0", name="write_file",
+                                        arguments={"path": "PLAN.md",
+                                                   "content": "# Plan\n\n## Milestones & Roadmap\n- [ ] M1: x\n"})]
+                    ),
+                    usage=TokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
+                )
+            return ProviderResponse(
+                message=Message.assistant(content=_json.dumps({
+                    "status": "blocked",
+                    "summary": "Review found issues",
+                    "report_markdown": "Issues.",
+                    "blockers": ["finding one"],
+                    "blocker_details": [
+                        {"finding": "finding one", "remediation": "fix it", "path": "src/app.py"}
+                    ],
+                })),
+                usage=TokenUsage(prompt_tokens=8, completion_tokens=3, total_tokens=11),
+            )
+
+    runner = AgentRunner(ws2, "claude", provider_adapter=BlockedAdapter())
+    result = runner.run_once(
+        prompt="Review the deliverables",
+        work_order_id="WO-000",
+        operation_id="op-rev",
+        is_authoring=True,
+    )
+    assert result.status == "blocked"
+    meta = result.meta or {}
+    details = meta.get("blocker_details") or []
+    assert details and details[0]["remediation"] == "fix it"

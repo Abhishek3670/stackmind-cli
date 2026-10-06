@@ -137,6 +137,7 @@ class HarnessDecision:
     retrieval_queries: tuple[str, ...]
     uncertainty: tuple[str, ...]
     commands: tuple[str, ...] = ()
+    blocker_details: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -735,6 +736,7 @@ class AgentRunner:
                 'llm_ms': llm_ms,
                 'run_at': run_at,
                 'tool_calls_audit': (completion.meta or {}).get('tool_calls_audit', []),
+                'blocker_details': [dict(d) for d in (getattr(decision, 'blocker_details', ()) or ())],
             }
             staged_errors = self._validate_staged_state(stage_inputs, source_root=workspace_root)
             if staged_errors:
@@ -892,7 +894,10 @@ class AgentRunner:
                         reason_msg = 'verification gate failed: ' + ', '.join(failed)
                         if staged_errors:
                             reason_msg += f" ({'; '.join(staged_errors)})"
-                        meta_dict: dict[str, Any] = {'commands_audit': stage_inputs.get('commands_audit', [])}
+                        meta_dict: dict[str, Any] = {
+                            'commands_audit': stage_inputs.get('commands_audit', []),
+                            'blocker_details': stage_inputs.get('blocker_details', []),
+                        }
                         if not dimensions.scope_verified:
                             # Scope evidence: make every scope-gate block
                             # diagnosable without re-running the turn.
@@ -1170,6 +1175,7 @@ class AgentRunner:
             'summary',
             'report_markdown',
             'blockers',
+            'blocker_details',
             'modified_files',
             'release_target',
             'retrieval_queries',
@@ -1185,6 +1191,10 @@ class AgentRunner:
         status = str(filtered_payload.get('status', ''))
         release_target = filtered_payload.get('release_target')
         blockers = tuple(str(item) for item in filtered_payload.get('blockers', []))
+        blocker_details = tuple(
+            dict(item) for item in filtered_payload.get('blocker_details', []) or []
+            if isinstance(item, dict) and str(item.get('finding', '')).strip()
+        )
         if task.work_order_id and task.deliverable_path and status == 'completed' and not str(release_target or '').strip():
             errors.append('release_target is required for completed work-order tasks')
         if status == 'blocked' and not blockers:
@@ -1198,6 +1208,7 @@ class AgentRunner:
             summary=str(filtered_payload['summary']).strip(),
             report_markdown=str(filtered_payload['report_markdown']).strip(),
             blockers=blockers,
+            blocker_details=blocker_details,
             modified_files=tuple(str(item) for item in filtered_payload.get('modified_files', [])),
             release_target=str(release_target).strip() if release_target else None,
             retrieval_queries=tuple(str(item) for item in filtered_payload.get('retrieval_queries', [])),
@@ -1789,6 +1800,7 @@ class AgentRunner:
             'summary',
             'report_markdown',
             'blockers',
+            'blocker_details',
             'modified_files',
             'release_target',
             'retrieval_queries',
@@ -2158,6 +2170,7 @@ class AgentRunner:
             'cost_estimate': round(completion.cost_estimate + retrieval.cost_estimate, 6),
             'commands_audit': stage_inputs.get('commands_audit', []),
             'tool_calls_audit': stage_inputs.get('tool_calls_audit', []),
+            'blocker_details': stage_inputs.get('blocker_details', []),
             'declaration_matches': stage_inputs.get('declaration_matches', True),
             'experience_id': exp_rec.experience_id if exp_rec else None,
             'knowledge_git_commit': context.git_commit,

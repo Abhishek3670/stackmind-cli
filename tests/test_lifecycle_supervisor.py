@@ -3363,3 +3363,164 @@ def test_integration_review_rework_targets_accused_work_orders(tmp_path: Path) -
     assert state.batch_operation_id is not None
     batch = mock_mgr.operations[state.batch_operation_id]
     assert batch["operation"] == "parallel_dispatch"
+
+
+def test_integration_review_rework_forwards_prescribed_fixes(tmp_path: Path) -> None:
+    """When the review prescribes fixes (blocker_details), the rework prompt
+    carries each blocker with its prescribed remedy verbatim to the worker."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir-rx", "Build API", tmp_path, "sess-ir-rx")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-002"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 0
+
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002", "title": "Backend", "assigned_agents": ["codex"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "code", "path": "src/backend.py", "description": "api"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "work-orders" / "INDEX.yaml").write_text(
+        yaml.safe_dump({"orders": [], "next_id": 3}), encoding="utf-8"
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    supervisor.advance(state)  # review dispatched
+    review_op_id = state.integration_operation_id
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Security violations",
+        "blockers": ["Hardcoded secret key fallback found in src/backend.py"],
+        "blocker_details": [
+            {
+                "finding": "Hardcoded secret key fallback found in src/backend.py",
+                "remediation": "Replace with SECRET_KEY = os.environ['SECRET_KEY'] so a missing variable fails fast",
+                "path": "src/backend.py",
+            }
+        ],
+    }
+
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+
+    rework_ops = [o for o in mock_mgr.list_operations() if "Rework work order WO-002" in str(o.get("prompt", ""))]
+    assert len(rework_ops) == 1
+    prompt = rework_ops[0]["prompt"]
+    # The finding AND the architect's prescribed fix reach the worker verbatim
+    assert "Hardcoded secret key fallback found in src/backend.py" in prompt
+    assert "Prescribed fix: Replace with SECRET_KEY = os.environ['SECRET_KEY'] so a missing variable fails fast" in prompt
+    assert "Apply each prescribed fix" in prompt
+
+
+def test_resume_grants_fresh_integration_rework_budget(tmp_path: Path) -> None:
+    """Operator resume resets integration_rework_rounds: a run whose rework
+    budget was exhausted in a previous session gets a fresh budget."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase as SupPhase
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    state = SupPhase and __import__(
+        "validators.kernel.daemon.supervisor", fromlist=["RunState"]
+    ).RunState(
+        run_id="run-rework-budget",
+        product_goal="goal",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=SupPhase.BLOCKED,
+        integration_rework_rounds=2,
+        max_retries=2,
+    )
+    (tmp_path / ".sync" / "runtime" / "supervisor").mkdir(parents=True, exist_ok=True)
+    import yaml as _yaml
+    (tmp_path / ".sync" / "runtime" / "supervisor" / "run-rework-budget.yaml").write_text(
+        _yaml.safe_dump(state.to_dict(), sort_keys=False), encoding="utf-8"
+    )
+
+    mgr.resume_run(sid, run_id="run-rework-budget")
+    resumed = mgr.get_run("run-rework-budget")
+    assert resumed["integration_rework_rounds"] == 0
+
+
+def test_gitops_budget_block_raises_budget_and_retries(tmp_path: Path) -> None:
+    """A CONTRACT_FILE_BUDGET_EXCEEDED block at the GitOps phase raises the
+    release-doc contract budget to cover the observed footprint and retries,
+    instead of dead-ending the run."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-gitops-budget", "Build API", tmp_path, "sess-gb")
+    state.phase = Phase.GITOPS
+    state.gitops_wo_id = "WO-005"
+    state.max_retries = 2
+
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    (contracts_dir / "WO-005.yaml").write_text(
+        yaml.safe_dump({
+            "schema_version": 1, "agent_id": "local-llm", "work_order": "WO-005",
+            "scope": {"allow": [{"module": "VERSION.md"}, {"module": "CHANGELOG.md"}],
+                      "deny": [], "write": "read-write"},
+            "budget": {"max_files_touched": 1, "max_tokens": 0},
+        }),
+        encoding="utf-8",
+    )
+
+    res = supervisor.advance(state)  # dispatch gitops turn (budget patched to 2 pre-dispatch)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    contract = yaml.safe_load((contracts_dir / "WO-005.yaml").read_text(encoding="utf-8"))
+    assert contract["budget"]["max_files_touched"] >= 2  # pre-dispatch patch
+
+    gitops_op_id = state.gitops_operation_id
+    mock_mgr.operations[gitops_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[gitops_op_id]["result"] = {
+        "status": "blocked",
+        "failure": {
+            "failure_code": "CONTRACT_FILE_BUDGET_EXCEEDED",
+            "observed_file_count": 2,
+            "canonical_message": "CONTRACT_FILE_BUDGET_EXCEEDED: 2 file(s) modified, exceeding budget max_files_touched limit of 1",
+        },
+        "blockers": ["CONTRACT_FILE_BUDGET_EXCEEDED: 2 file(s) modified"],
+    }
+
+    res2 = supervisor.advance(state)  # budget-class block -> bounded retry
+    assert res2 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.GITOPS
+    assert state.retry_counts.get("WO-005") == 1
+    contract = yaml.safe_load((contracts_dir / "WO-005.yaml").read_text(encoding="utf-8"))
+    assert contract["budget"]["max_files_touched"] >= 2  # raised to observed footprint
+
+    # Exhaustion -> terminal BLOCKED with the evidence in the error
+    gitops_op2 = state.gitops_operation_id
+    mock_mgr.operations[gitops_op2]["status"] = "BLOCKED"
+    mock_mgr.operations[gitops_op2]["result"] = {
+        "status": "blocked",
+        "failure": {
+            "failure_code": "CONTRACT_FILE_BUDGET_EXCEEDED",
+            "observed_file_count": 3,
+        },
+        "blockers": ["CONTRACT_FILE_BUDGET_EXCEEDED: 3 file(s) modified"],
+    }
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.WAITING_FOR_OPERATION  # second retry (attempt 3)
+    gitops_op3 = state.gitops_operation_id
+    mock_mgr.operations[gitops_op3]["status"] = "BLOCKED"
+    mock_mgr.operations[gitops_op3]["result"] = {
+        "status": "blocked",
+        "failure": {"failure_code": "CONTRACT_FILE_BUDGET_EXCEEDED", "observed_file_count": 3},
+        "blockers": ["CONTRACT_FILE_BUDGET_EXCEEDED: 3 file(s) modified"],
+    }
+    supervisor.advance(state)
+    assert state.phase == Phase.BLOCKED
+    assert "budget retries exhausted" in (state.error or "")

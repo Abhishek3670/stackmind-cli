@@ -698,6 +698,14 @@ def synthesize_child_work_orders(
             title, desc, deliv.get("path"), task_candidates,
             deliverable_type=deliv.get("type"),
         )
+        if primary_agent in ("local-llm", "gitops") and implementation_estimate:
+            # The release flow always writes the release documentation pair.
+            for rel in ("VERSION.md", "CHANGELOG.md"):
+                if rel not in implementation_estimate["expected_files"]:
+                    implementation_estimate["expected_files"].append(rel)
+            implementation_estimate["max_files_touched"] = len(
+                implementation_estimate["expected_files"]
+            )
 
         contract_rec = build_child_contract(
             wo_id=wo_id,
