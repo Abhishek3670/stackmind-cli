@@ -87,16 +87,23 @@ def test_codex_cannot_git_commit_or_git_push(tmp_path: Path) -> None:
     assert "denies" in str(exc_push.value).lower() or "not permitted" in str(exc_push.value).lower() or "denied" in str(exc_push.value).lower()
 
 
-def test_gemma_cannot_apply_patch_or_write_file(tmp_path: Path) -> None:
-    """Gemma (QA Lead) attempting apply_patch or write_file on source must raise PermissionError."""
-    gateway, workspace, _ = _build_gateway(tmp_path, "gemma")
+def test_gemma_writes_scoped_artifacts_but_cannot_apply_patch(tmp_path: Path) -> None:
+    """QA doctrine: gemma authors its executable test suites via write_file —
+    bounded by contract scope — while source-editing tools stay withheld."""
+    gateway, workspace, _ = _build_gateway(
+        tmp_path, "gemma", allow_patterns=["workspace/**", "graph/**", "tests/**"]
+    )
 
-    # Attempting write_file
-    with pytest.raises(PermissionError) as exc_write:
-        gateway.write_file("sample.py", "malicious write")
-    assert "denies" in str(exc_write.value).lower() or "not permitted" in str(exc_write.value).lower() or "denied" in str(exc_write.value).lower()
+    # write_file within contract scope succeeds (QA authors its test suites)
+    gateway.write_file("tests/test_sample.py", "def test_sample():\n    assert True\n")
+    assert workspace.path_for("tests/test_sample.py").is_file()
 
-    # Attempting apply_patch
+    # write_file on a deny-listed boundary is denied (contract is the boundary)
+    with pytest.raises(PermissionError) as exc_scope:
+        gateway.write_file("authoritative/leak.txt", "out of scope write")
+    assert "denied" in str(exc_scope.value).lower() or "denies" in str(exc_scope.value).lower()
+
+    # Attempting apply_patch remains denied (policy: source editing withheld)
     patch_text = (
         "--- sample.py\n"
         "+++ sample.py\n"
@@ -107,7 +114,7 @@ def test_gemma_cannot_apply_patch_or_write_file(tmp_path: Path) -> None:
     )
     with pytest.raises(PermissionError) as exc_patch:
         gateway.apply_patch("sample.py", patch_text)
-    assert "denies" in str(exc_patch.value).lower() or "not permitted" in str(exc_patch.value).lower() or "denied" in str(exc_patch.value).lower()
+    assert "denies" in str(exc_patch.value).lower() or "not permitted" in str(exc_patch.value).lower()
 
 
 def test_codex_and_gemini_cannot_create_work_order_or_author_contracts(tmp_path: Path) -> None:
@@ -289,8 +296,10 @@ def test_gemma_qa_tools_segregation() -> None:
     assert "read_file" in gemma_tool_names
     assert "list_directory" in gemma_tool_names
 
-    # Must NEVER contain code write or git mutation tools
-    assert "write_file" not in gemma_tool_names
+    # QA authors its executable test suites (deliverable-under-tests doctrine)
+    assert "write_file" in gemma_tool_names
+
+    # Must NEVER contain source-editing or git mutation tools
     assert "apply_patch" not in gemma_tool_names
     assert "delete_file" not in gemma_tool_names
     assert "move_file" not in gemma_tool_names

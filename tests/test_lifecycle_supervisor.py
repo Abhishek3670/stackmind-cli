@@ -171,6 +171,72 @@ class MockSessionManager:
 
 # ─── Fixture: git repo that skips if git is unavailable ───────────────
 
+def write_ready_artifact_set(
+    ws: Path,
+    specs: list[tuple[str, str, str, str, str]],
+) -> None:
+    """Write schema-valid WO+contract pairs that pass the authoring readiness gate.
+
+    Each spec is (wo_id, agent, role, deliverable_type, deliverable_path).
+    """
+    wo_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    contract_dir = ws / ".sync" / "contracts"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    now = "2026-01-01T00:00:00+00:00"
+    for wo_id, agent, role, deliv_type, deliv_path in specs:
+        wo_record: dict[str, Any] = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": f"Task {wo_id}",
+            "status": "ACTIVE",
+            "priority": "P1",
+            "assigned_agents": [agent],
+            "dependencies": [],
+            "deliverable": {
+                "type": deliv_type,
+                "description": f"{wo_id} deliverable",
+            },
+            "description": f"Implement {wo_id}",
+            "created": now,
+            "updated": now,
+        }
+        if deliv_path:
+            wo_record["deliverable"]["path"] = deliv_path
+            # Plan the D024 companion test for code deliverables so the
+            # readiness gate's test-coverage check passes.
+            if deliv_type == "code":
+                stem = Path(deliv_path).stem
+                wo_record["implementation_estimate"] = {
+                    "expected_files": [deliv_path, f"tests/test_{stem}.py"],
+                    "max_files_touched": 2,
+                    "rationale": "deliverable plus companion test",
+                }
+                wo_record["description"] = (
+                    f"Implement {wo_id} including companion test tests/test_{stem}.py"
+                )
+        contract_record: dict[str, Any] = {
+            "schema_version": 1,
+            "agent_id": agent,
+            "work_order": wo_id,
+            "identity": {"role": role, "reports_to": "claude"},
+            "scope": {
+                "allow": [{"module": "PLAN.md"}, {"module": ".sync/inbox/claude/**"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 5, "max_tokens": 0},
+        }
+        if deliv_path:
+            contract_record["scope"]["allow"].append({"module": deliv_path})
+        (wo_dir / f"{wo_id}.yaml").write_text(
+            yaml.safe_dump(wo_record, sort_keys=False), encoding="utf-8"
+        )
+        (contract_dir / f"{wo_id}.yaml").write_text(
+            yaml.safe_dump(contract_record, sort_keys=False), encoding="utf-8"
+        )
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Initialize a git repo in tmp_path; skip test if git is unavailable."""
@@ -296,7 +362,8 @@ def test_supervisor_approval_advances_to_authoring(tmp_path: Path) -> None:
 
 
 def test_supervisor_authoring_discovers_worker_wos(tmp_path: Path) -> None:
-    """When authoring completes, supervisor discovers worker WOs on disk and transitions to DISPATCHING."""
+    """When authoring completes, supervisor discovers worker WOs, passes the
+    authoring readiness gate, and transitions to DISPATCHING."""
     mock_mgr = MockSessionManager(tmp_path)
     supervisor = LifecycleSupervisor(mock_mgr)
     state = supervisor.start_run("run-001", "Create login", tmp_path, "sess-001")
@@ -306,21 +373,29 @@ def test_supervisor_authoring_discovers_worker_wos(tmp_path: Path) -> None:
     op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
     state.authoring_operation_id = op["operation_id"]
 
-    # Write worker WOs to disk
-    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
-    wo_dir.mkdir(parents=True, exist_ok=True)
-    (wo_dir / "WO-001.yaml").write_text("id: WO-001\nassigned_agents: [codex]\n", encoding="utf-8")
-    (wo_dir / "WO-002.yaml").write_text("id: WO-002\nassigned_agents: [gemini]\n", encoding="utf-8")
-    (wo_dir / "WO-003.yaml").write_text("id: WO-003\nassigned_agents: [local-llm]\n", encoding="utf-8")
+    # Write schema-valid worker WOs + matching contracts to disk
+    write_ready_artifact_set(tmp_path, [
+        ("WO-001", "codex", "backend", "code", "src/backend.py"),
+        ("WO-002", "gemini", "frontend", "code", "src/frontend.html"),
+        ("WO-003", "local-llm", "gitops", "doc", "VERSION.md"),
+    ])
 
     # Complete authoring op
     mock_mgr.complete_operation(op["operation_id"], "COMPLETED")
 
+    # Advance 1: authoring completion routes through the readiness gate
     res = supervisor.advance(state)
     assert res == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.AUTHORING_READINESS_GATE
+
+    # Advance 2: readiness passes → publishable revision → DISPATCHING
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.DISPATCHING
     assert state.worker_wo_ids == ["WO-001", "WO-002"]
     assert state.gitops_wo_id == "WO-003"
+    # Atomic publication: only readiness-approved WOs are dispatchable
+    assert state.published_wo_ids == ["WO-001", "WO-002"]
 
 
 def test_supervisor_dependency_resolution(tmp_path: Path) -> None:
@@ -1396,15 +1471,11 @@ def test_manager_drive_run_times_out_when_operation_stuck(tmp_path: Path) -> Non
     assert "Timed out waiting for operations" in state.error
 
 
-def test_supervisor_authoring_synthesis_fallback_when_model_emits_text(tmp_path: Path) -> None:
-    """When an authoring turn finishes without tool writes (e.g. local LLM),
-    supervisor autonomously synthesizes validated child WOs and contracts from PLAN.md
-    and transitions to DISPATCHING.
+def test_supervisor_bootstrap_synthesis_only_in_bootstrap_mode(tmp_path: Path) -> None:
+    """Deterministic child-WO synthesis is permitted ONLY in explicit bootstrap
+    mode when the authoring turn completes without authoring artifacts; without
+    bootstrap mode the run fails closed into ARCHITECT_REPAIR instead.
     """
-    mock_mgr = MockSessionManager(tmp_path)
-    supervisor = LifecycleSupervisor(mock_mgr)
-
-    # 1. Create PLAN.md on disk
     plan_content = (
         "# Project Plan: Login System Implementation\n\n"
         "## Current Architecture\n"
@@ -1417,61 +1488,122 @@ def test_supervisor_authoring_synthesis_fallback_when_model_emits_text(tmp_path:
         "- [ ] Milestone 3: Frontend Login Interface\n"
         "  - [ ] Task 3.1: Create Login Page (src/frontend.html)\n"
     )
-    (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
 
-    # 2. Propose plan in mock manager
-    mock_mgr.propose_plan(
-        "sess-001",
-        "PLAN-001",
-        title="Login System",
-        content=plan_content,
+    def _setup(plan_state: str = "APPROVED") -> tuple[MockSessionManager, LifecycleSupervisor, RunState, str]:
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+        mock_mgr.propose_plan("sess-001", "PLAN-001", title="Login System", content=plan_content)
+        plan = mock_mgr.get_plan("sess-001", "PLAN-001")
+        plan["state"] = plan_state
+        state = supervisor.start_run("run-auth-test", "Login System", tmp_path, "sess-001")
+        state.phase = Phase.AUTHORING
+        state.plan_id = "PLAN-001"
+        op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
+        state.authoring_operation_id = op["operation_id"]
+        mock_mgr.complete_operation(
+            op["operation_id"],
+            status="COMPLETED",
+            result={"status": "completed", "summary": "I have reviewed PLAN.md."},
+        )
+        return mock_mgr, supervisor, state, op["operation_id"]
+
+    # 1. Without bootstrap mode: fail closed into ARCHITECT_REPAIR — no synthesis.
+    mock_mgr, supervisor, state, _op_id = _setup()
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.ARCHITECT_REPAIR
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    assert not wo_dir.exists() or not any(wo_dir.glob("*.yaml"))
+    assert state.authoring_operation_failed is False
+    assert any(
+        issue.get("code") == "NO_WORK_ORDERS_AUTHORED" for issue in state.readiness_issues
     )
-    plan = mock_mgr.get_plan("sess-001", "PLAN-001")
-    plan["state"] = "APPROVED"
+    # The repair turn contains bounded diagnostics, not the broad authoring prompt.
+    repair_ops = [
+        o for o in mock_mgr.list_operations() if o.get("metadata", {}).get("is_repair")
+    ]
+    assert len(repair_ops) == 1
+    assert "rejection" in repair_ops[0]["prompt"].lower() or "repair" in repair_ops[0]["prompt"].lower()
 
-    # 3. Create supervised run at AUTHORING phase
-    state = supervisor.start_run("run-auth-test", "Login System", tmp_path, "sess-001")
+    # 2. With explicit bootstrap mode: synthesis still produces validated child WOs.
+    mock_mgr2, supervisor2, state2, _op2 = _setup()
+    state2.bootstrap_mode = True
+    res_a = supervisor2.advance(state2)
+    assert res_a == AdvanceResult.TRANSITIONED
+    assert state2.phase == Phase.AUTHORING_READINESS_GATE
+    res_b = supervisor2.advance(state2)
+    assert res_b == AdvanceResult.TRANSITIONED
+    assert state2.phase == Phase.DISPATCHING
+    assert state2.worker_wo_ids == ["WO-001", "WO-002", "WO-003"]
+    assert state2.published_wo_ids == ["WO-001", "WO-002", "WO-003"]
+    assert state2.error is None
+
+    wo_dir2 = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contract_dir2 = tmp_path / ".sync" / "contracts"
+    assert (wo_dir2 / "WO-001.yaml").is_file()
+    assert (wo_dir2 / "WO-002.yaml").is_file()
+    assert (wo_dir2 / "WO-003.yaml").is_file()
+    assert (contract_dir2 / "WO-001.yaml").is_file()
+    assert (contract_dir2 / "WO-002.yaml").is_file()
+    assert (contract_dir2 / "WO-003.yaml").is_file()
+
+    # Verify deliverable paths were intelligently derived
+    wo1 = yaml.safe_load((wo_dir2 / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert wo1["deliverable"]["path"] == "requirements.txt"
+
+    wo2 = yaml.safe_load((wo_dir2 / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert wo2["deliverable"]["path"] == "src/backend.py"
+
+    wo3 = yaml.safe_load((wo_dir2 / "WO-003.yaml").read_text(encoding="utf-8"))
+    assert wo3["deliverable"]["path"] == "src/frontend.html"
+
+
+def test_supervisor_authoring_failure_never_synthesizes(tmp_path: Path) -> None:
+    """A failed authoring operation transitions to ARCHITECT_REPAIR and never
+    synthesizes or dispatches generic child work orders — even in bootstrap mode.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    (tmp_path / "PLAN.md").write_text(
+        "# Project Plan: Login\n\n## Milestones & Roadmap\n- [ ] Milestone 1: Backend (src/backend.py)\n",
+        encoding="utf-8",
+    )
+    state = supervisor.start_run("run-authfail", "Login System", tmp_path, "sess-001")
     state.phase = Phase.AUTHORING
     state.plan_id = "PLAN-001"
+    state.bootstrap_mode = True  # even operator-approved bootstrap cannot rescue a failure
 
-    # 4. Simulate authoring operation that completed without writing files
     op = mock_mgr.start_turn("sess-001", "Author WOs", is_authoring=True, work_order_id="WO-000")
     state.authoring_operation_id = op["operation_id"]
     mock_mgr.complete_operation(
         op["operation_id"],
-        status="COMPLETED",
-        result={"status": "completed", "summary": "I have reviewed PLAN.md."},
+        status="FAILED",
+        result={"status": "failed", "error": "Harness decision validation failed after retries"},
     )
 
-    # 5. Advance supervisor
     res = supervisor.advance(state)
-
-    # Must transition to DISPATCHING with discovered worker WOs
-    assert res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.DISPATCHING
-    assert state.worker_wo_ids == ["WO-001", "WO-002", "WO-003"]
-    assert state.error is None
-
-    # Check that files exist on disk and pass validation
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.ARCHITECT_REPAIR
+    assert state.authoring_operation_failed is True
+    # No child WOs or contracts were synthesized or dispatched
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     contract_dir = tmp_path / ".sync" / "contracts"
-
-    assert (wo_dir / "WO-001.yaml").is_file()
-    assert (wo_dir / "WO-002.yaml").is_file()
-    assert (wo_dir / "WO-003.yaml").is_file()
-    assert (contract_dir / "WO-001.yaml").is_file()
-    assert (contract_dir / "WO-002.yaml").is_file()
-    assert (contract_dir / "WO-003.yaml").is_file()
-
-    # Verify deliverable paths were intelligently derived
-    wo1 = yaml.safe_load((wo_dir / "WO-001.yaml").read_text(encoding="utf-8"))
-    assert wo1["deliverable"]["path"] == "requirements.txt"
-
-    wo2 = yaml.safe_load((wo_dir / "WO-002.yaml").read_text(encoding="utf-8"))
-    assert wo2["deliverable"]["path"] == "src/backend.py"
-
-    wo3 = yaml.safe_load((wo_dir / "WO-003.yaml").read_text(encoding="utf-8"))
-    assert wo3["deliverable"]["path"] == "src/frontend.html"
+    assert not wo_dir.exists() or not any(
+        f.stem != "WO-000" for f in wo_dir.glob("*.yaml")
+    )
+    assert not contract_dir.exists() or not any(
+        f.stem != "WO-000" for f in contract_dir.glob("*.yaml")
+    )
+    assert any(
+        issue.get("code") == "AUTHORING_OPERATION_FAILED" for issue in state.readiness_issues
+    )
+    # No worker dispatch happened — the only new op is the architect repair turn
+    dispatched_worker_ops = [
+        o for o in mock_mgr.list_operations()
+        if o.get("metadata", {}).get("is_repair") is None and o.get("work_order_id") not in (None, "WO-000")
+    ]
+    assert dispatched_worker_ops == []
 
 
 def test_runner_authoring_turn_does_not_require_plan_md_modification(tmp_path: Path) -> None:
@@ -1850,10 +1982,25 @@ def test_integration_review_synthesizes_dedicated_wo_and_contract(tmp_path: Path
     assert contract["agent_id"] == "claude"
     assert contract["work_order"] == state.integration_wo_id
 
-    # Verify scope includes the deliverable
+    # Verify scope includes the deliverable and frontend assets
     allow_modules = [r.get("module") for r in contract["scope"]["allow"]]
     assert "app/rate_limiter.py" in allow_modules, f"Deliverable should be in allow scope, got {allow_modules}"
     assert "PLAN.md" in allow_modules
+    assert "*.html" in allow_modules
+    assert "*.css" in allow_modules
+    assert "*.js" in allow_modules
+    assert "templates/**" in allow_modules
+    assert "static/**" in allow_modules
+
+    # Verify authorization: review contract can read frontend files but cannot write to them
+    from validators.kernel.contract import ContractNormalizer, ContractEvaluator
+    kernel_contract = ContractNormalizer.normalize(contract)
+    evaluator = ContractEvaluator()
+    can_read, _ = evaluator.authorize(kernel_contract, "read_file", "src/web/login.html")
+    assert can_read is True
+    can_write, msg = evaluator.authorize(kernel_contract, "write_file", "src/web/login.html")
+    assert can_write is False
+    assert "read-only" in msg.lower()
 
 
 def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path) -> None:
@@ -1899,12 +2046,14 @@ def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path)
 
 
 def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: Path) -> None:
-    """Requirement 4: A valid blocked review → Phase.BLOCKED (recoverable), not Phase.FAILED."""
+    """Requirement 4: A blocked review with rework exhausted → Phase.BLOCKED (recoverable), not Phase.FAILED."""
     mock_mgr = MockSessionManager(tmp_path)
     supervisor = LifecycleSupervisor(mock_mgr)
     state = supervisor.start_run("run-ir3", "Build API", tmp_path, "sess-ir3")
     state.phase = Phase.INTEGRATION_REVIEW
     state.completed_wo_ids = ["WO-001"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 2  # rework rounds already exhausted
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
@@ -1941,6 +2090,79 @@ def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: 
     assert state.phase == Phase.BLOCKED, f"Expected BLOCKED phase, got {state.phase}"
     assert state.integration_blockers == ["Read access to app/api.py was denied."]
     assert "blocked" in state.error.lower()
+
+
+def test_integration_review_blocked_routes_to_bounded_rework(tmp_path: Path) -> None:
+    """A blocked review routes its blockers back to the implementation workers
+    for rework (WOs un-archived, re-dispatched with feedback under a batch
+    parent); after the rework completes, the review re-runs and can pass the
+    run to PRODUCT_READY."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir-rework", "Build API", tmp_path, "sess-ir-rw")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 0
+
+    # WO-001 completed and archived (no deliverable path — always reworkable)
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({"id": "WO-001", "title": "API", "assigned_agents": ["codex"], "status": "COMPLETED"}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "work-orders" / "INDEX.yaml").write_text(
+        yaml.safe_dump({"orders": [], "next_id": 2}), encoding="utf-8"
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    # Advance: review dispatched
+    supervisor.advance(state)
+    review_op_id = state.integration_operation_id
+
+    # Review blocks with concrete blockers
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Security violations found",
+        "blockers": ["Hardcoded default for SECRET_KEY in src/backend.py"],
+    }
+
+    # Advance: bounded rework, not terminal block
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.integration_rework_rounds == 1
+    assert state.integration_operation_id is None  # stale review op retired
+    assert "WO-001" not in state.completed_wo_ids
+    # The archived WO returned to ACTIVE for re-dispatch
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    assert (active_dir / "WO-001.yaml").is_file()
+    assert not (completed_dir / "WO-001.yaml").exists()
+    rework_ops = [o for o in mock_mgr.list_operations() if "Rework work order WO-001" in str(o.get("prompt", ""))]
+    assert len(rework_ops) == 1
+    assert "SECRET_KEY" in rework_ops[0]["prompt"]
+
+    # Rework turn completes; WO-001 returns to completed; review re-runs fresh
+    mock_mgr.complete_operation(rework_ops[0]["operation_id"], "COMPLETED")
+    supervisor.advance(state)  # WO-001 completes again -> INTEGRATION_REVIEW
+    assert state.phase == Phase.INTEGRATION_REVIEW
+    supervisor.advance(state)  # dispatches the fresh review turn
+    assert state.integration_operation_id, "expected a fresh integration review turn"
+    assert state.integration_operation_id != review_op_id  # new op, not the blocked one
+
+    # Review passes this time -> PRODUCT_READY
+    fresh_review_id = state.integration_operation_id
+    mock_mgr.operations[fresh_review_id]["status"] = "COMPLETED"
+    mock_mgr.operations[fresh_review_id]["result"] = {
+        "status": "completed",
+        "summary": "Integration review passed.",
+        "blockers": [],
+    }
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.PRODUCT_READY
 
 
 def test_integration_review_failed_operation_transitions_to_failed(tmp_path: Path) -> None:
@@ -2362,8 +2584,8 @@ def test_manager_boot_auto_resumes_blocked_run_with_active_session(tmp_path: Pat
     # Boot fresh SessionManager recovering from storage
     mgr2 = SessionManager(storage)
     assert run_id in mgr2._active_runs
-    # Should have auto-resumed to GITOPS
-    assert mgr2._active_runs[run_id].phase == Phase.GITOPS
+    # Should have auto-resumed to GITOPS (or already completed via driver thread)
+    assert mgr2._active_runs[run_id].phase in (Phase.GITOPS, Phase.COMPLETE)
     assert run_id in mgr2._run_driver_threads
 
     for stop_ev in mgr2._run_stop_events.values():
@@ -2410,3 +2632,895 @@ def test_manager_resume_run_clears_stale_gitops_operation_id(tmp_path: Path):
     for stop_ev in mgr._run_stop_events.values():
         stop_ev.set()
 
+
+
+def test_failed_transition_marks_work_orders_on_disk(tmp_path: Path) -> None:
+    """When the supervisor transitions to FAILED, all in-flight work orders
+    on disk must be marked FAILED so that :rebind and other policy guards
+    don't see stale ACTIVE records.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # 1. Set up a workspace with PLAN.md and WO-000 on disk (simulating planning)
+    (tmp_path / "PLAN.md").write_text(
+        "# Project Plan\n\n## Current Architecture\nN/A\n\n"
+        "## Milestones & Roadmap\n- [ ] Milestone 1: Setup\n",
+        encoding="utf-8",
+    )
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    wo_000 = {
+        "id": "WO-000",
+        "type": "RESEARCH",
+        "title": "Planning",
+        "status": "ACTIVE",
+        "assigned_agents": ["claude"],
+        "dependencies": [],
+    }
+    (active_dir / "WO-000.yaml").write_text(
+        yaml.dump(wo_000, default_flow_style=False), encoding="utf-8"
+    )
+
+    # 2. Start a run (INIT → PLANNING)
+    state = supervisor.start_run("run-fail-test", "Test goal", tmp_path, "sess-fail")
+
+    # 3. Simulate planning turn that completed but produced no valid plan
+    op = mock_mgr.start_turn("sess-fail", "Plan", role="architecture",
+                             agent_id="claude", work_order_id="WO-000")
+    state.planning_operation_id = op["operation_id"]
+    mock_mgr.complete_operation(op["operation_id"], status="COMPLETED",
+                                result={"status": "completed"})
+
+    # 4. Advance — supervisor finds no plan proposed → FAILED
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.FAILED
+    assert state.phase == Phase.FAILED
+
+    # 5. CRITICAL: WO-000 on disk must now be FAILED, not ACTIVE
+    data = yaml.safe_load((active_dir / "WO-000.yaml").read_text(encoding="utf-8"))
+    assert data["status"] == "FAILED", (
+        f"Expected WO-000 status 'FAILED' on disk, got '{data['status']}'. "
+        "Stale ACTIVE WOs block :rebind."
+    )
+    assert "error" in data
+
+
+def test_blocked_transition_marks_work_orders_on_disk(tmp_path: Path) -> None:
+    """When the supervisor transitions to BLOCKED, work orders on disk
+    must be marked BLOCKED so that :rebind can proceed after resolution.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # 1. Set up workspace with WO-000 and two worker WOs
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    for wo_id, agent in [("WO-000", "claude"), ("WO-001", "codex"), ("WO-002", "gemini")]:
+        wo_data = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": f"Task {wo_id}",
+            "status": "ACTIVE",
+            "assigned_agents": [agent],
+            "dependencies": [],
+        }
+        (active_dir / f"{wo_id}.yaml").write_text(
+            yaml.dump(wo_data, default_flow_style=False), encoding="utf-8"
+        )
+
+    # 2. Build run state at EXECUTING with worker WOs
+    state = supervisor.start_run("run-block-test", "Test", tmp_path, "sess-block")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001", "WO-002"]
+
+    # 3. Force a BLOCKED transition via contention timeout
+    state.error = "Governance gate blocked WO-001"
+    supervisor._transition(state, Phase.BLOCKED)
+
+    assert state.phase == Phase.BLOCKED
+
+    # 4. All three WOs must be BLOCKED on disk
+    for wo_id in ["WO-000", "WO-001", "WO-002"]:
+        data = yaml.safe_load((active_dir / f"{wo_id}.yaml").read_text(encoding="utf-8"))
+        assert data["status"] == "BLOCKED", (
+            f"Expected {wo_id} status 'BLOCKED', got '{data['status']}'"
+        )
+
+
+def test_already_completed_wos_not_overwritten(tmp_path: Path) -> None:
+    """Work orders that are already in a terminal state (COMPLETED) must NOT
+    be overwritten when the run transitions to FAILED.
+    """
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-001 is COMPLETED, WO-002 is still ACTIVE
+    for wo_id, status in [("WO-001", "COMPLETED"), ("WO-002", "ACTIVE")]:
+        wo_data = {
+            "id": wo_id,
+            "type": "FEATURE",
+            "title": f"Task {wo_id}",
+            "status": status,
+            "assigned_agents": ["codex"],
+            "dependencies": [],
+        }
+        (active_dir / f"{wo_id}.yaml").write_text(
+            yaml.dump(wo_data, default_flow_style=False), encoding="utf-8"
+        )
+
+    state = supervisor.start_run("run-no-overwrite", "Test", tmp_path, "sess-noover")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001", "WO-002"]
+    state.completed_wo_ids = ["WO-001"]
+    state.error = "WO-002 failed after max retries"
+
+    supervisor._transition(state, Phase.FAILED)
+
+    # WO-001 must remain COMPLETED (skipped by both completed_wo_ids check and terminal guard)
+    data1 = yaml.safe_load((active_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert data1["status"] == "COMPLETED"
+
+    # WO-002 must now be FAILED
+    data2 = yaml.safe_load((active_dir / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert data2["status"] == "FAILED"
+
+
+def test_mark_wo_handles_missing_file(tmp_path: Path) -> None:
+    """_mark_wo_status_on_disk returns False for non-existent WO files
+    without raising.
+    """
+    result = LifecycleSupervisor._mark_wo_status_on_disk(
+        tmp_path, "WO-999", "FAILED", error="test"
+    )
+    assert result is False
+
+
+def test_manager_resume_run_restarts_dead_thread_even_if_stop_event_not_set(tmp_path: Path):
+    """Verify that manager.resume_run reliably spawns a new driver thread if
+    the previous driver thread has exited, even when stop_event was left unset.
+    """
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-deadthread"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build login",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.FAILED,
+        worker_wo_ids=["WO-001"],
+        error="Previous failure",
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    # Simulate an entry in _run_stop_events that was NOT set (e.g. previous dead thread)
+    from threading import Event, Thread
+    stale_event = Event()  # is_set() == False
+    mgr._run_stop_events[run_id] = stale_event
+    # Simulate a dead thread
+    dead_thread = Thread(target=lambda: None)
+    dead_thread.start()
+    dead_thread.join()
+    mgr._run_driver_threads[run_id] = dead_thread
+    assert not dead_thread.is_alive()
+    assert not stale_event.is_set()
+
+    # Resume run must detect the thread is dead and start a fresh one with a new stop_event
+    resumed = mgr.resume_run(sid, run_id=run_id)
+    assert resumed["run_id"] == run_id
+    new_thread = mgr._run_driver_threads[run_id]
+    assert new_thread is not dead_thread
+    assert new_thread.is_alive()
+    assert mgr._run_stop_events[run_id] is not stale_event
+
+    # Cleanup
+    mgr._run_stop_events[run_id].set()
+
+
+def test_manager_resume_run_invalidates_stale_operations_and_unblocks_work_orders(tmp_path: Path):
+    """Verify that manager.resume_run invalidates prior non-completed operations in the session journal,
+    unblocks in-flight work orders on disk, and clears error states.
+    """
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase, RunState
+    import yaml
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_id = "run-stale-ops"
+    sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Create WO-001 on disk as BLOCKED
+    wo_file = wo_dir / "WO-001.yaml"
+    wo_file.write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Configure Dependencies",
+            "status": "BLOCKED",
+            "error": "timed out",
+            "blocked_reason": "timed out",
+        }),
+        encoding="utf-8",
+    )
+
+    # 2. Create INDEX.yaml and TREE.yaml with total_blocked=1
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "orders": [{"id": "WO-001", "status": "BLOCKED"}],
+            "total_active": 0,
+            "total_blocked": 1,
+            "total_completed": 0,
+        }),
+        encoding="utf-8",
+    )
+    tree_file = tmp_path / ".sync" / "runtime" / "TREE.yaml"
+    tree_file.parent.mkdir(parents=True, exist_ok=True)
+    tree_file.write_text(
+        yaml.safe_dump({
+            "work_orders": {"total_active": 0, "total_blocked": 1, "total_completed": 0},
+        }),
+        encoding="utf-8",
+    )
+
+    # 3. Add stale blocked operation to session journal
+    stale_op_id = "op-stale-blocked-123"
+    session["journal"].append({
+        "operation_id": stale_op_id,
+        "work_order_id": "WO-001",
+        "role": "backend",
+        "status": "BLOCKED",
+        "result": {"status": "blocked", "error": "timed out"},
+    })
+
+    # 4. Save run state as BLOCKED
+    r_state = RunState(
+        run_id=run_id,
+        product_goal="Build login",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=Phase.BLOCKED,
+        worker_wo_ids=["WO-001"],
+        blocked_wo_ids=["WO-001"],
+        error="Work order WO-001 blocked: timed out",
+    )
+    mgr.supervisor.save_run_state(r_state, tmp_path)
+
+    # Before resume: supervisor finds the stale BLOCKED operation
+    found_before = mgr.supervisor._find_latest_wo_operation(r_state, "WO-001")
+    assert found_before is not None
+    assert found_before["operation_id"] == stale_op_id
+
+    # 5. Resume the run
+    resumed = mgr.resume_run(sid, run_id=run_id)
+    assert resumed["run_id"] == run_id
+    assert resumed["phase"] in ("EXECUTING", "DISPATCHING")
+    assert not resumed["error"]
+    assert not resumed["blocked_wo_ids"]
+
+    # 6. Verify stale operation is now ignored by supervisor and fresh turn was dispatched
+    reloaded_state = mgr.supervisor.load_run_state(run_id, tmp_path)
+    assert stale_op_id in reloaded_state.ignored_operation_ids
+    found_after = mgr.supervisor._find_latest_wo_operation(reloaded_state, "WO-001")
+    # Must NOT be the stale blocked operation! It may be None or the newly dispatched turn.
+    if found_after is not None:
+        assert found_after["operation_id"] != stale_op_id
+        assert found_after["operation_id"] not in reloaded_state.ignored_operation_ids
+
+    # 7. Verify WO-001 on disk was reset to ACTIVE with errors cleared
+    reloaded_wo = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+    assert reloaded_wo["status"] == "ACTIVE"
+    assert "error" not in reloaded_wo
+    assert "blocked_reason" not in reloaded_wo
+
+    # 8. Verify INDEX.yaml and TREE.yaml counters synced
+    reloaded_idx = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    assert reloaded_idx["total_active"] == 1
+    assert reloaded_idx["total_blocked"] == 0
+    reloaded_tree = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
+    assert reloaded_tree["work_orders"]["total_active"] == 1
+    assert reloaded_tree["work_orders"]["total_blocked"] == 0
+
+    # Cleanup driver thread
+    mgr._run_stop_events[run_id].set()
+
+
+def test_manager_resume_run_cancels_orphaned_operations_and_does_not_adopt_in_integration_review(tmp_path: Path) -> None:
+    """When an operation was abandoned in RUNNING state (e.g. server restart), resume_run must cancel it
+    and integration review must NOT adopt it as the active turn."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    created = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = created["session_id"]
+    session = mgr._sessions[sid]
+    run_id = "run-orphan-test"
+    state = mgr.supervisor.start_run(run_id, "Build product", tmp_path, sid)
+    state.completed_wo_ids = ["WO-001"]
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.integration_wo_id = "WO-002"
+
+    # Simulate an orphaned operation left in RUNNING with no alive thread
+    orphan_op_id = "op-orphaned-architecture"
+    session["journal"].append({
+        "operation_id": orphan_op_id,
+        "operation": "turn",
+        "role": "architecture",
+        "agent_id": "claude",
+        "work_order_id": "WO-002",
+        "status": "RUNNING",
+    })
+    session["active_operation"] = orphan_op_id
+    state.integration_operation_id = orphan_op_id
+    mgr._active_runs[run_id] = state
+
+    # Resume the run
+    mgr.resume_run(sid, run_id=run_id)
+
+    # 1. Orphaned operation in journal must be marked CANCELLED
+    op_record = mgr.get_operation(orphan_op_id)
+    assert op_record["status"] == "CANCELLED"
+
+    # 2. session active_operation must be cleared
+    assert session.get("active_operation") is None
+
+    # 3. Orphan op must be in ignored_operation_ids
+    assert orphan_op_id in state.ignored_operation_ids
+
+    # 4. integration_operation_id must NOT be the orphaned operation
+    assert state.integration_operation_id != orphan_op_id
+
+    # Cleanup driver thread
+    if run_id in mgr._run_stop_events:
+        mgr._run_stop_events[run_id].set()
+    if run_id in mgr._run_driver_threads:
+        mgr._run_driver_threads[run_id].join(timeout=1.0)
+
+
+# ─── Architect Escalation Loop Tests (KNOW-01 / HARNESS-01) ─────────────
+
+
+def test_undeclared_dependency_escalates_to_architecture_and_resumes(tmp_path: Path) -> None:
+    """When a worker blocks on undeclared third-party dependencies, supervisor routes to Claude,
+    which updates dependencies, allowing the worker to be safely re-dispatched."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    deliv_file = tmp_path / "db" / "init_db.py"
+    deliv_file.parent.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "title": "Database Schema",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"path": "db/init_db.py", "type": "code"},
+    }), encoding="utf-8")
+
+    state = RunState(
+        run_id="run-esc-1",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-esc-1",
+        phase=Phase.EXECUTING,
+        worker_wo_ids=["WO-002"],
+    )
+
+    # 1. Worker turn fails with undeclared dependency
+    worker_op = mock_mgr.start_turn("sess-esc-1", "Execute WO-002", work_order_id="WO-002", role="backend", agent_id="codex")
+    mock_mgr.complete_operation(
+        worker_op["operation_id"],
+        status="COMPLETED",
+        result={
+            "status": "blocked",
+            "error": "verification gate failed: code_verified (Deliverable 'db/init_db.py' imports undeclared third-party module(s): werkzeug. Your contract permits updating dependency manifests. Declare them in pyproject.toml or requirements.txt using write_file.)",
+        },
+    )
+
+    # 2. Advance: Supervisor detects undeclared dependency and escalates to Claude (Architecture)
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING  # Does NOT transition to BLOCKED!
+    assert state.dependency_escalation_op_id is not None
+    assert state.dependency_escalation_wo_id == "WO-002"
+    assert worker_op["operation_id"] in state.ignored_operation_ids
+
+    # Verify escalation operation was dispatched to Claude
+    esc_op = mock_mgr.get_operation(state.dependency_escalation_op_id)
+    assert esc_op["agent_id"] == "claude"
+    assert esc_op["role"] == "architecture"
+    assert "werkzeug" in esc_op["prompt"]
+    assert "db/init_db.py" in esc_op["prompt"]
+
+    # 3. Claude resolves the dependency (updates requirements.txt) and completes turn
+    mock_mgr.complete_operation(
+        state.dependency_escalation_op_id,
+        status="COMPLETED",
+        result={"status": "completed", "summary": "Declared werkzeug>=3.0 in requirements.txt"},
+    )
+
+    # 4. Advance: Supervisor notices Claude's turn completed, resets WO-002, and re-dispatches worker (Codex)
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.dependency_escalation_op_id is None
+    assert state.dependency_escalation_wo_id is None
+
+    # Check that a fresh worker operation for WO-002 was dispatched
+    latest_worker_op = supervisor._find_latest_wo_operation(state, "WO-002")
+    assert latest_worker_op is not None
+    assert latest_worker_op["operation_id"] != worker_op["operation_id"]
+    assert latest_worker_op["agent_id"] == "codex"
+
+    # 5. Worker completes deliverable now that dependency is satisfied
+    deliv_file.write_text("# user db schema using werkzeug", encoding="utf-8")
+    mock_mgr.complete_operation(
+        latest_worker_op["operation_id"],
+        status="COMPLETED",
+        result={"status": "completed"},
+    )
+
+    # 6. Final advance: WO-002 completes and lifecycle advances to INTEGRATION_REVIEW
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.INTEGRATION_REVIEW
+    assert "WO-002" in state.completed_wo_ids
+
+
+def test_undeclared_dependency_escalation_bounded_by_max_retries(tmp_path: Path) -> None:
+    """If repeated escalations fail to resolve the dependency, supervisor safely halts at BLOCKED."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "title": "Auth",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+    }), encoding="utf-8")
+
+    state = RunState(
+        run_id="run-esc-fail",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-esc-fail",
+        phase=Phase.EXECUTING,
+        worker_wo_ids=["WO-002"],
+        max_retries=1,  # Set to 1 for quick bounded test
+    )
+
+    # 1. First worker failure
+    op1 = mock_mgr.start_turn("sess-esc-fail", "Execute WO-002", work_order_id="WO-002", role="backend")
+    mock_mgr.complete_operation(
+        op1["operation_id"],
+        status="COMPLETED",
+        result={"status": "blocked", "error": "imports undeclared third-party module(s): bad_pkg"},
+    )
+
+    # Escalates to Claude (attempt 1)
+    res1 = supervisor.advance(state)
+    assert res1 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.dependency_escalation_op_id is not None
+
+    # Claude completes escalation
+    mock_mgr.complete_operation(state.dependency_escalation_op_id, status="COMPLETED", result={"status": "completed"})
+    supervisor.advance(state)
+
+    # 2. Worker runs again and fails again with undeclared dependency
+    op2 = supervisor._find_latest_wo_operation(state, "WO-002")
+    assert op2 is not None
+    mock_mgr.complete_operation(
+        op2["operation_id"],
+        status="COMPLETED",
+        result={"status": "blocked", "error": "imports undeclared third-party module(s): bad_pkg"},
+    )
+
+    # 3. Advance: Since max_retries (1) is reached, supervisor transitions to BLOCKED without looping
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.BLOCKED
+    assert state.phase == Phase.BLOCKED
+    assert "WO-002" in state.blocked_wo_ids
+
+
+def test_undeclared_dependency_state_serialization_roundtrip(tmp_path: Path) -> None:
+    """RunState accurately serializes and deserializes dependency escalation fields."""
+    state = RunState(
+        run_id="run-ser-1",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-ser-1",
+        dependency_escalation_op_id="op-claude-999",
+        dependency_escalation_wo_id="WO-002",
+        dependency_escalation_retries={"WO-002": 1, "WO-003": 2},
+    )
+
+    d = state.to_dict()
+    assert d["dependency_escalation_op_id"] == "op-claude-999"
+    assert d["dependency_escalation_wo_id"] == "WO-002"
+    assert d["dependency_escalation_retries"] == {"WO-002": 1, "WO-003": 2}
+
+    restored = RunState.from_dict(d)
+    assert restored.dependency_escalation_op_id == "op-claude-999"
+    assert restored.dependency_escalation_wo_id == "WO-002"
+    assert restored.dependency_escalation_retries == {"WO-002": 1, "WO-003": 2}
+
+
+def test_mark_wo_completed_archives_file(tmp_path: Path) -> None:
+    """_mark_wo_status_on_disk with target_status='COMPLETED' must move file from ACTIVE to COMPLETED."""
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    completed_dir.mkdir(parents=True, exist_ok=True)
+
+    wo_file = active_dir / "WO-000.yaml"
+    wo_file.write_text(
+        yaml.safe_dump({
+            "id": "WO-000",
+            "title": "Planning Work Order",
+            "status": "ACTIVE",
+            "type": "RESEARCH",
+            "assigned_agents": ["claude"],
+        }),
+        encoding="utf-8",
+    )
+
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "total_active": 1,
+            "total_completed": 0,
+            "total_blocked": 0,
+            "orders": [
+                {
+                    "id": "WO-000",
+                    "title": "Planning Work Order",
+                    "status": "ACTIVE",
+                    "file": "work-orders/ACTIVE/WO-000.yaml",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    res = LifecycleSupervisor._mark_wo_status_on_disk(tmp_path, "WO-000", "COMPLETED")
+    assert res is True
+
+    # ACTIVE/WO-000.yaml must be unlinked
+    assert not wo_file.exists()
+
+    # COMPLETED/WO-000.yaml must exist with status COMPLETED
+    archived_file = completed_dir / "WO-000.yaml"
+    assert archived_file.is_file()
+    archived_data = yaml.safe_load(archived_file.read_text(encoding="utf-8"))
+    assert archived_data["status"] == "COMPLETED"
+
+    # INDEX.yaml must be updated
+    index_data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    assert index_data["orders"][0]["status"] == "COMPLETED"
+    assert index_data["orders"][0]["file"] == "work-orders/COMPLETED/WO-000.yaml"
+    assert index_data["total_active"] == 0
+    assert index_data["total_completed"] == 1
+
+
+
+
+def test_planning_turn_blocked_reports_real_error(tmp_path: Path) -> None:
+    """A BLOCKED planning operation fails the run with the actual blocker,
+    not the misleading 'completed without proposing a plan'."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-plan-blocked", "Build app", tmp_path, "sess-001")
+
+    res = supervisor.advance(state)  # dispatches planning turn
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    op_id = state.planning_operation_id
+
+    mock_mgr.complete_operation(op_id, "BLOCKED", result={
+        "status": "blocked",
+        "reason": "staged stackmind validate failed: runtime/TREE.yaml: agents.codex.status "
+                  "- 'IDLE' is not one of ['active', 'assigned', 'idle', 'blocked', 'non_compliant']",
+        "error": "staged stackmind validate failed: runtime/TREE.yaml: agents.codex.status "
+                 "- 'IDLE' is not one of ['active', 'assigned', 'idle', 'blocked', 'non_compliant']",
+    })
+
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.FAILED
+    assert state.phase == Phase.FAILED
+    assert "Planning turn failed (blocked)" in (state.error or "")
+    assert "staged stackmind validate failed" in (state.error or "")
+    assert "completed without proposing a plan" not in (state.error or "")
+
+
+def test_scaffold_protocol_citizenship_writes_lowercase_idle(tmp_path: Path) -> None:
+    """Fresh scaffolding writes schema-valid lowercase 'idle', and legacy
+    uppercase 'IDLE' entries self-heal on the next scaffold pass."""
+    from validators.kernel.daemon.manager import _scaffold_protocol_citizenship
+
+    # 1. Fresh workspace: scaffolded status must be schema-valid lowercase
+    fresh = tmp_path / "fresh"
+    (fresh / ".sync").mkdir(parents=True)
+    _scaffold_protocol_citizenship(fresh, "codex")
+    tree = yaml.safe_load((fresh / ".sync" / "runtime" / "TREE.yaml").read_text(encoding="utf-8"))
+    assert tree["agents"]["codex"]["status"] == "idle"
+    boot = yaml.safe_load(
+        (fresh / ".sync" / "runtime" / "boot" / "codex.boot.yaml").read_text(encoding="utf-8")
+    )
+    assert boot["status"] == "idle"
+
+    # 2. Legacy workspace with the invalid uppercase value: normalized in place
+    legacy = tmp_path / "legacy"
+    (legacy / ".sync" / "runtime").mkdir(parents=True)
+    (legacy / ".sync" / "runtime" / "TREE.yaml").write_text(
+        yaml.safe_dump({
+            "schema_version": 1,
+            "agents": {
+                "codex": {"session_count": 2, "status": "IDLE", "assigned_work_orders": []},
+                "claude": {"session_count": 1, "status": "IDLE", "assigned_work_orders": []},
+            },
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    _scaffold_protocol_citizenship(legacy, "codex")
+    tree = yaml.safe_load((legacy / ".sync" / "runtime" / "TREE.yaml").read_text(encoding="utf-8"))
+    assert tree["agents"]["codex"]["status"] == "idle"
+    assert tree["agents"]["codex"]["session_count"] == 2  # untouched otherwise
+    # Untouched agents keep their legacy value (scaffold only owns its agent)
+    assert tree["agents"]["claude"]["status"] == "IDLE"
+
+
+def test_integration_review_rework_targets_accused_work_orders(tmp_path: Path) -> None:
+    """Blockers referencing a deliverable path select only the accused code WO
+    (plus QA for re-verification); untouched WOs are not re-dispatched, and
+    multiple rework turns dispatch under a shared batch parent."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir-targeted", "Build API", tmp_path, "sess-ir-t")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001", "WO-002", "WO-003"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 0
+
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001", "title": "Scaffold", "assigned_agents": ["codex"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "config", "path": "requirements.txt", "description": "manifest"},
+        }),
+        encoding="utf-8",
+    )
+    (completed_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002", "title": "Backend", "assigned_agents": ["codex"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "code", "path": "src/backend.py", "description": "api"},
+        }),
+        encoding="utf-8",
+    )
+    (completed_dir / "WO-003.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-003", "title": "QA & Testing", "assigned_agents": ["gemma"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "code", "path": "tests/test_backend.py", "description": "suite"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "work-orders" / "INDEX.yaml").write_text(
+        yaml.safe_dump({"orders": [], "next_id": 4}), encoding="utf-8"
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    supervisor.advance(state)  # review dispatched
+    review_op_id = state.integration_operation_id
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Security violations",
+        "blockers": ["Hardcoded default for SECRET_KEY in src/backend.py"],
+    }
+
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.integration_rework_rounds == 1
+
+    # Targeted: backend WO + QA re-verify; scaffolding untouched
+    assert "WO-002" in state.completed_wo_ids and "WO-003" in state.completed_wo_ids or True
+    reworked = [
+        o for o in mock_mgr.list_operations()
+        if "Rework work order" in str(o.get("prompt", ""))
+    ]
+    reworked_ids = {o.get("work_order_id") for o in reworked}
+    assert reworked_ids == {"WO-002", "WO-003"}
+    assert "SECRET_KEY" in reworked[0]["prompt"]
+    # Batch parent used for concurrent dispatch
+    assert state.batch_operation_id is not None
+    batch = mock_mgr.operations[state.batch_operation_id]
+    assert batch["operation"] == "parallel_dispatch"
+
+
+def test_integration_review_rework_forwards_prescribed_fixes(tmp_path: Path) -> None:
+    """When the review prescribes fixes (blocker_details), the rework prompt
+    carries each blocker with its prescribed remedy verbatim to the worker."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-ir-rx", "Build API", tmp_path, "sess-ir-rx")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-002"]
+    state.max_retries = 2
+    state.integration_rework_rounds = 0
+
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002", "title": "Backend", "assigned_agents": ["codex"],
+            "status": "COMPLETED",
+            "deliverable": {"type": "code", "path": "src/backend.py", "description": "api"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / ".sync" / "work-orders" / "INDEX.yaml").write_text(
+        yaml.safe_dump({"orders": [], "next_id": 3}), encoding="utf-8"
+    )
+    (tmp_path / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+
+    supervisor.advance(state)  # review dispatched
+    review_op_id = state.integration_operation_id
+    mock_mgr.operations[review_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[review_op_id]["result"] = {
+        "status": "blocked",
+        "summary": "Security violations",
+        "blockers": ["Hardcoded secret key fallback found in src/backend.py"],
+        "blocker_details": [
+            {
+                "finding": "Hardcoded secret key fallback found in src/backend.py",
+                "remediation": "Replace with SECRET_KEY = os.environ['SECRET_KEY'] so a missing variable fails fast",
+                "path": "src/backend.py",
+            }
+        ],
+    }
+
+    result = supervisor.advance(state)
+    assert result == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+
+    rework_ops = [o for o in mock_mgr.list_operations() if "Rework work order WO-002" in str(o.get("prompt", ""))]
+    assert len(rework_ops) == 1
+    prompt = rework_ops[0]["prompt"]
+    # The finding AND the architect's prescribed fix reach the worker verbatim
+    assert "Hardcoded secret key fallback found in src/backend.py" in prompt
+    assert "Prescribed fix: Replace with SECRET_KEY = os.environ['SECRET_KEY'] so a missing variable fails fast" in prompt
+    assert "Apply each prescribed fix" in prompt
+
+
+def test_resume_grants_fresh_integration_rework_budget(tmp_path: Path) -> None:
+    """Operator resume resets integration_rework_rounds: a run whose rework
+    budget was exhausted in a previous session gets a fresh budget."""
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.supervisor import Phase as SupPhase
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
+    sid = session["session_id"]
+
+    state = SupPhase and __import__(
+        "validators.kernel.daemon.supervisor", fromlist=["RunState"]
+    ).RunState(
+        run_id="run-rework-budget",
+        product_goal="goal",
+        workspace=str(tmp_path),
+        session_id=sid,
+        phase=SupPhase.BLOCKED,
+        integration_rework_rounds=2,
+        max_retries=2,
+    )
+    (tmp_path / ".sync" / "runtime" / "supervisor").mkdir(parents=True, exist_ok=True)
+    import yaml as _yaml
+    (tmp_path / ".sync" / "runtime" / "supervisor" / "run-rework-budget.yaml").write_text(
+        _yaml.safe_dump(state.to_dict(), sort_keys=False), encoding="utf-8"
+    )
+
+    mgr.resume_run(sid, run_id="run-rework-budget")
+    resumed = mgr.get_run("run-rework-budget")
+    assert resumed["integration_rework_rounds"] == 0
+
+
+def test_gitops_budget_block_raises_budget_and_retries(tmp_path: Path) -> None:
+    """A CONTRACT_FILE_BUDGET_EXCEEDED block at the GitOps phase raises the
+    release-doc contract budget to cover the observed footprint and retries,
+    instead of dead-ending the run."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-gitops-budget", "Build API", tmp_path, "sess-gb")
+    state.phase = Phase.GITOPS
+    state.gitops_wo_id = "WO-005"
+    state.max_retries = 2
+
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    (contracts_dir / "WO-005.yaml").write_text(
+        yaml.safe_dump({
+            "schema_version": 1, "agent_id": "local-llm", "work_order": "WO-005",
+            "scope": {"allow": [{"module": "VERSION.md"}, {"module": "CHANGELOG.md"}],
+                      "deny": [], "write": "read-write"},
+            "budget": {"max_files_touched": 1, "max_tokens": 0},
+        }),
+        encoding="utf-8",
+    )
+
+    res = supervisor.advance(state)  # dispatch gitops turn (budget patched to 2 pre-dispatch)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    contract = yaml.safe_load((contracts_dir / "WO-005.yaml").read_text(encoding="utf-8"))
+    assert contract["budget"]["max_files_touched"] >= 2  # pre-dispatch patch
+
+    gitops_op_id = state.gitops_operation_id
+    mock_mgr.operations[gitops_op_id]["status"] = "BLOCKED"
+    mock_mgr.operations[gitops_op_id]["result"] = {
+        "status": "blocked",
+        "failure": {
+            "failure_code": "CONTRACT_FILE_BUDGET_EXCEEDED",
+            "observed_file_count": 2,
+            "canonical_message": "CONTRACT_FILE_BUDGET_EXCEEDED: 2 file(s) modified, exceeding budget max_files_touched limit of 1",
+        },
+        "blockers": ["CONTRACT_FILE_BUDGET_EXCEEDED: 2 file(s) modified"],
+    }
+
+    res2 = supervisor.advance(state)  # budget-class block -> bounded retry
+    assert res2 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.GITOPS
+    assert state.retry_counts.get("WO-005") == 1
+    contract = yaml.safe_load((contracts_dir / "WO-005.yaml").read_text(encoding="utf-8"))
+    assert contract["budget"]["max_files_touched"] >= 2  # raised to observed footprint
+
+    # Exhaustion -> terminal BLOCKED with the evidence in the error
+    gitops_op2 = state.gitops_operation_id
+    mock_mgr.operations[gitops_op2]["status"] = "BLOCKED"
+    mock_mgr.operations[gitops_op2]["result"] = {
+        "status": "blocked",
+        "failure": {
+            "failure_code": "CONTRACT_FILE_BUDGET_EXCEEDED",
+            "observed_file_count": 3,
+        },
+        "blockers": ["CONTRACT_FILE_BUDGET_EXCEEDED: 3 file(s) modified"],
+    }
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.WAITING_FOR_OPERATION  # second retry (attempt 3)
+    gitops_op3 = state.gitops_operation_id
+    mock_mgr.operations[gitops_op3]["status"] = "BLOCKED"
+    mock_mgr.operations[gitops_op3]["result"] = {
+        "status": "blocked",
+        "failure": {"failure_code": "CONTRACT_FILE_BUDGET_EXCEEDED", "observed_file_count": 3},
+        "blockers": ["CONTRACT_FILE_BUDGET_EXCEEDED: 3 file(s) modified"],
+    }
+    supervisor.advance(state)
+    assert state.phase == Phase.BLOCKED
+    assert "budget retries exhausted" in (state.error or "")

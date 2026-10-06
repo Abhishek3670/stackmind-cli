@@ -361,3 +361,212 @@ def test_provider_gateway_run_command_and_query_graph(tmp_path):
     graph_record = [r for r in journal.records if r.request.operation_type.value == "query_graph"][0]
     assert cmd_record.authorized is True
     assert graph_record.authorized is True
+
+
+def test_get_curated_tools_for_phase():
+    from validators.kernel.providers.gateway import (
+        get_curated_tools_for_phase,
+        PLANNING_CORE_TOOL_NAMES,
+        AUTHORING_CORE_TOOL_NAMES,
+        ARCHITECTURE_INVESTIGATION_TOOL_NAMES,
+    )
+
+    # Planning phase for architect
+    planning_tools = get_curated_tools_for_phase("claude", phase="planning")
+    tool_names = {t.name for t in planning_tools}
+    for name in PLANNING_CORE_TOOL_NAMES:
+        assert name in tool_names
+    assert "request_tools" in tool_names
+    # Should be lean: 5 tools max (4 core + request_tools)
+    assert len(planning_tools) <= 5
+
+    # Authoring phase for architect
+    authoring_tools = get_curated_tools_for_phase("claude", phase="authoring")
+    authoring_names = {t.name for t in authoring_tools}
+    for name in AUTHORING_CORE_TOOL_NAMES:
+        assert name in authoring_names
+    assert "request_tools" in authoring_names
+    assert len(authoring_tools) <= 4
+
+    # Investigation / general architecture phase
+    arch_tools = get_curated_tools_for_phase("claude", phase=None)
+    arch_names = {t.name for t in arch_tools}
+    for name in ARCHITECTURE_INVESTIGATION_TOOL_NAMES:
+        assert name in arch_names
+    assert "request_tools" in arch_names
+
+    # Local Ollama backend trims diagnostic bloat
+    ollama_tools = get_curated_tools_for_phase("codex", backend_id="ollama")
+    ollama_names = {t.name for t in ollama_tools}
+    assert "checkpoint" not in ollama_names
+    assert "skill_mine" not in ollama_names
+    assert "request_tools" in ollama_names
+
+
+def test_request_tools_dynamic_activation(tmp_path):
+    authoritative, workspace, tool_gw, journal, attempt, contract = _setup_test_gateway(tmp_path)
+
+    turn_count = 0
+
+    def mock_transport(payload: dict[str, Any], stream: bool, timeout: float | None) -> dict[str, Any]:
+        nonlocal turn_count
+        turn_count += 1
+        tools_sent = payload.get("tools", [])
+        tool_names = [t["function"]["name"] for t in tools_sent]
+
+        if turn_count == 1:
+            # Initially only read_file, write_file, request_tools are active
+            assert "query_graph" not in tool_names
+            return {
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "tc-req",
+                            "type": "function",
+                            "function": {
+                                "name": "request_tools",
+                                "arguments": json.dumps({"query": "knowledge"}),
+                            },
+                        }],
+                    },
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40},
+            }
+        elif turn_count == 2:
+            # After request_tools('knowledge'), query_graph should be dynamically added to active tools!
+            assert "query_graph" in tool_names
+            return {
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "Tools activated and used."},
+                }],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+            }
+
+    adapter = OpenAICompatibleAdapter(transport=mock_transport)
+    from validators.kernel.providers.gateway import STANDARD_KERNEL_TOOLS
+    initial_tools = [t for t in STANDARD_KERNEL_TOOLS if t.name in ("read_file", "write_file", "request_tools")]
+    gateway = ProviderGateway(adapter, tool_gw, attempt=attempt, contract=contract, tools=initial_tools)
+
+    messages = [Message.user("Need graph tools")]
+    history = gateway.run_loop(messages, max_turns=3)
+
+    tool_outputs = [m.content for m in history if m.role == "tool"]
+    assert any("Successfully activated" in out for out in tool_outputs)
+    assert any(t.name == "query_graph" for t in gateway.active_tools_list)
+
+
+def test_extract_plan_from_text_fallbacks():
+    from validators.harness.plan import extract_plan_from_text, validate_plan_structure
+
+    # 1. Fenced markdown block
+    fenced_input = (
+        "Here is the plan:\n"
+        "```markdown\n"
+        "# Project Plan: Weather App\n\n"
+        "## Current Architecture\n"
+        "Python FastAPI backend with standard library http.\n\n"
+        "## Milestones & Roadmap\n"
+        "- [ ] Milestone 1: Core API (Agent: codex)\n"
+        "  - [ ] Task 1.1: Build endpoints\n"
+        "```\n"
+        "Hope this helps!"
+    )
+    p1 = extract_plan_from_text(fenced_input, default_title="Fallback")
+    assert p1 is not None
+    assert "# Project Plan: Weather App" in p1
+    val, _ = validate_plan_structure(p1)
+    assert val is True
+
+    # 2. Raw text starting with # Project Plan
+    raw_input = (
+        "Understood. Starting planning.\n\n"
+        "# Project Plan: Task Tracker\n\n"
+        "## Current Architecture\n"
+        "CLI based tool using SQLite database.\n\n"
+        "## Milestones & Roadmap\n"
+        "- [ ] Milestone 1: Data Model (Agent: codex)\n"
+        "  - [ ] Task 1.1: Create migrations\n\n"
+        "```json\n"
+        "{\"status\": \"completed\", \"summary\": \"done\"}\n"
+        "```"
+    )
+    p2 = extract_plan_from_text(raw_input, default_title="Fallback")
+    assert p2 is not None
+    assert "# Project Plan: Task Tracker" in p2
+    assert "```json" not in p2
+    val, _ = validate_plan_structure(p2)
+    assert val is True
+
+    # 3. Text missing top-level heading but having ## Architecture and ## Milestones
+    partial_input = (
+        "## Architecture\n"
+        "Microservices communicating via REST.\n\n"
+        "## Milestones & Roadmap\n"
+        "- [ ] Milestone 1: Gateway Setup (Agent: codex)\n"
+        "  - [ ] Task 1.1: Configure routes\n"
+    )
+    p3 = extract_plan_from_text(partial_input, default_title="Auth Service")
+    assert p3 is not None
+    assert "# Project Plan: Auth Service" in p3
+    assert "## Architecture" in p3
+    val, _ = validate_plan_structure(p3)
+    assert val is True
+
+
+def test_adapter_timeout_handling_and_defaults(monkeypatch):
+    import builtins
+    import socket
+    import urllib.request
+    from validators.kernel.providers.adapter import OllamaAdapter, OpenAICompatibleAdapter
+    from validators.kernel.providers.errors import TimeoutError as KernelTimeoutError
+
+    # Test defaults
+    monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
+    monkeypatch.delenv("PROVIDER_TIMEOUT", raising=False)
+    ollama = OllamaAdapter()
+    assert ollama.default_timeout == 900.0
+
+    openai = OpenAICompatibleAdapter()
+    assert openai.default_timeout == 900.0
+
+    # Test env overrides
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "450.0")
+    monkeypatch.setenv("PROVIDER_TIMEOUT", "180.0")
+    assert OllamaAdapter().default_timeout == 450.0
+    assert OpenAICompatibleAdapter().default_timeout == 180.0
+
+    # Test explicit timeout argument
+    assert OllamaAdapter(default_timeout=60.0).default_timeout == 60.0
+
+    # Test builtins.TimeoutError mapping in urlopen
+    def mock_urlopen_builtin_timeout(req, timeout=None):
+        raise builtins.TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen_builtin_timeout)
+
+    ollama_mock = OllamaAdapter()
+    with pytest.raises(KernelTimeoutError) as exc_info:
+        ollama_mock.complete([Message.user("Hello")])
+    assert "Connection or timeout error" in str(exc_info.value)
+    assert exc_info.value.provider == "ollama"
+
+    openai_mock = OpenAICompatibleAdapter()
+    with pytest.raises(KernelTimeoutError) as exc_info:
+        openai_mock.complete([Message.user("Hello")])
+    assert "Connection or timeout error" in str(exc_info.value)
+    assert exc_info.value.provider == "openai-compatible"
+
+    # Test socket.timeout mapping in urlopen
+    def mock_urlopen_socket_timeout(req, timeout=None):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen_socket_timeout)
+    with pytest.raises(KernelTimeoutError):
+        ollama_mock.complete([Message.user("Hello")])
+    with pytest.raises(KernelTimeoutError):
+        openai_mock.complete([Message.user("Hello")])
+
+

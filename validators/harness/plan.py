@@ -47,7 +47,11 @@ ARCHITECTURE_RESEARCH_INSTRUCTIONS = (
     "### Step 1: Mandatory Codebase Research (FIRST ACTION)\n"
     "- In your FIRST action, you MUST call the `query_graph` tool (e.g. `query_graph(query='architecture')` "
     "or `query_graph(query='auth')`) to discover existing modules, patterns, and codebase conventions.\n"
-    "- Do NOT call `write_file` until you have first called `query_graph` and reviewed the response.\n\n"
+    "- Do NOT call `write_file` until you have first called `query_graph` and reviewed the response.\n"
+    "- Dynamic Tool Activation: If you need additional specialized tools to understand the codebase "
+    "(such as `git_log` or `git_diff` to see how architecture evolved, `find_callers` or `impact_analysis` "
+    "for dependency structure, or linters to identify existing constraints), call `request_tools(query='git')` "
+    "or `request_tools(query='<tool_name>')` to dynamically activate them.\n\n"
     "### Step 2: Write PLAN.md (AFTER RESEARCH)\n"
     "- Once research results are returned, use `write_file` to write the complete project plan to `PLAN.md`.\n"
     "- The file MUST strictly conform to the PLAN.md formatting specification below.\n"
@@ -311,3 +315,54 @@ def validate_plan_file(path: Path) -> tuple[bool, list[str]]:
         return validate_plan_structure(content)
     except Exception as exc:
         return False, [f"Failed to read {path}: {exc}"]
+
+
+def extract_plan_from_text(raw_text: str, default_title: str = "System Architecture") -> str | None:
+    """Extract or normalize a valid PLAN.md markdown string from raw model text.
+
+    Supports:
+    - Fenced markdown blocks (```markdown ... ``` or ```plan ... ```)
+    - Raw markdown starting with '# Project Plan' (or '# ... Plan')
+    - Body text that has '## Architecture' and '## Milestones' sections with tasks,
+      automatically prepending '# Project Plan: <default_title>'.
+    """
+    if not raw_text or not raw_text.strip():
+        return None
+
+    text = raw_text.strip()
+
+    # 1. Check for fenced markdown block containing a plan
+    fenced_blocks = re.findall(r"```(?:markdown|md|plan)?\s*(\n#[^`]+)```", text, re.DOTALL | re.IGNORECASE)
+    for block in fenced_blocks:
+        b = block.strip()
+        is_val, _ = validate_plan_structure(b)
+        if is_val:
+            return b
+
+    # 2. Check if text contains a top-level heading '# ... Plan'
+    plan_heading_match = re.search(r"(^#\s+.*Plan.*$)", text, re.MULTILINE | re.IGNORECASE)
+    if plan_heading_match:
+        start_idx = plan_heading_match.start()
+        candidate = text[start_idx:].strip()
+        # strip trailing json code block if present
+        candidate = re.sub(r"```(?:json)?\s*\{.*?\}\s*```\s*$", "", candidate, flags=re.DOTALL).strip()
+        is_val, _ = validate_plan_structure(candidate)
+        if is_val:
+            return candidate
+
+    # 3. If text contains '## Architecture' and '## Milestones' but lacks a top-level '# Project Plan:'
+    has_arch = bool(re.search(r"^##\s+.*(?:Architecture|Technical Design|Core Technologies).*$", text, re.MULTILINE | re.IGNORECASE))
+    has_milestones = bool(re.search(r"^##\s+.*(?:Milestones|Roadmap).*$", text, re.MULTILINE | re.IGNORECASE))
+    has_checklist = bool(re.search(r"^\s*-\s*\[([ xX])\]\s+(.+)$", text, re.MULTILINE))
+
+    if has_arch and has_milestones and has_checklist:
+        first_section = re.search(r"^##\s+", text, re.MULTILINE)
+        if first_section:
+            body = text[first_section.start():].strip()
+            body = re.sub(r"```(?:json)?\s*\{.*?\}\s*```\s*$", "", body, flags=re.DOTALL).strip()
+            candidate = f"# Project Plan: {default_title}\n\n{body}"
+            is_val, _ = validate_plan_structure(candidate)
+            if is_val:
+                return candidate
+
+    return None

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import shlex
 import time
 from collections.abc import Sequence
@@ -1110,6 +1112,23 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
             "required": ["version"],
         },
     ),
+    ToolDefinition(
+        name="request_tools",
+        description=(
+            "Dynamically activate additional specialized tools for this session by keyword, "
+            "category, or tool name (e.g. 'git', 'analysis', 'linters', 'graph', or a specific name like 'git_blame')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Category or tool name, e.g. 'git', 'analysis', 'knowledge', or 'git_blame'",
+                }
+            },
+            "required": ["query"],
+        },
+    ),
 )
 
 
@@ -1118,6 +1137,71 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     from validators.kernel.identity import get_role_policy
     policy = get_role_policy(role_or_agent)
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
+
+
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file")
+AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
+ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "list_directory",
+    "query_graph",
+    "find_symbol",
+    "find_references",
+    "git_log",
+    "git_diff",
+    "run_command",
+)
+
+
+def get_curated_tools_for_phase(
+    role_or_agent: str,
+    phase: str | None = None,
+    backend_id: str | None = None,
+) -> list[ToolDefinition]:
+    """Return an optimized, task-appropriate tool palette.
+
+    Prevents context bloat and tool dilution on local models while including
+    the request_tools meta-tool for dynamic on-demand capability expansion.
+    """
+    from validators.kernel.identity import get_role_policy
+    policy = get_role_policy(role_or_agent)
+    all_permitted = [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
+
+    norm_role = str(role_or_agent).lower().strip()
+    is_architect = norm_role in ("claude", "architecture", "architect")
+
+    request_tools_def = next((t for t in STANDARD_KERNEL_TOOLS if t.name == "request_tools"), None)
+
+    if is_architect:
+        if phase == "planning":
+            wanted = set(PLANNING_CORE_TOOL_NAMES)
+        elif phase == "authoring":
+            wanted = set(AUTHORING_CORE_TOOL_NAMES)
+        else:
+            wanted = set(ARCHITECTURE_INVESTIGATION_TOOL_NAMES)
+
+        curated = [t for t in all_permitted if t.name in wanted]
+        if request_tools_def and request_tools_def not in curated:
+            curated.append(request_tools_def)
+        return curated
+
+    # For other roles (codex, gemini, gemma, local-llm):
+    # If running against local Ollama, trim extraneous kernel diagnostic tools
+    if backend_id in ("ollama", "local", "local-llm"):
+        omitted = {
+            "checkpoint", "restore_checkpoint", "inspect_budget", "explain_denial",
+            "verify_scope", "dispatch_subagent", "compare_snapshots", "skill_mine",
+            "skill_promote", "skill_list", "skill_retrieve", "experience_search",
+        }
+        curated = [t for t in all_permitted if t.name not in omitted]
+        if request_tools_def and request_tools_def not in curated:
+            curated.append(request_tools_def)
+        return curated
+
+    if request_tools_def and request_tools_def not in all_permitted:
+        all_permitted.append(request_tools_def)
+    return all_permitted
 
 DEFAULT_MAX_TURNS: int = 20
 DEFAULT_MAX_TOOL_CALLS: int = 35
@@ -1194,16 +1278,69 @@ class ProviderGateway:
                 can_run_cmd, _ = evaluator.authorize(self.contract, "run_command", "workspace/command")
             if not can_run_cmd:
                 active_tools = [t for t in active_tools if t.name != "run_command"]
+        request_tools_def = next((t for t in STANDARD_KERNEL_TOOLS if t.name == "request_tools"), None)
+        if request_tools_def and request_tools_def.name not in {t.name for t in active_tools}:
+            active_tools.append(request_tools_def)
+        self.active_tools_list: list[ToolDefinition] = active_tools
         self.tools = tuple(active_tools)
         self.total_usage = TokenUsage()
         self.total_tool_calls: int = 0
         self.consecutive_failures: int = 0
         self.written_files: list[str] = []
+        self.read_counts: dict[str, int] = {}
+        provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
+        is_local = provider in ("ollama", "local", "llamacpp")
+        if max_tool_output_chars == DEFAULT_MAX_TOOL_OUTPUT_CHARS and is_local:
+            max_tool_output_chars = int(os.environ.get("LOCAL_TOOL_OUTPUT_CHARS", "4000"))
         self.max_tool_output_chars: int = max_tool_output_chars
 
+    def has_written_deliverable(self, required_deliverable: str | None) -> bool:
+        if not required_deliverable:
+            return True
+        norm_del = Path(required_deliverable).as_posix().lstrip("/")
+        norm_written = {Path(p).as_posix().lstrip("/") for p in self.written_files}
+        return norm_del in norm_written
+
+    def _compact_messages_for_context(self, messages: list[Message]) -> None:
+        """Compact older tool outputs in multi-turn loops to avoid blowing model context window."""
+        provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
+        is_local = provider in ("ollama", "local", "llamacpp")
+
+        tool_indices = [i for i, m in enumerate(messages) if str(m.role).lower() == "tool"]
+        if not tool_indices:
+            return
+
+        keep_recent = 2
+        older_indices = tool_indices[:-keep_recent] if len(tool_indices) > keep_recent else []
+
+        for idx in older_indices:
+            m = messages[idx]
+            content = m.content or ""
+            max_retain = 250 if is_local else 600
+            if len(content) > max_retain:
+                head = content[:150]
+                tail = content[-80:]
+                compacted = (
+                    f"{head}\n"
+                    f"... [Earlier tool output truncated to preserve context window: {len(content)} chars omitted] ...\n"
+                    f"{tail}"
+                )
+                messages[idx] = Message.tool(
+                    content=compacted,
+                    tool_call_id=m.tool_call_id or "call_unknown",
+                    name=m.name,
+                )
+
     def _get_max_tokens(self) -> int | None:
+        # Local models have no token limit (infinite budget)
+        provider = getattr(self.adapter, "provider_name", "") or ""
+        if str(provider).lower() in ("ollama", "local", "llamacpp"):
+            return None
         if self.contract and hasattr(self.contract, "budget") and self.contract.budget:
-            return self.contract.budget.get("max_tokens")
+            mt = self.contract.budget.get("max_tokens")
+            if mt is None or mt <= 0:
+                return None
+            return mt
         return None
 
     def _get_budget_max_tool_calls(self) -> int | None:
@@ -1281,7 +1418,15 @@ class ProviderGateway:
 
                 result = self.tool_gateway.read_file(target)
                 self.consecutive_failures = 0
-                return truncate_tool_output(result, max_chars=self.max_tool_output_chars)
+                r_count = self.read_counts.get(target, 0) + 1
+                self.read_counts[target] = r_count
+                out = truncate_tool_output(result, max_chars=self.max_tool_output_chars)
+                if r_count > 1:
+                    out += (
+                        f"\n\n[NOTICE: You have already read '{target}' in this session ({r_count} times). "
+                        f"Do NOT read this file again. Proceed immediately to author your assigned deliverable using write_file.]"
+                    )
+                return out
 
             if name == "write_file":
                 target = args.get("path") or args.get("target") or args.get("filename") or ""
@@ -1356,6 +1501,46 @@ class ProviderGateway:
                 out_str = json.dumps(result) if not isinstance(result, str) else result
                 return truncate_tool_output(out_str, max_chars=self.max_tool_output_chars)
 
+            if name == "request_tools":
+                query = str(args.get("query", "")).lower().strip()
+                if not query:
+                    return "Error: 'request_tools' requires a 'query' argument specifying the tool or category."
+
+                category_tools: dict[str, set[str]] = {
+                    "git": {"git_status", "git_diff", "git_log", "git_show", "git_blame", "git_changed_files", "git_branch"},
+                    "analysis": {"find_callers", "find_callees", "impact_analysis", "dependency_analysis", "data_flow_analysis"},
+                    "knowledge": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
+                    "graph": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
+                    "linter": {"run_command"},
+                    "linters": {"run_command"},
+                    "diagnostics": {"inspect_environment", "inspect_logs", "inspect_version", "checkpoint"},
+                    "search": {"grep", "glob", "semantic_search", "search_docs"},
+                }
+
+                target_names = set(category_tools.get(query, set()))
+                if not target_names:
+                    for t in STANDARD_KERNEL_TOOLS:
+                        if query == t.name.lower() or query in t.name.lower() or query in t.description.lower():
+                            target_names.add(t.name)
+
+                policy = getattr(self.tool_gateway, "policy", None)
+                added_tools: list[str] = []
+                already_active = {t.name for t in self.active_tools_list}
+                for t in STANDARD_KERNEL_TOOLS:
+                    if t.name in target_names and t.name not in already_active:
+                        if policy is None or policy.permits(t.name):
+                            self.active_tools_list.append(t)
+                            added_tools.append(t.name)
+
+                self.tools = tuple(self.active_tools_list)
+                self.consecutive_failures = 0
+                if added_tools:
+                    return f"Successfully activated tool(s): {added_tools}. Their schemas are now available for you to call in your next action."
+                elif any(t in already_active for t in target_names):
+                    return f"Tool(s) matching '{query}' are already active in your session."
+                else:
+                    return f"No permitted tools found matching '{query}'. Available categories: git, analysis, knowledge, search, linters."
+
             if hasattr(self.tool_gateway, name):
                 method = getattr(self.tool_gateway, name)
                 import inspect
@@ -1364,18 +1549,48 @@ class ProviderGateway:
                 for param_name, param in sig.parameters.items():
                     if param_name in args:
                         kwargs[param_name] = args[param_name]
-                    elif param_name == "target" and ("path" in args or "file" in args):
-                        kwargs[param_name] = args.get("path") or args.get("file")
-                    elif param_name == "path" and ("target" in args or "file" in args):
-                        kwargs[param_name] = args.get("target") or args.get("file")
-                    elif param_name == "filter_term" and ("filter" in args or "q" in args):
-                        kwargs[param_name] = args.get("filter") or args.get("q")
-                    elif param_name == "task_text" and ("text" in args or "task" in args):
-                        kwargs[param_name] = args.get("text") or args.get("task")
-                    elif param_name == "checkpoint_id" and ("id" in args or "cp_id" in args):
-                        kwargs[param_name] = args.get("id") or args.get("cp_id")
-                    elif param_name == "patch_content" and ("patch" in args or "diff" in args):
-                        kwargs[param_name] = args.get("patch") or args.get("diff")
+                    elif param_name == "target" and any(k in args for k in ("path", "file", "filename", "filepath")):
+                        kwargs[param_name] = args.get("path") or args.get("file") or args.get("filename") or args.get("filepath")
+                    elif param_name == "path" and any(k in args for k in ("target", "file", "filename", "filepath")):
+                        kwargs[param_name] = args.get("target") or args.get("file") or args.get("filename") or args.get("filepath")
+                    elif param_name == "filter_term" and any(k in args for k in ("filter", "q", "term")):
+                        kwargs[param_name] = args.get("filter") or args.get("q") or args.get("term")
+                    elif param_name == "task_text" and any(k in args for k in ("text", "task", "item")):
+                        kwargs[param_name] = args.get("text") or args.get("task") or args.get("item")
+                    elif param_name == "checkpoint_id" and any(k in args for k in ("id", "cp_id", "label")):
+                        kwargs[param_name] = args.get("id") or args.get("cp_id") or args.get("label")
+                    elif param_name == "patch_content" and any(k in args for k in ("patch", "diff", "content")):
+                        kwargs[param_name] = args.get("patch") or args.get("diff") or args.get("content")
+                    elif param_name == "agent_name" and any(k in args for k in ("agent", "name", "role", "actor")):
+                        kwargs[param_name] = args.get("agent") or args.get("name") or args.get("role") or args.get("actor")
+                    elif param_name == "wo_id" and any(k in args for k in ("work_order_id", "work_order", "id", "wo", "workorder")):
+                        kwargs[param_name] = (
+                            args.get("work_order_id")
+                            or args.get("work_order")
+                            or args.get("id")
+                            or args.get("wo")
+                            or args.get("workorder")
+                        )
+                    elif param_name == "skill_name" and any(k in args for k in ("skill", "name")):
+                        kwargs[param_name] = args.get("skill") or args.get("name")
+                    elif param_name == "command" and any(k in args for k in ("cmd", "args")):
+                        kwargs[param_name] = args.get("cmd") or args.get("args")
+                    elif param_name == "query" and any(k in args for k in ("q", "search", "prompt")):
+                        kwargs[param_name] = args.get("q") or args.get("search") or args.get("prompt")
+                    elif param_name == "symbol" and any(k in args for k in ("name", "target")):
+                        kwargs[param_name] = args.get("name") or args.get("target")
+                    elif param_name == "instructions" and any(k in args for k in ("instruction", "prompt", "message", "task")):
+                        kwargs[param_name] = args.get("instruction") or args.get("prompt") or args.get("message") or args.get("task")
+                    elif param_name == "summary" and any(k in args for k in ("description", "report", "message")):
+                        kwargs[param_name] = args.get("description") or args.get("report") or args.get("message")
+                    elif param_name == "verdict" and any(k in args for k in ("status", "decision")):
+                        kwargs[param_name] = args.get("status") or args.get("decision")
+                    elif param_name == "report" and any(k in args for k in ("summary", "description", "details")):
+                        kwargs[param_name] = args.get("summary") or args.get("description") or args.get("details")
+                    elif param_name == "new_version" and "version" in args:
+                        kwargs[param_name] = args.get("version")
+                    elif param_name == "entry" and any(k in args for k in ("changelog", "text", "content")):
+                        kwargs[param_name] = args.get("changelog") or args.get("text") or args.get("content")
 
                 result = method(**kwargs)
                 self.consecutive_failures = 0
@@ -1429,9 +1644,14 @@ class ProviderGateway:
                         or args.get("file")
                         or args.get("query")
                         or args.get("q")
-                        or ""
+                        or ("." if name in ("list_directory", "glob") else "")
                     )
-                    res = f"Error: PermissionError: Operation on '{target_str}' was denied by runtime policy/contract: {ex}"
+                    target_display = f"'{target_str}'" if target_str else f"tool '{name}'"
+                    res = (
+                        f"Error: PermissionError: Operation on {target_display} was denied by runtime policy/contract: {ex}. "
+                        f"CRITICAL: Do NOT retry accessing or writing {target_display} as it is outside your assigned scope. "
+                        f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
+                    )
             else:
                 res = f"Error executing {name}: {type(ex).__name__}: {ex}"
 
@@ -1501,10 +1721,16 @@ class ProviderGateway:
         tools: Sequence[ToolDefinition] | None = None,
         timeout: float | None = None,
         cancellation_token: Any | None = None,
+        required_deliverable: str | None = None,
         **kwargs: Any,
     ) -> list[Message]:
         """Execute full autonomous reasoning/tool loop until task completion or limit."""
-        active_tools = tools if tools is not None else self.tools
+        if tools is not None:
+            self.active_tools_list = list(tools)
+            request_tools_def = next((t for t in STANDARD_KERNEL_TOOLS if t.name == "request_tools"), None)
+            if request_tools_def and request_tools_def.name not in {t.name for t in self.active_tools_list}:
+                self.active_tools_list.append(request_tools_def)
+        active_tools = self.active_tools_list
 
         budget_turns = self.contract.budget.get("max_turns") if (self.contract and hasattr(self.contract, "budget") and self.contract.budget) else None
         effective_max_turns = max_turns or budget_turns or DEFAULT_MAX_TURNS
@@ -1516,8 +1742,14 @@ class ProviderGateway:
         recent_signatures: list[tuple[str, str]] = []
         signature_counts: dict[tuple[str, str], int] = {}
 
+        empty_tool_nudges = 0
+        max_empty_tool_nudges = 2
+        loop_nudges = 0
+        max_loop_nudges = 2
+
         for turn_idx in range(effective_max_turns):
             check_cancellation(cancellation_token)
+            self._compact_messages_for_context(messages)
 
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -1536,9 +1768,37 @@ class ProviderGateway:
                 **kwargs,
             )
 
-            # If the assistant gave an answer without emitting new tool calls, the task finished
+            # If the assistant gave an answer without emitting new tool calls, check if this was a false finish
             if not response.message.tool_calls:
+                norm_del = Path(required_deliverable).as_posix().lstrip("/") if required_deliverable else None
+                norm_written = {Path(p).as_posix().lstrip("/") for p in self.written_files}
+                has_unwritten_deliverable = bool(norm_del and norm_del not in norm_written)
+                has_write_tool = any(t.name == "write_file" for t in active_tools)
+
+                should_nudge = (
+                    (self.total_tool_calls == 0 and has_write_tool and empty_tool_nudges < max_empty_tool_nudges)
+                    or (has_unwritten_deliverable and has_write_tool and empty_tool_nudges < max_empty_tool_nudges)
+                )
+
+                if should_nudge:
+                    empty_tool_nudges += 1
+                    target_hint = f" '{required_deliverable}'" if required_deliverable else ""
+                    nudge_content = (
+                        f"You responded with text without calling tools or authoring required deliverable{target_hint}.\n"
+                        f"You MUST invoke `write_file` now to author your required deliverable{target_hint}.\n"
+                        "Note: Code execution, virtual environments, and tests are managed externally by the harness and QA lead. "
+                        "Do not wait or look for a virtual environment (.venv) or shell execution.\n"
+                        "To call write_file, invoke the tool or emit:\n"
+                        "<tool_call>\n"
+                        f'{{"name": "write_file", "arguments": {{"path": "{required_deliverable or "<file_path>"}", "content": "<file_content>"}}}}\n'
+                        "</tool_call>\n"
+                        "Please call `write_file` now."
+                    )
+                    messages.append(Message.user(nudge_content))
+                    continue
                 return messages
+            else:
+                empty_tool_nudges = 0
 
             # Check cumulative tool call limit after executing turn
             if self.total_tool_calls >= effective_max_tool_calls:
@@ -1563,18 +1823,59 @@ class ProviderGateway:
             if len(recent_signatures) >= DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:
                 last_sig = recent_signatures[-1]
                 if all(s == last_sig for s in recent_signatures[-DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:]):
+                    if (
+                        last_sig[0] in ("read_file", "list_directory", "glob", "grep")
+                        and loop_nudges < max_loop_nudges
+                    ):
+                        loop_nudges += 1
+                        signature_counts[last_sig] = 1
+                        recent_signatures = [s for s in recent_signatures if s != last_sig] + [last_sig]
+                        target_hint = (
+                            f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
+                            if (required_deliverable and not self.has_written_deliverable(required_deliverable))
+                            else " Proceed immediately with your work."
+                        )
+                        messages.append(Message.user(
+                            f"[SYSTEM WARNING: You have called '{last_sig[0]}' {DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS} times in a row without making progress. "
+                            f"Stop repeating this call.{target_hint} Repeated identical calls will abort your turn.]"
+                        ))
+                        continue
                     raise NoProgressLoopError(
                         f"Pathological loop: identical call '{last_sig[0]}' repeated {DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS} times without progress",
                         pattern=last_sig[0],
                     )
 
             # 3. Check per-signature total occurrences across turn
+            triggered_sig = None
+            triggered_count = 0
             for sig, count in signature_counts.items():
                 if count >= DEFAULT_MAX_TOTAL_IDENTICAL_CALLS:
-                    raise NoProgressLoopError(
-                        f"Pathological loop: call '{sig[0]}' with identical arguments repeated {count} times without progress",
-                        pattern=sig[0],
+                    triggered_sig = sig
+                    triggered_count = count
+                    break
+
+            if triggered_sig is not None:
+                if (
+                    triggered_sig[0] in ("read_file", "list_directory", "glob", "grep")
+                    and loop_nudges < max_loop_nudges
+                ):
+                    loop_nudges += 1
+                    signature_counts[triggered_sig] = 1
+                    recent_signatures = [s for s in recent_signatures if s != triggered_sig] + [triggered_sig]
+                    target_hint = (
+                        f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
+                        if (required_deliverable and not self.has_written_deliverable(required_deliverable))
+                        else " Proceed immediately with your work."
                     )
+                    messages.append(Message.user(
+                        f"[SYSTEM WARNING: You have called '{triggered_sig[0]}' with identical arguments {triggered_count} times without making progress. "
+                        f"Stop repeating this call.{target_hint} Repeated identical calls will abort your turn.]"
+                    ))
+                    continue
+                raise NoProgressLoopError(
+                    f"Pathological loop: call '{triggered_sig[0]}' with identical arguments repeated {triggered_count} times without progress",
+                    pattern=triggered_sig[0],
+                )
 
         # If loop exited all turns while still emitting tool calls, it was exhausted
         raise ToolLoopExhaustedError(

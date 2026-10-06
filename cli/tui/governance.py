@@ -111,11 +111,12 @@ def render_contract_hud(
     contract: Mapping[str, Any], title: str = "CONTRACT BOUNDARY HUD"
 ) -> Panel:
     """Render contract scope, write mode, and deny boundaries in a clean panel."""
-    write_mode = contract.get("write_mode", "governed")
-    allow = contract.get("allow", [])
-    deny = contract.get("deny", [])
-    governance = contract.get("governance", [])
-    budget = contract.get("budget", {})
+    scope = contract.get("scope", {}) if isinstance(contract.get("scope"), Mapping) else {}
+    write_mode = contract.get("write_mode") or scope.get("write") or "governed"
+    allow = contract.get("allow") or scope.get("allow", [])
+    deny = contract.get("deny") or scope.get("deny", [])
+    governance = contract.get("governance") or scope.get("governance", [])
+    budget = contract.get("budget") or scope.get("budget", {})
 
     lines: list[RenderableType] = []
 
@@ -130,9 +131,10 @@ def render_contract_hud(
     if allow:
         for entry in allow:
             if isinstance(entry, dict):
-                path = entry.get("path", "")
+                path = entry.get("path") or entry.get("module") or entry.get("target") or ""
                 ops = ", ".join(entry.get("ops", []))
-                lines.append(Text(f"  • {path} ", style="white").append(f"[{ops}]", style="dim"))
+                op_str = f" [{ops}]" if ops else ""
+                lines.append(Text(f"  • {path}", style="white").append(op_str, style="dim"))
             else:
                 lines.append(Text(f"  • {entry}", style="white"))
     else:
@@ -144,7 +146,7 @@ def render_contract_hud(
     if deny:
         for entry in deny:
             if isinstance(entry, dict):
-                path = entry.get("path", "")
+                path = entry.get("path") or entry.get("module") or entry.get("target") or ""
                 reason = entry.get("reason", "")
                 reason_str = f" — {reason}" if reason else ""
                 lines.append(Text(f"  ✗ {path}", style="red").append(reason_str, style="dim"))

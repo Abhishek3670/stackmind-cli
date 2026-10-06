@@ -575,8 +575,17 @@ def render_composer_box(
     Has the strongest container border in the interface (§29, §43),
     highlighting to #60a5fa when active.
     """
-    inner_width = max(40, width - 4)
+    inner_width = max(10, width - 4)
     border_color = "#60a5fa" if is_active else "#475569"
+
+    shortcut_candidates = [
+        shortcuts,
+        "Ctrl+K commands | Ctrl+L clear",
+        "Ctrl+K | Ctrl+L | PgUp/PgDn",
+        "Ctrl+K | Ctrl+L",
+    ]
+    seen = set()
+    shortcut_candidates = [sc for sc in shortcut_candidates if sc and not (sc in seen or seen.add(sc))]
 
     if not content and not has_content:
         if is_active:
@@ -587,24 +596,24 @@ def render_composer_box(
             line.append("> ", style="bold #38bdf8")
             body: RenderableType = line
         else:
-            left_plain = f"> {placeholder}"
+            max_p_len = max(0, inner_width - 2)
+            display_placeholder = placeholder
+            if len(display_placeholder) > max_p_len:
+                display_placeholder = display_placeholder[:max(0, max_p_len - 3)] + "..."
+            left_plain = f"> {display_placeholder}"
+
             available_shortcuts_width = inner_width - len(left_plain) - 2
-            if available_shortcuts_width >= len(shortcuts):
-                right_plain = shortcuts
-            elif available_shortcuts_width >= len("Ctrl+K commands | Ctrl+L clear"):
-                right_plain = "Ctrl+K commands | Ctrl+L clear"
-            elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L | PgUp/PgDn"):
-                right_plain = "Ctrl+K | Ctrl+L | PgUp/PgDn"
-            elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L"):
-                right_plain = "Ctrl+K | Ctrl+L"
-            else:
-                right_plain = ""
+            right_plain = ""
+            for sc in shortcut_candidates:
+                if available_shortcuts_width >= len(sc):
+                    right_plain = sc
+                    break
 
             spaces_count = max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
 
             line = Text(no_wrap=True)
             line.append("> ", style="bold #38bdf8")
-            line.append(placeholder, style="dim #94a3b8")
+            line.append(display_placeholder, style="dim #94a3b8")
             if right_plain:
                 line.append(" " * spaces_count)
                 line.append(right_plain, style="dim #64748b")
@@ -619,17 +628,22 @@ def render_composer_box(
 
         rendered_lines: list[Text] = []
         first_text = lines[0]
+
+        max_text_width = max(0, inner_width - 2)
+
+        # Content has priority: check if shortcuts fit alongside untruncated first_text
         left_plain = f"> {first_text}"
         available_shortcuts_width = inner_width - len(left_plain) - 2
-        if available_shortcuts_width >= len(shortcuts):
-            right_plain = shortcuts
-        elif available_shortcuts_width >= len("Ctrl+K commands | Ctrl+L clear"):
-            right_plain = "Ctrl+K commands | Ctrl+L clear"
-        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L | PgUp/PgDn"):
-            right_plain = "Ctrl+K | Ctrl+L | PgUp/PgDn"
-        elif available_shortcuts_width >= len("Ctrl+K | Ctrl+L"):
-            right_plain = "Ctrl+K | Ctrl+L"
-        else:
+        right_plain = ""
+        for sc in shortcut_candidates:
+            if available_shortcuts_width >= len(sc):
+                right_plain = sc
+                break
+
+        # Truncate first_text only if it alone exceeds the inner box width
+        if len(first_text) > max_text_width:
+            first_text = first_text[:max(0, max_text_width - 3)] + "..."
+            left_plain = f"> {first_text}"
             right_plain = ""
 
         spaces_count = max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
@@ -643,6 +657,9 @@ def render_composer_box(
         rendered_lines.append(line1)
 
         for sub_line in lines[1:]:
+            # Sub-lines have a 2-space indent ("  ") and no shortcuts
+            if len(sub_line) > max_text_width:
+                sub_line = sub_line[:max(0, max_text_width - 3)] + "..."
             line_n = Text()
             line_n.append("  ", style="dim #38bdf8")
             line_n.append(sub_line, style="white")
@@ -695,7 +712,9 @@ def _compute_cursor_col(editor: Any, default: int = 5) -> int:
     """
     if editor is None:
         return default
-    cursor = getattr(editor, "cursor", None)
+    cursor = getattr(editor, "displayed_cursor", None)
+    if not isinstance(cursor, int):
+        cursor = getattr(editor, "cursor", None)
     prefix = getattr(editor, "prompt_prefix", None)
     if not isinstance(cursor, int) or not isinstance(prefix, str):
         return default
@@ -963,26 +982,66 @@ def render_composer_top_border(
     else:
         label = placeholder
 
+    shortcut_candidates = [
+        shortcuts,
+        "Ctrl+K commands | Ctrl+L clear",
+        "Ctrl+K | Ctrl+L | PgUp/PgDn",
+        "Ctrl+K | Ctrl+L",
+    ]
+    seen = set()
+    shortcut_candidates = [sc for sc in shortcut_candidates if sc and not (sc in seen or seen.add(sc))]
+
     if label:
-        fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(shortcuts) + len(" ─╮")
-        if width >= fixed_len + 2:
+        # Check if any shortcut candidate fits alongside label
+        chosen_sc = None
+        for sc in shortcut_candidates:
+            fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(sc) + len(" ─╮")
+            if width >= fixed_len + 2:
+                chosen_sc = sc
+                break
+
+        if chosen_sc is not None:
+            fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(chosen_sc) + len(" ─╮")
             fill_count = width - fixed_len
             text = Text()
             text.append("╭─ ", style=border_color)
             text.append(label, style="bold #38bdf8" if active_content else "dim #94a3b8")
             text.append(" " + "─" * fill_count + " ", style=border_color)
-            text.append(shortcuts, style="dim #64748b")
+            text.append(chosen_sc, style="dim #64748b")
             text.append(" ─╮", style=border_color)
+            return text
+
+        # If shortcuts don't fit, check if full label fits alone
+        fixed_len_label_only = len("╭─ ") + len(label) + len(" ") + len("─╮")
+        if width >= fixed_len_label_only + 2:
+            fill_count = width - fixed_len_label_only
+            text = Text()
+            text.append("╭─ ", style=border_color)
+            text.append(label, style="bold #38bdf8" if active_content else "dim #94a3b8")
+            text.append(" " + "─" * fill_count + "─╮", style=border_color)
+            return text
+
+        # If label alone doesn't fit, truncate label if width >= 12
+        if width >= 12:
+            max_label = width - 8
+            truncated_label = label[:max(0, max_label - 3)] + "..."
+            fixed_len_trunc = len("╭─ ") + len(truncated_label) + len(" ") + len("─╮")
+            fill_count = width - fixed_len_trunc
+            text = Text()
+            text.append("╭─ ", style=border_color)
+            text.append(truncated_label, style="bold #38bdf8" if active_content else "dim #94a3b8")
+            text.append(" " + "─" * fill_count + "─╮", style=border_color)
             return text
     else:
-        fixed_len = len("╭─ ") + len(shortcuts) + len(" ─╮")
-        if width >= fixed_len + 2:
-            fill_count = width - fixed_len
-            text = Text()
-            text.append("╭─" + "─" * fill_count + " ", style=border_color)
-            text.append(shortcuts, style="dim #64748b")
-            text.append(" ─╮", style=border_color)
-            return text
+        for sc in shortcut_candidates:
+            fixed_len = len("╭─") + len(" ") + len(sc) + len(" ─╮")
+            if width >= fixed_len + 2:
+                fill_count = width - fixed_len
+                text = Text()
+                text.append("╭─" + "─" * fill_count + " ", style=border_color)
+                text.append(sc, style="dim #64748b")
+                text.append(" ─╮", style=border_color)
+                return text
 
     text = Text()
     text.append("╭" + "─" * max(2, width - 2) + "╮", style=border_color)
@@ -1414,7 +1473,7 @@ def get_help_str() -> str:
         "  :chat             Display conversation transcript\n"
         "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
         "  :compact          Compact older transcript turns to protect context window\n"
-        "  :timeout [sec]    Get or set client turn wait timeout (default: 45s)\n"
+        "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
         "  :exit, :quit, q   Gracefully stop daemon and exit\n"
@@ -1523,7 +1582,7 @@ def dispatch_delivery_command(
     live_manager: Any | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Dispatch interactive TUI commands, updating delivery state reactively."""
-    effective_timeout = client_timeout if client_timeout is not None else getattr(state, "client_timeout", 45.0)
+    effective_timeout = client_timeout if client_timeout is not None else getattr(state, "client_timeout", 0.0)
     state.client_timeout = effective_timeout
     normalized = text.strip()
     if not normalized:
@@ -1999,16 +2058,22 @@ def dispatch_delivery_command(
         if clean_to:
             try:
                 new_to = float(clean_to)
-                if new_to > 0:
+                if new_to < 0:
+                    output_str = "Timeout must be zero (no timeout) or a positive number."
+                elif new_to == 0:
+                    state.client_timeout = 0.0
+                    output_str = "Client timeout disabled (no timeout — will wait until operation completes)."
+                else:
                     state.client_timeout = new_to
                     output_str = f"Client timeout set to {new_to:.1f}s."
-                else:
-                    output_str = "Timeout must be a positive number."
             except ValueError:
-                output_str = f"Invalid timeout '{clean_to}'. Provide seconds (e.g., :timeout 60)."
+                output_str = f"Invalid timeout '{clean_to}'. Provide seconds (e.g., :timeout 60) or 0 to disable."
         else:
             cur_to = getattr(state, "client_timeout", effective_timeout)
-            output_str = f"Current client timeout: {cur_to:.1f}s."
+            if cur_to <= 0:
+                output_str = "Current client timeout: disabled (no timeout)."
+            else:
+                output_str = f"Current client timeout: {cur_to:.1f}s."
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -2121,7 +2186,7 @@ def dispatch_delivery_command(
 
         try:
             stream_gen = adapter.stream(session["session_id"], live=True, timeout=1.0)
-            while time.time() - start_time < max_wait and not completed:
+            while (max_wait <= 0 or time.time() - start_time < max_wait) and not completed:
                 # Check for dynamic terminal resize during active streaming / turn (WO-003)
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
                 if resized:
@@ -2156,7 +2221,10 @@ def dispatch_delivery_command(
                 if isinstance(ev, dict) and (ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"):
                     if not streaming_active and (now - last_progress_time >= 2.0):
                         elapsed = now - start_time
-                        prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
+                        if max_wait > 0:
+                            prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
+                        else:
+                            prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
                         # AC-7: Route tick through redraw_full_screen so heartbeat ticks do not corrupt layout
                         layout = compute_layout(shutil.get_terminal_size().columns)
                         transcript = (
@@ -2574,7 +2642,7 @@ def _dispatch_command(
     text: str,
     state: AutonomousDeliveryState | None = None,
     *,
-    client_timeout: float = 45.0,
+    client_timeout: float = 0.0,
 ) -> tuple[dict[str, Any], bool]:
     if state is None:
         state = AutonomousDeliveryState(session_id=session.get("session_id", "session-1"))
@@ -2588,13 +2656,13 @@ def _dispatch_command(
 @click.option("--workspace", "-w", "workspace", type=click.Path(path_type=Path), default=Path("."))
 @click.option("--session-id", "-s", "target_session_id", default=None, help="Attach to a specific daemon session ID.")
 @click.option("--demo", is_flag=True, help="Run the automated daemon-backed walkthrough.")
-@click.option("--timeout", "client_timeout", type=float, default=45.0, show_default=True, help="Turn operation wait timeout in seconds.")
+@click.option("--timeout", "client_timeout", type=float, default=0, show_default=True, help="Turn operation wait timeout in seconds (0=no timeout).")
 def tui(
     daemon_url: str | None,
     agent: str,
     workspace: Path,
     demo: bool,
-    client_timeout: float = 45.0,
+    client_timeout: float = 0.0,
     target_session_id: str | None = None,
 ) -> None:
     """Start the governed Python-native terminal control plane."""

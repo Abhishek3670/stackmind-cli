@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Callable
 
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from validators.clock import now as _now
 
 
 @dataclass(frozen=True)

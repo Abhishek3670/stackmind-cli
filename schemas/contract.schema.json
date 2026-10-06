@@ -12,6 +12,10 @@
     "schema_version": {
       "type": "integer"
     },
+    "synthesized_by": {
+      "type": "string",
+      "description": "Provenance marker for deterministic scaffolding (e.g. 'bootstrap'); an authorized author may supersede such artifacts."
+    },
     "agent_id": {
       "type": "string"
     },
@@ -91,7 +95,7 @@
         },
         "max_tokens": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 0
         },
         "expires_at": {
           "type": "string"

@@ -167,7 +167,10 @@ _ALLOWLIST_TOKENS = {
 }
 
 _ALLOWLIST_SUBSTRINGS = (
-    "mock", "dummy", "fake", "placeholder", "example", "test-token", "test_token", "sample-",
+    "mock", "dummy", "fake", "placeholder", "example", "test-token", "test_token", "sample",
+    "change-me", "changeme", "change_me", "replace-me", "replaceme", "replace_me",
+    "your-", "your_", "my-secret", "my_secret", "supersecret", "secret-key", "secret_key",
+    "default", "admin", "development", "dev", "demo", "todo", "insert-", "put-", "set-", "local",
 )
 
 

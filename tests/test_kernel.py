@@ -94,9 +94,11 @@ def test_proposed_capability_matrix_role_policies():
     assert gemma_policy.permits(OperationType.REQUEST_CHANGES.value)
     assert gemma_policy.permits(OperationType.RUN_TESTS.value)
     assert gemma_policy.permits(OperationType.SKILL_TEST.value)
-    # QA is an evaluator: file mutations are withheld
+    # QA authors its executable test suites (deliverable-under-tests
+    # doctrine): write_file is granted, bounded by contract scope.
+    assert gemma_policy.permits(OperationType.WRITE_FILE.value)
+    # Source-editing and release mutations remain withheld
     assert not gemma_policy.permits(OperationType.APPLY_PATCH.value)
-    assert not gemma_policy.permits(OperationType.WRITE_FILE.value)
     assert not gemma_policy.permits(OperationType.GIT_COMMIT.value)
 
     # 5. Local-LLM (GitOps)

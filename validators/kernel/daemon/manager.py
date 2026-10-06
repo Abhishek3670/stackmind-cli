@@ -66,8 +66,7 @@ _DEFAULT_ROLE_CONFIG = {
 }
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from validators.clock import now as _now
 
 
 def _is_narrower_or_equal(child_pat: str, parent_pat: str) -> bool:
@@ -165,9 +164,15 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
     if agent not in agents:
         agents[agent] = {
             "session_count": 0,
-            "status": "IDLE",
+            "status": "idle",
             "assigned_work_orders": [],
         }
+    else:
+        # Self-heal legacy scaffolding that wrote the schema-invalid 'IDLE'
+        # (tree.schema.json only permits lowercase states).
+        existing_status = str(agents[agent].get("status", ""))
+        if existing_status.upper() == "IDLE" and existing_status != "idle":
+            agents[agent]["status"] = "idle"
     tree_file.parent.mkdir(parents=True, exist_ok=True)
     tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
 
@@ -180,7 +185,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             "schema_version": 1,
             "release": "3.1.0",
             "session_count": 0,
-            "status": "IDLE",
+            "status": "idle",
             "assigned_work_orders": [],
             "blockers": [],
         }
@@ -324,6 +329,7 @@ def synthesize_bootstrap_planning(
                 {"module": "PLAN.md"},
                 {"module": ".sync/work-orders/**"},
                 {"module": ".sync/contracts/**"},
+                {"module": ".sync/decisions/**"},
                 {"module": ".sync/inbox/local-llm/**"},
                 {"module": ".sync/inbox/claude/**"},
             ],
@@ -465,6 +471,18 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
     elif phase in (Phase.DISPATCHING, Phase.EXECUTING):
         state.batch_operation_id = None
 
+    ignored = set(getattr(state, "ignored_operation_ids", []) or [])
+    if getattr(state, "integration_operation_id", None) in ignored:
+        state.integration_operation_id = None
+    if getattr(state, "planning_operation_id", None) in ignored:
+        state.planning_operation_id = None
+    if getattr(state, "authoring_operation_id", None) in ignored:
+        state.authoring_operation_id = None
+    if getattr(state, "gitops_operation_id", None) in ignored:
+        state.gitops_operation_id = None
+    if getattr(state, "batch_operation_id", None) in ignored:
+        state.batch_operation_id = None
+
 
 class SessionManager:
     """Owns daemon sessions, their audit journals, and active-operation cancellation."""
@@ -480,6 +498,7 @@ class SessionManager:
         self._sessions: dict[str, dict[str, Any]] = recovered["sessions"]
         self._active: dict[str, Event] = {}
         self._turn_threads: dict[str, Thread] = {}
+        self._operation_event: Event = Event()
         self._roles: dict[str, dict[str, Any]] = {k: dict(v) for k, v in _DEFAULT_ROLE_CONFIG.items()}
         if "PYTEST_CURRENT_TEST" not in os.environ:
             try:
@@ -569,30 +588,13 @@ class SessionManager:
                                         session["state"] = "RUNNING"
                                         session["updated_at"] = _now()
                                     if loaded_state.phase in (Phase.BLOCKED, Phase.FAILED):
-                                        loaded_state.error = None
-                                        loaded_state.blocked_wo_ids.clear()
-                                        prev_phase = None
-                                        if loaded_state.transitions:
-                                            for t in reversed(loaded_state.transitions):
-                                                p_from = t.get("from")
-                                                try:
-                                                    candidate = Phase(p_from) if p_from else None
-                                                except ValueError:
-                                                    candidate = None
-                                                if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
-                                                    prev_phase = candidate
-                                                    break
-                                        target_phase = prev_phase or (
-                                            Phase.DISPATCHING if loaded_state.worker_wo_ids
-                                            else Phase.AUTHORING if loaded_state.plan_id
-                                            else Phase.PLANNING
-                                        )
-                                        _reset_phase_operation_id(loaded_state, target_phase)
-                                        self.supervisor._transition(loaded_state, target_phase)
+                                        self._prepare_run_for_resume(loaded_state, session, ws)
                                         try:
                                             self.supervisor.save_run_state(loaded_state, ws)
                                         except Exception:
                                             pass
+                                    else:
+                                        self._cleanup_orphaned_operations(loaded_state, session)
                                     stop_ev = Event()
                                     self._run_stop_events[r_id] = stop_ev
                                     drv_thread = Thread(
@@ -622,6 +624,13 @@ class SessionManager:
 
     def _default_runner(self, workspace: str, agent: str) -> Any:
         import copy
+        import importlib
+        import sys
+        if "validators.harness.runner" in sys.modules:
+            try:
+                importlib.reload(sys.modules["validators.harness.runner"])
+            except Exception:
+                pass
         from validators.harness.backend import get_default_registry
         from validators.harness.runner import AgentRunner
 
@@ -644,15 +653,17 @@ class SessionManager:
                 endpoint = getattr(backend, "endpoint", None) or os.getenv("OLLAMA_HOST", "http://localhost:11434")
                 if endpoint and not endpoint.startswith("http"):
                     endpoint = f"http://{endpoint}"
-                m = model_name or getattr(backend, "model", "qwen2.5-coder:7b") or "qwen2.5-coder:7b"
-                provider_adapter = OllamaAdapter(endpoint=endpoint, model=m)
+                m = model_name or getattr(backend, "model", "ornith-1.5-16k:latest") or "ornith-1.5-16k:latest"
+                t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
+                provider_adapter = OllamaAdapter(endpoint=endpoint, model=m, default_timeout=float(t_val) if t_val else None)
             elif backend_id in ("openai", "openai-compatible"):
                 from validators.kernel.providers.adapter import OpenAICompatibleAdapter
 
                 base_url = getattr(backend, "base_url", None) or "https://api.openai.com/v1"
                 api_key = getattr(backend, "api_key", None) or os.getenv("OPENAI_API_KEY", "")
                 m = model_name or getattr(backend, "model", "gpt-4o") or "gpt-4o"
-                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m)
+                t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
+                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
 
             return AgentRunner(Path(workspace), agent, backend=backend, provider_adapter=provider_adapter)
         return AgentRunner(Path(workspace), agent)
@@ -1135,7 +1146,10 @@ class SessionManager:
                         "(e.g. WO-001.yaml) conforming to schemas/work-order.schema.json.\n"
                         "3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
                         "conforming to schemas/contract.schema.json.\n"
-                        "4. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
+                        "4. QA/verification Work Orders (assigned to gemma) MUST declare an executable code deliverable under tests/ "
+                        "— the test suite the QA worker will author and execute end-to-end — and every code deliverable needs a "
+                        "planned companion test (e.g. tests/test_<stem>.py).\n"
+                        "5. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
                         "and modified_files listing all authored files."
                     )
                     turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
@@ -1148,6 +1162,7 @@ class SessionManager:
                         is_authoring=True,
                     )
 
+            self._operation_event.set()
             return [dict(w) for w in created_work_orders]
 
     def reject_plan(
@@ -1230,9 +1245,144 @@ class SessionManager:
             self._save()
             return active_run.to_dict()
 
+    def _prepare_run_for_resume(self, state: Any, session: dict[str, Any], ws: Path) -> Any:
+        """Reset failed/blocked run state, unblock work orders on disk, and invalidate stale operations."""
+        from .supervisor import Phase
+
+        state.error = None
+        state.blocked_wo_ids.clear()
+        state.failed_wo_ids.clear()
+        state.retry_counts.clear()
+        # Operator resume grants a fresh rework budget: the human decided to
+        # continue the run (often after a platform upgrade or manual repair),
+        # so stale exhaustion from previous sessions must not dead-end it.
+        state.integration_rework_rounds = 0
+
+        # Invalidate any existing non-completed operations in the session journal
+        # so the supervisor does not immediately re-block on stale historical failures.
+        completed_set = set(state.completed_wo_ids)
+        if not hasattr(state, "ignored_operation_ids"):
+            state.ignored_operation_ids = []
+        for op in session.get("journal", []):
+            op_wo = op.get("work_order_id")
+            op_id = op.get("operation_id")
+            op_status = str(op.get("status", "")).upper()
+            if op_id and (op_wo is None or op_wo not in completed_set):
+                if op_status == "COMPLETED":
+                    continue
+                if op_id not in state.ignored_operation_ids:
+                    state.ignored_operation_ids.append(op_id)
+                if op_status not in _OPERATION_TERMINAL:
+                    t = self._turn_threads.get(op_id)
+                    if t is None or not t.is_alive():
+                        op["status"] = "CANCELLED"
+                        op.setdefault("transitions", []).append({
+                            "status": "CANCELLED",
+                            "at": _now(),
+                            "reason": "invalidated_on_resume",
+                        })
+                        c_event = self._active.get(op_id)
+                        if c_event:
+                            c_event.set()
+
+        # Clear session active_operation if it was pointing to an invalidated or dead operation
+        active_op_id = session.get("active_operation")
+        if active_op_id:
+            if active_op_id in state.ignored_operation_ids:
+                session["active_operation"] = None
+            else:
+                t = self._turn_threads.get(active_op_id)
+                if t is None or not t.is_alive():
+                    session["active_operation"] = None
+
+        # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
+        self.supervisor.unblock_in_flight_work_orders(state)
+
+        prev_phase = None
+        if state.transitions:
+            for t in reversed(state.transitions):
+                p_from = t.get("from")
+                try:
+                    candidate = Phase(p_from) if p_from else None
+                except ValueError:
+                    candidate = None
+                if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
+                    prev_phase = candidate
+                    break
+        target_phase = prev_phase or (
+            Phase.DISPATCHING if state.worker_wo_ids
+            else Phase.AUTHORING if state.plan_id
+            else Phase.PLANNING
+        )
+        _reset_phase_operation_id(state, target_phase)
+        self.supervisor._transition(state, target_phase)
+        return target_phase
+
+    def _cleanup_orphaned_operations(self, state: Any, session: dict[str, Any]) -> None:
+        """Mark orphaned non-terminal operations as CANCELLED and clear phase operation IDs."""
+        completed_set = set(getattr(state, "completed_wo_ids", []))
+        if not hasattr(state, "ignored_operation_ids"):
+            state.ignored_operation_ids = []
+        for op in session.get("journal", []):
+            op_wo = op.get("work_order_id")
+            op_id = op.get("operation_id")
+            op_status = str(op.get("status", "")).upper()
+            if op_id and (op_wo is None or op_wo not in completed_set):
+                if op_status == "COMPLETED":
+                    continue
+                if op_status not in _OPERATION_TERMINAL:
+                    t = self._turn_threads.get(op_id)
+                    if t is None or not t.is_alive():
+                        op["status"] = "CANCELLED"
+                        op.setdefault("transitions", []).append({
+                            "status": "CANCELLED",
+                            "at": _now(),
+                            "reason": "cleaned_up_on_resume",
+                        })
+                        c_event = self._active.get(op_id)
+                        if c_event:
+                            c_event.set()
+                        if op_id not in state.ignored_operation_ids:
+                            state.ignored_operation_ids.append(op_id)
+
+        active_op_id = session.get("active_operation")
+        if active_op_id:
+            if active_op_id in state.ignored_operation_ids:
+                session["active_operation"] = None
+            else:
+                t = self._turn_threads.get(active_op_id)
+                if t is None or not t.is_alive():
+                    session["active_operation"] = None
+
+        # Only clear phase operation ID if it is dead or ignored, never if actively running
+        for attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id", "gitops_operation_id", "batch_operation_id"):
+            phase_op_id = getattr(state, attr, None)
+            if phase_op_id:
+                if phase_op_id in getattr(state, "ignored_operation_ids", []):
+                    setattr(state, attr, None)
+                else:
+                    t = self._turn_threads.get(phase_op_id)
+                    if t is None or not t.is_alive():
+                        setattr(state, attr, None)
+
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""
         with self._lock:
+            import importlib
+            import sys
+            if "validators.kernel.daemon.supervisor" in sys.modules:
+                try:
+                    reloaded_mod = importlib.reload(sys.modules["validators.kernel.daemon.supervisor"])
+                    if hasattr(self, "supervisor") and self.supervisor is not None:
+                        self.supervisor.__class__ = reloaded_mod.LifecycleSupervisor
+                except Exception:
+                    pass
+            if "validators.harness.runner" in sys.modules:
+                try:
+                    importlib.reload(sys.modules["validators.harness.runner"])
+                except Exception:
+                    pass
+
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
@@ -1266,29 +1416,17 @@ class SessionManager:
                 except Exception:
                     pass
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
-                state.error = None
-                state.blocked_wo_ids.clear()
-                prev_phase = None
-                if state.transitions:
-                    for t in reversed(state.transitions):
-                        p_from = t.get("from")
-                        try:
-                            candidate = Phase(p_from) if p_from else None
-                        except ValueError:
-                            candidate = None
-                        if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
-                            prev_phase = candidate
-                            break
-                target_phase = prev_phase or (
-                    Phase.DISPATCHING if state.worker_wo_ids
-                    else Phase.AUTHORING if state.plan_id
-                    else Phase.PLANNING
-                )
-                _reset_phase_operation_id(state, target_phase)
-                self.supervisor._transition(state, target_phase)
+                self._prepare_run_for_resume(state, session, ws)
+            else:
+                self._cleanup_orphaned_operations(state, session)
 
             self._active_runs[target_run_id] = state
-            if target_run_id not in self._run_stop_events or self._run_stop_events[target_run_id].is_set():
+            try:
+                self.supervisor.save_run_state(state, ws)
+            except Exception:
+                pass
+            existing_thread = self._run_driver_threads.get(target_run_id)
+            if existing_thread is None or not existing_thread.is_alive():
                 stop_event = Event()
                 self._run_stop_events[target_run_id] = stop_event
                 driver_thread = Thread(
@@ -1307,6 +1445,7 @@ class SessionManager:
                 phase=state.phase.value,
             )
             self._save()
+            self._operation_event.set()
             return state.to_dict()
 
     def synthesize_bootstrap_planning(
@@ -1392,6 +1531,18 @@ class SessionManager:
                 parent_record.setdefault("children", []).append(operation_id)
             else:
                 session["active_operation"] = operation_id
+
+            if work_order_id:
+                try:
+                    ws_dir = Path(session.get("workspace", "."))
+                    c_path = ws_dir / ".sync" / "contracts" / f"{work_order_id}.yaml"
+                    if c_path.exists():
+                        loaded_contract = yaml.safe_load(c_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded_contract, dict):
+                            session["contract"] = loaded_contract
+                            self.events.publish("contract.loaded", session_id, contract=loaded_contract)
+                except Exception:
+                    pass
 
             self._active[operation_id] = cancel
             session["journal"].append(record)
@@ -1589,6 +1740,7 @@ class SessionManager:
                 error=op_err,
             )
             self._save()
+            self._operation_event.set()
             return dict(record)
 
     def cancel_session(self, session_id: str) -> dict[str, Any]:
@@ -1641,15 +1793,28 @@ class SessionManager:
                 )
                 params["work_order_id"] = wo_rec["id"]
 
-                # S1 Wiring: register run with supervisor and launch background driver
-                created_run_id = f"run-{uuid4().hex[:8]}"
-                from .supervisor import Phase
-                run_state = self.supervisor.start_run(created_run_id, prompt, ws_path, session_id)
-                run_state.planning_wo_id = wo_rec["id"]
-                self._active_runs[created_run_id] = run_state
-                stop_event = Event()
-                self._run_stop_events[created_run_id] = stop_event
-                params["run_id"] = created_run_id
+                existing_run_id = params.get("run_id")
+                if not existing_run_id:
+                    # S1 Wiring: register run with supervisor and launch background driver
+                    created_run_id = f"run-{uuid4().hex[:8]}"
+                    from .supervisor import Phase
+                    # An operator-dispatched goal is the explicit bootstrap-mode
+                    # approval: deterministic child-WO synthesis stays available
+                    # for this run but is never triggered by an authoring failure.
+                    run_state = self.supervisor.start_run(
+                        created_run_id,
+                        prompt,
+                        ws_path,
+                        session_id,
+                        bootstrap_mode=bool(params.get("bootstrap_mode", True)),
+                    )
+                    run_state.planning_wo_id = wo_rec["id"]
+                    self._active_runs[created_run_id] = run_state
+                    stop_event = Event()
+                    self._run_stop_events[created_run_id] = stop_event
+                    params["run_id"] = created_run_id
+                else:
+                    params["run_id"] = existing_run_id
 
             cancel_event, operation_id = self.begin_operation(
                 session_id,
@@ -1711,11 +1876,14 @@ class SessionManager:
         self,
         run_id: str,
         stop_event: Event,
-        max_wait_seconds: float = 300.0,
+        max_wait_seconds: float | None = None,
     ) -> None:
         """Background driver loop continuously advancing the supervisor run until completion."""
         import time
         from .supervisor import AdvanceResult, Phase
+
+        if max_wait_seconds is None:
+            max_wait_seconds = float(os.environ.get("SUPERVISOR_OPERATION_TIMEOUT", 3600.0))
 
         state = self._active_runs.get(run_id)
         if not state:
@@ -1723,71 +1891,96 @@ class SessionManager:
         ws = Path(state.workspace)
         waiting_operation_started_at: float | None = None
 
-        while not stop_event.is_set() and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
-            prev_phase = state.phase
-            try:
-                result = self.supervisor.advance(state)
-            except Exception as exc:
-                state.error = f"Supervisor advance exception: {exc}"
-                self.supervisor._transition(state, Phase.FAILED)
-                result = AdvanceResult.FAILED
-
-            if state.phase != prev_phase:
-                waiting_operation_started_at = None
-                self.events.publish(
-                    "run.phase",
-                    state.session_id,
-                    run_id=run_id,
-                    phase=state.phase.value,
-                    goal=state.product_goal,
-                )
+        try:
+            while not stop_event.is_set() and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED):
+                prev_phase = state.phase
                 try:
-                    self.supervisor.save_run_state(state, ws)
-                except Exception:
-                    pass
+                    result = self.supervisor.advance(state)
+                except Exception as exc:
+                    state.error = f"Supervisor advance exception: {exc}"
+                    self.supervisor._transition(state, Phase.FAILED)
+                    result = AdvanceResult.FAILED
 
-            if result == AdvanceResult.WAITING_FOR_HUMAN:
-                waiting_operation_started_at = None
-                time.sleep(0.2)
-                continue
-            if result == AdvanceResult.WAITING_FOR_OPERATION:
-                now_mono = time.monotonic()
-                if waiting_operation_started_at is None:
-                    waiting_operation_started_at = now_mono
-                elif now_mono - waiting_operation_started_at > max_wait_seconds:
-                    state.error = (
-                        f"Timed out waiting for operations in phase {state.phase.value} "
-                        f"after {max_wait_seconds:.0f}s"
+                if state.phase != prev_phase:
+                    waiting_operation_started_at = None
+                    self.events.publish(
+                        "run.phase",
+                        state.session_id,
+                        run_id=run_id,
+                        phase=state.phase.value,
+                        goal=state.product_goal,
                     )
-                    self.supervisor._transition(state, Phase.BLOCKED)
-                    result = AdvanceResult.BLOCKED
+                    try:
+                        self.supervisor.save_run_state(state, ws)
+                    except Exception:
+                        pass
+
+                if result == AdvanceResult.WAITING_FOR_HUMAN:
+                    waiting_operation_started_at = None
+                    self._operation_event.wait(timeout=0.2)
+                    self._operation_event.clear()
+                    continue
+                if result == AdvanceResult.WAITING_FOR_OPERATION:
+                    has_alive_threads = False
+                    with self._lock:
+                        has_alive_threads = any(t.is_alive() for t in self._turn_threads.values())
+
+                    if has_alive_threads:
+                        # As long as worker threads are actively executing, supervisor stays alive
+                        # and never times out (vital for slow local quantized models).
+                        waiting_operation_started_at = None
+                        self._operation_event.wait(timeout=0.5)
+                        self._operation_event.clear()
+                        continue
+
+                    # If timeout is disabled (max_wait_seconds <= 0), wait indefinitely for event
+                    if max_wait_seconds <= 0:
+                        self._operation_event.wait(timeout=0.5)
+                        self._operation_event.clear()
+                        continue
+
+                    # No threads are alive; track whether an orphaned/stuck operation has timed out
+                    now_mono = time.monotonic()
+                    if waiting_operation_started_at is None:
+                        waiting_operation_started_at = now_mono
+                    elif now_mono - waiting_operation_started_at > max_wait_seconds:
+                        state.error = (
+                            f"Timed out waiting for operations in phase {state.phase.value} "
+                            f"after {max_wait_seconds:.0f}s"
+                        )
+                        self.supervisor._transition(state, Phase.BLOCKED)
+                        result = AdvanceResult.BLOCKED
+                        try:
+                            self.supervisor.save_run_state(state, ws)
+                        except Exception:
+                            pass
+                        self.events.publish(
+                            "run.blocked",
+                            state.session_id,
+                            run_id=run_id,
+                            phase=state.phase.value,
+                            error=state.error,
+                        )
+                        break
+
+                    self._operation_event.wait(timeout=0.2)
+                    self._operation_event.clear()
+                    continue
+                if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
                     try:
                         self.supervisor.save_run_state(state, ws)
                     except Exception:
                         pass
                     self.events.publish(
-                        "run.blocked",
+                        f"run.{state.phase.value.lower()}",
                         state.session_id,
                         run_id=run_id,
                         phase=state.phase.value,
                         error=state.error,
                     )
                     break
-                time.sleep(0.2)
-                continue
-            if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
-                try:
-                    self.supervisor.save_run_state(state, ws)
-                except Exception:
-                    pass
-                self.events.publish(
-                    f"run.{state.phase.value.lower()}",
-                    state.session_id,
-                    run_id=run_id,
-                    phase=state.phase.value,
-                    error=state.error,
-                )
-                break
+        finally:
+            stop_event.set()
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """Get the state dictionary for an active or persisted run."""
@@ -1880,18 +2073,36 @@ class SessionManager:
             res_meta = getattr(result, "meta", None) or {}
             res_reason = getattr(result, "reason", None)
             res_status = getattr(result, "status", "completed")
+            blocker_list = res_meta.get("blockers") or ([res_reason] if res_reason else [])
+            computed_err = res_reason or ("; ".join(str(b) for b in blocker_list) if blocker_list else None) or res_meta.get("summary") or res_status
             result_data = {
                 "status": res_status,
                 "persisted": getattr(result, "persisted", False),
                 "task_id": getattr(result, "task_id", None),
                 "reason": res_reason,
-                "error": res_reason or res_status,
+                "error": computed_err,
                 "report_path": str(result.report_path) if getattr(result, "report_path", None) else None,
                 "summary": res_meta.get("summary"),
-                "blockers": res_meta.get("blockers") or ([res_reason] if res_reason else []),
+                "blockers": blocker_list,
                 "backend_id": b_id if isinstance(b_id, str) else None,
                 "model": b_mod if isinstance(b_mod, str) else None,
             }
+            # Durable worker-blocker evidence packet (failure_code, observed files…)
+            failure_packet = res_meta.get("failure")
+            if isinstance(failure_packet, dict) and failure_packet.get("failure_code"):
+                result_data["failure"] = failure_packet
+                result_data["failure_code"] = failure_packet.get("failure_code")
+            # Execution telemetry for supervisor acceptance checks (QA evidence).
+            # Keys are attached only when the runner actually reported them so
+            # legacy/mock runners without telemetry keep legacy semantics.
+            if "commands_audit" in res_meta:
+                result_data["commands_audit"] = res_meta.get("commands_audit") or []
+            if "tool_calls_audit" in res_meta:
+                result_data["tool_calls_audit"] = res_meta.get("tool_calls_audit") or []
+            if "scope_evidence" in res_meta:
+                result_data["scope_evidence"] = res_meta.get("scope_evidence")
+            if res_meta.get("blocker_details"):
+                result_data["blocker_details"] = res_meta.get("blocker_details")
             if result.status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,
@@ -1951,6 +2162,27 @@ class SessionManager:
                             )
                     except Exception:
                         pass
+
+                # Selectively trigger incremental knowledge graph update if code files were modified
+                try:
+                    obs = res_meta.get("observed_changes", {})
+                    changed_files = list(
+                        set(obs.get("added", []))
+                        | set(obs.get("modified", []))
+                        | set(obs.get("deleted", []))
+                    )
+                    if not changed_files and res_meta.get("modified_files"):
+                        changed_files = list(res_meta.get("modified_files"))
+                    code_changes = [
+                        str(f).replace("\\", "/").strip().lstrip("/")
+                        for f in changed_files
+                        if not str(f).replace("\\", "/").strip().lstrip("/").startswith((".sync", ".git"))
+                    ]
+                    if code_changes:
+                        from validators.knowledge.compiler.incremental import incremental_update
+                        incremental_update(ws_path, agent=agent, changed_paths=tuple(code_changes))
+                except Exception:
+                    pass
 
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "success", operation_id=operation_id,

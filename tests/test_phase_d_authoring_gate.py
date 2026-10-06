@@ -730,3 +730,55 @@ def test_concurrent_turn_promotion_prevents_clobbering_under_runtime_lock(tmp_pa
 
 
 
+
+
+def test_bootstrap_synthesized_artifact_may_be_superseded_by_architect(tmp_path):
+    """Bootstrap-synthesized artifacts are scaffolding: an Architect may replace
+    them; workers still cannot, and architect-authored artifacts stay protected."""
+    gate = AuthoringGate()
+
+    bootstrap_wo = {
+        "id": "WO-001", "type": "FEATURE", "title": "Scaffold", "status": "ACTIVE",
+        "priority": "P1", "assigned_agents": ["codex"], "dependencies": [],
+        "deliverable": {"type": "code", "path": "src/app.py", "description": "app"},
+        "description": "Implement", "created": "2026-01-01", "updated": "2026-01-01",
+        "synthesized_by": "bootstrap",
+    }
+    existing = tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-001.yaml"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(yaml.safe_dump(bootstrap_wo, sort_keys=False), encoding="utf-8")
+
+    replacement = dict(bootstrap_wo)
+    replacement["title"] = "Authored properly by the Architect"
+    replacement.pop("synthesized_by")
+    replacement["description"] = "Real authoring pass"
+    decision = gate.validate_artifact_content(
+        ".sync/work-orders/ACTIVE/WO-001.yaml",
+        yaml.safe_dump(replacement, sort_keys=False),
+        agent="architecture",
+        project_root=tmp_path,
+    )
+    assert decision.passed, decision.errors
+
+    # A worker still cannot overwrite it
+    worker_decision = gate.validate_artifact_content(
+        ".sync/work-orders/ACTIVE/WO-001.yaml",
+        yaml.safe_dump(replacement, sort_keys=False),
+        agent="codex",
+        project_root=tmp_path,
+    )
+    assert not worker_decision.passed
+    assert any("not authorized" in e for e in worker_decision.errors)
+
+    # An architect-authored (non-synthesized) artifact remains protected —
+    # checked from a fresh gate (a new session/turn); same-session rewrites
+    # are intentionally allowed by the session-authored carve-out.
+    existing.write_text(yaml.safe_dump(replacement, sort_keys=False), encoding="utf-8")
+    second_pass = AuthoringGate().validate_artifact_content(
+        ".sync/work-orders/ACTIVE/WO-001.yaml",
+        yaml.safe_dump({**replacement, "title": "Different content again"}, sort_keys=False),
+        agent="architecture",
+        project_root=tmp_path,
+    )
+    assert not second_pass.passed
+    assert any("Overwrite conflict" in e for e in second_pass.errors)

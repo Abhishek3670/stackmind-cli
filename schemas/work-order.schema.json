@@ -132,7 +132,16 @@
       "type": "string"
     },
     "blocked_reason": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "reproduction_steps": {
       "type": "array",
@@ -188,6 +197,34 @@
     "plan_ref": {
       "type": "string"
     },
+    "synthesized_by": {
+      "type": "string",
+      "description": "Provenance marker for deterministic scaffolding (e.g. 'bootstrap'); an authorized author may supersede such artifacts."
+    },
+    "implementation_estimate": {
+      "type": "object",
+      "description": "Architect-authored estimate of the file footprint of this work order; the contract budget must cover it.",
+      "required": [
+        "expected_files",
+        "max_files_touched"
+      ],
+      "properties": {
+        "expected_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_files_touched": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rationale": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "created": {
       "oneOf": [
         {
@@ -222,10 +259,16 @@
       ]
     },
     "unblocked": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "unblocked_reason": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "description": {
       "type": "string"
