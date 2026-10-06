@@ -2127,7 +2127,7 @@ class SessionManager:
                             for offset, m in enumerate(parsed_plan.milestones):
                                 idx = start_idx + offset
                                 wo_id = f"WO-{idx:03d}"
-                                agent_id, role = determine_assigned_agent(m.title, m.tasks)
+                                agent_id, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                                 deliv = extract_deliverable_spec(m.title, m.tasks, role)
                                 proposed_wos.append({
                                     "id": wo_id,

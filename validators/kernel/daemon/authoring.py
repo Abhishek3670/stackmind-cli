@@ -129,11 +129,26 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
     }
 
 
-def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
+def determine_assigned_agent(
+    title: str, tasks: list[str], agent_hint: str | None = None
+) -> tuple[str, str]:
     """Determine (agent_id, role) from milestone title and tasks.
 
-    The Architect's explicit designation in PLAN.md takes top priority.
+    The Architect's explicit designation in PLAN.md takes top priority — either
+    the structured `agent_hint` (parsed from the "(Agent: <id>)" annotation by
+    the plan parser) or an inline designation in the title/tasks text.
     """
+    role_map = {
+        "codex": "backend",
+        "gemini": "frontend",
+        "gemma": "qa",
+        "local-llm": "gitops",
+        "claude": "architecture",
+    }
+    hint = str(agent_hint or "").strip().lower()
+    if hint in role_map:
+        return hint, role_map[hint]
+
     combined = (f"{title} " + " ".join(tasks)).lower()
     title_lower = title.lower()
 
@@ -149,13 +164,6 @@ def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
     )
     if agent_match:
         explicit_agent = agent_match.group(1).lower().strip()
-        role_map = {
-            "codex": "backend",
-            "gemini": "frontend",
-            "gemma": "qa",
-            "local-llm": "gitops",
-            "claude": "architecture",
-        }
         if explicit_agent in role_map:
             return explicit_agent, role_map[explicit_agent]
 
@@ -557,7 +565,7 @@ def synthesize_child_work_orders(
                 parsed = parse_plan(plan["content"])
                 for offset, m in enumerate(parsed.milestones):
                     idx = start_idx + offset
-                    agent, role = determine_assigned_agent(m.title, m.tasks)
+                    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
                     deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
@@ -578,7 +586,7 @@ def synthesize_child_work_orders(
             parsed = parse_plan(plan)
             for offset, m in enumerate(parsed.milestones):
                 idx = start_idx + offset
-                agent, role = determine_assigned_agent(m.title, m.tasks)
+                agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                 deliv = extract_deliverable_spec(m.title, m.tasks, role)
                 wo_id = f"WO-{idx:03d}"
                 deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
@@ -603,7 +611,7 @@ def synthesize_child_work_orders(
                 parsed = parse_plan(plan_file.read_text(encoding="utf-8"))
                 for offset, m in enumerate(parsed.milestones):
                     idx = start_idx + offset
-                    agent, role = determine_assigned_agent(m.title, m.tasks)
+                    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
                     deps = [f"WO-{idx-1:03d}"] if offset > 0 else []

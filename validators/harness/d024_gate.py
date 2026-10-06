@@ -158,6 +158,45 @@ class D024Gate:
 
         return None
 
+    def _declared_test_plan_companion(
+        self, project_path: Path, wo_data: dict[str, Any], deliverable_path: str
+    ) -> Path | None:
+        """Resolve the companion test via the work order's declared test_plan.
+
+        An explicit test_plan (per-file or consolidated) is the authoritative
+        coverage declaration shared with the authoring readiness gate; when the
+        deliverable is mapped, the mapped test files must exist and be
+        non-empty for the requirement to be satisfied.
+        """
+        raw = wo_data.get("test_plan")
+        if not isinstance(raw, list):
+            return None
+
+        def _norm(value: Any) -> str:
+            return str(value or "").replace("\\", "/").strip().lstrip("/").lstrip("./")
+
+        norm_deliv = _norm(deliverable_path)
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            sources = entry.get("sources")
+            if sources is None:
+                sources = [entry["source"]] if entry.get("source") else []
+            if isinstance(sources, str):
+                sources = [sources]
+            norm_sources = {_norm(s) for s in sources if _norm(s)}
+            if norm_deliv not in norm_sources:
+                continue
+            tests = entry.get("tests")
+            if isinstance(tests, str):
+                tests = [tests]
+            for test_rel in tests or []:
+                candidate = project_path / _norm(test_rel)
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return candidate
+            return None  # declared mapping exists but its tests are missing/empty
+        return None
+
     def resolve_target_work_orders(
         self, project_path: Path, work_order_id: str, wo_data: dict[str, Any]
     ) -> tuple[str, ...]:
@@ -413,7 +452,11 @@ class D024Gate:
                             or deliv_path_str.endswith((".py", ".ts", ".js", ".go", ".rs", ".dart"))
                         )
                         if is_code:
-                            test_file = self.find_companion_test_file(project_path, deliv_path_str)
+                            test_file = self._declared_test_plan_companion(
+                                project_path, target_data, deliv_path_str
+                            )
+                            if test_file is None:
+                                test_file = self.find_companion_test_file(project_path, deliv_path_str)
                             if not test_file or not test_file.exists():
                                 deliverable_issues.append(f"no test file found for deliverable {deliv_path_str}")
                             elif test_file.is_file() and test_file.stat().st_size == 0:

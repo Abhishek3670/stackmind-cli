@@ -609,6 +609,117 @@ class TestRecoveryDecisions:
         ]
         assert len(reops) == 1
 
+    def test_verification_block_retries_with_declared_observed_feedback(
+        self, tmp_path: Path,
+    ) -> None:
+        """A verification-gate block (declared vs observed mismatch) retries
+        with the scope evidence in the prompt instead of a blind same-prompt
+        retry, and synthesizes the OUTCOME_NOT_VERIFIED evidence packet."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": (
+                "verification gate failed: outcome_verified, scope_verified "
+                "(declared ['index.html']; observed ['index/html/index.html'])"
+            ),
+            "scope_evidence": {
+                "declared": ["index.html"],
+                "observed": ["index/html/index.html"],
+                "mismatch_reason": "declared but not written: ['index.html']",
+            },
+        })
+
+        res = supervisor.advance(state)
+
+        assert res == AdvanceResult.WAITING_FOR_OPERATION  # retry dispatched
+        assert state.retry_counts["WO-001"] == 1
+        assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
+        retry_ops = [
+            o for o in mock_mgr.list_operations()
+            if o.get("work_order_id") == "WO-001" and o.get("operation_id") != op["operation_id"]
+        ]
+        assert retry_ops, "retry turn was not dispatched"
+        prompt = str(retry_ops[-1].get("prompt", ""))
+        assert "You declared these files" in prompt
+        assert "'index.html'" in prompt
+        assert "index/html/index.html" in prompt
+        assert "EXACTLY that path" in prompt
+
+    def test_verification_block_escalates_to_recovery_on_exhaustion(
+        self, tmp_path: Path,
+    ) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        state.retry_counts["WO-001"] = state.max_retries
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": (
+                "verification gate failed: outcome_verified "
+                "(declared deliverable 'index.html' was not added or modified)"
+            ),
+            "scope_evidence": {"declared": ["index.html"], "observed": []},
+        })
+
+        supervisor.advance(state)
+
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        assert state.recovery_attempts["WO-001"] == 1
+        assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
+
+    def test_amend_contract_places_repair_authorization_contract(
+        self, tmp_path: Path,
+    ) -> None:
+        """amend_contract archives the original contract but must leave a
+        transitional repair-authorization contract in its place: the repair
+        turn's pre-execution gate matches the task WO against it, and it grants
+        write authorization for the amended contract itself."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        state.retry_counts["WO-001"] = state.max_retries
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": (
+                "verification gate failed: outcome_verified "
+                "(declared deliverable 'src/app.py' was not added or modified)"
+            ),
+            "scope_evidence": {"declared": ["src/app.py"], "observed": []},
+        })
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        decision_path = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_path.write_text(json.dumps({
+            "work_order": "WO-001",
+            "action": "amend_contract",
+            "reason": "authorize root-level deliverable writes",
+            "failure_code": "OUTCOME_NOT_VERIFIED",
+            "transient": False,
+            "contract_revision": 2,
+        }), encoding="utf-8")
+        rec_op = next(
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        )
+        mock_mgr.complete_operation(rec_op["operation_id"], "COMPLETED")
+
+        supervisor.advance(state)
+
+        assert state.phase == Phase.ARCHITECT_REPAIR
+        assert state.repair_context.get("action") == "amend_contract"
+        contract = yaml.safe_load(
+            (tmp_path / ".sync" / "contracts" / "WO-001.yaml").read_text(encoding="utf-8")
+        )
+        # Pre-execution identity restored: contract work order matches the task.
+        assert contract["work_order"] == "WO-001"
+        assert contract["synthesized_by"] == "recovery-repair"
+        modules = {r["module"] for r in contract["scope"]["allow"]}
+        assert ".sync/contracts/WO-001.yaml" in modules  # self-write authorization
+        assert ".sync/decisions/**" in modules
+        # The original authored scope is preserved into the transitional contract.
+        assert "src/app.py" in modules
+
     def test_split_decision_supersedes_original_and_readies_children(
         self, tmp_path: Path,
     ) -> None:
@@ -638,6 +749,19 @@ class TestRecoveryDecisions:
         assert state.phase == Phase.ARCHITECT_REPAIR
         assert res == AdvanceResult.WAITING_FOR_OPERATION
         assert "WO-001" in state.superseded_wo_ids
+
+        # The supervisor placed a transitional repair-authorization contract so
+        # the repair turn passes pre-execution validation (task WO matches
+        # contract WO) and is authorized to author the replacement contracts.
+        transition_contract = yaml.safe_load(
+            (tmp_path / ".sync" / "contracts" / "WO-001.yaml").read_text(encoding="utf-8")
+        )
+        assert transition_contract["work_order"] == "WO-001"
+        assert transition_contract["synthesized_by"] == "recovery-repair"
+        modules = {r["module"] for r in transition_contract["scope"]["allow"]}
+        assert ".sync/work-orders/**" in modules
+        assert ".sync/contracts/**" in modules
+        assert ".sync/decisions/**" in modules
 
         # The Architect authors the dependency-safe children during repair
         write_wo(tmp_path, make_wo("WO-002", deliv_path="src/part_one.py", title="Scaffold part 1"))
@@ -1266,7 +1390,7 @@ class TestLazyTurnNudge:
         assert "invoked NO tools" in prompt
         assert "src/backend.py" in prompt and "write_file" in prompt
 
-    def test_lazy_turn_exhaustion_blocks_with_evidence(self, tmp_path: Path) -> None:
+    def test_lazy_turn_exhaustion_escalates_to_recovery_with_evidence(self, tmp_path: Path) -> None:
         mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-001")
         state.max_retries = 1
         op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
@@ -1276,9 +1400,10 @@ class TestLazyTurnNudge:
 
         nudges = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
         mock_mgr.complete_operation(nudges[-1]["operation_id"], "BLOCKED", result=self._blocked_result(["src/backend.py"]))
-        supervisor.advance(state)  # retries exhausted -> terminal block
-        assert state.phase == Phase.BLOCKED
-        assert "scope_verified" in (state.error or "")
+        supervisor.advance(state)  # retries exhausted -> Architect recovery decision
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
+        assert "scope_verified" in state.worker_blockers["WO-001"]["canonical_message"]
 
     def test_non_lazy_scope_block_still_terminal(self, tmp_path: Path) -> None:
         """Observed non-empty (real writes, wrong scope) keeps the terminal

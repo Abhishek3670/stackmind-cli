@@ -715,6 +715,27 @@ class LifecycleSupervisor:
             "6. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
             "and modified_files listing all authored files."
         )
+        # Canonical authoring policy digest + approved milestone table: the
+        # architect authors against the same policy the readiness gate
+        # enforces, and knows the stable milestone ids to reference.
+        try:
+            from validators.harness.authoring_policy import authoring_prompt_digest
+            from validators.harness.authoring_readiness import load_plan_milestones
+
+            authoring_prompt += "\n\n" + authoring_prompt_digest()
+            plan_milestones = load_plan_milestones(Path(state.workspace))
+            if plan_milestones:
+                milestone_table = "\n".join(
+                    f"  - {ref['id']}: '{ref['title']}'"
+                    + (f" (agent: {ref['agent']})" if ref.get("agent") else "")
+                    for ref in plan_milestones
+                )
+                authoring_prompt += (
+                    "\n\nApproved plan milestones (set `milestone_id` on each work "
+                    f"order to the matching id):\n{milestone_table}"
+                )
+        except Exception:
+            pass
         plan = {}
         if state.plan_id:
             try:
@@ -857,6 +878,11 @@ class LifecycleSupervisor:
                 if action == "split_work_order":
                     # The blocked WO is superseded by its children; they join the
                     # normal execution loop instead of re-dispatching the original.
+                    # The transitional repair-authorization contract is retired
+                    # with the superseded work order (archived for audit).
+                    self._archive_recovery_artifact(
+                        ws, state.run_id, f".sync/contracts/{wo_id}.yaml"
+                    )
                     state.repair_context = {}
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
                     self._transition(state, Phase.EXECUTING)
@@ -1228,6 +1254,22 @@ class LifecycleSupervisor:
             or raw_error or raw_reason or "governance gate blocked"
         )
 
+        # Verification-dimension failures (outcome_verified / scope_verified)
+        # block without a contract-gate evidence packet.  Synthesize one so the
+        # classification below treats them as bounded transient failures and
+        # escalates to the Architect recovery decision on budget exhaustion
+        # instead of hard-blocking the whole run.
+        if evidence is None and "verification gate failed" in err_msg.lower():
+            evidence = {
+                "failure_code": "OUTCOME_NOT_VERIFIED",
+                "work_order_id": wo_id,
+                "operation_id": op.get("operation_id"),
+                "canonical_message": err_msg,
+                "scope_evidence": result.get("scope_evidence") or {},
+            }
+            result["failure"] = evidence
+            state.worker_blockers[wo_id] = dict(evidence)
+
         # Route verified governance failures to an Architect recovery
         # decision — never to an automatic same-contract worker retry.
         # Transient failures keep the bounded auto-retry path until the
@@ -1353,10 +1395,31 @@ class LifecycleSupervisor:
                 agent = self._agent_for_wo(wo_id, ws)
                 deliv_path = self._get_wo_deliverable_path(wo_id, ws)
                 target_str = f" '{deliv_path}'" if deliv_path else ""
+                # Targeted feedback: the scope evidence tells the model exactly
+                # which declarations were not written — a blind "author the
+                # deliverable" retry converges poorly with small local models.
+                evidence_lines = ""
+                if isinstance(scope_evidence, dict):
+                    declared_list = sorted(scope_evidence.get("declared") or [])
+                    observed_list = sorted(scope_evidence.get("observed") or [])
+                    mismatch_reason = scope_evidence.get("mismatch_reason")
+                    evidence_lines = (
+                        f" You declared these files: {declared_list}. "
+                        f"You actually wrote: {observed_list}."
+                    )
+                    if mismatch_reason:
+                        evidence_lines += f" Mismatch: {mismatch_reason}."
                 try:
                     self.manager.start_turn(
                         state.session_id,
-                        f"Retry work order {wo_id}: previous attempt halted ({err_msg}). You MUST invoke write_file to author the deliverable code{target_str} (attempt {retries + 2})",
+                        (
+                            f"Retry work order {wo_id}: previous attempt halted ({err_msg})."
+                            f"{evidence_lines} "
+                            f"You MUST invoke write_file to author the deliverable{target_str} "
+                            "at EXACTLY that path — no renamed or extra-nested folders — and "
+                            "declare in modified_files ONLY files you actually wrote with "
+                            f"write_file this turn (attempt {retries + 2})"
+                        ),
                         role=self._role_for_agent(agent),
                         agent_id=agent,
                         work_order_id=wo_id,
@@ -2209,17 +2272,44 @@ class LifecycleSupervisor:
             return None
 
     def _run_readiness_gate(self, state: RunState, ws: Path) -> Any:
-        """Run the authoring readiness gate with plan-derived milestone expectations."""
+        """Compile the authored set, then run the readiness gate on the canonical result.
+
+        The deterministic compiler runs first: it injects system-owned
+        invariants (QA verdict channel, milestone identity) and routes
+        non-normalizable intent straight to repair.  The readiness gate then
+        validates the canonical set and remains authoritative.
+        """
+        from validators.harness.authoring_compiler import compile_authoring_artifacts
         from validators.harness.authoring_readiness import (
-            load_expected_milestones,
+            AuthoringReadinessResult,
+            load_plan_milestones,
             milestone_matches,
             validate_authoring_readiness,
         )
-        expected = load_expected_milestones(ws)
+        plan_milestones = load_plan_milestones(ws)
+
+        # Deterministic preflight/normalization pass (SYSTEM-NORMALIZABLE
+        # fixes are applied in place; ARCHITECT-DECISION-REQUIRED findings
+        # short-circuit into a targeted repair turn).
+        compile_result = compile_authoring_artifacts(ws, plan_milestones)
+        if compile_result.decision_required:
+            result = AuthoringReadinessResult(
+                ready=False,
+                plan_id=state.plan_id or "",
+                issues=tuple(compile_result.decision_required),
+            )
+            self._persist_readiness_report(state, ws, result)
+            return result
+
+        expected = plan_milestones
         if expected and state.milestone_exemptions:
             expected = [
-                m for m in expected
-                if not any(milestone_matches(m, exempt) for exempt in state.milestone_exemptions)
+                ref for ref in expected
+                if not any(
+                    milestone_matches(exempt, ref["title"])
+                    or (ref["id"] and ref["id"].lower() == str(exempt).strip().lower())
+                    for exempt in state.milestone_exemptions
+                )
             ]
         result = validate_authoring_readiness(
             ws,
@@ -2392,7 +2482,8 @@ class LifecycleSupervisor:
             + (
                 "- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
                 "conforming to schemas/contract.schema.json. The budget must be explicitly sized "
-                "from the task's real file footprint. The original contract has been archived.\n"
+                "from the task's real file footprint. A transitional repair contract is already in "
+                "place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )
             + (
@@ -2415,13 +2506,35 @@ class LifecycleSupervisor:
         )
 
     def _authoring_repair_prompt(self, state: RunState) -> str:
-        """Bounded authoring-repair prompt from the persisted readiness diagnostics."""
+        """Bounded authoring-repair prompt from the persisted readiness diagnostics.
+
+        Every diagnostic carries its required_action, and the affected-artifact
+        list is derived from ALL issue attachments — relational findings
+        (milestone coverage, QA channel, test planning) name their artifacts
+        here, so the prompt never claims "affected: none" while demanding fixes.
+        """
+        issues = [i for i in state.readiness_issues[:8] if isinstance(i, dict)]
         issue_lines = "\n".join(
             f"- [{i.get('code')}] {i.get('message')}"
-            for i in state.readiness_issues[:8] if isinstance(i, dict)
+            + (f"\n    required_action: {i.get('required_action')}" if i.get("required_action") else "")
+            for i in issues
         )
-        affected = list(state.repair_context.get("affected_artifacts") or [])
-        affected_lines = "\n".join(f"- {p}" for p in affected) if affected else "- (none)"
+        affected: list[str] = []
+        for i in state.readiness_issues:
+            if not isinstance(i, dict):
+                continue
+            paths = list(i.get("affected_artifacts") or [])
+            if i.get("artifact_path"):
+                paths.append(i["artifact_path"])
+            for p in paths:
+                if p and p not in affected:
+                    affected.append(str(p))
+        if affected:
+            affected_intro = "Artifacts named by the diagnostics (correct these; do not touch others):"
+            affected_lines = "\n".join(f"- {p}" for p in sorted(affected))
+        else:
+            affected_intro = "No individual artifact is named; re-author per the diagnostics above:"
+            affected_lines = "- (the failure is artifact-set-wide, e.g. the plan or the full authored set)"
         return (
             f"ARCHITECT AUTHORING REPAIR (revision {state.authoring_revision}, "
             f"attempt {state.authoring_repair_attempts}/{state.max_authoring_repairs}).\n\n"
@@ -2429,8 +2542,8 @@ class LifecycleSupervisor:
             f"rejected fail-closed and was NOT dispatched to any worker.\n"
             f"Failure: {state.error}\n\n"
             f"Readiness diagnostics (bounded):\n{issue_lines or '- (operation-level failure; no artifact diagnostics)'}\n\n"
-            f"Affected artifacts archived for audit (re-author them fresh):\n{affected_lines}\n\n"
-            "Correct ONLY the affected governed artifacts:\n"
+            f"{affected_intro}\n{affected_lines}\n\n"
+            "Correct each diagnostic by following its required_action:\n"
             "1. Re-write each affected Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
             "conforming to schemas/work-order.schema.json.\n"
             "2. Re-write each affected or missing Contract YAML to .sync/contracts/<WO-ID>.yaml "
@@ -2438,11 +2551,10 @@ class LifecycleSupervisor:
             "3. Explicitly size every contract budget: declare implementation_estimate "
             "(expected_files, max_files_touched) in the work order and set the contract "
             "max_files_touched to cover it.\n"
-            "4. QA/verification Work Orders must declare an executable code deliverable under tests/ "
-            "(the suite their worker will author and execute), and every code deliverable needs a "
-            "planned companion test (e.g. tests/test_<stem>.py).\n"
-            "5. Do not modify unrelated work orders, contracts, or application code.\n"
-            "6. Return the final HarnessDecision JSON with status 'completed' and modified_files "
+            "4. Every code deliverable must declare a `test_plan` mapping it to test "
+            "artifact(s) (e.g. tests/test_<stem>.py, or a consolidated suite listing "
+            "the sources it covers).\n"
+            "5. Return the final HarnessDecision JSON with status 'completed' and modified_files "
             "listing the files you wrote."
         )
 
@@ -2697,6 +2809,15 @@ class LifecycleSupervisor:
                     f"amend_contract requires a new contract revision "
                     f"(current {current_revision}, requested {new_revision!r})"
                 )
+            original_contract: dict[str, Any] = {}
+            contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+            if contract_file.is_file():
+                try:
+                    loaded = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        original_contract = loaded
+                except Exception:
+                    pass
             self._archive_recovery_artifact(
                 ws, state.run_id, f".sync/contracts/{wo_id}.yaml"
             )
@@ -2706,6 +2827,7 @@ class LifecycleSupervisor:
                 "action": action,
                 "work_order": wo_id,
                 "decision": decision,
+                "original_contract": original_contract,
             }
             return self._enter_recovery_repair(state, ws, record)
 
@@ -2717,6 +2839,15 @@ class LifecycleSupervisor:
                     "rejected_reason": "split_work_order requires replacement_work_orders",
                 })
                 return None, "split_work_order requires a non-empty replacement_work_orders list"
+            original_contract: dict[str, Any] = {}
+            contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+            if contract_file.is_file():
+                try:
+                    loaded = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        original_contract = loaded
+                except Exception:
+                    pass
             self._archive_recovery_artifact(ws, state.run_id, f".sync/work-orders/ACTIVE/{wo_id}.yaml")
             self._archive_recovery_artifact(ws, state.run_id, f".sync/contracts/{wo_id}.yaml")
             if wo_id not in state.superseded_wo_ids:
@@ -2729,6 +2860,7 @@ class LifecycleSupervisor:
                 "work_order": wo_id,
                 "decision": decision,
                 "replacement_work_orders": children,
+                "original_contract": original_contract,
             }
             return self._enter_recovery_repair(state, ws, record)
 
@@ -2739,13 +2871,23 @@ class LifecycleSupervisor:
                     **record, "applied": False,
                     "rejected_reason": "create_dependency_work_order requires replacement_work_orders",
                 })
-                return None, "create_dependency_work_order requires new prerequisite work order IDs"
+                return None, "create_dependency_work_order requires a non-empty replacement_work_orders list"
+            original_contract: dict[str, Any] = {}
+            contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+            if contract_file.is_file():
+                try:
+                    loaded = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        original_contract = loaded
+                except Exception:
+                    pass
             state.repair_context = {
                 "source": "recovery",
                 "action": action,
                 "work_order": wo_id,
                 "decision": decision,
                 "replacement_work_orders": new_wos,
+                "original_contract": original_contract,
             }
             return self._enter_recovery_repair(state, ws, record)
 
@@ -2779,6 +2921,16 @@ class LifecycleSupervisor:
             )
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED, None
+        # Deterministic bookkeeping: place/extend the transitional
+        # repair-authorization contract so the repair turn passes pre-execution
+        # validation (task WO matches contract WO) and is authorized to write
+        # the governance artifacts the approved action must re-author.
+        self._write_recovery_repair_authorization(
+            ws,
+            str(state.repair_context.get("work_order") or ""),
+            str(state.repair_context.get("action") or ""),
+            state.repair_context.get("original_contract") or {},
+        )
         state.recovery_decisions.append({**record, "applied": True, "stage": "repair_dispatched"})
         state.error = (
             f"Recovery action '{state.repair_context.get('action')}' for "
@@ -2793,6 +2945,89 @@ class LifecycleSupervisor:
             return AdvanceResult.BLOCKED, None
         state.architect_repair_operation_id = op.get("operation_id")
         return AdvanceResult.WAITING_FOR_OPERATION, None
+
+    def _write_recovery_repair_authorization(
+        self, ws: Path, wo_id: str, action: str, original_contract: dict[str, Any],
+    ) -> None:
+        """Place or extend the transitional repair-authorization contract.
+
+        Deterministic supervisor bookkeeping for recovery repair turns: the
+        pre-execution gate matches the task's work order against this contract,
+        and the repair turn needs write authorization for the governance
+        artifacts the approved action must re-author.  Without it the repair
+        turn fail-closed at pre-execution validation ("task work order X does
+        not match contract work order Y") and the recovery budget exhausted on
+        a deterministically impossible turn.
+        """
+        if not wo_id:
+            return
+        from validators.harness.authoring_gate import AuthoringGate
+
+        contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+        original_scope = original_contract.get("scope") if isinstance(original_contract, dict) else None
+        allow = list((original_scope or {}).get("allow") or [])
+        deny = list((original_scope or {}).get("deny") or [{"module": ".git/**"}])
+        budget = original_contract.get("budget") if isinstance(original_contract, dict) else None
+
+        def _ensure(module: str) -> None:
+            if module not in {r.get("module") for r in allow if isinstance(r, dict)}:
+                allow.append({"module": module})
+
+        _ensure(f".sync/contracts/{wo_id}.yaml")
+        _ensure(".sync/decisions/**")
+        if action in ("split_work_order", "create_dependency_work_order"):
+            _ensure(".sync/work-orders/**")
+            _ensure(".sync/contracts/**")
+
+        if action == "create_dependency_work_order" and contract_file.is_file():
+            # The original contract stays authoritative for the surviving work
+            # order; only extend it with the channels the prerequisite-
+            # authoring turn requires.
+            try:
+                data = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    scope = data.setdefault("scope", {})
+                    allow_list = scope.setdefault("allow", [])
+                    existing = {r.get("module") for r in allow_list if isinstance(r, dict)}
+                    for module in (".sync/work-orders/**", ".sync/contracts/**", ".sync/decisions/**"):
+                        if module not in existing:
+                            allow_list.append({"module": module})
+                    data["normalized_by"] = "recovery-repair"
+                    contract_file.write_text(
+                        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+                    )
+                    return
+            except Exception:
+                pass
+
+        record: dict[str, Any] = {
+            "schema_version": 1,
+            "agent_id": "claude",
+            "work_order": wo_id,
+            "identity": {"role": "architecture", "reports_to": "ceo"},
+            "scope": {
+                "allow": allow,
+                "deny": deny,
+                "write": "read-write",
+            },
+            "budget": (
+                budget
+                if isinstance(budget, dict) and budget.get("max_files_touched")
+                else {"max_files_touched": 10, "max_tokens": 50000}
+            ),
+            "synthesized_by": "recovery-repair",
+        }
+        gate = AuthoringGate(project_root=ws)
+        contract_yaml = yaml.safe_dump(record, sort_keys=False)
+        gate_decision = gate.validate_artifact_content(
+            f".sync/contracts/{wo_id}.yaml", contract_yaml, agent="ceo"
+        )
+        if not gate_decision.passed:
+            raise ValueError(
+                f"Recovery repair contract failed authoring gate: {gate_decision.summary}"
+            )
+        contract_file.parent.mkdir(parents=True, exist_ok=True)
+        contract_file.write_text(contract_yaml, encoding="utf-8")
 
     def _archive_recovery_artifact(self, ws: Path, run_id: str, rel_path: str) -> None:
         """Preserve a superseded/amended governed artifact under the audit path."""

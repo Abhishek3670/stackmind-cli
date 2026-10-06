@@ -13,6 +13,10 @@ class PlanValidationError(ValueError):
     pass
 
 
+# Trailing "(Agent: <id>)" annotation on a milestone title — metadata, not title text.
+_MILESTONE_AGENT_ANNOTATION_RE = re.compile(r"\(\s*(?:Agent|agent)\s*:\s*([^)]+)\)\s*$")
+
+
 PLAN_GENERATION_INSTRUCTIONS = (
     "When generating or updating PLAN.md, you MUST strictly structure it as follows:\n\n"
     "# Project Plan: <project-name>\n\n"
@@ -160,6 +164,7 @@ class PlanMilestone:
     title: str
     status: str  # "COMPLETED" or "PENDING"
     tasks: list[str] = field(default_factory=list)
+    agent: str | None = None  # semantic agent metadata parsed from "(Agent: <id>)"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -167,6 +172,7 @@ class PlanMilestone:
             "title": self.title,
             "status": self.status,
             "tasks": list(self.tasks),
+            "agent": self.agent,
         }
 
 
@@ -286,11 +292,21 @@ def parse_plan(content: str) -> PlanStructure:
                         m_id = f"M{len(milestones) + 1}"
                         m_title = m_id_or_title
 
+                    # Separate agent metadata from the semantic title: the plan
+                    # format appends "(Agent: <id>)" to milestone titles, but that
+                    # annotation is metadata, not title text.
+                    m_agent: str | None = None
+                    agent_match = _MILESTONE_AGENT_ANNOTATION_RE.search(m_title)
+                    if agent_match:
+                        m_agent = agent_match.group(1).strip().lower()
+                        m_title = m_title[: agent_match.start()].rstrip().rstrip("-–—,").rstrip()
+
                     current_milestone = PlanMilestone(
                         id=m_id,
                         title=m_title,
                         status="COMPLETED" if checked else "PENDING",
                         tasks=[],
+                        agent=m_agent,
                     )
                     milestones.append(current_milestone)
             elif current_milestone and re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str):

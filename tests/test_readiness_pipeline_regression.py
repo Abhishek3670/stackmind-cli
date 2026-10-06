@@ -1,0 +1,331 @@
+"""End-to-end regression tests for the hardened authoring → readiness pipeline.
+
+Reproduces the clean_tui_test production failure (2026-10-06): an architect
+authored schema-valid work orders whose titles omitted the plan's
+"(Agent: gemini)" annotations, a QA contract without the verdict channel, and
+no per-deliverable test plan — the readiness gate rejected the set and two
+repair rounds failed on "(affected: none)" guidance.
+
+After the hardening: the deterministic compiler injects the system-owned
+invariants, the readiness gate validates the canonical set with actionable
+structured diagnostics, and the repair prompt names the real affected
+artifacts.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from tests.test_authoring_compiler import make_contract, make_wo, write_contract, write_wo
+from tests.test_lifecycle_supervisor import MockSessionManager
+from validators.harness.authoring_compiler import compile_authoring_artifacts
+from validators.harness.authoring_readiness import (
+    load_expected_milestones,
+    load_plan_milestones,
+    milestone_matches,
+    validate_authoring_readiness,
+)
+from validators.harness.d024_gate import D024Gate
+from validators.harness.plan import parse_plan
+from validators.kernel.daemon.supervisor import LifecycleSupervisor
+
+
+PLAN_MD = (
+    "# Project Plan: Static Welcome Page with Animated Wave\n\n"
+    "## Current Architecture\n"
+    "Standalone HTML/CSS/JS, zero dependencies.\n\n"
+    "## Milestones & Roadmap\n"
+    "- [ ] Milestone 1: Frontend Scaffolding (Agent: gemini)\n"
+    "  - [ ] Task 1.1: Create public/index.html\n"
+    "  - [ ] Task 1.2: Create public/style.css\n"
+    "- [ ] Milestone 2: Wave Background Implementation (Agent: gemini)\n"
+    "  - [ ] Task 2.1: Implement the wave SVG and CSS keyframes\n"
+    "- [ ] Milestone 3: Animated Welcome Text (Agent: gemini)\n"
+    "  - [ ] Task 3.1: Write public/script.js\n"
+    "- [ ] Milestone 4: QA & Visual Verification (Agent: gemma)\n"
+    "  - [ ] Task 4.1: Author and execute tests/test_visuals.py\n"
+    "- [ ] Milestone 5: Finalization & GitOps (Agent: local-llm)\n"
+    "  - [ ] Task 5.1: Update CHANGELOG.md\n"
+)
+
+
+def build_clean_tui_test_artifacts(ws: Path) -> None:
+    """Replicate the exact authored artifact set from the failed run."""
+    ws.joinpath("PLAN.md").write_text(PLAN_MD, encoding="utf-8")
+    write_wo(ws, make_wo("WO-001", "gemini", "public/index.html", "config",
+                         title="Frontend Scaffolding"))
+    write_wo(ws, make_wo("WO-002", "gemini", "public/style.css",
+                         title="Wave Background Implementation"))
+    write_wo(ws, make_wo("WO-003", "gemini", "public/script.js",
+                         title="Animated Welcome Text"))
+    write_wo(ws, make_wo("WO-004", "gemma", "tests/test_visuals.py",
+                         title="QA & Visual Verification"))
+    write_wo(ws, make_wo("WO-005", "local-llm", "CHANGELOG.md", "doc",
+                         title="Finalization & GitOps"))
+    write_contract(ws, make_contract("WO-001", "gemini", [{"module": "public/**"}]))
+    write_contract(ws, make_contract("WO-002", "gemini", [{"module": "public/**"}]))
+    write_contract(ws, make_contract("WO-003", "gemini", [{"module": "public/**"}]))
+    write_contract(ws, make_contract("WO-004", "gemma", [{"module": "public/**"}, {"module": "tests/**"}]))
+    write_contract(ws, make_contract("WO-005", "local-llm", [{"module": "CHANGELOG.md"}]))
+
+
+# ─── Milestone identity parsing/matching ──────────────────────────────
+
+class TestMilestoneIdentity:
+    def test_agent_annotation_is_metadata_not_title(self) -> None:
+        parsed = parse_plan(PLAN_MD)
+        first = parsed.milestones[0]
+        assert first.id == "Milestone 1"
+        assert first.title == "Frontend Scaffolding"  # annotation separated
+        assert first.agent == "gemini"
+        assert parsed.milestones[3].agent == "gemma"
+        assert parsed.milestones[4].agent == "local-llm"
+
+    def test_annotation_no_longer_breaks_title_matching(self) -> None:
+        # Regression: the legacy matcher scored this pair 2/4 = 0.5 < 0.6 and
+        # raised MILESTONE_UNCOVERED for the flagship milestone of the run.
+        assert milestone_matches("Frontend Scaffolding (Agent: gemini)", "Frontend Scaffolding")
+
+    def test_load_plan_milestones_returns_structured_refs(self, tmp_path: Path) -> None:
+        tmp_path.joinpath("PLAN.md").write_text(PLAN_MD, encoding="utf-8")
+        refs = load_plan_milestones(tmp_path)
+        assert refs[0] == {"id": "Milestone 1", "title": "Frontend Scaffolding", "agent": "gemini"}
+        # Backward-compatible titles helper still works
+        assert load_expected_milestones(tmp_path)[0] == "Frontend Scaffolding"
+
+    def test_agent_assignment_uses_parsed_metadata_not_title_text(self) -> None:
+        # Regression guard: parse_plan strips "(Agent: gemini)" from the title,
+        # so downstream assignment must come from the parsed metadata hint —
+        # "Wave Background Implementation" has no assignable keyword in it.
+        from validators.kernel.daemon.authoring import determine_assigned_agent
+
+        parsed = parse_plan(PLAN_MD)
+        wave = parsed.milestones[1]
+        assert wave.agent == "gemini"
+        agent, role = determine_assigned_agent(wave.title, wave.tasks, agent_hint=wave.agent)
+        assert (agent, role) == ("gemini", "frontend")
+
+
+# ─── The clean_tui_test failure, end to end ───────────────────────────
+
+class TestCleanTuiTestRegression:
+    def test_raw_authored_set_fails_with_actionable_diagnostics(self, tmp_path: Path) -> None:
+        build_clean_tui_test_artifacts(tmp_path)
+        refs = load_plan_milestones(tmp_path)
+
+        result = validate_authoring_readiness(tmp_path, expected_milestones=refs)
+
+        assert not result.ready
+        codes = result.issue_codes()
+        assert "QA_VERDICT_CHANNEL_MISSING" in codes
+        assert [i.code for i in result.issues].count("TEST_COVERAGE_UNPLANNED") == 2
+        # The matcher fix means the annotated milestone now matches by title…
+        assert "MILESTONE_UNCOVERED" not in codes
+        # …and every diagnostic is actionable without inferring anything.
+        for issue in result.issues:
+            assert issue.required_action, issue.code
+            assert issue.canonical_rule, issue.code
+
+    def test_compiled_set_passes_when_coverage_is_declared(self, tmp_path: Path) -> None:
+        build_clean_tui_test_artifacts(tmp_path)
+        refs = load_plan_milestones(tmp_path)
+
+        # 1. Compiler injects the system-owned invariants.
+        compile_result = compile_authoring_artifacts(tmp_path, refs)
+        assert not compile_result.decision_required
+        wo001 = yaml.safe_load(
+            (tmp_path / ".sync/work-orders/ACTIVE/WO-001.yaml").read_text(encoding="utf-8")
+        )
+        assert wo001["milestone_id"] == "Milestone 1"
+        assert wo001["normalized_by"].startswith("authoring-compiler/")
+        contract004 = yaml.safe_load(
+            (tmp_path / ".sync/contracts/WO-004.yaml").read_text(encoding="utf-8")
+        )
+        assert {"module": ".sync/inbox/claude/**"} in contract004["scope"]["allow"]
+
+        # 2. The consolidated QA suite is declared explicitly (what the
+        #    repair turn would produce under the explicit-test-plan policy).
+        wo004_path = tmp_path / ".sync/work-orders/ACTIVE/WO-004.yaml"
+        wo004 = yaml.safe_load(wo004_path.read_text(encoding="utf-8"))
+        wo004["test_plan"] = [{
+            "sources": ["public/style.css", "public/script.js"],
+            "tests": ["tests/test_visuals.py"],
+        }]
+        wo004_path.write_text(yaml.safe_dump(wo004, sort_keys=False), encoding="utf-8")
+
+        # 3. The readiness gate validates the canonical set and passes.
+        result = validate_authoring_readiness(tmp_path, expected_milestones=refs)
+        assert result.ready, [i.message for i in result.issues]
+
+    def test_milestone_id_primary_matching_rejects_wrong_ids(self, tmp_path: Path) -> None:
+        build_clean_tui_test_artifacts(tmp_path)
+        refs = load_plan_milestones(tmp_path)
+        compile_authoring_artifacts(tmp_path, refs)
+
+        # Point WO-001 at the wrong milestone: title similarity must not save it.
+        wo001_path = tmp_path / ".sync/work-orders/ACTIVE/WO-001.yaml"
+        wo001 = yaml.safe_load(wo001_path.read_text(encoding="utf-8"))
+        wo001["milestone_id"] = "Milestone 3"
+        wo001_path.write_text(yaml.safe_dump(wo001, sort_keys=False), encoding="utf-8")
+
+        result = validate_authoring_readiness(tmp_path, expected_milestones=refs)
+        assert not result.ready
+        uncovered = [i for i in result.issues if i.code == "MILESTONE_UNCOVERED"]
+        assert any("Frontend Scaffolding" in i.message for i in uncovered)
+
+    def test_supervisor_gate_runs_compiler_and_passes(self, tmp_path: Path) -> None:
+        """The supervisor's readiness-gate phase normalizes before validating."""
+        build_clean_tui_test_artifacts(tmp_path)
+        # Declare coverage so the canonical set is fully conforming.
+        wo004_path = tmp_path / ".sync/work-orders/ACTIVE/WO-004.yaml"
+        wo004 = yaml.safe_load(wo004_path.read_text(encoding="utf-8"))
+        wo004["test_plan"] = [{
+            "sources": ["public/style.css", "public/script.js"],
+            "tests": ["tests/test_visuals.py"],
+        }]
+        wo004_path.write_text(yaml.safe_dump(wo004, sort_keys=False), encoding="utf-8")
+
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        state = supervisor.start_run("run-regression", "Static welcome page", tmp_path, "sess-reg")
+        state.plan_id = "PLAN-001"
+
+        result = supervisor._run_readiness_gate(state, tmp_path)
+        assert result.ready, [i.message for i in result.issues]
+        # The compiler normalized the authored set on disk: QA channel injected
+        # and provenance recorded (a second compile pass is a no-op).
+        contract004 = yaml.safe_load(
+            (tmp_path / ".sync/contracts/WO-004.yaml").read_text(encoding="utf-8")
+        )
+        assert {"module": ".sync/inbox/claude/**"} in contract004["scope"]["allow"]
+        assert contract004["normalized_by"].startswith("authoring-compiler/")
+        assert compile_authoring_artifacts(tmp_path, load_plan_milestones(tmp_path)).normalized_paths == ()
+
+    def test_supervisor_gate_routes_compiler_rejection_to_diagnostics(self, tmp_path: Path) -> None:
+        build_clean_tui_test_artifacts(tmp_path)
+        # Ambiguous title: WO-001 matches both "Frontend Scaffolding" (M1, by
+        # containment) and the re-worded "Frontend Scaffolding Extensions" (M2,
+        # exactly) — the compiler refuses to guess the milestone_id.
+        tmp_path.joinpath("PLAN.md").write_text(
+            PLAN_MD.replace(
+                "Milestone 2: Wave Background Implementation",
+                "Milestone 2: Frontend Scaffolding Extensions",
+            ),
+            encoding="utf-8",
+        )
+        wo001_path = tmp_path / ".sync/work-orders/ACTIVE/WO-001.yaml"
+        wo001 = yaml.safe_load(wo001_path.read_text(encoding="utf-8"))
+        wo001["title"] = "Frontend Scaffolding Extensions"
+        wo001_path.write_text(yaml.safe_dump(wo001, sort_keys=False), encoding="utf-8")
+
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        state = supervisor.start_run("run-ambiguous", "Static welcome page", tmp_path, "sess-amb")
+
+        result = supervisor._run_readiness_gate(state, tmp_path)
+        assert not result.ready
+        codes = result.issue_codes()
+        assert "MILESTONE_MAPPING_AMBIGUOUS" in codes
+        # Diagnostics are actionable for the repair turn.
+        for issue in result.issues:
+            assert issue.required_action
+
+
+# ─── D024 honors declared test plans ──────────────────────────────────
+
+class TestD024DeclaredTestPlan:
+    def test_declared_consolidated_mapping_satisfies_companion_requirement(self, tmp_path: Path) -> None:
+        deliverable = tmp_path / "public" / "style.css"
+        deliverable.parent.mkdir(parents=True, exist_ok=True)
+        deliverable.write_text("body { color: rebeccapurple; }", encoding="utf-8")
+        test_file = tmp_path / "tests" / "test_visuals.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_visuals():\n    assert True\n", encoding="utf-8")
+
+        wo_data = {
+            "test_plan": [{
+                "sources": ["public/style.css", "public/script.js"],
+                "tests": ["tests/test_visuals.py"],
+            }],
+        }
+
+        companion = D024Gate()._declared_test_plan_companion(tmp_path, wo_data, "public/style.css")
+        assert companion == test_file
+
+    def test_declared_mapping_with_missing_test_file_is_not_satisfied(self, tmp_path: Path) -> None:
+        (tmp_path / "public").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "public" / "script.js").write_text("console.log('hi');", encoding="utf-8")
+        wo_data = {"test_plan": [{"sources": ["public/script.js"], "tests": ["tests/test_missing.py"]}]}
+
+        assert D024Gate()._declared_test_plan_companion(tmp_path, wo_data, "public/script.js") is None
+
+    def test_unmapped_deliverable_falls_back_to_heuristics(self, tmp_path: Path) -> None:
+        (tmp_path / "public").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "public" / "other.js").write_text("x", encoding="utf-8")
+        wo_data = {"test_plan": [{"sources": ["public/style.css"], "tests": ["tests/test_style.py"]}]}
+
+        # 'public/other.js' is not in the declared mapping → no declared companion;
+        # the legacy heuristic path remains responsible.
+        assert D024Gate()._declared_test_plan_companion(tmp_path, wo_data, "public/other.js") is None
+
+
+# ─── Repair prompt accuracy ───────────────────────────────────────────
+
+class TestRepairPromptAccuracy:
+    def _supervisor_and_state(self, tmp_path: Path) -> tuple[LifecycleSupervisor, Any]:
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        state = supervisor.start_run("run-repair", "Build app", tmp_path, "sess-repair")
+        return supervisor, state
+
+    def test_prompt_lists_affected_artifacts_and_required_actions(self, tmp_path: Path) -> None:
+        supervisor, state = self._supervisor_and_state(tmp_path)
+        state.readiness_issues = [
+            {
+                "code": "QA_VERDICT_CHANNEL_MISSING",
+                "category": "scope",
+                "message": "Contract '.sync/contracts/WO-004.yaml' does not authorize the QA verdict channel",
+                "work_order_id": "WO-004",
+                "artifact_path": ".sync/contracts/WO-004.yaml",
+                "required_action": "Add the canonical QA verdict permission.",
+                "affected_artifacts": [".sync/contracts/WO-004.yaml"],
+            },
+            {
+                "code": "MILESTONE_UNCOVERED",
+                "category": "coverage",
+                "message": "Expected implementation milestone 'Frontend Scaffolding' has no authored work order",
+                "work_order_id": None,
+                "artifact_path": None,
+                "required_action": "Set milestone_id on the work order.",
+            },
+        ]
+
+        prompt = supervisor._authoring_repair_prompt(state)
+
+        assert "required_action: Add the canonical QA verdict permission." in prompt
+        assert "required_action: Set milestone_id on the work order." in prompt
+        assert ".sync/contracts/WO-004.yaml" in prompt
+        # The old contradiction — "affected: (none)" alongside demanded fixes — is gone.
+        assert "(none)" not in prompt
+        assert "Correct ONLY the affected governed artifacts" not in prompt
+
+    def test_prompt_reports_set_wide_failures_honestly(self, tmp_path: Path) -> None:
+        supervisor, state = self._supervisor_and_state(tmp_path)
+        state.readiness_issues = [
+            {
+                "code": "MILESTONE_UNCOVERED",
+                "category": "coverage",
+                "message": "Expected implementation milestone 'X' has no authored work order",
+                "work_order_id": None,
+                "artifact_path": None,
+                "required_action": "Set milestone_id on the work order.",
+            },
+        ]
+
+        prompt = supervisor._authoring_repair_prompt(state)
+
+        assert "No individual artifact is named" in prompt
+        assert "(none)" not in prompt

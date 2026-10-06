@@ -1548,6 +1548,8 @@ class AgentRunner:
                 'Environment notice: Virtual environments (.venv), dependencies, and tests are managed externally by the harness and QA lead. '
                 'Do not inspect, search for, or wait for .venv or shell execution. Your sole job is to author the code directly in your assigned deliverable files using write_file. '
                 'Only create or modify files permitted by your contract scope. '
+                'In modified_files, declare ONLY files you actually wrote this turn with write_file, using the exact same paths — '
+                'never a renamed or extra-nested variant. '
                 'Once your files are written, return the final HarnessDecision as JSON.'
             )
 
