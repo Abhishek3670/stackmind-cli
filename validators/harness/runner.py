@@ -843,7 +843,10 @@ class AgentRunner:
                     )
                     phantom_files = {
                         p for p in dec_norm
-                        if not (staged_root / p).is_file() and p.startswith(('_scratch', 'scratch', '.sync/state', '.sync/runtime'))
+                        if not (staged_root / p).is_file() and (
+                            p.startswith(('_scratch', 'scratch', '.sync/runtime'))
+                            or any(p.startswith(prefix) for prefix in bookkeeping_prefixes)
+                        )
                     }
                     dec_effective = dec_norm - phantom_files
                     # Trust direction: a turn must WRITE everything it
@@ -1006,22 +1009,27 @@ class AgentRunner:
         self, tree_data: dict[str, Any], work_order_id: str | None = None
     ) -> HarnessTask | None:
         if work_order_id:
-            path = self.sync_path / 'work-orders' / 'ACTIVE' / f'{work_order_id}.yaml'
-            if path.exists():
-                payload = self._read_yaml(path)
-                deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
-                return HarnessTask(
-                    kind='work_order',
-                    identifier=work_order_id,
-                    path=path,
-                    title=str(payload.get('title', work_order_id)),
-                    body=str(payload.get('description', '')),
-                    query=str(payload.get('title', work_order_id)),
-                    work_order_id=work_order_id,
-                    deliverable_path=deliverable.get('path') if isinstance(deliverable, dict) else None,
-                    work_order_type=str(payload.get('type')) if isinstance(payload, dict) and payload.get('type') else None,
-                    deliverable_type=str(deliverable.get('type')) if isinstance(deliverable, dict) and deliverable.get('type') else None,
-                )
+            # Explicit ids resolve against every work-order state: recovery
+            # repair turns target work orders that the recovery itself may
+            # have moved to BLOCKED/COMPLETED — never fall back to inbox
+            # processing for an explicitly addressed work order.
+            for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                path = self.sync_path / 'work-orders' / sub / f'{work_order_id}.yaml'
+                if path.exists():
+                    payload = self._read_yaml(path)
+                    deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
+                    return HarnessTask(
+                        kind='work_order',
+                        identifier=work_order_id,
+                        path=path,
+                        title=str(payload.get('title', work_order_id)),
+                        body=str(payload.get('description', '')),
+                        query=str(payload.get('title', work_order_id)),
+                        work_order_id=work_order_id,
+                        deliverable_path=deliverable.get('path') if isinstance(deliverable, dict) else None,
+                        work_order_type=str(payload.get('type')) if isinstance(payload, dict) and payload.get('type') else None,
+                        deliverable_type=str(deliverable.get('type')) if isinstance(deliverable, dict) and deliverable.get('type') else None,
+                    )
 
         inbox_dir = self.sync_path / 'inbox' / self.agent
         inbox_candidates = (

@@ -109,6 +109,42 @@ class TestMilestoneIdentity:
         assert (agent, role) == ("gemini", "frontend")
 
 
+class TestRepairTurnTaskDiscovery:
+    def test_discover_explicit_work_order_resolves_from_blocked_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression: recovery repair turns target work orders that the
+        recovery itself moved to BLOCKED — discover_next_task must resolve
+        the explicit id from BLOCKED/COMPLETED instead of falling back to
+        the first inbox item (the stale-notice hijack)."""
+        from validators.harness.runner import AgentRunner
+
+        runtime = tmp_path / ".sync" / "runtime"
+        runtime.mkdir(parents=True)
+        (runtime / "TREE.yaml").write_text(
+            "schema_version: 1\ntree_version: 1\n", encoding="utf-8"
+        )
+        blocked = tmp_path / ".sync" / "work-orders" / "BLOCKED"
+        blocked.mkdir(parents=True)
+        (blocked / "WO-001.yaml").write_text(yaml.safe_dump({
+            "id": "WO-001", "type": "FEATURE", "title": "Blocked child",
+            "status": "BLOCKED", "priority": "P1", "assigned_agents": ["codex"],
+            "dependencies": [],
+            "deliverable": {"type": "code", "path": "src/core/app.py", "description": "child"},
+            "description": "child",
+        }), encoding="utf-8")
+        inbox = tmp_path / ".sync" / "inbox" / "claude"
+        inbox.mkdir(parents=True)
+        (inbox / "2026-10-07_claude_WO-000-complete.md").write_text("done", encoding="utf-8")
+
+        runner = AgentRunner(tmp_path, "claude")
+        task = runner.discover_next_task(runner._load_tree(), work_order_id="WO-001")
+
+        assert task is not None
+        assert task.kind == "work_order"
+        assert task.identifier == "WO-001"
+
+
 # ─── The clean_tui_test failure, end to end ───────────────────────────
 
 class TestCleanTuiTestRegression:

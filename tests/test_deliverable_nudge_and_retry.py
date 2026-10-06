@@ -257,7 +257,7 @@ def test_supervisor_retries_outcome_verified_failure(tmp_path):
     assert state.retry_counts.get("WO-003") == 1
     assert "op-blocked-1" in state.ignored_operation_ids
     assert len(mgr.turns) == 1
-    assert "declared deliverable 'src/backend.py' was not created" in mgr.turns[0]["prompt"]
+    assert "declared deliverable 'src/backend.py' was not added or modified in this turn" in mgr.turns[0]["prompt"]
     assert "write_file" in mgr.turns[0]["prompt"]
 
     # Verify work order on disk has error cleared and status ACTIVE

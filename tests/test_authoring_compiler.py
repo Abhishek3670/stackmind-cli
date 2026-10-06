@@ -353,6 +353,36 @@ class TestConsolidatedTestPlanDefault:
             assert "test_plan" not in saved
 
 
+# ─── Contract identity normalization ──────────────────────────────────
+
+class TestContractIdentityNormalization:
+    def test_agent_id_normalized_to_work_order_assignee(self, tmp_path: Path) -> None:
+        # Regression: recovery repair turns copy the author's identity onto
+        # the contracts they author (agent_id: claude), which the readiness
+        # gate rejects (CONTRACT_AGENT_MISMATCH) and the rejected-artifact
+        # archive then deletes.  The compiler normalizes it instead.
+        write_wo(tmp_path, make_wo("WO-001", "codex", "src/app.py"))
+        contract_rel = write_contract(tmp_path, make_contract("WO-001", "claude", [{"module": "src/**"}]))
+
+        result = compile_authoring_artifacts(tmp_path)
+
+        assert not result.decision_required
+        assert contract_rel in result.normalized_paths
+        saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
+        assert saved["agent_id"] == "codex"
+        assert any("agent_id -> codex" in item for item in result.injections[contract_rel])
+
+    def test_matching_agent_id_is_untouched(self, tmp_path: Path) -> None:
+        write_wo(tmp_path, make_wo("WO-001", "codex", "src/app.py"))
+        contract_rel = write_contract(tmp_path, make_contract("WO-001", "codex", [{"module": "src/**"}]))
+
+        result = compile_authoring_artifacts(tmp_path)
+
+        assert contract_rel not in result.normalized_paths
+        saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
+        assert saved["agent_id"] == "codex"
+
+
 # ─── Declared test plan validation ────────────────────────────────────
 
 class TestDeclaredTestPlanValidation:

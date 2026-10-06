@@ -667,6 +667,49 @@ class TestRecoveryDecisions:
         assert state.recovery_attempts["WO-001"] == 1
         assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
 
+    def test_split_rejected_when_children_collide_with_active_work_orders(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression: the architect's split decision reused live work-order ids
+        (WO-002/WO-003 were active, contracted, and mid-execution) — the split
+        must be rejected back with a corrective diagnostic instead of applied."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        # WO-002 is an authored, active work order — the split reuses its id
+        write_wo(tmp_path, make_wo("WO-002", deliv_path="src/other.py"))
+        write_contract(tmp_path, make_contract("WO-002", extra_allow=["src/other.py"]))
+        evidence = make_evidence("WO-001", tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        evidence["operation_id"] = op["operation_id"]
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=blocked_result(evidence))
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        decision_path = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_path.write_text(json.dumps({
+            "work_order": "WO-001",
+            "action": "split_work_order",
+            "reason": "split WO-001",
+            "replacement_work_orders": ["WO-002", "WO-004"],  # WO-002 collides
+            "contract_revision": 1,
+        }), encoding="utf-8")
+        rec_op = next(
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        )
+        mock_mgr.complete_operation(rec_op["operation_id"], "COMPLETED")
+
+        supervisor.advance(state)
+
+        assert state.recovery_decisions[-1]["applied"] is False
+        assert "collide" in state.recovery_decisions[-1]["rejected_reason"]
+        # initial decision + corrective re-dispatch with the collision feedback
+        assert state.recovery_attempts.get("WO-001") == 2
+        # Corrective re-dispatch: the architect decides again with the feedback
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        # Nothing applied — the blocked WO's contract is untouched
+        assert (tmp_path / ".sync" / "contracts" / "WO-001.yaml").exists()
+
     def test_amend_contract_places_repair_authorization_contract(
         self, tmp_path: Path,
     ) -> None:
@@ -719,6 +762,47 @@ class TestRecoveryDecisions:
         assert ".sync/decisions/**" in modules
         # The original authored scope is preserved into the transitional contract.
         assert "src/app.py" in modules
+
+    def test_stale_inbox_notices_archived_before_recovery_repair(
+        self, tmp_path: Path,
+    ) -> None:
+        """Stale completion notices for non-active work orders are moved to
+        _read/ before the repair turn dispatches — discover_next_task falls
+        back to the first inbox item when the explicit work order cannot be
+        resolved, and a stale notice hijacks the repair turn."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        stale = tmp_path / ".sync" / "inbox" / "claude" / "2026-10-07_claude_WO-000-complete.md"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("completed", encoding="utf-8")
+
+        evidence = make_evidence("WO-001", tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        evidence["operation_id"] = op["operation_id"]
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=blocked_result(evidence))
+        supervisor.advance(state)  # recovery decision dispatched
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        decision_path = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_path.write_text(json.dumps({
+            "work_order": "WO-001",
+            "action": "amend_contract",
+            "reason": "authorize writes",
+            "failure_code": "OUTCOME_NOT_VERIFIED",
+            "transient": False,
+            "contract_revision": 2,
+        }), encoding="utf-8")
+        rec_op = next(
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        )
+        mock_mgr.complete_operation(rec_op["operation_id"], "COMPLETED")
+
+        supervisor.advance(state)
+
+        assert state.phase == Phase.ARCHITECT_REPAIR
+        assert not stale.exists()
+        assert (tmp_path / ".sync" / "inbox" / "claude" / "_read" / stale.name).exists()
 
     def test_split_decision_supersedes_original_and_readies_children(
         self, tmp_path: Path,

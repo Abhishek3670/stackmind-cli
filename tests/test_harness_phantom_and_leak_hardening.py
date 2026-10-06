@@ -98,3 +98,25 @@ def test_phantom_declaration_pruning(tmp_path: Path):
 
     assert declaration_matches is True
     assert phantom_files == {"_scratch/decision.json"}
+
+
+def test_bookkeeping_inbox_declaration_pruned_when_unwritten(tmp_path: Path):
+    """Verify that bookkeeping paths like .sync/inbox/claude/qa_verdict.txt are treated as phantoms if unwritten."""
+    bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/')
+    staged_root = tmp_path / "staged"
+    staged_root.mkdir()
+    (staged_root / "tests").mkdir()
+    (staged_root / "tests" / "test_suite.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    dec_norm = {"tests/test_suite.py", ".sync/inbox/claude/qa_verdict.txt"}
+    phantom_files = {
+        p for p in dec_norm
+        if not (staged_root / p).is_file() and (
+            p.startswith(('_scratch', 'scratch', '.sync/runtime'))
+            or any(p.startswith(prefix) for prefix in bookkeeping_prefixes)
+        )
+    }
+    dec_effective = dec_norm - phantom_files
+    assert phantom_files == {".sync/inbox/claude/qa_verdict.txt"}
+    assert dec_effective == {"tests/test_suite.py"}
+

@@ -366,9 +366,11 @@ def validate_authoring_readiness(
 
     # ── 1. Discover and parse artifacts ─────────────────────────────
     active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
     contracts_dir = ws / ".sync" / "contracts"
 
     wo_files: dict[str, tuple[str, dict[str, Any]]] = {}
+    completed_wo_files: dict[str, tuple[str, dict[str, Any]]] = {}
     duplicate_ids: set[str] = set()
     if active_dir.is_dir():
         for f in sorted(active_dir.glob("*.yaml")):
@@ -387,6 +389,17 @@ def validate_authoring_readiness(
             wo_files[wo_id] = (rel, data)
     else:
         _issue(issues, "NO_WORK_ORDERS", "coverage", f"Active work order directory '{active_dir.name}' does not exist; nothing authored", artifact_path=".sync/work-orders/ACTIVE")
+
+    if completed_dir.is_dir():
+        for f in sorted(completed_dir.glob("*.yaml")):
+            rel = f.relative_to(ws).as_posix()
+            data = _load_yaml(f, issues, rel)
+            if data is None:
+                continue
+            wo_id = str(data.get("id") or f.stem)
+            if wo_id in skip_ids:
+                continue
+            completed_wo_files[wo_id] = (rel, data)
 
     contracts: dict[str, _ContractArtifact] = {}
     if contracts_dir.is_dir():
@@ -434,7 +447,7 @@ def validate_authoring_readiness(
             _issue(issues, "MISSING_CONTRACT", "coverage", f"Work order '{wo_id}' has no matching contract at .sync/contracts/{wo_id}.yaml", work_order_id=wo_id, artifact_path=rel)
 
     for wo_ref, contract in sorted(contracts.items()):
-        if wo_ref in wo_files:
+        if wo_ref in wo_files or wo_ref in completed_wo_files:
             continue
         # Supervisor-synthesized recovery-repair authorizations are bookkeeping,
         # not architect artifacts: a transitional contract for a superseded
@@ -446,6 +459,7 @@ def validate_authoring_readiness(
 
     # ── 4. Milestone coverage ───────────────────────────────────────
     if expected_milestones:
+        all_known_wos = {**completed_wo_files, **wo_files}
         refs: list[dict[str, Any]] = []
         for entry in expected_milestones:
             if isinstance(entry, dict):
@@ -460,7 +474,7 @@ def validate_authoring_readiness(
                 refs.append({"id": "", "title": str(entry), "agent": None})
         for ref in refs:
             matched = [
-                wo_id for wo_id, (_rel, data) in wo_files.items()
+                wo_id for wo_id, (_rel, data) in all_known_wos.items()
                 if _wo_matches_milestone(data, ref)
             ]
             if len(matched) == 1:
@@ -611,7 +625,7 @@ def validate_authoring_readiness(
                 dep_str = str(dep).strip()
                 if not dep_str:
                     continue
-                if dep_str in wo_files or dep_str in skip_ids:
+                if dep_str in wo_files or dep_str in completed_wo_files or dep_str in skip_ids:
                     continue
                 _issue(issues, "DEPENDENCY_MISSING", "dependency", f"Work order '{wo_id}' depends on '{dep_str}' which is not an authored " f"active work order", work_order_id=wo_id, artifact_path=rel)
         elif deps not in (None, []):
@@ -656,6 +670,10 @@ def validate_authoring_readiness(
 
     planned_tests: list[str] = list(declared_tests)
     for _wo_id, (_rel, data) in wo_files.items():
+        for planned in _planned_test_paths(data):
+            if planned not in planned_tests:
+                planned_tests.append(planned)
+    for _wo_id, (_rel, data) in completed_wo_files.items():
         for planned in _planned_test_paths(data):
             if planned not in planned_tests:
                 planned_tests.append(planned)

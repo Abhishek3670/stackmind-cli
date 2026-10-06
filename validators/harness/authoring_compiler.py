@@ -263,12 +263,33 @@ def compile_authoring_artifacts(
             data["test_plan"] = [{"sources": [deliv_path_str], "tests": [suite]}]
             _mark(rel, f"+test_plan (consolidated default -> {suite})", data, wo_path)
 
-    # ── Contracts: QA verdict channel injection ───────────────────────
+    # ── Contracts: identity normalization + QA verdict channel ────────
+    wo_assignees: dict[str, str] = {}
+    for _rel, _path, wo_data in wo_records:
+        wo_id_value = str(wo_data.get("id") or Path(_rel).stem)
+        assigned = wo_data.get("assigned_agents")
+        primary = (
+            str(assigned[0]).strip().lower()
+            if isinstance(assigned, list) and assigned else ""
+        )
+        if wo_id_value and primary:
+            wo_assignees[wo_id_value] = primary
+
     for contract_path in sorted(contracts_dir.glob("*.yaml")) if contracts_dir.is_dir() else []:
         rel = contract_path.relative_to(ws).as_posix()
         data = _load_yaml_mapping(contract_path)
         if data is None:
             continue
+
+        # Identity normalization: the contract's agent_id must match its work
+        # order's assignee — repair turns routinely copy the author's identity
+        # onto the contracts they author, which the readiness gate rejects.
+        wo_ref = str(data.get("work_order") or "").strip()
+        assignee = wo_assignees.get(wo_ref)
+        if assignee and str(data.get("agent_id") or "").strip().lower() != assignee:
+            data["agent_id"] = assignee
+            _mark(rel, f"agent_id -> {assignee} (matches work order assignee)", data, contract_path)
+
         if not qa_verdict_channel_required(data.get("agent_id")):
             continue
         if _scope_allows(data, QA_VERDICT_PROBE_PATH):

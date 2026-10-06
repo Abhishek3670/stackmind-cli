@@ -2064,7 +2064,7 @@ class LifecycleSupervisor:
                             scope_dict = c_data.setdefault("scope", {})
                             allow_list = scope_dict.setdefault("allow", [])
                             existing_mods = {r.get("module") for r in allow_list if isinstance(r, dict)}
-                            needed = ["tests/**", "test/**", "src/**", "app/**", "*.py"]
+                            needed = ["tests/**", "test/**", "src/**", "app/**", "*.py", "VERSION.md", "CHANGELOG.md"]
                             updated = False
                             for n in needed:
                                 if n not in existing_mods:
@@ -2127,7 +2127,7 @@ class LifecycleSupervisor:
                 f"3. Run the run_security_scan tool over the deliverables (src/) and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
                 f"4. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
-                f"5. Write your QA verdict to .sync/inbox/claude/ and declare '{deliv_path}' in modified_files.\n"
+                f"5. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
                 "Review against the security checklist: no hardcoded secrets or env-fallback defaults, "
                 "debug flags disabled, authentication logic free of obvious flaws, and forms protected "
                 "against CSRF/replay where applicable."
@@ -2223,7 +2223,7 @@ class LifecycleSupervisor:
                         f"the test suite '{deliv_path}' with write_file, execute it end-to-end "
                         f"with the run_tests tool (pytest), and run the run_security_scan tool "
                         f"over the deliverables before completing. Then write your QA verdict "
-                        f"to .sync/inbox/claude/ and declare the suite in modified_files."
+                        f"to .sync/inbox/claude/ if providing feedback, and declare in modified_files ONLY files you actually wrote with write_file."
                     ),
                     role=self._role_for_agent("gemma"),
                     agent_id="gemma",
@@ -2636,6 +2636,44 @@ class LifecycleSupervisor:
         except Exception:
             pass
 
+    def _ensure_dependency_escalation_channel(self, ws: Path, wo_id: str) -> None:
+        """Grant dependency manifest and inbox channels on the contract for architecture escalation.
+
+        Deterministic supervisor bookkeeping so Architecture (Claude) can update
+        requirements.txt / pyproject.toml or direct the worker via .sync/inbox/.
+        """
+        contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+        if not contract_file.is_file():
+            return
+        try:
+            data = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            scope = data.setdefault("scope", {})
+            allow_list = scope.setdefault("allow", [])
+            existing_allow = {
+                r.get("module") for r in allow_list if isinstance(r, dict)
+            }
+            deny_list = scope.get("deny") or []
+            filtered_deny = [
+                r for r in deny_list
+                if not (isinstance(r, dict) and r.get("module") in ("requirements.txt", "pyproject.toml"))
+                and not (isinstance(r, str) and r in ("requirements.txt", "pyproject.toml"))
+            ]
+            scope["deny"] = filtered_deny
+            needed = ["requirements.txt", "pyproject.toml", ".sync/inbox/**"]
+            updated = False
+            for n in needed:
+                if n not in existing_allow:
+                    allow_list.append({"module": n})
+                    updated = True
+            if updated or len(filtered_deny) != len(deny_list):
+                contract_file.write_text(
+                    yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+                )
+        except Exception:
+            pass
+
     def _dispatch_recovery_decision(
         self, state: RunState, ws: Path, wo_id: str, corrective: str | None = None,
     ) -> dict[str, Any] | None:
@@ -2839,6 +2877,28 @@ class LifecycleSupervisor:
                     "rejected_reason": "split_work_order requires replacement_work_orders",
                 })
                 return None, "split_work_order requires a non-empty replacement_work_orders list"
+            # Collision guard: replacement children must not reuse the ids of
+            # other active work orders — the split archives the blocked WO's
+            # artifacts and re-authors the children, so a colliding id would
+            # clobber a live, contracted work order mid-execution.
+            active_ids = {
+                p.stem for p in (ws / ".sync" / "work-orders" / "ACTIVE").glob("*.yaml")
+            } if (ws / ".sync" / "work-orders" / "ACTIVE").is_dir() else set()
+            colliding = sorted((set(children) & active_ids) - {wo_id})
+            if colliding:
+                state.recovery_decisions.append({
+                    **record, "applied": False,
+                    "rejected_reason": (
+                        "replacement work orders collide with existing active work orders: "
+                        + ", ".join(colliding)
+                    ),
+                })
+                return None, (
+                    f"split_work_order replacement ids {', '.join(colliding)} collide with existing "
+                    "active work orders; choose fresh ids (not present in .sync/work-orders/ACTIVE) "
+                    "for the replacement children, or use amend_contract to adjust the existing "
+                    "work order's scope instead"
+                )
             original_contract: dict[str, Any] = {}
             contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
             if contract_file.is_file():
@@ -2872,6 +2932,24 @@ class LifecycleSupervisor:
                     "rejected_reason": "create_dependency_work_order requires replacement_work_orders",
                 })
                 return None, "create_dependency_work_order requires a non-empty replacement_work_orders list"
+            # Collision guard: a NEW prerequisite work order must use a fresh id —
+            # reusing an active work order's id would clobber it.
+            active_ids = {
+                p.stem for p in (ws / ".sync" / "work-orders" / "ACTIVE").glob("*.yaml")
+            } if (ws / ".sync" / "work-orders" / "ACTIVE").is_dir() else set()
+            colliding = sorted(set(new_wos) & active_ids)
+            if colliding:
+                state.recovery_decisions.append({
+                    **record, "applied": False,
+                    "rejected_reason": (
+                        "new prerequisite work orders collide with existing active work orders: "
+                        + ", ".join(colliding)
+                    ),
+                })
+                return None, (
+                    f"create_dependency_work_order ids {', '.join(colliding)} collide with existing "
+                    "active work orders; prerequisite work orders must use fresh ids"
+                )
             original_contract: dict[str, Any] = {}
             contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
             if contract_file.is_file():
@@ -2931,6 +3009,7 @@ class LifecycleSupervisor:
             str(state.repair_context.get("action") or ""),
             state.repair_context.get("original_contract") or {},
         )
+        self._archive_stale_inbox_notices(ws)
         state.recovery_decisions.append({**record, "applied": True, "stage": "repair_dispatched"})
         state.error = (
             f"Recovery action '{state.repair_context.get('action')}' for "
@@ -3028,6 +3107,38 @@ class LifecycleSupervisor:
             )
         contract_file.parent.mkdir(parents=True, exist_ok=True)
         contract_file.write_text(contract_yaml, encoding="utf-8")
+
+    def _archive_stale_inbox_notices(self, ws: Path) -> None:
+        """Move stale completion/review notices out of agent inboxes when their
+        work order is no longer active.
+
+        ``discover_next_task`` falls back to the first inbox item when an
+        explicit work order cannot be resolved (e.g. after a split archives
+        the blocked work order); without this hygiene a stale notice redirects
+        recovery repair turns into processing it instead of authoring the
+        repair artifacts.
+        """
+        import shutil
+
+        inbox_root = ws / ".sync" / "inbox"
+        if not inbox_root.is_dir():
+            return
+        active_ids = {
+            p.stem for p in (ws / ".sync" / "work-orders" / "ACTIVE").glob("*.yaml")
+        } if (ws / ".sync" / "work-orders" / "ACTIVE").is_dir() else set()
+        for agent_dir in sorted(inbox_root.iterdir()):
+            if not agent_dir.is_dir() or agent_dir.name.startswith("_") or agent_dir.name == "CEO":
+                continue
+            read_dir = agent_dir / "_read"
+            for notice in sorted(agent_dir.glob("*.md")):
+                match = re.search(r"(WO-\d+)", notice.name)
+                if not match or match.group(1) in active_ids:
+                    continue  # no work-order reference, or the WO is still active
+                read_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(notice), str(read_dir / notice.name))
+                except OSError:
+                    pass
 
     def _archive_recovery_artifact(self, ws: Path, run_id: str, rel_path: str) -> None:
         """Preserve a superseded/amended governed artifact under the audit path."""
@@ -3507,6 +3618,7 @@ class LifecycleSupervisor:
             f"Do NOT write or edit the worker's application code directly."
         )
 
+        self._ensure_dependency_escalation_channel(ws, wo_id)
         return self._architect_turn(state, prompt, wo_id)
 
     def _check_qa_verdict(self, wo_id: str, ws: Path) -> str | None:
