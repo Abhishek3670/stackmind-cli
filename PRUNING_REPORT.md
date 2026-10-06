@@ -3,6 +3,8 @@
 **Date:** 2026-10-06 · **Branch:** `agent_IO_config` · **HEAD:** `9a4b91b`
 **Status: APPROVED (2026-10-06) — Tier A + Tier B executed on branch `chore/prune-irrelevant-artifacts` (D025-compliant: backup, precondition check, forward commits only). Amendment: `docs/STACKMIND_CLI.md` changed from DELETE → ARCHIVE per approval. Tier C deferred to a separate pass.**
 
+**Post-execution note (owner decision):** root `AGENTS.md` and `.sync/` were removed by the owner as obsolete legacy artifacts — `AGENTS.md` was verified to be the `stackmind init` scaffold (`templates/AGENTS.template.md` + `{{PROJECT_NAME}}` substitution), describing the protocol this product ships into *managed projects*, not rules binding this repo's own development. `.gitignore` updated to ignore local scratch (`diagrams/`, `.zcode/`, `.zcodeignore`). The KEEP list below reflects the state at execution time, before this removal.
+
 ---
 
 ## 1. Executive summary
