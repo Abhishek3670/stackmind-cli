@@ -20,7 +20,7 @@ The code review found three implementation risks that need separate bug-fix work
 | Designated interpreter | PASS | `.venv\\Scripts\\python.exe`, Python 3.11.9 |
 | Test runner | PASS | pytest 9.1.1 from the designated venv |
 | Targeted P7 regression | PASS | `76 passed in 19.81s` |
-| Full regression | BLOCKED | `pytest -q` stalled after 105 tests with no completion summary; partial output retained in `docs/runtime-truth/.wo-025-full-pytest.out` |
+| Full regression | BLOCKED | `pytest -q` stalled after 105 tests with no completion summary; partial output retained in `docs/archive/wo-025-evidence/.wo-025-full-pytest.out` |
 | Memory benchmark | NOT AVAILABLE | pytest produced no peak-memory metric; no benchmark framework was configured for the audited run |
 
 Targeted command:

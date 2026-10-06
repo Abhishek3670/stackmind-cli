@@ -1,0 +1,381 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "StackMind Governed Multi-Agent Workflow",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy-path",
+        "label": "Request to release",
+        "focus": [
+          "request",
+          "planning",
+          "approval",
+          "authoring",
+          "executing",
+          "qa",
+          "integration",
+          "gitops",
+          "complete"
+        ],
+        "note": "The governed main path from CEO request to the release commit."
+      },
+      {
+        "id": "recovery",
+        "label": "Bounded recovery",
+        "focus": [
+          "executing",
+          "qa",
+          "recovery_decision",
+          "repair",
+          "approval"
+        ],
+        "note": "Where rework, blocked work, and gate failures stop and who decides."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "human",
+      "label": "CEO / Human"
+    },
+    {
+      "id": "gitops",
+      "label": "Local-LLM — GitOps"
+    },
+    {
+      "id": "architect",
+      "label": "Claude — Architect"
+    },
+    {
+      "id": "workers",
+      "label": "Workers — Codex · Gemini"
+    },
+    {
+      "id": "qa",
+      "label": "Gemma — QA"
+    },
+    {
+      "id": "recovery",
+      "label": "Recovery & Repair",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "intake",
+      "label": "Intake",
+      "fromCol": 0,
+      "toCol": 0
+    },
+    {
+      "id": "govern",
+      "label": "Plan & approve",
+      "fromCol": 1,
+      "toCol": 2,
+      "variant": "emphasis"
+    },
+    {
+      "id": "author",
+      "label": "Author",
+      "fromCol": 3,
+      "toCol": 3
+    },
+    {
+      "id": "deliver",
+      "label": "Execute & release",
+      "fromCol": 4,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "groups": [
+    {
+      "id": "bounded_recovery",
+      "label": "Bounded recovery loops (≤ 2)",
+      "lane": "recovery",
+      "fromCol": 2,
+      "toCol": 5,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "request",
+    "planning",
+    "approval",
+    "authoring",
+    "executing",
+    "qa",
+    "integration",
+    "gitops",
+    "complete"
+  ],
+  "nodes": [
+    {
+      "id": "request",
+      "lane": "human",
+      "col": 0,
+      "type": "external",
+      "label": "CEO Request",
+      "sublabel": "product goal",
+      "width": 92
+    },
+    {
+      "id": "planning",
+      "lane": "architect",
+      "col": 1,
+      "type": "backend",
+      "label": "Planning",
+      "sublabel": "PLAN.md + WOs",
+      "width": 92
+    },
+    {
+      "id": "approval",
+      "lane": "human",
+      "col": 2,
+      "type": "security",
+      "label": "Approval Gate",
+      "sublabel": "approve / reject",
+      "tag": "HUMAN GATE",
+      "width": 92
+    },
+    {
+      "id": "authoring",
+      "lane": "architect",
+      "col": 3,
+      "type": "backend",
+      "label": "AUTHORING",
+      "sublabel": "WO + contract",
+      "tag": "fail-closed",
+      "width": 92
+    },
+    {
+      "id": "executing",
+      "lane": "workers",
+      "col": 4,
+      "type": "backend",
+      "label": "EXECUTING",
+      "sublabel": "tools → validate",
+      "tag": "verify → write-back",
+      "width": 88
+    },
+    {
+      "id": "qa",
+      "lane": "qa",
+      "col": 5,
+      "type": "security",
+      "label": "QA Verdict",
+      "sublabel": "verdict + D024",
+      "width": 84
+    },
+    {
+      "id": "integration",
+      "lane": "architect",
+      "col": 5,
+      "type": "backend",
+      "label": "Integration",
+      "sublabel": "read-only review",
+      "width": 92,
+      "tag": "prescribed fixes"
+    },
+    {
+      "id": "gitops",
+      "lane": "gitops",
+      "col": 5,
+      "type": "cloud",
+      "label": "GITOPS",
+      "sublabel": "VERSION · CHANGELOG",
+      "width": 92
+    },
+    {
+      "id": "complete",
+      "lane": "human",
+      "col": 5,
+      "type": "backend",
+      "label": "COMPLETE",
+      "sublabel": "release commit",
+      "width": 92
+    },
+    {
+      "id": "repair",
+      "lane": "recovery",
+      "col": 2,
+      "type": "security",
+      "label": "ARCHITECT_REPAIR",
+      "sublabel": "gate failure fix",
+      "width": 130
+    },
+    {
+      "id": "recovery_decision",
+      "lane": "recovery",
+      "col": 3,
+      "type": "security",
+      "label": "Recovery Decision",
+      "sublabel": "retry · amend · split WO",
+      "tag": "escalate → human",
+      "width": 110
+    }
+  ],
+  "edges": [
+    {
+      "id": "request-plan",
+      "from": "request",
+      "to": "planning",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "plan-approval",
+      "from": "planning",
+      "to": "approval",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "approval-reject",
+      "from": "approval",
+      "to": "planning",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "approval-authoring",
+      "from": "approval",
+      "to": "authoring",
+      "label": "approved",
+      "variant": "emphasis",
+      "role": "main",
+      "labelSegment": 2
+    },
+    {
+      "id": "authoring-executing",
+      "from": "authoring",
+      "to": "executing",
+      "label": "governed turn",
+      "variant": "default",
+      "role": "main",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 12
+    },
+    {
+      "id": "authoring-repair",
+      "from": "authoring",
+      "to": "repair",
+      "label": "gate fail",
+      "variant": "security",
+      "role": "error",
+      "labelDx": -80
+    },
+    {
+      "id": "repair-authoring",
+      "from": "repair",
+      "to": "authoring",
+      "label": "≤ 2 repairs",
+      "variant": "dashed",
+      "role": "return",
+      "labelDx": 80
+    },
+    {
+      "id": "executing-qa",
+      "from": "executing",
+      "to": "qa",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "qa-integration",
+      "from": "qa",
+      "to": "integration",
+      "label": "APPROVED",
+      "variant": "emphasis",
+      "role": "main",
+      "labelDx": 30
+    },
+    {
+      "id": "qa-executing",
+      "from": "qa",
+      "to": "executing",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "qa-recovery",
+      "from": "qa",
+      "to": "recovery_decision",
+      "label": "BLOCKED",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "recovery-executing",
+      "from": "recovery_decision",
+      "to": "executing",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "integration-executing",
+      "from": "integration",
+      "to": "executing",
+      "variant": "dashed",
+      "role": "error"
+    },
+    {
+      "id": "integration-gitops",
+      "from": "integration",
+      "to": "gitops",
+      "label": "pass",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "gitops-complete",
+      "from": "gitops",
+      "to": "complete",
+      "label": "release commit",
+      "variant": "emphasis",
+      "role": "main"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Deterministic Supervisor",
+      "items": [
+        "State machine drives every phase — never an autonomous LLM",
+        "Run state persisted to .sync/runtime/supervisor/run-*.yaml",
+        "Workers are role-bound LLM backends (codex, gemini, gemma, local-llm)"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Governed Harness Turn",
+      "items": [
+        "Context assembly is fail-closed against the contract scope",
+        "Model tools write to a scratch workspace, never the live tree",
+        "Schema validation + staged stackmind validate + PLAT-03 lock",
+        "Write-back only after all 6 verification dimensions pass"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Bounded Recovery",
+      "items": [
+        "Worker rework and authoring repairs capped at 2 rounds",
+        "Blocked work needs a machine-readable architect decision",
+        "escalate_human returns control to the CEO"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Learning Loop (LEARN-01)",
+      "items": [
+        "Experiences captured only from fully verified turns",
+        "Clusters need ≥ 3 verified episodes before distillation",
+        "3-stage verification gates every skill promotion"
+      ]
+    }
+  ]
+}

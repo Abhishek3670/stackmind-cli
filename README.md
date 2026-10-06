@@ -1,6 +1,6 @@
 # stackmind-cli
 
-A multi-agent engineering project managed by [stackmind](https://github.com/stackmind/stackmind).
+A multi-agent engineering project managed by [stackmind](https://github.com/Abhishek3670/stackmind).
 
 ## Getting Started
 
@@ -10,6 +10,6 @@ A multi-agent engineering project managed by [stackmind](https://github.com/stac
 
 ## Runtime
 
-- **Version:** v3.1.0
+- **Version:** v3.7.0
 - **Agents:** See `AGENTS.md` for roster
 - **State:** `.sync/runtime/TREE.yaml`

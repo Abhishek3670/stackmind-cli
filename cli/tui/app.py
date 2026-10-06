@@ -568,7 +568,7 @@ def render_composer_box(
     is_active: bool = False,
     has_content: bool = False,
 ) -> Panel:
-    """Render the rounded input composer box matching image.png:
+    """Render the rounded input composer box matching docs/assets/image.png:
     > Type a message...               Ctrl+K commands | Ctrl+L clear
 
     Expands vertically upward/downward for multiline typing (§28, §30).
