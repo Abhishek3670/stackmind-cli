@@ -89,7 +89,7 @@ class RunState:
     workspace: str
     session_id: str
     phase: Phase = Phase.INIT
-    planning_wo_id: str = "WO-000"
+    planning_wo_id: str | None = "WO-000"
     planning_operation_id: str | None = None
     authoring_operation_id: str | None = None
     plan_id: str | None = None
@@ -576,11 +576,17 @@ class LifecycleSupervisor:
             run_id=state.run_id,
         )
         state.planning_operation_id = op.get("operation_id")
-        state.planning_wo_id = op.get("work_order_id") or state.planning_wo_id
+        state.planning_wo_id = op.get("work_order_id") or state.planning_wo_id or "WO-000"
         return AdvanceResult.WAITING_FOR_OPERATION
 
     def _advance_awaiting_approval(self, state: RunState) -> AdvanceResult:
         """AWAITING_APPROVAL: check if the plan has been approved or rejected."""
+        if not state.plan_id:
+            plans = self.manager.list_plans(state.session_id)
+            for p in reversed(plans):
+                if str(p.get("state", "")).upper() == "AWAITING_APPROVAL":
+                    state.plan_id = p.get("plan_id")
+                    break
         if not state.plan_id:
             state.error = "No plan_id recorded"
             self._transition(state, Phase.FAILED)
@@ -596,6 +602,7 @@ class LifecycleSupervisor:
             # Re-dispatch planning with feedback
             feedback = plan.get("feedback") or plan.get("reason") or ""
             state.planning_operation_id = None  # reset to re-dispatch
+            state.planning_wo_id = None  # reset so next planning turn allocates a fresh WO ID
             self._transition(state, Phase.PLANNING)
             # Update product goal with feedback for re-planning
             if feedback:

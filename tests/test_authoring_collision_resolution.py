@@ -290,3 +290,107 @@ Baseline environment.
     new_contract = yaml.safe_load((contracts_dir / "WO-009.yaml").read_text(encoding="utf-8"))
     assert new_contract["agent_id"] == "codex"
     assert new_contract["identity"]["role"] == "backend"
+
+
+def test_plan_rejection_allocates_next_available_work_order_without_collision(tmp_path: Path):
+    """When a plan is rejected, re-planning allocates the next unused work order ID (e.g. WO-008)
+    rather than colliding with the completed planning work order (e.g. WO-007)."""
+    from validators.kernel.daemon.supervisor import LifecycleSupervisor, Phase, AdvanceResult
+    from validators.kernel.daemon.storage import DaemonStorage
+    from cli.validate import validate
+
+    # 1. Setup workspace with completed work orders WO-000 through WO-006
+    comp_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(0, 7):
+        (comp_dir / f"WO-{i:03d}.yaml").write_text(
+            yaml.safe_dump({"id": f"WO-{i:03d}", "status": "COMPLETED"}), encoding="utf-8"
+        )
+
+    storage = DaemonStorage(tmp_path / ".daemon_storage")
+    manager = SessionManager(storage)
+    session = manager.create_session("claude", "mock-provider", {"allow": ["*"], "deny": []}, str(tmp_path))
+    sid = session["session_id"]
+
+    supervisor = LifecycleSupervisor(manager)
+    state = supervisor.start_run("run-reject-test", "Design auth system", tmp_path, sid)
+    manager._active_runs["run-reject-test"] = state
+
+    # 2. First advance -> dispatches planning turn and synthesizes WO-007
+    res1 = supervisor.advance(state)
+    assert res1 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.planning_wo_id == "WO-007"
+    assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-007.yaml").is_file()
+
+    # 3. Simulate turn completion & propose plan
+    manager.propose_plan(sid, "plan-1", "Auth System Plan", metadata={"operation_id": state.planning_operation_id})
+    manager.complete_operation(operation_id=state.planning_operation_id, status="COMPLETED", result={"summary": "Plan ready"})
+
+    # Advance supervisor -> moves to AWAITING_APPROVAL and archives WO-007
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.AWAITING_APPROVAL
+    assert "WO-007" in state.completed_wo_ids
+    assert (comp_dir / "WO-007.yaml").is_file()
+    assert not (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-007.yaml").exists()
+
+    # 4. Reject the plan with feedback
+    manager.reject_plan(sid, "plan-1", reason="Need rate limiting added")
+
+    # Advance supervisor -> transitions to PLANNING
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.PLANNING
+    assert state.planning_wo_id is None
+    assert state.planning_operation_id is None
+
+    # 5. Advance again -> dispatches re-planning turn under WO-008 (next available ID)
+    res3 = supervisor.advance(state)
+    assert res3 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.planning_wo_id == "WO-008"
+    assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-008.yaml").is_file()
+
+    # Invariants: WO-007 remains solely in COMPLETED, WO-008 solely in ACTIVE
+    assert (comp_dir / "WO-007.yaml").is_file()
+    assert not (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-007.yaml").exists()
+    assert not (comp_dir / "WO-008.yaml").exists()
+
+    # Validate that runtime passes with zero multi-directory issues
+    val_res = validate(tmp_path)
+    state_dir_errors = [e.message for e in val_res.errors if "exists in multiple state directories" in e.message]
+    assert state_dir_errors == []
+
+
+def test_prepare_run_for_resume_cleans_up_dual_state_collision(tmp_path: Path):
+    """_prepare_run_for_resume heals dual-state active/completed work order collisions on disk."""
+    from validators.kernel.daemon.supervisor import Phase
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    comp_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    comp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collision on disk: WO-007 exists in BOTH ACTIVE and COMPLETED
+    (comp_dir / "WO-007.yaml").write_text("id: WO-007\nstatus: COMPLETED\n", encoding="utf-8")
+    (act_dir / "WO-007.yaml").write_text("id: WO-007\nstatus: ACTIVE\n", encoding="utf-8")
+
+    storage = DaemonStorage(tmp_path / ".daemon_storage")
+    manager = SessionManager(storage)
+    session = manager.create_session("claude", "mock-provider", {"allow": ["*"], "deny": []}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_state = manager.supervisor.start_run("run-heal", "Goal", tmp_path, sid)
+    run_state.phase = Phase.FAILED
+    run_state.planning_wo_id = "WO-007"
+    run_state.completed_wo_ids = ["WO-007"]
+    manager._active_runs["run-heal"] = run_state
+
+    # Resume run -> calls _prepare_run_for_resume
+    manager._prepare_run_for_resume(run_state, session, tmp_path)
+
+    # The stale active duplicate was removed
+    assert not (act_dir / "WO-007.yaml").exists()
+    assert (comp_dir / "WO-007.yaml").is_file()
+    # planning_wo_id was cleared so next advance will allocate fresh ID
+    assert run_state.planning_wo_id is None

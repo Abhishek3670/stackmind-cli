@@ -259,16 +259,18 @@ def resolve_bootstrap_work_order_id(workspace: Path | str, preferred_id: str = "
     ws = Path(workspace)
     active_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{preferred_id}.yaml"
     completed_path = ws / ".sync" / "work-orders" / "COMPLETED" / f"{preferred_id}.yaml"
-    if not active_path.exists() and not completed_path.exists():
+    blocked_path = ws / ".sync" / "work-orders" / "BLOCKED" / f"{preferred_id}.yaml"
+    if not active_path.exists() and not completed_path.exists() and not blocked_path.exists():
         return preferred_id
-    if active_path.exists():
+    if active_path.exists() and not completed_path.exists() and not blocked_path.exists():
         return preferred_id
 
     for i in range(1, 1000):
         candidate = f"WO-{i:03d}"
         cand_active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{candidate}.yaml"
         cand_comp = ws / ".sync" / "work-orders" / "COMPLETED" / f"{candidate}.yaml"
-        if not cand_active.exists() and not cand_comp.exists():
+        cand_block = ws / ".sync" / "work-orders" / "BLOCKED" / f"{candidate}.yaml"
+        if not cand_active.exists() and not cand_comp.exists() and not cand_block.exists():
             return candidate
     return preferred_id
 
@@ -288,7 +290,7 @@ def synthesize_bootstrap_planning(
     _scaffold_protocol_citizenship(ws, assigned_agent)
     now = _now()
 
-    actual_wo_id = wo_id or resolve_bootstrap_work_order_id(ws, "WO-000")
+    actual_wo_id = resolve_bootstrap_work_order_id(ws, wo_id or "WO-000")
 
     # 1. Construct Work Order record
     title_snippet = prompt.strip()[:80].replace("\n", " ").strip()
@@ -389,6 +391,15 @@ def synthesize_bootstrap_planning(
     wo_path.parent.mkdir(parents=True, exist_ok=True)
     wo_path.write_text(wo_yaml, encoding="utf-8")
 
+    # Invariant: work order must not exist in multiple state directories
+    for stale_dir in ("COMPLETED", "BLOCKED"):
+        stale_file = ws / ".sync" / "work-orders" / stale_dir / f"{actual_wo_id}.yaml"
+        if stale_file.is_file():
+            try:
+                stale_file.unlink()
+            except OSError:
+                pass
+
     contract_path = ws / ".sync" / "contracts" / f"{actual_wo_id}.yaml"
     contract_path.parent.mkdir(parents=True, exist_ok=True)
     contract_path.write_text(contract_yaml, encoding="utf-8")
@@ -405,25 +416,39 @@ def synthesize_bootstrap_planning(
         except Exception:
             pass
 
-    existing_order_ids = {
-        item.get("id") for item in index_data["orders"] if isinstance(item, dict)
+    target_entry = {
+        "id": actual_wo_id,
+        "type": wo_record["type"],
+        "title": wo_record["title"],
+        "status": wo_record["status"],
+        "priority": wo_record["priority"],
+        "assigned_agents": wo_record["assigned_agents"],
+        "dependencies": wo_record["dependencies"],
+        "deliverable": wo_record["deliverable"],
+        "created": wo_record["created"],
+        "updated": wo_record["updated"],
+        "file": f"work-orders/ACTIVE/{actual_wo_id}.yaml",
     }
-    if actual_wo_id not in existing_order_ids:
-        index_data["orders"].append({
-            "id": actual_wo_id,
-            "type": wo_record["type"],
-            "title": wo_record["title"],
-            "status": wo_record["status"],
-            "priority": wo_record["priority"],
-            "assigned_agents": wo_record["assigned_agents"],
-            "dependencies": wo_record["dependencies"],
-            "deliverable": wo_record["deliverable"],
-            "created": wo_record["created"],
-            "updated": wo_record["updated"],
-            "file": f"work-orders/ACTIVE/{actual_wo_id}.yaml",
-        })
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+    found = False
+    for i, item in enumerate(index_data["orders"]):
+        if isinstance(item, dict) and item.get("id") == actual_wo_id:
+            index_data["orders"][i] = target_entry
+            found = True
+            break
+    if not found:
+        index_data["orders"].append(target_entry)
+
+    index_data["total_active"] = sum(
+        1 for o in index_data["orders"] if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+    )
+    index_data["total_completed"] = sum(
+        1 for o in index_data["orders"] if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+    )
+    index_data["total_blocked"] = sum(
+        1 for o in index_data["orders"] if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
+    )
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
 
     # 6. Update .sync/runtime/TREE.yaml
     tree_path = ws / ".sync" / "runtime" / "TREE.yaml"
@@ -466,6 +491,8 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
         state.integration_operation_id = None
     elif phase == Phase.PLANNING:
         state.planning_operation_id = None
+        if getattr(state, "planning_wo_id", None) in getattr(state, "completed_wo_ids", []):
+            state.planning_wo_id = None
     elif phase == Phase.AUTHORING:
         state.authoring_operation_id = None
     state.batch_operation_id = None
@@ -1287,6 +1314,8 @@ class SessionManager:
         state.recovery_attempts.clear()
         state.dependency_escalation_retries.clear()
         state.worker_blockers.clear()
+        if getattr(state, "planning_wo_id", None) in getattr(state, "completed_wo_ids", []):
+            state.planning_wo_id = None
         # Operator resume grants a fresh rework budget: the human decided to
         # continue the run (often after a platform upgrade or manual repair),
         # so stale exhaustion from previous sessions must not dead-end it.
@@ -1344,6 +1373,18 @@ class SessionManager:
 
         # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
         self.supervisor.unblock_in_flight_work_orders(state)
+
+        # Clean up any stale active duplicates for work orders that are already completed
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+        if active_dir.is_dir() and completed_dir.is_dir():
+            for comp_file in completed_dir.glob("*.yaml"):
+                act_file = active_dir / comp_file.name
+                if act_file.is_file() and comp_file.stem in getattr(state, "completed_wo_ids", []):
+                    try:
+                        act_file.unlink()
+                    except OSError:
+                        pass
 
         # Synchronize INDEX.yaml and TREE.yaml with the unblocked work orders
         try:
@@ -1408,7 +1449,7 @@ class SessionManager:
                         candidate = Phase(p_from) if p_from else None
                     except ValueError:
                         candidate = None
-                    if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED, Phase.ARCHITECT_REPAIR):
+                    if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED, Phase.ARCHITECT_REPAIR, Phase.INIT):
                         prev_phase = candidate
                         break
             target_phase = prev_phase or (

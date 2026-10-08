@@ -2973,6 +2973,8 @@ class AgentRunner:
                     c_id = comp_data.get("id") or comp_file.stem
                     if c_id in existing_orders:
                         c_entry = existing_orders[c_id]
+                        if c_entry.get("file", "").startswith("work-orders/ACTIVE/"):
+                            continue
                         if c_entry.get("status") != "COMPLETED":
                             c_entry["status"] = "COMPLETED"
                             updated_index = True
