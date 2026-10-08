@@ -1380,11 +1380,13 @@ class SessionManager:
         if active_dir.is_dir() and completed_dir.is_dir():
             for comp_file in completed_dir.glob("*.yaml"):
                 act_file = active_dir / comp_file.name
-                if act_file.is_file() and comp_file.stem in getattr(state, "completed_wo_ids", []):
+                if act_file.is_file():
                     try:
                         act_file.unlink()
                     except OSError:
                         pass
+                if comp_file.stem not in getattr(state, "completed_wo_ids", []):
+                    state.completed_wo_ids.append(comp_file.stem)
 
         # Synchronize INDEX.yaml and TREE.yaml with the unblocked work orders
         try:

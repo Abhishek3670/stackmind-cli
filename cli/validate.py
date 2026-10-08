@@ -629,7 +629,13 @@ def _validate_lock(sync_path: Path, agents: list[str], result: ValidationResult)
     issue. This check flags only integrity problems: a LOCK file that exists
     but is malformed (ERROR), or one whose holder is not a known agent (WARN).
     """
-    from .lock import get_lock_path, lock_is_malformed, read_lock
+    try:
+        from .lock import get_lock_path, lock_is_malformed, read_lock
+    except (ImportError, ValueError):
+        try:
+            from lock import get_lock_path, lock_is_malformed, read_lock
+        except (ImportError, ValueError):
+            from ..lock import get_lock_path, lock_is_malformed, read_lock
 
     lock_path = get_lock_path(sync_path)
     if not lock_path.exists():

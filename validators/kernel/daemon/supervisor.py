@@ -4072,7 +4072,7 @@ class LifecycleSupervisor:
         """Reset non-completed work orders on disk back to ACTIVE when resuming a run."""
         ws = Path(state.workspace)
         candidate_ids: list[str] = []
-        if state.planning_wo_id and state.phase == Phase.PLANNING:
+        if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
             candidate_ids.append(state.planning_wo_id)
         candidate_ids.extend(state.worker_wo_ids)
         if state.integration_wo_id:
@@ -4685,6 +4685,11 @@ def archive_completed_work_orders(
             pass
         archived.append(wo_id)
 
+    # Also include any target_ids that are already in completed_dir
+    for target_id in target_ids:
+        if (completed_dir / f"{target_id}.yaml").is_file() and target_id not in archived:
+            archived.append(target_id)
+
     if not archived:
         return []
 
@@ -4735,6 +4740,12 @@ def archive_completed_work_orders(
             tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
         except Exception:
             pass
+
+    try:
+        from validators.harness.runner import HarnessRunner
+        HarnessRunner._sync_index_and_tree_yaml(ws)
+    except Exception:
+        pass
 
     return archived
 

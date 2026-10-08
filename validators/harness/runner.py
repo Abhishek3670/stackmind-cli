@@ -22,7 +22,7 @@ from typing import Any, Callable, Protocol, Sequence
 import yaml
 from jsonschema import Draft7Validator
 
-from cli.lock import acquire_lock, release_lock
+from lock import acquire_lock, release_lock
 from cli.validate import validate as validate_runtime
 from validators.knowledge.contract import ContractAccessDenied, ContractExpiredError
 from validators.harness.retrieval import (
@@ -2920,6 +2920,48 @@ class AgentRunner:
             updated_index = False
             assigned_per_agent: dict[str, list[str]] = {}
 
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            completed_dir = sync_dir / "work-orders" / "COMPLETED"
+            if completed_dir.is_dir():
+                for comp_file in sorted(completed_dir.glob("*.yaml")):
+                    comp_data = yaml.safe_load(comp_file.read_text(encoding="utf-8")) or {}
+                    c_id = comp_data.get("id") or comp_file.stem
+                    active_dup = active_dir / comp_file.name
+                    if active_dup.is_file():
+                        try:
+                            active_dup.unlink()
+                        except OSError:
+                            pass
+                    c_file = f"work-orders/COMPLETED/{comp_file.name}"
+                    if c_id in existing_orders:
+                        c_entry = existing_orders[c_id]
+                        if c_entry.get("status") != "COMPLETED":
+                            c_entry["status"] = "COMPLETED"
+                            updated_index = True
+                        if c_entry.get("file") != c_file:
+                            c_entry["file"] = c_file
+                            updated_index = True
+                    else:
+                        c_entry = {
+                            "id": c_id,
+                            "type": comp_data.get("type", "FEATURE"),
+                            "title": comp_data.get("title", f"Work order {c_id}"),
+                            "status": "COMPLETED",
+                            "priority": comp_data.get("priority", "P0"),
+                            "assigned_agents": comp_data.get("assigned_agents", ["codex"]),
+                            "dependencies": comp_data.get("dependencies", []),
+                            "created": str(comp_data.get("created") or now_iso),
+                            "updated": str(comp_data.get("updated") or now_iso),
+                            "file": c_file,
+                        }
+                        if comp_data.get("deliverable"):
+                            c_entry["deliverable"] = comp_data["deliverable"]
+                        orders.append(c_entry)
+                        existing_orders[c_id] = c_entry
+                        updated_index = True
+
             for wo_file in sorted(active_dir.glob("*.yaml")):
                 wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
                 if not isinstance(wo_data, dict):
@@ -2934,8 +2976,6 @@ class AgentRunner:
                     assigned_per_agent.setdefault(agents.lower().strip(), []).append(wo_id)
 
                 if wo_id not in existing_orders:
-                    from datetime import datetime, timezone
-                    now_iso = datetime.now(timezone.utc).isoformat()
                     created_val = wo_data.get("created") or now_iso
                     updated_val = wo_data.get("updated") or now_iso
                     new_entry = {
@@ -2966,22 +3006,38 @@ class AgentRunner:
                         entry["file"] = target_file
                         updated_index = True
 
-            completed_dir = sync_dir / "work-orders" / "COMPLETED"
-            if completed_dir.is_dir():
-                for comp_file in sorted(completed_dir.glob("*.yaml")):
-                    comp_data = yaml.safe_load(comp_file.read_text(encoding="utf-8")) or {}
-                    c_id = comp_data.get("id") or comp_file.stem
-                    if c_id in existing_orders:
-                        c_entry = existing_orders[c_id]
-                        if c_entry.get("file", "").startswith("work-orders/ACTIVE/"):
-                            continue
-                        if c_entry.get("status") != "COMPLETED":
-                            c_entry["status"] = "COMPLETED"
+            blocked_dir = sync_dir / "work-orders" / "BLOCKED"
+            if blocked_dir.is_dir():
+                for b_file in sorted(blocked_dir.glob("*.yaml")):
+                    b_data = yaml.safe_load(b_file.read_text(encoding="utf-8")) or {}
+                    b_id = b_data.get("id") or b_file.stem
+                    b_rel = f"work-orders/BLOCKED/{b_file.name}"
+                    if b_id in existing_orders:
+                        b_entry = existing_orders[b_id]
+                        if b_entry.get("status") != "BLOCKED":
+                            b_entry["status"] = "BLOCKED"
                             updated_index = True
-                        c_file = f"work-orders/COMPLETED/{comp_file.name}"
-                        if c_entry.get("file") != c_file:
-                            c_entry["file"] = c_file
+                        if b_entry.get("file") != b_rel:
+                            b_entry["file"] = b_rel
                             updated_index = True
+                    else:
+                        b_entry = {
+                            "id": b_id,
+                            "type": b_data.get("type", "FEATURE"),
+                            "title": b_data.get("title", f"Work order {b_id}"),
+                            "status": "BLOCKED",
+                            "priority": b_data.get("priority", "P0"),
+                            "assigned_agents": b_data.get("assigned_agents", ["codex"]),
+                            "dependencies": b_data.get("dependencies", []),
+                            "created": str(b_data.get("created") or now_iso),
+                            "updated": str(b_data.get("updated") or now_iso),
+                            "file": b_rel,
+                        }
+                        if b_data.get("deliverable"):
+                            b_entry["deliverable"] = b_data["deliverable"]
+                        orders.append(b_entry)
+                        existing_orders[b_id] = b_entry
+                        updated_index = True
 
             tot_active = sum(
                 1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
@@ -3003,6 +3059,7 @@ class AgentRunner:
                 updated_index = True
 
             if updated_index:
+                index_data["last_updated"] = now_iso
                 index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
 
             # Also ensure work_orders totals and assigned_work_orders in TREE.yaml are updated
@@ -3017,6 +3074,18 @@ class AgentRunner:
                                 tree_data["work_orders"][k] = index_data.get(k, 0)
                                 updated_tree = True
                     if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                        completed_set = {
+                            o.get("id") for o in orders
+                            if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+                        }
+                        for ag_name, ag_entry in tree_data["agents"].items():
+                            if isinstance(ag_entry, dict) and "assigned_work_orders" in ag_entry:
+                                curr = ag_entry["assigned_work_orders"]
+                                if isinstance(curr, list):
+                                    filtered = [w for w in curr if w not in completed_set]
+                                    if filtered != curr:
+                                        ag_entry["assigned_work_orders"] = filtered
+                                        updated_tree = True
                         for ag_name, wo_ids in assigned_per_agent.items():
                             if ag_name in tree_data["agents"]:
                                 ag_entry = tree_data["agents"][ag_name]
