@@ -37,6 +37,13 @@ _PLANNING_WO_IDS = {"WO-000"}
 _WO_ID_PATTERN = re.compile(r"^WO-[0-9]{3,}$")
 
 
+def _parse_wo_index(wo_id: str | None) -> int | None:
+    if not wo_id:
+        return None
+    m = re.match(r"^WO-([0-9]+)$", str(wo_id).strip())
+    return int(m.group(1)) if m else None
+
+
 @dataclass(frozen=True)
 class ReadinessIssue:
     """One structured readiness failure with a stable, machine-readable code.
@@ -89,6 +96,7 @@ class AuthoringReadinessResult:
     plan_id: str
     artifact_paths: tuple[str, ...] = ()
     issues: tuple[ReadinessIssue, ...] = field(default_factory=tuple)
+    warnings: tuple[str, ...] = ()
 
     def issue_codes(self) -> tuple[str, ...]:
         return tuple(sorted({issue.code for issue in self.issues}))
@@ -113,17 +121,59 @@ def _issue(issues: list[ReadinessIssue], code: str, category: str, message: str,
     issues.append(ReadinessIssue(code, category, message, **kw))
 
 
+_TITLE_STOP_WORDS = {
+    "and", "the", "for", "of", "a", "an", "to", "in", "with", "on", "by", "at", "as", "via"
+}
+
+_ACTION_PREFIX_VERBS = {
+    "implement", "implementation", "create", "creating", "build", "building",
+    "add", "adding", "develop", "development", "setup", "set", "author", "authoring",
+    "perform", "execute"
+}
+
+_SYNONYM_CLUSTERS = (
+    {"qa", "quality", "assurance"},
+    {"test", "testing", "tests", "validation", "validate", "verify", "verification"},
+    {"release", "gitops", "packaging", "package", "versioning", "version", "deployment", "deploy", "finalization"},
+    {"engine", "logic", "core"},
+    {"scaffolding", "scaffold", "setup", "init", "initialize", "initialization", "structure"},
+    {"ui", "frontend", "interface"},
+    {"api", "backend", "endpoint", "service"},
+    {"calc", "calculate", "calculation", "calculator"},
+)
+
+
+def _stem(word: str) -> str:
+    w = word.lower()
+    for sfx in ("ing", "tion", "tions", "ment", "es", "s"):
+        if len(w) > len(sfx) + 2 and w.endswith(sfx):
+            return w[:-len(sfx)]
+    return w
+
+
+def _expand_tokens(tokens: set[str]) -> set[str]:
+    expanded = set(tokens)
+    for t in list(tokens):
+        st = _stem(t)
+        expanded.add(st)
+        for cluster in _SYNONYM_CLUSTERS:
+            if t in cluster or st in {_stem(c) for c in cluster}:
+                expanded.update(cluster)
+                expanded.update(_stem(c) for c in cluster)
+    return expanded
+
+
 def _title_tokens(value: Any) -> set[str]:
-    stop = {"and", "the", "for", "of", "a", "an", "to", "in", "with", "on"}
     return {
-        t for t in re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower()).split() if t not in stop
+        t for t in re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower()).split()
+        if t not in _TITLE_STOP_WORDS
     }
 
 
 def _title_token_list(value: Any) -> list[str]:
-    stop = {"and", "the", "for", "of", "a", "an", "to", "in", "with", "on"}
     return [
-        t for t in re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower()).split() if t not in stop
+        t for t in re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower()).split()
+        if t not in _TITLE_STOP_WORDS
     ]
 
 
@@ -136,13 +186,15 @@ def _contains_contiguous(haystack: list[str], needle: list[str]) -> bool:
 
 
 def milestone_matches(milestone: str, wo_title: str) -> bool:
-    """Deterministic lenient matcher: containment or >=60% token overlap.
+    """Deterministic lenient matcher: containment, synonym expansion, or token overlap.
 
     Containment is checked in the ORIGINAL token order (so a work order titled
     "Frontend Scaffolding" matches the plan milestone "Frontend Scaffolding
     (Agent: gemini)") as well as on the legacy sorted-token text; the sorted
     variant alone silently rejected titles whose trailing annotations sorted
     between the title's own words.
+    Also handles domain synonyms (e.g. QA <-> Quality Assurance, Testing <-> Validation,
+    Release <-> Packaging/Versioning), action verb stripping, and stemming.
     """
     m_tokens = _title_tokens(milestone)
     w_tokens = _title_tokens(wo_title)
@@ -159,7 +211,43 @@ def milestone_matches(milestone: str, wo_title: str) -> bool:
     if m_text == w_text or m_text in w_text or w_text in m_text:
         return True
     overlap = len(m_tokens & w_tokens) / max(len(m_tokens), len(w_tokens))
-    return overlap >= 0.6
+    if overlap >= 0.6:
+        return True
+
+    # Semantic & synonym-expanded matching
+    m_core = m_tokens - _ACTION_PREFIX_VERBS
+    w_core = w_tokens - _ACTION_PREFIX_VERBS
+    if not m_core or not w_core:
+        return False
+    if m_core == w_core:
+        return True
+
+    raw_overlap = len(m_core & w_core) / max(len(m_core), len(w_core))
+    if raw_overlap >= 0.6 or (raw_overlap >= 0.5 and len(m_core & w_core) >= 2):
+        return True
+
+    m_exp = _expand_tokens(m_core)
+    w_exp = _expand_tokens(w_core)
+    inter = m_exp & w_exp
+    if not inter:
+        return False
+
+    m_core_matched = sum(
+        1 for t in m_core
+        if t in w_exp or _stem(t) in w_exp or any(t in c and bool(w_exp & c) for c in _SYNONYM_CLUSTERS)
+    )
+    w_core_matched = sum(
+        1 for t in w_core
+        if t in m_exp or _stem(t) in m_exp or any(t in c and bool(m_exp & c) for c in _SYNONYM_CLUSTERS)
+    )
+    if m_core_matched >= 2 and w_core_matched >= 2:
+        return True
+    if len(m_core) == 1 and len(w_core) == 1 and m_core_matched == 1 and w_core_matched == 1:
+        return True
+    if (m_core_matched / len(m_core) >= 0.6) and (w_core_matched / len(w_core) >= 0.6):
+        return True
+
+    return False
 
 
 def load_expected_milestones(workspace: Path | str) -> list[str] | None:
@@ -207,14 +295,43 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
     """Match an authored work order to a plan milestone reference.
 
     Stable ``milestone_id`` equality is the primary identity; lexical title
-    similarity is the backward-compatible fallback for artifacts that predate
-    compiler-injected ids.
+    similarity and agent alignment are the backward-compatible fallback for
+    artifacts that predate compiler-injected ids.
     """
     wo_mid = str(data.get(MILESTONE_ID_FIELD) or "").strip()
     ref_id = str(ref.get("id") or "").strip()
     if wo_mid and ref_id:
         return wo_mid.lower() == ref_id.lower()
-    return milestone_matches(ref.get("title"), str(data.get("title", "")))
+
+    if milestone_matches(str(ref.get("title") or ""), str(data.get("title", ""))):
+        return True
+
+    ref_agent = str(ref.get("agent") or "").strip().lower()
+    if ref_agent:
+        wo_assigned = data.get("assigned_agents")
+        wo_agents = [
+            str(a).strip().lower()
+            for a in (wo_assigned if isinstance(wo_assigned, list) else [wo_assigned])
+            if a
+        ]
+        if ref_agent in wo_agents:
+            m_tokens = _title_tokens(ref.get("title")) - _ACTION_PREFIX_VERBS
+            w_tokens = _title_tokens(data.get("title")) - _ACTION_PREFIX_VERBS
+            if m_tokens and w_tokens:
+                m_exp = _expand_tokens(m_tokens)
+                w_exp = _expand_tokens(w_tokens)
+                shared_exact = m_tokens & w_tokens
+                shared_exp = m_exp & w_exp
+                m_matched = sum(1 for t in m_tokens if t in w_exp or _stem(t) in w_exp or any(t in c and bool(w_exp & c) for c in _SYNONYM_CLUSTERS))
+                w_matched = sum(1 for t in w_tokens if t in m_exp or _stem(t) in m_exp or any(t in c and bool(m_exp & c) for c in _SYNONYM_CLUSTERS))
+                if m_matched >= 2 and w_matched >= 2:
+                    return True
+                if len(m_tokens) == 1 and len(w_tokens) == 1 and m_matched == 1 and w_matched == 1:
+                    return True
+                if (m_matched / len(m_tokens) >= 0.6) and (w_matched / len(w_tokens) >= 0.6):
+                    return True
+
+    return False
 
 
 def _path_matches_rule(norm_path: str, pattern: str) -> bool:
@@ -351,6 +468,7 @@ def validate_authoring_readiness(
     plan_id: str = "",
     expected_milestones: Sequence[str] | None = None,
     planning_wo_id: str = "WO-000",
+    completed_wo_ids: Sequence[str] | None = None,
 ) -> AuthoringReadinessResult:
     """Validate the authored artifact set for atomic publication.
 
@@ -359,6 +477,7 @@ def validate_authoring_readiness(
     """
     ws = Path(workspace)
     issues: list[ReadinessIssue] = []
+    warnings: list[str] = []
     artifact_paths: list[str] = []
     skip_ids = _PLANNING_WO_IDS | ({planning_wo_id} if planning_wo_id else set())
 
@@ -459,7 +578,21 @@ def validate_authoring_readiness(
 
     # ── 4. Milestone coverage ───────────────────────────────────────
     if expected_milestones:
-        all_known_wos = {**completed_wo_files, **wo_files}
+        p_idx = _parse_wo_index(planning_wo_id)
+        if completed_wo_ids is not None:
+            valid_completed = set(completed_wo_ids)
+            plan_completed_wos = {
+                wid: item for wid, item in completed_wo_files.items()
+                if wid in valid_completed
+            }
+        elif p_idx is not None:
+            plan_completed_wos = {
+                wid: item for wid, item in completed_wo_files.items()
+                if (_parse_wo_index(wid) or 0) > p_idx
+            }
+        else:
+            plan_completed_wos = dict(completed_wo_files)
+        all_known_wos = {**plan_completed_wos, **wo_files}
         refs: list[dict[str, Any]] = []
         for entry in expected_milestones:
             if isinstance(entry, dict):
@@ -486,7 +619,7 @@ def validate_authoring_readiness(
                     "coverage",
                     f"Expected implementation milestone '{ref['title']}' has no authored work order",
                     why=(
-                        "Every approved plan milestone must map to exactly one authored "
+                        "Every approved plan milestone must map to at least one authored "
                         "work order before dispatch."
                     ),
                     actual_state=f"no authored work order matches milestone '{ref['title']}'",
@@ -498,24 +631,33 @@ def validate_authoring_readiness(
                     canonical_rule="milestone.identity",
                 )
             else:
-                _issue(
-                    issues,
-                    "MILESTONE_AMBIGUOUS",
-                    "coverage",
-                    f"Expected implementation milestone '{ref['title']}' is covered by multiple "
-                    f"work orders ({', '.join(sorted(matched))}); split milestones via a "
-                    "recovery decision instead",
-                    why="Ambiguous coverage makes dispatch responsibility undefined.",
-                    actual_state=f"work orders {', '.join(sorted(matched))} all match",
-                    expected_state="exactly one matching work order per milestone",
-                    required_action=(
-                        "Re-title or re-scope the overlapping work orders so each plan "
-                        "milestone has one owner; use a recovery decision to split "
-                        "milestones when both work orders are genuinely required."
-                    ),
-                    canonical_rule="milestone.identity",
-                    affected_artifacts=tuple(sorted(matched)),
-                )
+                ref_id_str = str(ref.get("id") or "").strip().lower()
+                explicit_matches = [
+                    wo_id for wo_id in matched
+                    if ref_id_str and str(all_known_wos[wo_id][1].get(MILESTONE_ID_FIELD) or "").strip().lower() == ref_id_str
+                ]
+                # If they matched solely via heuristic title matching without explicit
+                # milestone_ids, surface the ambiguity. Explicit milestone_id linkage
+                # signals intentional 1:N milestone decomposition.
+                if len(explicit_matches) != len(matched):
+                    _issue(
+                        issues,
+                        "MILESTONE_AMBIGUOUS",
+                        "coverage",
+                        f"Expected implementation milestone '{ref['title']}' is covered by multiple "
+                        f"work orders ({', '.join(sorted(matched))}); split milestones via a "
+                        "recovery decision instead",
+                        why="Ambiguous coverage makes dispatch responsibility undefined.",
+                        actual_state=f"work orders {', '.join(sorted(matched))} all match",
+                        expected_state="exactly one matching work order per milestone",
+                        required_action=(
+                            "Re-title or re-scope the overlapping work orders so each plan "
+                            "milestone has one owner; use a recovery decision to split "
+                            "milestones when both work orders are genuinely required."
+                        ),
+                        canonical_rule="milestone.identity",
+                        affected_artifacts=tuple(sorted(matched)),
+                    )
 
     # ── 5. Contract binding, roles, deliverables, deps, budget, scope ──
     for wo_id, (rel, data) in sorted(wo_files.items()):
@@ -617,6 +759,16 @@ def validate_authoring_readiness(
         if contract is not None and deliv_path:
             if not _scope_allows(contract.data, deliv_path):
                 _issue(issues, "DELIVERABLE_OUTSIDE_SCOPE", "scope", f"Contract '{contract.path}' scope does not authorize deliverable path " f"'{deliv_path}'", work_order_id=wo_id, artifact_path=contract.path)
+
+        # Acceptance criteria: warning-only nudge (adoption pattern mirrors
+        # test_plan) — machine-checkable criteria let QA verify against the
+        # architect's stated intent instead of guessing it.
+        if not data.get("acceptance_criteria"):
+            warnings.append(
+                f"Work order '{wo_id}' declares no acceptance_criteria; QA verifies "
+                "against machine-checkable statements — author them during the next "
+                "amend or authoring pass"
+            )
 
         # Dependencies exist
         deps = data.get("dependencies")
@@ -724,6 +876,7 @@ def validate_authoring_readiness(
         plan_id=plan_id,
         artifact_paths=tuple(sorted(set(artifact_paths))),
         issues=tuple(issues),
+        warnings=tuple(warnings),
     )
 
 

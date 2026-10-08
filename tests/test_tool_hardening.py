@@ -1127,3 +1127,42 @@ def test_preexisting_deliverable_noop_turn_blocked_even_with_bookkeeping(tmp_pat
     assert len(inbox_reviews) == 0
 
 
+def test_validate_decision_defaults_release_target_from_deliverable(tmp_path: Path) -> None:
+    from validators.harness.runner import HarnessTask
+    init(tmp_path)
+    runner = AgentRunner(tmp_path, "gemini")
+    task = HarnessTask(
+        kind="work_order",
+        identifier="WO-001",
+        path=tmp_path / "WO-001.yaml",
+        title="Test Work Order",
+        body="Test Body",
+        query="Test Query",
+        work_order_id="WO-001",
+        deliverable_path="index.html",
+    )
+    # Payload omitting release_target entirely
+    decision = runner._validate_decision(task, {
+        "status": "completed",
+        "summary": "Completed scaffolding",
+        "report_markdown": "Created index.html",
+        "modified_files": ["index.html"],
+        "blockers": [],
+    })
+    assert decision.status == "completed"
+    assert decision.release_target == "index.html"
+
+    # Payload explicitly null/empty release_target
+    decision_null = runner._validate_decision(task, {
+        "status": "completed",
+        "summary": "Completed scaffolding",
+        "report_markdown": "Created index.html",
+        "modified_files": ["index.html"],
+        "release_target": None,
+        "blockers": [],
+    })
+    assert decision_null.status == "completed"
+    assert decision_null.release_target == "index.html"
+
+
+

@@ -66,6 +66,7 @@ def test_runner_completes_assigned_work_order_and_keeps_tree_byte_identical(tmp_
     tree = yaml.safe_load(tree_path.read_text(encoding='utf-8'))
     tree['agents']['codex']['assigned_work_orders'] = ['WO-101']
     tree['agents']['codex']['status'] = 'assigned'
+    tree['work_orders']['total_active'] = 1
     _write_yaml(tree_path, tree)
     tree_before = tree_path.read_bytes()
 

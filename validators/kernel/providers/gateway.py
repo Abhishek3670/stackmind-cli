@@ -1154,6 +1154,35 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
 )
 
 
+WORKER_CODE_CORE_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "apply_patch",
+    "list_directory",
+    "glob",
+    "grep",
+    "run_command",
+)
+WORKER_QA_CORE_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "list_directory",
+    "glob",
+    "run_tests",
+    "run_lint",
+    "run_security_scan",
+    "verify_deliverable",
+)
+WORKER_GITOPS_CORE_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "list_directory",
+    "git_status",
+    "git_diff",
+    "git_log",
+)
+
+
 def get_curated_tools_for_phase(
     role_or_agent: str,
     phase: str | None = None,
@@ -1186,15 +1215,19 @@ def get_curated_tools_for_phase(
             curated.append(request_tools_def)
         return curated
 
-    # For other roles (codex, gemini, gemma, local-llm):
-    # If running against local Ollama, trim extraneous kernel diagnostic tools
-    if backend_id in ("ollama", "local", "local-llm"):
-        omitted = {
-            "checkpoint", "restore_checkpoint", "inspect_budget", "explain_denial",
-            "verify_scope", "dispatch_subagent", "compare_snapshots", "skill_mine",
-            "skill_promote", "skill_list", "skill_retrieve", "experience_search",
-        }
-        curated = [t for t in all_permitted if t.name not in omitted]
+    # For worker roles (codex, gemini, gemma, local-llm):
+    # When running against local/Ollama models or when curated palette is requested,
+    # supply role-specific core tool sets (5-8 tools) + request_tools for on-demand discovery.
+    is_local_backend = backend_id in ("ollama", "local", "local-llm")
+    if is_local_backend or phase is not None:
+        if norm_role in ("gemma", "qa"):
+            wanted = set(WORKER_QA_CORE_TOOL_NAMES)
+        elif norm_role in ("local-llm", "gitops"):
+            wanted = set(WORKER_GITOPS_CORE_TOOL_NAMES)
+        else:
+            wanted = set(WORKER_CODE_CORE_TOOL_NAMES)
+
+        curated = [t for t in all_permitted if t.name in wanted]
         if request_tools_def and request_tools_def not in curated:
             curated.append(request_tools_def)
         return curated
@@ -1238,6 +1271,9 @@ def check_cancellation(cancellation_token: Any | None) -> None:
         raise OperationCancelledError("Operation cancelled via cancellation token")
 
 
+_POLLING_TOOLS = {"process_status", "process_output", "process_poll", "task_status"}
+
+
 def detect_tool_cycle(signatures: list[tuple[str, str]]) -> str | None:
     """Detect repeating cycles of tool calls (e.g. A->B->A->B)."""
     for cycle_len in (2, 3):
@@ -1247,9 +1283,15 @@ def detect_tool_cycle(signatures: list[tuple[str, str]]) -> str | None:
                 chunk = signatures[-needed:]
                 pattern = chunk[:cycle_len]
                 if chunk == pattern * mult:
+                    # Polling tools (e.g. process_status -> process_output) naturally alternate
+                    # while waiting for background operations; exempt them from false-positive trips.
+                    if mult < 4 and all(p[0] in _POLLING_TOOLS for p in pattern):
+                        continue
                     names = " -> ".join(p[0] for p in pattern)
                     return f"Pathological tool call cycle detected: ({names}) repeated {mult} times without progress"
     return None
+
+
 
 
 class ProviderGateway:
@@ -1515,6 +1557,9 @@ class ProviderGateway:
                     "linters": {"run_command"},
                     "diagnostics": {"inspect_environment", "inspect_logs", "inspect_version", "checkpoint"},
                     "search": {"grep", "glob", "semantic_search", "search_docs"},
+                    "browser": {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "inspect_screenshot"},
+                    "process": {"process_start", "process_status", "process_output", "process_stop"},
+                    "testing": {"run_tests", "run_lint", "run_typecheck", "run_security_scan", "verify_deliverable", "verify_tests"},
                 }
 
                 target_names = set(category_tools.get(query, set()))
@@ -1825,6 +1870,7 @@ class ProviderGateway:
                 if all(s == last_sig for s in recent_signatures[-DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:]):
                     if (
                         last_sig[0] in ("read_file", "list_directory", "glob", "grep")
+                        and required_deliverable
                         and loop_nudges < max_loop_nudges
                     ):
                         loop_nudges += 1
@@ -1832,7 +1878,7 @@ class ProviderGateway:
                         recent_signatures = [s for s in recent_signatures if s != last_sig] + [last_sig]
                         target_hint = (
                             f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
-                            if (required_deliverable and not self.has_written_deliverable(required_deliverable))
+                            if not self.has_written_deliverable(required_deliverable)
                             else " Proceed immediately with your work."
                         )
                         messages.append(Message.user(
@@ -1857,6 +1903,7 @@ class ProviderGateway:
             if triggered_sig is not None:
                 if (
                     triggered_sig[0] in ("read_file", "list_directory", "glob", "grep")
+                    and required_deliverable
                     and loop_nudges < max_loop_nudges
                 ):
                     loop_nudges += 1
@@ -1864,7 +1911,7 @@ class ProviderGateway:
                     recent_signatures = [s for s in recent_signatures if s != triggered_sig] + [triggered_sig]
                     target_hint = (
                         f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
-                        if (required_deliverable and not self.has_written_deliverable(required_deliverable))
+                        if not self.has_written_deliverable(required_deliverable)
                         else " Proceed immediately with your work."
                     )
                     messages.append(Message.user(

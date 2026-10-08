@@ -91,7 +91,7 @@ def _is_non_secret_name(name: str) -> bool:
     return bool(_NON_SECRET_NAME_PATTERN.match(base))
 
 
-def scan_file(rel_path: str, content: str) -> list[SecurityFinding]:
+def scan_file(rel_path: str, content: str, *, allow_debug: bool = False) -> list[SecurityFinding]:
     """Scan one file's content and return deterministic security findings."""
     findings: list[SecurityFinding] = []
     is_python = rel_path.endswith(".py")
@@ -134,6 +134,8 @@ def scan_file(rel_path: str, content: str) -> list[SecurityFinding]:
             continue
 
         if is_python and _DEBUG_ASSIGN_PATTERN.search(code_part):
+            if allow_debug:
+                continue
             findings.append(SecurityFinding(
                 code="DEBUG_MODE_ENABLED",
                 severity="critical",
@@ -160,16 +162,16 @@ def scan_file(rel_path: str, content: str) -> list[SecurityFinding]:
     return findings
 
 
-def scan_files(entries: Iterable[tuple[str, str]]) -> list[SecurityFinding]:
+def scan_files(entries: Iterable[tuple[str, str]], *, allow_debug: bool = False) -> list[SecurityFinding]:
     """Scan (relative_path, content) pairs and return sorted findings."""
     findings: list[SecurityFinding] = []
     for rel_path, content in entries:
-        findings.extend(scan_file(rel_path, content))
+        findings.extend(scan_file(rel_path, content, allow_debug=allow_debug))
     findings.sort(key=lambda f: (f.path, f.line, f.code))
     return findings
 
 
-def scan_directory(root: Path, target: str = ".") -> list[SecurityFinding]:
+def scan_directory(root: Path, target: str = ".", *, allow_debug: bool = False) -> list[SecurityFinding]:
     """Scan Python files under ``root/target`` (directory or single file)."""
     target_path = (Path(root) / target).resolve() if not Path(target).is_absolute() else Path(target)
     if target_path.is_file():
@@ -182,7 +184,7 @@ def scan_directory(root: Path, target: str = ".") -> list[SecurityFinding]:
             if parts & {".git", ".venv", "venv", "__pycache__", "node_modules", ".sync"}:
                 continue
             entries.append((rel, _read(f)))
-    return scan_files((p, c) for p, c in entries if c is not None)
+    return scan_files(((p, c) for p, c in entries if c is not None), allow_debug=allow_debug)
 
 
 def _read(path: Path) -> str | None:

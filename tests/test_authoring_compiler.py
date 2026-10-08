@@ -382,6 +382,38 @@ class TestContractIdentityNormalization:
         saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
         assert saved["agent_id"] == "codex"
 
+    def test_contradictory_deny_rules_are_sanitized(self, tmp_path: Path) -> None:
+        """When a contract has allow: .sync/inbox/claude/** and broad deny: .sync/**,
+        the compiler drops the conflicting .sync/** deny rule."""
+        write_wo(tmp_path, make_wo("WO-004", "gemma", "tests/test_visuals.py"))
+        raw = make_contract("WO-004", "gemma", [{"module": "tests/**"}, {"module": ".sync/inbox/claude/**"}])
+        raw["scope"]["deny"] = [{"module": ".git/**"}, {"module": ".sync/**"}]
+        contract_rel = write_contract(tmp_path, raw)
+
+        result = compile_authoring_artifacts(tmp_path)
+
+        assert contract_rel in result.normalized_paths
+        saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
+        denied = [r["module"] for r in saved["scope"]["deny"]]
+        assert ".git/**" in denied
+        assert ".sync/**" not in denied
+        assert any("-scope.deny: .sync/**" in item for item in result.injections[contract_rel])
+
+    def test_specific_deny_rules_are_preserved(self, tmp_path: Path) -> None:
+        """Specific deny exclusions inside an allow pattern (e.g. src/secret.py inside src/**)
+        must NOT be dropped."""
+        write_wo(tmp_path, make_wo("WO-001", "codex", "src/app.py"))
+        raw = make_contract("WO-001", "codex", [{"module": "src/**"}])
+        raw["scope"]["deny"] = [{"module": ".git/**"}, {"module": "src/secret.py"}]
+        contract_rel = write_contract(tmp_path, raw)
+
+        result = compile_authoring_artifacts(tmp_path)
+
+        saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
+        denied = [r["module"] for r in saved["scope"]["deny"]]
+        assert ".git/**" in denied
+        assert "src/secret.py" in denied
+
 
 # ─── Declared test plan validation ────────────────────────────────────
 

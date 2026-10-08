@@ -39,7 +39,9 @@ from validators.harness.authoring_readiness import (
     _planned_test_paths,
     _covers_stem,
     _scope_allows,
+    _title_tokens,
     milestone_matches,
+    _wo_matches_milestone,
 )
 
 _NORMALIZED_BY = f"authoring-compiler/{POLICY_VERSION}"
@@ -121,6 +123,44 @@ def compile_authoring_artifacts(
             normalized.append(rel)
         injections.setdefault(rel, []).append(what)
 
+    # ── Anti-collision check: detect active work orders colliding with COMPLETED/BLOCKED
+    closed_ids: set[str] = set()
+    for sub in ("COMPLETED", "BLOCKED"):
+        d = ws / ".sync" / "work-orders" / sub
+        if d.is_dir():
+            closed_ids.update(f.stem for f in d.glob("*.yaml"))
+
+    if closed_ids and active_dir.is_dir():
+        active_wo_files = sorted(active_dir.glob("*.yaml"))
+        colliding = [f for f in active_wo_files if f.stem in closed_ids]
+        if colliding:
+            from validators.kernel.daemon.authoring import get_next_work_order_int
+            start_idx = get_next_work_order_int(ws)
+            id_map: dict[str, str] = {}
+            for offset, f in enumerate(colliding):
+                new_id = f"WO-{start_idx + offset:03d}"
+                id_map[f.stem] = new_id
+
+            for old_id, new_id in id_map.items():
+                old_f = active_dir / f"{old_id}.yaml"
+                new_f = active_dir / f"{new_id}.yaml"
+                if old_f.is_file():
+                    data = _load_yaml_mapping(old_f) or {}
+                    data["id"] = new_id
+                    deps = data.get("dependencies", [])
+                    if isinstance(deps, list):
+                        data["dependencies"] = [id_map.get(d, d) for d in deps]
+                    _mark(new_f.relative_to(ws).as_posix(), f"+renumber: {old_id} -> {new_id} (anti-collision)", data, new_f)
+                    old_f.unlink(missing_ok=True)
+                if contracts_dir.is_dir():
+                    old_c = contracts_dir / f"{old_id}.yaml"
+                    new_c = contracts_dir / f"{new_id}.yaml"
+                    if old_c.is_file():
+                        c_data = _load_yaml_mapping(old_c) or {}
+                        c_data["work_order"] = new_id
+                        _mark(new_c.relative_to(ws).as_posix(), f"+contract renumber: {old_id} -> {new_id}", c_data, new_c)
+                        old_c.unlink(missing_ok=True)
+
     # ── Work orders: milestone identity + declared test plan ──────────
     wo_records: list[tuple[str, Path, dict[str, Any]]] = []
     for wo_path in sorted(active_dir.glob("*.yaml")) if active_dir.is_dir() else []:
@@ -132,6 +172,7 @@ def compile_authoring_artifacts(
 
     mapped_ids: set[str] = set()
     unmapped: list[tuple[str, Path, dict[str, Any]]] = []
+    ambiguous: list[tuple[str, Path, dict[str, Any], list[dict[str, Any]]]] = []
     had_ambiguity = False
 
     for rel, wo_path, data in wo_records:
@@ -173,8 +214,23 @@ def compile_authoring_artifacts(
 
         matches = [
             m for m in plan_milestones
-            if milestone_matches(str(m.get("title") or ""), str(data.get("title", "")))
+            if _wo_matches_milestone(data, m)
         ]
+        if len(matches) > 1:
+            wo_assigned = data.get("assigned_agents")
+            wo_agents = [
+                str(a).strip().lower()
+                for a in (wo_assigned if isinstance(wo_assigned, list) else [wo_assigned])
+                if a
+            ]
+            if wo_agents:
+                agent_matches = [
+                    m for m in matches
+                    if str(m.get("agent") or "").strip().lower() in wo_agents
+                ]
+                if len(agent_matches) == 1:
+                    matches = agent_matches
+
         if len(matches) == 1:
             data["milestone_id"] = str(matches[0]["id"])
             _mark(rel, f"+milestone_id: {matches[0]['id']}", data, wo_path)
@@ -199,12 +255,11 @@ def compile_authoring_artifacts(
             # below when the authored set is 1:1 with the plan.
             unmapped.append((rel, wo_path, data))
 
-    # 3. Ordinal 1:1 fallback: the authoring convention (and the approval
-    #    preview shown to the operator) maps exactly one work order per plan
-    #    milestone in order.  When the authored set is 1:1 with the plan and
-    #    titles could not resolve the remaining identities, assign the
-    #    remaining milestones in order.  Any ambiguity or count mismatch
-    #    defers to the readiness gate / repair instead of guessing.
+    # 3. Ordinal 1:1 fallback & dependency-inherited decomposition:
+    #    When unmapped count matches uncovered count, assign in order.
+    #    When all milestones are already covered, unmapped work orders that
+    #    depend on a work order belonging to an established milestone inherit
+    #    that milestone identity.
     if plan_milestones and not had_ambiguity and unmapped:
         uncovered = [
             m for m in plan_milestones
@@ -215,6 +270,22 @@ def compile_authoring_artifacts(
                 data["milestone_id"] = str(milestone["id"])
                 _mark(rel, f"+milestone_id: {milestone['id']} (ordinal)", data, wo_path)
                 mapped_ids.add(str(milestone["id"]))
+            unmapped.clear()
+        elif not uncovered:
+            wo_id_to_mid = {
+                str(d.get("id") or Path(r).stem): str(d.get("milestone_id"))
+                for r, _p, d in wo_records
+                if d.get("milestone_id")
+            }
+            for rel, wo_path, data in list(unmapped):
+                deps = [str(dep).strip() for dep in (data.get("dependencies") or []) if str(dep).strip()]
+                parent_mids = {wo_id_to_mid[dep] for dep in deps if dep in wo_id_to_mid}
+                if len(parent_mids) == 1:
+                    parent_mid = next(iter(parent_mids))
+                    data["milestone_id"] = parent_mid
+                    _mark(rel, f"+milestone_id: {parent_mid} (dependency decomposition)", data, wo_path)
+                    wo_id_to_mid[str(data.get("id") or Path(rel).stem)] = parent_mid
+                    unmapped.remove((rel, wo_path, data))
 
     # 4. Consolidated test_plan default: when code deliverables lack declared
     #    coverage and the authored set plans exactly ONE test artifact (the
@@ -290,20 +361,44 @@ def compile_authoring_artifacts(
             data["agent_id"] = assignee
             _mark(rel, f"agent_id -> {assignee} (matches work order assignee)", data, contract_path)
 
-        if not qa_verdict_channel_required(data.get("agent_id")):
-            continue
-        if _scope_allows(data, QA_VERDICT_PROBE_PATH):
-            continue
         scope = data.get("scope")
         if not isinstance(scope, dict):
             scope = {}
             data["scope"] = scope
-        allow = scope.get("allow")
-        if not isinstance(allow, list):
-            allow = []
-            scope["allow"] = allow
-        allow.append({"module": QA_VERDICT_CHANNEL})
-        _mark(rel, f"+scope.allow: {QA_VERDICT_CHANNEL}", data, contract_path)
+
+        if qa_verdict_channel_required(data.get("agent_id")) and not _scope_allows(data, QA_VERDICT_PROBE_PATH):
+            allow = scope.get("allow")
+            if not isinstance(allow, list):
+                allow = []
+                scope["allow"] = allow
+            allow.append({"module": QA_VERDICT_CHANNEL})
+            _mark(rel, f"+scope.allow: {QA_VERDICT_CHANNEL}", data, contract_path)
+
+        # Sanitize contradictory deny rules: remove broad deny patterns
+        # (e.g. .sync/**) that would negate an explicitly allowed rule.
+        deny_list = scope.get("deny")
+        allow_list = scope.get("allow")
+        if isinstance(deny_list, list) and isinstance(allow_list, list):
+            allow_rules: list[str] = []
+            for item in allow_list:
+                p = (item.get("module") or item.get("target") or item.get("path")) if isinstance(item, dict) else item
+                if p:
+                    allow_rules.append(str(p))
+
+            from validators.kernel.contract import ContractEvaluator
+            filtered_deny = []
+            removed_deny: list[str] = []
+            for d_item in deny_list:
+                d_pat = (d_item.get("module") or d_item.get("target") or d_item.get("path")) if isinstance(d_item, dict) else d_item
+                d_str = str(d_pat or "")
+                if any(ContractEvaluator._matches(a.replace("\\", "/").rstrip("/*"), d_str) for a in allow_rules):
+                    removed_deny.append(d_str)
+                else:
+                    filtered_deny.append(d_item)
+
+            if removed_deny:
+                scope["deny"] = filtered_deny
+                _mark(rel, f"-scope.deny: {', '.join(removed_deny)} (contradicts scope.allow)", data, contract_path)
 
     return AuthoringCompileResult(
         normalized_paths=tuple(normalized),

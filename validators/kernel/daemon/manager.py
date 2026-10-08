@@ -624,13 +624,6 @@ class SessionManager:
 
     def _default_runner(self, workspace: str, agent: str) -> Any:
         import copy
-        import importlib
-        import sys
-        if "validators.harness.runner" in sys.modules:
-            try:
-                importlib.reload(sys.modules["validators.harness.runner"])
-            except Exception:
-                pass
         from validators.harness.backend import get_default_registry
         from validators.harness.runner import AgentRunner
 
@@ -1138,14 +1131,51 @@ class SessionManager:
                         already_authoring = True
                         break
                 if not already_authoring:
+                    allocated_ids = [
+                        str(w.get("id"))
+                        for w in created_work_orders
+                        if isinstance(w, dict) and w.get("id")
+                    ]
+                    if not allocated_ids:
+                        try:
+                            from .authoring import get_next_work_order_int
+                            start_wo_idx = get_next_work_order_int(workspace)
+                            allocated_ids = [f"WO-{start_wo_idx + i:03d}" for i in range(len(proposed_wos) or 1)]
+                        except Exception:
+                            allocated_ids = ["WO-001"]
+
+                    example_id = allocated_ids[0] if allocated_ids else "WO-001"
+                    allocated_list_str = ", ".join(allocated_ids)
+                    allocated_mapping_lines = []
+                    if created_work_orders:
+                        for i, w in enumerate(created_work_orders):
+                            if isinstance(w, dict) and w.get("id"):
+                                m_id = w.get("milestone_id") or f"Milestone {i+1}"
+                                allocated_mapping_lines.append(f"  - {m_id}: {w['id']} ('{w.get('title', '')}')")
+                    elif proposed_wos:
+                        for i, w in enumerate(proposed_wos):
+                            wo_id = allocated_ids[i] if i < len(allocated_ids) else f"WO-{i+1:03d}"
+                            t = w.get("title", "") if isinstance(w, dict) else str(w)
+                            allocated_mapping_lines.append(f"  - Milestone {i+1}: {wo_id} ('{t}')")
+
+                    allocated_block = ""
+                    if allocated_mapping_lines:
+                        allocated_block = (
+                            f"\nAllocated Work Order IDs for approved milestones:\n"
+                            + "\n".join(allocated_mapping_lines)
+                            + f"\n\nCRITICAL ANTI-COLLISION RULE: You MUST author using ONLY the allocated IDs above ({allocated_list_str}). "
+                            f"Do NOT reuse earlier or completed Work Order IDs (e.g. WO-001).\n"
+                        )
+
                     authoring_prompt = (
                         f"The architecture plan '{plan_id}' has been approved by the operator (reason: {reason or 'Approved by operator'}).\n\n"
                         "Your task now as Senior Architect is to author the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
+                        f"{allocated_block}\n"
                         "1. Review PLAN.md for the approved milestones and tasks.\n"
-                        "2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
-                        "(e.g. WO-001.yaml) conforming to schemas/work-order.schema.json.\n"
-                        "3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
-                        "conforming to schemas/contract.schema.json.\n"
+                        f"2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                        f"(e.g. {example_id}.yaml) conforming to schemas/work-order.schema.json.\n"
+                        f"3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
+                        f"(e.g. {example_id}.yaml) conforming to schemas/contract.schema.json.\n"
                         "4. QA/verification Work Orders (assigned to gemma) MUST declare an executable code deliverable under tests/ "
                         "— the test suite the QA worker will author and execute end-to-end — and every code deliverable needs a "
                         "planned companion test (e.g. tests/test_<stem>.py).\n"
@@ -1261,6 +1291,10 @@ class SessionManager:
         # so stale exhaustion from previous sessions must not dead-end it.
         state.integration_rework_rounds = 0
         state.authoring_repair_attempts = 0
+        # Held-back QA re-dispatch is likewise released: the fresh QA turn
+        # re-evaluates the deliverables and re-routes defects if they persist.
+        if hasattr(state, "qa_rework_targets"):
+            state.qa_rework_targets.clear()
 
         # Invalidate any existing non-completed operations in the session journal
         # so the supervisor does not immediately re-block on stale historical failures.
@@ -1302,22 +1336,77 @@ class SessionManager:
         # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
         self.supervisor.unblock_in_flight_work_orders(state)
 
-        prev_phase = None
-        if state.transitions:
-            for t in reversed(state.transitions):
-                p_from = t.get("from")
-                try:
-                    candidate = Phase(p_from) if p_from else None
-                except ValueError:
-                    candidate = None
-                if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED):
-                    prev_phase = candidate
-                    break
-        target_phase = prev_phase or (
-            Phase.DISPATCHING if state.worker_wo_ids
-            else Phase.AUTHORING if state.plan_id
-            else Phase.PLANNING
-        )
+        # Synchronize INDEX.yaml and TREE.yaml with the unblocked work orders
+        try:
+            from validators.harness.runner import HarnessRunner
+            HarnessRunner._sync_index_and_tree_yaml(ws)
+        except Exception:
+            pass
+
+        # Ensure project configuration exists in .sync/config.yaml
+        cfg_path = ws / ".sync" / "config.yaml"
+        if not cfg_path.is_file():
+            try:
+                cfg_path.write_text(
+                    yaml.safe_dump({"environment": "development"}, sort_keys=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        # Reconcile active work orders with PLAN.md
+        try:
+            from .authoring import reconcile_active_work_orders_with_plan
+            reconcile_active_work_orders_with_plan(ws)
+        except Exception:
+            pass
+
+        # Reset exhausted authoring repair counters so resumed runs have a fresh chance
+        state.authoring_repair_attempts = 0
+        state.authoring_operation_failed = False
+        if hasattr(state, "dependency_escalation_retries") and isinstance(state.dependency_escalation_retries, dict):
+            state.dependency_escalation_retries.clear()
+        if hasattr(state, "recovery_attempts") and isinstance(state.recovery_attempts, dict):
+            state.recovery_attempts.clear()
+        if state.error and ("exhausted" in state.error or "blocked" in state.error.lower()):
+            state.error = None
+
+        self.supervisor._discover_worker_wos(state)
+
+        # Check if active work orders now pass readiness
+        target_phase = None
+        try:
+            from validators.harness.authoring_readiness import validate_authoring_readiness
+            readiness = validate_authoring_readiness(
+                ws,
+                plan_id=state.plan_id or "",
+                planning_wo_id=state.planning_wo_id,
+                completed_wo_ids=state.completed_wo_ids,
+            )
+            if readiness.ready and state.worker_wo_ids:
+                state.published_wo_ids = sorted(state.worker_wo_ids)
+                state.readiness_issues = []
+                target_phase = Phase.DISPATCHING
+        except Exception:
+            pass
+
+        if target_phase is None:
+            prev_phase = None
+            if state.transitions:
+                for t in reversed(state.transitions):
+                    p_from = t.get("from")
+                    try:
+                        candidate = Phase(p_from) if p_from else None
+                    except ValueError:
+                        candidate = None
+                    if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED, Phase.ARCHITECT_REPAIR):
+                        prev_phase = candidate
+                        break
+            target_phase = prev_phase or (
+                Phase.DISPATCHING if state.worker_wo_ids
+                else Phase.AUTHORING if state.plan_id
+                else Phase.PLANNING
+            )
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase)
         return target_phase
@@ -2142,6 +2231,7 @@ class SessionManager:
                                     "dependencies": [f"WO-{idx-1:03d}"] if offset > 0 else [],
                                     "deliverable": deliv,
                                     "description": "\n".join(m.tasks) if m.tasks else m.title,
+                                    "milestone_id": m.id,
                                 })
                             plan_meta = {
                                 "work_orders": proposed_wos,

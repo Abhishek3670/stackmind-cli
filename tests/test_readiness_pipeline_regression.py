@@ -365,3 +365,239 @@ class TestRepairPromptAccuracy:
 
         assert "No individual artifact is named" in prompt
         assert "(none)" not in prompt
+
+
+class TestSynonymAndDecompositionMilestoneCoverage:
+    def test_milestone_synonym_and_prefix_matching(self) -> None:
+        # Action verb stripping + calculation/logic
+        assert milestone_matches("Tip Calculation Engine", "Implement Tip Calculation Logic")
+        # QA <-> Quality Assurance, Testing <-> Validation
+        assert milestone_matches("Quality Assurance & Validation", "End-to-End Testing & QA")
+        # Release <-> Packaging & Versioning
+        assert milestone_matches("Final Release & GitOps", "Release Packaging & Versioning")
+        # Distinct milestones must still not collide
+        assert not milestone_matches("Tip Calculation Engine", "End-to-End Testing & QA")
+        assert not milestone_matches("Frontend UI Development", "Final Release & GitOps")
+
+    def test_multiple_work_orders_with_explicit_milestone_id_is_valid_decomposition(
+        self, tmp_path: Path
+    ) -> None:
+        """When an architect breaks a milestone into multiple work orders and explicitly
+        binds them via milestone_id, authoring readiness gate accepts the decomposition."""
+        (tmp_path / "PLAN.md").write_text(
+            "# Project Plan: Engine\n\n## Current Architecture\nCore engine.\n\n## Milestones & Roadmap\n"
+            "- [ ] Milestone 1: Core Engine (Agent: codex)\n",
+            encoding="utf-8",
+        )
+        write_wo(tmp_path, {
+            "id": "WO-001", "type": "FEATURE", "title": "Engine Core",
+            "status": "PENDING", "priority": "P1", "assigned_agents": ["codex"],
+            "dependencies": [], "milestone_id": "Milestone 1",
+            "deliverable": {"type": "code", "path": "src/core.py"},
+            "implementation_estimate": {"expected_files": ["src/core.py"]},
+        })
+        write_contract(tmp_path, {
+            "work_order": "WO-001", "agent_id": "codex",
+            "budget": {"max_files_touched": 5},
+            "scope": {"allow": [{"module": "src/**"}]},
+        })
+        write_wo(tmp_path, {
+            "id": "WO-002", "type": "FEATURE", "title": "Engine API",
+            "status": "PENDING", "priority": "P1", "assigned_agents": ["codex"],
+            "dependencies": ["WO-001"], "milestone_id": "Milestone 1",
+            "deliverable": {"type": "code", "path": "src/api.py"},
+            "implementation_estimate": {"expected_files": ["src/api.py"]},
+        })
+        write_contract(tmp_path, {
+            "work_order": "WO-002", "agent_id": "codex",
+            "budget": {"max_files_touched": 5},
+            "scope": {"allow": [{"module": "src/**"}]},
+        })
+
+        refs = load_plan_milestones(tmp_path)
+        result = validate_authoring_readiness(tmp_path, expected_milestones=refs)
+        assert "MILESTONE_AMBIGUOUS" not in result.issue_codes()
+        assert "MILESTONE_UNCOVERED" not in result.issue_codes()
+
+    def test_compiler_dependency_decomposition_fallback(self, tmp_path: Path) -> None:
+        """When 1 work order maps 1:1 to milestone and a secondary work order depends on it,
+        the compiler injects the parent's milestone_id as dependency decomposition."""
+        (tmp_path / "PLAN.md").write_text(
+            "# Project Plan: Tip Calculator\n\n## Current Architecture\nCalculator backend.\n\n## Milestones & Roadmap\n"
+            "- [ ] Milestone 1: Tip Calculation Engine (Agent: codex)\n",
+            encoding="utf-8",
+        )
+        write_wo(tmp_path, {
+            "id": "WO-001", "type": "FEATURE", "title": "Implement Tip Calculation Logic",
+            "status": "PENDING", "priority": "P1", "assigned_agents": ["codex"],
+            "dependencies": [],
+            "deliverable": {"type": "code", "path": "src/calc.py"},
+            "implementation_estimate": {"expected_files": ["src/calc.py"]},
+        })
+        write_contract(tmp_path, {
+            "work_order": "WO-001", "agent_id": "codex",
+            "budget": {"max_files_touched": 5},
+            "scope": {"allow": [{"module": "src/**"}]},
+        })
+        write_wo(tmp_path, {
+            "id": "WO-002", "type": "FEATURE", "title": "Implement Backend API",
+            "status": "PENDING", "priority": "P1", "assigned_agents": ["codex"],
+            "dependencies": ["WO-001"],
+            "deliverable": {"type": "code", "path": "src/app.py"},
+            "implementation_estimate": {"expected_files": ["src/app.py"]},
+        })
+        write_contract(tmp_path, {
+            "work_order": "WO-002", "agent_id": "codex",
+            "budget": {"max_files_touched": 5},
+            "scope": {"allow": [{"module": "src/**"}]},
+        })
+
+        refs = load_plan_milestones(tmp_path)
+        compile_res = compile_authoring_artifacts(tmp_path, refs)
+        assert not compile_res.decision_required
+        wo002 = yaml.safe_load((tmp_path / ".sync/work-orders/ACTIVE/WO-002.yaml").read_text(encoding="utf-8"))
+        assert wo002.get("milestone_id") == "Milestone 1"
+
+    def test_compiler_disambiguates_milestones_sharing_common_words(self, tmp_path: Path) -> None:
+        """Regression test for shared-token milestones under the same agent.
+        
+        Milestone 2 ('Animated Background Implementation') and Milestone 3
+        ('Animated Welcome Message') share the word 'Animated' and are both
+        assigned to 'gemini'. The compiler must map WO-002 and WO-003 to
+        their respective milestones without flagging MILESTONE_MAPPING_AMBIGUOUS.
+        """
+        plan_content = (
+            "# Project Plan: Animated Welcome\n\n"
+            "## Current Architecture\n"
+            "Standalone HTML/CSS/JS, zero dependencies.\n\n"
+            "## Milestones & Roadmap\n"
+            "- [ ] Milestone 1: Scaffolding (Agent: gemini)\n"
+            "- [ ] Milestone 2: Animated Background Implementation (Agent: gemini)\n"
+            "- [ ] Milestone 3: Animated Welcome Message (Agent: gemini)\n"
+        )
+        (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+        write_wo(tmp_path, {
+            "id": "WO-001", "type": "FEATURE", "title": "Scaffolding",
+            "status": "ACTIVE", "priority": "P0", "assigned_agents": ["gemini"],
+            "dependencies": [], "deliverable": {"type": "code", "path": "index.html"},
+        })
+        write_wo(tmp_path, {
+            "id": "WO-002", "type": "FEATURE", "title": "Animated Background Implementation",
+            "status": "ACTIVE", "priority": "P1", "assigned_agents": ["gemini"],
+            "dependencies": ["WO-001"], "deliverable": {"type": "code", "path": "style.css"},
+        })
+        write_wo(tmp_path, {
+            "id": "WO-003", "type": "FEATURE", "title": "Animated Welcome Message",
+            "status": "ACTIVE", "priority": "P1", "assigned_agents": ["gemini"],
+            "dependencies": ["WO-002"], "deliverable": {"type": "code", "path": "script.js"},
+        })
+        for wid in ("WO-001", "WO-002", "WO-003"):
+            write_contract(tmp_path, {
+                "work_order": wid, "agent_id": "gemini",
+                "budget": {"max_files_touched": 5},
+                "scope": {"allow": [{"module": "**"}]},
+            })
+
+        refs = load_plan_milestones(tmp_path)
+        compile_res = compile_authoring_artifacts(tmp_path, refs)
+        assert not compile_res.decision_required, [f"{i.code}: {i.message}" for i in compile_res.decision_required]
+
+        wo2 = yaml.safe_load((tmp_path / ".sync/work-orders/ACTIVE/WO-002.yaml").read_text(encoding="utf-8"))
+        wo3 = yaml.safe_load((tmp_path / ".sync/work-orders/ACTIVE/WO-003.yaml").read_text(encoding="utf-8"))
+        assert wo2.get("milestone_id") == "Milestone 2"
+        assert wo3.get("milestone_id") == "Milestone 3"
+
+
+class TestMultiGoalMilestoneIsolation:
+    """Regression tests for multi-goal / continuation runs.
+
+    In a continuation run (e.g. Goal 2 after Goal 1), earlier work orders
+    (WO-001, WO-002, etc.) reside in .sync/work-orders/COMPLETED/ with
+    historical milestone_ids ('Milestone 1', 'Milestone 2').
+    The authoring readiness gate must scope milestone coverage strictly
+    to the active plan's work orders (those created after the planning WO,
+    or explicitly tracked in state.completed_wo_ids) so that historical
+    work orders do not trigger spurious MILESTONE_AMBIGUOUS or MILESTONE_COVERAGE errors.
+    """
+
+    def test_historical_completed_wos_do_not_collide_with_new_goal_milestones(self, tmp_path: Path) -> None:
+        # 1. Simulate Goal 1 completed work orders in COMPLETED/
+        completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+        completed_dir.mkdir(parents=True, exist_ok=True)
+
+        wo1 = make_wo("WO-001", "gemini", "public/index.html", "code", title="Project Scaffolding", milestone_id="Milestone 1")
+        wo2 = make_wo("WO-002", "gemini", "public/style.css", "code", title="Wave Animation", milestone_id="Milestone 2")
+        (completed_dir / "WO-001.yaml").write_text(yaml.safe_dump(wo1), encoding="utf-8")
+        (completed_dir / "WO-002.yaml").write_text(yaml.safe_dump(wo2), encoding="utf-8")
+
+        # 2. Simulate Goal 2: new PLAN.md with its own Milestone 1 and Milestone 2
+        goal2_plan = (
+            "# Project Plan: Codebase Audit & Gap Analysis\n\n"
+            "## Milestones & Roadmap\n"
+            "- [ ] Milestone 1: Codebase Audit (Agent: gemini)\n"
+            "  - [ ] Task 1.1: Audit files\n"
+            "- [ ] Milestone 2: Gap Analysis & Correction (Agent: gemini)\n"
+            "  - [ ] Task 2.1: Fix issues\n"
+            "- [ ] Milestone 3: Final Verification (Agent: gemma)\n"
+            "  - [ ] Task 3.1: Run verification suite\n"
+        )
+        (tmp_path / "PLAN.md").write_text(goal2_plan, encoding="utf-8")
+
+        # Active work orders created under Goal 2 (planning work order was WO-007)
+        wo8 = make_wo("WO-008", "gemini", "audit.py", "code", title="Codebase Audit", milestone_id="Milestone 1")
+        wo9 = make_wo("WO-009", "gemini", "fix.py", "code", title="Gap Analysis & Correction", milestone_id="Milestone 2", dependencies=["WO-008"])
+        wo10 = make_wo("WO-010", "gemma", "tests/test_verify.py", "code", title="Final Verification", milestone_id="Milestone 3", dependencies=["WO-009"])
+        wo10["test_plan"] = [{
+            "sources": ["audit.py", "fix.py"],
+            "tests": ["tests/test_verify.py"],
+        }]
+        write_wo(tmp_path, wo8)
+        write_wo(tmp_path, wo9)
+        write_wo(tmp_path, wo10)
+
+        # Contracts for Goal 2
+        write_contract(tmp_path, make_contract("WO-008", "gemini", [{"module": "audit.py"}, {"module": "tests/**"}]))
+        write_contract(tmp_path, make_contract("WO-009", "gemini", [{"module": "fix.py"}, {"module": "tests/**"}]))
+        write_contract(tmp_path, make_contract("WO-010", "gemma", [{"module": "**"}, {"module": ".sync/inbox/claude/**"}]))
+
+        # 3. Validate authoring readiness with planning_wo_id="WO-007"
+        # and completed_wo_ids=[] (Goal 2 has no completed work orders yet)
+        res = validate_authoring_readiness(
+            tmp_path,
+            plan_id="PLAN-002",
+            planning_wo_id="WO-007",
+            completed_wo_ids=[],
+        )
+        assert res.ready, f"Expected ready=True, got issues: {[f'{i.code}: {i.message}' for i in res.issues]}"
+
+    def test_milestone_isolation_via_index_fallback_when_completed_ids_omitted(self, tmp_path: Path) -> None:
+        # Same setup, but without passing completed_wo_ids explicitly;
+        # the gate should infer index > parse_wo_index(planning_wo_id)
+        completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+        completed_dir.mkdir(parents=True, exist_ok=True)
+
+        wo1 = make_wo("WO-001", "gemini", "a.py", "code", title="Historical 1", milestone_id="Milestone 1")
+        (completed_dir / "WO-001.yaml").write_text(yaml.safe_dump(wo1), encoding="utf-8")
+
+        goal_plan = (
+            "# Project Plan\n\n"
+            "## Milestones & Roadmap\n"
+            "- [ ] Milestone 1: Fresh Work (Agent: gemma)\n"
+            "  - [ ] Task 1.1: Do work\n"
+        )
+        (tmp_path / "PLAN.md").write_text(goal_plan, encoding="utf-8")
+
+        wo8 = make_wo("WO-008", "gemma", "tests/test_b.py", "code", title="Fresh Work", milestone_id="Milestone 1")
+        write_wo(tmp_path, wo8)
+        write_contract(tmp_path, make_contract("WO-008", "gemma", [{"module": "**"}, {"module": ".sync/inbox/claude/**"}]))
+
+        res = validate_authoring_readiness(
+            tmp_path,
+            plan_id="PLAN-002",
+            planning_wo_id="WO-007",
+            # completed_wo_ids omitted -> relies on WO index > 7
+        )
+        assert res.ready, f"Expected ready=True, got issues: {[f'{i.code}: {i.message}' for i in res.issues]}"
+
+
+

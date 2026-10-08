@@ -55,6 +55,14 @@ class ToolGateway:
         return value
 
     def write_file(self, target: str, content: str) -> None:
+        # In-turn ownership guard (worker task contract): deny writes to other
+        # work orders' deliverables and over-budget file counts WITH actionable
+        # feedback, instead of letting the turn fail at post-turn verification.
+        ownership = getattr(self, "task_ownership", None)
+        if ownership is not None:
+            denial = ownership.check_write(target)
+            if denial:
+                raise PermissionError(denial)
         record = self._authorize(OperationType.WRITE_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
