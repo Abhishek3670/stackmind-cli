@@ -2714,6 +2714,7 @@ class LifecycleSupervisor:
             }
             if state.gitops_wo_id:
                 params["work_order_id"] = state.gitops_wo_id
+                self._mark_wo_status_on_disk(ws, state.gitops_wo_id, "ACTIVE", clear_error=True)
             op = self.manager.start_turn(
                 state.session_id,
                 gitops_prompt,

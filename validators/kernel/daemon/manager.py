@@ -1492,6 +1492,7 @@ class SessionManager:
                 else Phase.AUTHORING if state.plan_id
                 else Phase.PLANNING
             )
+        state.error = None
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase)
         return target_phase
@@ -1559,6 +1560,11 @@ class SessionManager:
             if "validators.harness.runner" in sys.modules:
                 try:
                     importlib.reload(sys.modules["validators.harness.runner"])
+                except Exception:
+                    pass
+            if "validators.harness.d024_gate" in sys.modules:
+                try:
+                    importlib.reload(sys.modules["validators.harness.d024_gate"])
                 except Exception:
                     pass
 
