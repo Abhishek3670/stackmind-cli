@@ -2002,5 +2002,130 @@ class TestIndexAndTreeSyncOnResume:
         _validate_work_order_state_files(sync_dir, res_after)
         assert not any("does not match INDEX.yaml" in e.message for e in res_after.errors)
 
+    def test_load_harness_contract_fallback_agent_contract_matches_task_work_order(self, tmp_path: Path) -> None:
+        """Verify fallback agent contract binds to the task work order and passes pre-execution check."""
+        from unittest.mock import MagicMock
+        from validators.harness.contract_gate import load_harness_contract, verify_pre_execution
+        from validators.harness.runner import HarnessTask
+
+        sync_dir = tmp_path / ".sync"
+        agents_dir = sync_dir / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "claude.contract.yaml").write_text(yaml.safe_dump({
+            "schema_version": 1,
+            "agent_id": "claude",
+            "work_order": "WO-000",
+            "identity": {"role": "architecture", "reports_to": "ceo"},
+            "scope": {
+                "allow": [{"module": "PLAN.md"}, {"module": ".sync/contracts/**"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 10, "max_tokens": 50000},
+        }), encoding="utf-8")
+
+        contract = load_harness_contract(tmp_path, "claude", "WO-011")
+        assert contract is not None
+        assert contract.work_order == "WO-011"
+
+        task = MagicMock(work_order_id="WO-011")
+        # Pre-execution validation must not raise ContractAccessDenied
+        verify_pre_execution(tmp_path, "claude", task, MagicMock())
+
+    def test_compiler_injects_deliverable_path_into_contract_scope(self, tmp_path: Path) -> None:
+        """Verify authoring compiler injects the deliverable path into contract scope when missing."""
+        from validators.harness.authoring_compiler import compile_authoring_artifacts
+
+        sync_dir = tmp_path / ".sync"
+        active_wo_dir = sync_dir / "work-orders" / "ACTIVE"
+        active_wo_dir.mkdir(parents=True, exist_ok=True)
+        (active_wo_dir / "WO-011.yaml").write_text(yaml.safe_dump({
+            "schema_version": 1,
+            "id": "WO-011",
+            "title": "UI Analysis",
+            "type": "AUDIT",
+            "status": "ACTIVE",
+            "assigned_agents": ["gemini"],
+            "deliverable": {"path": "GAP_ANALYSIS_UIUX.md", "type": "doc"},
+        }), encoding="utf-8")
+
+        contracts_dir = sync_dir / "contracts"
+        contracts_dir.mkdir(parents=True, exist_ok=True)
+        (contracts_dir / "WO-011.yaml").write_text(yaml.safe_dump({
+            "schema_version": 1,
+            "agent_id": "gemini",
+            "work_order": "WO-011",
+            "identity": {"role": "frontend", "reports_to": "claude"},
+            "scope": {
+                "allow": [{"module": "src/templates/**"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 10, "max_tokens": 50000},
+        }), encoding="utf-8")
+
+        res = compile_authoring_artifacts(tmp_path)
+        assert any("GAP_ANALYSIS_UIUX.md" in inj for inj_list in res.injections.values() for inj in inj_list)
+        contract_data = yaml.safe_load((contracts_dir / "WO-011.yaml").read_text(encoding="utf-8"))
+        allowed_modules = [m.get("module") for m in contract_data["scope"]["allow"]]
+        assert "GAP_ANALYSIS_UIUX.md" in allowed_modules
+
+    def test_prepare_run_for_resume_restores_superseded_contract(self, tmp_path: Path) -> None:
+        """Verify manager _prepare_run_for_resume restores missing contracts from superseded audit directory."""
+        from validators.kernel.daemon.manager import SessionManager
+        from validators.kernel.daemon.storage import DaemonStorage
+        from validators.kernel.daemon.supervisor import RunState, Phase
+
+        sync_dir = tmp_path / ".sync"
+        active_wo_dir = sync_dir / "work-orders" / "ACTIVE"
+        active_wo_dir.mkdir(parents=True, exist_ok=True)
+        (active_wo_dir / "WO-011.yaml").write_text(yaml.safe_dump({
+            "schema_version": 1,
+            "id": "WO-011",
+            "title": "UI Analysis",
+            "type": "AUDIT",
+            "status": "ACTIVE",
+            "assigned_agents": ["gemini"],
+            "deliverable": {"path": "GAP_ANALYSIS_UIUX.md", "type": "doc"},
+        }), encoding="utf-8")
+
+        superseded_dir = sync_dir / "reports" / "authoring" / "run-test" / "superseded"
+        superseded_dir.mkdir(parents=True, exist_ok=True)
+        (superseded_dir / "WO-011-12345.yaml").write_text(yaml.safe_dump({
+            "schema_version": 1,
+            "agent_id": "gemini",
+            "work_order": "WO-011",
+            "identity": {"role": "frontend", "reports_to": "claude"},
+            "scope": {
+                "allow": [{"module": "src/**"}, {"module": "GAP_ANALYSIS_UIUX.md"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 15, "max_tokens": 30000},
+        }), encoding="utf-8")
+
+        # Live contract is missing initially
+        live_contract = sync_dir / "contracts" / "WO-011.yaml"
+        assert not live_contract.exists()
+
+        storage = DaemonStorage(tmp_path / "daemon-state")
+        mgr = SessionManager(storage)
+        state = RunState(
+            run_id="run-test",
+            product_goal="test",
+            workspace=str(tmp_path),
+            session_id="sess-test",
+            phase=Phase.BLOCKED,
+            worker_wo_ids=["WO-011"],
+            error="Architect repair turn failed (BLOCKED) and repair attempts are exhausted",
+        )
+        session = {"journal": []}
+        mgr._prepare_run_for_resume(state, session, tmp_path)
+
+        assert live_contract.is_file()
+        assert state.authoring_repair_attempts == 0
+        assert state.error is None
+
+
 
 

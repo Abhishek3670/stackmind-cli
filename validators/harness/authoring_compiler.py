@@ -334,17 +334,30 @@ def compile_authoring_artifacts(
             data["test_plan"] = [{"sources": [deliv_path_str], "tests": [suite]}]
             _mark(rel, f"+test_plan (consolidated default -> {suite})", data, wo_path)
 
-    # ── Contracts: identity normalization + QA verdict channel ────────
+    # ── Contracts: identity normalization + QA verdict channel + deliverable scope ────────
     wo_assignees: dict[str, str] = {}
-    for _rel, _path, wo_data in wo_records:
-        wo_id_value = str(wo_data.get("id") or Path(_rel).stem)
-        assigned = wo_data.get("assigned_agents")
-        primary = (
-            str(assigned[0]).strip().lower()
-            if isinstance(assigned, list) and assigned else ""
-        )
-        if wo_id_value and primary:
-            wo_assignees[wo_id_value] = primary
+    wo_deliverables: dict[str, str] = {}
+    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+        sub_d = ws / ".sync" / "work-orders" / sub
+        if sub_d.is_dir():
+            for p in sub_d.glob("*.yaml"):
+                wdata = _load_yaml_mapping(p)
+                if isinstance(wdata, dict):
+                    wid = str(wdata.get("id") or p.stem)
+                    if wid not in wo_assignees:
+                        ass = wdata.get("assigned_agents")
+                        prim = (
+                            str(ass[0]).strip().lower()
+                            if isinstance(ass, list) and ass else ""
+                        )
+                        if prim:
+                            wo_assignees[wid] = prim
+                    if wid not in wo_deliverables:
+                        deliv = wdata.get("deliverable")
+                        if isinstance(deliv, dict):
+                            dp = _normalize_rel(deliv.get("path"))
+                            if dp:
+                                wo_deliverables[wid] = dp
 
     for contract_path in sorted(contracts_dir.glob("*.yaml")) if contracts_dir.is_dir() else []:
         rel = contract_path.relative_to(ws).as_posix()
@@ -373,6 +386,15 @@ def compile_authoring_artifacts(
                 scope["allow"] = allow
             allow.append({"module": QA_VERDICT_CHANNEL})
             _mark(rel, f"+scope.allow: {QA_VERDICT_CHANNEL}", data, contract_path)
+
+        deliv_path = wo_deliverables.get(wo_ref)
+        if deliv_path and not _scope_allows(data, deliv_path):
+            allow = scope.get("allow")
+            if not isinstance(allow, list):
+                allow = []
+                scope["allow"] = allow
+            allow.append({"module": deliv_path})
+            _mark(rel, f"+scope.allow: {deliv_path} (authorizes work order deliverable)", data, contract_path)
 
         # Sanitize contradictory deny rules: remove broad deny patterns
         # (e.g. .sync/**) that would negate an explicitly allowed rule.

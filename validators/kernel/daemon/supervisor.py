@@ -1033,8 +1033,16 @@ class LifecycleSupervisor:
             state.recovery_decision_operation_id = new_op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
 
-        # Decision operation lost (crash/resume) — re-dispatch from stored evidence.
+        # Decision operation lost (crash/resume) — check if decision file already exists on disk,
+        # otherwise re-dispatch from stored evidence.
         if wo_id:
+            decision, decision_error = self._load_recovery_decision(ws, str(wo_id), {})
+            if decision and decision_error is None:
+                advance, apply_error = self._apply_recovery_decision(
+                    state, ws, str(wo_id), decision
+                )
+                if apply_error is None:
+                    return advance if advance is not None else AdvanceResult.WAITING_FOR_OPERATION
             new_op = self._dispatch_recovery_decision(state, ws, str(wo_id), None)
             if new_op is not None:
                 state.recovery_decision_operation_id = new_op.get("operation_id")
@@ -2513,28 +2521,28 @@ class LifecycleSupervisor:
         return code_wos + qa_wos
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
-        """Return a completed work order to ACTIVE so rework can re-dispatch it."""
+        """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""
         active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if active.is_file():
             return self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
-        completed = ws / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
-        if not completed.is_file():
-            return False
-        try:
-            data = yaml.safe_load(completed.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return False
-            data["status"] = "ACTIVE"
-            data["updated"] = _now()
-            data.pop("error", None)
-            data.pop("blocked_reason", None)
-            active.parent.mkdir(parents=True, exist_ok=True)
-            active.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-            completed.unlink()
-            self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
-            return True
-        except Exception:
-            return False
+        for sub in ("COMPLETED", "BLOCKED"):
+            cand = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+            if cand.is_file():
+                try:
+                    data = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        data["status"] = "ACTIVE"
+                        data["updated"] = _now()
+                        data.pop("error", None)
+                        data.pop("blocked_reason", None)
+                        active.parent.mkdir(parents=True, exist_ok=True)
+                        active.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+                        cand.unlink()
+                        self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+                        return True
+                except Exception:
+                    pass
+        return False
 
     def _advance_product_ready(self, state: RunState) -> AdvanceResult:
         """PRODUCT_READY: discover or create GitOps WO and dispatch."""
@@ -3090,6 +3098,18 @@ class LifecycleSupervisor:
         """Dispatch the dedicated Architect repair turn with bounded diagnostics."""
         source = str(state.repair_context.get("source", "authoring"))
         if source == "recovery":
+            wo_id = state.repair_context.get("work_order")
+            action = state.repair_context.get("action")
+            if wo_id:
+                contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+                if not contract_file.is_file():
+                    self._write_recovery_repair_authorization(
+                        ws,
+                        str(wo_id),
+                        str(action or ""),
+                        state.repair_context.get("original_contract") or {},
+                        state=state,
+                    )
             prompt = self._recovery_repair_prompt(state)
         else:
             prompt = self._authoring_repair_prompt(state)
@@ -3107,16 +3127,28 @@ class LifecycleSupervisor:
         child_ids = ctx.get("replacement_work_orders") or []
         children_lines = "\n".join(f"- {c}" for c in child_ids) if child_ids else "- (none declared)"
         post_check_error = ctx.get("post_check_error")
+        orig = ctx.get("original_contract") or {}
+        orig_allow = [
+            r.get("module") for r in (orig.get("scope", {}).get("allow") or [])
+            if isinstance(r, dict) and r.get("module")
+        ]
+        orig_agent = orig.get("agent_id") or "worker"
+        existing_rules_str = (
+            f"\nExisting allowed modules for {orig_agent} on {wo_id}:\n"
+            + "".join(f"  - {m}\n" for m in orig_allow)
+            if orig_allow else ""
+        )
         return (
             f"ARCHITECT RECOVERY REPAIR for work order {wo_id} (approved action: {action}).\n\n"
             f"Recovery decision:\n{decision_lines}\n\n"
             f"Post-repair validation error: {post_check_error or 'none yet (first application pass)'}\n\n"
             "Apply the decision by authoring governed artifacts with write_file:\n"
             + (
-                "- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
-                "conforming to schemas/contract.schema.json. The budget must be explicitly sized "
-                "from the task's real file footprint. A transitional repair contract is already in "
-                "place at that path — overwrite it with the amended contract; do not delete it.\n"
+                f"- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
+                f"conforming to schemas/contract.schema.json. The budget must be explicitly sized "
+                f"from the task's real file footprint. Preserve existing allowed paths (including the "
+                f"work order deliverable) and append the new path requested by the recovery decision.{existing_rules_str}"
+                f"A transitional repair contract is already in place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )
             + (
@@ -3536,6 +3568,8 @@ class LifecycleSupervisor:
                         original_contract = loaded
                 except Exception:
                     pass
+            if not original_contract:
+                original_contract = self._find_latest_contract_for_wo(ws, state.run_id, wo_id)
             self._archive_recovery_artifact(
                 ws, state.run_id, f".sync/contracts/{wo_id}.yaml"
             )
@@ -3688,6 +3722,7 @@ class LifecycleSupervisor:
             str(state.repair_context.get("work_order") or ""),
             str(state.repair_context.get("action") or ""),
             state.repair_context.get("original_contract") or {},
+            state=state,
         )
         self._archive_stale_inbox_notices(ws)
         state.recovery_decisions.append({**record, "applied": True, "stage": "repair_dispatched"})
@@ -3705,8 +3740,53 @@ class LifecycleSupervisor:
         state.architect_repair_operation_id = op.get("operation_id")
         return AdvanceResult.WAITING_FOR_OPERATION, None
 
+    def _find_latest_contract_for_wo(
+        self, ws: Path, run_id: str, wo_id: str
+    ) -> dict[str, Any]:
+        """Find the most recent contract for a work order across live, superseded, and audit paths."""
+        c_path = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+        if c_path.is_file():
+            try:
+                data = yaml.safe_load(c_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        if run_id:
+            superseded_dir = ws / ".sync" / "reports" / "authoring" / run_id / "superseded"
+            if superseded_dir.is_dir():
+                candidates = sorted(
+                    superseded_dir.glob(f"{wo_id}*.yaml"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for cand in candidates:
+                    try:
+                        data = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                        if isinstance(data, dict) and data.get("scope"):
+                            return data
+                    except Exception:
+                        pass
+            report_dir = ws / ".sync" / "reports" / "authoring" / run_id
+            if report_dir.is_dir():
+                for rev_dir in sorted(report_dir.glob("rev*"), reverse=True):
+                    cand = rev_dir / f"{wo_id}.yaml"
+                    if cand.is_file():
+                        try:
+                            data = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                            if isinstance(data, dict) and data.get("scope"):
+                                return data
+                        except Exception:
+                            pass
+        return {}
+
     def _write_recovery_repair_authorization(
-        self, ws: Path, wo_id: str, action: str, original_contract: dict[str, Any],
+        self,
+        ws: Path,
+        wo_id: str,
+        action: str,
+        original_contract: dict[str, Any],
+        state: RunState | None = None,
     ) -> None:
         """Place or extend the transitional repair-authorization contract.
 
@@ -3723,6 +3803,10 @@ class LifecycleSupervisor:
         from validators.harness.authoring_gate import AuthoringGate
 
         contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+        if not original_contract:
+            run_id = getattr(state, "run_id", "") if state else ""
+            original_contract = self._find_latest_contract_for_wo(ws, run_id, wo_id)
+
         original_scope = original_contract.get("scope") if isinstance(original_contract, dict) else None
         allow = list((original_scope or {}).get("allow") or [])
         deny = list((original_scope or {}).get("deny") or [{"module": ".git/**"}])
@@ -3737,6 +3821,20 @@ class LifecycleSupervisor:
         if action in ("split_work_order", "create_dependency_work_order"):
             _ensure(".sync/work-orders/**")
             _ensure(".sync/contracts/**")
+
+        # Also ensure work order's declared deliverable is allowed
+        for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+            wo_cand = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+            if wo_cand.is_file():
+                try:
+                    wo_data = yaml.safe_load(wo_cand.read_text(encoding="utf-8"))
+                    if isinstance(wo_data, dict):
+                        deliv = wo_data.get("deliverable")
+                        if isinstance(deliv, dict) and deliv.get("path"):
+                            _ensure(str(deliv["path"]))
+                    break
+                except Exception:
+                    pass
 
         if action == "create_dependency_work_order" and contract_file.is_file():
             # The original contract stays authoritative for the surviving work

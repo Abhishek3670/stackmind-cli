@@ -1418,12 +1418,45 @@ class SessionManager:
         state.authoring_operation_failed = False
         if hasattr(state, "dependency_escalation_retries") and isinstance(state.dependency_escalation_retries, dict):
             state.dependency_escalation_retries.clear()
-        if hasattr(state, "recovery_attempts") and isinstance(state.recovery_attempts, dict):
-            state.recovery_attempts.clear()
-        if state.error and ("exhausted" in state.error or "blocked" in state.error.lower()):
+        if state.error and ("exhausted" in state.error or "blocked" in state.error.lower() or "failed" in state.error.lower()):
             state.error = None
 
         self.supervisor._discover_worker_wos(state)
+
+        # Restore missing contracts for active worker work orders
+        contracts_dir = ws / ".sync" / "contracts"
+        contracts_dir.mkdir(parents=True, exist_ok=True)
+        for wo_id in getattr(state, "worker_wo_ids", []):
+            wo_contract_path = contracts_dir / f"{wo_id}.yaml"
+            if not wo_contract_path.is_file():
+                restored = self.supervisor._find_latest_contract_for_wo(ws, state.run_id, wo_id)
+                if restored:
+                    wo_contract_path.write_text(yaml.safe_dump(restored, sort_keys=False), encoding="utf-8")
+                else:
+                    wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                    if wo_file.is_file():
+                        try:
+                            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                            agents = wo_data.get("assigned_agents") or []
+                            agent = str(agents[0]) if agents else "backend"
+                            from .authoring import synthesize_child_work_order
+                            synthesize_child_work_order(
+                                ws,
+                                wo_id,
+                                wo_data.get("title", ""),
+                                agent,
+                                wo_data.get("deliverable", {}).get("path", ""),
+                            )
+                        except Exception:
+                            pass
+
+        # Compile authoring artifacts to inject deliverable paths and normalize invariants
+        try:
+            from validators.harness.authoring_compiler import compile_authoring_artifacts
+            from validators.harness.authoring_readiness import load_plan_milestones
+            compile_authoring_artifacts(ws, load_plan_milestones(ws))
+        except Exception:
+            pass
 
         # Check if active work orders now pass readiness
         target_phase = None
