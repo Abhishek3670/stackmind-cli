@@ -114,7 +114,15 @@ WORK_ORDER_SCHEMA_TEMPLATE = (
     "  description: \"Login authentication endpoint handler\"\n"
     "description: >                       # Detailed implementation requirements for the worker\n"
     "  Implement the POST /login endpoint with credential validation.\n"
-    "```\n"
+    "acceptance_criteria:                 # Concrete verifiable acceptance criteria (MUST specify interface contracts)\n"
+    "  - \"Handler validates username and password credentials against database\"\n"
+    "  - \"Returns 200 with JWT token on success and 401 on invalid credentials\"\n"
+    "```\n\n"
+    "#### Cross-Component Integration Guidance:\n"
+    "When decomposing a multi-file feature (e.g. HTML, CSS, JS), the parent Work Order (e.g. index.html) MUST define "
+    "explicit `acceptance_criteria` specifying the container markup, classes, and element IDs (e.g. #animated-name) "
+    "that downstream scripts and styles hook into. Downstream Work Orders must reference those exact IDs. "
+    "Never leave parent deliverables as empty placeholder scaffolding.\n"
 )
 
 

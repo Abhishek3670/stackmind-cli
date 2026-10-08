@@ -1191,6 +1191,7 @@ class LifecycleSupervisor:
                         prompt += (
                             f". You MUST author the test suite '{deliv_path}' with write_file using standard Python "
                             f"(pytest, html.parser, re, pathlib; do NOT import external browser drivers like playwright/selenium), "
+                            f"asserting semantic goal requirements (user text, IDs, classes) rather than superficial file existence, "
                             f"execute it end-to-end with the run_tests tool (pytest), and immediately "
                             f"after run_tests run the run_security_scan tool over the deliverables. "
                             f"If the tests fail because an application deliverable is defective, do NOT "
@@ -2550,7 +2551,7 @@ class LifecycleSupervisor:
             return (
                 f"Execute work order {wo_id} as the QA worker.\n"
                 f"1. Author the declared test suite '{deliv_path}' with write_file — thorough "
-                f"end-to-end coverage of the deliverables produced by the other work orders.\n"
+                f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.\n"
                 f"2. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
                 f"3. Run the run_security_scan tool over the deliverables (src/) and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
@@ -4215,24 +4216,6 @@ class LifecycleSupervisor:
         except Exception:
             return True
         return True
-
-    def _get_wo_type(self, wo_id: str, ws: Path) -> str:
-        """Get deliverable type for a work order (e.g. 'code', 'config', 'doc')."""
-        wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
-        if not wo_file.is_file():
-            return "code"
-        try:
-            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                deliv = data.get("deliverable")
-                if isinstance(deliv, dict) and deliv.get("type"):
-                    return str(deliv["type"]).lower().strip()
-                wo_t = data.get("type")
-                if wo_t:
-                    return str(wo_t).lower().strip()
-        except Exception:
-            pass
-        return "code"
 
     def _get_qa_feedback(self, wo_id: str, ws: Path) -> str:
         """Extract QA review feedback text from verdict file if present."""

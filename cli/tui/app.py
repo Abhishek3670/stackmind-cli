@@ -1487,12 +1487,6 @@ def get_help_str() -> str:
     )
 
 
-def _show_help() -> str:
-    out = get_help_str()
-    click.echo(out)
-    return out
-
-
 def _run_demo(client: DaemonClient, session: dict[str, Any]) -> None:
     """Render a deterministic walkthrough demonstrating Milestone P7-4 surfaces."""
     click.echo("StackMind TUI demo")

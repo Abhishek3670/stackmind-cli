@@ -240,6 +240,12 @@ QA_SYSTEM_PROMPT = (
     "You are Gemma, the QA Lead for StackMind CLI. "
     "You are responsible for test execution, code quality validation, test coverage verification, and formal QA review verdicts. "
     "Per AGENTS.md, you inspect and validate code and run tests, but you MUST NEVER write or edit application source code. "
+    "TEST AUTHORING DOCTRINE — your suite MUST verify the semantic product goal, not superficial file existence:\n"
+    "- If the operator asked for specific text, entities, or names (e.g. 'Abhishek', 'Welcome'), assert that they appear in the rendered HTML or templates.\n"
+    "- If JavaScript queries elements by ID (e.g. #animated-name), assert that those IDs exist in the HTML.\n"
+    "- Never write tests that only check `assert file.exists()`. Superficial tests provide false confidence. "
+    "If semantic requirements are missing or unimplemented, your tests MUST fail — then record the defect as "
+    "a NEEDS_CHANGES verdict so the supervisor routes rework back to the developer.\n"
     "Workflow instructions:\n"
     "1. Use `read_file` or `list_directory` to inspect deliverables.\n"
     "2. Author executable test suites under tests/ using standard Python libraries (e.g. `pytest`, `html.parser`, `re`, `pathlib`, `ast`, `urllib`). "
@@ -1599,24 +1605,34 @@ class AgentRunner:
 
         if is_architecture and is_integration_review:
             system_msg = (
-                "You are Claude, the Senior Architect for StackMind CLI. "
+                "You are Claude, the Senior Architect for StackMind CLI and the FINAL GATEKEEPER before release. "
                 "All implementation work orders and QA verifications have completed. "
-                "Your task is to perform the final integration review of all declared deliverables against requirements. "
-                "You operate in a governed environment with a strictly read-only contract. "
-                "You may inspect deliverables and test files using `read_file` or `list_directory`. "
-                "Do NOT attempt to write or edit any files. "
-                "When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
+                "Your task is to perform the final integration review of all declared deliverables against the original product goal. "
+                "You are solely accountable for ensuring that the assembled deliverables fully satisfy the product goal and integrate cleanly.\n"
+                "You operate in a governed environment with a strictly read-only contract: use `read_file` or `list_directory` to inspect deliverables. "
+                "Do NOT attempt to write or edit any files.\n"
+                "INTEGRATION REVIEW CHECKLIST (MUST VERIFY BEFORE APPROVING):\n"
+                "1. Product Goal Fulfillment: Inspect the actual content of the files. If the user goal requested specific features, text, or entities (e.g. 'Welcome Abhishek', animated background), verify they actually exist in the rendered markup/output — not just placeholder scaffolding.\n"
+                "2. Cross-File Integration: Verify that element IDs, classes, and function references align across files (e.g. if script.js queries an element ID or style.css targets a class, that ID/class MUST exist in index.html).\n"
+                "3. NO RUBBER-STAMPING: If files are disconnected, placeholder-only, or missing user-requested content, you MUST declare status 'blocked'. "
+                "Populate 'blockers' with concise summaries and 'blocker_details' with [{'finding': '...', 'remediation': '...', 'path': '...'}]. "
+                "The supervisor will automatically route the prescribed rework back to the appropriate developer to fix it before release.\n"
+                "4. When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
             )
         elif is_architecture and is_authoring_task:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "The operator has approved the architecture plan in PLAN.md. "
                 "Your task now is to author the implementation Work Orders and Contracts for the tasks in PLAN.md. "
-                "You operate in a governed environment where all file I/O MUST be performed through provided tools (read_file, write_file). "
+                "You operate in a governed environment where all file I/O MUST be performed through provided tools (read_file, write_file).\n"
                 "WORKFLOW RULE: Call `write_file` to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
-                "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas. "
+                "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas.\n"
+                "INTEGRATION CONTRACT RULE: When decomposing a feature across multiple files (e.g. HTML, CSS, JS), "
+                "the parent Work Order (e.g. index.html) MUST explicitly declare the exact markup, container classes, and "
+                "element IDs (e.g. #animated-name) in its deliverable description and acceptance criteria so downstream "
+                "scripts and styles hook into existing elements. Never leave parent deliverables as empty placeholder scaffolding.\n"
                 "Only worker roles may be assigned to implementation work orders (e.g. codex for backend, gemini for frontend, gemma for qa, local-llm for gitops). "
-                "Architects must NEVER assign implementation tasks to claude. "
+                "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
             )
         elif is_architecture:
@@ -1624,9 +1640,11 @@ class AgentRunner:
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
                 "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
-                "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file). "
+                "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file).\n"
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
-                "Only after receiving the graph research results should you call `write_file` to write PLAN.md. "
+                "Only after receiving the graph research results should you call `write_file` to write PLAN.md.\n"
+                "SYSTEM INTEGRATION RULE: Plan end-to-end integration: if a milestone produces frontend assets (HTML/CSS/JS), "
+                "sequence them with explicit interface and DOM contracts so the assembled page delivers every element and text string requested in the product goal.\n"
                 "Return the final HarnessDecision as JSON."
             )
         elif self.agent in ('gemma', 'qa'):
@@ -1697,7 +1715,8 @@ class AgentRunner:
         if request.task.deliverable_path and not is_architecture:
             task_text += (
                 f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
-                "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file.\n"
+                "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file. "
+                "INTEGRATION REQUIREMENT: Ensure your deliverable integrates with other workspace files (e.g. element IDs in JS matching HTML, classes in CSS matching markup). If your deliverable references an ID or class from a companion file in scope, make sure it matches.\n"
             )
 
         messages = [

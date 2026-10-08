@@ -57,19 +57,6 @@ def _is_glob(pattern: str) -> bool:
     return bool(_GLOB_CHARS.search(pattern))
 
 
-def _matches_scope(path: str, scope_entries: list[dict[str, Any]]) -> bool:
-    for entry in scope_entries:
-        pattern = _norm(entry.get("module") or entry.get("path") or entry.get("target"))
-        if not pattern:
-            continue
-        if _is_glob(pattern):
-            if fnmatch.fnmatch(path, pattern) or path.startswith(pattern.replace("**", "").rstrip("/") + "/"):
-                return True
-        elif path == pattern or path.startswith(pattern + "/"):
-            return True
-    return False
-
-
 def collect_peer_deliverables(workspace: Path | str, own_wo_id: str | None) -> list[tuple[str, str]]:
     """Deliverable paths declared by OTHER active work orders: (wo_id, path)."""
     active_dir = Path(workspace) / ".sync" / "work-orders" / "ACTIVE"
@@ -181,10 +168,17 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     )
     workflow_steps = (
         f"\nWORKFLOW INSTRUCTIONS:\n"
-        f"1. In your first action, you MUST call `write_file(path='{deliverable}', content='...')` to create your deliverable.\n"
-        f"2. Stay within your file budget and contract scope.\n"
-        f"3. Only AFTER calling `write_file`, output your final JSON decision conforming to the contract below.\n"
-        f"CRITICAL: Do NOT output the final JSON decision without calling `write_file` first. Claiming a file was modified without calling `write_file` will fail verification immediately.\n\n"
+        f"1. In your first action, use `read_file` to inspect existing workspace files "
+        f"(e.g. index.html) and learn the markup, element IDs, classes, and naming your "
+        f"deliverable must integrate with.\n"
+        f"2. Call `write_file(path='{deliverable}', content='...')` to author your deliverable as complete final content.\n"
+        f"3. Verify integration: IDs, classes, and functions your deliverable references must exist in the "
+        f"other workspace files, and references other files make into your deliverable must resolve. If your "
+        f"contract scope allows, fix a mismatched companion file; NEVER write files listed under read_only_files.\n"
+        f"4. Only once the deliverable exists and integrates with the workspace, output your final JSON decision "
+        f"conforming to the contract below.\n"
+        f"CRITICAL: Do NOT output the final JSON decision without calling `write_file` for your deliverable "
+        f"first. Claiming a file was modified without calling `write_file` will fail verification immediately.\n\n"
         if deliverable else ""
     )
     return (

@@ -1,6 +1,6 @@
 # StackMind — 5-Agent Responsibility & Access Matrix
 
-**Status:** Proposed  
+**Status:** Implemented (2026-10-08) — enforcement mapping in [§19 Implementation Map](#19-implementation-map-code-enforced)  
 **Purpose:** Define the responsibilities, capabilities, tool privileges, context access, write boundaries, authority, and hard restrictions for all StackMind agents.
 
 ---
@@ -119,12 +119,14 @@ PLAN.md
 | Contract Authoring | ✅ |
 | Contract Verification | ✅ |
 | Scope Verification | ✅ |
-| Command Execution | ❌ |
+| Command Execution | Inspect (§10) |
 | Application Code Writing | ❌ |
 | Test Writing | ❌ |
 | Browser | ❌ |
 | QA Verdict | ❌ |
 | Git Mutation | ❌ |
+
+`Inspect` = command execution is offered only in the architecture-investigation palette for read-only diagnosis (`validators/kernel/providers/gateway.py`, `ARCHITECTURE_INVESTIGATION_TOOL_NAMES`); the planning and authoring palettes do not offer it, and every invocation still passes the hard interpreter denylist and resource sandbox. The architect's own contract scope keeps writes confined to governance artifacts.
 
 ### Hard Restrictions
 
@@ -387,6 +389,8 @@ Gemma
 
 Gemma must **never repair application code to make its own verdict pass**.
 
+This rule is runtime-enforced end to end: the QA system prompt mandates finalizing a defect finding as a `NEEDS_CHANGES` verdict plus a `blocked` decision naming the defective deliverable (`validators/harness/runner.py`, `QA_SYSTEM_PROMPT`), and the supervisor routes the finding back to the owning developer work order for bounded rework, holding the QA work order until every rework target re-completes (`validators/kernel/daemon/supervisor.py`, `_route_qa_defect_to_developers` / `qa_rework_targets`).
+
 ---
 
 # 7. Local-LLM — GitOps / Release Lead
@@ -579,6 +583,8 @@ The runtime should **not** inject all available information by default.
 | Release | — | — | — | Verify | **RW** |
 
 `RW*` = only tests directly associated with the agent's assigned implementation scope.
+
+Nuance: implementation workers (codex/gemini) also hold `git_restore` and `git_create_branch` for local worktree hygiene; history-affecting operations (staging, commit, tag, push, release) remain exclusive to Local-LLM as specified above.
 
 ---
 
@@ -951,3 +957,35 @@ Tool availability and authorization are enforced outside the model.
 ```
 
 **StackMind should therefore be designed as a capability-controlled multi-agent runtime, not as five LLMs differentiated only by system prompts.**
+
+---
+
+# 19. Implementation Map (code-enforced)
+
+Every authority row above resolves to a runtime enforcement point, not a prompt instruction. The policy catalog is machine-checked against this matrix by `tests/test_agent_matrix_enforcement.py`.
+
+| Matrix requirement | Enforcement point |
+|---|---|
+| Role → capability catalog (§10, §16) | `validators/kernel/identity.py` — `get_role_policy` (:47); policy is human-assigned and never derived from provider identity (:29) |
+| Runtime-is-authoritative flow (§15) | `validators/kernel/boundary.py` — `RuntimeBoundary.submit` (policy check → contract evaluation → journal, both outcomes); 100% of tool calls traverse it (`validators/kernel/tools.py`, `_authorize`) |
+| Knowledge layer shared read-only (§8, INV-001/002) | Universal base set in `get_role_policy` (:54-121); knowledge tools return read-only envelopes (`validators/knowledge/api.py`); contract-scoped read filtering (`is_node_in_scope`) |
+| Work orders / contracts authored by Claude only (§2, §10) | `validators/harness/authoring_gate.py` — `validate_author_role` (:97): workers can never author governed artifacts; enforced in-turn at `ToolGateway.write_file` (`validators/kernel/tools.py`) |
+| Scope is explicit per WO (INV-003) | Frozen `AgentContract` (`validators/kernel/contract.py`); deny-beats-allow evaluator (:96-204); compiled worker task contract renders the same scope the gates enforce (`validators/harness/task_contract.py`) |
+| Cross-agent deliverable protection (§2) | `TaskOwnership.check_write` — peer work-order deliverables are read-only in-turn (`validators/harness/task_contract.py`), attached per worker turn by the harness runner |
+| Self-approval impossible / verdict authority (INV-005) | Verdict ops (`submit_verdict`/`request_changes`/`approve_work_order`) exist only in gemma's policy; **verdict-channel write gate** in `ToolGateway` (`_verdict_channel_denial`): `.sync/inbox/claude/`, `.sync/qa/verdicts/`, and verdict/review-named files under `.sync/reviews/` require verdict (gemma) or governance (claude) authority — covered for both `write_file` and `apply_patch` |
+| QA does not repair application code (INV-007) | `QA_SYSTEM_PROMPT` doctrine (`validators/harness/runner.py`) + supervisor defect routing `_route_qa_defect_to_developers` with `qa_rework_targets` hold-back (`validators/kernel/daemon/supervisor.py`) |
+| Git mutation centralized (INV-006) | All `git_stage/commit/tag/push`, `create_release`, `rollback_release` operations exist only in local-llm's policy (`identity.py` :254-294); `git_push` additionally requires D025's operator-controlled double lock (`tools.py`) |
+| Destructive Git ops need CEO/User authorization (§7) | `validators/harness/d025_gate.py` (backup-before/verify-after sequencing) + `git_push` operator env/receipt lock (`validators/kernel/tools.py`) |
+| No release without QA (§13 release gate) | `validators/harness/d024_gate.py` — GitOps work orders block until a gemma APPROVED verdict exists; pre-checked before execution and re-checked under the runtime lock |
+| Application-code isolation from QA | Gemma's policy withholds `apply_patch`/`delete_file`/`move_file`/git mutations; its contract scope is bounded to the declared test suite and verdict channels (`validators/harness/authoring_compiler.py` injects the QA verdict channel) |
+| Fail-closed codes (§14) | `CONTRACT_SCOPE_DENIED` / `CONTRACT_EXPIRED` / `CONTRACT_FILE_BUDGET_EXCEEDED` (`validators/harness/contract_gate.py`), `CAPABILITY_DENIED` semantics as structured `PermissionError` denials with `explain_denial` introspection, `RELEASE_BLOCKED` via `D024ViolationError` |
+| Command execution hardening (all roles) | Hard interpreter denylist with no contract override (`validators/kernel/interpreter_denylist.py`), secret-scrubbed resource-limited sandbox (`validators/kernel/sandbox.py`), staged-scratch execution only |
+| Selective context (§9, INV-009) | Curated per-phase tool palettes + `request_tools` expansion (`validators/kernel/providers/gateway.py`, `get_curated_tools_for_phase`), token-budgeted `assemble_context` (`validators/knowledge/api.py`), capped and injection-sanitized retrieval (`validators/harness/retrieval.py`) |
+| Write boundary per path (§12) | Per-WO contract allow/deny rules evaluated post-execution against *observed* files (`validators/harness/contract_gate.py`, `verify_post_execution`), in-turn via the kernel contract evaluator and `TaskOwnership`; the role-domain defaults in §12 are the architect's authoring responsibility, expressed as contract scopes |
+| Human authority above all agents | Plan approval gate (`AWAITING_APPROVAL`, `supervisor.py`), operator resume (`_prepare_run_for_resume`), D025 receipt lock, skill promotion governor (`validators/skill/governor.py`) |
+
+### Verification
+
+- `tests/test_agent_matrix_enforcement.py` — machine-checks the policy catalog rows above and the verdict-channel gate behavior (`write_file` + `apply_patch`).
+- `tests/test_lifecycle_supervisor.py`, `tests/test_qa_defect_routing.py` — lifecycle, QA verdict, and defect-routing authority flows.
+- `tests/test_d024_qa_gate.py`, `tests/test_tool_hardening.py` — release gate and tool-boundary hardening.
