@@ -667,6 +667,33 @@ class TestRecoveryDecisions:
         assert state.recovery_attempts["WO-001"] == 1
         assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
 
+    def test_security_verified_block_retries_and_escalates_on_exhaustion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Verify verification gate security_verified failure retries and escalates."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": "verification gate failed: security_verified (credential leak detected in app.py: 'api_key=...')",
+        })
+
+        res = supervisor.advance(state)
+        # 1. Bounded retry dispatched
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.retry_counts["WO-001"] == 1
+        assert state.worker_blockers["WO-001"]["failure_code"] == "SECURITY_NOT_VERIFIED"
+
+        # 2. When retry budget is exhausted, escalates to Architect recovery decision
+        state.retry_counts["WO-001"] = state.max_retries
+        retry_op = mock_mgr.start_turn("sess-001", "Retry WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(retry_op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": "verification gate failed: security_verified (credential leak detected in app.py: 'api_key=...')",
+        })
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
     def test_nudge_contention_waits_without_consuming_budget(
         self, tmp_path: Path,
     ) -> None:

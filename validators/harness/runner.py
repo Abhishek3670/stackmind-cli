@@ -2557,6 +2557,19 @@ class AgentRunner:
             not Path(relative_path).is_absolute() and '..' not in Path(relative_path).parts
             for relative_path in changed_files
         )
+        if not all(
+            not Path(relative_path).is_absolute() and '..' not in Path(relative_path).parts
+            for relative_path in changed_files
+        ):
+            for relative_path in changed_files:
+                if Path(relative_path).is_absolute() or '..' in Path(relative_path).parts:
+                    staged_errors.append(f"path traversal or absolute path detected in {relative_path}")
+
+        if not d025_passed:
+            staged_errors.append("D025 destructive command validation failed")
+        if not d024_passed:
+            staged_errors.append("D024 release gate validation failed")
+
         if security_verified:
             from validators.kernel.security import scan_for_credential_leaks
 
@@ -2565,11 +2578,14 @@ class AgentRunner:
                 if candidate.is_file():
                     try:
                         content = candidate.read_text(encoding='utf-8', errors='replace')
-                        if scan_for_credential_leaks(content, file_path=relative_path):
+                        leaks = scan_for_credential_leaks(content, file_path=relative_path)
+                        if leaks:
                             security_verified = False
+                            staged_errors.append(f"credential leak detected in {relative_path}: {leaks[0]}")
                             break
-                    except OSError:
+                    except OSError as exc:
                         security_verified = False
+                        staged_errors.append(f"failed to read {relative_path} for security scan: {exc}")
                         break
 
         deliverable_touched = False

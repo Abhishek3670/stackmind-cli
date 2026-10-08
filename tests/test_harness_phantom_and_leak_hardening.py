@@ -120,3 +120,78 @@ def test_bookkeeping_inbox_declaration_pruned_when_unwritten(tmp_path: Path):
     assert phantom_files == {".sync/inbox/claude/qa_verdict.txt"}
     assert dec_effective == {"tests/test_suite.py"}
 
+
+def test_test_file_passwords_and_tokens_not_flagged_as_leaks():
+    """Verify test files can define integration test credentials without false-positive leak errors."""
+    test_suite_code = """
+def test_login_flow(client):
+    username = 'testuser'
+    password = 'MySecureIntegrationPassword123!'
+    resp = client.post('/login', json={'username': username, 'password': password})
+    assert resp.status_code == 200
+"""
+    # Test file should NOT be flagged for generic password assignment
+    leaks = scan_for_credential_leaks(test_suite_code, file_path="tests/test_auth.py")
+    assert leaks == []
+
+    # But real concrete provider keys must still be flagged even in test files
+    leaked_test_code = """
+def test_external_api():
+    client = OpenAI(api_key='sk-proj-abc123456789012345678901234567890')
+"""
+    leaks_with_real_key = scan_for_credential_leaks(leaked_test_code, file_path="tests/test_api.py")
+    assert len(leaks_with_real_key) > 0
+
+
+def test_security_verified_failure_records_staged_diagnostic(tmp_path: Path):
+    """Verify that runner._evaluate_verification_dimensions populates staged_errors on leak."""
+    from unittest.mock import MagicMock
+    from validators.harness.runner import HarnessRunner
+    from validators.harness.snapshot import WorkspaceSnapshot
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".sync").mkdir()
+    (ws / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / ".sync").mkdir()
+    (staged / "app.py").write_text("API_KEY = 'sk-proj-abc123456789012345678901234567890'\n", encoding="utf-8")
+
+    runner = HarnessRunner(ws, agent="codex")
+    before_snap = WorkspaceSnapshot.capture(ws)
+    after_snap = WorkspaceSnapshot.capture(staged)
+    diff = before_snap.diff(after_snap)
+
+    task = HarnessTask(kind="work_order", identifier="WO-001", path=ws / "app.py", title="App", body="Code", query="")
+    decision = HarnessDecision(
+        status="completed",
+        summary="Done",
+        report_markdown="Done",
+        blockers=(),
+        modified_files=("app.py",),
+        release_target="app.py",
+        retrieval_queries=(),
+        uncertainty=(),
+    )
+
+    staged_errors: list[str] = []
+    dimensions = runner._evaluate_verification_dimensions(
+        task=task,
+        decision=decision,
+        diff=diff,
+        before_snapshot=before_snap,
+        after_snapshot=after_snap,
+        staged_root=staged,
+        staged_errors=staged_errors,
+        declaration_matches=True,
+        command_results=[],
+        d025_passed=True,
+        has_staged_writes=False,
+    )
+    assert not dimensions.security_verified
+    assert len(staged_errors) > 0
+    assert "credential leak detected in app.py" in staged_errors[0]
+
+

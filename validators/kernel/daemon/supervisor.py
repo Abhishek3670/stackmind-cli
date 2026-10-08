@@ -282,6 +282,7 @@ TRANSIENT_RETRYABLE_CODES = {
     "OUTCOME_NOT_VERIFIED",
     "CODE_NOT_VERIFIED",
     "STATE_NOT_VERIFIED",
+    "SECURITY_NOT_VERIFIED",
     "VERIFICATION_GATE_FAILED",
     "IMPORT_SATISFIABILITY_FAILED",
     "TOOL_LOOP_HALTED",
@@ -1341,6 +1342,8 @@ class LifecycleSupervisor:
                 code = "CODE_NOT_VERIFIED"
             elif "state_verified" in err_msg.lower():
                 code = "STATE_NOT_VERIFIED"
+            elif "security_verified" in err_msg.lower():
+                code = "SECURITY_NOT_VERIFIED"
             evidence = {
                 "failure_code": code,
                 "work_order_id": wo_id,
@@ -1513,6 +1516,8 @@ class LifecycleSupervisor:
         err_lower = err_msg.lower()
         is_transient_blockage = (
             "outcome_verified" in err_lower
+            or "security_verified" in err_lower
+            or "state_verified" in err_lower
             or ("code_verified" in err_lower and "scope_verified" not in err_lower)
             or "declared deliverable" in err_lower
             or "unfulfilled deliverable" in err_lower
