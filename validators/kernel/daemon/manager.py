@@ -1297,6 +1297,14 @@ class SessionManager:
         if hasattr(state, "qa_rework_targets"):
             state.qa_rework_targets.clear()
 
+        # Archive any pre-existing unconsumed QA verdicts so freshly resumed worker turns
+        # are not immediately failed by obsolete findings from prior sessions.
+        for wo in getattr(state, "worker_wo_ids", []):
+            try:
+                self.supervisor._archive_verdicts_for_wo(wo, ws)
+            except Exception:
+                pass
+
         # Invalidate any existing non-completed operations in the session journal
         # so the supervisor does not immediately re-block on stale historical failures.
         completed_set = set(state.completed_wo_ids)

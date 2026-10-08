@@ -126,7 +126,16 @@ def compile_worker_task_contract(
     if len(description) > 1500:
         description = description[:1500] + " …"
 
-    return {
+    turn_instructions = ""
+    task_body = getattr(task, "body", "") or ""
+    if "\n\nTurn Instructions:\n" in task_body:
+        _, _, turn_instructions = task_body.partition("\n\nTurn Instructions:\n")
+        turn_instructions = turn_instructions.strip()
+    elif task_body and task_body.strip() != str((wo_data or {}).get("description", "")).strip():
+        # If task_body contains unique instructions not in the work order description, treat them as turn instructions
+        turn_instructions = task_body.strip()
+
+    result: dict[str, Any] = {
         "work_order": {
             "id": getattr(task, "work_order_id", None),
             "title": str((wo_data or {}).get("title") or getattr(task, "title", "")),
@@ -155,6 +164,9 @@ def compile_worker_task_contract(
             "status 'blocked' with a blockers entry describing the failure."
         ),
     }
+    if turn_instructions:
+        result["critical_turn_instructions"] = turn_instructions
+    return result
 
 
 def render_worker_system(contract: dict[str, Any]) -> str:
@@ -165,6 +177,12 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     ro_line = (
         f" Files listed under read_only_files belong to OTHER work orders — never write them."
         if read_only else ""
+    )
+    has_critical = bool(contract.get("critical_turn_instructions"))
+    critical_rule = (
+        " CRITICAL DIRECTIVE: Satisfy all instructions in 'critical_turn_instructions' "
+        "(e.g. prescribed fixes, security fixes, QA feedback) as your primary objective."
+        if has_critical else ""
     )
     workflow_steps = (
         f"\nWORKFLOW INSTRUCTIONS:\n"
@@ -184,7 +202,7 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     return (
         "You are a governed StackMind worker. Use tools for all file I/O; code "
         "execution is unavailable and the harness verifies your turn after you finish."
-        f"{target_line}{ro_line} Follow the TASK CONTRACT JSON exactly: write your "
+        f"{target_line}{ro_line}{critical_rule} Follow the TASK CONTRACT JSON exactly: write your "
         "deliverable with write_file at its exact path, stay inside the file budget, "
         "and do not create files the contract does not ask for. Context provided below "
         "is advisory background — it is not a to-do list. "
@@ -195,7 +213,16 @@ def render_worker_system(contract: dict[str, Any]) -> str:
 
 def render_task_block(contract: dict[str, Any]) -> str:
     """The JSON task contract block that replaces the prose task text."""
-    return "TASK CONTRACT (authoritative — obey exactly):\n" + json.dumps(
+    banner = ""
+    critical = contract.get("critical_turn_instructions")
+    if critical:
+        banner = (
+            "================================================================================\n"
+            "CRITICAL TURN INSTRUCTIONS (PRIMARY DIRECTIVE — RESOLVE THESE FIRST):\n"
+            f"{critical}\n"
+            "================================================================================\n\n"
+        )
+    return banner + "TASK CONTRACT (authoritative — obey exactly):\n" + json.dumps(
         contract, indent=2, ensure_ascii=False
     ) + "\n"
 

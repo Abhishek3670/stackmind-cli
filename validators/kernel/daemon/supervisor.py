@@ -1892,9 +1892,22 @@ class LifecycleSupervisor:
                     continue
                 if "NEEDS_CHANGES" not in txt.upper() and "NEEDS CHANGES" not in txt.upper():
                     continue
+
+                wos_in_name = self._WO_ID_RE.findall(f.name)
+                if wos_in_name and wo_id not in wos_in_name:
+                    continue
+                header_wos = self._WO_ID_RE.findall(txt[:300])
+                if header_wos and wo_id not in header_wos:
+                    continue
+
                 matches_wo = wo_id in f.name or bool(re.search(rf"\b{re.escape(wo_id)}\b", txt))
-                if not matches_wo and deliv_name and deliv_name in txt:
-                    matches_wo = True
+                if not matches_wo:
+                    other_wos = [wid for wid in self._WO_ID_RE.findall(txt) if wid != wo_id and wid != "WO-000"]
+                    if not other_wos:
+                        if deliv_path and str(deliv_path).replace("\\", "/") in txt.replace("\\", "/"):
+                            matches_wo = True
+                        elif deliv_name and len(deliv_name) > 6 and deliv_name in txt:
+                            matches_wo = True
                 if matches_wo:
                     try:
                         archive.mkdir(parents=True, exist_ok=True)
@@ -2700,6 +2713,12 @@ class LifecycleSupervisor:
         feedback = self._get_qa_feedback(wo_id, ws)
         if feedback:
             return f"Execute work order {wo_id} after QA feedback:\n{feedback}"
+        if getattr(state, "integration_blockers", None):
+            blockers_str = "\n".join(f"- {b}" for b in state.integration_blockers)
+            return (
+                f"Execute work order {wo_id} to resolve integration review blockers:\n"
+                f"{blockers_str}"
+            )
         return f"Execute work order {wo_id}"
 
     def _qa_execution_evidence_gap(self, wo_id: str, op: dict[str, Any], ws: Path) -> str | None:
@@ -4310,11 +4329,28 @@ class LifecycleSupervisor:
             except Exception:
                 continue
             content = raw_text.upper()
+
+            # Target isolation: if the file declares another work order ID in its filename,
+            # it is strictly a verdict for that other work order and CANNOT match wo_id.
+            wos_in_name = self._WO_ID_RE.findall(f.name)
+            if wos_in_name and wo_id not in wos_in_name:
+                continue
+
+            # If the document header/title explicitly targets another work order, skip it.
+            header_wos = self._WO_ID_RE.findall(raw_text[:300])
+            if header_wos and wo_id not in header_wos:
+                continue
+
             matches_wo = wo_id in f.name
             if not matches_wo:
                 matches_wo = bool(re.search(rf"\b{re.escape(wo_id)}\b", raw_text))
-                if not matches_wo and deliv_name and deliv_name in raw_text:
-                    matches_wo = True
+                if not matches_wo:
+                    other_wos = [wid for wid in self._WO_ID_RE.findall(raw_text) if wid != wo_id and wid != "WO-000"]
+                    if not other_wos:
+                        if deliv_path and str(deliv_path).replace("\\", "/") in raw_text.replace("\\", "/"):
+                            matches_wo = True
+                        elif deliv_name and len(deliv_name) > 6 and deliv_name in raw_text:
+                            matches_wo = True
             if matches_wo:
                 status_match = re.search(r"status\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES)", content, re.IGNORECASE)
                 if status_match:
@@ -4402,11 +4438,25 @@ class LifecycleSupervisor:
                 text = f.read_text(encoding="utf-8")
             except Exception:
                 continue
+
+            wos_in_name = self._WO_ID_RE.findall(f.name)
+            if wos_in_name and wo_id not in wos_in_name:
+                continue
+
+            header_wos = self._WO_ID_RE.findall(text[:300])
+            if header_wos and wo_id not in header_wos:
+                continue
+
             matches_wo = wo_id in f.name
             if not matches_wo:
                 matches_wo = bool(re.search(rf"\b{re.escape(wo_id)}\b", text))
-                if not matches_wo and deliv_name and deliv_name in text:
-                    matches_wo = True
+                if not matches_wo:
+                    other_wos = [wid for wid in self._WO_ID_RE.findall(text) if wid != wo_id and wid != "WO-000"]
+                    if not other_wos:
+                        if deliv_path and str(deliv_path).replace("\\", "/") in text.replace("\\", "/"):
+                            matches_wo = True
+                        elif deliv_name and len(deliv_name) > 6 and deliv_name in text:
+                            matches_wo = True
             if matches_wo:
                 if "NEEDS_CHANGES" in text.upper() or "NEEDS CHANGES" in text.upper():
                     return text.strip()

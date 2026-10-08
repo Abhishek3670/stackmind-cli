@@ -642,5 +642,68 @@ def test_qa_rework_target_unarchived_and_registered_in_worker_wo_ids(tmp_path: P
     assert dispatched[0]["agent_id"] == "codex"
 
 
+def test_check_qa_verdict_ignores_verdicts_explicitly_targeting_other_wos(tmp_path: Path) -> None:
+    """_check_qa_verdict for WO-002 must ignore verdict files targeting WO-004, even if deliverable name is mentioned."""
+    _write_worker_yaml(tmp_path, "WO-002", "codex", "src/app.py")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_suite.py")
+
+    inbox = tmp_path / ".sync" / "inbox" / "claude"
+    inbox.mkdir(parents=True, exist_ok=True)
+    other_verdict = inbox / "WO-004-qa-verdict.md"
+    other_verdict.write_text(
+        "# QA Verdict for WO-004 (Integration Review Round 2/2)\n"
+        "**Status:** NEEDS_CHANGES\n"
+        "**Verdict:** BLOCKED\n\n"
+        "Security defects found in `src/app.py`: Hardcoded Secret Key.\n",
+        encoding="utf-8",
+    )
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # When checking WO-002, the WO-004 verdict must NOT match
+    assert supervisor._check_qa_verdict("WO-002", tmp_path) is None
+    assert supervisor._get_qa_feedback("WO-002", tmp_path) == ""
+
+    # When an actual verdict for WO-002 is written, it matches
+    wo2_verdict = inbox / "WO-002-qa-verdict.md"
+    wo2_verdict.write_text("Status: NEEDS_CHANGES\nFix the database schema\n", encoding="utf-8")
+    assert supervisor._check_qa_verdict("WO-002", tmp_path) == "NEEDS_CHANGES"
+    assert "Fix the database schema" in supervisor._get_qa_feedback("WO-002", tmp_path)
+
+
+def test_task_contract_extracts_and_renders_critical_turn_instructions(tmp_path: Path) -> None:
+    """When a task includes Turn Instructions, compile_worker_task_contract extracts them and renders the directive banner."""
+    from validators.harness.task_contract import compile_worker_task_contract, render_task_block, render_worker_system
+
+    task = SimpleNamespace(
+        work_order_id="WO-002",
+        deliverable_path="src/app.py",
+        title="Backend Core & Database",
+        body=(
+            "Implement the backend infrastructure: 1. Database... 2. Authentication...\n\n"
+            "Turn Instructions:\n"
+            "CRITICAL: Fix hardcoded SECRET_KEY and disable debug mode in src/app.py."
+        ),
+        identifier="WO-002",
+    )
+    wo_data = {
+        "id": "WO-002",
+        "title": "Backend Core & Database",
+        "description": "Implement the backend infrastructure: 1. Database... 2. Authentication...",
+    }
+
+    contract = compile_worker_task_contract(task, wo_data, None, tmp_path)
+    assert contract.get("critical_turn_instructions") == "CRITICAL: Fix hardcoded SECRET_KEY and disable debug mode in src/app.py."
+
+    task_block = render_task_block(contract)
+    assert "CRITICAL TURN INSTRUCTIONS (PRIMARY DIRECTIVE" in task_block
+    assert "Fix hardcoded SECRET_KEY" in task_block
+
+    system_prompt = render_worker_system(contract)
+    assert "CRITICAL DIRECTIVE: Satisfy all instructions in 'critical_turn_instructions'" in system_prompt
+
+
+
 
 
