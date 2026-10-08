@@ -328,9 +328,16 @@ def format_work_orders(
 def format_current_operation(
     current_operation: dict[str, Any] | Any | None,
     width: int | None = None,
+    state: Any | None = None,
 ) -> list[Text]:
     """Format current operation section into compact display."""
     if not current_operation:
+        if state is not None and getattr(state, "phase", None) in ("BLOCKED", "FAILED"):
+            st_phase = getattr(state, "phase")
+            phase_val = st_phase.value if hasattr(st_phase, "value") else str(st_phase)
+            st_text = "Blocked" if phase_val.upper() == "BLOCKED" else "Failed"
+            st_color = "#f43f5e" if phase_val.upper() == "FAILED" else "#f59e0b"
+            return [Text(f"  ⊘ {st_text}", style=f"bold {st_color}")]
         return [Text("  ○ Idle", style="dim #475569")]
 
     if isinstance(current_operation, Mapping):
@@ -456,7 +463,7 @@ def render_runtime_panel(
 
     # 6. Section: CURRENT OPERATION
     items.append(Text("CURRENT OPERATION", style="bold #a855f7"))
-    for op_line in format_current_operation(current_operation, width=width):
+    for op_line in format_current_operation(current_operation, width=width, state=state):
         items.append(op_line)
 
     # 7. Independent scroll indicator (§10)

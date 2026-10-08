@@ -936,6 +936,7 @@ class LifecycleSupervisor:
             state.readiness_issues = []
             state.error = None
             state.architect_repair_operation_id = None
+            state.authoring_repair_attempts = 0
             if source == "recovery" and wo_id:
                 action = str(action or "")
                 if action == "split_work_order":
@@ -3706,13 +3707,7 @@ class LifecycleSupervisor:
         self, state: RunState, ws: Path, record: dict[str, Any],
     ) -> tuple[AdvanceResult | None, str | None]:
         """Route a recovery application into the bounded ARCHITECT_REPAIR turn."""
-        if state.authoring_repair_attempts >= state.max_authoring_repairs:
-            state.error = (
-                f"Recovery repair for {record.get('work_order')} could not start — repair attempts "
-                f"exhausted ({state.authoring_repair_attempts}/{state.max_authoring_repairs})"
-            )
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED, None
+        state.authoring_repair_attempts = 0
         # Deterministic bookkeeping: place/extend the transitional
         # repair-authorization contract so the repair turn passes pre-execution
         # validation (task WO matches contract WO) and is authorized to write

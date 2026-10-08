@@ -396,6 +396,25 @@ def compile_authoring_artifacts(
             allow.append({"module": deliv_path})
             _mark(rel, f"+scope.allow: {deliv_path} (authorizes work order deliverable)", data, contract_path)
 
+        # Root directory aliasing: if contract allows src/<dir>/** but src/<dir>
+        # does not exist and <dir> exists at workspace root, alias it so workers
+        # are not blocked on conventional top-level directories (e.g. templates/, static/).
+        cur_allow = scope.get("allow")
+        if isinstance(cur_allow, list):
+            injected_root_rules: list[str] = []
+            for item in cur_allow:
+                p = (item.get("module") or item.get("target") or item.get("path")) if isinstance(item, dict) else item
+                p_str = str(p or "")
+                if p_str.startswith("src/"):
+                    sub_part = p_str[4:]
+                    first_seg = sub_part.split("/")[0]
+                    if (ws / first_seg).exists() and not (ws / "src" / first_seg).exists():
+                        injected_root_rules.append(sub_part)
+            for rule in injected_root_rules:
+                if not any((it.get("module") == rule if isinstance(it, dict) else it == rule) for it in cur_allow):
+                    cur_allow.append({"module": rule})
+                    _mark(rel, f"+scope.allow: {rule} (root alias for non-existent src/{rule})", data, contract_path)
+
         # Sanitize contradictory deny rules: remove broad deny patterns
         # (e.g. .sync/**) that would negate an explicitly allowed rule.
         deny_list = scope.get("deny")

@@ -44,6 +44,8 @@ class ProjectPhase(str, Enum):
     AUTONOMOUS_EXECUTION = "AUTONOMOUS_EXECUTION"
     PLAN_REJECTED = "PLAN_REJECTED"
     PROJECT_COMPLETE = "PROJECT_COMPLETE"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
 
 
 @dataclass
@@ -314,6 +316,7 @@ class AutonomousDeliveryState:
         self.project_name = project_name
         self.session_id = session_id
         self.phase: ProjectPhase = ProjectPhase.INITIALIZING
+        self.error: str | None = None
         self.plan: dict[str, Any] = {}
         self.plan_revisions: list[PlanRevision] = []
         if roles is not None:
@@ -706,19 +709,31 @@ class AutonomousDeliveryState:
         if not active_op and "op-root" in self.operations:
             self.operations.pop("op-root", None)
 
-        run_phase = session.get("phase") or (session.get("run", {}).get("phase") if isinstance(session.get("run"), Mapping) else None)
+        run_dict = session.get("run") if isinstance(session.get("run"), Mapping) else {}
+        run_phase = session.get("phase") or run_dict.get("phase")
+        run_error = session.get("error") or run_dict.get("error")
+        if run_error:
+            self.error = str(run_error)
+
         if run_phase:
             rp_str = str(run_phase).upper()
             if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
                           "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION"):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                if not run_error:
+                    self.error = None
             elif rp_str == "AWAITING_APPROVAL":
                 self.phase = ProjectPhase.AWAITING_APPROVAL
             elif rp_str in ("COMPLETE", "PRODUCT_READY"):
                 self.phase = ProjectPhase.PROJECT_COMPLETE
                 self.is_complete = True
+                self.error = None
                 for k in self.completion_checklist:
                     self.completion_checklist[k] = True
+            elif rp_str == "BLOCKED":
+                self.phase = ProjectPhase.BLOCKED
+            elif rp_str == "FAILED":
+                self.phase = ProjectPhase.FAILED
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
         if not isinstance(wo_records, list):
@@ -1203,21 +1218,35 @@ class AutonomousDeliveryState:
                 for k in self.completion_checklist:
                     self.completion_checklist[k] = True
                 self.is_complete = True
+                self.error = None
                 self.add_activity("StackMind", "project phase complete")
             elif phase_val in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
                                "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION"):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                self.error = None
             elif phase_val == "AWAITING_APPROVAL":
                 self.phase = ProjectPhase.AWAITING_APPROVAL
             elif phase_val == "BLOCKED":
+                self.phase = ProjectPhase.BLOCKED
+                if payload.get("error"):
+                    self.error = str(payload["error"])
                 self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
             elif phase_val == "FAILED":
+                self.phase = ProjectPhase.FAILED
+                if payload.get("error"):
+                    self.error = str(payload["error"])
                 self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
 
         elif name == "run.blocked":
+            self.phase = ProjectPhase.BLOCKED
+            if payload.get("error"):
+                self.error = str(payload["error"])
             self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
 
         elif name == "run.failed":
+            self.phase = ProjectPhase.FAILED
+            if payload.get("error"):
+                self.error = str(payload["error"])
             self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
 
 

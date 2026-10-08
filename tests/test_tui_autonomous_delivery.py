@@ -737,3 +737,67 @@ def test_tui_update_from_session_clears_idle_op_root() -> None:
     assert state.get_current_operation() is None
 
 
+def test_tui_blocked_phase_surfaced_in_state_and_banner() -> None:
+    """A blocked daemon run must be surfaced in state.phase and render_phase_banner."""
+    from cli.tui.app import render_phase_banner
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    session = {
+        "session_id": "sess-123",
+        "phase": "BLOCKED",
+        "error": "Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)",
+        "run": {
+            "phase": "BLOCKED",
+            "error": "Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)",
+        },
+    }
+    state.update_from_session(session)
+
+    assert state.phase == ProjectPhase.BLOCKED
+    assert state.error == "Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)"
+
+    banner = render_phase_banner(state)
+    assert "PHASE: BLOCKED" in banner
+    assert "⊘ Autonomous Execution (BLOCKED)" in banner
+    assert "Blocker: Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)" in banner
+    assert "Use :resume to continue" in banner
+
+
+def test_tui_blocked_event_updates_state() -> None:
+    """Processing run.blocked event must update state.phase and state.error."""
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    event = {
+        "sequence": 1,
+        "name": "run.blocked",
+        "payload": {
+            "run_id": "run-6b31b8f5",
+            "phase": "BLOCKED",
+            "error": "Recovery repair for WO-011 could not start",
+        },
+    }
+    state.process_event(event)
+
+    assert state.phase == ProjectPhase.BLOCKED
+    assert state.error == "Recovery repair for WO-011 could not start"
+
+
+def test_tui_current_operation_shows_blocked_when_runtime_blocked() -> None:
+    """Current operation section must display ⊘ Blocked when runtime is in BLOCKED phase."""
+    from cli.tui.runtime_panel import format_current_operation
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.phase = ProjectPhase.BLOCKED
+
+    lines = format_current_operation(None, state=state)
+    assert any("Blocked" in line.plain for line in lines)
+
+
+

@@ -2126,6 +2126,74 @@ class TestIndexAndTreeSyncOnResume:
         assert state.authoring_repair_attempts == 0
         assert state.error is None
 
+    def test_enter_recovery_repair_resets_authoring_repair_attempts_across_cycles(self, tmp_path: Path) -> None:
+        """Sequential recovery events for different blockers must each receive a fresh
+        authoring repair turn budget instead of accumulating stale counters."""
+        from unittest.mock import MagicMock
+        ws = tmp_path
+        (ws / ".sync" / "contracts").mkdir(parents=True, exist_ok=True)
+        (ws / ".sync" / "inbox" / "claude").mkdir(parents=True, exist_ok=True)
+        mock_mgr = MagicMock()
+        mock_mgr.events = MagicMock()
+        supervisor = LifecycleSupervisor(mock_mgr)
+        state = RunState(
+            run_id="run-fresh-budget",
+            product_goal="test goal",
+            workspace=str(ws),
+            session_id="sess-budget",
+            worker_wo_ids=["WO-011"],
+            max_authoring_repairs=2,
+            authoring_repair_attempts=2,  # simulate prior cycle accumulated count
+        )
+        record = {
+            "work_order": "WO-011",
+            "action": "amend_contract",
+            "reason": "amend scope for templates",
+        }
+        state.repair_context = {
+            "work_order": "WO-011",
+            "action": "amend_contract",
+            "original_contract": {"scope": {"allow": []}},
+        }
+        res, err = supervisor._enter_recovery_repair(state, ws, record)
+        assert err is None
+        assert state.phase == Phase.ARCHITECT_REPAIR
+        assert state.authoring_repair_attempts == 1
+        assert state.error == "Recovery action 'amend_contract' for WO-011 requires artifact repair"
+
+    def test_authoring_compiler_aliases_src_paths_to_root_when_src_missing(self, tmp_path: Path) -> None:
+        """When contracts specify src/templates/** but the repo only has root templates/,
+        compile_authoring_artifacts aliases the rule to templates/**."""
+        from validators.harness.authoring_compiler import compile_authoring_artifacts
+
+        ws = tmp_path
+        (ws / "templates").mkdir(parents=True, exist_ok=True)
+        (ws / "templates" / "login.html").write_text("<h1>Login</h1>", encoding="utf-8")
+        (ws / "static").mkdir(parents=True, exist_ok=True)
+        (ws / "static" / "style.css").write_text("body {}", encoding="utf-8")
+
+        contract_path = ws / ".sync" / "contracts" / "WO-011.yaml"
+        contract_path.parent.mkdir(parents=True, exist_ok=True)
+        contract_path.write_text(yaml.safe_dump({
+            "schema_version": 1,
+            "agent_id": "gemini",
+            "work_order": "WO-011",
+            "scope": {
+                "allow": [
+                    {"module": "src/templates/**"},
+                    {"module": "src/static/**"},
+                ],
+                "deny": [],
+            },
+        }), encoding="utf-8")
+
+        res = compile_authoring_artifacts(ws)
+        updated = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+        allowed_modules = [m.get("module") for m in updated["scope"]["allow"]]
+        assert "templates/**" in allowed_modules
+        assert "static/**" in allowed_modules
+
+
 
 
 

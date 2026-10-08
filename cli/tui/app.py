@@ -151,6 +151,20 @@ def render_phase_banner(state: AutonomousDeliveryState) -> str:
         lines.append("✓ PLAN approved")
         lines.append("● Autonomous Execution")
         lines.append("○ Project Complete")
+    elif state.phase == ProjectPhase.BLOCKED:
+        lines.append("✓ PLAN approved")
+        lines.append("⊘ Autonomous Execution (BLOCKED)")
+        lines.append("○ Project Complete")
+        if getattr(state, "error", None):
+            lines.append(f"  Blocker: {state.error}")
+        lines.append("  Hint: Use :resume to continue or inspect with :events")
+    elif state.phase == ProjectPhase.FAILED:
+        lines.append("✓ PLAN approved")
+        lines.append("✗ Autonomous Execution (FAILED)")
+        lines.append("○ Project Complete")
+        if getattr(state, "error", None):
+            lines.append(f"  Error: {state.error}")
+        lines.append("  Hint: Use :resume to retry or inspect with :events")
     elif state.phase == ProjectPhase.PROJECT_COMPLETE:
         lines.append("✓ PLAN approved")
         lines.append("✓ Autonomous Execution")
@@ -1370,13 +1384,14 @@ def get_status_str(
     width: int = 80,
 ) -> str:
     """Build status header, contract HUD, and delivery view as a formatted string."""
+    if state is not None:
+        state.update_from_session(session)
     conn_status = state.connection_status if state else "online"
     parts = [
         format_session_header(session, width=width, status=conn_status),
         render_contract_hud_str(session.get("contract", {}), width=width),
     ]
     if state is not None:
-        state.update_from_session(session)
         parts.append(state.context_meter_text)
         parts.append("")
         parts.append(render_project_delivery_view(state))
@@ -1924,6 +1939,7 @@ def dispatch_delivery_command(
             if resumed_run:
                 run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {resumed_run.get('phase')}"
                 state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                state.error = None
         except Exception as run_err:
             if run_id_clean:
                 run_resumed_msg = f" (supervisor note: {run_err})"
