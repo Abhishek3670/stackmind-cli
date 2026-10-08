@@ -503,3 +503,104 @@ def test_qa_completed_turn_with_deliverable_defect_routes_rework_to_developer(tm
     assert "index.html" in rework_ops[0]["prompt"]
 
 
+def test_qa_defect_routing_resets_retry_budget_for_previously_exhausted_worker(tmp_path: Path) -> None:
+    """When a worker used all retries in initial dev, QA defect routing resets its budget to allow rework."""
+    _write_worker_yaml(tmp_path, "WO-001", "gemini", "index.html")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_animations.py")
+    (tmp_path / "index.html").write_text("<html></html>\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_animations.py").write_text("def test_x(): assert True\n", encoding="utf-8")
+    claude_inbox = tmp_path / ".sync" / "inbox" / "claude"
+    claude_inbox.mkdir(parents=True, exist_ok=True)
+    verdict = claude_inbox / "WO-004-qa-verdict.md"
+    verdict.write_text(
+        "# QA Verdict: WO-004\n## Status: NEEDS_CHANGES\n"
+        "Blocker: index.html is missing element with id='animated-text'\n",
+        encoding="utf-8",
+    )
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001", "WO-004"])
+    state.completed_wo_ids = ["WO-001"]
+    # Simulate WO-001 having used all 2 retries in initial development
+    state.retry_counts["WO-001"] = state.max_retries
+    state.failed_wo_ids = ["WO-001"]
+
+    wo4_op = mock_mgr.start_turn("sess-001", "QA page", work_order_id="WO-004", agent_id="gemma")
+    mock_mgr.complete_operation(
+        wo4_op["operation_id"],
+        "COMPLETED",
+        result={
+            "status": "completed",
+            "summary": "QA executed tests",
+            "tool_calls_audit": [
+                {"tool": "run_tests"},
+                {"tool": "run_security_scan"},
+            ],
+        },
+    )
+
+    res = supervisor.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert "WO-001" not in state.failed_wo_ids
+    # Rework dispatch consumed 1 attempt of the reset fresh budget
+    assert state.retry_counts["WO-001"] == 1
+    # Verdict file should be moved to _consumed
+    consumed = tmp_path / ".sync" / "reviews" / "_consumed"
+    assert consumed.is_dir()
+    assert any("WO-004-qa-verdict" in p.name for p in consumed.glob("*.md"))
+
+
+def test_integration_rework_resets_retry_budget_for_reworkable_wos(tmp_path: Path) -> None:
+    """Integration review blocker routing clears failed status, resets retry budget, and unarchives deliverable."""
+    _write_worker_yaml(tmp_path, "WO-002", "codex", "src/app.py")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "app.py").write_text("SECRET_KEY = 'hardcoded'\n", encoding="utf-8")
+
+    # Move WO-002 to completed
+    active_wo = tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml"
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    active_wo.rename(completed_dir / "WO-002.yaml")
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-int", "Goal", tmp_path, "sess-int")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.worker_wo_ids = ["WO-002"]
+    state.completed_wo_ids = ["WO-002"]
+    state.max_retries = 2
+    state.retry_counts["WO-002"] = 2
+    state.failed_wo_ids = ["WO-002"]
+
+    # Dispatch integration review operation
+    int_op = mock_mgr.start_turn("sess-int", "Integration review", work_order_id="WO-REV", role="architect")
+    state.integration_operation_id = int_op["operation_id"]
+    state.integration_wo_id = "WO-REV"
+
+    # Complete integration review as BLOCKED with blocker in src/app.py
+    mock_mgr.complete_operation(
+        int_op["operation_id"],
+        "BLOCKED",
+        result={
+            "status": "blocked",
+            "blockers": ["Hardcoded secret key in src/app.py"],
+            "blocker_details": [
+                {"finding": "Hardcoded secret key", "path": "src/app.py", "remediation": "Use env var"}
+            ],
+        },
+    )
+
+    res = supervisor.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.integration_rework_rounds == 1
+    assert "WO-002" not in state.completed_wo_ids
+    assert "WO-002" not in state.failed_wo_ids
+    assert state.retry_counts["WO-002"] == 0
+    # Deliverable WO-002 unarchived to ACTIVE
+    assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml").is_file()
+
+
+

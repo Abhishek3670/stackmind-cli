@@ -1674,6 +1674,10 @@ class LifecycleSupervisor:
                 state.completed_wo_ids.remove(target_id)
             if target_id in state.blocked_wo_ids:
                 state.blocked_wo_ids.remove(target_id)
+            if target_id in state.failed_wo_ids:
+                state.failed_wo_ids.remove(target_id)
+            # Rework phase grants a fresh retry budget for fixing defects
+            state.retry_counts[target_id] = 0
             target_op = self._find_latest_wo_operation(state, target_id)
             if target_op and target_op.get("operation_id"):
                 target_op_id = str(target_op["operation_id"])
@@ -1691,12 +1695,7 @@ class LifecycleSupervisor:
 
             if self._retry_worker(state, ws, target_id, _rework_prompt):
                 dispatched.append(target_id)
-
-        if not dispatched:
-            # Target retry budgets exhausted — the generic classification
-            # (failed targets, bounded escalation) still applies.
-            state.qa_rework_targets.pop(qa_wo_id, None)
-            return None
+                self._archive_verdicts_for_wo(target_id, ws)
 
         # Consume the verdict files that named or contributed to the targets so the stale
         # NEEDS_CHANGES cannot re-trigger rework or poison D024's
@@ -1720,6 +1719,12 @@ class LifecycleSupervisor:
                             except Exception:
                                 pass
         self._archive_qa_defect_verdicts(to_archive, ws)
+
+        if not dispatched:
+            # Target retry budgets exhausted or dispatch failed — the generic classification
+            # (failed targets, bounded escalation) still applies.
+            state.qa_rework_targets.pop(qa_wo_id, None)
+            return None
 
         state.qa_rework_targets[qa_wo_id] = dispatched
         return AdvanceResult.WAITING_FOR_OPERATION
@@ -1785,20 +1790,66 @@ class LifecycleSupervisor:
 
     def _archive_qa_defect_verdicts(self, hits: list[tuple[str, str, Path]], ws: Path) -> None:
         """Move consumed NEEDS_CHANGES verdicts out of every verdict search path."""
+        import shutil
+        import uuid
         archive = ws / ".sync" / "reviews" / "_consumed"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         for _target, _text, path in hits:
+            if not path.is_file():
+                continue
             try:
                 archive.mkdir(parents=True, exist_ok=True)
-                path.rename(archive / f"{path.stem}-{stamp}{path.suffix}")
+                dest = archive / f"{path.stem}-{stamp}{path.suffix}"
+                if dest.exists():
+                    dest = archive / f"{path.stem}-{stamp}-{uuid.uuid4().hex[:6]}{path.suffix}"
+                shutil.move(str(path), str(dest))
             except Exception:
                 pass
+
+    def _archive_verdicts_for_wo(self, wo_id: str, ws: Path) -> None:
+        """Archive all NEEDS_CHANGES verdict files matching wo_id once rework is dispatched."""
+        import shutil
+        import uuid
+        archive = ws / ".sync" / "reviews" / "_consumed"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        search_dirs = [
+            ws / ".sync" / "inbox" / "claude",
+            ws / ".sync" / "inbox" / "claude" / "_read",
+            ws / ".sync" / "reviews",
+            ws / ".sync" / "qa" / "verdicts",
+        ]
+        deliv_path = self._get_wo_deliverable_path(wo_id, ws)
+        deliv_name = Path(deliv_path).name if deliv_path else None
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            for f in list(d.iterdir()):
+                if not f.is_file() or not any(k in f.name.lower() for k in ("verdict", "review")):
+                    continue
+                try:
+                    txt = f.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                if "NEEDS_CHANGES" not in txt.upper() and "NEEDS CHANGES" not in txt.upper():
+                    continue
+                matches_wo = wo_id in f.name or bool(re.search(rf"\b{re.escape(wo_id)}\b", txt))
+                if not matches_wo and deliv_name and deliv_name in txt:
+                    matches_wo = True
+                if matches_wo:
+                    try:
+                        archive.mkdir(parents=True, exist_ok=True)
+                        dest = archive / f"{f.stem}-{stamp}{f.suffix}"
+                        if dest.exists():
+                            dest = archive / f"{f.stem}-{stamp}-{uuid.uuid4().hex[:6]}{f.suffix}"
+                        shutil.move(str(f), str(dest))
+                    except Exception:
+                        pass
 
     def _is_reworkable_target(self, state: RunState, ws: Path, qa_wo_id: str, wo_id: str) -> bool:
         """A rework target must be a completed, non-QA, non-gitops work order."""
         if wo_id in (qa_wo_id, state.planning_wo_id, "WO-000"):
             return False
-        if wo_id in state.failed_wo_ids:
+        if wo_id in state.failed_wo_ids and wo_id not in state.completed_wo_ids:
             return False
         if self._role_for_agent(self._agent_for_wo(wo_id, ws)) in ("qa", "gitops"):
             return False
@@ -1990,6 +2041,12 @@ class LifecycleSupervisor:
                         self._unarchive_work_order(ws, wo_id)
                         if wo_id in state.completed_wo_ids:
                             state.completed_wo_ids.remove(wo_id)
+                        if wo_id in state.failed_wo_ids:
+                            state.failed_wo_ids.remove(wo_id)
+                        if wo_id in state.blocked_wo_ids:
+                            state.blocked_wo_ids.remove(wo_id)
+                        state.retry_counts[wo_id] = 0
+                        self._archive_verdicts_for_wo(wo_id, ws)
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
                             self.manager.start_turn(
@@ -3706,6 +3763,8 @@ class LifecycleSupervisor:
             state.blocked_wo_ids.remove(wo_id)
         if wo_id in state.failed_wo_ids:
             state.failed_wo_ids.remove(wo_id)
+        state.retry_counts[wo_id] = 0
+        self._archive_verdicts_for_wo(wo_id, ws)
         self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         if redispatch:
             agent = self._agent_for_wo(wo_id, ws)
@@ -4154,30 +4213,38 @@ class LifecycleSupervisor:
             ws / ".sync" / "reviews",
             ws / ".sync" / "qa" / "verdicts",
         ]
+        candidates: list[Path] = []
         for d in search_dirs:
             if not d.is_dir():
                 continue
             for f in d.iterdir():
-                if not f.is_file():
-                    continue
-                name = f.name
-                if not any(k in name.lower() for k in ("verdict", "review")):
-                    continue
-                try:
-                    raw_text = f.read_text(encoding="utf-8")
-                except Exception:
-                    continue
-                content = raw_text.upper()
-                matches_wo = wo_id in name
-                if not matches_wo:
-                    matches_wo = bool(re.search(rf"\b{re.escape(wo_id)}\b", raw_text))
-                    if not matches_wo and deliv_name and deliv_name in raw_text:
-                        matches_wo = True
-                if matches_wo:
-                    if "APPROVED" in content:
-                        return "APPROVED"
-                    if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content:
+                if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
+                    candidates.append(f)
+
+        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+        for f in candidates:
+            try:
+                raw_text = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            content = raw_text.upper()
+            matches_wo = wo_id in f.name
+            if not matches_wo:
+                matches_wo = bool(re.search(rf"\b{re.escape(wo_id)}\b", raw_text))
+                if not matches_wo and deliv_name and deliv_name in raw_text:
+                    matches_wo = True
+            if matches_wo:
+                status_match = re.search(r"status\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES)", content, re.IGNORECASE)
+                if status_match:
+                    val = status_match.group(1).upper()
+                    if "NEEDS" in val:
                         return "NEEDS_CHANGES"
+                    return "APPROVED"
+                if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content:
+                    return "NEEDS_CHANGES"
+                if "APPROVED" in content:
+                    return "APPROVED"
         return None
 
     def _get_wo_deliverable_path(self, wo_id: str, ws: Path) -> str | None:
@@ -4239,27 +4306,29 @@ class LifecycleSupervisor:
             ws / ".sync" / "reviews",
             ws / ".sync" / "qa" / "verdicts",
         ]
+        candidates: list[Path] = []
         for d in search_dirs:
             if not d.is_dir():
                 continue
             for f in d.iterdir():
-                if not f.is_file():
-                    continue
-                name = f.name
-                if not any(k in name.lower() for k in ("verdict", "review")):
-                    continue
-                try:
-                    text = f.read_text(encoding="utf-8")
-                except Exception:
-                    continue
-                matches_wo = wo_id in name
-                if not matches_wo:
-                    matches_wo = bool(re.search(rf"\b{re.escape(wo_id)}\b", text))
-                    if not matches_wo and deliv_name and deliv_name in text:
-                        matches_wo = True
-                if matches_wo:
-                    if "NEEDS_CHANGES" in text.upper() or "NEEDS CHANGES" in text.upper():
-                        return text.strip()
+                if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
+                    candidates.append(f)
+
+        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+        for f in candidates:
+            try:
+                text = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            matches_wo = wo_id in f.name
+            if not matches_wo:
+                matches_wo = bool(re.search(rf"\b{re.escape(wo_id)}\b", text))
+                if not matches_wo and deliv_name and deliv_name in text:
+                    matches_wo = True
+            if matches_wo:
+                if "NEEDS_CHANGES" in text.upper() or "NEEDS CHANGES" in text.upper():
+                    return text.strip()
         return ""
 
     def _find_gitops_wo(self, ws: Path, state: RunState) -> str | None:
