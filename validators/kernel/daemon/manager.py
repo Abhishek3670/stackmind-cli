@@ -468,8 +468,7 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
         state.planning_operation_id = None
     elif phase == Phase.AUTHORING:
         state.authoring_operation_id = None
-    elif phase in (Phase.DISPATCHING, Phase.EXECUTING):
-        state.batch_operation_id = None
+    state.batch_operation_id = None
 
     ignored = set(getattr(state, "ignored_operation_ids", []) or [])
     if getattr(state, "integration_operation_id", None) in ignored:
@@ -1280,6 +1279,8 @@ class SessionManager:
         from .supervisor import Phase
 
         state.error = None
+        state.contention_count = 0
+        state.batch_operation_id = None
         state.blocked_wo_ids.clear()
         state.failed_wo_ids.clear()
         state.retry_counts.clear()
@@ -1413,6 +1414,7 @@ class SessionManager:
 
     def _cleanup_orphaned_operations(self, state: Any, session: dict[str, Any]) -> None:
         """Mark orphaned non-terminal operations as CANCELLED and clear phase operation IDs."""
+        state.contention_count = 0
         completed_set = set(getattr(state, "completed_wo_ids", []))
         if not hasattr(state, "ignored_operation_ids"):
             state.ignored_operation_ids = []
@@ -1794,6 +1796,48 @@ class SessionManager:
                         "result": result,
                         "completed_at": record.get("completed_at"),
                     }
+                    # S6 Concurrency: auto-reconcile parallel_dispatch container operations
+                    # when all its registered children have reached terminal state.
+                    if (
+                        parent_record.get("operation") == "parallel_dispatch"
+                        and parent_record.get("status") not in _OPERATION_TERMINAL
+                    ):
+                        children_ids = parent_record.get("children", [])
+                        if children_ids:
+                            all_term = True
+                            any_fail = False
+                            for cid in children_ids:
+                                try:
+                                    _, crec = self._operation(cid)
+                                    if crec.get("status") not in _OPERATION_TERMINAL:
+                                        all_term = False
+                                        break
+                                    if crec.get("status") == "FAILED":
+                                        any_fail = True
+                                except KeyError:
+                                    pass
+                            if all_term:
+                                parent_status = "FAILED" if any_fail else "COMPLETED"
+                                self._transition(parent_record, parent_status)
+                                parent_record.update(
+                                    completed_at=_now(),
+                                    result={
+                                        "status": parent_status.lower(),
+                                        "child_results": parent_record.get("child_results", {}),
+                                        "aggregated_results": list(parent_record.get("child_results", {}).values()),
+                                    },
+                                )
+                                self._active.pop(parent_id, None)
+                                if session.get("active_operation") == parent_id:
+                                    session["active_operation"] = None
+                                parent_event = "operation.failed" if parent_status == "FAILED" else "operation.completed"
+                                self.events.publish(
+                                    parent_event,
+                                    session["session_id"],
+                                    operation_id=parent_id,
+                                    status=parent_status,
+                                    result=parent_record["result"],
+                                )
                 except KeyError:
                     pass
             if record.get("child_results"):

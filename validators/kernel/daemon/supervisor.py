@@ -394,10 +394,16 @@ class LifecycleSupervisor:
             return AdvanceResult.FAILED
         try:
             res = handler(state)
-            if res != AdvanceResult.WAITING_FOR_OPERATION:
-                state.contention_count = 0
+            state.contention_count = 0
             return res
         except OperationContentionError as exc:
+            threads_alive = False
+            if hasattr(self.manager, "_turn_threads"):
+                threads_alive = any(t.is_alive() for t in getattr(self.manager, "_turn_threads", {}).values())
+            if threads_alive:
+                state.contention_count = 0
+                return AdvanceResult.WAITING_FOR_OPERATION
+
             state.contention_count += 1
             if state.contention_count >= self.max_contention_retries:
                 state.error = (
@@ -411,6 +417,13 @@ class LifecycleSupervisor:
             # Fallback for mock session managers or unmigrated call sites
             err_str = str(exc).lower()
             if "running root operation" in err_str or "active operation" in err_str:
+                threads_alive = False
+                if hasattr(self.manager, "_turn_threads"):
+                    threads_alive = any(t.is_alive() for t in getattr(self.manager, "_turn_threads", {}).values())
+                if threads_alive:
+                    state.contention_count = 0
+                    return AdvanceResult.WAITING_FOR_OPERATION
+
                 state.contention_count += 1
                 if state.contention_count >= self.max_contention_retries:
                     state.error = (
@@ -1106,6 +1119,28 @@ class LifecycleSupervisor:
         ws = Path(state.workspace)
         all_done = True
 
+        # S6 Concurrency: Reconcile batch operation if one is tracked.
+        # If all its child operations have reached terminal state, finalize the container
+        # operation so the session active operation is cleared before subsequent dispatches.
+        if state.batch_operation_id:
+            batch_op = self._get_operation(state.batch_operation_id)
+            if batch_op is None or batch_op.get("status") in _OPERATION_TERMINAL:
+                state.batch_operation_id = None
+            else:
+                children = batch_op.get("children", [])
+                if children:
+                    all_term = True
+                    any_fail = False
+                    for cid in children:
+                        cop = self._get_operation(cid)
+                        if cop is None or cop.get("status") not in _OPERATION_TERMINAL:
+                            all_term = False
+                            break
+                        if cop.get("status") == "FAILED":
+                            any_fail = True
+                    if all_term:
+                        self._close_batch_operation(state, "FAILED" if any_fail else "COMPLETED")
+
         if state.dependency_escalation_op_id:
             escalation = self._poll_dependency_escalation(state, ws)
             if escalation is not None:
@@ -1165,6 +1200,7 @@ class LifecycleSupervisor:
                                 role=self._role_for_agent(agent),
                                 agent_id=agent,
                                 work_order_id=wo_id,
+                                parent_operation_id=state.batch_operation_id,
                             )
                         except OperationContentionError:
                             all_done = False
@@ -1708,9 +1744,12 @@ class LifecycleSupervisor:
                     f"test suite (QA owns it):\n{_f}\n\nQA finding context:\n{feedback}"
                 )
 
-            if self._retry_worker(state, ws, target_id, _rework_prompt):
-                dispatched.append(target_id)
-                self._archive_verdicts_for_wo(target_id, ws)
+            try:
+                if self._retry_worker(state, ws, target_id, _rework_prompt):
+                    dispatched.append(target_id)
+                    self._archive_verdicts_for_wo(target_id, ws)
+            except OperationContentionError:
+                pass
 
         # Consume the verdict files that named or contributed to the targets so the stale
         # NEEDS_CHANGES cannot re-trigger rework or poison D024's
@@ -1736,8 +1775,14 @@ class LifecycleSupervisor:
         self._archive_qa_defect_verdicts(to_archive, ws)
 
         if not dispatched:
-            # Target retry budgets exhausted or dispatch failed — the generic classification
-            # (failed targets, bounded escalation) still applies.
+            # Target retry budgets exhausted or dispatch deferred due to contention
+            has_pending = any(
+                state.retry_counts.get(t, 0) < state.max_retries
+                for t in targets
+            )
+            if has_pending:
+                state.qa_rework_targets[qa_wo_id] = list(targets.keys())
+                return AdvanceResult.WAITING_FOR_OPERATION
             state.qa_rework_targets.pop(qa_wo_id, None)
             return None
 
@@ -1937,6 +1982,7 @@ class LifecycleSupervisor:
                 role=self._role_for_agent(agent),
                 agent_id=agent,
                 work_order_id=wo_id,
+                parent_operation_id=state.batch_operation_id,
             )
             # Budget is consumed only after a successful dispatch — a
             # contention failure never consumes a turn that never ran.
@@ -1952,12 +1998,20 @@ class LifecycleSupervisor:
         return True
 
     def _close_batch_operation(self, state: RunState, status: str) -> None:
-        if state.batch_operation_id:
+        batch_id = state.batch_operation_id
+        if batch_id:
             if hasattr(self.manager, "complete_operation"):
                 try:
-                    self.manager.complete_operation(operation_id=state.batch_operation_id, status=status)
+                    self.manager.complete_operation(operation_id=batch_id, status=status)
                 except Exception:
-                    pass
+                    try:
+                        self.manager.complete_operation(operation_id=batch_id, status="FAILED")
+                    except Exception:
+                        pass
+            if hasattr(self.manager, "_sessions"):
+                sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+                if sess and sess.get("active_operation") == batch_id:
+                    sess["active_operation"] = None
             state.batch_operation_id = None
 
     def _advance_integration_review(self, state: RunState) -> AdvanceResult:

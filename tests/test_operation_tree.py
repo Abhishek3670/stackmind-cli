@@ -371,3 +371,37 @@ def test_daemon_client_operation_children_and_cascade(tmp_path):
         cancelled = client.operation_cancel(parent_id)
         assert cancelled["status"] == "CANCEL_REQUESTED"
         assert client.operation_get(child_id)["status"] == "CANCEL_REQUESTED"
+
+
+def test_parallel_dispatch_auto_completes_when_all_children_terminal(tmp_path):
+    """When all child operations of a parallel_dispatch container complete,
+    SessionManager automatically completes the batch operation and frees session active_operation."""
+    manager = SessionManager(DaemonStorage(tmp_path))
+    session = manager.create_session("codex", "test", _contract(), "workspace")
+    session_id = session["session_id"]
+
+    _, parent_id = manager.begin_operation(
+        session_id, "parallel_dispatch", {"work_orders": ["WO-001", "WO-002"]}
+    )
+    assert manager._sessions[session_id].get("active_operation") == parent_id
+    parent_rec = manager.get_operation(parent_id)
+    assert parent_rec["status"] == "RUNNING"
+
+    _, c1_id = manager.begin_operation(session_id, "child_1", parent_operation_id=parent_id)
+    _, c2_id = manager.begin_operation(session_id, "child_2", parent_operation_id=parent_id)
+
+    # Complete first child: parent is still RUNNING, active_operation still held
+    manager.complete_operation(c1_id, status="COMPLETED")
+    assert manager.get_operation(parent_id)["status"] == "RUNNING"
+    assert manager._sessions[session_id].get("active_operation") == parent_id
+
+    # Complete second child: all children now terminal -> parent auto-completes and releases active_operation
+    manager.complete_operation(c2_id, status="COMPLETED")
+    assert manager.get_operation(parent_id)["status"] == "COMPLETED"
+    assert manager._sessions[session_id].get("active_operation") is None
+
+    # Fresh root turn can now begin immediately without contention
+    _, next_op_id = manager.begin_operation(session_id, "next_root_turn")
+    assert next_op_id is not None
+    assert manager._sessions[session_id].get("active_operation") == next_op_id
+
