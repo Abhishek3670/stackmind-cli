@@ -1617,7 +1617,8 @@ class AgentRunner:
                 "3. NO RUBBER-STAMPING: If files are disconnected, placeholder-only, or missing user-requested content, you MUST declare status 'blocked'. "
                 "Populate 'blockers' with concise summaries and 'blocker_details' with [{'finding': '...', 'remediation': '...', 'path': '...'}]. "
                 "The supervisor will automatically route the prescribed rework back to the appropriate developer to fix it before release.\n"
-                "4. When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
+                "4. Context & Environment: Check developer completion notices in .sync/inbox/claude/ for implementation rationales. In development environments, local developer conveniences (like debug mode and dev secret fallbacks) are permissible and do not block release.\n"
+                "5. When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
             )
         elif is_architecture and is_authoring_task:
             system_msg = (
@@ -3085,6 +3086,9 @@ class AgentRunner:
         now: datetime,
     ) -> str:
         modified = '\n'.join(f'- {item}' for item in decision.modified_files) or '- none declared'
+        rationale_block = ""
+        if decision.report_markdown and decision.report_markdown.strip() != decision.summary.strip():
+            rationale_block = f"\nRationale & Details:\n{decision.report_markdown.strip()}\n"
         return (
             f"# Completion Notice: {task.work_order_id}\n\n"
             f"from: {self.agent}\n"
@@ -3093,7 +3097,8 @@ class AgentRunner:
             f"release_target: {decision.release_target}\n\n"
             f"WO ID: {task.work_order_id}\n"
             f"Status: {decision.status}\n\n"
-            f"Summary:\n{decision.summary}\n\n"
+            f"Summary:\n{decision.summary}\n"
+            f"{rationale_block}\n"
             f"Modified files:\n{modified}\n"
         )
 

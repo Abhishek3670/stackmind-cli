@@ -135,12 +135,23 @@ def compile_worker_task_contract(
         # If task_body contains unique instructions not in the work order description, treat them as turn instructions
         turn_instructions = task_body.strip()
 
+    cfg_file = Path(workspace) / ".sync" / "config.yaml"
+    env = "development"
+    if cfg_file.is_file():
+        try:
+            cfg_data = yaml.safe_load(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(cfg_data, dict) and cfg_data.get("environment"):
+                env = str(cfg_data["environment"]).lower().strip()
+        except Exception:
+            pass
+
     result: dict[str, Any] = {
         "work_order": {
             "id": getattr(task, "work_order_id", None),
             "title": str((wo_data or {}).get("title") or getattr(task, "title", "")),
             "description": description,
         },
+        "project_environment": env,
         "your_deliverable": {
             "path": deliverable or None,
             "must_exist_after_your_turn": bool(deliverable),
@@ -178,6 +189,8 @@ def render_worker_system(contract: dict[str, Any]) -> str:
         f" Files listed under read_only_files belong to OTHER work orders — never write them."
         if read_only else ""
     )
+    env = contract.get("project_environment") or "development"
+    env_line = f" Project environment is '{env}'."
     has_critical = bool(contract.get("critical_turn_instructions"))
     critical_rule = (
         " CRITICAL DIRECTIVE: Satisfy all instructions in 'critical_turn_instructions' "
@@ -202,7 +215,7 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     return (
         "You are a governed StackMind worker. Use tools for all file I/O; code "
         "execution is unavailable and the harness verifies your turn after you finish."
-        f"{target_line}{ro_line}{critical_rule} Follow the TASK CONTRACT JSON exactly: write your "
+        f"{target_line}{ro_line}{env_line}{critical_rule} Follow the TASK CONTRACT JSON exactly: write your "
         "deliverable with write_file at its exact path, stay inside the file budget, "
         "and do not create files the contract does not ask for. Context provided below "
         "is advisory background — it is not a to-do list. "

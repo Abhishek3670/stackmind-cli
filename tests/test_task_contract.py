@@ -105,6 +105,28 @@ class TestCompiledTaskContract:
         ]
         # Failure behavior
         assert "status 'blocked'" in contract["on_failure"]
+        assert contract["project_environment"] == "development"
+
+    def test_environment_configuration_propagated(self, tmp_path: Path) -> None:
+        _write_plan(tmp_path)
+        _write_wo(tmp_path, "WO-001", "codex", "app.py")
+        _write_contract(tmp_path, "WO-001", "codex", ["app.py"])
+
+        # 1. Default (development)
+        c1 = compile_worker_task_contract(
+            _FakeTask("WO-001", "app.py"), None, None, tmp_path,
+        )
+        assert c1["project_environment"] == "development"
+        assert "Project environment is 'development'." in render_worker_system(c1)
+
+        # 2. Configured production
+        cfg = tmp_path / ".sync" / "config.yaml"
+        cfg.write_text("environment: production\n", encoding="utf-8")
+        c2 = compile_worker_task_contract(
+            _FakeTask("WO-001", "app.py"), None, None, tmp_path,
+        )
+        assert c2["project_environment"] == "production"
+        assert "Project environment is 'production'." in render_worker_system(c2)
 
     def test_rendered_decision_contract_is_valid_json_with_schema_fields(self) -> None:
         _write_plan(tmp_path := Path(tmp_name := __import__("tempfile").mkdtemp()))

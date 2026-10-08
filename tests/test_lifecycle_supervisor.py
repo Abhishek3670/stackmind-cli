@@ -2043,6 +2043,41 @@ def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path)
     assert "non-empty string array" in prompt.lower() or "non-empty" in prompt.lower(), \
         "Prompt must specify blockers must be non-empty when blocked"
     assert "read-only" in prompt.lower(), "Prompt should mention read-only scope constraint"
+    assert "Project Environment:" in prompt
+    assert "developer completion notices" in prompt.lower()
+
+
+def test_integration_review_prompt_environment_adaptation(tmp_path: Path) -> None:
+    """Integration review checklist adapts to environment (development allows dev conveniences; production enforces strict fail-fast)."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-env-test", "Goal", tmp_path, "sess-env")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text("id: WO-001\ntitle: Task\nassigned_agents: [codex]\n", encoding="utf-8")
+
+    # 1. Default (development)
+    cfg = tmp_path / ".sync" / "config.yaml"
+    cfg.write_text("environment: development\n", encoding="utf-8")
+    supervisor.advance(state)
+    prompt_dev = mock_mgr.operations[state.integration_operation_id]["prompt"]
+    assert "ENVIRONMENT: DEVELOPMENT" in prompt_dev
+    assert "debug=True" in prompt_dev
+    assert "permitted and must NOT block release" in prompt_dev
+    mock_mgr.operations[state.integration_operation_id]["status"] = "COMPLETED"
+
+    # 2. Production
+    cfg.write_text("environment: production\n", encoding="utf-8")
+    state2 = supervisor.start_run("run-env-prod", "Goal", tmp_path, "sess-env-prod")
+    state2.phase = Phase.INTEGRATION_REVIEW
+    state2.completed_wo_ids = ["WO-001"]
+    supervisor.advance(state2)
+    prompt_prod = mock_mgr.operations[state2.integration_operation_id]["prompt"]
+    assert "ENVIRONMENT: PRODUCTION" in prompt_prod
+    assert "Debug flags are disabled for production" in prompt_prod
 
 
 def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: Path) -> None:
