@@ -1170,6 +1170,21 @@ def prompt_composer_input(
             else:
                 sys.stdout.write(f"\n{bottom_border}\x1b[1A\r")
             sys.stdout.flush()
+        def _clear_dropdown() -> None:
+            if is_full_screen and session is not None and state is not None:
+                try:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=True,
+                        composer_content=getattr(state, "composer_buffer", ""),
+                        live_manager=live_manager,
+                    )
+                except Exception:
+                    pass
+
         try:
             val = raw_prompt_input(
                 placeholder=placeholder,
@@ -1184,6 +1199,7 @@ def prompt_composer_input(
                 on_page_down=on_page_down,
                 on_wheel_up=on_wheel_up,
                 on_wheel_down=on_wheel_down,
+                on_clear_dropdown=_clear_dropdown,
                 key_stream=key_stream,
                 top_border_renderer=lambda has_c: render_composer_top_border_str(
                     placeholder=placeholder,

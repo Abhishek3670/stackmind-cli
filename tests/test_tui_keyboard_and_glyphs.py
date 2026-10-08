@@ -42,9 +42,11 @@ from cli.tui.glyphs import (
     tree_branch,
 )
 from cli.tui.keyboard import (
+    DEFAULT_COMMANDS,
     Key,
     RawLineEditor,
     TerminalStateRestorer,
+    format_dropdown_lines,
     raw_prompt_input,
 )
 
@@ -930,6 +932,156 @@ def test_composer_box_responsive_content_and_shortcuts():
     func_text = "def calculate_statistics(data, threshold=10):"
     box_long = render_composer_box_str(width=80, content=func_text)
     assert "calculate_statistics" in box_long
+
+
+# ─── 8. AUTOFILL DROPDOWN MENU FOR ':' TESTS ─────────────────────────────────
+
+
+def test_dropdown_activation_on_colon():
+    """Verify typing ':' activates the command autofill dropdown with :resume at the top."""
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    assert editor.dropdown_active is True
+    assert len(editor.dropdown_matches) == len(DEFAULT_COMMANDS)
+    assert editor.dropdown_matches[0][0] == ":resume"
+    assert editor.dropdown_index == 0
+
+
+def test_dropdown_arrow_navigation():
+    """Verify Arrow Down/Up navigates through dropdown commands."""
+    editor = RawLineEditor()
+    editor.handle_key(":")
+
+    # Initial selection: 0 (:resume)
+    assert editor.dropdown_index == 0
+    # Down arrow -> 1 (:status)
+    editor.handle_key(Key.DOWN)
+    assert editor.dropdown_index == 1
+    assert editor.dropdown_matches[1][0] == ":status"
+
+    # Down arrow -> 2 (:plan)
+    editor.handle_key(Key.DOWN)
+    assert editor.dropdown_index == 2
+    assert editor.dropdown_matches[2][0] == ":plan"
+
+    # Up arrow -> back to 1 (:status)
+    editor.handle_key(Key.UP)
+    assert editor.dropdown_index == 1
+
+    # Up arrow -> back to 0 (:resume)
+    editor.handle_key(Key.UP)
+    assert editor.dropdown_index == 0
+
+    # Up arrow wraps to last item
+    editor.handle_key(Key.UP)
+    assert editor.dropdown_index == len(editor.dropdown_matches) - 1
+
+
+def test_dropdown_enter_selection():
+    """Verify Enter on selected command autofills and submits immediate commands or prepares args."""
+    # 1. Immediate command (:resume)
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    assert editor.dropdown_index == 0
+    submitted = editor.handle_key(Key.ENTER)
+    assert submitted is True
+    assert editor.text == ":resume"
+    assert editor.dropdown_active is False
+
+    # 2. Command with args (:goal)
+    editor2 = RawLineEditor()
+    editor2.handle_key(":")
+    editor2.handle_key("g")  # filters to :goal
+    assert editor2.dropdown_matches[0][0] == ":goal"
+    submitted2 = editor2.handle_key(Key.ENTER)
+    assert submitted2 is False  # allows user to type goal argument
+    assert editor2.text == ":goal "
+    assert editor2.dropdown_active is False
+
+
+def test_dropdown_tab_selection():
+    """Verify Tab autofills the highlighted command without immediate submission."""
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    editor.handle_key("w")  # matches :wo
+    assert [m[0] for m in editor.dropdown_matches] == [":wo"]
+    submitted = editor.handle_key(Key.TAB)
+    assert submitted is False
+    assert editor.text == ":wo"
+    assert editor.dropdown_active is False
+
+
+def test_dropdown_filtering():
+    """Verify dropdown filters dynamically as user types prefix."""
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    editor.handle_key("p")
+    matches = [m[0] for m in editor.dropdown_matches]
+    assert ":plan" in matches
+    assert ":pause" in matches
+    assert ":resume" not in matches
+
+    # Down arrow moves to :pause
+    editor.handle_key(Key.DOWN)
+    assert editor.dropdown_matches[editor.dropdown_index][0] == ":pause"
+    submitted = editor.handle_key(Key.ENTER)
+    assert submitted is True
+    assert editor.text == ":pause"
+
+
+def test_dropdown_dismiss_escape():
+    """Verify Escape dismisses the dropdown without altering text."""
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    assert editor.dropdown_active is True
+    editor.handle_key(Key.ESCAPE)
+    assert editor.dropdown_active is False
+    assert editor.text == ":"
+
+
+def test_dropdown_backspace():
+    """Verify Backspace closing the ':' prefix deactivates the dropdown."""
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    assert editor.dropdown_active is True
+    editor.handle_key(Key.BACKSPACE)
+    assert editor.dropdown_active is False
+    assert editor.text == ""
+
+
+def test_raw_prompt_input_autofill_simulation():
+    """Verify raw_prompt_input works end-to-end with simulated key stream for ':' autofill."""
+    # 1. Type ':' and press Enter -> selects default top choice ':resume'
+    keys1 = iter([":", Key.ENTER])
+    res1 = raw_prompt_input(width=80, key_stream=keys1)
+    assert res1 == ":resume"
+
+    # 2. Type ':', press Down, press Enter -> selects ':status'
+    keys2 = iter([":", Key.DOWN, Key.ENTER])
+    res2 = raw_prompt_input(width=80, key_stream=keys2)
+    assert res2 == ":status"
+
+    # 3. Type ':w' and press Enter -> selects ':wo'
+    keys3 = iter([":", "w", Key.ENTER])
+    res3 = raw_prompt_input(width=80, key_stream=keys3)
+    assert res3 == ":wo"
+
+
+def test_format_dropdown_lines_structure():
+    """Verify format_dropdown_lines produces valid bordered boxes with selection markers."""
+    lines = format_dropdown_lines(DEFAULT_COMMANDS, selected_index=0, width=80)
+    assert len(lines) >= 3
+    # Top border
+    assert "Commands" in lines[0]
+    # Selected first item has '> '
+    assert "> " in lines[1]
+    assert ":resume" in lines[1]
+    # Second item has no selection marker
+    assert "  " in lines[2]
+    assert ":status" in lines[2]
+    # Bottom border has pagination info
+    assert f"(1/{len(DEFAULT_COMMANDS)})" in lines[-1]
+
 
 
 
