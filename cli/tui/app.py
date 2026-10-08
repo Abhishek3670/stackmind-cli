@@ -195,10 +195,19 @@ def render_roles_panel(state: AutonomousDeliveryState, detailed: bool = False) -
     # Dashboard compact view
     lines = ["AGENTS"]
     for role_name, r in state.roles.items():
-        marker = "✓" if r.state.upper() in {"COMPLETED", "DONE"} else ("●" if r.state.upper() in {"RUNNING", "ACTIVE"} else "○")
+        disp_state = r.display_state
+        if state.phase == ProjectPhase.BLOCKED:
+            if role_name.lower() == "gitops" and (
+                "gitops" in str(getattr(state, "error", "")).lower()
+                or any(w.status == "BLOCKED" for w in state.work_orders if w.role.lower() in ("gitops", "local-llm"))
+            ):
+                disp_state = "blocked"
+            elif disp_state == "implementing":
+                disp_state = "idle"
+        marker = "✓" if disp_state == "completed" else ("!" if disp_state == "blocked" else ("●" if disp_state in {"running", "implementing"} else "○"))
         badge = format_model_badge(r.backend, getattr(r, "model", None), getattr(r, "quantization", None))
-        badge_str = f" [{badge}]" if (getattr(r, "model", None) and r.state.upper() in {"RUNNING", "ACTIVE", "ORCHESTRATING"}) else ""
-        lines.append(f"{marker} {role_name:<16} {r.display_state}{badge_str}")
+        badge_str = f" [{badge}]" if (getattr(r, "model", None) and disp_state in {"running", "implementing", "orchestrating"}) else ""
+        lines.append(f"{marker} {role_name:<16} {disp_state}{badge_str}")
     return "\n".join(lines)
 
 
@@ -206,7 +215,17 @@ def render_work_orders_panel(state: AutonomousDeliveryState) -> str:
     """Renders the Work Orders panel (:wo command)."""
     lines = ["WORK ORDERS"]
     for wo in state.work_orders:
-        marker = "✓" if wo.status.upper() in {"COMPLETED", "DONE"} else ("●" if wo.status.upper() in {"RUNNING", "ACTIVE"} else "○")
+        st = wo.status.upper()
+        if st in {"COMPLETED", "DONE", "VERIFIED", "SUCCESS"}:
+            marker = "✓"
+        elif st in {"BLOCKED"}:
+            marker = "⊘"
+        elif st in {"RUNNING", "ACTIVE", "IN_PROGRESS"}:
+            marker = "●"
+        elif st in {"FAILED", "ERROR"}:
+            marker = "×"
+        else:
+            marker = "○"
         title_summary = wo.title if len(wo.title) <= 24 else wo.title[:21] + "..."
         lines.append(f"{marker} {wo.id:<8} {title_summary}")
     return "\n".join(lines)
@@ -1943,6 +1962,8 @@ def dispatch_delivery_command(
         except Exception as run_err:
             if run_id_clean:
                 run_resumed_msg = f" (supervisor note: {run_err})"
+        if session.get("workspace"):
+            state.sync_work_orders_from_disk(session.get("workspace"))
         output_str = f"Session {session.get('state', 'RUNNING')}{run_resumed_msg}"
         state.add_message("user", normalized)
         state.add_message("system", output_str)

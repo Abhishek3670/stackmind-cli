@@ -718,13 +718,14 @@ class AutonomousDeliveryState:
         if run_phase:
             rp_str = str(run_phase).upper()
             if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
-                          "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION"):
+                          "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION",
+                          "PRODUCT_READY", "GITOPS"):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
                 if not run_error:
                     self.error = None
             elif rp_str == "AWAITING_APPROVAL":
                 self.phase = ProjectPhase.AWAITING_APPROVAL
-            elif rp_str in ("COMPLETE", "PRODUCT_READY"):
+            elif rp_str in ("COMPLETE",):
                 self.phase = ProjectPhase.PROJECT_COMPLETE
                 self.is_complete = True
                 self.error = None
@@ -734,6 +735,10 @@ class AutonomousDeliveryState:
                 self.phase = ProjectPhase.BLOCKED
             elif rp_str == "FAILED":
                 self.phase = ProjectPhase.FAILED
+
+        ws_session = session.get("workspace")
+        if ws_session:
+            self.sync_work_orders_from_disk(ws_session)
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
         if not isinstance(wo_records, list):
@@ -751,6 +756,101 @@ class AutonomousDeliveryState:
             items.append(WorkOrderItem(wo_id, title, role=role, priority=priority, status=status))
         if items:
             self.work_orders = items
+
+    def sync_work_orders_from_disk(self, workspace: Path | str | None = None) -> None:
+        """Synchronize work order statuses accurately from disk (.sync/work-orders/INDEX.yaml and folders)."""
+        ws_val = workspace or getattr(self, "workspace", None)
+        if not ws_val:
+            return
+        try:
+            ws_path = Path(ws_val)
+            if not ws_path.is_dir():
+                return
+            sync_wos = ws_path / ".sync" / "work-orders"
+            if not sync_wos.is_dir():
+                return
+
+            import yaml
+            disk_statuses: dict[str, str] = {}
+            disk_orders: dict[str, dict[str, Any]] = {}
+
+            completed_dir = sync_wos / "COMPLETED"
+            if completed_dir.is_dir():
+                for f in completed_dir.glob("*.yaml"):
+                    disk_statuses[f.stem] = "COMPLETED"
+                    try:
+                        data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            disk_orders[f.stem] = data
+                    except Exception:
+                        pass
+
+            blocked_dir = sync_wos / "BLOCKED"
+            if blocked_dir.is_dir():
+                for f in blocked_dir.glob("*.yaml"):
+                    disk_statuses[f.stem] = "BLOCKED"
+                    try:
+                        data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            disk_orders[f.stem] = data
+                    except Exception:
+                        pass
+
+            active_dir = sync_wos / "ACTIVE"
+            if active_dir.is_dir():
+                for f in active_dir.glob("*.yaml"):
+                    try:
+                        data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+                        st = str(data.get("status", "ACTIVE")).upper()
+                        if data.get("error") or data.get("blocked_reason"):
+                            st = "BLOCKED"
+                        disk_statuses[f.stem] = st
+                        disk_orders[f.stem] = data
+                    except Exception:
+                        disk_statuses.setdefault(f.stem, "ACTIVE")
+
+            index_file = sync_wos / "INDEX.yaml"
+            if index_file.is_file():
+                try:
+                    idx = yaml.safe_load(index_file.read_text(encoding="utf-8")) or {}
+                    for o in idx.get("orders", []):
+                        if isinstance(o, dict) and o.get("id"):
+                            oid = str(o["id"])
+                            ost = str(o.get("status", "")).upper()
+                            if ost:
+                                disk_statuses[oid] = ost
+                            disk_orders[oid] = o
+                except Exception:
+                    pass
+
+            if not disk_statuses and not disk_orders:
+                return
+
+            default_titles = {
+                "Architecture & Orchestration",
+                "Backend API & Services",
+                "Frontend Client & Views",
+                "Q/A Verification Suite",
+                "GitOps Release & Hygiene",
+            }
+            is_dummy = self.work_orders and all(w.title in default_titles for w in self.work_orders)
+
+            if disk_orders and (not self.work_orders or is_dummy or set(disk_orders.keys()) != {w.id for w in self.work_orders}):
+                items = []
+                for oid, o in sorted(disk_orders.items()):
+                    title = str(o.get("title", f"Work order {oid}"))
+                    agents = o.get("assigned_agents")
+                    role = agents[0].title() if isinstance(agents, list) and agents else "Backend"
+                    priority = str(o.get("priority", "P0"))
+                    st = disk_statuses.get(oid, str(o.get("status", "WAITING")).upper())
+                    items.append(WorkOrderItem(oid, title, role=role, priority=priority, status=st))
+                self.work_orders = items
+            else:
+                for w in self.work_orders:
+                    if w.id in disk_statuses:
+                        w.status = disk_statuses[w.id]
+        except Exception:
+            pass
 
     def get_agent_hierarchy(self) -> list[dict[str, Any]]:
         """Return the dynamic agent hierarchy without hard-coding the agent roster (§7, §8).
@@ -796,11 +896,20 @@ class AutonomousDeliveryState:
                     "is_root": True,
                 })
             for w_obj in children_objs:
+                w_status = w_obj.display_state
+                if self.phase == ProjectPhase.BLOCKED:
+                    if w_obj.role.lower() == "gitops" and (
+                        "gitops" in str(getattr(self, "error", "")).lower()
+                        or any(w.status == "BLOCKED" for w in self.work_orders if w.role.lower() in ("gitops", "local-llm"))
+                    ):
+                        w_status = "blocked"
+                    elif w_status == "implementing":
+                        w_status = "idle"
                 entries.append({
                     "name": w_obj.role,
                     "role": w_obj.role,
                     "backend": w_obj.backend,
-                    "status": w_obj.display_state,
+                    "status": w_status,
                     "is_root": False,
                 })
             return entries
@@ -918,19 +1027,7 @@ class AutonomousDeliveryState:
         if workspace is not None:
             try:
                 ws_path = Path(workspace)
-                active_wos_dir = ws_path / ".sync" / "work-orders" / "ACTIVE"
-                if active_wos_dir.is_dir():
-                    import yaml
-                    disk_wos = []
-                    for wo_file in sorted(active_wos_dir.glob("*.yaml")):
-                        try:
-                            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
-                            if isinstance(wo_data, dict):
-                                disk_wos.append(wo_data)
-                        except Exception:
-                            pass
-                    if disk_wos:
-                        self.sync_work_orders(disk_wos)
+                self.sync_work_orders_from_disk(ws_path)
 
                 plan_file = ws_path / ".sync" / "PLAN.md"
                 if not plan_file.exists():
@@ -938,6 +1035,7 @@ class AutonomousDeliveryState:
                 if plan_file.exists():
                     self.completion_checklist["PLAN.md"] = True
                     if self.phase in (ProjectPhase.INITIALIZING, ProjectPhase.AWAITING_APPROVAL):
+                        active_wos_dir = ws_path / ".sync" / "work-orders" / "ACTIVE"
                         if active_wos_dir.is_dir() and any(active_wos_dir.glob("*.yaml")):
                             self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
             except Exception:
@@ -1067,9 +1165,10 @@ class AutonomousDeliveryState:
                 self.roles[normalized_role].state = "RUNNING"
                 if wo_id:
                     self.roles[normalized_role].work_order_id = wo_id
-            for wo in self.work_orders:
-                if wo.id == wo_id or wo.role.lower() == normalized_role.lower():
-                    wo.status = "RUNNING"
+            if wo_id:
+                for wo in self.work_orders:
+                    if wo.id == wo_id:
+                        wo.status = "RUNNING"
             self.add_activity(normalized_role, "started", op_name or (wo_id or ""))
 
         elif name in {"operation.completed", "turn.completed"}:
@@ -1088,9 +1187,10 @@ class AutonomousDeliveryState:
 
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "COMPLETED"
-            for wo in self.work_orders:
-                if wo.id == wo_id or wo.role.lower() == normalized_role.lower():
-                    wo.status = "COMPLETED"
+            if wo_id:
+                for wo in self.work_orders:
+                    if wo.id == wo_id:
+                        wo.status = "COMPLETED"
             # Update checklist
             if "backend" in normalized_role.lower():
                 self.completion_checklist["Backend"] = True
@@ -1213,15 +1313,16 @@ class AutonomousDeliveryState:
 
         elif name == "run.phase":
             phase_val = str(payload.get("phase", "")).upper()
-            if phase_val in ("COMPLETE", "PRODUCT_READY"):
+            if phase_val == "COMPLETE":
                 self.phase = ProjectPhase.PROJECT_COMPLETE
                 for k in self.completion_checklist:
                     self.completion_checklist[k] = True
                 self.is_complete = True
                 self.error = None
-                self.add_activity("StackMind", "project phase complete")
+                self.add_activity("StackMind", "project complete")
             elif phase_val in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
-                               "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION"):
+                               "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION",
+                               "PRODUCT_READY", "GITOPS"):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
                 self.error = None
             elif phase_val == "AWAITING_APPROVAL":
@@ -1231,23 +1332,35 @@ class AutonomousDeliveryState:
                 if payload.get("error"):
                     self.error = str(payload["error"])
                 self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+                for r_obj in self.roles.values():
+                    if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                        r_obj.state = "WAITING"
             elif phase_val == "FAILED":
                 self.phase = ProjectPhase.FAILED
                 if payload.get("error"):
                     self.error = str(payload["error"])
                 self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+                for r_obj in self.roles.values():
+                    if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                        r_obj.state = "WAITING"
 
         elif name == "run.blocked":
             self.phase = ProjectPhase.BLOCKED
             if payload.get("error"):
                 self.error = str(payload["error"])
             self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+            for r_obj in self.roles.values():
+                if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                    r_obj.state = "WAITING"
 
         elif name == "run.failed":
             self.phase = ProjectPhase.FAILED
             if payload.get("error"):
                 self.error = str(payload["error"])
             self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+            for r_obj in self.roles.values():
+                if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                    r_obj.state = "WAITING"
 
 
 __all__ = [
