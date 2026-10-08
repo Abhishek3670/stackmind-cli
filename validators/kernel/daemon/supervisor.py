@@ -1114,6 +1114,17 @@ class LifecycleSupervisor:
         if not state.worker_wo_ids:
             self._discover_worker_wos(state)
 
+        # Ensure any uncompleted QA rework targets are tracked as worker WOs
+        # and unarchived on disk if they were completed previously.
+        for qa_id, targets in list(state.qa_rework_targets.items()):
+            for target_id in targets:
+                if target_id not in state.completed_wo_ids:
+                    if target_id not in state.worker_wo_ids:
+                        state.worker_wo_ids.append(target_id)
+                    if state.published_wo_ids and target_id not in state.published_wo_ids:
+                        state.published_wo_ids.append(target_id)
+                    self._unarchive_work_order(ws, target_id)
+
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
@@ -1683,7 +1694,11 @@ class LifecycleSupervisor:
                 target_op_id = str(target_op["operation_id"])
                 if target_op_id not in state.ignored_operation_ids:
                     state.ignored_operation_ids.append(target_op_id)
-            self._mark_wo_status_on_disk(ws, target_id, "ACTIVE", clear_error=True)
+            self._unarchive_work_order(ws, target_id)
+            if target_id not in state.worker_wo_ids:
+                state.worker_wo_ids.append(target_id)
+            if state.published_wo_ids and target_id not in state.published_wo_ids:
+                state.published_wo_ids.append(target_id)
 
             def _rework_prompt(n: int, agent: str, _t=target_id, _f=finding) -> str:
                 return (
@@ -2039,6 +2054,10 @@ class LifecycleSupervisor:
                             parent_op_id = None
                     for wo_id in reworkable:
                         self._unarchive_work_order(ws, wo_id)
+                        if wo_id not in state.worker_wo_ids:
+                            state.worker_wo_ids.append(wo_id)
+                        if state.published_wo_ids and wo_id not in state.published_wo_ids:
+                            state.published_wo_ids.append(wo_id)
                         if wo_id in state.completed_wo_ids:
                             state.completed_wo_ids.remove(wo_id)
                         if wo_id in state.failed_wo_ids:
@@ -2411,6 +2430,7 @@ class LifecycleSupervisor:
             active.parent.mkdir(parents=True, exist_ok=True)
             active.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
             completed.unlink()
+            self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
             return True
         except Exception:
             return False
@@ -2623,6 +2643,9 @@ class LifecycleSupervisor:
                 "debug flags disabled, authentication logic free of obvious flaws, and forms protected "
                 "against CSRF/replay where applicable."
             )
+        feedback = self._get_qa_feedback(wo_id, ws)
+        if feedback:
+            return f"Execute work order {wo_id} after QA feedback:\n{feedback}"
         return f"Execute work order {wo_id}"
 
     def _qa_execution_evidence_gap(self, wo_id: str, op: dict[str, Any], ws: Path) -> str | None:
@@ -3949,13 +3972,17 @@ class LifecycleSupervisor:
             candidate_ids.append(state.integration_wo_id)
         if state.gitops_wo_id:
             candidate_ids.append(state.gitops_wo_id)
+        for qa_id, targets in list(getattr(state, "qa_rework_targets", {}).items()):
+            for target_id in targets:
+                if target_id not in candidate_ids:
+                    candidate_ids.append(target_id)
 
         seen: set[str] = set(state.completed_wo_ids)
         for wo_id in candidate_ids:
             if wo_id in seen:
                 continue
             seen.add(wo_id)
-            self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+            self._unarchive_work_order(ws, wo_id)
             if wo_id in state.blocked_wo_ids:
                 state.blocked_wo_ids.remove(wo_id)
 

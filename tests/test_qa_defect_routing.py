@@ -603,4 +603,44 @@ def test_integration_rework_resets_retry_budget_for_reworkable_wos(tmp_path: Pat
     assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml").is_file()
 
 
+def test_qa_rework_target_unarchived_and_registered_in_worker_wo_ids(tmp_path: Path) -> None:
+    """When a QA rework target is not in worker_wo_ids and archived on disk,
+    _advance_executing unarchives it, registers it in worker_wo_ids, and dispatches it."""
+    _write_worker_yaml(tmp_path, "WO-002", "codex", "src/backend.py")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_backend.py")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "backend.py").write_text("print('hello')", encoding="utf-8")
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_backend.py").write_text("def test_b(): pass", encoding="utf-8")
+
+    # Move WO-002 to COMPLETED
+    active_wo = tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml"
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    active_wo.rename(completed_dir / "WO-002.yaml")
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-qa-target", "Goal", tmp_path, "sess-qa-target")
+    state.phase = Phase.EXECUTING
+    # WO-002 is NOT in worker_wo_ids initially (e.g. from state loaded after completion)
+    state.worker_wo_ids = ["WO-004"]
+    state.completed_wo_ids = []
+    state.qa_rework_targets = {"WO-004": ["WO-002"]}
+
+    res = supervisor.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert "WO-002" in state.worker_wo_ids
+    assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml").is_file()
+    # WO-002 turn was dispatched
+    dispatched = [
+        op for op in mock_mgr.list_operations()
+        if op.get("work_order_id") == "WO-002"
+    ]
+    assert len(dispatched) == 1
+    assert dispatched[0]["agent_id"] == "codex"
+
+
+
 
