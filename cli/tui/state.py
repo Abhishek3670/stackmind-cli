@@ -24,7 +24,8 @@ def canonical_blocker_text(block_msg: Any) -> str:
     render as a single deduplicated canonical line; raw evidence remains
     available in the underlying payload instead of being repeated in the list.
     """
-    text = str(block_msg or "")
+    if not block_msg:
+        return ""
     if isinstance(block_msg, Mapping):
         failure = block_msg.get("failure")
         if isinstance(failure, Mapping):
@@ -33,7 +34,10 @@ def canonical_blocker_text(block_msg: Any) -> str:
             rev = failure.get("contract_revision", 1)
             msg = str(failure.get("canonical_message") or block_msg.get("error") or "")
             return f"{code} [{wo} rev {rev}] {msg}".strip()
-    return text
+        from cli.tui.events import clean_error_message
+        return clean_error_message(block_msg)
+    from cli.tui.events import clean_error_message
+    return clean_error_message(block_msg)
 
 
 class ProjectPhase(str, Enum):
@@ -183,7 +187,8 @@ class ActionsGroup:
         duration_seconds: float | None = None,
         error: str | None = None,
     ) -> TurnAction | None:
-        """Complete an existing action in-place without duplicate cards (§21)."""
+        if status.upper() in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}:
+            self.expanded = True
         for a in self.actions:
             if a.action_id == action_id:
                 a.status = status
@@ -239,8 +244,14 @@ class ActionsGroup:
         """Format the summary header line per §20 and §21."""
         arrow = "▾" if self.expanded else "▸"
         count = len(self.actions)
+        failed_count = sum(1 for a in self.actions if a.status.upper() in {"FAILED", "FAILURE", "ERROR"})
         if self.active or self.has_running:
             suffix = f"{count}"
+        elif failed_count > 0:
+            if self.completed_count > 0:
+                suffix = f"{self.completed_count} completed, {failed_count} failed"
+            else:
+                suffix = f"{failed_count} failed"
         else:
             suffix = f"{count} completed"
         return f"{arrow} Actions · {suffix}"
@@ -382,6 +393,7 @@ class AutonomousDeliveryState:
         self.seen_message_keys: set[tuple[str, str]] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False)
+        self.current_turn_thinking: str = ""
         self.client_timeout: float = client_timeout
         self.context_window_tokens = max(1, context_window_tokens)
         self.compaction_threshold = min(max(compaction_threshold, 0.1), 1.0)
@@ -390,6 +402,28 @@ class AutonomousDeliveryState:
         self.completion_tokens: int = 0
         self.cumulative_turn_tokens: int = 0
         self.compaction_count: int = 0
+        self.settings_panel_open: bool = False
+        self.settings_selected_row: int = 0
+        self.settings_current_view: str = "main"  # "main", "provider:<name>", "roles"
+        self.settings_field_idx: int = 0
+        self.settings_status_msg: str = ""
+        self.settings_obj: Any | None = None
+
+    def open_settings(self, settings_obj: Any | None = None) -> None:
+        """Open the interactive settings panel anchored below the composer."""
+        self.settings_panel_open = True
+        self.settings_selected_row = 0
+        self.settings_current_view = "main"
+        self.settings_status_msg = ""
+        if settings_obj is not None:
+            self.settings_obj = settings_obj
+
+    def close_settings(self) -> None:
+        """Close the interactive settings panel and restore normal viewport."""
+        self.settings_panel_open = False
+        self.settings_selected_row = 0
+        self.settings_current_view = "main"
+        self.settings_status_msg = ""
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -498,16 +532,23 @@ class AutonomousDeliveryState:
         msg_content = content
         if role == "assistant":
             from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning
-            if msg_thinking is None and "<think" in content.lower():
-                msg_thinking = extract_internal_reasoning(content)
+            if msg_thinking is None:
+                if getattr(self, "current_turn_thinking", None):
+                    msg_thinking = self.current_turn_thinking
+                elif "<think" in content.lower():
+                    msg_thinking = extract_internal_reasoning(content)
+            self.current_turn_thinking = ""
             if "<think" in msg_content.lower():
                 msg_content = strip_internal_reasoning(msg_content)
 
         msg_actions = actions
-        if role == "assistant" and msg_actions is None and self.current_turn_actions and not self.current_turn_actions.is_empty:
-            msg_actions = self.current_turn_actions
-            msg_actions.active = False
-            self.current_turn_actions = ActionsGroup(active=False)
+        if role == "assistant":
+            if msg_actions is None and self.current_turn_actions and not self.current_turn_actions.is_empty:
+                msg_actions = self.current_turn_actions
+            if msg_actions is not None:
+                msg_actions.active = False
+            if msg_actions is self.current_turn_actions:
+                self.current_turn_actions = ActionsGroup(active=False)
 
         msg = ChatMessage(
             role=role,
@@ -1232,7 +1273,8 @@ class AutonomousDeliveryState:
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             op_id = payload.get("operation_id")
-            err_msg = payload.get("error") or payload.get("reason") or "failed"
+            from cli.tui.events import clean_error_message
+            err_msg = clean_error_message(payload.get("error") or payload.get("reason") or "failed")
             if op_id and op_id in self.operations:
                 self.operations[op_id].status = "FAILED"
             else:
@@ -1248,7 +1290,8 @@ class AutonomousDeliveryState:
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             op_id = payload.get("operation_id")
-            block_msg = payload.get("error") or payload.get("reason") or "blocked"
+            from cli.tui.events import clean_error_message
+            block_msg = clean_error_message(payload.get("error") or payload.get("reason") or "blocked")
             if op_id and op_id in self.operations:
                 self.operations[op_id].status = "BLOCKED"
             else:
@@ -1269,6 +1312,7 @@ class AutonomousDeliveryState:
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.current_turn_actions.actions) + 1}")
             from cli.tui.events import format_action_description
             desc = format_action_description(tool_name, str(target))
+            self.current_turn_actions.expanded = True
             self.record_turn_action(call_id, desc, status="RUNNING")
 
         elif name == "event.toolCall":
@@ -1281,18 +1325,39 @@ class AutonomousDeliveryState:
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.current_turn_actions.actions) + 1}")
             from cli.tui.events import format_action_description
             desc = format_action_description(tool_name, str(target))
+            self.current_turn_actions.expanded = True
             self.record_turn_action(call_id, desc, status="RUNNING")
 
         elif name == "event.toolResult":
             tool_name = payload.get("tool_name", "tool")
             role = (payload.get("role") or "Agent").title()
             status = payload.get("status", "completed")
-            from cli.tui.events import normalize_status
+            from cli.tui.events import clean_error_message, normalize_status
             norm_status = normalize_status(status)
             self.add_activity(role, f"{tool_name} ({norm_status.lower()})", "")
             call_id = str(payload.get("call_id") or payload.get("operation_id") or "")
-            err = str(payload.get("error")) if payload.get("error") else None
+            err = clean_error_message(payload.get("error")) if payload.get("error") else None
+            if norm_status in {"FAILED", "BLOCKED"}:
+                self.current_turn_actions.expanded = True
             self.complete_turn_action(call_id, status=norm_status, error=err)
+
+        elif name in {"agent.thinking", "turn.thinking", "reasoning.delta"}:
+            raw_think = payload.get("text") or payload.get("thinking") or payload.get("thought") or payload.get("reasoning") or payload.get("delta") or ""
+            think_text = str(raw_think)
+            if think_text.strip():
+                # Preserve leading whitespace (including paragraph breaks)
+                # Only strip trailing whitespace to avoid double-spaces
+                chunk = think_text.rstrip()
+                if chunk:
+                    if getattr(self, "current_turn_thinking", None):
+                        # Preserve leading whitespace for chunks like " how", " ,", " ."
+                        # This maintains provider's original spacing and punctuation
+                        if chunk.startswith((" ", "\t", "\n")):
+                            self.current_turn_thinking += chunk
+                        else:
+                            self.current_turn_thinking += " " + chunk
+                    else:
+                        self.current_turn_thinking = chunk
 
         elif name in {"verification.completed", "verification.recorded"}:
             res = payload.get("result")
@@ -1330,7 +1395,8 @@ class AutonomousDeliveryState:
             elif phase_val == "BLOCKED":
                 self.phase = ProjectPhase.BLOCKED
                 if payload.get("error"):
-                    self.error = str(payload["error"])
+                    from cli.tui.events import clean_error_message
+                    self.error = clean_error_message(payload["error"])
                 self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
                 for r_obj in self.roles.values():
                     if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
@@ -1338,7 +1404,8 @@ class AutonomousDeliveryState:
             elif phase_val == "FAILED":
                 self.phase = ProjectPhase.FAILED
                 if payload.get("error"):
-                    self.error = str(payload["error"])
+                    from cli.tui.events import clean_error_message
+                    self.error = clean_error_message(payload["error"])
                 self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
                 for r_obj in self.roles.values():
                     if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
@@ -1347,7 +1414,8 @@ class AutonomousDeliveryState:
         elif name == "run.blocked":
             self.phase = ProjectPhase.BLOCKED
             if payload.get("error"):
-                self.error = str(payload["error"])
+                from cli.tui.events import clean_error_message
+                self.error = clean_error_message(payload["error"])
             self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
             for r_obj in self.roles.values():
                 if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
@@ -1356,7 +1424,8 @@ class AutonomousDeliveryState:
         elif name == "run.failed":
             self.phase = ProjectPhase.FAILED
             if payload.get("error"):
-                self.error = str(payload["error"])
+                from cli.tui.events import clean_error_message
+                self.error = clean_error_message(payload["error"])
             self.add_activity("StackMind", "run failed", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
             for r_obj in self.roles.values():
                 if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:

@@ -41,7 +41,8 @@
         "ACTIVE",
         "BLOCKED",
         "COMPLETE",
-        "COMPLETED"
+        "COMPLETED",
+        "FAILED"
       ]
     },
     "priority": {
@@ -379,7 +380,8 @@
                 "ACTIVE",
                 "BLOCKED",
                 "COMPLETE",
-                "COMPLETED"
+                "COMPLETED",
+                "FAILED"
               ]
             },
             "completed_at": {

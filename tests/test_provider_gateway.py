@@ -82,44 +82,73 @@ def test_provider_gateway_end_to_end_loop_with_tool_execution(tmp_path):
         turn_count += 1
         messages = payload.get("messages", [])
 
-        if turn_count == 1:
-            # Model returns tool call to write_file
-            return {
-                "id": "resp-1",
-                "model": "test-gpt",
-                "choices": [{
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "content": "I will write the release notes.",
-                        "tool_calls": [{
-                            "id": "call-write-1",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": json.dumps({"path": "RELEASE.md", "content": "# Release v3.1.0\nPhase P2 complete."}),
-                            },
-                        }],
-                    },
-                }],
-                "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
-            }
-        elif turn_count == 2:
-            # Check that tool output was included in messages
-            assert any(m.get("role") == "tool" and m.get("tool_call_id") == "call-write-1" for m in messages)
-            return {
-                "id": "resp-2",
-                "model": "test-gpt",
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": "Release notes have been written successfully and the task is complete.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 160, "completion_tokens": 20, "total_tokens": 180},
-            }
-        raise AssertionError("Unexpected turn in test")
+        if stream:
+            # For streaming, return list of dict chunks (SSE format)
+            if turn_count == 1:
+                # Model returns tool call to write_file
+                return [
+                    {"choices": [{
+                        "delta": {
+                            "role": "assistant",
+                            "content": "I will write the release notes.",
+                            "tool_calls": [{
+                                "id": "call-write-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps({"path": "RELEASE.md", "content": "# Release v3.1.0\nPhase P2 complete."}),
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }], "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}},
+                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                ]
+            elif turn_count == 2:
+                assert any(m.get("role") == "tool" and m.get("tool_call_id") == "call-write-1" for m in messages)
+                return [
+                    {"choices": [{"delta": {"content": "Release notes have been written successfully and the task is complete."}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 160, "completion_tokens": 20, "total_tokens": 180}},
+                ]
+            raise AssertionError("Unexpected turn in test")
+        else:
+            # For complete() calls, return full response dict
+            if turn_count == 1:
+                return {
+                    "id": "resp-1",
+                    "model": "test-gpt",
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "I will write the release notes.",
+                            "tool_calls": [{
+                                "id": "call-write-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps({"path": "RELEASE.md", "content": "# Release v3.1.0\nPhase P2 complete."}),
+                                },
+                            }],
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+                }
+            elif turn_count == 2:
+                assert any(m.get("role") == "tool" and m.get("tool_call_id") == "call-write-1" for m in messages)
+                return {
+                    "id": "resp-2",
+                    "model": "test-gpt",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "Release notes have been written successfully and the task is complete.",
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 160, "completion_tokens": 20, "total_tokens": 180},
+                }
+            raise AssertionError("Unexpected turn in test")
 
     adapter = OpenAICompatibleAdapter(
         base_url="https://api.example.com",
@@ -172,40 +201,65 @@ def test_provider_gateway_handles_scope_denial(tmp_path):
     def mock_transport(payload: dict[str, Any], stream: bool, timeout: float | None) -> dict[str, Any]:
         nonlocal turn_count
         turn_count += 1
-        if turn_count == 1:
-            return {
-                "id": "resp-1",
-                "model": "test-gpt",
-                "choices": [{
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "content": "Attempting to access restricted path.",
-                        "tool_calls": [{
-                            "id": "call-deny-1",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": json.dumps({"path": "restricted/secret.txt", "content": "data"}),
-                            },
-                        }],
-                    },
-                }],
-                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
-            }
+        if stream:
+            if turn_count == 1:
+                return [
+                    {"choices": [{
+                        "delta": {
+                            "role": "assistant",
+                            "content": "Attempting to access restricted path.",
+                            "tool_calls": [{
+                                "id": "call-deny-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps({"path": "restricted/secret.txt", "content": "data"}),
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }], "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}},
+                ]
+            else:
+                return [
+                    {"choices": [{"delta": {"content": "Operation failed as target is restricted."}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 130, "completion_tokens": 15, "total_tokens": 145}},
+                ]
         else:
-            return {
-                "id": "resp-2",
-                "model": "test-gpt",
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": "Operation failed as target is restricted.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 130, "completion_tokens": 15, "total_tokens": 145},
-            }
+            if turn_count == 1:
+                return {
+                    "id": "resp-1",
+                    "model": "test-gpt",
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "Attempting to access restricted path.",
+                            "tool_calls": [{
+                                "id": "call-deny-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps({"path": "restricted/secret.txt", "content": "data"}),
+                                },
+                            }],
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+                }
+            else:
+                return {
+                    "id": "resp-2",
+                    "model": "test-gpt",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "Operation failed as target is restricted.",
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 130, "completion_tokens": 15, "total_tokens": 145},
+                }
 
     adapter = OpenAICompatibleAdapter(transport=mock_transport)
     gateway = ProviderGateway(adapter, tool_gw, attempt=attempt, contract=contract)
@@ -229,6 +283,11 @@ def test_provider_gateway_budget_enforcement(tmp_path):
     )
 
     def mock_transport(payload: dict[str, Any], stream: bool, timeout: float | None) -> dict[str, Any]:
+        if stream:
+            return [
+                {"choices": [{"delta": {"content": "Response"}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 150, "completion_tokens": 80, "total_tokens": 230}},
+            ]
         return {
             "id": "resp-budget",
             "choices": [{
@@ -308,42 +367,76 @@ def test_provider_gateway_run_command_and_query_graph(tmp_path):
     def mock_transport(payload: dict[str, Any], stream: bool, timeout: float | None) -> dict[str, Any]:
         nonlocal turn_count
         turn_count += 1
-        if turn_count == 1:
-            return {
-                "choices": [{
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": "tc-cmd",
-                                "type": "function",
-                                "function": {
-                                    "name": "run_command",
-                                    "arguments": json.dumps({"command": [sys.executable, "hello_task.py"]}),
+        if stream:
+            if turn_count == 1:
+                return [
+                    {"choices": [{
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "tc-cmd",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run_command",
+                                        "arguments": json.dumps({"command": [sys.executable, "hello_task.py"]}),
+                                    },
                                 },
-                            },
-                            {
-                                "id": "tc-graph",
-                                "type": "function",
-                                "function": {
-                                    "name": "query_graph",
-                                    "arguments": json.dumps({"query": "AuthService"}),
+                                {
+                                    "id": "tc-graph",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "query_graph",
+                                        "arguments": json.dumps({"query": "AuthService"}),
+                                    },
                                 },
-                            },
-                        ],
-                    },
-                }],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
-            }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }], "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70}},
+                ]
+            else:
+                return [
+                    {"choices": [{"delta": {"content": "Commands executed."}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90}},
+                ]
         else:
-            return {
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "Commands executed."},
-                }],
-                "usage": {"prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90},
-            }
+            if turn_count == 1:
+                return {
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "tc-cmd",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run_command",
+                                        "arguments": json.dumps({"command": [sys.executable, "hello_task.py"]}),
+                                    },
+                                },
+                                {
+                                    "id": "tc-graph",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "query_graph",
+                                        "arguments": json.dumps({"query": "AuthService"}),
+                                    },
+                                },
+                            ],
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
+                }
+            else:
+                return {
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Commands executed."},
+                    }],
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90},
+                }
 
     adapter = OpenAICompatibleAdapter(transport=mock_transport)
     gateway = ProviderGateway(adapter, tool_gw, attempt=attempt, contract=contract)
@@ -414,36 +507,64 @@ def test_request_tools_dynamic_activation(tmp_path):
         tools_sent = payload.get("tools", [])
         tool_names = [t["function"]["name"] for t in tools_sent]
 
-        if turn_count == 1:
-            # Initially only read_file, write_file, request_tools are active
-            assert "query_graph" not in tool_names
-            return {
-                "choices": [{
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "tool_calls": [{
-                            "id": "tc-req",
-                            "type": "function",
-                            "function": {
-                                "name": "request_tools",
-                                "arguments": json.dumps({"query": "knowledge"}),
-                            },
-                        }],
-                    },
-                }],
-                "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40},
-            }
-        elif turn_count == 2:
-            # After request_tools('knowledge'), query_graph should be dynamically added to active tools!
-            assert "query_graph" in tool_names
-            return {
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "Tools activated and used."},
-                }],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
-            }
+        if stream:
+            if turn_count == 1:
+                # Initially only read_file, write_file, request_tools are active
+                assert "query_graph" not in tool_names
+                return [
+                    {"choices": [{
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "tc-req",
+                                "type": "function",
+                                "function": {
+                                    "name": "request_tools",
+                                    "arguments": json.dumps({"query": "knowledge"}),
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }], "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}},
+                ]
+            elif turn_count == 2:
+                # After request_tools('knowledge'), query_graph should be dynamically added to active tools!
+                assert "query_graph" in tool_names
+                return [
+                    {"choices": [{"delta": {"content": "Tools activated and used."}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}},
+                ]
+        else:
+            if turn_count == 1:
+                # Initially only read_file, write_file, request_tools are active
+                assert "query_graph" not in tool_names
+                return {
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "tc-req",
+                                "type": "function",
+                                "function": {
+                                    "name": "request_tools",
+                                    "arguments": json.dumps({"query": "knowledge"}),
+                                },
+                            }],
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40},
+                }
+            elif turn_count == 2:
+                # After request_tools('knowledge'), query_graph should be dynamically added to active tools!
+                assert "query_graph" in tool_names
+                return {
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Tools activated and used."},
+                    }],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+                }
 
     adapter = OpenAICompatibleAdapter(transport=mock_transport)
     from validators.kernel.providers.gateway import STANDARD_KERNEL_TOOLS
@@ -568,5 +689,83 @@ def test_adapter_timeout_handling_and_defaults(monkeypatch):
         ollama_mock.complete([Message.user("Hello")])
     with pytest.raises(KernelTimeoutError):
         openai_mock.complete([Message.user("Hello")])
+
+
+def test_null_tool_calls_resilience():
+    """Verify that adapters and models handle 'tool_calls': null / None without TypeError."""
+    from validators.kernel.providers.adapter import (
+        AnthropicAdapter,
+        GeminiAdapter,
+        OllamaAdapter,
+        OpenAICompatibleAdapter,
+    )
+    from validators.kernel.providers.models import Message, ToolCallRequest
+
+    # 1. Message models null tolerance
+    msg = Message.assistant(content="Test message", tool_calls=None)
+    assert msg.tool_calls == ()
+    tc = ToolCallRequest.from_provider_call(None, None, None)
+    assert tc.id == ""
+    assert tc.name == ""
+    assert tc.arguments == {}
+
+    # 2. OpenAICompatibleAdapter complete with "tool_calls": null
+    def mock_openai_transport(payload, stream, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hey! What's up?",
+                        "tool_calls": None,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+    openai_adapter = OpenAICompatibleAdapter(transport=mock_openai_transport)
+    resp = openai_adapter.complete([Message.user("Hey! what's up?")])
+    assert resp.message.content == "Hey! What's up?"
+    assert resp.message.tool_calls == ()
+    assert resp.finish_reason == "stop"
+
+    # 3. OpenAICompatibleAdapter stream with null tool_calls and choices
+    stream_payload = [
+        {"choices": [{"delta": {"content": "Hey! ", "tool_calls": None}}]},
+        {"choices": [{"delta": {"content": "What's up?", "tool_calls": None}, "finish_reason": "stop"}]},
+    ]
+    openai_stream_adapter = OpenAICompatibleAdapter(transport=lambda p, s, t: stream_payload)
+    chunks = list(openai_stream_adapter.stream([Message.user("Hey!")]))
+    assert "".join(c.delta_content for c in chunks) == "Hey! What's up?"
+
+    # 4. OllamaAdapter complete with "tool_calls": null
+    def mock_ollama_transport(payload, stream, timeout):
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "Hello from Ollama!",
+                "tool_calls": None,
+            },
+            "done_reason": "stop",
+            "prompt_eval_count": 8,
+            "eval_count": 4,
+        }
+
+    ollama_adapter = OllamaAdapter(transport=mock_ollama_transport)
+    ollama_resp = ollama_adapter.complete([Message.user("Hi")])
+    assert ollama_resp.message.content == "Hello from Ollama!"
+    assert ollama_resp.message.tool_calls == ()
+
+    # 5. OllamaAdapter stream with null tool_calls
+    ollama_stream_payload = [
+        {"message": {"content": "Hello ", "tool_calls": None}},
+        {"message": {"content": "there!", "tool_calls": None}, "done": True, "done_reason": "stop"},
+    ]
+    ollama_stream_adapter = OllamaAdapter(transport=lambda p, s, t: ollama_stream_payload)
+    ollama_chunks = list(ollama_stream_adapter.stream([Message.user("Hi")]))
+    assert "".join(c.delta_content for c in ollama_chunks) == "Hello there!"
+
 
 

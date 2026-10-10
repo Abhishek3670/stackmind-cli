@@ -43,6 +43,14 @@ from .providers import (
     ToolDefinition,
 )
 from .session import AgentSession, Attempt, LifecycleState
+from .settings import (
+    ProviderConfig,
+    StackMindSettings,
+    get_default_settings,
+    load_settings,
+    save_settings,
+    test_provider_connection,
+)
 from .tools import ToolGateway
 from .tui import DaemonClient, StackMindTuiAdapter
 from .verification import SandboxCanaryVerifier

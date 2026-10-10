@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, RLock, Thread
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 import yaml
@@ -36,6 +36,7 @@ _ROLE_ALIASES = {
     "architect": "architecture",
     "codex": "backend",
     "backend": "backend",
+    "code": "backend",
     "gemini": "frontend",
     "frontend": "frontend",
     "gemma": "qa",
@@ -144,6 +145,9 @@ def _verify_contract_scope_narrowing(parent_scope: Any, child_scope: Any) -> Non
 
 def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
     """Auto-scaffold minimal valid protocol citizenship for workspace agents."""
+    from cli.init import ensure_workspace_protocol_scaffolding
+    ensure_workspace_protocol_scaffolding(workspace)
+
     sync_dir = workspace / ".sync"
     tree_file = sync_dir / "runtime" / "TREE.yaml"
     tree_data: dict[str, Any] = {}
@@ -181,7 +185,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
         boot_file.parent.mkdir(parents=True, exist_ok=True)
         boot_payload = {
             "agent": agent,
-            "role": "Backend Developer" if agent == "codex" else agent.capitalize(),
+            "role": "Architecture" if agent == "claude" else ("Backend Developer" if agent == "codex" else agent.capitalize()),
             "schema_version": 1,
             "release": "3.1.0",
             "session_count": 0,
@@ -201,6 +205,22 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
 
     if agent == "claude":
         claude_contract = sync_dir / "agents" / "claude.contract.yaml"
+        default_claude_allow = [
+            {"module": "PLAN.md"},
+            {"module": "README.md"},
+            {"module": "AGENTS.md"},
+            {"module": "ARCHITECTURE.md"},
+            {"module": "VERSION"},
+            {"module": "*.md"},
+            {"module": "package.json"},
+            {"module": "pyproject.toml"},
+            {"module": "Cargo.toml"},
+            {"module": "go.mod"},
+            {"module": ".sync/work-orders/**"},
+            {"module": ".sync/contracts/**"},
+            {"module": ".sync/inbox/local-llm/**"},
+            {"module": ".sync/inbox/claude/**"},
+        ]
         if not claude_contract.exists():
             claude_contract.parent.mkdir(parents=True, exist_ok=True)
             claude_contract.write_text(yaml.safe_dump({
@@ -212,13 +232,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                     "reports_to": "ceo",
                 },
                 "scope": {
-                    "allow": [
-                        {"module": "PLAN.md"},
-                        {"module": ".sync/work-orders/**"},
-                        {"module": ".sync/contracts/**"},
-                        {"module": ".sync/inbox/local-llm/**"},
-                        {"module": ".sync/inbox/claude/**"},
-                    ],
+                    "allow": default_claude_allow,
                     "deny": [
                         {"module": ".git/**"},
                         {"module": "src/**"},
@@ -245,6 +259,31 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                     "max_tokens": 50000,
                 },
             }, sort_keys=False), encoding="utf-8")
+        else:
+            try:
+                cdata = yaml.safe_load(claude_contract.read_text(encoding="utf-8"))
+                if isinstance(cdata, dict) and "scope" in cdata and isinstance(cdata["scope"], dict):
+                    existing_allow = cdata["scope"].get("allow", [])
+                    existing_modules = set()
+                    for item in existing_allow:
+                        if isinstance(item, dict):
+                            existing_modules.add(item.get("module"))
+                        elif isinstance(item, str):
+                            existing_modules.add(item)
+                    essential_docs = [
+                        "README.md", "AGENTS.md", "ARCHITECTURE.md", "VERSION", "*.md",
+                        "package.json", "pyproject.toml", "Cargo.toml", "go.mod"
+                    ]
+                    dirty = False
+                    for doc in essential_docs:
+                        if doc not in existing_modules:
+                            existing_allow.append({"module": doc})
+                            dirty = True
+                    if dirty:
+                        cdata["scope"]["allow"] = existing_allow
+                        claude_contract.write_text(yaml.safe_dump(cdata, sort_keys=False), encoding="utf-8")
+            except Exception:
+                pass
 
     (sync_dir / "inbox" / agent / "_read").mkdir(parents=True, exist_ok=True)
     (sync_dir / "outbox" / agent).mkdir(parents=True, exist_ok=True)
@@ -531,7 +570,11 @@ class SessionManager:
                 from validators.harness.backend import get_default_registry
 
                 reg = get_default_registry()
-                if "ollama" in reg and reg.get("ollama").status == "available" and reg.get("ollama").model:
+                has_anthropic = "anthropic" in reg and reg.get("anthropic").status == "available"
+                has_openai = "openai" in reg and reg.get("openai").status == "available"
+                has_ollama = "ollama" in reg and reg.get("ollama").status == "available" and reg.get("ollama").model
+
+                if has_ollama:
                     ollama_m = reg.get("ollama").model
                     for r_name in self._roles:
                         self._roles[r_name] = {
@@ -539,20 +582,27 @@ class SessionManager:
                             "model": ollama_m,
                             "status": "configured",
                         }
-                elif "anthropic" in reg and reg.get("anthropic").status == "available":
+                elif has_anthropic:
                     for r_name in self._roles:
                         self._roles[r_name] = {
                             "backend": "anthropic",
                             "model": reg.get("anthropic").model or "claude-3-7-sonnet",
                             "status": "configured",
                         }
-                elif "openai" in reg and reg.get("openai").status == "available":
+                elif has_openai:
                     for r_name in self._roles:
                         self._roles[r_name] = {
                             "backend": "openai",
                             "model": reg.get("openai").model or "gpt-4o",
                             "status": "configured",
                         }
+
+                if has_anthropic:
+                    self._roles["architecture"] = {
+                        "backend": "anthropic",
+                        "model": reg.get("anthropic").model or "claude-3-7-sonnet",
+                        "status": "configured",
+                    }
             except Exception:
                 pass
 
@@ -654,10 +704,23 @@ class SessionManager:
         from validators.harness.runner import AgentRunner
 
         if isinstance(self, SessionManager):
+            from validators.kernel.settings import find_settings_file, load_settings
             canonical = self._canonical_role(agent)
             role_cfg = self._roles.get(canonical, {})
-            backend_id = role_cfg.get("backend", "echo-agent")
-            model_name = role_cfg.get("model")
+            has_disk_settings = find_settings_file(workspace) is not None
+            app_settings = load_settings(workspace) if has_disk_settings else None
+
+            if role_cfg.get("backend") and role_cfg.get("backend") != "echo-agent":
+                backend_id = role_cfg["backend"]
+                model_name = role_cfg.get("model")
+            elif app_settings:
+                role_settings = app_settings.roles.get(canonical, {})
+                backend_id = role_settings.get("provider") or role_cfg.get("backend", "echo-agent")
+                model_name = role_settings.get("model") or role_cfg.get("model")
+            else:
+                backend_id = role_cfg.get("backend", "echo-agent")
+                model_name = role_cfg.get("model")
+
             registry = get_default_registry()
             backend = registry.get(backend_id) if backend_id in registry else None
             if backend is not None:
@@ -665,27 +728,81 @@ class SessionManager:
                 if model_name:
                     backend.model = model_name
                     backend.model_name = model_name
+
             provider_adapter = None
+            prov_cfg = (app_settings.providers.get(backend_id) if app_settings else None) or load_settings().providers.get(backend_id)
+
             if backend_id == "ollama":
                 from validators.kernel.providers.adapter import OllamaAdapter
+                from validators.kernel.settings import sanitize_model_name
 
-                endpoint = getattr(backend, "endpoint", None) or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+                endpoint = (prov_cfg.base_url if prov_cfg else None) or getattr(backend, "endpoint", None) or os.getenv("OLLAMA_HOST", "http://localhost:11434")
                 if endpoint and not endpoint.startswith("http"):
                     endpoint = f"http://{endpoint}"
-                m = model_name or getattr(backend, "model", "ornith-1.5-16k:latest") or "ornith-1.5-16k:latest"
+                m = model_name or (prov_cfg.default_model if prov_cfg else None) or getattr(backend, "model", "ornith-1.5-16k:latest") or "ornith-1.5-16k:latest"
+                m = sanitize_model_name(m, "ollama")
                 t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
                 provider_adapter = OllamaAdapter(endpoint=endpoint, model=m, default_timeout=float(t_val) if t_val else None)
-            elif backend_id in ("openai", "openai-compatible"):
-                from validators.kernel.providers.adapter import OpenAICompatibleAdapter
 
-                base_url = getattr(backend, "base_url", None) or "https://api.openai.com/v1"
-                api_key = getattr(backend, "api_key", None) or os.getenv("OPENAI_API_KEY", "")
-                m = model_name or getattr(backend, "model", "gpt-4o") or "gpt-4o"
+            elif backend_id in ("anthropic", "claude"):
+                from validators.kernel.providers.adapter import AnthropicAdapter
+
+                base_url = (prov_cfg.base_url if prov_cfg else None) or "https://api.anthropic.com"
+                api_key = (prov_cfg.api_key if prov_cfg else None) or getattr(backend, "api_key", None) or os.getenv("ANTHROPIC_API_KEY", "")
+                m = model_name or (prov_cfg.default_model if prov_cfg else None) or getattr(backend, "model", "claude-3-7-sonnet-20250219") or "claude-3-7-sonnet-20250219"
+                t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
+                provider_adapter = AnthropicAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
+
+            elif backend_id in ("openai", "openai-compatible", "openrouter", "custom") or (prov_cfg and prov_cfg.base_url and backend_id not in ("gemini", "google")):
+                from validators.kernel.providers.adapter import OpenAICompatibleAdapter
+                from validators.kernel.settings import sanitize_model_name
+
+                default_url = "https://openrouter.ai/api/v1" if backend_id == "openrouter" else ("http://localhost:20128/v1" if backend_id == "custom" else "https://api.openai.com/v1")
+                base_url = (prov_cfg.base_url if prov_cfg else None) or getattr(backend, "base_url", None) or default_url
+                default_env_key = "OPENROUTER_API_KEY" if backend_id == "openrouter" else ("CUSTOM_API_KEY" if backend_id == "custom" else "OPENAI_API_KEY")
+                api_key = (prov_cfg.api_key if prov_cfg else None) or getattr(backend, "api_key", None) or os.getenv(default_env_key, "")
+                default_m = "anthropic/claude-3.7-sonnet" if backend_id == "openrouter" else ("default" if backend_id == "custom" else "gpt-4o")
+                m = model_name or (prov_cfg.default_model if prov_cfg else None) or getattr(backend, "model", default_m) or default_m
+                m = sanitize_model_name(m, backend_id)
                 t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
                 provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
 
+            elif backend_id in ("gemini", "google"):
+                from validators.kernel.providers.adapter import GeminiAdapter
+
+                base_url = (prov_cfg.base_url if prov_cfg else None) or "https://generativelanguage.googleapis.com/v1beta"
+                api_key = (prov_cfg.api_key if prov_cfg else None) or getattr(backend, "api_key", None) or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
+                m = model_name or (prov_cfg.default_model if prov_cfg else None) or getattr(backend, "model", "gemini-2.0-flash") or "gemini-2.0-flash"
+                t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
+                provider_adapter = GeminiAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
+
             return AgentRunner(Path(workspace), agent, backend=backend, provider_adapter=provider_adapter)
         return AgentRunner(Path(workspace), agent)
+
+    def get_settings(self, workspace: str | None = None) -> dict[str, Any]:
+        """Fetch current settings from workspace settings.json."""
+        from validators.kernel.settings import load_settings
+        ws = Path(workspace) if workspace else None
+        return load_settings(ws).to_dict()
+
+    def update_settings(self, settings_data: dict[str, Any], workspace: str | None = None) -> dict[str, Any]:
+        """Save settings updates to settings.json and apply to running daemon."""
+        from validators.kernel.settings import StackMindSettings, save_settings
+        ws = Path(workspace) if workspace else None
+        settings_obj = StackMindSettings.from_dict(settings_data)
+        saved_path = save_settings(settings_obj, ws)
+
+        # Apply updated role mappings to current daemon roles
+        for r_name, r_cfg in settings_obj.roles.items():
+            canonical = self._canonical_role(r_name)
+            prov = r_cfg.get("provider")
+            mod = r_cfg.get("model")
+            if prov and canonical in self._roles:
+                self._roles[canonical]["backend"] = prov
+                if mod:
+                    self._roles[canonical]["model"] = mod
+
+        return settings_obj.to_dict()
 
     def list_backends(self) -> list[dict[str, Any]]:
         from validators.harness.backend import get_default_registry
@@ -736,6 +853,10 @@ class SessionManager:
             raise ValueError("role is required")
         if not isinstance(backend, str) or not backend.strip():
             raise ValueError("backend is required")
+
+        if model:
+            from validators.kernel.settings import sanitize_model_name
+            model = sanitize_model_name(model, backend)
 
         canonical = self._canonical_role(role)
         target_ids = self._role_target_identifiers(role)
@@ -1450,6 +1571,26 @@ class SessionManager:
                         except Exception:
                             pass
 
+        # Ensure active worker work orders have a viable file budget on resume to prevent immediate re-blocking
+        for wo_id in getattr(state, "worker_wo_ids", []):
+            wo_contract_path = contracts_dir / f"{wo_id}.yaml"
+            if wo_contract_path.is_file():
+                try:
+                    cdata = yaml.safe_load(wo_contract_path.read_text(encoding="utf-8"))
+                    if isinstance(cdata, dict) and isinstance(cdata.get("budget"), dict):
+                        b_val = cdata["budget"].get("max_files_touched")
+                        if isinstance(b_val, int) and b_val <= 1:
+                            cdata["budget"]["max_files_touched"] = 5
+                            wo_contract_path.write_text(yaml.safe_dump(cdata, sort_keys=False), encoding="utf-8")
+                            wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                            if wo_file.is_file():
+                                w_raw = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                                if isinstance(w_raw, dict) and isinstance(w_raw.get("implementation_estimate"), dict):
+                                    w_raw["implementation_estimate"]["max_files_touched"] = 5
+                                    wo_file.write_text(yaml.safe_dump(w_raw, sort_keys=False), encoding="utf-8")
+                except Exception:
+                    pass
+
         # Compile authoring artifacts to inject deliverable paths and normalize invariants
         try:
             from validators.harness.authoring_compiler import compile_authoring_artifacts
@@ -1572,6 +1713,11 @@ class SessionManager:
             if not session:
                 raise KeyError("unknown session")
             ws = Path(session.get("workspace", ""))
+            try:
+                from cli.init import ensure_workspace_protocol_scaffolding
+                ensure_workspace_protocol_scaffolding(ws)
+            except Exception:
+                pass
             target_run_id = run_id
             if not target_run_id:
                 sup_dir = ws / ".sync" / "runtime" / "supervisor"
@@ -1873,6 +2019,13 @@ class SessionManager:
 
             self._transition(record, final_status)
             record.update(completed_at=_now(), result=result)
+            if final_status in ("FAILED", "BLOCKED") and not record.get("error"):
+                if isinstance(result, Mapping):
+                    raw_e = result.get("error") or result.get("reason") or result.get("message")
+                    if isinstance(raw_e, Mapping):
+                        raw_e = raw_e.get("message") or raw_e.get("error") or raw_e.get("reason")
+                    if raw_e:
+                        record["error"] = str(raw_e)
             parent_id = record.get("parent_operation_id")
             if parent_id:
                 try:
@@ -2066,7 +2219,7 @@ class SessionManager:
                 self._run_driver_threads[created_run_id] = driver_thread
                 driver_thread.start()
 
-            canonical_role = self._canonical_role(role_param or "backend")
+            canonical_role = self._canonical_role(role_param or "architecture")
             agent_id_param = str(params.get("agent_id") or params.get("role") or canonical_role)
             self.events.publish(
                 "turn.started",
@@ -2136,6 +2289,7 @@ class SessionManager:
                         run_id=run_id,
                         phase=state.phase.value,
                         goal=state.product_goal,
+                        error=state.error,
                     )
                     try:
                         self.supervisor.save_run_state(state, ws)
@@ -2248,7 +2402,7 @@ class SessionManager:
             session = self._sessions[session_id]
             workspace = str(session["workspace"])
             _, op_rec = self._operation(operation_id)
-            raw_agent = str(op_rec.get("agent_id") or op_rec.get("role") or session.get("agent") or "codex").lower().strip()
+            raw_agent = str(op_rec.get("agent_id") or op_rec.get("role") or session.get("agent") or "claude").lower().strip()
             agent = _ROLE_TO_PRIMARY_AGENT.get(raw_agent, raw_agent)
             op_role = op_rec.get("role") or self._canonical_role(agent)
         tool_name = "harness.run_once"
@@ -2261,6 +2415,18 @@ class SessionManager:
             _scaffold_protocol_citizenship(ws_path, agent)
             runner = self._runner_factory(workspace, agent)
             runner.on_token = lambda text: self.events.publish("token.delta", session_id, delta=text, operation_id=operation_id)
+            runner.on_tool_call = lambda name, args, call_id=None: self.events.tool_call(
+                session_id, name, call_id or f"call-{uuid4().hex[:8]}", args, operation_id,
+                role=op_role, agent_id=agent,
+            )
+            runner.on_tool_result = lambda name, call_id, status, res=None, err=None: self.events.tool_result(
+                session_id, name, call_id, status, operation_id=operation_id,
+                result=res, error=err, role=op_role, agent_id=agent,
+            )
+            runner.on_thinking = lambda think_text: self.events.publish(
+                "reasoning.delta", session_id, text=think_text, operation_id=operation_id,
+                role=op_role, agent_id=agent,
+            )
             with self._lock:
                 try:
                     _, op_rec = self._operation(operation_id)
@@ -2298,10 +2464,17 @@ class SessionManager:
             b_id = getattr(runner, "backend_id", None)
             b_mod = getattr(runner, "backend_model", None)
             res_meta = getattr(result, "meta", None) or {}
-            res_reason = getattr(result, "reason", None)
-            res_status = getattr(result, "status", "completed")
-            blocker_list = res_meta.get("blockers") or ([res_reason] if res_reason else [])
-            computed_err = res_reason or ("; ".join(str(b) for b in blocker_list) if blocker_list else None) or res_meta.get("summary") or res_status
+            res_payload = getattr(result, "payload", None) or {}
+            res_reason = getattr(result, "reason", None) or res_payload.get("reason")
+            res_status = getattr(result, "status", None) or res_payload.get("status") or "completed"
+            blocker_list = res_meta.get("blockers") or res_payload.get("blockers") or ([res_reason] if res_reason else [])
+            computed_err = res_reason or ("; ".join(str(b) for b in blocker_list) if blocker_list else None) or res_meta.get("summary") or res_payload.get("summary") or res_status
+            full_text = (
+                res_meta.get("report_markdown")
+                or res_payload.get("report_markdown")
+                or res_meta.get("summary")
+                or res_payload.get("summary")
+            )
             result_data = {
                 "status": res_status,
                 "persisted": getattr(result, "persisted", False),
@@ -2309,11 +2482,14 @@ class SessionManager:
                 "reason": res_reason,
                 "error": computed_err,
                 "report_path": str(result.report_path) if getattr(result, "report_path", None) else None,
-                "summary": res_meta.get("summary"),
+                "summary": full_text or res_meta.get("summary") or res_payload.get("summary"),
+                "report_markdown": full_text,
                 "blockers": blocker_list,
                 "backend_id": b_id if isinstance(b_id, str) else None,
                 "model": b_mod if isinstance(b_mod, str) else None,
             }
+            if res_meta.get("thinking"):
+                result_data["thinking"] = res_meta.get("thinking")
             # Durable worker-blocker evidence packet (failure_code, observed files…)
             failure_packet = res_meta.get("failure")
             if isinstance(failure_packet, dict) and failure_packet.get("failure_code"):
@@ -2330,13 +2506,13 @@ class SessionManager:
                 result_data["scope_evidence"] = res_meta.get("scope_evidence")
             if res_meta.get("blocker_details"):
                 result_data["blocker_details"] = res_meta.get("blocker_details")
-            if result.status == "cancelled" or cancel_event.is_set():
+            if res_status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,
                     role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data, status="CANCELLED")
-            elif result.status in {"completed", "idle"}:
+            elif res_status in {"completed", "idle"}:
                 # Check if this was a Turn 1 planning turn that generated a valid PLAN.md
                 is_goal_turn = bool(op_rec.get("metadata", {}).get("is_goal"))
                 is_authoring_turn = bool(op_rec.get("metadata", {}).get("is_authoring"))
@@ -2417,7 +2593,7 @@ class SessionManager:
                     result=result_data, role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data)
-            elif result.status == "blocked":
+            elif res_status == "blocked":
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
                     result=result_data, role=op_role, agent_id=agent,
@@ -2504,9 +2680,11 @@ class SessionManager:
                 ws_path = Path(parent_session["workspace"])
                 if (ws_path / ".sync" / "work-orders").is_dir():
                     from validators.harness.d024_gate import D024Gate, D024ViolationError
-                    d024_decision = D024Gate().evaluate_work_order(ws_path, work_order_id)
-                    if not d024_decision.passed:
-                        raise D024ViolationError(f"D024 QA Gate Blocked: {d024_decision.reason}")
+                    gate = D024Gate()
+                    if gate.find_work_order_file(ws_path, work_order_id):
+                        d024_decision = gate.evaluate_work_order(ws_path, work_order_id)
+                        if not d024_decision.passed:
+                            raise D024ViolationError(f"D024 QA Gate Blocked: {d024_decision.reason}")
         _, op_id = self.begin_operation(
             session_id,
             f"execute.{canonical_role}",
@@ -2666,7 +2844,7 @@ class SessionManager:
                 or (e.payload.get("parent_operation_id") == op_id)
             ]
             cursor = max((e.sequence for e in agent_events), default=after)
-            role = op_record.get("role") or self._canonical_role(op_record.get("agent_id", "backend"))
+            role = op_record.get("role") or self._canonical_role(op_record.get("agent_id", "architecture"))
             agent_id = op_record.get("agent_id") or role
             return {
                 "agentId": agent_id,

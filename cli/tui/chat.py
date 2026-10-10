@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import os
 import re
@@ -17,6 +18,79 @@ from rich.text import Text
 
 if TYPE_CHECKING:
     from cli.tui.state import ChatMessage
+
+
+# ─── Transcript Render Cache ─────────────────────────────────────────────────
+
+# Cache for rendered transcript strings keyed by (transcript_hash, width, options)
+# Uses string output rather than Rich renderables to avoid console/mutable-state issues
+_TRANSCRIPT_CACHE: dict[str, str] = {}
+_TRANSCRIPT_CACHE_MAX_SIZE = 500  # Prevent unbounded growth in long sessions
+_TRANSCRIPT_CACHE_VERSION = "v1"  # Schema version for cache invalidation on rendering changes
+
+
+def _compute_transcript_hash(messages: list[ChatMessage]) -> str:
+    """Compute a deterministic hash for the complete ordered transcript.
+
+    Includes ALL messages to detect:
+    - Earlier-message content changes
+    - Last-message content changes
+    - Message additions, removals, or reordering
+    - Role or metadata changes
+    - Full content (no truncation)
+    """
+    key_parts = [
+        _TRANSCRIPT_CACHE_VERSION,
+        str(len(messages)),  # Detect additions/removals
+    ]
+    for msg in messages:
+        # Include full content (no truncation) to avoid collisions
+        # Use hashlib.md5 for each message to handle arbitrarily long content
+        msg_content = getattr(msg, "content", "")
+        msg_role = getattr(msg, "role", "")
+        msg_actions = str(getattr(msg, "actions", None))
+        msg_thinking = getattr(msg, "thinking", None) or ""
+        msg_model = getattr(msg, "model", None) or ""
+
+        # Hash individual message to handle long content efficiently
+        msg_hash = hashlib.md5(
+            "{}|{}|{}|{}|{}".format(
+                msg_role, msg_content, msg_actions, msg_thinking, msg_model
+            ).encode("utf-8")
+        ).hexdigest()
+        key_parts.append(msg_hash)
+
+    return hashlib.md5("|".join(key_parts).encode("utf-8")).hexdigest()
+
+
+def _compute_cache_key(transcript_hash: str, width: int,
+                       inline_diffs: bool = True, show_timestamps: bool = False,
+                       accent: bool = True) -> str:
+    """Compute cache key including all rendering-relevant parameters."""
+    return "{}|{}|{}|{}|{}".format(
+        transcript_hash, width, inline_diffs, show_timestamps, accent
+    )
+
+
+def _clear_cache_if_needed() -> None:
+    """Evict oldest entries if cache exceeds max size (FIFO eviction)."""
+    if len(_TRANSCRIPT_CACHE) > _TRANSCRIPT_CACHE_MAX_SIZE:
+        # Clear entire cache when over limit (simplest FIFO approximation)
+        _TRANSCRIPT_CACHE.clear()
+
+
+def _get_cached_render(cache_key: str) -> str | None:
+    """Get cached render if exists."""
+    return _TRANSCRIPT_CACHE.get(cache_key)
+
+
+def _set_cached_render(cache_key: str, rendered: str) -> None:
+    """Store render in cache, evicting if necessary."""
+    _clear_cache_if_needed()
+    _TRANSCRIPT_CACHE[cache_key] = rendered
+
+
+# ─── Message Rendering Helpers ──────────────────────────────────────────────
 
 
 def strip_internal_reasoning(content: str) -> str:
@@ -165,16 +239,25 @@ def render_actions_group(
 
     arrow = "▾" if actions_obj.expanded else "▸"
     count = len(actions_obj.actions)
+    failed_count = sum(1 for a in actions_obj.actions if str(getattr(a, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"})
     if getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
         suffix = f"{count}"
+        suffix_style = "dim white"
+    elif failed_count > 0:
+        if getattr(actions_obj, "completed_count", 0) > 0:
+            suffix = f"{actions_obj.completed_count} completed, {failed_count} failed"
+        else:
+            suffix = f"{failed_count} failed"
+        suffix_style = "bold red"
     else:
         suffix = f"{count} completed"
+        suffix_style = "dim white"
 
     header = Text()
-    header.append(f"{arrow} ", style="bold cyan")
+    header.append(f"{arrow} ", style="bold red" if failed_count > 0 else "bold cyan")
     header.append("Actions", style="bold white")
     header.append(" · ", style="dim")
-    header.append(suffix, style="dim white")
+    header.append(suffix, style=suffix_style)
 
     if not actions_obj.expanded:
         return header
@@ -196,7 +279,9 @@ def render_actions_group(
 
         line.append(f" {act.description}", style="white")
         if getattr(act, "error", None) and str(getattr(act, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"}:
-            line.append(f" ({act.error})", style="bold red")
+            from cli.tui.events import clean_error_message
+            clean_err = clean_error_message(act.error)
+            line.append(f" ({clean_err})", style="bold red")
         lines.append(line)
 
     return Group(*lines)
@@ -446,8 +531,12 @@ def render_chat_transcript(
     padding: tuple[int, int] = (0, 1),
     show_timestamps: bool = False,
     accent: bool = True,
+    inline_diffs: bool = True,
 ) -> RenderableType:
-    """Render the full conversation transcript with left alignment, small horizontal padding (§13), and inline diffs (§33)."""
+    """Render the full conversation transcript with left alignment, small horizontal padding (§13), and inline diffs (§33).
+
+    Caches rendered message strings to avoid repeated Markdown parsing for stable messages.
+    """
     if not messages:
         empty_text = Text("(No messages in conversation yet.)", style="dim italic")
         return Padding(empty_text, padding) if padding else empty_text
@@ -475,6 +564,7 @@ def render_chat_transcript(
                     actions=getattr(msg, "actions", None),
                     thinking=getattr(msg, "thinking", None),
                     model=getattr(msg, "model", None),
+                    inline_diffs=inline_diffs,
                 )
             )
         elif role == "system":
@@ -517,8 +607,27 @@ def render_chat_transcript_str(
     accent: bool = True,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    inline_diffs: bool = True,
 ) -> str:
-    """Render the full conversation transcript as plain or ANSI formatted string using in-memory capture."""
+    """Render the full conversation transcript as plain or ANSI formatted string using in-memory capture.
+
+    Caches rendered output to avoid repeated Markdown parsing for unchanged transcripts.
+    Cache key includes ALL messages to prevent stale output when earlier messages change.
+    """
+    # Generate cache key from complete transcript and render parameters
+    cache_key = None
+    if messages:
+        transcript_hash = _compute_transcript_hash(messages)
+        cache_key = _compute_cache_key(
+            transcript_hash, width,
+            inline_diffs=inline_diffs,
+            show_timestamps=show_timestamps,
+            accent=accent,
+        )
+        cached = _get_cached_render(cache_key)
+        if cached is not None:
+            return cached
+
     console, use_ansi = _make_capture_console(
         width=width,
         force_color=force_color,
@@ -531,9 +640,13 @@ def render_chat_transcript_str(
             padding=padding,
             show_timestamps=show_timestamps,
             accent=accent,
+            inline_diffs=inline_diffs,
         )
     )
-    return console.export_text(styles=use_ansi).rstrip()
+    result = console.export_text(styles=use_ansi).rstrip()
+    if cache_key is not None:
+        _set_cached_render(cache_key, result)
+    return result
 
 
 __all__ = [
@@ -552,4 +665,7 @@ __all__ = [
     "render_user_message",
     "render_user_message_str",
     "should_render_ansi",
+    "_TRANSCRIPT_CACHE",
+    "_TRANSCRIPT_CACHE_MAX_SIZE",
+    "_clear_cache_if_needed",
 ]

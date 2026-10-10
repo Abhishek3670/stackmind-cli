@@ -7,6 +7,15 @@ identity:
 scope:
   allow:
     - module: PLAN.md
+    - module: README.md
+    - module: AGENTS.md
+    - module: ARCHITECTURE.md
+    - module: VERSION
+    - module: "*.md"
+    - module: package.json
+    - module: pyproject.toml
+    - module: Cargo.toml
+    - module: go.mod
     - module: .sync/work-orders/**
     - module: .sync/contracts/**
     - module: .sync/inbox/local-llm/**

@@ -23,3 +23,9 @@ diagrams
 .zcode
 .zcodeignore
 docs/diagrams/*.visual-check.*
+
+# Local daemon state and phase investigation artifacts
+daemon-state.json
+PHASE*.md
+STREAMING*.md
+THINKING*.md

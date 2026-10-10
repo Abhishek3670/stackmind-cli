@@ -232,6 +232,16 @@ def test_turn_response_extraction(tmp_path: Path):
     }
     assert extract_assistant_response(payload_summary) == "Completed code refactor in auth/service.py"
 
+    # 3. From report_markdown prioritizing over "Completed task via tools" fallback summary
+    payload_report_md = {
+        "result": {
+            "summary": "Completed task via tools",
+            "report_markdown": "Hello! I am ready to help you build your application.",
+        }
+    }
+    assert extract_assistant_response(payload_report_md) == "Hello! I am ready to help you build your application."
+
+
 
 def test_operational_event_manager_lifecycle(tmp_path: Path):
     """Verify OperationalEventManager handles tool call start, completion, and response emission."""
@@ -311,3 +321,69 @@ def test_tui_repl_diff_and_events_commands(tmp_path: Path):
     assert "Diff" in result.output
     # :events reports status
     assert "No new events." in result.output or "session.started" in result.output or "Operation" in result.output
+
+
+def test_clean_error_message_formats_cleanly():
+    """Verify clean_error_message unwraps dicts, stringified dicts, and tracebacks."""
+    from cli.tui.events import clean_error_message
+
+    # 1. Direct dictionary with reason
+    err_dict = {
+        "status": "failed",
+        "persisted": False,
+        "reason": "Rate limit exceeded (HTTP 429)",
+        "error": "Rate limit exceeded (HTTP 429)",
+    }
+    assert clean_error_message(err_dict) == "Rate limit exceeded (HTTP 429)"
+
+    # 2. Stringified Python dictionary
+    raw_str = "{'status': 'failed', 'persisted': False, 'reason': 'Backend execution error: Rate limit exceeded (HTTP 429)'}"
+    assert clean_error_message(raw_str) == "Backend execution error: Rate limit exceeded (HTTP 429)"
+
+    # 3. Simple error string
+    assert clean_error_message("Connection refused by upstream proxy") == "Connection refused by upstream proxy"
+
+    # 4. Traceback
+    tb = "Traceback (most recent call last):\n  File 'app.py', line 10\nConnectionResetError: Remote disconnected"
+    assert clean_error_message(tb) == "ConnectionResetError: Remote disconnected"
+
+
+def test_actions_group_failure_visibility():
+    """Verify ActionsGroup auto-expands and highlights failures in red with clean descriptions."""
+    from cli.tui.chat import render_actions_group_str
+    from cli.tui.state import ActionsGroup
+
+    group = ActionsGroup(active=False)
+    # Complete an action that failed
+    group.complete_action(
+        "act-1",
+        status="FAILED",
+        error="Rate limit exceeded (HTTP 429)",
+    )
+
+    # 1. Must auto-expand on failure
+    assert group.expanded is True
+
+    # 2. Header must report failure count
+    assert "1 failed" in group.format_header_text()
+    assert "1 completed" not in group.format_header_text()
+
+    # 3. Rendered string must contain failure glyph and clean error
+    rendered = render_actions_group_str(group)
+    assert "1 failed" in rendered
+    assert "Rate limit exceeded (HTTP 429)" in rendered
+    assert "×" in rendered
+
+
+def test_canonical_blocker_text_cleans_raw_errors():
+    """Verify canonical_blocker_text cleans raw dictionary errors."""
+    from cli.tui.state import canonical_blocker_text
+
+    raw_blocker = {
+        "status": "blocked",
+        "error": "Architect repair turn failed [Rate limit exceeded (HTTP 429)] and repair attempts are exhausted (3/2)",
+    }
+    cleaned = canonical_blocker_text(raw_blocker)
+    assert "Rate limit exceeded (HTTP 429)" in cleaned
+    assert "{" not in cleaned
+

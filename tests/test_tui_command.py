@@ -99,6 +99,14 @@ def test_adapter_routes_all_interactive_commands():
         ("session-1", "approved prompt"),
         ("session-1", "Build user authentication"),
     ]
+    raw_call = client.turn_calls[0]
+    assert raw_call["params"]["role"] == "architecture"
+    assert raw_call["params"]["agent_id"] == "claude"
+
+    prompt_call = client.turn_calls[1]
+    assert prompt_call["params"]["role"] == "architecture"
+    assert prompt_call["params"]["agent_id"] == "claude"
+
     goal_call = client.turn_calls[2]
     assert goal_call["params"]["role"] == "architecture"
     assert goal_call["params"]["agent_id"] == "claude"

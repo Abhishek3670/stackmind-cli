@@ -7,8 +7,9 @@ import os
 from pathlib import Path
 import shlex
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
+from uuid import uuid4
 
 from validators.kernel.contract import AgentContract
 from validators.kernel.session import Attempt
@@ -1306,11 +1307,19 @@ class ProviderGateway:
         contract: AgentContract | None = None,
         tools: Sequence[ToolDefinition] = STANDARD_KERNEL_TOOLS,
         max_tool_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+        on_tool_call: Callable[[str, dict[str, Any], str], None] | None = None,
+        on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> None:
         self.adapter = adapter
         self.tool_gateway = tool_gateway
         self.attempt = attempt
         self.contract = contract or (attempt.contract if attempt and hasattr(attempt, "contract") else None)
+        self.on_tool_call = on_tool_call
+        self.on_tool_result = on_tool_result
+        self.on_thinking = on_thinking
+        self.on_token = on_token
         active_tools = list(tools)
         if self.contract and hasattr(tool_gateway, "boundary") and hasattr(tool_gateway.boundary, "evaluator"):
             evaluator = tool_gateway.boundary.evaluator
@@ -1728,31 +1737,146 @@ class ProviderGateway:
         self._check_budget_before_call()
 
         active_tools = tools if tools is not None else self.tools
-        response = self.adapter.complete(
-            messages,
-            tools=active_tools,
-            timeout=timeout,
-            cancellation_token=cancellation_token,
-            **kwargs,
+
+        # Streaming path: use adapter.stream() for progressive delivery (Phase 34)
+        # Use streaming when adapter supports it, passing active_tools so the provider
+        # can properly generate tool calls during streaming
+        supports_streaming = (
+            hasattr(self.adapter, "stream")
+            and callable(self.adapter.stream)
         )
+
+        if supports_streaming:
+            # Use streaming for incremental text delivery (with tools if configured)
+            content_parts = []
+            accumulated_tool_calls = []
+            final_finish_reason = None
+            final_usage = TokenUsage()
+
+            try:
+                for chunk in self.adapter.stream(
+                    messages,
+                    tools=active_tools,
+                    timeout=timeout,
+                    cancellation_token=cancellation_token,
+                    **kwargs,
+                ):
+                    check_cancellation(cancellation_token)
+
+                    # Forward thinking deltas immediately
+                    if chunk.delta_thinking and self.on_thinking:
+                        try:
+                            self.on_thinking(chunk.delta_thinking)
+                        except Exception:
+                            pass
+
+                    # Forward text deltas immediately for progressive rendering
+                    if chunk.delta_content:
+                        content_parts.append(chunk.delta_content)
+                        if self.on_token:
+                            try:
+                                self.on_token(chunk.delta_content)
+                            except Exception:
+                                pass
+
+                    # Accumulate tool calls from stream
+                    if chunk.delta_tool_calls:
+                        accumulated_tool_calls.extend(chunk.delta_tool_calls)
+
+                    # Accumulate usage and track finish reason
+                    if chunk.usage:
+                        final_usage = final_usage + chunk.usage
+                    if chunk.finish_reason:
+                        final_finish_reason = chunk.finish_reason
+
+                # Build final response
+                response_message = Message.assistant(
+                    content="".join(content_parts),
+                    tool_calls=accumulated_tool_calls,
+                )
+                response = ProviderResponse(
+                    message=response_message,
+                    usage=final_usage,
+                    finish_reason=final_finish_reason or "stop",
+                    model=getattr(self.adapter, "model_name", ""),
+                    raw_payload={},
+                )
+            except (ProviderError, TimeoutError):
+                # Streaming failed, fall back to complete
+                response = self.adapter.complete(
+                    messages,
+                    tools=active_tools,
+                    timeout=timeout,
+                    cancellation_token=cancellation_token,
+                    **kwargs,
+                )
+        else:
+            # Standard complete path (with tools or streaming not supported)
+            response = self.adapter.complete(
+                messages,
+                tools=active_tools,
+                timeout=timeout,
+                cancellation_token=cancellation_token,
+                **kwargs,
+            )
+
+            # Publish full response via on_token if callback provided
+            if response.message and response.message.content:
+                from cli.tui.chat import extract_internal_reasoning
+                think_extracted = extract_internal_reasoning(response.message.content)
+                if think_extracted and self.on_thinking:
+                    try:
+                        self.on_thinking(think_extracted)
+                    except Exception:
+                        pass
+
+                if self.on_token and not response.message.tool_calls:
+                    try:
+                        self.on_token(response.message.content)
+                    except Exception:
+                        pass
+
         self._record_and_check_budget(response.usage)
 
         messages.append(response.message)
 
-        if response.message.tool_calls:
+        if response.message and response.message.tool_calls:
             if len(response.message.tool_calls) > DEFAULT_MAX_TOOL_CALLS_PER_TURN:
                 raise ToolLimitExceededError(
                     f"Turn emitted {len(response.message.tool_calls)} tool calls, exceeding maximum allowed per turn ({DEFAULT_MAX_TOOL_CALLS_PER_TURN})",
                     tool_calls=len(response.message.tool_calls),
                     max_tool_calls=DEFAULT_MAX_TOOL_CALLS_PER_TURN,
                 )
-            for tc in response.message.tool_calls:
+            for tc in (response.message.tool_calls or ()):
                 check_cancellation(cancellation_token)
-                tool_output = self.execute_tool_call(
-                    tc,
-                    cancellation_token=cancellation_token,
-                    max_tool_calls=max_tool_calls,
-                )
+                call_id = tc.id or f"call_{uuid4().hex[:8]}"
+                if self.on_tool_call:
+                    try:
+                        self.on_tool_call(tc.name, tc.arguments or {}, call_id)
+                    except Exception:
+                        pass
+                tool_output = None
+                tool_error = None
+                status = "success"
+                try:
+                    tool_output = self.execute_tool_call(
+                        tc,
+                        cancellation_token=cancellation_token,
+                        max_tool_calls=max_tool_calls,
+                    )
+                    if tool_output and (str(tool_output).startswith("Error:") or str(tool_output).startswith("Warning:")):
+                        status = "failure"
+                        tool_error = str(tool_output)
+                except Exception as err:
+                    status = "failure"
+                    tool_error = str(err)
+                    raise
+                finally:
+                    if self.on_tool_result:
+                        try:
+                            self.on_tool_result(tc.name, call_id, status, tool_output, tool_error)
+                        except Exception:
+                            pass
                 messages.append(Message.tool(content=tool_output, tool_call_id=tc.id, name=tc.name))
 
         return response
@@ -1814,15 +1938,17 @@ class ProviderGateway:
             )
 
             # If the assistant gave an answer without emitting new tool calls, check if this was a false finish
-            if not response.message.tool_calls:
+            if not (response.message and response.message.tool_calls):
                 norm_del = Path(required_deliverable).as_posix().lstrip("/") if required_deliverable else None
                 norm_written = {Path(p).as_posix().lstrip("/") for p in self.written_files}
                 has_unwritten_deliverable = bool(norm_del and norm_del not in norm_written)
                 has_write_tool = any(t.name == "write_file" for t in active_tools)
 
-                should_nudge = (
-                    (self.total_tool_calls == 0 and has_write_tool and empty_tool_nudges < max_empty_tool_nudges)
-                    or (has_unwritten_deliverable and has_write_tool and empty_tool_nudges < max_empty_tool_nudges)
+                should_nudge = bool(
+                    required_deliverable
+                    and has_write_tool
+                    and empty_tool_nudges < max_empty_tool_nudges
+                    and (self.total_tool_calls == 0 or has_unwritten_deliverable)
                 )
 
                 if should_nudge:
@@ -1854,7 +1980,7 @@ class ProviderGateway:
                 )
 
             # Record signatures for repetition/cycle detection
-            for tc in response.message.tool_calls:
+            for tc in (response.message.tool_calls or () if response.message else ()):
                 sig = (tc.name, json.dumps(tc.arguments or {}, sort_keys=True))
                 recent_signatures.append(sig)
                 signature_counts[sig] = signature_counts.get(sig, 0) + 1

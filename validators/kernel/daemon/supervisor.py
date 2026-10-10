@@ -27,7 +27,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -41,6 +41,28 @@ logger = logging.getLogger("stackmind.supervisor")
 def _strip_code_fences(text: str) -> str:
     """Strip markdown code fences from model output used in run-state messages."""
     return re.sub(r"```[a-zA-Z]*\n?", "", str(text or "")).strip()
+
+
+def _extract_op_error(op: Any) -> str | None:
+    """Extract a concise human-readable error or reason from an operation record."""
+    if not isinstance(op, Mapping):
+        return None
+    res = op.get("result")
+    candidates = []
+    if isinstance(res, Mapping):
+        candidates.extend([res.get("error"), res.get("reason"), res.get("message"), res.get("summary")])
+    candidates.extend([op.get("error"), op.get("reason")])
+    for c in candidates:
+        if c:
+            if isinstance(c, Mapping):
+                msg = c.get("message") or c.get("error") or c.get("reason")
+                if msg:
+                    return str(msg).strip()
+            elif isinstance(c, str) and c.strip():
+                s = c.strip()
+                if s.lower() not in {"failed", "blocked", "completed", "cancelled", "unknown"}:
+                    return s
+    return None
 
 
 # ─── Lifecycle phases ─────────────────────────────────────────────────
@@ -526,13 +548,7 @@ class LifecycleSupervisor:
             if status not in _OPERATION_TERMINAL:
                 return AdvanceResult.WAITING_FOR_OPERATION
             if status in ("FAILED", "BLOCKED", "CANCELLED"):
-                op_result = op.get("result", {}) or {}
-                err_detail = (
-                    op_result.get("error")
-                    or op_result.get("reason")
-                    or op.get("error")
-                    or "unknown"
-                )
+                err_detail = _extract_op_error(op) or op.get("error") or "unknown"
                 state.error = f"Planning turn failed ({status.lower()}): {err_detail}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED
@@ -866,8 +882,10 @@ class LifecycleSupervisor:
             if op_failed:
                 state.authoring_repair_attempts += 1
                 if state.authoring_repair_attempts > state.max_authoring_repairs:
+                    err_cause = _extract_op_error(op)
+                    detail = f" [{err_cause}]" if err_cause else f" ({status})"
                     state.error = (
-                        f"Architect repair turn failed ({status}) and repair attempts are exhausted "
+                        f"Architect repair turn failed{detail} and repair attempts are exhausted "
                         f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
                         f"operator intervention required"
                     )
@@ -3148,8 +3166,8 @@ class LifecycleSupervisor:
             + (
                 f"- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
                 f"conforming to schemas/contract.schema.json. The budget must be explicitly sized "
-                f"from the task's real file footprint. Preserve existing allowed paths (including the "
-                f"work order deliverable) and append the new path requested by the recovery decision.{existing_rules_str}"
+                f"from the task's real file footprint (ensure max_files_touched is at least 5 or sized to accommodate all files touched plus test/db fixtures). "
+                f"Preserve existing allowed paths (including the work order deliverable) and append the new path requested by the recovery decision.{existing_rules_str}"
                 f"A transitional repair contract is already in place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )
@@ -3853,6 +3871,17 @@ class LifecycleSupervisor:
             except Exception:
                 pass
 
+        evidence = (state.worker_blockers.get(wo_id) or {}) if state else {}
+        observed_count = int(evidence.get("observed_file_count", 0)) if isinstance(evidence, dict) else 0
+        if action == "amend_contract" or (isinstance(evidence, dict) and evidence.get("failure_code") == "CONTRACT_FILE_BUDGET_EXCEEDED"):
+            repair_budget = {"max_files_touched": max(10, observed_count + 5), "max_tokens": 50000}
+        else:
+            repair_budget = (
+                budget
+                if isinstance(budget, dict) and budget.get("max_files_touched")
+                else {"max_files_touched": 10, "max_tokens": 50000}
+            )
+
         record: dict[str, Any] = {
             "schema_version": 1,
             "agent_id": "claude",
@@ -3863,11 +3892,7 @@ class LifecycleSupervisor:
                 "deny": deny,
                 "write": "read-write",
             },
-            "budget": (
-                budget
-                if isinstance(budget, dict) and budget.get("max_files_touched")
-                else {"max_files_touched": 10, "max_tokens": 50000}
-            ),
+            "budget": repair_budget,
             "synthesized_by": "recovery-repair",
         }
         gate = AuthoringGate(project_root=ws)
@@ -4276,8 +4301,9 @@ class LifecycleSupervisor:
                     else:
                         wo_ids.append(wo_id)
             except Exception:
-                wo_ids.append(wo_id)  # Include even if we can't read it
-        state.worker_wo_ids = wo_ids
+                wo_ids.append(wo_id)
+        if wo_ids or not state.worker_wo_ids:
+            state.worker_wo_ids = wo_ids
 
     def _dependencies_met(self, state: RunState, wo_id: str, ws: Path) -> bool:
         """Check that all dependencies of a WO are in completed_wo_ids."""

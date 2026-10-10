@@ -22,7 +22,7 @@ from typing import Any, Callable, Protocol, Sequence
 import yaml
 from jsonschema import Draft7Validator
 
-from lock import acquire_lock, release_lock
+from cli.lock import acquire_lock, release_lock
 from cli.validate import validate as validate_runtime
 from validators.knowledge.contract import ContractAccessDenied, ContractExpiredError
 from validators.harness.retrieval import (
@@ -293,6 +293,9 @@ class AgentRunner:
         now_fn: Any | None = None,
         sleep_fn: Any | None = None,
         on_token: Callable[[str], None] | None = None,
+        on_tool_call: Callable[[str, dict[str, Any], str], None] | None = None,
+        on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
     ) -> None:
         self.project_path = project_path.resolve()
         self.sync_path = self.project_path / '.sync'
@@ -330,6 +333,9 @@ class AgentRunner:
         self.sleep_fn = sleep_fn or time.sleep
         self.reader = ResourceReadTracker(max_reads=3)
         self.on_token = on_token
+        self.on_tool_call = on_tool_call
+        self.on_tool_result = on_tool_result
+        self.on_thinking = on_thinking
         self._tree_cache: dict[str, Any] | None = None
 
     @staticmethod
@@ -364,22 +370,7 @@ class AgentRunner:
         try:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)
-            task = self.discover_next_task(tree_data, work_order_id=work_order_id)
-            if task is not None and is_authoring:
-                task = HarnessTask(
-                    kind=task.kind,
-                    identifier=task.identifier,
-                    path=task.path,
-                    title=task.title,
-                    body=task.body,
-                    query=task.query,
-                    work_order_id=task.work_order_id,
-                    deliverable_path=None,
-                    is_authoring=True,
-                    work_order_type=task.work_order_type,
-                    deliverable_type=task.deliverable_type,
-                )
-            if task is None and prompt:
+            if prompt and not work_order_id and not is_authoring:
                 adhoc_file = self.sync_path / 'inbox' / self.agent / 'adhoc.md'
                 task = HarnessTask(
                     kind='adhoc',
@@ -388,10 +379,26 @@ class AgentRunner:
                     title=prompt.strip() or 'User Prompt',
                     body=prompt.strip() or 'User Prompt',
                     query=prompt.strip() or 'User Prompt',
-                    is_authoring=is_authoring,
+                    is_authoring=False,
                     work_order_type=None,
                     deliverable_type=None,
                 )
+            else:
+                task = self.discover_next_task(tree_data, work_order_id=work_order_id)
+                if task is not None and is_authoring:
+                    task = HarnessTask(
+                        kind=task.kind,
+                        identifier=task.identifier,
+                        path=task.path,
+                        title=task.title,
+                        body=task.body,
+                        query=task.query,
+                        work_order_id=task.work_order_id,
+                        deliverable_path=None,
+                        is_authoring=True,
+                        work_order_type=task.work_order_type,
+                        deliverable_type=task.deliverable_type,
+                    )
             if task is None:
                 return HarnessRunResult(
                     status='idle',
@@ -400,7 +407,7 @@ class AgentRunner:
                     reason='no inbox items or assigned work orders',
                 )
 
-            if task is not None and prompt and prompt.strip():
+            if task is not None and task.kind != 'adhoc' and prompt and prompt.strip():
                 p_str = prompt.strip()
                 if p_str != task.title.strip() and p_str != task.body.strip():
                     task = HarnessTask(
@@ -592,8 +599,8 @@ class AgentRunner:
                 has_commands = bool(completion.payload.get('commands'))
                 if not has_modifications and not has_commands:
                     from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning
-                    raw_summary = strip_internal_reasoning(str(completion.payload.get('summary') or ''))
-                    raw_report = strip_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
+                    raw_summary = strip_internal_reasoning(str(completion.payload.get('summary') or '')).strip()
+                    raw_report = strip_internal_reasoning(str(completion.payload.get('report_markdown') or '')).strip()
                     raw_thinking = (
                         completion.payload.get('thinking')
                         or completion.payload.get('reasoning')
@@ -602,42 +609,41 @@ class AgentRunner:
                         or extract_internal_reasoning(str(completion.payload.get('summary') or ''))
                         or extract_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
                     )
-                    if not raw_summary and not raw_report:
-                        return HarnessRunResult(
-                            status='blocked',
-                            persisted=False,
-                            task_id=task.identifier,
-                            reason='verification gate failed: outcome_verified',
+                    if raw_summary or raw_report:
+                        outbox_dir = self.sync_path / 'outbox' / self.agent
+                        outbox_dir.mkdir(parents=True, exist_ok=True)
+                        now_str = run_at.isoformat().replace(':', '-')
+                        out_path = outbox_dir / f'harness-{now_str}.md'
+                        thinking_section = f'## Thinking\n{raw_thinking}\n\n' if raw_thinking else ''
+                        report_content = (
+                            f'# Harness Report: {task.identifier}\n\n'
+                            f'- agent: `{self.agent}`\n'
+                            f'- task: `{task.identifier}`\n'
+                            f'- kind: `adhoc`\n'
+                            f'- status: `completed`\n'
+                            f'- recorded_at: `{run_at.isoformat()}`\n\n'
+                            f'{thinking_section}'
+                            f'## Summary\n{raw_summary or raw_report}\n\n'
+                            f'## Report\n{raw_report or raw_summary}\n'
                         )
-
-                    outbox_dir = self.sync_path / 'outbox' / self.agent
-                    outbox_dir.mkdir(parents=True, exist_ok=True)
-                    now_str = run_at.isoformat().replace(':', '-')
-                    out_path = outbox_dir / f'harness-{now_str}.md'
-                    thinking_section = f'## Thinking\n{raw_thinking}\n\n' if raw_thinking else ''
-                    report_content = (
-                        f'# Harness Report: {task.identifier}\n\n'
-                        f'- agent: `{self.agent}`\n'
-                        f'- task: `{task.identifier}`\n'
-                        f'- kind: `adhoc`\n'
-                        f'- status: `completed`\n'
-                        f'- recorded_at: `{run_at.isoformat()}`\n\n'
-                        f'{thinking_section}'
-                        f'## Summary\n{raw_summary or raw_report}\n\n'
-                        f'## Report\n{raw_report or raw_summary}\n'
-                    )
-                    out_path.write_text(report_content, encoding='utf-8')
-                    summary = raw_summary or raw_report
-                    meta: dict[str, Any] = {'summary': summary}
-                    if raw_thinking:
-                        meta['thinking'] = raw_thinking
-                    return HarnessRunResult(
-                        status='completed',
-                        persisted=True,
-                        task_id=task.identifier,
-                        report_path=out_path,
-                        meta=meta,
-                    )
+                        out_path.write_text(report_content, encoding='utf-8')
+                        meta: dict[str, Any] = {
+                            'summary': raw_summary or raw_report,
+                            'report_markdown': raw_report or raw_summary,
+                        }
+                        if raw_thinking:
+                            meta['thinking'] = raw_thinking
+                        if hasattr(completion, 'meta') and isinstance(completion.meta, dict):
+                            for k in ('tool_calls_audit', 'commands_audit', 'backend_id', 'model'):
+                                if k in completion.meta:
+                                    meta[k] = completion.meta[k]
+                        return HarnessRunResult(
+                            status='completed',
+                            persisted=True,
+                            task_id=task.identifier,
+                            report_path=out_path,
+                            meta=meta,
+                        )
 
             # Decision validation with feedback and bounded retry (Requirement 3)
             max_validation_retries = 2
@@ -1580,6 +1586,10 @@ class AgentRunner:
                 phase=task_phase,
                 backend_id=self.backend_id,
             ),
+            on_tool_call=getattr(self, 'on_tool_call', None),
+            on_tool_result=getattr(self, 'on_tool_result', None),
+            on_thinking=getattr(self, 'on_thinking', None),
+            on_token=getattr(self, 'on_token', None),
         )
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
@@ -1636,6 +1646,41 @@ class AgentRunner:
                 "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
             )
+        elif request.task.kind == 'adhoc':
+            if is_architecture:
+                system_msg = (
+                    "You are Claude, the Lead Architect for StackMind CLI, paired with the operator in this project workspace. "
+                    "You handle General Q&A, chat, code explanation, architecture planning, and ad-hoc workspace assistance. "
+                    "Respond conversationally, helpfully, and directly to the operator's message with architectural depth and precision.\n\n"
+                    "ARCHITECTURAL CAPABILITIES & INSTRUCTIONS:\n"
+                    "1. When the operator asks for a plan, design, or feature specification (e.g. login page, auth flow, API, database schema):\n"
+                    "   - Provide a complete, production-grade architectural blueprint: technology stack choices, component decomposition, data/control flow, and file layout.\n"
+                    "   - Detail security best practices (e.g. password hashing with Argon2/bcrypt, secure session/JWT with HttpOnly cookies, CSRF tokens, rate limiting, and input sanitization).\n"
+                    "   - Outline the concrete implementation milestones with assigned specialist agent roles:\n"
+                    "     * Backend (Codex): APIs, data models, auth logic, and core services\n"
+                    "     * Frontend (Gemini): UI markup, responsive styles, client validation, and UX states\n"
+                    "     * QA (Gemma): Automated test suites, security scans, and behavioral assertions\n"
+                    "     * GitOps (Local-LLM): Semantic versioning, changelog, and release packaging\n"
+                    "   - Proactive guidance: Explicitly inform the operator that to build, launch, and test this plan autonomously across the workspace, they can execute:\n"
+                    "     `:goal <description>` in the prompt bar.\n"
+                    "2. Workspace Investigation: You have access to tools (read_file, list_directory, query_graph, find_symbol, find_references, write_file, run_command) if needed to inspect or examine the codebase. If you execute tools, synthesize your findings directly into your answer so the operator sees the context.\n"
+                    "3. Conversational Feedback: For greetings, general questions, explanations, or code reviews, answer directly in clean Markdown without making unnecessary tool calls.\n"
+                    "4. Output Format: Never output raw JSON decision schemas unless explicitly requested. Always deliver well-structured Markdown prose."
+                )
+            else:
+                agent_title = self.agent.title()
+                system_msg = (
+                    f"You are StackMind's {agent_title} agent, paired with the operator in this project workspace. "
+                    "Respond conversationally, helpfully, and directly to the operator's message. "
+                    "You have access to tools (e.g. read_file, list_directory, query_graph, write_file) if you need "
+                    "to inspect or edit workspace files to answer or fulfill the request. If no tools are needed "
+                    "(such as for greetings, general explanations, answering questions, or conversational feedback), "
+                    "answer directly in plain text without making unnecessary tool calls. "
+                    "Do NOT format your response as a JSON decision schema unless explicitly asked."
+                )
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = raw_context
+            task_text = f"User Message:\n{request.task.body or request.task.title}\n\n"
         elif is_architecture:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
@@ -1720,11 +1765,15 @@ class AgentRunner:
                 "INTEGRATION REQUIREMENT: Ensure your deliverable integrates with other workspace files (e.g. element IDs in JS matching HTML, classes in CSS matching markup). If your deliverable references an ID or class from a companion file in scope, make sure it matches.\n"
             )
 
+        user_content = task_text
+        if request.task.kind != 'adhoc':
+            user_content = f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
+        elif getattr(request.context, "text", None):
+            user_content = f'{task_text}Context:\n{request.context.text}'
+
         messages = [
             Message.system(system_msg),
-            Message.user(
-                f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
-            ),
+            Message.user(user_content),
         ]
         from validators.kernel.providers.errors import (
             ConsecutiveToolFailureError,
@@ -1757,8 +1806,9 @@ class AgentRunner:
                 for msg in messages:
                     if msg.tool_calls:
                         for tc in msg.tool_calls:
-                            if tc.name == 'write_file' and 'path' in tc.arguments:
-                                p = str(tc.arguments['path'])
+                            tc_args = getattr(tc, 'arguments', None) or {}
+                            if tc.name == 'write_file' and 'path' in tc_args:
+                                p = str(tc_args['path'])
                                 if p not in written_files_so_far:
                                     written_files_so_far.append(p)
 
@@ -1794,14 +1844,55 @@ class AgentRunner:
                 raise ValueError('provider tool loop ended without an assistant message')
         final = next((m for m in reversed(assistant_msgs) if m.content and m.content.strip()), assistant_msgs[-1])
         raw_text = (final.content or '').strip()
+        if request.task.kind == 'adhoc' and not raw_text and getattr(gateway, 'adapter', None) is not None:
+            try:
+                fin_messages = [
+                    m for m in history
+                    if (m.content and m.content.strip()) or m.tool_calls or m.role != 'assistant'
+                ]
+                fin_prompt = (
+                    "Based on the tool results and workspace inspection above, please provide your final, "
+                    "comprehensive conversational response to the operator's message."
+                )
+                fin_messages.append(Message.user(fin_prompt))
+
+                streamed_parts: list[str] = []
+                if hasattr(gateway.adapter, 'stream'):
+                    try:
+                        for chunk in gateway.adapter.stream(fin_messages, tools=[]):
+                            if getattr(chunk, 'delta_content', None):
+                                streamed_parts.append(chunk.delta_content)
+                                # Propagate delta through on_token callback (set by SessionManager for daemon delivery)
+                                if self.on_token:
+                                    try:
+                                        self.on_token(chunk.delta_content)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                if streamed_parts:
+                    raw_text = "".join(streamed_parts).strip()
+
+                if not raw_text:
+                    fin_resp = gateway.adapter.complete(fin_messages, tools=[])
+                    if fin_resp and getattr(fin_resp, 'message', None) and fin_resp.message.content:
+                        raw_text = fin_resp.message.content.strip()
+                        if self.on_token and raw_text:
+                            try:
+                                self.on_token(raw_text)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
         payload = self._parse_json_payload(raw_text)
 
         written_files: list[str] = []
         for msg in history:
             if msg.tool_calls:
                 for tc in msg.tool_calls:
-                    if tc.name == 'write_file' and 'path' in tc.arguments:
-                        p = str(tc.arguments['path'])
+                    tc_args = getattr(tc, 'arguments', None) or {}
+                    if tc.name == 'write_file' and 'path' in tc_args:
+                        p = str(tc_args['path'])
                         if p not in written_files:
                             written_files.append(p)
         for wf in getattr(gateway, "written_files", []):
@@ -1819,6 +1910,41 @@ class AgentRunner:
                     if key in tc_args:
                         entry[key] = tc_args[key]
                 tool_calls_audit.append(entry)
+
+        if request.task.kind == 'adhoc' and not raw_text:
+            inspected_items = []
+            for tc in tool_calls_audit:
+                tname = tc.get("tool", "")
+                arg_str = ""
+                for k in ('path', 'file', 'target', 'command', 'symbol', 'query'):
+                    if k in tc:
+                        arg_str = str(tc[k])
+                        break
+                inspected_items.append(f"- `{tname}` {arg_str}".strip())
+            tools_summary = "\n".join(inspected_items) if inspected_items else "Workspace tools executed."
+            orig_prompt = request.task.body or request.task.title or "your request"
+
+            if is_architecture:
+                raw_text = (
+                    f"### Workspace Exploration Summary\n"
+                    f"I have inspected the project workspace:\n{tools_summary}\n\n"
+                    f"### Architectural Recommendation\n"
+                    f"To turn this plan into code, launch the app in the development environment, "
+                    f"and execute verification across the specialist agent team, run:\n\n"
+                    f"`:goal {orig_prompt}`\n\n"
+                    f"This will initialize milestones in PLAN.md, assign work orders, and verify delivery."
+                )
+            else:
+                raw_text = (
+                    f"Completed workspace inspection:\n{tools_summary}\n\n"
+                    f"To execute this goal across the autonomous agent team, run:\n`:goal {orig_prompt}`"
+                )
+            if self.on_token and raw_text:
+                try:
+                    self.on_token(raw_text)
+                except Exception:
+                    pass
+            payload = self._parse_json_payload(raw_text)
 
         # Plan deliverable fallback: if is_plan_task and PLAN.md was not written via tool call,
         # extract it from raw text / assistant messages / payload report and persist it to staged root.
@@ -1898,9 +2024,10 @@ class AgentRunner:
                     'blockers': [blocker_detail],
                 }
             else:
+                summary_text = raw_text if (request.task.kind == 'adhoc' and raw_text) else (raw_text[:200] if raw_text else None)
                 payload = {
                     'status': 'completed',
-                    'summary': raw_text[:200] or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                    'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
                     'report_markdown': raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
                     'modified_files': written_files,
                     'blockers': [],
@@ -2115,6 +2242,8 @@ class AgentRunner:
             events_write = self._build_events_write(stage_inputs, 0, 0)
             self._apply_ops(staged_root, [report_write, events_write])
             self._sync_index_and_tree_yaml(staged_root)
+            from cli.init import ensure_workspace_protocol_scaffolding
+            ensure_workspace_protocol_scaffolding(staged_root)
             validation = validate_runtime(staged_root)
         return [issue.message for issue in validation.errors]
 

@@ -197,6 +197,10 @@ class JsonRpcProtocol:
             return {"backends": self.manager.list_backends()}
         if method == "role.list":
             return {"roles": self.manager.list_roles()}
+        if method == "settings.get":
+            return {"settings": self.manager.get_settings(params.get("workspace"))}
+        if method == "settings.update":
+            return {"settings": self.manager.update_settings(params.get("settings", {}), params.get("workspace"))}
         if method == "role.configureBackend":
             role = params.get("role")
             backend = params.get("backend")

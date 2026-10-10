@@ -28,7 +28,7 @@ from rich.text import Text
 # ── Panel Constants ──────────────────────────────────────────────────────────
 
 RUNTIME_HEADING = "StackMind Runtime"
-RUNTIME_SECTIONS = ("AGENTS", "WORK ORDERS", "CURRENT OPERATION")
+RUNTIME_SECTIONS = ("AGENTS", "WORK ORDERS", "CURRENT OPERATION", "THINKING")
 
 # Standard symbols and color styles per §8
 STATUS_SYMBOLS: dict[str, tuple[str, str, str]] = {
@@ -337,7 +337,16 @@ def format_current_operation(
             phase_val = st_phase.value if hasattr(st_phase, "value") else str(st_phase)
             st_text = "Blocked" if phase_val.upper() == "BLOCKED" else "Failed"
             st_color = "#f43f5e" if phase_val.upper() == "FAILED" else "#f59e0b"
-            return [Text(f"  ⊘ {st_text}", style=f"bold {st_color}")]
+            res_lines = [Text(f"  ⊘ {st_text}", style=f"bold {st_color}")]
+            err = getattr(state, "error", None)
+            if err:
+                from cli.tui.events import clean_error_message
+                short_err = clean_error_message(err)
+                max_len = max((width - 4), 20) if width else 35
+                if len(short_err) > max_len:
+                    short_err = short_err[:max_len - 1] + "…"
+                res_lines.append(Text(f"    {short_err}", style="dim #ef4444"))
+            return res_lines
         return [Text("  ○ Idle", style="dim #475569")]
 
     if isinstance(current_operation, Mapping):
@@ -465,6 +474,7 @@ def render_runtime_panel(
     items.append(Text("CURRENT OPERATION", style="bold #a855f7"))
     for op_line in format_current_operation(current_operation, width=width, state=state):
         items.append(op_line)
+    items.append(Text(""))
 
     # 7. Independent scroll indicator (§10)
     if scroll is not None and scroll.has_new_activity:

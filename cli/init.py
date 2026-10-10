@@ -189,6 +189,9 @@ def _create_empty_dirs(sync_path: Path, agents: list[str]) -> None:
         "state",
         "runtime/drafts",
         "runtime/receipts",
+        "runtime/boot",
+        "runtime/supervisor",
+        "runtime/daemon",
         "experience/records",
         "experience/cache",
         "skills/manifests",
@@ -228,12 +231,116 @@ def _create_empty_dirs(sync_path: Path, agents: list[str]) -> None:
         (outbox_dir / ".gitkeep").write_text("", encoding="utf-8")
 
     # Work order subdirectories
-    for wo_dir in ["ACTIVE", "COMPLETED", "BLOCKED"]:
+    for wo_dir in ["ACTIVE", "COMPLETED", "BLOCKED", "TEMPLATES"]:
         dir_path = sync_path / "work-orders" / wo_dir
         dir_path.mkdir(parents=True, exist_ok=True)
         gitkeep = dir_path / ".gitkeep"
         if not gitkeep.exists():
             gitkeep.write_text("", encoding="utf-8")
+
+
+def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
+    """Ensure baseline .sync/ directories and required protocol governance files exist.
+
+    Idempotent and safe to invoke on any active workspace. Creates missing directories
+    and populates PROTOCOL_DIGEST.md, PROTOCOL_DIGEST.hash, and RUNTIME_VERSION if missing.
+    Also repairs schema-invalid work-order status 'FAILED' to 'BLOCKED'.
+    """
+    try:
+        ws_path = Path(workspace).resolve()
+        sync_path = ws_path / ".sync"
+        sync_path.mkdir(parents=True, exist_ok=True)
+
+        templates_dir = get_templates_dir()
+        templates_sync_dir = templates_dir / "sync"
+
+        # 1. PROTOCOL_DIGEST.md & .hash
+        digest_path = sync_path / "PROTOCOL_DIGEST.md"
+        if not digest_path.exists():
+            src_digest = templates_sync_dir / "PROTOCOL_DIGEST.md"
+            if src_digest.exists():
+                shutil.copy2(src_digest, digest_path)
+            else:
+                digest_path.write_text("# StackMind Protocol Digest\n\nProtocol rules active.\n", encoding="utf-8")
+
+        hash_path = sync_path / "PROTOCOL_DIGEST.hash"
+        if not hash_path.exists() or hash_path.stat().st_size == 0:
+            hash_val = compute_protocol_hash(digest_path)
+            hash_path.write_text(f"{hash_val}\n", encoding="utf-8", newline="\n")
+
+        # 2. RUNTIME_VERSION
+        version_path = sync_path / "RUNTIME_VERSION"
+        needs_version_write = False
+        if not version_path.exists() or version_path.stat().st_size == 0:
+            needs_version_write = True
+        else:
+            try:
+                import yaml
+                v_data = yaml.safe_load(version_path.read_text(encoding="utf-8"))
+                if not isinstance(v_data, dict):
+                    needs_version_write = True
+            except Exception:
+                needs_version_write = True
+
+        if needs_version_write:
+            src_template = templates_sync_dir / "RUNTIME_VERSION.template"
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if src_template.exists():
+                tmpl_text = src_template.read_text(encoding="utf-8")
+                content = tmpl_text.replace("{{INIT_TIMESTAMP}}", now_iso).replace("{{RUNTIME_VERSION}}", RUNTIME_VERSION)
+                version_path.write_text(content, encoding="utf-8")
+            else:
+                default_content = (
+                    f'version: "{RUNTIME_VERSION}"\n\n'
+                    'schema_versions:\n'
+                    '  tree: 1\n'
+                    '  boot: 1\n'
+                    '  work_order: 1\n'
+                    '  index: 1\n\n'
+                    f'min_cli_version: "{RUNTIME_VERSION}"\n\n'
+                    f'created_at: "{now_iso}"\n'
+                    'created_by: "stackmind-init"\n\n'
+                    'upgraded_at: null\n'
+                    'upgraded_from: null\n'
+                    'upgraded_by: null\n\n'
+                    'migration_history: []\n'
+                )
+                version_path.write_text(default_content, encoding="utf-8")
+
+        # 3. Create all baseline directories with .gitkeep
+        _create_empty_dirs(sync_path, DEFAULT_AGENTS)
+
+        # 4. Repair schema-invalid FAILED status on work orders
+        import yaml
+        wos_dir = sync_path / "work-orders"
+        if wos_dir.is_dir():
+            for sub in ("ACTIVE", "BLOCKED"):
+                sub_dir = wos_dir / sub
+                if sub_dir.is_dir():
+                    for f in sub_dir.glob("*.yaml"):
+                        try:
+                            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                            if isinstance(data, dict) and str(data.get("status", "")).upper() == "FAILED":
+                                data["status"] = "BLOCKED"
+                                f.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+                        except Exception:
+                            pass
+            idx_file = wos_dir / "INDEX.yaml"
+            if idx_file.is_file():
+                try:
+                    idx_data = yaml.safe_load(idx_file.read_text(encoding="utf-8"))
+                    if isinstance(idx_data, dict) and isinstance(idx_data.get("orders"), list):
+                        changed = False
+                        for o in idx_data["orders"]:
+                            if isinstance(o, dict) and str(o.get("status", "")).upper() == "FAILED":
+                                o["status"] = "BLOCKED"
+                                changed = True
+                        if changed:
+                            idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def init_git(path: Path, initial_commit: bool = True) -> bool:

@@ -30,7 +30,7 @@ class DaemonStorage:
         self.root.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, sort_keys=True)
+            json.dump(state, handle, indent=2, sort_keys=True, default=str)
             handle.flush()
             os.fsync(handle.fileno())
         for attempt in range(5):
@@ -42,7 +42,7 @@ class DaemonStorage:
                     try:
                         # Fallback for Windows file contention: direct write
                         with self.path.open("w", encoding="utf-8") as handle:
-                            json.dump(state, handle, indent=2, sort_keys=True)
+                            json.dump(state, handle, indent=2, sort_keys=True, default=str)
                     finally:
                         temporary.unlink(missing_ok=True)
                     break

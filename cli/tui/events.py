@@ -57,6 +57,38 @@ def normalize_status(raw_status: str | None) -> str:
     return val
 
 
+def clean_error_message(err: Any) -> str:
+    """Extract a concise human-readable error string avoiding raw dicts or traces."""
+    if not err:
+        return ""
+    if isinstance(err, Mapping):
+        for key in ("message", "error", "reason", "summary", "detail"):
+            val = err.get(key)
+            if val and val != err:
+                cleaned = clean_error_message(val)
+                if cleaned and cleaned.lower() not in {"failed", "blocked", "error"}:
+                    return cleaned
+        for val in err.values():
+            if isinstance(val, str) and val.strip() and val.strip().lower() not in {"failed", "blocked", "error"}:
+                return val.strip()
+        return "Operation failed"
+
+    msg = str(err).strip()
+    if msg.startswith("{") and msg.endswith("}") and ("'reason':" in msg or "'error':" in msg or "'message':" in msg):
+        try:
+            import ast
+            parsed = ast.literal_eval(msg)
+            if isinstance(parsed, Mapping):
+                return clean_error_message(parsed)
+        except Exception:
+            pass
+    if "Traceback (most recent call last):" in msg:
+        lines = [line.strip() for line in msg.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    return msg
+
+
 def format_tool_name(tool_name: str) -> str:
     """Clean up and format tool name for terminal presentation."""
     cleaned = (
@@ -289,7 +321,7 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
 
     if name in {"operation.failed", "operation.error"}:
         op_id = payload.get("operation_id") or "op"
-        err = payload.get("error", "FAILED")
+        err = clean_error_message(payload.get("error", "FAILED"))
         text = Text("✗ Operation ", style="red")
         text.append(str(op_id), style="bold red")
         text.append(f" failed ({err})", style="white")
@@ -367,14 +399,19 @@ def extract_assistant_response(
                         _, _, body = content.partition("## Report")
                         report_body, _, _ = body.partition("## Meta")
                         clean = report_body.strip()
-                        if clean:
+                        if clean and clean != "Completed task via tools":
                             return clean_response(clean)
-                    return clean_response(content)
+                    if content.strip() and content.strip() != "Completed task via tools":
+                        return clean_response(content)
                 except Exception:
                     pass
 
+        report_md = result.get("report_markdown")
+        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
+            return clean_response(report_md)
+
         summary = result.get("summary")
-        if summary and isinstance(summary, str) and summary.strip():
+        if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
             return clean_response(summary)
 
         response = result.get("response")
@@ -442,6 +479,22 @@ def extract_text_delta(event: Mapping[str, Any] | Any) -> str | None:
     # Also check if payload has an explicit delta field
     if "delta" in payload and isinstance(payload["delta"], str) and payload["delta"]:
         return payload["delta"]
+    return None
+
+
+def extract_reasoning_delta(event: Mapping[str, Any] | Any) -> str | None:
+    """Extract normalized reasoning/thinking delta from streaming event."""
+    if not isinstance(event, Mapping):
+        return None
+    name = str(event.get("name", "")).lower()
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    if name == "reasoning.delta":
+        for key in ("text", "reasoning", "thinking", "delta"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     return None
 
 
@@ -565,16 +618,18 @@ class OperationalEventManager:
                 activity.status = status
                 activity.duration_seconds = duration
                 if payload.get("error"):
-                    activity.error = str(payload["error"])
+                    activity.error = clean_error_message(payload["error"])
             else:
                 activity = ToolActivity(
                     tool_name=str(payload.get("tool_name", "tool")),
                     status=status,
                     call_id=call_id,
                     duration_seconds=duration,
-                    error=str(payload.get("error")) if payload.get("error") else None,
+                    error=clean_error_message(payload.get("error")) if payload.get("error") else None,
                 )
             self.tool_history.append(activity)
+            if status in {ToolStatus.FAILED, ToolStatus.BLOCKED}:
+                self.current_actions.expanded = True
             self.current_actions.complete_action(
                 call_id,
                 status=status,
@@ -766,6 +821,7 @@ __all__ = [
     "STATUS_MARKERS",
     "ToolActivity",
     "ToolStatus",
+    "clean_error_message",
     "extract_assistant_response",
     "extract_assistant_thinking",
     "format_action_description",
