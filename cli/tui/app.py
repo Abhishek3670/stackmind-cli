@@ -2370,7 +2370,12 @@ def dispatch_delivery_command(
         current_cols, current_lines = init_term.columns, init_term.lines
 
         try:
-            stream_gen = adapter.stream(session["session_id"], live=True, timeout=1.0)
+            stream_gen = adapter.stream(
+                session["session_id"],
+                live=True,
+                timeout=1.0,
+                after=state.last_sequence,
+            )
             while (max_wait <= 0 or time.time() - start_time < max_wait) and not completed:
                 # Check for dynamic terminal resize during active streaming / turn (WO-003)
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
@@ -2405,7 +2410,12 @@ def dispatch_delivery_command(
                         except Exception:
                             pass
                     time.sleep(0.05)
-                    stream_gen = adapter.stream(session["session_id"], live=True, timeout=1.0)
+                    stream_gen = adapter.stream(
+                        session["session_id"],
+                        live=True,
+                        timeout=1.0,
+                        after=state.last_sequence,
+                    )
                     continue
                 except Exception:
                     time.sleep(0.05)
@@ -2456,6 +2466,12 @@ def dispatch_delivery_command(
 
                 # 2. Process concrete domain event
                 if not isinstance(ev, dict):
+                    continue
+                sequence = ev.get("sequence")
+                if isinstance(sequence, int) and sequence <= state.last_sequence:
+                    # A reconnecting transport can replay events already folded
+                    # into the canonical transcript. Do not feed their deltas
+                    # into this turn's transient response buffer.
                     continue
                 state.process_event(ev)
                 ev_name = str(ev.get("name", ""))

@@ -214,6 +214,71 @@ class TestCompletionRedrawLifecycle:
         assert completion_redraw["clear"] is False
         assert "conversation_content" not in completion_redraw
 
+    def test_dispatch_starts_after_recovered_history_and_ignores_replayed_chunks(self, monkeypatch):
+        """A reconnect replay must not prepend a prior answer to the next turn."""
+        from cli.tui.app import dispatch_delivery_command
+        from cli.tui.events import recover_transcript_from_events
+        from cli.tui.state import AutonomousDeliveryState
+
+        state = AutonomousDeliveryState(session_id="session-1")
+        prior_events = [
+            {
+                "sequence": 1,
+                "name": "turn.started",
+                "payload": {"operation_id": "op-old", "prompt": "Hey"},
+            },
+            {
+                "sequence": 2,
+                "name": "text.delta",
+                "payload": {"operation_id": "op-old", "delta": "The old answer"},
+            },
+            {
+                "sequence": 3,
+                "name": "operation.completed",
+                "payload": {"operation_id": "op-old", "response": "The old answer"},
+            },
+        ]
+        recover_transcript_from_events(prior_events, state)
+        assert state.last_sequence == 3
+
+        adapter = MagicMock()
+        adapter.command.return_value = {"operation_id": "op-new"}
+        # Deliberately include already-recovered events to model a transport
+        # replay that ignores the requested cursor.
+        adapter.stream.return_value = iter([
+            prior_events[1],
+            prior_events[2],
+            {
+                "sequence": 4,
+                "name": "text.delta",
+                "payload": {"operation_id": "op-new", "delta": "A clean new answer"},
+            },
+            {
+                "sequence": 5,
+                "name": "operation.completed",
+                "payload": {"operation_id": "op-new"},
+            },
+        ])
+
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        monkeypatch.setattr("cli.tui.app.redraw_full_screen", lambda *args, **kwargs: "frame")
+        dispatch_delivery_command(
+            adapter,
+            MagicMock(),
+            {"session_id": "session-1", "workspace": "."},
+            "Tell me a joke",
+            state,
+            client_timeout=10,
+        )
+
+        adapter.stream.assert_called_once_with(
+            "session-1", live=True, timeout=1.0, after=3,
+        )
+        assistant_messages = [
+            message.content for message in state.messages if message.role == "assistant"
+        ]
+        assert assistant_messages == ["The old answer", "A clean new answer"]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
