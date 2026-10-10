@@ -298,6 +298,15 @@ class AuthoringGate:
             if not deliverable.get("description"):
                 errors.append("Work Order deliverable requires a non-empty 'description'")
 
+        # Validate requirement_refs if present
+        requirement_refs = data.get("requirement_refs")
+        if isinstance(requirement_refs, list):
+            for ref in requirement_refs:
+                if not isinstance(ref, str):
+                    errors.append(f"requirement_refs entry '{ref}' must be a string")
+                elif not ref.startswith("R"):
+                    errors.append(f"requirement_refs entry '{ref}' must start with 'R' (e.g., R001)")
+
     def _validate_contract(self, norm_path: str, data: dict[str, Any], errors: list[str]) -> None:
         schema = self.get_schema("contract.schema.json")
         if schema:
