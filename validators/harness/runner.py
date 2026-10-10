@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 import yaml
 from jsonschema import Draft7Validator
@@ -31,6 +31,7 @@ from validators.harness.retrieval import (
     SearchProvider,
     SessionSearchTool,
 )
+from validators.harness.task_contract import reconcile_modified_files
 from validators.knowledge.api import ContextBundle, KnowledgeAPI
 
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / 'schemas' / 'harness-output.schema.json'
@@ -233,6 +234,41 @@ class EchoLLMProvider:
             model=self.model_name,
             payload=payload,
         )
+
+
+QA_SYSTEM_PROMPT = (
+    "You are Gemma, the QA Lead for StackMind CLI. "
+    "You are responsible for test execution, code quality validation, test coverage verification, and formal QA review verdicts. "
+    "Per AGENTS.md, you inspect and validate code and run tests, but you MUST NEVER write or edit application source code. "
+    "TEST AUTHORING DOCTRINE — your suite MUST verify the semantic product goal, not superficial file existence:\n"
+    "- If the operator asked for specific text, entities, or names (e.g. 'Abhishek', 'Welcome'), assert that they appear in the rendered HTML or templates.\n"
+    "- If JavaScript queries elements by ID (e.g. #animated-name), assert that those IDs exist in the HTML.\n"
+    "- Never write tests that only check `assert file.exists()`. Superficial tests provide false confidence. "
+    "If semantic requirements are missing or unimplemented, your tests MUST fail — then record the defect as "
+    "a NEEDS_CHANGES verdict so the supervisor routes rework back to the developer.\n"
+    "Workflow instructions:\n"
+    "1. Use `read_file` or `list_directory` to inspect deliverables.\n"
+    "2. Author executable test suites under tests/ using standard Python libraries (e.g. `pytest`, `html.parser`, `re`, `pathlib`, `ast`, `urllib`). "
+    "Do NOT import or depend on external browser automation tools like `playwright` or `selenium` unless they are already installed in the environment.\n"
+    "3. Call `run_tests` (or `verify_tests`) to execute pytest against the test suite and verify test results.\n"
+    "4. IMMEDIATELY after `run_tests` — whatever its outcome, pass or fail — call `run_security_scan` over the "
+    "deliverables and triage its findings. This evidence is required for every verdict; never defer it to the end "
+    "of the turn, and never skip it because tests already failed.\n"
+    "5. Call `verify_deliverable` to confirm all required artifacts exist.\n"
+    "6. If ALL checks pass: call `approve_work_order` (or `submit_verdict`) to submit an APPROVED verdict.\n"
+    "7. If tests fail because of an APPLICATION-CODE defect (the test is correct, a deliverable is wrong):\n"
+    "   - Do NOT edit application source code — it is outside your contract.\n"
+    "   - Do NOT rewrite or re-run the test suite more than once: a correct failing test is your finding, "
+    "not your problem to fix. Retrying it changes nothing.\n"
+    "   - Write a NEEDS_CHANGES verdict with `write_file` to `.sync/inbox/claude/<TARGET-WORK-ORDER-ID>-qa-verdict.md` "
+    "(e.g. `WO-001-qa-verdict.md` naming the defective developer work order) naming the defective deliverable and the failing assertion.\n"
+    "   - Finalize the turn declaring status 'blocked' with a blocker that names the failing deliverable path "
+    "(e.g. 'index.html'), the failing assertion, and the owning work order if known. The supervisor routes the "
+    "fix back to the developer agent.\n"
+    "8. Only if the test ITSELF is wrong (a bad selector or expectation authored by QA) may you fix the test "
+    "file — once — and re-run it once.\n"
+    "9. Return the final HarnessDecision JSON with your verdict and review notes."
+)
 
 
 class AgentRunner:
@@ -616,11 +652,12 @@ class AgentRunner:
                 except ValueError as exc:
                     last_val_exc = exc
                     if retry_idx < max_validation_retries and self.provider_adapter is not None:
+                        expected_release = json.dumps(task.deliverable_path or "patch") if task.work_order_id else "null"
                         feedback_prompt = (
                             f"Your previous output decision failed schema validation with error: {exc}.\n"
                             "Please correct your response and return ONLY valid JSON matching this schema:\n"
                             "If status is 'completed':\n"
-                            '{\n  "status": "completed",\n  "summary": "...",\n  "report_markdown": "...",\n  "blockers": []\n}\n'
+                            '{\n  "status": "completed",\n  "summary": "...",\n  "report_markdown": "...",\n  "blockers": [],\n  "release_target": ' + expected_release + '\n}\n'
                             "If status is 'blocked':\n"
                             '{\n  "status": "blocked",\n  "summary": "...",\n  "report_markdown": "...",\n  "blockers": ["<non-empty blocker description>"]\n}\n'
                             "CRITICAL: If status is 'blocked', the 'blockers' field MUST be a non-empty JSON array of strings."
@@ -640,6 +677,8 @@ class AgentRunner:
                             if retry_payload and isinstance(retry_payload, dict):
                                 if 'report_markdown' not in retry_payload and 'summary' in retry_payload:
                                     retry_payload['report_markdown'] = retry_payload['summary']
+                                if task.work_order_id and retry_payload.get('status') == 'completed' and not retry_payload.get('release_target'):
+                                    retry_payload['release_target'] = task.deliverable_path or 'patch'
                                 current_payload = retry_payload
                                 continue
                         except Exception:
@@ -654,7 +693,16 @@ class AgentRunner:
                     persisted=False,
                     task_id=task.identifier,
                     reason=f"Harness decision validation failed after retries: {reason_str}",
-                    meta={'error': reason_str, 'blockers': [reason_str]},
+                    meta={
+                        'error': reason_str,
+                        'blockers': [reason_str],
+                        'failure': {
+                            'failure_code': 'HARNESS_DECISION_INVALID',
+                            'canonical_message': f"Harness decision validation failed after retries: {reason_str}",
+                            'work_order_id': task.work_order_id,
+                            'raw_reason': reason_str,
+                        },
+                    },
                 )
 
             # 7. Post-decision validation.
@@ -724,6 +772,27 @@ class AgentRunner:
             if self._is_cancelled(cancellation):
                 return self._cancelled_result(task, operation_id)
 
+            # The write_file journal is authoritative for what the turn actually
+            # touched: reconcile the model's self-reported modified_files against
+            # it so undeclared-but-written files are reported honestly instead of
+            # failing the declaration gate, and claimed-but-never-written files
+            # stay a declaration failure.
+            auto_added_files: list[str] = []
+            journal = getattr(tool_runtime, "boundary", None) and tool_runtime.boundary.journal
+            if decision is not None and journal is not None:
+                from validators.kernel.operations import OperationType
+                written_paths = [
+                    rec.request.target.replace('workspace/', '', 1).replace('\\', '/')
+                    for rec in journal.records
+                    if rec.request.operation_type.value == 'write_file' and rec.result == 'written'
+                ]
+                decision, auto_added_files = reconcile_modified_files(decision, written_paths)
+
+            if self.agent == 'claude' and decision is not None:
+                decision, auto_added_files = self._reconcile_authored_work_orders(
+                    workspace_root, decision, auto_added_files
+                )
+
             stage_inputs = {
                 'completion': completion,
                 'context': context,
@@ -737,6 +806,7 @@ class AgentRunner:
                 'run_at': run_at,
                 'tool_calls_audit': (completion.meta or {}).get('tool_calls_audit', []),
                 'blocker_details': [dict(d) for d in (getattr(decision, 'blocker_details', ()) or ())],
+                'auto_added_files': auto_added_files,
             }
             staged_errors = self._validate_staged_state(stage_inputs, source_root=workspace_root)
             if staged_errors:
@@ -835,15 +905,42 @@ class AgentRunner:
                         else None
                     )
                     dec_norm = {Path(p).as_posix().lstrip('/') for p in decision.modified_files if p}
+                    tool_written: set[str] = set()
+                    if tool_runtime is not None:
+                        journal = getattr(tool_runtime, "boundary", None) and tool_runtime.boundary.journal
+                        if journal is not None:
+                            tool_written.update(
+                                Path(rec.request.target.replace('workspace/', '', 1)).as_posix().lstrip('/')
+                                for rec in journal.records
+                                if rec.request.operation_type.value == 'write_file' and rec.result == 'written'
+                            )
+                        if hasattr(tool_runtime, "gateway") and hasattr(tool_runtime.gateway, "written_files"):
+                            tool_written.update(Path(p).as_posix().lstrip('/') for p in tool_runtime.gateway.written_files)
+                    for tc in (getattr(completion, "meta", None) or {}).get("tool_calls_audit", []):
+                        if isinstance(tc, dict) and tc.get("tool") == "write_file" and tc.get("path"):
+                            tool_written.add(Path(str(tc["path"])).as_posix().lstrip('/'))
+                    if self.agent in ("local-llm", "gitops"):
+                        for rel_file in ("VERSION.md", "CHANGELOG.md"):
+                            if rel_file in dec_norm and (staged_root / rel_file).is_file():
+                                tool_written.add(rel_file)
+
+                    idempotent_writes = {
+                        p for p in dec_norm
+                        if p in tool_written and (staged_root / p).is_file()
+                    }
+                    all_observed = set(diff.all_changed_files) | idempotent_writes
                     observed_task_files = tuple(
-                        norm_p for path in diff.all_changed_files
+                        norm_p for path in sorted(all_observed)
                         if (norm_p := Path(path).as_posix().lstrip('/'))
                         and not (any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes) and norm_p not in dec_norm)
                         and (task_wo_rel is None or norm_p != task_wo_rel or norm_p in dec_norm)
                     )
                     phantom_files = {
                         p for p in dec_norm
-                        if not (staged_root / p).is_file() and p.startswith(('_scratch', 'scratch', '.sync/state', '.sync/runtime'))
+                        if not (staged_root / p).is_file() and (
+                            p.startswith(('_scratch', 'scratch', '.sync/runtime'))
+                            or any(p.startswith(prefix) for prefix in bookkeeping_prefixes)
+                        )
                     }
                     dec_effective = dec_norm - phantom_files
                     # Trust direction: a turn must WRITE everything it
@@ -926,7 +1023,7 @@ class AgentRunner:
                             reason=reason_msg,
                             meta=meta_dict,
                         )
-                    self._apply_verified_workspace_diff(staged_root, diff)
+                    self._apply_verified_workspace_diff(staged_root, diff, extra_paths=sorted(idempotent_writes))
 
                 # `.sync` is excluded from workspace snapshots, so commit the
                 # harness-owned bookkeeping only after the staged verification passes.
@@ -1000,28 +1097,40 @@ class AgentRunner:
                 persisted=False,
                 task_id=None,
                 reason=str(exc),
+                meta={
+                    'failure': {
+                        'failure_code': 'LOOP_GUARD_TRIPPED',
+                        'canonical_message': str(exc),
+                    },
+                    'blockers': [str(exc)],
+                },
             )
 
     def discover_next_task(
         self, tree_data: dict[str, Any], work_order_id: str | None = None
     ) -> HarnessTask | None:
         if work_order_id:
-            path = self.sync_path / 'work-orders' / 'ACTIVE' / f'{work_order_id}.yaml'
-            if path.exists():
-                payload = self._read_yaml(path)
-                deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
-                return HarnessTask(
-                    kind='work_order',
-                    identifier=work_order_id,
-                    path=path,
-                    title=str(payload.get('title', work_order_id)),
-                    body=str(payload.get('description', '')),
-                    query=str(payload.get('title', work_order_id)),
-                    work_order_id=work_order_id,
-                    deliverable_path=deliverable.get('path') if isinstance(deliverable, dict) else None,
-                    work_order_type=str(payload.get('type')) if isinstance(payload, dict) and payload.get('type') else None,
-                    deliverable_type=str(deliverable.get('type')) if isinstance(deliverable, dict) and deliverable.get('type') else None,
-                )
+            # Explicit ids resolve against every work-order state: recovery
+            # repair turns target work orders that the recovery itself may
+            # have moved to BLOCKED/COMPLETED — never fall back to inbox
+            # processing for an explicitly addressed work order.
+            for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                path = self.sync_path / 'work-orders' / sub / f'{work_order_id}.yaml'
+                if path.exists():
+                    payload = self._read_yaml(path)
+                    deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
+                    return HarnessTask(
+                        kind='work_order',
+                        identifier=work_order_id,
+                        path=path,
+                        title=str(payload.get('title', work_order_id)),
+                        body=str(payload.get('description', '')),
+                        query=str(payload.get('title', work_order_id)),
+                        work_order_id=work_order_id,
+                        deliverable_path=deliverable.get('path') if isinstance(deliverable, dict) else None,
+                        work_order_type=str(payload.get('type')) if isinstance(payload, dict) and payload.get('type') else None,
+                        deliverable_type=str(deliverable.get('type')) if isinstance(deliverable, dict) and deliverable.get('type') else None,
+                    )
 
         inbox_dir = self.sync_path / 'inbox' / self.agent
         inbox_candidates = (
@@ -1183,12 +1292,14 @@ class AgentRunner:
             'commands',
         }
         filtered_payload = {k: v for k, v in cleaned_payload.items() if k in allowed_keys}
+        status = str(filtered_payload.get('status', ''))
+        if task.work_order_id and status == 'completed' and not str(filtered_payload.get('release_target') or '').strip():
+            filtered_payload['release_target'] = task.deliverable_path or 'patch'
 
         errors = [
             f"{'.'.join(str(part) for part in error.absolute_path) or '(root)'}: {error.message}"
             for error in _OUTPUT_VALIDATOR.iter_errors(filtered_payload)
         ]
-        status = str(filtered_payload.get('status', ''))
         release_target = filtered_payload.get('release_target')
         blockers = tuple(str(item) for item in filtered_payload.get('blockers', []))
         blocker_details = tuple(
@@ -1201,8 +1312,6 @@ class AgentRunner:
             errors.append('blocked decisions must declare blockers')
         if errors:
             raise ValueError('invalid harness output: ' + '; '.join(errors))
-        if task.work_order_id and status == 'completed' and not str(release_target or '').strip():
-            release_target = task.deliverable_path or 'patch'
         return HarnessDecision(
             status=status,
             summary=str(filtered_payload['summary']).strip(),
@@ -1232,8 +1341,25 @@ class AgentRunner:
         from validators.kernel.tools import ToolGateway
         from validators.kernel.workspace import ScratchWorkspace
 
+        known_contract_exts = frozenset({
+            '.md', '.yaml', '.yml', '.json', '.jsonc', '.jsonl', '.py', '.pyi', '.txt', '.toml',
+            '.ini', '.cfg', '.conf', '.lock', '.html', '.htm', '.css', '.scss', '.sass', '.less',
+            '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.vue', '.svelte', '.wasm',
+            '.xml', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp',
+            '.sh', '.bash', '.zsh', '.bat', '.cmd', '.ps1', '.sql', '.db', '.sqlite',
+            '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.java', '.kt', '.cs', '.rb', '.php', '.swift',
+            '.csv', '.tsv', '.rst', '.env',
+        })
+
         def workspace_rules(rules: Any) -> tuple[str, ...]:
             converted: list[str] = []
+            seen: set[str] = set()
+
+            def add_rule(r: str) -> None:
+                if r not in seen:
+                    seen.add(r)
+                    converted.append(r)
+
             for rule in rules:
                 val = None
                 if isinstance(rule, dict):
@@ -1250,20 +1376,25 @@ class AgentRunner:
 
                 has_sep = '/' in val
                 has_wildcard = '*' in val or '?' in val
-                has_file_ext = any(val.endswith(ext) for ext in ('.md', '.yaml', '.yml', '.json', '.py', '.txt', '.toml', '.ini', '.cfg', '.lock'))
+                suffix = Path(val).suffix.lower()
+                has_file_ext = suffix in known_contract_exts
                 is_dotted_path = val.startswith('.')
 
+                # Always preserve the exact path explicitly named in the contract
+                add_rule(f'workspace/{val}')
+
                 if has_sep or has_wildcard or has_file_ext or is_dotted_path:
-                    if has_file_ext or has_wildcard:
-                        converted.append(f'workspace/{val}')
-                    else:
+                    if not (has_file_ext or has_wildcard):
                         clean_dir = val.rstrip('/')
-                        converted.append(f'workspace/{clean_dir}')
-                        converted.append(f'workspace/{clean_dir}/**')
+                        add_rule(f'workspace/{clean_dir}')
+                        add_rule(f'workspace/{clean_dir}/**')
                 else:
                     mod_path = val.replace('.', '/').rstrip('/')
-                    converted.append(f'workspace/{mod_path}')
-                    converted.append(f'workspace/{mod_path}/**')
+                    if mod_path != val:
+                        add_rule(f'workspace/{mod_path}')
+                        add_rule(f'workspace/{mod_path}/**')
+                    else:
+                        add_rule(f'workspace/{val}/**')
             return tuple(converted)
 
         attempt_id = f'harness-{self.agent}-{int(time.time() * 1000)}'
@@ -1377,6 +1508,7 @@ class AgentRunner:
                         'report_markdown': raw_text,
                         'blockers': [],
                         'modified_files': [],
+                        'release_target': (request.task.deliverable_path or 'patch') if request.task.work_order_id else None,
                         'commands': [],
                         'retrieval_queries': [],
                         'uncertainty': [],
@@ -1437,6 +1569,7 @@ class AgentRunner:
             else "integration" if is_integration_review
             else None
         )
+        uses_task_contract = False
         gateway = ProviderGateway(
             self.provider_adapter,
             tool_runtime.gateway,
@@ -1472,24 +1605,35 @@ class AgentRunner:
 
         if is_architecture and is_integration_review:
             system_msg = (
-                "You are Claude, the Senior Architect for StackMind CLI. "
+                "You are Claude, the Senior Architect for StackMind CLI and the FINAL GATEKEEPER before release. "
                 "All implementation work orders and QA verifications have completed. "
-                "Your task is to perform the final integration review of all declared deliverables against requirements. "
-                "You operate in a governed environment with a strictly read-only contract. "
-                "You may inspect deliverables and test files using `read_file` or `list_directory`. "
-                "Do NOT attempt to write or edit any files. "
-                "When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
+                "Your task is to perform the final integration review of all declared deliverables against the original product goal. "
+                "You are solely accountable for ensuring that the assembled deliverables fully satisfy the product goal and integrate cleanly.\n"
+                "You operate in a governed environment with a strictly read-only contract: use `read_file` or `list_directory` to inspect deliverables. "
+                "Do NOT attempt to write or edit any files.\n"
+                "INTEGRATION REVIEW CHECKLIST (MUST VERIFY BEFORE APPROVING):\n"
+                "1. Product Goal Fulfillment: Inspect the actual content of the files. If the user goal requested specific features, text, or entities (e.g. 'Welcome Abhishek', animated background), verify they actually exist in the rendered markup/output — not just placeholder scaffolding.\n"
+                "2. Cross-File Integration: Verify that element IDs, classes, and function references align across files (e.g. if script.js queries an element ID or style.css targets a class, that ID/class MUST exist in index.html).\n"
+                "3. NO RUBBER-STAMPING: If files are disconnected, placeholder-only, or missing user-requested content, you MUST declare status 'blocked'. "
+                "Populate 'blockers' with concise summaries and 'blocker_details' with [{'finding': '...', 'remediation': '...', 'path': '...'}]. "
+                "The supervisor will automatically route the prescribed rework back to the appropriate developer to fix it before release.\n"
+                "4. Context & Environment: Check developer completion notices in .sync/inbox/claude/ for implementation rationales. In development environments, local developer conveniences (like debug mode and dev secret fallbacks) are permissible and do not block release.\n"
+                "5. When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
             )
         elif is_architecture and is_authoring_task:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "The operator has approved the architecture plan in PLAN.md. "
                 "Your task now is to author the implementation Work Orders and Contracts for the tasks in PLAN.md. "
-                "You operate in a governed environment where all file I/O MUST be performed through provided tools (read_file, write_file). "
+                "You operate in a governed environment where all file I/O MUST be performed through provided tools (read_file, write_file).\n"
                 "WORKFLOW RULE: Call `write_file` to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
-                "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas. "
+                "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas.\n"
+                "INTEGRATION CONTRACT RULE: When decomposing a feature across multiple files (e.g. HTML, CSS, JS), "
+                "the parent Work Order (e.g. index.html) MUST explicitly declare the exact markup, container classes, and "
+                "element IDs (e.g. #animated-name) in its deliverable description and acceptance criteria so downstream "
+                "scripts and styles hook into existing elements. Never leave parent deliverables as empty placeholder scaffolding.\n"
                 "Only worker roles may be assigned to implementation work orders (e.g. codex for backend, gemini for frontend, gemma for qa, local-llm for gitops). "
-                "Architects must NEVER assign implementation tasks to claude. "
+                "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
             )
         elif is_architecture:
@@ -1497,23 +1641,15 @@ class AgentRunner:
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
                 "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
-                "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file). "
+                "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file).\n"
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
-                "Only after receiving the graph research results should you call `write_file` to write PLAN.md. "
+                "Only after receiving the graph research results should you call `write_file` to write PLAN.md.\n"
+                "SYSTEM INTEGRATION RULE: Plan end-to-end integration: if a milestone produces frontend assets (HTML/CSS/JS), "
+                "sequence them with explicit interface and DOM contracts so the assembled page delivers every element and text string requested in the product goal.\n"
                 "Return the final HarnessDecision as JSON."
             )
         elif self.agent in ('gemma', 'qa'):
-            system_msg = (
-                "You are Gemma, the QA Lead for StackMind CLI. "
-                "You are responsible for test execution, code quality validation, test coverage verification, and formal QA review verdicts. "
-                "Per AGENTS.md, you inspect and validate code and run tests, but you MUST NEVER write or edit application source code. "
-                "Workflow instructions:\n"
-                "1. Use `read_file` or `list_directory` to inspect deliverables.\n"
-                "2. Call `run_tests` (or `verify_tests`) to execute pytest against the test suite and verify test results.\n"
-                "3. Call `verify_deliverable` to confirm all required artifacts exist.\n"
-                "4. When validation passes, call `approve_work_order` (or `submit_verdict`) to submit your QA verdict.\n"
-                "5. Return the final HarnessDecision JSON with your verdict and review notes."
-            )
+            system_msg = QA_SYSTEM_PROMPT
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = raw_context
         elif self.agent in ('local-llm', 'gitops'):
@@ -1529,27 +1665,38 @@ class AgentRunner:
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = raw_context
         else:
-            scope_hints: list[str] = []
-            if kernel_contract is not None:
-                for r in getattr(kernel_contract, "allow", ()):
-                    clean_r = str(r).replace("workspace/", "").replace("workspace\\", "")
-                    if clean_r and not clean_r.startswith(".sync") and clean_r != "PLAN.md":
-                        scope_hints.append(clean_r)
-            scope_line = f" Allowed write scope: {', '.join(scope_hints)}." if scope_hints else ""
-            target_line = f" Target deliverable file: '{request.task.deliverable_path}'." if request.task.deliverable_path else ""
-            action_line = (
-                f" WORKFLOW REQUIREMENT: You MUST author the declared deliverable '{request.task.deliverable_path}' using the `write_file` tool in this session. "
-                "Do NOT output plain text planning or commentary without tool calls; you MUST execute tool calls to create the file before completing."
-                if request.task.deliverable_path else ""
+            # Worker turns run against a COMPILED task contract: the same
+            # structured sources the gates read, rendered as one JSON block —
+            # ownership, budget, acceptance criteria, and the decision output
+            # contract.  Replaces the prose task/scope paragraphs.
+            from validators.harness.task_contract import (
+                compile_worker_task_contract,
+                render_task_block,
+                render_worker_system,
             )
-            system_msg = (
-                'You are a governed StackMind worker. Use tools for all file I/O. '
-                f'Code execution is unavailable; the harness verifies after the final decision.{scope_line}{target_line}{action_line} '
-                'Environment notice: Virtual environments (.venv), dependencies, and tests are managed externally by the harness and QA lead. '
-                'Do not inspect, search for, or wait for .venv or shell execution. Your sole job is to author the code directly in your assigned deliverable files using write_file. '
-                'Only create or modify files permitted by your contract scope. '
-                'Once your files are written, return the final HarnessDecision as JSON.'
+            wo_data = None
+            contract_data = None
+            if request.task.work_order_id:
+                for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                    wo_path = self.sync_path / 'work-orders' / sub / f'{request.task.work_order_id}.yaml'
+                    if wo_path.exists():
+                        wo_data = self._read_yaml(wo_path)
+                        break
+                contract_path = self.sync_path / 'contracts' / f'{request.task.work_order_id}.yaml'
+                if contract_path.exists():
+                    contract_data = self._read_yaml(contract_path)
+            task_contract_json = compile_worker_task_contract(
+                request.task, wo_data, contract_data, self.project_path,
             )
+            system_msg = render_worker_system(task_contract_json)
+            task_text = render_task_block(task_contract_json) + '\n'
+            uses_task_contract = True
+            if tool_runtime is not None:
+                from validators.harness.task_contract import TaskOwnership
+                try:
+                    tool_runtime.gateway.task_ownership = TaskOwnership.from_contract(task_contract_json)
+                except Exception:
+                    pass
 
             existing_files: list[str] = []
             try:
@@ -1569,7 +1716,8 @@ class AgentRunner:
         if request.task.deliverable_path and not is_architecture:
             task_text += (
                 f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
-                "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file.\n"
+                "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file. "
+                "INTEGRATION REQUIREMENT: Ensure your deliverable integrates with other workspace files (e.g. element IDs in JS matching HTML, classes in CSS matching markup). If your deliverable references an ID or class from a companion file in scope, make sure it matches.\n"
             )
 
         messages = [
@@ -1954,6 +2102,8 @@ class AgentRunner:
                         if src_sub.is_dir():
                             dst_sub = staged_root / '.sync' / sub
                             shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+                if self.agent == 'claude':
+                    self._reconcile_staged_work_order_collisions(staged_root)
                 self._sync_index_and_tree_yaml(staged_root)
             self._apply_non_report_writes(stage_inputs, base_path=staged_root)
             report_write = self._build_report_write(
@@ -1964,6 +2114,7 @@ class AgentRunner:
             )
             events_write = self._build_events_write(stage_inputs, 0, 0)
             self._apply_ops(staged_root, [report_write, events_write])
+            self._sync_index_and_tree_yaml(staged_root)
             validation = validate_runtime(staged_root)
         return [issue.message for issue in validation.errors]
 
@@ -2208,6 +2359,16 @@ class AgentRunner:
             'uncertainty': list(decision.uncertainty),
             'verification_dimensions': dimensions.to_dict() if dimensions else {},
         }
+        if decision.status == 'blocked':
+            gt = completion.meta.get('guard_trip') if hasattr(completion, 'meta') else None
+            if gt:
+                meta_out['failure'] = {
+                    'failure_code': 'LOOP_GUARD_TRIPPED',
+                    'canonical_message': str(gt),
+                }
+            elif stage_inputs.get('failure'):
+                meta_out['failure'] = stage_inputs['failure']
+        return meta_out
 
     def _evaluate_verification_dimensions(
         self,
@@ -2247,8 +2408,9 @@ class AgentRunner:
                     decision,
                     observed_files=task_changed_files,
                 )
-            except Exception:
+            except Exception as exc:
                 scope_verified = False
+                staged_errors.append(str(exc))
 
         # Runtime contracts use path rules; validate those directly when present.
         raw_contract = None
@@ -2296,6 +2458,18 @@ class AgentRunner:
                         continue  # Harness-owned bookkeeping writes are authorized separately.
                     allowed = not allow_paths or any(_path_matches_rule(normalized, rule) for rule in allow_paths)
                     denied = any(_path_matches_rule(normalized, rule) for rule in deny_paths)
+                    if denied:
+                        matching_deny = [r for r in deny_paths if _path_matches_rule(normalized, r)]
+                        matching_allow = [r for r in allow_paths if _path_matches_rule(normalized, r)]
+                        if matching_allow and all(
+                            any(
+                                _path_matches_rule(a.replace('\\', '/').rstrip('/*'), d)
+                                and not _path_matches_rule(d.replace('\\', '/').rstrip('/*'), a)
+                                for a in matching_allow
+                            )
+                            for d in matching_deny
+                        ):
+                            denied = False
                     if not allowed or denied:
                         scope_verified = False
 
@@ -2343,9 +2517,12 @@ class AgentRunner:
                         if not plan_valid:
                             code_verified = False
                             state_verified = False
-                    except Exception:
+                            for err in plan_errs:
+                                staged_errors.append(f"PLAN.md: {err}")
+                    except Exception as exc:
                         code_verified = False
                         state_verified = False
+                        staged_errors.append(f"PLAN.md read error: {exc}")
 
             # Phase D: Governed YAML authoring gate (.sync/work-orders and .sync/contracts)
             if (norm_rel.startswith('.sync/work-orders/') or norm_rel.startswith('.sync/contracts/')) and norm_rel in dec_norm:
@@ -2359,6 +2536,8 @@ class AgentRunner:
                     if not gate_decision.passed:
                         code_verified = False
                         state_verified = False
+                        for err in gate_decision.errors:
+                            staged_errors.append(f"{relative_path}: {err}")
 
         for result in command_results:
             command = str(result.args).lower()
@@ -2379,6 +2558,19 @@ class AgentRunner:
             not Path(relative_path).is_absolute() and '..' not in Path(relative_path).parts
             for relative_path in changed_files
         )
+        if not all(
+            not Path(relative_path).is_absolute() and '..' not in Path(relative_path).parts
+            for relative_path in changed_files
+        ):
+            for relative_path in changed_files:
+                if Path(relative_path).is_absolute() or '..' in Path(relative_path).parts:
+                    staged_errors.append(f"path traversal or absolute path detected in {relative_path}")
+
+        if not d025_passed:
+            staged_errors.append("D025 destructive command validation failed")
+        if not d024_passed:
+            staged_errors.append("D024 release gate validation failed")
+
         if security_verified:
             from validators.kernel.security import scan_for_credential_leaks
 
@@ -2387,11 +2579,14 @@ class AgentRunner:
                 if candidate.is_file():
                     try:
                         content = candidate.read_text(encoding='utf-8', errors='replace')
-                        if scan_for_credential_leaks(content, file_path=relative_path):
+                        leaks = scan_for_credential_leaks(content, file_path=relative_path)
+                        if leaks:
                             security_verified = False
+                            staged_errors.append(f"credential leak detected in {relative_path}: {leaks[0]}")
                             break
-                    except OSError:
+                    except OSError as exc:
                         security_verified = False
+                        staged_errors.append(f"failed to read {relative_path} for security scan: {exc}")
                         break
 
         deliverable_touched = False
@@ -2407,10 +2602,13 @@ class AgentRunner:
         )
 
         if decision.status == 'blocked':
-            outcome_verified = bool(decision.blockers) and bool(
-                (decision.summary and decision.summary.strip())
-                or (decision.report_markdown and decision.report_markdown.strip())
-            )
+            if task.deliverable_path and not getattr(task, 'is_authoring', False):
+                outcome_verified = deliverable_touched
+            else:
+                outcome_verified = bool(decision.blockers) and bool(
+                    (decision.summary and decision.summary.strip())
+                    or (decision.report_markdown and decision.report_markdown.strip())
+                )
         elif getattr(task, 'is_authoring', False):
             # Authoring turns produce governed work orders and contracts (or synthesis).
             outcome_verified = (
@@ -2547,16 +2745,19 @@ class AgentRunner:
             outcome_verified=outcome_verified,
         )
 
-    def _apply_verified_workspace_diff(self, staged_root: Path, diff: Any) -> None:
+    def _apply_verified_workspace_diff(
+        self, staged_root: Path, diff: Any, extra_paths: Sequence[str] = ()
+    ) -> None:
         """Commit only the already-verified staged diff to the live workspace."""
-        for relative_path in (*diff.added, *diff.modified):
+        for relative_path in (*diff.added, *diff.modified, *extra_paths):
             relative = Path(relative_path)
             if relative.is_absolute() or '..' in relative.parts:
                 raise ValueError(f'unsafe staged path: {relative_path}')
             source = staged_root / relative
             target = self.project_path / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
         for relative_path in diff.deleted:
             relative = Path(relative_path)
             if relative.is_absolute() or '..' in relative.parts:
@@ -2565,6 +2766,139 @@ class AgentRunner:
             if target.exists():
                 target.unlink()
         self._sync_index_and_tree_yaml(self.project_path)
+
+    def _reconcile_authored_work_orders(
+        self,
+        workspace_root: Path,
+        decision: Any,
+        auto_added_files: list[str],
+    ) -> tuple[Any, list[str]]:
+        """Reconcile architect-authored work orders against live closed work orders.
+
+        When the architect authors child work orders starting from WO-001 on a
+        continuation goal (where WO-001..WO-007 are already in COMPLETED/),
+        remap the newly authored active work orders and contracts to the
+        allocated or next sequential IDs to prevent multi-directory state conflicts.
+        """
+        closed_ids: set[str] = set()
+        for sub in ("COMPLETED", "BLOCKED"):
+            d = self.project_path / ".sync" / "work-orders" / sub
+            if d.is_dir():
+                closed_ids.update(f.stem for f in d.glob("*.yaml"))
+        if not closed_ids:
+            return decision, auto_added_files
+
+        ws_active_dir = workspace_root / ".sync" / "work-orders" / "ACTIVE"
+        ws_contracts_dir = workspace_root / ".sync" / "contracts"
+        if not ws_active_dir.is_dir():
+            return decision, auto_added_files
+
+        active_files = sorted(ws_active_dir.glob("*.yaml"))
+        if not active_files:
+            return decision, auto_added_files
+
+        active_ids = [f.stem for f in active_files]
+        colliding_ids = [wo_id for wo_id in active_ids if wo_id in closed_ids]
+        if not colliding_ids:
+            return decision, auto_added_files
+
+        proj_active_dir = self.project_path / ".sync" / "work-orders" / "ACTIVE"
+        proj_active_ids = (
+            sorted(f.stem for f in proj_active_dir.glob("*.yaml"))
+            if proj_active_dir.is_dir()
+            else []
+        )
+        proj_safe_ids = [wo_id for wo_id in proj_active_ids if wo_id not in closed_ids]
+
+        if len(proj_safe_ids) >= len(active_files):
+            target_ids = proj_safe_ids[: len(active_files)]
+        else:
+            from validators.kernel.daemon.authoring import get_next_work_order_int
+
+            start_idx = get_next_work_order_int(self.project_path)
+            target_ids = [f"WO-{start_idx + i:03d}" for i in range(len(active_files))]
+
+        id_map: dict[str, str] = {}
+        for old_id, new_id in zip(active_ids, target_ids):
+            if old_id != new_id:
+                id_map[old_id] = new_id
+
+        if not id_map:
+            return decision, auto_added_files
+
+        # 1. Remap work order files in workspace_root
+        for old_id, new_id in id_map.items():
+            old_f = ws_active_dir / f"{old_id}.yaml"
+            new_f = ws_active_dir / f"{new_id}.yaml"
+            if old_f.is_file():
+                try:
+                    wo_data = yaml.safe_load(old_f.read_text(encoding="utf-8")) or {}
+                    wo_data["id"] = new_id
+                    deps = wo_data.get("dependencies", [])
+                    if isinstance(deps, list):
+                        wo_data["dependencies"] = [id_map.get(d, d) for d in deps]
+                    new_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                    old_f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # 2. Remap contract files in workspace_root
+        if ws_contracts_dir.is_dir():
+            for old_id, new_id in id_map.items():
+                old_c = ws_contracts_dir / f"{old_id}.yaml"
+                new_c = ws_contracts_dir / f"{new_id}.yaml"
+                if old_c.is_file():
+                    try:
+                        c_data = yaml.safe_load(old_c.read_text(encoding="utf-8")) or {}
+                        c_data["work_order"] = new_id
+                        new_c.write_text(yaml.safe_dump(c_data, sort_keys=False), encoding="utf-8")
+                        old_c.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        # 3. Remap modified_files and auto_added_files
+        def _remap_path_str(p: str) -> str:
+            norm = p.replace("\\", "/")
+            for old_id, new_id in id_map.items():
+                old_wo = f"work-orders/ACTIVE/{old_id}.yaml"
+                if norm.endswith(old_wo):
+                    return norm.replace(f"{old_id}.yaml", f"{new_id}.yaml")
+                old_c = f"contracts/{old_id}.yaml"
+                if norm.endswith(old_c):
+                    return norm.replace(f"{old_id}.yaml", f"{new_id}.yaml")
+            return norm
+
+        from dataclasses import replace
+
+        if hasattr(decision, "modified_files") and decision.modified_files:
+            remapped_mod = tuple(sorted({_remap_path_str(p) for p in decision.modified_files}))
+            decision = replace(decision, modified_files=remapped_mod)
+
+        auto_added_files = [_remap_path_str(p) for p in auto_added_files]
+        return decision, auto_added_files
+
+    @staticmethod
+    def _reconcile_staged_work_order_collisions(staged_root: Path) -> None:
+        """Ensure active work orders in staged_root do not collide with COMPLETED or BLOCKED states."""
+        sync_dir = staged_root / ".sync"
+        active_dir = sync_dir / "work-orders" / "ACTIVE"
+        if not active_dir.is_dir():
+            return
+        closed_ids: set[str] = set()
+        for sub in ("COMPLETED", "BLOCKED"):
+            d = sync_dir / "work-orders" / sub
+            if d.is_dir():
+                closed_ids.update(f.stem for f in d.glob("*.yaml"))
+        if not closed_ids:
+            return
+
+        contracts_dir = sync_dir / "contracts"
+        for wo_file in list(active_dir.glob("*.yaml")):
+            wo_id = wo_file.stem
+            if wo_id in closed_ids:
+                wo_file.unlink(missing_ok=True)
+                if contracts_dir.is_dir():
+                    (contracts_dir / f"{wo_id}.yaml").unlink(missing_ok=True)
 
     @staticmethod
     def _sync_index_and_tree_yaml(base_dir: Path) -> None:
@@ -2623,28 +2957,75 @@ class AgentRunner:
                     updated_index = True
                 else:
                     entry = existing_orders[wo_id]
-                    if entry.get("status") != wo_data.get("status"):
-                        entry["status"] = wo_data.get("status", "ACTIVE")
+                    target_status = wo_data.get("status", "ACTIVE")
+                    target_file = f"work-orders/ACTIVE/{wo_file.name}"
+                    if entry.get("status") != target_status:
+                        entry["status"] = target_status
                         updated_index = True
+                    if entry.get("file") != target_file:
+                        entry["file"] = target_file
+                        updated_index = True
+
+            completed_dir = sync_dir / "work-orders" / "COMPLETED"
+            if completed_dir.is_dir():
+                for comp_file in sorted(completed_dir.glob("*.yaml")):
+                    comp_data = yaml.safe_load(comp_file.read_text(encoding="utf-8")) or {}
+                    c_id = comp_data.get("id") or comp_file.stem
+                    if c_id in existing_orders:
+                        c_entry = existing_orders[c_id]
+                        if c_entry.get("file", "").startswith("work-orders/ACTIVE/"):
+                            continue
+                        if c_entry.get("status") != "COMPLETED":
+                            c_entry["status"] = "COMPLETED"
+                            updated_index = True
+                        c_file = f"work-orders/COMPLETED/{comp_file.name}"
+                        if c_entry.get("file") != c_file:
+                            c_entry["file"] = c_file
+                            updated_index = True
+
+            tot_active = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+            )
+            tot_completed = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+            )
+            tot_blocked = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
+            )
+            if index_data.get("total_active") != tot_active:
+                index_data["total_active"] = tot_active
+                updated_index = True
+            if index_data.get("total_completed") != tot_completed:
+                index_data["total_completed"] = tot_completed
+                updated_index = True
+            if index_data.get("total_blocked") != tot_blocked:
+                index_data["total_blocked"] = tot_blocked
+                updated_index = True
 
             if updated_index:
                 index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
 
-            # Also ensure assigned_work_orders in TREE.yaml are updated
+            # Also ensure work_orders totals and assigned_work_orders in TREE.yaml are updated
             tree_file = sync_dir / "runtime" / "TREE.yaml"
             if tree_file.is_file():
                 tree_data = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
-                if isinstance(tree_data, dict) and "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                if isinstance(tree_data, dict):
                     updated_tree = False
-                    for ag_name, wo_ids in assigned_per_agent.items():
-                        if ag_name in tree_data["agents"]:
-                            ag_entry = tree_data["agents"][ag_name]
-                            if isinstance(ag_entry, dict):
-                                curr_assigned = ag_entry.setdefault("assigned_work_orders", [])
-                                for w in wo_ids:
-                                    if w not in curr_assigned:
-                                        curr_assigned.append(w)
-                                        updated_tree = True
+                    if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+                        for k in ("total_active", "total_completed", "total_blocked"):
+                            if tree_data["work_orders"].get(k) != index_data.get(k, 0):
+                                tree_data["work_orders"][k] = index_data.get(k, 0)
+                                updated_tree = True
+                    if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                        for ag_name, wo_ids in assigned_per_agent.items():
+                            if ag_name in tree_data["agents"]:
+                                ag_entry = tree_data["agents"][ag_name]
+                                if isinstance(ag_entry, dict):
+                                    curr_assigned = ag_entry.setdefault("assigned_work_orders", [])
+                                    for w in wo_ids:
+                                        if w not in curr_assigned:
+                                            curr_assigned.append(w)
+                                            updated_tree = True
                     if updated_tree:
                         tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
         except Exception:
@@ -2707,6 +3088,9 @@ class AgentRunner:
         now: datetime,
     ) -> str:
         modified = '\n'.join(f'- {item}' for item in decision.modified_files) or '- none declared'
+        rationale_block = ""
+        if decision.report_markdown and decision.report_markdown.strip() != decision.summary.strip():
+            rationale_block = f"\nRationale & Details:\n{decision.report_markdown.strip()}\n"
         return (
             f"# Completion Notice: {task.work_order_id}\n\n"
             f"from: {self.agent}\n"
@@ -2715,7 +3099,8 @@ class AgentRunner:
             f"release_target: {decision.release_target}\n\n"
             f"WO ID: {task.work_order_id}\n"
             f"Status: {decision.status}\n\n"
-            f"Summary:\n{decision.summary}\n\n"
+            f"Summary:\n{decision.summary}\n"
+            f"{rationale_block}\n"
             f"Modified files:\n{modified}\n"
         )
 
@@ -2728,10 +3113,14 @@ def _first_content_line(text: str, *, fallback: str) -> str:
     return fallback
 
 
+HarnessRunner = AgentRunner
+
 __all__ = [
     'AgentRunner',
     'EchoLLMProvider',
     'HarnessRunResult',
+    'HarnessRunner',
     'HarnessTask',
     'LLMProvider',
 ]
+

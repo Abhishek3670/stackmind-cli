@@ -526,3 +526,202 @@ def test_d024_gate_blocks_on_deterministic_security_findings(tmp_path):
     clean_decision = D024Gate().evaluate_work_order(clean_project, "WO-102")
     assert clean_decision.passed is True
     assert "security finding" not in str(clean_decision.reason)
+
+
+def test_d024_gate_passes_entrypoint_frontend_deliverable_with_e2e_suite(tmp_path):
+    """Entrypoints and frontend deliverables (e.g. static/index.html) are covered
+    by integration/e2e test suites even without literal stem matching."""
+    project = _setup_gate_scenario(
+        tmp_path,
+        deliverable_path="static/index.html",
+        deliverable_content="<!DOCTYPE html><html><body><h1>Hello</h1></body></html>",
+        verdict_type="APPROVED",
+        create_test_file=False,
+    )
+    # Create an e2e test that does NOT mention "index" or "static"
+    e2e_test = project / "tests" / "test_e2e.py"
+    e2e_test.parent.mkdir(parents=True, exist_ok=True)
+    e2e_test.write_text("def test_calculator_api():\n    assert 1 + 1 == 2\n", encoding="utf-8")
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(project, "WO-102")
+    assert decision.passed is True
+    assert decision.verdict_status == "APPROVED"
+    assert decision.deliverable_exists is True
+
+    precond = gate.verify_gitops_preconditions(project, "WO-102")
+    assert precond.passed is True
+
+
+def test_d024_gate_resolves_downstream_qa_work_order_companion_test(tmp_path):
+    """Downstream QA work order deliverable satisfies companion test requirement for implementation WO."""
+    project = _setup_gate_scenario(
+        tmp_path,
+        wo_target="WO-101",
+        wo_gitops="WO-104",
+        deliverable_path="src/feature.py",
+        deliverable_content="def feature(): pass\n",
+        verdict_type=None,
+        create_test_file=False,
+    )
+    # Add a dedicated QA work order WO-103 that depends on WO-101
+    qa_wo = {
+        "id": "WO-103",
+        "type": "VALIDATION",
+        "title": "QA and Integration Testing for WO-101",
+        "status": "COMPLETED",
+        "priority": "P1",
+        "assigned_agents": ["gemma"],
+        "dependencies": ["WO-101"],
+        "deliverable": {
+            "type": "code",
+            "path": "tests/test_e2e.py",
+            "description": "End-to-end integration test suite",
+        },
+        "description": "Test WO-101 integration",
+    }
+    _write_yaml(project / ".sync" / "work-orders" / "COMPLETED" / "WO-103.yaml", qa_wo)
+
+    # GitOps WO-104 depends on QA WO-103
+    gitops_wo = {
+        "id": "WO-104",
+        "type": "RELEASE",
+        "title": "Release packaging",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["local-llm"],
+        "dependencies": ["WO-103"],
+        "contract_ref": ".sync/contracts/WO-104.yaml",
+        "deliverable": {
+            "type": "code",
+            "path": "VERSION.md",
+            "description": "Release metadata update",
+        },
+        "description": "Perform release for WO-103",
+    }
+    _write_yaml(project / ".sync" / "work-orders" / "ACTIVE" / "WO-104.yaml", gitops_wo)
+
+    # Create the test file delivered by QA
+    qa_test = project / "tests" / "test_e2e.py"
+    qa_test.parent.mkdir(parents=True, exist_ok=True)
+    qa_test.write_text("def test_suite(): assert True\n", encoding="utf-8")
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(project, "WO-104")
+    assert decision.passed is True
+    assert decision.verdict_status == "APPROVED"
+    assert "WO-103.yaml" in decision.verdict_files
+
+    precond = gate.verify_gitops_preconditions(project, "WO-104")
+    assert precond.passed is True
+
+
+def test_d024_gate_permits_debug_mode_when_environment_is_development(tmp_path):
+    """When .sync/config.yaml sets environment: development, DEBUG_MODE_ENABLED does not block D024."""
+    debug_content = (
+        "def run():\n"
+        "    app.run(debug=True)\n"
+    )
+    project = _setup_gate_scenario(
+        tmp_path,
+        deliverable_content=debug_content,
+        verdict_type="APPROVED",
+        create_test_file=True,
+    )
+    # Add .sync/config.yaml with environment: development
+    config_file = project / ".sync" / "config.yaml"
+    config_file.write_text("environment: development\n", encoding="utf-8")
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(project, "WO-102")
+    assert decision.passed is True
+    assert "DEBUG_MODE_ENABLED" not in str(decision.reason)
+
+
+def test_d024_gate_blocks_debug_mode_when_environment_is_production(tmp_path):
+    """When .sync/config.yaml sets environment: production, DEBUG_MODE_ENABLED blocks D024."""
+    debug_content = (
+        "def run():\n"
+        "    app.run(debug=True)\n"
+    )
+    project = _setup_gate_scenario(
+        tmp_path,
+        deliverable_content=debug_content,
+        verdict_type="APPROVED",
+        create_test_file=True,
+    )
+    config_file = project / ".sync" / "config.yaml"
+    config_file.write_text("environment: production\n", encoding="utf-8")
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(project, "WO-102")
+    assert decision.passed is False
+    assert "DEBUG_MODE_ENABLED" in str(decision.reason)
+
+
+def test_d024_gate_permits_debug_mode_via_security_allow_debug_flag(tmp_path):
+    """When .sync/config.yaml sets security.allow_debug: true, DEBUG_MODE_ENABLED does not block."""
+    debug_content = (
+        "def run():\n"
+        "    app.run(debug=True)\n"
+    )
+    project = _setup_gate_scenario(
+        tmp_path,
+        deliverable_content=debug_content,
+        verdict_type="APPROVED",
+        create_test_file=True,
+    )
+    config_file = project / ".sync" / "config.yaml"
+    config_file.write_text("security:\n  allow_debug: true\n", encoding="utf-8")
+
+    gate = D024Gate()
+    decision = gate.evaluate_work_order(project, "WO-102")
+    assert decision.passed is True
+    assert "DEBUG_MODE_ENABLED" not in str(decision.reason)
+
+
+def test_gitops_release_scope_idempotent_write_recognized(tmp_path):
+    """GitOps release files (e.g. VERSION.md) already existing on disk are recognized as observed."""
+    from validators.harness.runner import AgentRunner, HarnessTask, HarnessDecision
+    from validators.harness.snapshot import WorkspaceSnapshot
+
+    ws = tmp_path / "project"
+    ws.mkdir()
+    (ws / ".sync").mkdir()
+    (ws / ".sync" / "work-orders" / "ACTIVE").mkdir(parents=True)
+    (ws / ".sync" / "contracts").mkdir(parents=True)
+
+    # Pre-existing VERSION.md with version 0.1.0
+    (ws / "VERSION.md").write_text("0.1.0\n", encoding="utf-8")
+
+    runner = AgentRunner(ws, "local-llm")
+    assert runner.agent in ("local-llm", "gitops")
+
+    # Capture before snapshot
+    before = WorkspaceSnapshot.capture(ws)
+
+    # Simulate turn writing CHANGELOG.md and identical VERSION.md
+    (ws / "CHANGELOG.md").write_text("# Release 0.1.0\n", encoding="utf-8")
+    (ws / "VERSION.md").write_text("0.1.0\n", encoding="utf-8")
+
+    after = WorkspaceSnapshot.capture(ws)
+    diff = before.diff(after)
+    # Note that diff only sees CHANGELOG.md because VERSION.md hash didn't change
+    assert "CHANGELOG.md" in diff.all_changed_files
+    assert "VERSION.md" not in diff.all_changed_files
+
+    # Verify that runner's idempotent writes logic handles this
+    dec_norm = {"CHANGELOG.md", "VERSION.md"}
+    tool_written = set()
+    if runner.agent in ("local-llm", "gitops"):
+        for rel_file in ("VERSION.md", "CHANGELOG.md"):
+            if rel_file in dec_norm and (ws / rel_file).is_file():
+                tool_written.add(rel_file)
+
+    idempotent_writes = {p for p in dec_norm if p in tool_written and (ws / p).is_file()}
+    assert "VERSION.md" in idempotent_writes
+    all_observed = set(diff.all_changed_files) | idempotent_writes
+    assert dec_norm - all_observed == set()
+
+
+

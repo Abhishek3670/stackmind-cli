@@ -162,6 +162,15 @@ class ContractEvaluator:
             or t_clean == r_clean.rstrip("/*")
         )
 
+    @classmethod
+    def _is_strictly_narrower(cls, sub_rule: str, super_rule: str) -> bool:
+        sub_clean = sub_rule.replace("\\", "/").rstrip("/*").rstrip("/")
+        super_clean = super_rule.replace("\\", "/").rstrip("/*").rstrip("/")
+        return (
+            cls._matches(sub_clean, super_rule)
+            and not cls._matches(super_clean, sub_rule)
+        )
+
     def authorize(
         self, contract: AgentContract, operation_type: str, target: str
     ) -> tuple[bool, str]:
@@ -180,10 +189,24 @@ class ContractEvaluator:
             and contract.write_mode != "read-write"
         ):
             return False, "contract is read-only"
-        if any(self._matches(target, rule) for rule in contract.deny):
-            return False, "target is explicitly denied"
         normalized = target.replace("\\", "/").strip("/")
-        if any(normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/") for p in self._PROTOCOL_TARGET_PREFIXES):
+        is_protocol_target = any(
+            normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/")
+            for p in self._PROTOCOL_TARGET_PREFIXES
+        )
+        matching_deny = [r for r in contract.deny if self._matches(target, r)]
+        if matching_deny:
+            matching_allow = [r for r in contract.allow if self._matches(target, r)]
+            def _denial_overridden(d_rule: str) -> bool:
+                if any(self._is_strictly_narrower(a_rule, d_rule) for a_rule in matching_allow):
+                    return True
+                if is_protocol_target:
+                    return True
+                return False
+
+            if not all(_denial_overridden(d) for d in matching_deny):
+                return False, "target is explicitly denied"
+        if is_protocol_target:
             return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
             # For read-only directory enumeration (list_directory, glob), permit

@@ -129,11 +129,26 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
     }
 
 
-def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
+def determine_assigned_agent(
+    title: str, tasks: list[str], agent_hint: str | None = None
+) -> tuple[str, str]:
     """Determine (agent_id, role) from milestone title and tasks.
 
-    The Architect's explicit designation in PLAN.md takes top priority.
+    The Architect's explicit designation in PLAN.md takes top priority — either
+    the structured `agent_hint` (parsed from the "(Agent: <id>)" annotation by
+    the plan parser) or an inline designation in the title/tasks text.
     """
+    role_map = {
+        "codex": "backend",
+        "gemini": "frontend",
+        "gemma": "qa",
+        "local-llm": "gitops",
+        "claude": "architecture",
+    }
+    hint = str(agent_hint or "").strip().lower()
+    if hint in role_map:
+        return hint, role_map[hint]
+
     combined = (f"{title} " + " ".join(tasks)).lower()
     title_lower = title.lower()
 
@@ -149,13 +164,6 @@ def determine_assigned_agent(title: str, tasks: list[str]) -> tuple[str, str]:
     )
     if agent_match:
         explicit_agent = agent_match.group(1).lower().strip()
-        role_map = {
-            "codex": "backend",
-            "gemini": "frontend",
-            "gemma": "qa",
-            "local-llm": "gitops",
-            "claude": "architecture",
-        }
         if explicit_agent in role_map:
             return explicit_agent, role_map[explicit_agent]
 
@@ -212,6 +220,7 @@ def build_child_work_order(
     priority: str,
     deliverable: dict[str, str],
     implementation_estimate: dict[str, Any] | None = None,
+    milestone_id: str | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Work Order record."""
     now = _now()
@@ -235,6 +244,8 @@ def build_child_work_order(
         "created": now,
         "updated": now,
     }
+    if milestone_id:
+        record["milestone_id"] = str(milestone_id).strip()
     if implementation_estimate:
         record["implementation_estimate"] = dict(implementation_estimate)
     return record
@@ -557,7 +568,7 @@ def synthesize_child_work_orders(
                 parsed = parse_plan(plan["content"])
                 for offset, m in enumerate(parsed.milestones):
                     idx = start_idx + offset
-                    agent, role = determine_assigned_agent(m.title, m.tasks)
+                    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
                     deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
@@ -578,7 +589,7 @@ def synthesize_child_work_orders(
             parsed = parse_plan(plan)
             for offset, m in enumerate(parsed.milestones):
                 idx = start_idx + offset
-                agent, role = determine_assigned_agent(m.title, m.tasks)
+                agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                 deliv = extract_deliverable_spec(m.title, m.tasks, role)
                 wo_id = f"WO-{idx:03d}"
                 deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
@@ -603,7 +614,7 @@ def synthesize_child_work_orders(
                 parsed = parse_plan(plan_file.read_text(encoding="utf-8"))
                 for offset, m in enumerate(parsed.milestones):
                     idx = start_idx + offset
-                    agent, role = determine_assigned_agent(m.title, m.tasks)
+                    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
                     deliv = extract_deliverable_spec(m.title, m.tasks, role)
                     wo_id = f"WO-{idx:03d}"
                     deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
@@ -654,6 +665,7 @@ def synthesize_child_work_orders(
             continue
 
         assigned = wo.get("assigned_agents", ["codex"])
+        has_explicit_assigned = bool(wo.get("assigned_agents"))
         primary_agent = assigned[0] if assigned else "codex"
         title = wo.get("title", f"Work order {wo_id}")
         desc = wo.get("description", title)
@@ -661,10 +673,20 @@ def synthesize_child_work_orders(
         prio = wo.get("priority", "P1")
         deliv = wo.get("deliverable") or {}
 
-        # Refine agent assignment if defaulted to codex but clearly targets frontend or QA
-        detected_agent, detected_role = determine_assigned_agent(title, [desc])
-        if primary_agent == "codex" and detected_agent in ("gemini", "gemma", "local-llm"):
-            primary_agent = detected_agent
+        # Refine agent assignment only if not explicitly designated by the plan
+        if not has_explicit_assigned:
+            detected_agent, detected_role = determine_assigned_agent(title, [desc], agent_hint=primary_agent)
+            if primary_agent == "codex" and detected_agent in ("gemini", "gemma", "local-llm"):
+                primary_agent = detected_agent
+
+        # Safety rule: QA worker (gemma) CANNOT deliver non-test code (violates AuthoringReadiness)
+        deliv_path = str(deliv.get("path") or "")
+        is_test_path = deliv_path.startswith("tests/") or "test" in Path(deliv_path).name
+        if primary_agent == "gemma" and deliv_path and not is_test_path:
+            if any(deliv_path.endswith(ext) for ext in (".html", ".css", ".js", ".jsx", ".tsx")):
+                primary_agent = "gemini"
+            else:
+                primary_agent = "codex"
 
         role = "backend"
         if primary_agent == "gemini":
@@ -727,6 +749,7 @@ def synthesize_child_work_orders(
             priority=prio,
             deliverable=deliv,
             implementation_estimate=implementation_estimate,
+            milestone_id=wo.get("milestone_id"),
         )
 
         # Provenance marker: bootstrap-synthesized artifacts are scaffolding an
@@ -833,3 +856,120 @@ def synthesize_child_work_orders(
     tree_path.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
 
     return created_records
+
+
+def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
+    """Reconcile active work orders and contracts against PLAN.md milestones.
+
+    Aligns agent assignment mismatches (e.g., when keyword-based synthesis
+    assigned 'gemma' to a backend task whose plan milestone specifies 'codex').
+    Updates:
+    - .sync/work-orders/ACTIVE/<WO-ID>.yaml
+    - .sync/contracts/<WO-ID>.yaml
+    - .sync/work-orders/INDEX.yaml
+    - .sync/runtime/TREE.yaml
+
+    Returns:
+        List of work order IDs that were reconciled.
+    """
+    ws = Path(workspace).resolve()
+    active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    if not active_dir.is_dir():
+        return []
+
+    from validators.harness.authoring_readiness import load_plan_milestones, _wo_matches_milestone
+
+    plan_milestones = load_plan_milestones(ws)
+    if not plan_milestones:
+        return []
+
+    reconciled_ids: list[str] = []
+    role_map = {
+        "codex": "backend",
+        "gemini": "frontend",
+        "gemma": "qa",
+        "local-llm": "gitops",
+        "claude": "architecture",
+    }
+
+    active_files = sorted(active_dir.glob("*.yaml"))
+    for wo_file in active_files:
+        try:
+            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            if not isinstance(wo_data, dict):
+                continue
+            wo_id = wo_data.get("id") or wo_file.stem
+            current_assigned = wo_data.get("assigned_agents", [])
+            primary_agent = current_assigned[0] if current_assigned else ""
+            deliv = wo_data.get("deliverable", {})
+            deliv_path = str(deliv.get("path", "") if isinstance(deliv, dict) else "")
+            is_test_path = deliv_path.startswith("tests/") or "test" in Path(deliv_path).name
+
+            matched_ref = next((r for r in plan_milestones if _wo_matches_milestone(wo_data, r)), None)
+
+            target_agent = None
+            if matched_ref and matched_ref.get("agent"):
+                target_agent = matched_ref["agent"].strip().lower()
+            elif primary_agent == "gemma" and deliv_path and not is_test_path:
+                # QA agent cannot deliver non-test code
+                if any(deliv_path.endswith(ext) for ext in (".html", ".css", ".js", ".jsx", ".tsx")):
+                    target_agent = "gemini"
+                else:
+                    target_agent = "codex"
+
+            if target_agent and target_agent != primary_agent:
+                wo_data["assigned_agents"] = [target_agent]
+                wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+
+                # Reconcile matching contract
+                contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+                if contract_file.is_file():
+                    try:
+                        c_data = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                        if isinstance(c_data, dict):
+                            c_data["agent_id"] = target_agent
+                            ident = c_data.setdefault("identity", {})
+                            if isinstance(ident, dict):
+                                ident["role"] = role_map.get(target_agent, "backend")
+                                ident["reports_to"] = "claude"
+                            contract_file.write_text(yaml.safe_dump(c_data, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
+
+                # Update INDEX.yaml
+                index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
+                if index_path.is_file():
+                    try:
+                        index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+                        if isinstance(index_data, dict) and "orders" in index_data:
+                            for ord_entry in index_data["orders"]:
+                                if isinstance(ord_entry, dict) and ord_entry.get("id") == wo_id:
+                                    ord_entry["assigned_agents"] = [target_agent]
+                            index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
+
+                # Update TREE.yaml
+                tree_path = ws / ".sync" / "runtime" / "TREE.yaml"
+                if tree_path.is_file():
+                    try:
+                        tree_data = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
+                        if isinstance(tree_data, dict) and "agents" in tree_data:
+                            agents_map = tree_data["agents"]
+                            if primary_agent in agents_map:
+                                p_orders = agents_map[primary_agent].get("assigned_work_orders", [])
+                                if wo_id in p_orders:
+                                    p_orders.remove(wo_id)
+                            t_info = agents_map.setdefault(target_agent, {"assigned_work_orders": [], "status": "idle", "session_count": 0})
+                            t_orders = t_info.setdefault("assigned_work_orders", [])
+                            if wo_id not in t_orders:
+                                t_orders.append(wo_id)
+                            tree_path.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
+
+                reconciled_ids.append(wo_id)
+        except Exception:
+            continue
+
+    return reconciled_ids

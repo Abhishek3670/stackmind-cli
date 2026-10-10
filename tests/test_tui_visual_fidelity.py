@@ -1,6 +1,6 @@
 """Automated Visual Fidelity & Layout Alignment Test Suite (WO-034).
 
-Verifies 100% visual fidelity with image.png and fixes the double-echo bug:
+Verifies 100% visual fidelity with docs/assets/image.png and fixes the double-echo bug:
 - Double-echo elimination across all *_str() renderers using in-memory buffers
 - Top status header bar (stackmind | dev ~/projects/..., session, agent, provider, ● online)
 - Card-bordered landing block (rounded panel, purple ✦ star, StackMind title, dynamic version,
@@ -133,7 +133,7 @@ def test_double_echo_elimination_in_str_renderers(capsys: pytest.CaptureFixture[
 
 
 def test_top_header_bar_visual_fidelity():
-    """Verify top header bar components match image.png."""
+    """Verify top header bar components match docs/assets/image.png."""
     session = {
         "session_id": "a7f3b19c-test-456",
         "agent": "gemini",
@@ -252,7 +252,7 @@ def test_chat_messages_accent_and_timestamps():
 
 
 def test_inline_tool_card_visual_fidelity():
-    """Verify inline tool activity card matches image.png (⚯, name, target, duration, ✓)."""
+    """Verify inline tool activity card matches docs/assets/image.png (⚯, name, target, duration, ✓)."""
     activity = ToolActivity(
         tool_name="read_file",
         target="src/auth/service.py",
@@ -269,7 +269,7 @@ def test_inline_tool_card_visual_fidelity():
 
 
 def test_inline_diff_card_visual_fidelity():
-    """Verify inline diff card matches image.png (file path, 'unified diff' label, syntax lines)."""
+    """Verify inline diff card matches docs/assets/image.png (file path, 'unified diff' label, syntax lines)."""
     diff_snippet = """--- a/src/auth/service.py
 +++ b/src/auth/service.py
 @@ -10,3 +10,4 @@
@@ -340,7 +340,7 @@ def test_tui_repl_startup_layout_fidelity(tmp_path: Path):
 
 
 def test_interactive_composer_box_borders():
-    """Verify top and bottom borders of interactive composer box match image.png (WO-035)."""
+    """Verify top and bottom borders of interactive composer box match docs/assets/image.png (WO-035)."""
     top = render_composer_top_border_str(width=80)
     assert top.startswith("╭─ ")
     assert "Type a message..." in top

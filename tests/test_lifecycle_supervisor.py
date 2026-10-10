@@ -2043,6 +2043,41 @@ def test_integration_review_prompt_contains_explicit_json_format(tmp_path: Path)
     assert "non-empty string array" in prompt.lower() or "non-empty" in prompt.lower(), \
         "Prompt must specify blockers must be non-empty when blocked"
     assert "read-only" in prompt.lower(), "Prompt should mention read-only scope constraint"
+    assert "Project Environment:" in prompt
+    assert "developer completion notices" in prompt.lower()
+
+
+def test_integration_review_prompt_environment_adaptation(tmp_path: Path) -> None:
+    """Integration review checklist adapts to environment (development allows dev conveniences; production enforces strict fail-fast)."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-env-test", "Goal", tmp_path, "sess-env")
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.completed_wo_ids = ["WO-001"]
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text("id: WO-001\ntitle: Task\nassigned_agents: [codex]\n", encoding="utf-8")
+
+    # 1. Default (development)
+    cfg = tmp_path / ".sync" / "config.yaml"
+    cfg.write_text("environment: development\n", encoding="utf-8")
+    supervisor.advance(state)
+    prompt_dev = mock_mgr.operations[state.integration_operation_id]["prompt"]
+    assert "ENVIRONMENT: DEVELOPMENT" in prompt_dev
+    assert "debug=True" in prompt_dev
+    assert "permitted and must NOT block release" in prompt_dev
+    mock_mgr.operations[state.integration_operation_id]["status"] = "COMPLETED"
+
+    # 2. Production
+    cfg.write_text("environment: production\n", encoding="utf-8")
+    state2 = supervisor.start_run("run-env-prod", "Goal", tmp_path, "sess-env-prod")
+    state2.phase = Phase.INTEGRATION_REVIEW
+    state2.completed_wo_ids = ["WO-001"]
+    supervisor.advance(state2)
+    prompt_prod = mock_mgr.operations[state2.integration_operation_id]["prompt"]
+    assert "ENVIRONMENT: PRODUCTION" in prompt_prod
+    assert "Debug flags are disabled for production" in prompt_prod
 
 
 def test_integration_review_blocked_transitions_to_blocked_not_failed(tmp_path: Path) -> None:
@@ -3524,3 +3559,76 @@ def test_gitops_budget_block_raises_budget_and_retries(tmp_path: Path) -> None:
     supervisor.advance(state)
     assert state.phase == Phase.BLOCKED
     assert "budget retries exhausted" in (state.error or "")
+
+
+def test_executing_reconciles_completed_batch_operation_and_allows_rework_dispatch(tmp_path: Path) -> None:
+    """When an executing batch operation's children have finished, advance() reconciles
+    the container operation and clears state.batch_operation_id, allowing rework turns
+    to dispatch without operation contention."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-batch-reconcile", "Test Batch", tmp_path, "sess-batch-rec")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001", "WO-002", "WO-004"]
+    state.completed_wo_ids = ["WO-001"]
+
+    # Register batch operation with two child turns
+    batch_op_id = "batch-rec-001"
+    c1_id = "turn-wo002"
+    c2_id = "turn-wo004"
+    mock_mgr.operations[batch_op_id] = {
+        "operation_id": batch_op_id,
+        "operation": "parallel_dispatch",
+        "status": "RUNNING",
+        "children": [c1_id, c2_id],
+    }
+    mock_mgr.operations[c1_id] = {
+        "operation_id": c1_id,
+        "parent_operation_id": batch_op_id,
+        "work_order_id": "WO-002",
+        "status": "COMPLETED",
+        "result": {"status": "completed"},
+    }
+    mock_mgr.operations[c2_id] = {
+        "operation_id": c2_id,
+        "parent_operation_id": batch_op_id,
+        "work_order_id": "WO-004",
+        "status": "COMPLETED",
+        "result": {"status": "completed"},
+    }
+    state.batch_operation_id = batch_op_id
+
+    # Create work orders on disk
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    (active_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002", "assigned_agents": ["codex"], "dependencies": ["WO-001"],
+        "deliverable": {"type": "code", "path": "src/backend.py"},
+    }), encoding="utf-8")
+    (active_dir / "WO-004.yaml").write_text(yaml.safe_dump({
+        "id": "WO-004", "assigned_agents": ["gemma"], "dependencies": ["WO-002"],
+        "deliverable": {"type": "test", "path": "tests/test_backend.py"},
+    }), encoding="utf-8")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "backend.py").write_text("code", encoding="utf-8")
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_backend.py").write_text("test", encoding="utf-8")
+
+    # Author defect verdict from Gemma targeting WO-002
+    inbox = tmp_path / ".sync" / "inbox" / "claude"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "WO-002-qa-verdict.md").write_text("NEEDS_CHANGES: fix backend security flaw", encoding="utf-8")
+
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    # Batch operation was reconciled and completed
+    assert state.batch_operation_id is None
+    assert mock_mgr.operations[batch_op_id]["status"] == "COMPLETED"
+    assert state.contention_count == 0
+    # Rework turn was dispatched for WO-002
+    rework_turns = [
+        o for o in mock_mgr.list_operations()
+        if o.get("work_order_id") == "WO-002" and "Rework work order" in str(o.get("prompt", ""))
+    ]
+    assert len(rework_turns) == 1
+

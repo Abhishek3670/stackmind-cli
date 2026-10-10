@@ -609,6 +609,265 @@ class TestRecoveryDecisions:
         ]
         assert len(reops) == 1
 
+    def test_verification_block_retries_with_declared_observed_feedback(
+        self, tmp_path: Path,
+    ) -> None:
+        """A verification-gate block (declared vs observed mismatch) retries
+        with the scope evidence in the prompt instead of a blind same-prompt
+        retry, and synthesizes the OUTCOME_NOT_VERIFIED evidence packet."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": (
+                "verification gate failed: outcome_verified, scope_verified "
+                "(declared ['index.html']; observed ['index/html/index.html'])"
+            ),
+            "scope_evidence": {
+                "declared": ["index.html"],
+                "observed": ["index/html/index.html"],
+                "mismatch_reason": "declared but not written: ['index.html']",
+            },
+        })
+
+        res = supervisor.advance(state)
+
+        assert res == AdvanceResult.WAITING_FOR_OPERATION  # retry dispatched
+        assert state.retry_counts["WO-001"] == 1
+        assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
+        retry_ops = [
+            o for o in mock_mgr.list_operations()
+            if o.get("work_order_id") == "WO-001" and o.get("operation_id") != op["operation_id"]
+        ]
+        assert retry_ops, "retry turn was not dispatched"
+        prompt = str(retry_ops[-1].get("prompt", ""))
+        assert "You declared these files" in prompt
+        assert "'index.html'" in prompt
+        assert "index/html/index.html" in prompt
+        assert "EXACTLY that path" in prompt
+
+    def test_verification_block_escalates_to_recovery_on_exhaustion(
+        self, tmp_path: Path,
+    ) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        state.retry_counts["WO-001"] = state.max_retries
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": (
+                "verification gate failed: outcome_verified "
+                "(declared deliverable 'index.html' was not added or modified)"
+            ),
+            "scope_evidence": {"declared": ["index.html"], "observed": []},
+        })
+
+        supervisor.advance(state)
+
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        assert state.recovery_attempts["WO-001"] == 1
+        assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
+
+    def test_security_verified_block_retries_and_escalates_on_exhaustion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Verify verification gate security_verified failure retries and escalates."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": "verification gate failed: security_verified (credential leak detected in app.py: 'api_key=...')",
+        })
+
+        res = supervisor.advance(state)
+        # 1. Bounded retry dispatched
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.retry_counts["WO-001"] == 1
+        assert state.worker_blockers["WO-001"]["failure_code"] == "SECURITY_NOT_VERIFIED"
+
+        # 2. When retry budget is exhausted, escalates to Architect recovery decision
+        state.retry_counts["WO-001"] = state.max_retries
+        retry_op = mock_mgr.start_turn("sess-001", "Retry WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(retry_op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": "verification gate failed: security_verified (credential leak detected in app.py: 'api_key=...')",
+        })
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+    def test_nudge_contention_waits_without_consuming_budget(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression: with parallel worker dispatch, the nudge-retry's
+        start_turn can hit session contention (a sibling worker op is still
+        running).  The contention must WAIT (budget preserved, WO stays
+        active) instead of being swallowed into a terminal block."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "reason": (
+                "verification gate failed: outcome_verified, scope_verified "
+                "(declared ['requirements.txt']; observed [])"
+            ),
+            "scope_evidence": {"declared": ["requirements.txt"], "observed": []},
+        })
+
+        from validators.kernel.daemon.supervisor import OperationContentionError
+
+        original_start = mock_mgr.start_turn
+        mock_mgr.start_turn = lambda *a, **k: (_ for _ in ()).throw(
+            OperationContentionError("session already has an active operation")
+        )
+
+        res = supervisor.advance(state)
+
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.EXECUTING  # waiting, not terminal
+        assert state.retry_counts.get("WO-001", 0) == 0  # budget preserved
+        # The contended dispatch created no operation
+        assert all(
+            o.get("operation_id") != op["operation_id"] or True
+            for o in mock_mgr.list_operations()
+        )
+        mock_mgr.start_turn = original_start
+
+    def test_split_rejected_when_children_collide_with_active_work_orders(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression: the architect's split decision reused live work-order ids
+        (WO-002/WO-003 were active, contracted, and mid-execution) — the split
+        must be rejected back with a corrective diagnostic instead of applied."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        # WO-002 is an authored, active work order — the split reuses its id
+        write_wo(tmp_path, make_wo("WO-002", deliv_path="src/other.py"))
+        write_contract(tmp_path, make_contract("WO-002", extra_allow=["src/other.py"]))
+        evidence = make_evidence("WO-001", tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        evidence["operation_id"] = op["operation_id"]
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=blocked_result(evidence))
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        decision_path = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_path.write_text(json.dumps({
+            "work_order": "WO-001",
+            "action": "split_work_order",
+            "reason": "split WO-001",
+            "replacement_work_orders": ["WO-002", "WO-004"],  # WO-002 collides
+            "contract_revision": 1,
+        }), encoding="utf-8")
+        rec_op = next(
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        )
+        mock_mgr.complete_operation(rec_op["operation_id"], "COMPLETED")
+
+        supervisor.advance(state)
+
+        assert state.recovery_decisions[-1]["applied"] is False
+        assert "collide" in state.recovery_decisions[-1]["rejected_reason"]
+        # initial decision + corrective re-dispatch with the collision feedback
+        assert state.recovery_attempts.get("WO-001") == 2
+        # Corrective re-dispatch: the architect decides again with the feedback
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        # Nothing applied — the blocked WO's contract is untouched
+        assert (tmp_path / ".sync" / "contracts" / "WO-001.yaml").exists()
+
+    def test_amend_contract_places_repair_authorization_contract(
+        self, tmp_path: Path,
+    ) -> None:
+        """amend_contract archives the original contract but must leave a
+        transitional repair-authorization contract in its place: the repair
+        turn's pre-execution gate matches the task WO against it, and it grants
+        write authorization for the amended contract itself."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        state.retry_counts["WO-001"] = state.max_retries
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": (
+                "verification gate failed: outcome_verified "
+                "(declared deliverable 'src/app.py' was not added or modified)"
+            ),
+            "scope_evidence": {"declared": ["src/app.py"], "observed": []},
+        })
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        decision_path = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_path.write_text(json.dumps({
+            "work_order": "WO-001",
+            "action": "amend_contract",
+            "reason": "authorize root-level deliverable writes",
+            "failure_code": "OUTCOME_NOT_VERIFIED",
+            "transient": False,
+            "contract_revision": 2,
+        }), encoding="utf-8")
+        rec_op = next(
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        )
+        mock_mgr.complete_operation(rec_op["operation_id"], "COMPLETED")
+
+        supervisor.advance(state)
+
+        assert state.phase == Phase.ARCHITECT_REPAIR
+        assert state.repair_context.get("action") == "amend_contract"
+        contract = yaml.safe_load(
+            (tmp_path / ".sync" / "contracts" / "WO-001.yaml").read_text(encoding="utf-8")
+        )
+        # Pre-execution identity restored: contract work order matches the task.
+        assert contract["work_order"] == "WO-001"
+        assert contract["synthesized_by"] == "recovery-repair"
+        modules = {r["module"] for r in contract["scope"]["allow"]}
+        assert ".sync/contracts/WO-001.yaml" in modules  # self-write authorization
+        assert ".sync/decisions/**" in modules
+        # The original authored scope is preserved into the transitional contract.
+        assert "src/app.py" in modules
+
+    def test_stale_inbox_notices_archived_before_recovery_repair(
+        self, tmp_path: Path,
+    ) -> None:
+        """Stale completion notices for non-active work orders are moved to
+        _read/ before the repair turn dispatches — discover_next_task falls
+        back to the first inbox item when the explicit work order cannot be
+        resolved, and a stale notice hijacks the repair turn."""
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        stale = tmp_path / ".sync" / "inbox" / "claude" / "2026-10-07_claude_WO-000-complete.md"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("completed", encoding="utf-8")
+
+        evidence = make_evidence("WO-001", tmp_path)
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        evidence["operation_id"] = op["operation_id"]
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result=blocked_result(evidence))
+        supervisor.advance(state)  # recovery decision dispatched
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        decision_path = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_path.write_text(json.dumps({
+            "work_order": "WO-001",
+            "action": "amend_contract",
+            "reason": "authorize writes",
+            "failure_code": "OUTCOME_NOT_VERIFIED",
+            "transient": False,
+            "contract_revision": 2,
+        }), encoding="utf-8")
+        rec_op = next(
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        )
+        mock_mgr.complete_operation(rec_op["operation_id"], "COMPLETED")
+
+        supervisor.advance(state)
+
+        assert state.phase == Phase.ARCHITECT_REPAIR
+        assert not stale.exists()
+        assert (tmp_path / ".sync" / "inbox" / "claude" / "_read" / stale.name).exists()
+
     def test_split_decision_supersedes_original_and_readies_children(
         self, tmp_path: Path,
     ) -> None:
@@ -638,6 +897,19 @@ class TestRecoveryDecisions:
         assert state.phase == Phase.ARCHITECT_REPAIR
         assert res == AdvanceResult.WAITING_FOR_OPERATION
         assert "WO-001" in state.superseded_wo_ids
+
+        # The supervisor placed a transitional repair-authorization contract so
+        # the repair turn passes pre-execution validation (task WO matches
+        # contract WO) and is authorized to author the replacement contracts.
+        transition_contract = yaml.safe_load(
+            (tmp_path / ".sync" / "contracts" / "WO-001.yaml").read_text(encoding="utf-8")
+        )
+        assert transition_contract["work_order"] == "WO-001"
+        assert transition_contract["synthesized_by"] == "recovery-repair"
+        modules = {r["module"] for r in transition_contract["scope"]["allow"]}
+        assert ".sync/work-orders/**" in modules
+        assert ".sync/contracts/**" in modules
+        assert ".sync/decisions/**" in modules
 
         # The Architect authors the dependency-safe children during repair
         write_wo(tmp_path, make_wo("WO-002", deliv_path="src/part_one.py", title="Scaffold part 1"))
@@ -1266,7 +1538,7 @@ class TestLazyTurnNudge:
         assert "invoked NO tools" in prompt
         assert "src/backend.py" in prompt and "write_file" in prompt
 
-    def test_lazy_turn_exhaustion_blocks_with_evidence(self, tmp_path: Path) -> None:
+    def test_lazy_turn_exhaustion_escalates_to_recovery_with_evidence(self, tmp_path: Path) -> None:
         mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-001")
         state.max_retries = 1
         op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
@@ -1276,9 +1548,10 @@ class TestLazyTurnNudge:
 
         nudges = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
         mock_mgr.complete_operation(nudges[-1]["operation_id"], "BLOCKED", result=self._blocked_result(["src/backend.py"]))
-        supervisor.advance(state)  # retries exhausted -> terminal block
-        assert state.phase == Phase.BLOCKED
-        assert "scope_verified" in (state.error or "")
+        supervisor.advance(state)  # retries exhausted -> Architect recovery decision
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        assert state.worker_blockers["WO-001"]["failure_code"] == "OUTCOME_NOT_VERIFIED"
+        assert "scope_verified" in state.worker_blockers["WO-001"]["canonical_message"]
 
     def test_non_lazy_scope_block_still_terminal(self, tmp_path: Path) -> None:
         """Observed non-empty (real writes, wrong scope) keeps the terminal
@@ -1501,3 +1774,233 @@ def test_blocker_details_plumb_through_decision_and_meta(tmp_path: Path) -> None
     meta = result.meta or {}
     details = meta.get("blocker_details") or []
     assert details and details[0]["remediation"] == "fix it"
+
+
+# ─── Universal Architect Escalation for Worker Execution Blockers ──────────
+
+class TestUniversalArchitectEscalation:
+    """All unclassified worker execution blockers (loop guards, missing modules,
+    test crashes) escalate to Claude (Senior Architect) for recovery decisions
+    instead of dying in terminal Phase.BLOCKED."""
+
+    def test_unclassified_worker_blocker_escalates_to_architect_recovery(self, tmp_path: Path) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-004")
+        state.max_retries = 1
+        state.worker_wo_ids = ["WO-004"]
+        write_wo(tmp_path, make_wo("WO-004", agent="gemma", deliv_path="tests/test_app.py"))
+        write_contract(tmp_path, make_contract("WO-004", agent="gemma"))
+
+        # Turn 1 halts with loop guard / process error
+        op = mock_mgr.start_turn("sess-001", "Execute WO-004", work_order_id="WO-004", agent_id="gemma")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "reason": "Pathological tool call cycle detected: (process_status -> process_output) repeated 2 times without progress",
+        })
+        res = supervisor.advance(state)
+        # Nudge retry dispatched (attempt 2)
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.EXECUTING
+        assert state.retry_counts.get("WO-004") == 1
+
+        # Turn 2 halts with module missing error (retries now exhausted)
+        nudges = [o for o in mock_mgr.list_operations() if "attempt 2" in str(o.get("prompt", ""))]
+        assert len(nudges) == 1
+        mock_mgr.complete_operation(nudges[-1]["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "reason": "ModuleNotFoundError: No module named 'flask'",
+        })
+        res2 = supervisor.advance(state)
+
+        # Must NOT hard-block; must escalate to Claude (Architect) recovery decision!
+        assert res2 == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+        assert "WO-004" in state.worker_blockers
+        assert state.worker_blockers["WO-004"]["failure_code"] in ("DEPENDENCY_ERROR", "LOOP_GUARD_TRIPPED", "WORKER_BLOCKED")
+
+        recovery_ops = [
+            o for o in mock_mgr.list_operations()
+            if o.get("metadata", {}).get("is_recovery_decision")
+        ]
+        assert len(recovery_ops) == 1
+        assert recovery_ops[0]["agent_id"] == "claude"
+        prompt = recovery_ops[0]["prompt"]
+        assert "ARCHITECT RECOVERY DECISION" in prompt
+        assert "WO-004" in prompt
+        assert "flask" in prompt or "Pathological" in prompt
+
+    def test_architect_recovery_decision_resumes_worker_after_execution_blocker(self, tmp_path: Path) -> None:
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path, "WO-004")
+        state.max_retries = 1
+        state.worker_wo_ids = ["WO-004"]
+        write_wo(tmp_path, make_wo("WO-004", agent="gemma", deliv_path="tests/test_app.py"))
+        write_contract(tmp_path, make_contract("WO-004", agent="gemma"))
+
+        # Block the worker and escalate to recovery
+        op = mock_mgr.start_turn("sess-001", "Execute WO-004", work_order_id="WO-004", agent_id="gemma")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "reason": "Pathological loop guard tripped: NoProgressLoopError",
+        })
+        state.retry_counts["WO-004"] = 1  # simulate exhausted retries
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        # Architect provides recovery decision: retry_unchanged with transient flag
+        rec_op = state.recovery_decision_operation_id
+        assert rec_op is not None
+        decision_data = {
+            "work_order": "WO-004",
+            "action": "retry_unchanged",
+            "transient": True,
+            "failure_code": state.worker_blockers["WO-004"]["failure_code"],
+            "reason": "Retry after resetting loop state",
+        }
+        mock_mgr.complete_operation(rec_op, "COMPLETED", result={
+            "status": "completed",
+            "summary": json.dumps(decision_data),
+        })
+
+        res = supervisor.advance(state)
+        # Supervisor applies Architect's decision and resumes worker in EXECUTING
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.EXECUTING
+        assert "WO-004" not in state.blocked_wo_ids
+
+
+class TestAmendContractAutoAdvance:
+    def test_amend_contract_auto_advances_when_revision_matches_or_lags_current(self, tmp_path: Path) -> None:
+        """When an architect specifies amend_contract with a revision that does not
+        strictly exceed current_revision, supervisor auto-advances monotonically."""
+        from tests.test_authoring_recovery import setup_executing_state
+
+        mock_mgr, supervisor, state = setup_executing_state(tmp_path)
+        state.contract_revisions["WO-001"] = 2
+        state.retry_counts["WO-001"] = state.max_retries
+
+        op = mock_mgr.start_turn("sess-001", "Execute WO-001", work_order_id="WO-001", agent_id="codex")
+        mock_mgr.complete_operation(op["operation_id"], "BLOCKED", result={
+            "status": "blocked",
+            "error": "verification gate failed: outcome_verified",
+            "scope_evidence": {"declared": ["src/app.py"], "observed": ["src/app.py"]},
+        })
+        supervisor.advance(state)
+        assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+        # The blocker evidence recorded current contract_revision
+        assert state.worker_blockers["WO-001"]["contract_revision"] == 2
+
+        # Architect outputs contract_revision: 2 (matching current 2)
+        rec_op = state.recovery_decision_operation_id
+        decision_data = {
+            "work_order": "WO-001",
+            "action": "amend_contract",
+            "reason": "Amending contract to allow clean execution",
+            "contract_revision": 2,
+        }
+        decision_file = tmp_path / ".sync" / "decisions" / "recovery" / "WO-001.decision.json"
+        decision_file.parent.mkdir(parents=True, exist_ok=True)
+        decision_file.write_text(json.dumps(decision_data), encoding="utf-8")
+
+        mock_mgr.complete_operation(rec_op, "COMPLETED", result={"status": "completed"})
+
+        res = supervisor.advance(state)
+        assert res == AdvanceResult.WAITING_FOR_OPERATION
+        assert state.phase == Phase.ARCHITECT_REPAIR
+        # Revision strictly advanced to 3
+        assert state.contract_revisions["WO-001"] == 3
+
+
+class TestBookkeepingBudgetExemption:
+    def test_sync_inbox_files_do_not_breach_project_file_budget(self, tmp_path: Path) -> None:
+        """Protocol messages under .sync/inbox/ do not count against max_files_touched."""
+        from validators.harness.contract_gate import verify_post_execution
+        from unittest.mock import MagicMock
+
+        # Contract with budget max_files_touched: 1, allowing public/** and .sync/inbox/**
+        contract_data = {
+            "schema_version": 1,
+            "agent_id": "gemma",
+            "work_order": "WO-010",
+            "scope": {
+                "allow": [{"module": "tests/**"}, {"module": ".sync/inbox/claude/**"}],
+                "deny": [{"module": ".git/**"}],
+                "write": "read-write",
+            },
+            "budget": {"max_files_touched": 1},
+        }
+        c_path = tmp_path / ".sync" / "contracts" / "WO-010.yaml"
+        c_path.parent.mkdir(parents=True, exist_ok=True)
+        c_path.write_text(yaml.safe_dump(contract_data), encoding="utf-8")
+
+        task = MagicMock()
+        task.work_order_id = "WO-010"
+        task.agent = "gemma"
+        task.identifier = "T-010"
+
+        decision = MagicMock()
+        decision.modified_files = ["tests/test_verify.py", ".sync/inbox/claude/verdict_WO-010.md"]
+
+        # 1 project file + 1 .sync bookkeeping file = 2 total files
+        # Must not raise ContractAccessDenied because project files touched == 1 <= max_files_touched (1)
+        verify_post_execution(
+            tmp_path,
+            "gemma",
+            task,
+            decision,
+            observed_files=decision.modified_files,
+        )
+
+
+class TestIndexAndTreeSyncOnResume:
+    def test_sync_index_fixes_stale_completed_status_for_active_work_orders(self, tmp_path: Path) -> None:
+        """When work orders in ACTIVE/ have stale COMPLETED entries in INDEX.yaml,
+        _sync_index_and_tree_yaml synchronizes INDEX.yaml and TREE.yaml so validation passes."""
+        from validators.harness.runner import HarnessRunner
+        from cli.validate import _validate_work_order_state_files, ValidationResult
+
+        sync_dir = tmp_path / ".sync"
+        active_dir = sync_dir / "work-orders" / "ACTIVE"
+        active_dir.mkdir(parents=True, exist_ok=True)
+
+        # WO-008 is active on disk
+        wo8 = {
+            "id": "WO-008", "type": "FEATURE", "title": "Audit", "status": "ACTIVE",
+            "assigned_agents": ["gemma"], "dependencies": [],
+            "deliverable": {"type": "code", "path": "tests/test_audit.py"},
+        }
+        (active_dir / "WO-008.yaml").write_text(yaml.safe_dump(wo8), encoding="utf-8")
+
+        # But INDEX.yaml was left with stale COMPLETED status and COMPLETED file path
+        index_data = {
+            "schema_version": 1,
+            "orders": [
+                {
+                    "id": "WO-008", "type": "FEATURE", "title": "Audit", "status": "COMPLETED",
+                    "file": "work-orders/COMPLETED/WO-008.yaml",
+                }
+            ],
+            "total_active": 0, "total_completed": 1, "total_blocked": 0,
+        }
+        (sync_dir / "work-orders" / "INDEX.yaml").write_text(yaml.safe_dump(index_data), encoding="utf-8")
+
+        # Before sync: validate fails with status mismatch
+        res_before = ValidationResult()
+        _validate_work_order_state_files(sync_dir, res_before)
+        assert any("does not match INDEX.yaml" in e.message for e in res_before.errors)
+
+        # Run sync
+        HarnessRunner._sync_index_and_tree_yaml(tmp_path)
+
+        # After sync: INDEX.yaml has status ACTIVE and file work-orders/ACTIVE/WO-008.yaml
+        idx_after = yaml.safe_load((sync_dir / "work-orders" / "INDEX.yaml").read_text(encoding="utf-8"))
+        entry = next(o for o in idx_after["orders"] if o["id"] == "WO-008")
+        assert entry["status"] == "ACTIVE"
+        assert entry["file"] == "work-orders/ACTIVE/WO-008.yaml"
+
+        # Validate no longer has INDEX mismatch error for WO-008
+        res_after = ValidationResult()
+        _validate_work_order_state_files(sync_dir, res_after)
+        assert not any("does not match INDEX.yaml" in e.message for e in res_after.errors)
+
+
+

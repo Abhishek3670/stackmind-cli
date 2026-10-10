@@ -24,6 +24,18 @@ from .workspace import ScratchWorkspace
 
 
 class ToolGateway:
+    # Agent Matrix §12 / INV-005: QA verdict and review artifacts decide
+    # release progression (D024). Authoring them requires the QA verdict
+    # authority (gemma) or the architect's governance authority (claude) —
+    # implementation workers record findings via their own outbox or
+    # submit_for_review instead.
+    VERDICT_CHANNEL_PREFIXES = (
+        ".sync/qa/verdicts/",
+        ".sync/inbox/claude/",
+        ".sync/reviews/",
+    )
+    VERDICT_AUTHORITY_OPERATIONS = ("submit_verdict", "create_work_order")
+
     def __init__(self, workspace: ScratchWorkspace, boundary: RuntimeBoundary,
                  contract: AgentContract, policy: AuthorizationPolicy, session_id: str,
                  attempt_id: str, actor_id: str, provider_id: str,
@@ -54,7 +66,48 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, "read")
         return value
 
+    def _verdict_channel_denial(self, target: str) -> str | None:
+        """Deny verdict/review-channel writes to agents without verdict authority.
+
+        Uses the same channel/filename heuristics as the supervisor's verdict
+        reader (D024): files under the QA verdict channels, or verdict/review
+        named files under reviews, are QA-verdict artifacts.
+        """
+        normalized = target.replace("\\", "/").strip().lstrip("/")
+        in_channel = any(normalized.startswith(p) for p in self.VERDICT_CHANNEL_PREFIXES)
+        if not in_channel:
+            return None
+        name = normalized.rsplit("/", 1)[-1].lower()
+        hinted = "verdict" in name or "review" in name
+        # The QA verdict channels are verdict-only; reviews also carry the
+        # architect's integration-review reports.
+        qa_only_channel = normalized.startswith(
+            (".sync/qa/verdicts/", ".sync/inbox/claude/")
+        )
+        if not (hinted or qa_only_channel):
+            return None
+        if any(self.policy.permits(op) for op in self.VERDICT_AUTHORITY_OPERATIONS):
+            return None
+        return (
+            f"Verdict authority denied: '{target}' is a QA verdict/review channel. "
+            "Only the QA Lead (gemma) and the Architect (claude) may write verdict "
+            "or review artifacts there; record your findings in your own outbox "
+            "(.sync/outbox/<agent>/) or via submit_for_review — the supervisor "
+            "routes QA findings to the architect."
+        )
+
     def write_file(self, target: str, content: str) -> None:
+        # In-turn ownership guard (worker task contract): deny writes to other
+        # work orders' deliverables and over-budget file counts WITH actionable
+        # feedback, instead of letting the turn fail at post-turn verification.
+        ownership = getattr(self, "task_ownership", None)
+        if ownership is not None:
+            denial = ownership.check_write(target)
+            if denial:
+                raise PermissionError(denial)
+        verdict_denial = self._verdict_channel_denial(target)
+        if verdict_denial:
+            raise PermissionError(verdict_denial)
         record = self._authorize(OperationType.WRITE_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
@@ -251,6 +304,12 @@ class ToolGateway:
                 raise PermissionError(
                     f"Diff hunk header path '{hp}' is outside allowed contract scope: {rec_hdr.reason}"
                 )
+            verdict_denial = self._verdict_channel_denial(hp)
+            if verdict_denial:
+                raise PermissionError(verdict_denial)
+        verdict_denial = self._verdict_channel_denial(target)
+        if verdict_denial:
+            raise PermissionError(verdict_denial)
 
         path = self.workspace.path_for(target)
         if not path.is_file():

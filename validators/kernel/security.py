@@ -167,7 +167,7 @@ _ALLOWLIST_TOKENS = {
 }
 
 _ALLOWLIST_SUBSTRINGS = (
-    "mock", "dummy", "fake", "placeholder", "example", "test-token", "test_token", "sample",
+    "mock", "dummy", "fake", "placeholder", "example", "test", "test-token", "test_token", "sample",
     "change-me", "changeme", "change_me", "replace-me", "replaceme", "replace_me",
     "your-", "your_", "my-secret", "my_secret", "supersecret", "secret-key", "secret_key",
     "default", "admin", "development", "dev", "demo", "todo", "insert-", "put-", "set-", "local",
@@ -368,8 +368,9 @@ class CredentialLeakScanner:
             if s and len(s) >= 6 and s in text:
                 leaks.append(f"Configured credential exposed: '{s[:3]}...'")
 
-        # Check regex patterns
-        for pattern in _CREDENTIAL_PATTERNS:
+        # Check regex patterns (in test files, exclude generic variable assignments like password = '...' which serve as test fixtures)
+        patterns_to_check = _CREDENTIAL_PATTERNS[1:] if is_test_file(file_path) else _CREDENTIAL_PATTERNS
+        for pattern in patterns_to_check:
             for match in pattern.finditer(text):
                 matched_val = next((g for g in match.groups() if g is not None), match.group(0))
                 if not is_allowlisted_token(matched_val):

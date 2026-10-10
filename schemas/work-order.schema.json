@@ -197,6 +197,42 @@
     "plan_ref": {
       "type": "string"
     },
+    "milestone_id": {
+      "type": "string",
+      "description": "Stable identifier linking this work order to its approved plan milestone (e.g. 'Milestone 1'); primary identity for readiness milestone-coverage validation."
+    },
+    "test_plan": {
+      "type": "array",
+      "description": "Explicit mapping of code deliverables to the test artifacts that cover them; honored by the authoring readiness gate and the D024 gate.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "tests"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "normalized_by": {
+      "type": "string",
+      "description": "Provenance marker for deterministic compiler normalization (e.g. 'authoring-compiler/1.0.0'); records system-injected invariants on architect-authored artifacts."
+    },
     "synthesized_by": {
       "type": "string",
       "description": "Provenance marker for deterministic scaffolding (e.g. 'bootstrap'); an authorized author may supersede such artifacts."

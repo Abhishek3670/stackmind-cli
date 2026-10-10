@@ -219,11 +219,15 @@ def verify_post_execution(
                 f"Contract {contract.work_order} is read-only but {len(files_to_check)} file(s) were modified"
             )
             
-    # 2. Check files touched budget
+    # 2. Check files touched budget (excluding internal bookkeeping/protocol files under .sync/)
     max_files = contract.budget.get("max_files_touched")
-    if max_files is not None and len(files_to_check) > max_files:
+    project_files_to_check = tuple(
+        f for f in files_to_check
+        if not str(f).replace("\\", "/").startswith(".sync/")
+    )
+    if max_files is not None and len(project_files_to_check) > max_files:
         raise ContractAccessDenied(
-            f"{len(files_to_check)} file(s) modified, exceeding budget max_files_touched limit of {max_files}"
+            f"{len(project_files_to_check)} project file(s) modified, exceeding budget max_files_touched limit of {max_files}"
         )
         
     # 3. Check scope allowed/denied for each modified file
@@ -251,9 +255,23 @@ def verify_post_execution(
                     or norm_fp == p_norm
                     or norm_fp.startswith(p_norm.rstrip("/") + "/")
                 ):
-                    raise ContractAccessDenied(
-                        f"Modification to file {file_path} is explicitly denied by rule: {pattern}"
-                    )
+                    p_clean = p_norm.rstrip("/*").rstrip("/")
+                    overridden = False
+                    for allow_rule in contract.allow_rules:
+                        a_pat = allow_rule.get("module") or allow_rule.get("path") or allow_rule.get("target")
+                        if a_pat:
+                            a_norm = a_pat.replace("\\", "/").lstrip("./")
+                            a_clean = a_norm.rstrip("/*").rstrip("/")
+                            if (norm_fp == a_norm or norm_fp.startswith(a_clean + "/") or fnmatch.fnmatch(norm_fp, a_norm)) and (
+                                (a_clean.startswith(p_clean + "/") or fnmatch.fnmatch(a_clean, p_norm))
+                                and not (p_clean.startswith(a_clean + "/") or fnmatch.fnmatch(p_clean, a_norm))
+                            ):
+                                overridden = True
+                                break
+                    if not overridden:
+                        raise ContractAccessDenied(
+                            f"Modification to file {file_path} is explicitly denied by rule: {pattern}"
+                        )
                 
         # Allow check
         allowed = False

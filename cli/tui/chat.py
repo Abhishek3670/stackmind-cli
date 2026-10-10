@@ -19,10 +19,6 @@ if TYPE_CHECKING:
     from cli.tui.state import ChatMessage
 
 
-def _current_time_str() -> str:
-    return datetime.datetime.now().strftime("%H:%M")
-
-
 def strip_internal_reasoning(content: str) -> str:
     """Remove provider-delimited private reasoning without altering final Markdown."""
     clean = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", content, flags=re.IGNORECASE | re.DOTALL)

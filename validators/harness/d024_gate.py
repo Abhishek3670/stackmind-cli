@@ -7,6 +7,7 @@ of work orders until the QA role (Gemma) has issued an explicit APPROVED verdict
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -81,6 +82,29 @@ class D024Gate:
         re.IGNORECASE,
     )
 
+    def _load_project_config(self, project_path: Path) -> dict[str, Any]:
+        """Load project configuration from .sync/config.yaml or .sync/runtime/TREE.yaml."""
+        cfg_path = project_path / ".sync" / "config.yaml"
+        if cfg_path.is_file():
+            try:
+                data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        tree_path = project_path / ".sync" / "runtime" / "TREE.yaml"
+        if tree_path.is_file():
+            try:
+                tree_data = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
+                if isinstance(tree_data, dict):
+                    if "config" in tree_data and isinstance(tree_data["config"], dict):
+                        return tree_data["config"]
+                    if "environment" in tree_data:
+                        return {"environment": tree_data["environment"]}
+            except Exception:
+                pass
+        return {}
+
     def find_work_order_file(self, project_path: Path, work_order_id: str) -> Path | None:
         """Find work order YAML in ACTIVE, COMPLETED, or BLOCKED directories."""
         sync_path = project_path / ".sync"
@@ -123,7 +147,28 @@ class D024Gate:
         tests_dir = project_path / "tests"
         if not tests_dir.is_dir():
             root_test = project_path / f"test_{stem}.py"
-            return root_test if (root_test.is_file() and root_test.stat().st_size > 0) else None
+            if root_test.is_file() and root_test.stat().st_size > 0:
+                return root_test
+            if stem in ("__init__", "main", "index", "app") or deliv_p.suffix.lower() in (
+                ".html", ".htm", ".css", ".svg"
+            ):
+                for cand_name in (
+                    "test_e2e.py",
+                    "test_integration.py",
+                    "test_ui.py",
+                    "test_web.py",
+                    "test_api.py",
+                    "test_app.py",
+                    "test_main.py",
+                    "test_server.py",
+                ):
+                    root_cand = project_path / cand_name
+                    if root_cand.is_file() and root_cand.stat().st_size > 0:
+                        return root_cand
+                for tf in sorted(project_path.glob("test_*.py")):
+                    if tf.is_file() and tf.stat().st_size > 0:
+                        return tf
+            return None
 
         direct_candidates = [
             tests_dir / f"test_{stem}.py",
@@ -156,6 +201,127 @@ class D024Gate:
                 except Exception:
                     continue
 
+        # Fallback for entrypoint stems and frontend/markup deliverables:
+        # Per authoring readiness convention, entrypoint stems ("app", "main", "index", "__init__")
+        # and static frontend assets (.html, .htm, .css, .svg) are exercised by integration/e2e
+        # suites or any available non-empty test suite in tests/.
+        if stem in ("__init__", "main", "index", "app") or deliv_p.suffix.lower() in (
+            ".html", ".htm", ".css", ".svg"
+        ):
+            common_suites = (
+                "test_e2e.py",
+                "test_integration.py",
+                "test_ui.py",
+                "test_web.py",
+                "test_api.py",
+                "test_app.py",
+                "test_main.py",
+                "test_server.py",
+            )
+            for cand_name in common_suites:
+                for match in tests_dir.rglob(cand_name):
+                    if match.is_file() and match.stat().st_size > 0:
+                        return match
+
+            for test_file in sorted(tests_dir.rglob("test_*.py")):
+                if test_file.is_file() and test_file.stat().st_size > 0:
+                    return test_file
+            for test_file in sorted(tests_dir.rglob("*_test.py")):
+                if test_file.is_file() and test_file.stat().st_size > 0:
+                    return test_file
+
+        return None
+
+    def _declared_test_plan_companion(
+        self, project_path: Path, wo_data: dict[str, Any], deliverable_path: str
+    ) -> Path | None:
+        """Resolve the companion test via the work order's declared test_plan.
+
+        An explicit test_plan (per-file or consolidated) is the authoritative
+        coverage declaration shared with the authoring readiness gate; when the
+        deliverable is mapped, the mapped test files must exist and be
+        non-empty for the requirement to be satisfied.
+        """
+        raw = wo_data.get("test_plan")
+        if not isinstance(raw, list):
+            return None
+
+        def _norm(value: Any) -> str:
+            return str(value or "").replace("\\", "/").strip().lstrip("/").lstrip("./")
+
+        norm_deliv = _norm(deliverable_path)
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            sources = entry.get("sources")
+            if sources is None:
+                sources = [entry["source"]] if entry.get("source") else []
+            if isinstance(sources, str):
+                sources = [sources]
+            norm_sources = {_norm(s) for s in sources if _norm(s)}
+            if norm_deliv not in norm_sources:
+                continue
+            tests = entry.get("tests")
+            if isinstance(tests, str):
+                tests = [tests]
+            for test_rel in tests or []:
+                candidate = project_path / _norm(test_rel)
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return candidate
+            return None  # declared mapping exists but its tests are missing/empty
+        return None
+
+    def _downstream_qa_companion(self, project_path: Path, target_wo: str) -> Path | None:
+        """Resolve companion test artifact from a downstream QA work order that verified target_wo."""
+        active_and_completed = [
+            project_path / ".sync" / "work-orders" / "ACTIVE",
+            project_path / ".sync" / "work-orders" / "COMPLETED",
+        ]
+        for p_dir in active_and_completed:
+            if not p_dir.is_dir():
+                continue
+            for wf in p_dir.glob("*.yaml"):
+                try:
+                    wdata = yaml.safe_load(wf.read_text(encoding="utf-8")) or {}
+                    if (
+                        not any(str(a).lower().strip() in ("gemma", "qa") for a in wdata.get("assigned_agents", []))
+                        and not any(kw in str(wdata.get("title", "")).lower() for kw in ("qa", "verification"))
+                        and str(wdata.get("type", "")).lower() not in ("qa", "validation", "verification")
+                    ):
+                        continue
+
+                    deps_and_targets = set(wdata.get("dependencies", [])) | set(wdata.get("targets", []))
+                    for match in WO_REF_PATTERN.findall(f"{wdata.get('title', '')} {wdata.get('description', '')}"):
+                        deps_and_targets.add(match)
+
+                    if target_wo not in deps_and_targets:
+                        continue
+
+                    deliv_paths: list[str] = []
+                    d = wdata.get("deliverable")
+                    if isinstance(d, dict) and (d.get("path") or d.get("file")):
+                        deliv_paths.append(str(d.get("path") or d.get("file")).strip())
+                    elif isinstance(d, str) and d.strip():
+                        deliv_paths.append(d.strip())
+                    for d_extra in wdata.get("deliverables", []):
+                        if isinstance(d_extra, dict) and (d_extra.get("path") or d_extra.get("file")):
+                            deliv_paths.append(str(d_extra.get("path") or d_extra.get("file")).strip())
+                        elif isinstance(d_extra, str) and d_extra.strip():
+                            deliv_paths.append(d_extra.strip())
+
+                    for dp in deliv_paths:
+                        dp_norm = dp.replace("\\", "/").strip().lstrip("./")
+                        if (
+                            dp_norm.startswith("tests/")
+                            or dp_norm.startswith("test/")
+                            or Path(dp_norm).stem.startswith("test_")
+                            or Path(dp_norm).stem.endswith(("_test", "-test"))
+                        ):
+                            cand = project_path / dp_norm
+                            if cand.is_file() and cand.stat().st_size > 0:
+                                return cand
+                except Exception:
+                    pass
         return None
 
     def resolve_target_work_orders(
@@ -327,6 +493,13 @@ class D024Gate:
             return decision
 
         target_wos = self.resolve_target_work_orders(project_path, work_order_id, wo_data)
+        config = self._load_project_config(project_path)
+        env_val = str(config.get("environment") or os.getenv("STACKMIND_ENV") or "").lower().strip()
+        allow_debug = (
+            env_val in ("dev", "development", "local", "test")
+            or bool(config.get("security", {}).get("allow_debug"))
+            or bool(config.get("allow_debug"))
+        )
         all_verdict_files: list[str] = []
         combined_evidence: dict[str, Any] = {}
 
@@ -402,7 +575,7 @@ class D024Gate:
                             # fallbacks, enabled debug flags, dynamic exec —
                             # the findings a model reviewer routinely misses.
                             from validators.harness.security_scan import scan_file as scan_security
-                            for finding in scan_security(deliv_path_str, content):
+                            for finding in scan_security(deliv_path_str, content, allow_debug=allow_debug):
                                 deliverable_issues.append(finding.format())
 
                         deliv_type = ""
@@ -413,7 +586,15 @@ class D024Gate:
                             or deliv_path_str.endswith((".py", ".ts", ".js", ".go", ".rs", ".dart"))
                         )
                         if is_code:
-                            test_file = self.find_companion_test_file(project_path, deliv_path_str)
+                            test_file = self._declared_test_plan_companion(
+                                project_path, target_data, deliv_path_str
+                            )
+                            if test_file is None:
+                                test_file = self._downstream_qa_companion(
+                                    project_path, target_wo
+                                )
+                            if test_file is None:
+                                test_file = self.find_companion_test_file(project_path, deliv_path_str)
                             if not test_file or not test_file.exists():
                                 deliverable_issues.append(f"no test file found for deliverable {deliv_path_str}")
                             elif test_file.is_file() and test_file.stat().st_size == 0:

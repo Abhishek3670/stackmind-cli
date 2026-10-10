@@ -16,6 +16,10 @@
       "type": "string",
       "description": "Provenance marker for deterministic scaffolding (e.g. 'bootstrap'); an authorized author may supersede such artifacts."
     },
+    "normalized_by": {
+      "type": "string",
+      "description": "Provenance marker for deterministic compiler normalization (e.g. 'authoring-compiler/1.0.0'); records system-injected invariants such as the QA verdict channel."
+    },
     "agent_id": {
       "type": "string"
     },

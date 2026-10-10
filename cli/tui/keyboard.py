@@ -685,6 +685,123 @@ def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
     return res
 
 
+DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
+    (":resume", "Resume active session", False),
+    (":status", "Display current Session & Delivery View", False),
+    (":plan", "Display Plan Approval surface & history", False),
+    (":wo", "Display Work Orders table and progress", False),
+    (":goal", "Submit product goal to Architecture", True),
+    (":approve", "Submit Plan approval or HITL approval", False),
+    (":reject", "Submit Plan rejection feedback", False),
+    (":roles", "Display Agent Roles & Backend bindings", False),
+    (":rebind", "Rebind agent role to backend", True),
+    (":tree", "Display Hierarchical Operation Tree", False),
+    (":agents", "Display Hierarchical Agent Tree", False),
+    (":completion", "Display Project Complete checklist", False),
+    (":cancel", "Cancel in-flight turn, agent, or operation", False),
+    (":contract", "Display Contract Boundary HUD & permissions", False),
+    (":diff", "Display Unified Diff viewer", False),
+    (":matrix", "Display 6-Dimensional Verification Matrix", False),
+    (":events", "Stream incremental sequenced events", False),
+    (":reconnect", "Reconnect to daemon & replay missed events", False),
+    (":pause", "Pause active session turn", False),
+    (":chat", "Display conversation transcript", False),
+    (":actions", "Toggle/expand/collapse turn Actions group", False),
+    (":compact", "Compact older transcript turns", False),
+    (":timeout", "Get or set client turn wait timeout", False),
+    (":landing", "Display branded landing block", False),
+    (":help", "Show help menu with all commands", False),
+    (":debugkeys", "Toggle debug key logging to file", False),
+    (":exit", "Gracefully stop daemon and exit", False),
+    (":quit", "Gracefully stop daemon and exit", False),
+]
+
+
+def format_dropdown_lines(
+    matches: list[tuple[str, str, bool]],
+    selected_index: int,
+    width: int,
+    max_visible: int = 6,
+) -> list[str]:
+    """Format dropdown lines with borders, selection marker, and colors."""
+    if not matches:
+        return []
+
+    total = len(matches)
+    selected_index = max(0, min(selected_index, total - 1))
+
+    if total <= max_visible:
+        start_idx = 0
+        end_idx = total
+    else:
+        half = max_visible // 2
+        if selected_index < half:
+            start_idx = 0
+            end_idx = max_visible
+        elif selected_index >= total - half:
+            start_idx = total - max_visible
+            end_idx = total
+        else:
+            start_idx = selected_index - half
+            end_idx = start_idx + max_visible
+
+    box_w = max(36, min(width - 2, 74))
+    inner_w = box_w - 4
+
+    border_color = "\033[90m"
+    cyan_bold = "\033[1;36m"
+    white_bold = "\033[1;37m"
+    dim_color = "\033[90m"
+    reset = "\033[0m"
+
+    hint = "↑/↓ nav  Tab/Enter select  Esc close"
+    header_title = " Commands "
+    top_mid = f"──{header_title}─"
+    rem = box_w - 5 - len(top_mid) - len(hint)
+    if rem >= 0:
+        top_line = f"{border_color}┌{top_mid}{'─' * rem} {dim_color}{hint}{border_color} ─┐{reset}"
+    else:
+        rem_short = max(0, box_w - 2 - len(top_mid))
+        top_line = f"{border_color}┌{top_mid}{'─' * rem_short}┐{reset}"
+
+    lines = [top_line]
+    cmd_col_w = 14
+
+    for i in range(start_idx, end_idx):
+        cmd, desc, _ = matches[i]
+        is_sel = (i == selected_index)
+
+        avail_desc_w = inner_w - cmd_col_w - 2
+        if len(desc) > avail_desc_w:
+            desc_str = desc[:max(0, avail_desc_w - 3)] + "..."
+        else:
+            desc_str = desc
+
+        padding_w = max(0, inner_w - (2 + cmd_col_w + len(desc_str)))
+        cmd_padded = cmd.ljust(cmd_col_w)
+
+        if is_sel:
+            marker = f"{cyan_bold}> {reset}"
+            cmd_part = f"{white_bold}{cmd_padded}{reset}"
+            desc_part = f"{cyan_bold}{desc_str}{reset}"
+            fill = " " * padding_w
+            line = f"{border_color}│ {reset}{marker}{cmd_part}{desc_part}{fill} {border_color}│{reset}"
+        else:
+            marker = "  "
+            cmd_part = f"{white_bold}{cmd_padded}{reset}"
+            desc_part = f"{dim_color}{desc_str}{reset}"
+            fill = " " * padding_w
+            line = f"{border_color}│ {reset}{marker}{cmd_part}{desc_part}{fill} {border_color}│{reset}"
+        lines.append(line)
+
+    footer_info = f" ({selected_index + 1}/{total}) "
+    fill_bot = max(0, box_w - 3 - len(footer_info))
+    bot_line = f"{border_color}└─{footer_info}{'─' * fill_bot}┘{reset}"
+    lines.append(bot_line)
+
+    return lines
+
+
 class RawLineEditor:
     """In-memory line buffer maintaining cursor position, edit history, and rendering."""
 
@@ -703,6 +820,8 @@ class RawLineEditor:
         on_transition: Optional[Callable[[bool], None]] = None,
         width: int = 80,
         right_border: Optional[str] = None,
+        commands: Optional[list[tuple[str, str, bool]]] = None,
+        on_clear_dropdown: Optional[Callable[[], None]] = None,
     ) -> None:
         self.prompt_prefix = prompt_prefix
         self.buffer: list[str] = list(initial_text)
@@ -729,7 +848,16 @@ class RawLineEditor:
         else:
             self.right_border = "│"
 
+        self.commands: list[tuple[str, str, bool]] = list(commands) if commands is not None else list(DEFAULT_COMMANDS)
+        self.dropdown_active: bool = False
+        self.dropdown_index: int = 0
+        self.dropdown_matches: list[tuple[str, str, bool]] = []
+        self._last_dropdown_lines_count: int = 0
+        self._dropdown_dismissed: bool = False
+        self.on_clear_dropdown = on_clear_dropdown
+
         self._update_state()
+        self._update_dropdown()
 
     @property
     def text(self) -> str:
@@ -739,11 +867,52 @@ class RawLineEditor:
         if self.state is not None and hasattr(self.state, "composer_buffer"):
             self.state.composer_buffer = self.text
 
+    def _update_dropdown(self) -> None:
+        text = self.text
+        if text.startswith(":") and " " not in text and not self._dropdown_dismissed:
+            prefix = text.lower()
+            self.dropdown_matches = [c for c in self.commands if c[0].lower().startswith(prefix)]
+            if self.dropdown_matches:
+                self.dropdown_active = True
+                if self.dropdown_index >= len(self.dropdown_matches):
+                    self.dropdown_index = 0
+                return
+        self.dropdown_active = False
+        self.dropdown_matches = []
+        self.dropdown_index = 0
+
+    def _erase_dropdown(self, out: Any = sys.stdout) -> None:
+        if self._last_dropdown_lines_count <= 0:
+            return
+        H = self._last_dropdown_lines_count
+        self._last_dropdown_lines_count = 0
+        if getattr(self, "on_clear_dropdown", None):
+            try:
+                self.on_clear_dropdown()
+            except Exception:
+                pass
+        offset_up = H + (1 if self.has_borders else 0)
+        try:
+            out.write(f"\x1b[{offset_up}A")
+            for _ in range(H):
+                out.write("\r\x1b[2K\x1b[1B")
+            down_steps = 1 if self.has_borders else 0
+            if down_steps > 0:
+                out.write(f"\x1b[{down_steps}B")
+            visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+            cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+            out.write(f"\x1b[{cursor_col}G")
+            out.flush()
+        except Exception:
+            pass
+
     def insert_char(self, ch: str) -> None:
         was_empty = len(self.buffer) == 0
         self.buffer.insert(self.cursor, ch)
         self.cursor += 1
         self._update_state()
+        self._dropdown_dismissed = False
+        self._update_dropdown()
         if was_empty and self.on_transition:
             self.on_transition(True)
 
@@ -752,6 +921,8 @@ class RawLineEditor:
             self.buffer.pop(self.cursor - 1)
             self.cursor -= 1
             self._update_state()
+            self._dropdown_dismissed = False
+            self._update_dropdown()
             if len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
 
@@ -759,6 +930,8 @@ class RawLineEditor:
         if self.cursor < len(self.buffer):
             self.buffer.pop(self.cursor)
             self._update_state()
+            self._dropdown_dismissed = False
+            self._update_dropdown()
             if len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
 
@@ -788,6 +961,8 @@ class RawLineEditor:
             self.buffer = list(self.history[self.history_index])
             self.cursor = len(self.buffer)
             self._update_state()
+            self._dropdown_dismissed = False
+            self._update_dropdown()
             if was_empty and len(self.buffer) > 0 and self.on_transition:
                 self.on_transition(True)
             elif not was_empty and len(self.buffer) == 0 and self.on_transition:
@@ -808,6 +983,9 @@ class RawLineEditor:
             self.cursor = len(self.buffer)
             self._update_state()
 
+        self._dropdown_dismissed = False
+        self._update_dropdown()
+
         if was_empty and len(self.buffer) > 0 and self.on_transition:
             self.on_transition(True)
         elif not was_empty and len(self.buffer) == 0 and self.on_transition:
@@ -826,6 +1004,52 @@ class RawLineEditor:
                 raise EOFError()
             self.delete_forward()
             return False
+
+        if self.dropdown_active and self.dropdown_matches:
+            if key == Key.DOWN:
+                self.dropdown_index = (self.dropdown_index + 1) % len(self.dropdown_matches)
+                return False
+            if key == Key.UP:
+                self.dropdown_index = (self.dropdown_index - 1) % len(self.dropdown_matches)
+                return False
+            if key in (Key.TAB, "\t"):
+                cmd, desc, req_args = self.dropdown_matches[self.dropdown_index]
+                self.buffer = list(cmd)
+                if req_args:
+                    self.buffer.append(" ")
+                self.cursor = len(self.buffer)
+                self._update_state()
+                self.dropdown_active = False
+                self._erase_dropdown()
+                return False
+            if key in (Key.ENTER, Key.NEWLINE):
+                cmd, desc, req_args = self.dropdown_matches[self.dropdown_index]
+                self.buffer = list(cmd)
+                self.cursor = len(self.buffer)
+                self._update_state()
+                self.dropdown_active = False
+                self._erase_dropdown()
+                if req_args:
+                    self.buffer.append(" ")
+                    self.cursor += 1
+                    self._update_state()
+                    return False
+                return True
+            if key == Key.ESCAPE:
+                self._dropdown_dismissed = True
+                self.dropdown_active = False
+                self._erase_dropdown()
+                return False
+            if key == Key.RIGHT and self.cursor == len(self.buffer):
+                cmd, desc, req_args = self.dropdown_matches[self.dropdown_index]
+                self.buffer = list(cmd)
+                if req_args:
+                    self.buffer.append(" ")
+                self.cursor = len(self.buffer)
+                self._update_state()
+                self.dropdown_active = False
+                self._erase_dropdown()
+                return False
 
         if key in (Key.ENTER, Key.NEWLINE):
             return True
@@ -983,6 +1207,32 @@ class RawLineEditor:
         # Move cursor to active edit position inside composer box
         cursor_col = visible_prefix_len + displayed_cursor + 1
         out.write(f"\x1b[{cursor_col}G")
+
+        # Dropdown management
+        if self._last_dropdown_lines_count > 0 and not self.dropdown_active:
+            self._erase_dropdown(out)
+
+        if self.dropdown_active and self.dropdown_matches:
+            dropdown_lines = format_dropdown_lines(
+                self.dropdown_matches,
+                self.dropdown_index,
+                width=self.width,
+            )
+            if dropdown_lines:
+                H = len(dropdown_lines)
+                self._last_dropdown_lines_count = H
+                offset_up = H + (1 if self.has_borders else 0)
+                try:
+                    out.write(f"\x1b[{offset_up}A")
+                    for d_line in dropdown_lines:
+                        out.write(f"\r{d_line}\x1b[K\x1b[1B")
+                    down_steps = 1 if self.has_borders else 0
+                    if down_steps > 0:
+                        out.write(f"\x1b[{down_steps}B")
+                    out.write(f"\x1b[{cursor_col}G")
+                except Exception:
+                    pass
+
         out.flush()
 
 
@@ -999,6 +1249,8 @@ def raw_prompt_input(
     on_page_down: Optional[Callable[[], None]] = None,
     on_wheel_up: Optional[Callable[[], None]] = None,
     on_wheel_down: Optional[Callable[[], None]] = None,
+    on_clear_dropdown: Optional[Callable[[], None]] = None,
+    commands: Optional[list[tuple[str, str, bool]]] = None,
     key_stream: Optional[Iterator[str]] = None,
     top_border_renderer: Optional[Callable[[bool], str]] = None,
 ) -> str:
@@ -1120,6 +1372,8 @@ def raw_prompt_input(
         on_wheel_down=wrapped_wheel_down,
         on_transition=handle_transition,
         width=width,
+        commands=commands,
+        on_clear_dropdown=on_clear_dropdown,
     )
 
     with TerminalStateRestorer():
@@ -1129,11 +1383,15 @@ def raw_prompt_input(
                 k = read_next_key(key_stream=key_stream)
                 done = editor.handle_key(k)
                 if done:
+                    if editor._last_dropdown_lines_count > 0:
+                        editor._erase_dropdown()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     break
                 editor.redraw_line()
             except (KeyboardInterrupt, EOFError):
+                if editor._last_dropdown_lines_count > 0:
+                    editor._erase_dropdown()
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 raise

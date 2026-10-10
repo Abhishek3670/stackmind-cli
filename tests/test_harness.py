@@ -66,6 +66,7 @@ def test_runner_completes_assigned_work_order_and_keeps_tree_byte_identical(tmp_
     tree = yaml.safe_load(tree_path.read_text(encoding='utf-8'))
     tree['agents']['codex']['assigned_work_orders'] = ['WO-101']
     tree['agents']['codex']['status'] = 'assigned'
+    tree['work_orders']['total_active'] = 1
     _write_yaml(tree_path, tree)
     tree_before = tree_path.read_bytes()
 
@@ -123,8 +124,11 @@ def test_runner_completes_assigned_work_order_and_keeps_tree_byte_identical(tmp_
     assert result.persisted
     assert tree_path.read_bytes() == tree_before
     assert result.report_path is not None and result.report_path.exists()
-    assert (project / '.sync' / 'inbox' / 'gemma' / '2026-07-17_codex_WO-101-review.md').exists()
-    assert (project / '.sync' / 'inbox' / 'claude' / '2026-07-17_codex_WO-101-complete.md').exists()
+    notice_file = project / '.sync' / 'inbox' / 'claude' / '2026-07-17_codex_WO-101-complete.md'
+    assert notice_file.exists()
+    notice_text = notice_file.read_text(encoding='utf-8')
+    assert "Rationale & Details:" in notice_text
+    assert "Validated, staged, and wrote back the harness result." in notice_text
     updated_wo = yaml.safe_load(
         (project / '.sync' / 'work-orders' / 'ACTIVE' / 'WO-101.yaml').read_text(encoding='utf-8')
     )

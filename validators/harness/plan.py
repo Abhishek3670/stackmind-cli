@@ -13,6 +13,10 @@ class PlanValidationError(ValueError):
     pass
 
 
+# Trailing "(Agent: <id>)" annotation on a milestone title — metadata, not title text.
+_MILESTONE_AGENT_ANNOTATION_RE = re.compile(r"\(\s*(?:Agent|agent)\s*:\s*([^)]+)\)\s*$")
+
+
 PLAN_GENERATION_INSTRUCTIONS = (
     "When generating or updating PLAN.md, you MUST strictly structure it as follows:\n\n"
     "# Project Plan: <project-name>\n\n"
@@ -78,6 +82,7 @@ WORK_ORDER_SCHEMA_TEMPLATE = (
     "When introducing third-party dependencies, author an explicit scaffolding Work Order FIRST:\n"
     "```yaml\n"
     "id: \"WO-001\"                         # Required: regex ^WO-[0-9]{3}$ matching filename stem\n"
+    "milestone_id: \"Milestone 1\"           # Matching plan milestone id from PLAN.md (e.g. \"Milestone 1\")\n"
     "type: \"FEATURE\"                      # Scaffolding task type\n"
     "title: \"Configure Project Dependencies\"\n"
     "status: \"ACTIVE\"                     # Required: ACTIVE\n"
@@ -95,6 +100,7 @@ WORK_ORDER_SCHEMA_TEMPLATE = (
     "#### Implementation Work Order Pattern (Dependent on Scaffolding):\n"
     "```yaml\n"
     "id: \"WO-002\"                         # Required: regex ^WO-[0-9]{3}$ matching filename stem\n"
+    "milestone_id: \"Milestone 2\"           # Matching plan milestone id from PLAN.md (e.g. \"Milestone 2\")\n"
     "type: \"FEATURE\"                      # Required: PHASE, FEATURE, BUGFIX, HOTFIX, REFACTOR, RESEARCH, AUDIT, VALIDATION, FIX\n"
     "title: \"Implement Login API Endpoint\" # Required: concise task title\n"
     "status: \"ACTIVE\"                     # Required: READY, PENDING, ACTIVE, BLOCKED, COMPLETE, COMPLETED\n"
@@ -108,7 +114,15 @@ WORK_ORDER_SCHEMA_TEMPLATE = (
     "  description: \"Login authentication endpoint handler\"\n"
     "description: >                       # Detailed implementation requirements for the worker\n"
     "  Implement the POST /login endpoint with credential validation.\n"
-    "```\n"
+    "acceptance_criteria:                 # Concrete verifiable acceptance criteria (MUST specify interface contracts)\n"
+    "  - \"Handler validates username and password credentials against database\"\n"
+    "  - \"Returns 200 with JWT token on success and 401 on invalid credentials\"\n"
+    "```\n\n"
+    "#### Cross-Component Integration Guidance:\n"
+    "When decomposing a multi-file feature (e.g. HTML, CSS, JS), the parent Work Order (e.g. index.html) MUST define "
+    "explicit `acceptance_criteria` specifying the container markup, classes, and element IDs (e.g. #animated-name) "
+    "that downstream scripts and styles hook into. Downstream Work Orders must reference those exact IDs. "
+    "Never leave parent deliverables as empty placeholder scaffolding.\n"
 )
 
 
@@ -160,6 +174,7 @@ class PlanMilestone:
     title: str
     status: str  # "COMPLETED" or "PENDING"
     tasks: list[str] = field(default_factory=list)
+    agent: str | None = None  # semantic agent metadata parsed from "(Agent: <id>)"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -167,6 +182,7 @@ class PlanMilestone:
             "title": self.title,
             "status": self.status,
             "tasks": list(self.tasks),
+            "agent": self.agent,
         }
 
 
@@ -286,11 +302,21 @@ def parse_plan(content: str) -> PlanStructure:
                         m_id = f"M{len(milestones) + 1}"
                         m_title = m_id_or_title
 
+                    # Separate agent metadata from the semantic title: the plan
+                    # format appends "(Agent: <id>)" to milestone titles, but that
+                    # annotation is metadata, not title text.
+                    m_agent: str | None = None
+                    agent_match = _MILESTONE_AGENT_ANNOTATION_RE.search(m_title)
+                    if agent_match:
+                        m_agent = agent_match.group(1).strip().lower()
+                        m_title = m_title[: agent_match.start()].rstrip().rstrip("-–—,").rstrip()
+
                     current_milestone = PlanMilestone(
                         id=m_id,
                         title=m_title,
                         status="COMPLETED" if checked else "PENDING",
                         tasks=[],
+                        agent=m_agent,
                     )
                     milestones.append(current_milestone)
             elif current_milestone and re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str):
