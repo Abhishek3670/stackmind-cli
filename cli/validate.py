@@ -203,14 +203,6 @@ def validate_schema(sync_path: Path, result: ValidationResult) -> None:
 
 
 def validate_structure(project_path: Path, sync_path: Path, agents: list[str], result: ValidationResult) -> None:
-    if not (project_path / "AGENTS.md").exists():
-        result.issues.append(Issue(
-            layer="Structure",
-            severity=Severity.ERROR,
-            message="Missing: AGENTS.md in project root",
-            path="AGENTS.md",
-        ))
-
     required_files = [
         "PROTOCOL_DIGEST.md",
         "PROTOCOL_DIGEST.hash",

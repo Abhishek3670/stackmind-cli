@@ -19,14 +19,6 @@ def project_state(workspace: Path) -> str:
         return "stackmind"
     if (workspace / ".sync-ref").exists():
         return "damaged"
-    agents_file = workspace / "AGENTS.md"
-    if agents_file.is_file():
-        try:
-            head = agents_file.read_text(encoding="utf-8")[:2048].lower()
-        except (OSError, UnicodeError):
-            head = ""
-        if "stackmind" in head and "version: v" in head:
-            return "damaged"
     if not workspace.exists() or not any(workspace.iterdir()):
         return "empty"
     return "adopt"
@@ -52,8 +44,8 @@ def prepare_project(workspace: Path, *, yes: bool, interactive: bool) -> None:
         if state == "adopt":
             click.echo(
                 "Adoption will add the .sync runtime and missing StackMind files; "
-                "existing AGENT(S).md, README.md, PLAN.md, CHANGELOG.md, VERSION, "
-                "and .gitignore content will be preserved."
+                "existing README.md, PLAN.md, CHANGELOG.md, VERSION, and .gitignore "
+                "content will be preserved."
             )
             if not yes:
                 if not interactive:

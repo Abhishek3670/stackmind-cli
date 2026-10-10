@@ -58,45 +58,93 @@ class TestCleanDeliveryPolicy:
 
 
 class TestCleanDeliveryGate:
-    """Tests for clean delivery validation gate (to be implemented)."""
+    """Tests for clean delivery validation gate."""
 
     def test_gate_detects_prohibited_references(self):
         """Clean delivery gate should detect prohibited StackMind references."""
-        # TODO: Implement CleanDeliveryGate in validators/harness/clean_delivery_gate.py
-        # This test documents the expected behavior:
-        #
-        # 1. Scan product-deliverable boundary (not .sync/)
-        # 2. Check tracked files and staged content
-        # 3. Check commit messages and trailers
-        # 4. Detect prohibited references:
-        #    - "StackMind", "stackmind-cli"
-        #    - ".sync", internal runtime state
-        #    - "AGENTS.md", agent names (Claude, Codex, Gemini, Gemma, Local-LLM)
-        #    - Work orders, harness references, internal contracts
-        #
-        # 5. Exclude only designated internal runtime boundary
-        # 6. Fail closed when scanning cannot complete
-
-        # Placeholder: This test documents the expected interface
-        from pathlib import Path
-        import tempfile
+        from validators.harness.clean_delivery_gate import CleanDeliveryGate
 
         with tempfile.TemporaryDirectory() as tmp:
             project_path = Path(tmp)
             readme = project_path / "README.md"
             readme.write_text("Managed by stackmind\n")
 
-            # Expected behavior: gate should detect the prohibited reference
-            # from validators.harness.clean_delivery_gate import CleanDeliveryGate
-            # gate = CleanDeliveryGate(project_path)
-            # findings = gate.scan()
-            # assert len(findings) > 0
+            gate = CleanDeliveryGate(project_path)
+            passed, findings = gate.validate()
 
-        pytest.skip("CleanDeliveryGate to be implemented")
+            assert not passed, "Gate should fail when prohibited references are found"
+            assert len(findings) > 0, "Gate should return findings for prohibited references"
+            assert any("prohibited" in f["issue"].lower() for f in findings), \
+                "Findings should mention prohibited terms"
 
     def test_gate_allows_internal_sync_files(self):
         """Internal .sync/ files should be excluded from scan."""
-        # TODO: Implement CleanDeliveryGate
-        # Expected: .sync/ runtime metadata should not cause false positives
+        from validators.harness.clean_delivery_gate import CleanDeliveryGate
 
-        pytest.skip("CleanDeliveryGate to be implemented")
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = Path(tmp)
+            # Create .sync structure with internal runtime content
+            sync = project_path / ".sync" / "runtime" / "boot"
+            sync.mkdir(parents=True)
+            (sync / "codex.boot.yaml").write_text("agent: codex\n")
+
+            # Product file should have no stackmind branding
+            product_file = project_path / "product.txt"
+            product_file.write_text("# Product content\n")
+
+            gate = CleanDeliveryGate(project_path)
+            passed, findings = gate.validate()
+
+            assert passed, "Gate should pass when only .sync/ has internal content"
+
+    def test_gate_detects_internal_file_references(self):
+        """Gate should detect references to internal files like AGENTS.md."""
+        from validators.harness.clean_delivery_gate import CleanDeliveryGate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = Path(tmp)
+            readme = project_path / "README.md"
+            readme.write_text("See AGENTS.md for agent instructions\n")
+
+            gate = CleanDeliveryGate(project_path)
+            passed, findings = gate.validate()
+
+            assert not passed, "Gate should fail on internal file references"
+            assert any("AGENTS.md" in f["issue"] for f in findings), \
+                "Should flag AGENTS.md references"
+
+    def test_clean_project_passes(self):
+        """Clean project with no StackMind references should pass."""
+        from validators.harness.clean_delivery_gate import CleanDeliveryGate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = Path(tmp)
+            readme = project_path / "README.md"
+            readme.write_text("# My Project\n\nA sample project.\n")
+
+            gate = CleanDeliveryGate(project_path)
+            passed, findings = gate.validate()
+
+            assert passed, "Clean project should pass validation"
+            assert len(findings) == 0, "Clean project should have no findings"
+
+    def test_adoption_readme_leakage_detected(self):
+        """Adoption path that appends runtime note should be detected."""
+        from validators.harness.clean_delivery_gate import CleanDeliveryGate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = Path(tmp)
+            readme = project_path / "README.md"
+            # Simulate content that would be created during adoption
+            readme.write_text(
+                "# My Project\n\n"
+                "## StackMind Runtime\n\n"
+                "This project uses StackMind for its governed agent runtime.\n"
+            )
+
+            gate = CleanDeliveryGate(project_path)
+            passed, findings = gate.validate()
+
+            assert not passed, "Gate should detect StackMind runtime references"
+            assert any("stackmind" in f["issue"].lower() for f in findings), \
+                "Should flag StackMind term"

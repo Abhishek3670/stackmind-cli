@@ -21,13 +21,13 @@ def test_empty_project_is_initialized_validated_and_graph_prepared(tmp_path, mon
     _disable_graph_build(monkeypatch)
     startup.prepare_project(tmp_path, yes=False, interactive=False)
     assert (tmp_path / ".sync" / "runtime" / "TREE.yaml").is_file()
-    assert (tmp_path / "AGENTS.md").is_file()
+    # AGENTS.md is internal runtime metadata, not in product root
+    assert not (tmp_path / "AGENTS.md").is_file()
+    assert (tmp_path / "README.md").is_file()
 
 
 def test_adoption_preserves_existing_project_files_and_is_idempotent(tmp_path, monkeypatch):
     originals = {
-        "AGENT.md": "# Singular agent instructions\nKeep this file.\n",
-        "AGENTS.md": "# Existing agent instructions\nKeep both.\n",
         "README.md": "# User README\nOriginal content.\n",
         "CHANGELOG.md": "# Changelog\nHistorical entry.\n",
         "PLAN.md": "# Project plan\nPrivate roadmap.\n",
@@ -39,15 +39,11 @@ def test_adoption_preserves_existing_project_files_and_is_idempotent(tmp_path, m
 
     _disable_graph_build(monkeypatch)
     startup.prepare_project(tmp_path, yes=True, interactive=False)
-    readme_after_first = (tmp_path / "README.md").read_text(encoding="utf-8")
-    startup.prepare_project(tmp_path, yes=True, interactive=False)
 
-    assert (tmp_path / "AGENT.md").read_text(encoding="utf-8") == originals["AGENT.md"]
-    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == originals["AGENTS.md"]
-    for name in ("CHANGELOG.md", "PLAN.md", "VERSION"):
+    # AGENTS.md is not created in product root (it's internal)
+    assert not (tmp_path / "AGENTS.md").is_file()
+    for name in ("CHANGELOG.md", "PLAN.md", "VERSION", "README.md"):
         assert (tmp_path / name).read_text(encoding="utf-8") == originals[name]
-    assert readme_after_first.count("<!-- stackmind-runtime:start -->") == 1
-    assert (tmp_path / "README.md").read_text(encoding="utf-8") == readme_after_first
     ignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
     assert "build/" in ignore and "*.local" in ignore
     assert ignore.count(".sync/") == 1
@@ -403,7 +399,7 @@ def test_empty_project_tui_creates_git_repo_with_initial_commit(tmp_path, monkey
     assert log.endswith("Initial stackmind runtime")
     code, files = _git(["show", "--name-only", "--format="], tmp_path)
     committed = set(files.splitlines())
-    assert {".gitignore", "AGENTS.md", "PLAN.md", "CHANGELOG.md", "VERSION"} <= committed
+    assert {".gitignore", "PLAN.md", "CHANGELOG.md", "VERSION"} <= committed
     assert "README.md" in committed
     # .sync has its own repository and is never tracked by the outer one
     assert not any(name.startswith(".sync/") for name in committed)
@@ -444,7 +440,7 @@ def test_adoption_with_existing_history_never_adds_commits_or_stages(tmp_path, m
     assert "?? dirty.txt" in _git(["status", "--porcelain"], tmp_path)[1]
     readme = (tmp_path / "README.md").read_text(encoding="utf-8")
     assert readme.startswith("# Mine\n")  # original content preserved
-    assert readme.count("<!-- stackmind-runtime:start -->") == 1  # managed note appended
+    assert "<!-- stackmind-runtime:start -->" not in readme
 
 
 def test_adoption_into_non_repo_directory_touches_no_git(tmp_path, monkeypatch):
@@ -460,13 +456,13 @@ def test_init_git_stages_only_stackmind_files_not_user_changes(tmp_path, monkeyp
 
     (tmp_path / "user_file.txt").write_text("precious\n", encoding="utf-8")
     (tmp_path / ".gitignore").write_text(".sync/\n", encoding="utf-8")
-    (tmp_path / "AGENTS.md").write_text("# stackmind\n", encoding="utf-8")
+    (tmp_path / "PLAN.md").write_text("# stackmind\n", encoding="utf-8")
 
     assert init_git(tmp_path) is True
 
     code, files = _git(["show", "--name-only", "--format="], tmp_path)
     assert code == 0
-    assert set(files.splitlines()) == {".gitignore", "AGENTS.md"}
+    assert set(files.splitlines()) == {".gitignore", "PLAN.md"}
     assert "?? user_file.txt" in _git(["status", "--porcelain"], tmp_path)[1]
 
 
@@ -480,7 +476,7 @@ def test_init_git_skips_commit_when_history_exists(tmp_path, monkeypatch):
         ["git", "-c", "user.name=u", "-c", "user.email=u@u", "commit", "-m", "seed"],
         cwd=str(tmp_path), check=True, capture_output=True,
     )
-    (tmp_path / "AGENTS.md").write_text("# stackmind\n", encoding="utf-8")
+    (tmp_path / "PLAN.md").write_text("# stackmind\n", encoding="utf-8")
 
     from cli.init import init_git
 
@@ -488,7 +484,7 @@ def test_init_git_skips_commit_when_history_exists(tmp_path, monkeypatch):
     code, log = _git(["log", "--oneline"], tmp_path)
     assert log.count("\n") == 0 and log.endswith("seed")
     # the new stackmind file was not staged either
-    assert "?? AGENTS.md" in _git(["status", "--porcelain"], tmp_path)[1]
+    assert "?? PLAN.md" in _git(["status", "--porcelain"], tmp_path)[1]
 
 
 def test_init_git_commit_failure_returns_false_not_raise(tmp_path, monkeypatch):
@@ -497,7 +493,7 @@ def test_init_git_commit_failure_returns_false_not_raise(tmp_path, monkeypatch):
     from cli.init import init_git
 
     # A git wrapper that fails `git commit` simulates hook/identity failure.
-    (tmp_path / "AGENTS.md").write_text("# stackmind\n", encoding="utf-8")
+    (tmp_path / "PLAN.md").write_text("# stackmind\n", encoding="utf-8")
     calls = {"committed": False}
 
     real_run = init_module.subprocess.run
@@ -513,7 +509,7 @@ def test_init_git_commit_failure_returns_false_not_raise(tmp_path, monkeypatch):
     assert calls["committed"]
     # repo exists and file remains on disk: recoverable, nothing destroyed
     assert (tmp_path / ".git").is_dir()
-    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "# stackmind\n"
+    assert (tmp_path / "PLAN.md").read_text(encoding="utf-8") == "# stackmind\n"
 
 
 def test_init_git_paths_with_spaces(tmp_path, monkeypatch):

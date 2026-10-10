@@ -3,7 +3,6 @@
 Handles:
 - Template rendering ({{PLACEHOLDER}} substitution)
 - Directory structure creation from templates/sync/
-- AGENTS.md rendering to project root
 - Git initialization for both project and .sync repos
 - PROTOCOL_DIGEST.hash generation (SHA-256)
 - RUNTIME_VERSION file creation
@@ -345,7 +344,6 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
 
 STACKMIND_ROOT_FILES = (
     ".gitignore",
-    "AGENTS.md",
     "README.md",
     "PLAN.md",
     "CHANGELOG.md",
@@ -452,10 +450,6 @@ def validate_result(project_path: Path, agents: list[str]) -> list[str]:
     """
     errors: list[str] = []
     sync_path = project_path / ".sync"
-
-    # Required root files
-    if not (project_path / "AGENTS.md").exists():
-        errors.append("Missing: AGENTS.md in project root")
 
     # Required .sync files
     required_sync_files = [
@@ -632,11 +626,8 @@ def init(
         "STACKMIND_BIN_PATH": stackmind_bin.replace("\\", "/"),
     }
 
-    # ── Step 4: Render AGENTS.md and README.md to project root ─
-    agents_template = templates_dir / "AGENTS.template.md"
-    if not preserve_existing or not (project_path / "AGENTS.md").exists():
-        render_template_file(agents_template, project_path / "AGENTS.md", context)
-
+    # ── Step 4: Render product-facing documentation ─
+    # AGENTS.md is internal runtime metadata, stays in .sync/ only
     readme_template = templates_dir / "README.template.md"
     readme_path = project_path / "README.md"
     if readme_template.exists() and (not preserve_existing or not readme_path.exists()):
@@ -645,8 +636,6 @@ def init(
             readme_path,
             context,
         )
-    elif preserve_existing and readme_path.exists():
-        _append_stackmind_readme_section(readme_path)
 
     plan_template = templates_dir / "PLAN.template.md"
     if plan_template.exists() and (
@@ -679,7 +668,7 @@ def init(
         if ".sync/" not in current_gi:
             gitignore_path.write_text(current_gi.rstrip() + "\n\n# Stackmind runtime\n.sync/\ngraphify-out/\n", encoding="utf-8", newline="\n")
 
-    console.print("[bold green][+][/bold green] Rendered AGENTS.md, PLAN.md, CHANGELOG.md, VERSION, .gitignore")
+    console.print("[bold green][+][/bold green] Rendered PLAN.md, CHANGELOG.md, VERSION, .gitignore")
 
     # ── Step 5: Create .sync/ structure ───────────────────────
     sync_path.mkdir(parents=True, exist_ok=True)
@@ -731,9 +720,8 @@ def init(
             f"  Runtime: [dim]{sync_path}[/dim]\n"
             f"  Version: [dim]v{RUNTIME_VERSION}[/dim]\n\n"
             f"[dim]Next steps:[/dim]\n"
-            f"  1. Review [bold]AGENTS.md[/bold] in project root\n"
-            f"  2. Customize agent contracts in [bold].sync/agents/[/bold]\n"
-            f"  3. Run [bold]stackmind validate {project_path}[/bold] to verify",
+            f"  1. Customize agent contracts in [bold].sync/agents/[/bold]\n"
+            f"  2. Run [bold]stackmind validate {project_path}[/bold] to verify",
             title="[bold] stackmind [/bold]",
             border_style="green",
         )
