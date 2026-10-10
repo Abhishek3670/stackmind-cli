@@ -371,3 +371,156 @@ def test_workspace_argument_rejects_a_file(tmp_path):
     result = CliRunner().invoke(cli, ["tui", "--workspace", str(target)])
     assert result.exit_code == 2
     assert "Directory" in result.output
+
+
+# ── Git initialization contract ──────────────────────────────────
+
+
+def _git(args: list[str], cwd) -> tuple[int, str]:
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env={
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(cwd),
+        },
+    )
+    return completed.returncode, completed.stdout.strip()
+
+
+def test_empty_project_tui_creates_git_repo_with_initial_commit(tmp_path, monkeypatch):
+    _disable_graph_build(monkeypatch)
+    startup.prepare_project(tmp_path, yes=False, interactive=False)
+
+    assert (tmp_path / ".git").is_dir()
+    code, log = _git(["log", "--oneline"], tmp_path)
+    assert code == 0
+    assert log.endswith("Initial stackmind runtime")
+    code, files = _git(["show", "--name-only", "--format="], tmp_path)
+    committed = set(files.splitlines())
+    assert {".gitignore", "AGENTS.md", "PLAN.md", "CHANGELOG.md", "VERSION"} <= committed
+    assert "README.md" in committed
+    # .sync has its own repository and is never tracked by the outer one
+    assert not any(name.startswith(".sync/") for name in committed)
+    assert (_git(["-C", ".sync", "log", "--oneline"], tmp_path)[0]) == 0
+
+
+def test_repeated_tui_runs_do_not_create_redundant_commits(tmp_path, monkeypatch):
+    _disable_graph_build(monkeypatch)
+    startup.prepare_project(tmp_path, yes=False, interactive=False)
+    first_count = int(_git(["rev-list", "--count", "HEAD"], tmp_path)[1])
+
+    (tmp_path / "user_note.txt").write_text("mine\n", encoding="utf-8")
+    startup.prepare_project(tmp_path, yes=False, interactive=False)
+
+    assert int(_git(["rev-list", "--count", "HEAD"], tmp_path)[1]) == first_count
+    status = _git(["status", "--porcelain"], tmp_path)[1]
+    assert "?? user_note.txt" in status  # user files never staged
+
+
+def test_adoption_with_existing_history_never_adds_commits_or_stages(tmp_path, monkeypatch):
+    import subprocess
+
+    (tmp_path / "README.md").write_text("# Mine\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "add", "README.md"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=u", "-c", "user.email=u@u", "commit", "-m", "user history"],
+        cwd=str(tmp_path), check=True, capture_output=True,
+    )
+    (tmp_path / "dirty.txt").write_text("unstaged work\n", encoding="utf-8")
+
+    _disable_graph_build(monkeypatch)
+    startup.prepare_project(tmp_path, yes=True, interactive=False)
+
+    code, log = _git(["log", "--oneline"], tmp_path)
+    assert code == 0
+    assert log.count("\n") == 0 and log.endswith("user history")
+    assert "?? dirty.txt" in _git(["status", "--porcelain"], tmp_path)[1]
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("# Mine\n")  # original content preserved
+    assert readme.count("<!-- stackmind-runtime:start -->") == 1  # managed note appended
+
+
+def test_adoption_into_non_repo_directory_touches_no_git(tmp_path, monkeypatch):
+    (tmp_path / "README.md").write_text("# Mine\n", encoding="utf-8")
+    _disable_graph_build(monkeypatch)
+    startup.prepare_project(tmp_path, yes=True, interactive=False)
+    assert not (tmp_path / ".git").exists()
+    assert (tmp_path / ".sync").is_dir()
+
+
+def test_init_git_stages_only_stackmind_files_not_user_changes(tmp_path, monkeypatch):
+    from cli.init import init_git
+
+    (tmp_path / "user_file.txt").write_text("precious\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".sync/\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("# stackmind\n", encoding="utf-8")
+
+    assert init_git(tmp_path) is True
+
+    code, files = _git(["show", "--name-only", "--format="], tmp_path)
+    assert code == 0
+    assert set(files.splitlines()) == {".gitignore", "AGENTS.md"}
+    assert "?? user_file.txt" in _git(["status", "--porcelain"], tmp_path)[1]
+
+
+def test_init_git_skips_commit_when_history_exists(tmp_path, monkeypatch):
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=u", "-c", "user.email=u@u", "commit", "-m", "seed"],
+        cwd=str(tmp_path), check=True, capture_output=True,
+    )
+    (tmp_path / "AGENTS.md").write_text("# stackmind\n", encoding="utf-8")
+
+    from cli.init import init_git
+
+    assert init_git(tmp_path) is True
+    code, log = _git(["log", "--oneline"], tmp_path)
+    assert log.count("\n") == 0 and log.endswith("seed")
+    # the new stackmind file was not staged either
+    assert "?? AGENTS.md" in _git(["status", "--porcelain"], tmp_path)[1]
+
+
+def test_init_git_commit_failure_returns_false_not_raise(tmp_path, monkeypatch):
+    from cli.init import init as _unused
+    import cli.init as init_module
+    from cli.init import init_git
+
+    # A git wrapper that fails `git commit` simulates hook/identity failure.
+    (tmp_path / "AGENTS.md").write_text("# stackmind\n", encoding="utf-8")
+    calls = {"committed": False}
+
+    real_run = init_module.subprocess.run
+
+    def failing_commit(args, **kwargs):
+        if args[:2] == ["git", "commit"]:
+            calls["committed"] = True
+            raise init_module.subprocess.CalledProcessError(1, args)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(init_module.subprocess, "run", failing_commit)
+    assert init_git(tmp_path) is False
+    assert calls["committed"]
+    # repo exists and file remains on disk: recoverable, nothing destroyed
+    assert (tmp_path / ".git").is_dir()
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "# stackmind\n"
+
+
+def test_init_git_paths_with_spaces(tmp_path, monkeypatch):
+    project = tmp_path / "my spaced project"
+    project.mkdir()
+    _disable_graph_build(monkeypatch)
+    startup.prepare_project(project, yes=False, interactive=False)
+    code, log = _git(["log", "--oneline"], project)
+    assert code == 0
+    assert log.endswith("Initial stackmind runtime")

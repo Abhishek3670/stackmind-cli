@@ -343,12 +343,24 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
         pass
 
 
+STACKMIND_ROOT_FILES = (
+    ".gitignore",
+    "AGENTS.md",
+    "README.md",
+    "PLAN.md",
+    "CHANGELOG.md",
+    "VERSION",
+)
+
+
 def init_git(path: Path, initial_commit: bool = True) -> bool:
     """Initialize a git repository at the given path.
 
     Args:
         path: Directory to initialize as a git repo.
-        initial_commit: If True, create an initial commit.
+        initial_commit: If True, create an initial commit of the StackMind
+            files only, and only when the repository has no commits yet.
+            Existing user files and history are never staged or rewritten.
 
     Returns:
         True if git init succeeded, False otherwise.
@@ -363,20 +375,48 @@ def init_git(path: Path, initial_commit: bool = True) -> bool:
         )
 
         if initial_commit:
-            subprocess.run(
-                ["git", "add", "."],
+            # Only the very first commit is created here; repositories with
+            # existing history are left untouched.
+            has_commits = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
                 cwd=str(path),
                 capture_output=True,
-                check=True,
+                check=False,
                 text=True,
-            )
-            # Ensure .sync is never staged into the outer repository
-            if (path / ".sync").exists() and path.name != ".sync":
+            ).returncode == 0
+            if has_commits:
+                return True
+            if path.name != ".sync":
+                # Stage only the StackMind-rendered root files so pre-existing
+                # user files are never swept into the initialization commit.
+                # (.sync/ is ignored via .gitignore; the .sync repo is separate.)
+                # Clear any pre-existing staged changes so only stackmind files are committed.
                 subprocess.run(
-                    ["git", "reset", ".sync"],
+                    ["git", "reset"],
                     cwd=str(path),
                     capture_output=True,
                     check=False,
+                    text=True,
+                )
+                existing = [f for f in STACKMIND_ROOT_FILES if (path / f).is_file()]
+                if not existing:
+                    return True
+                subprocess.run(
+                    ["git", "add", "--", *existing],
+                    cwd=str(path),
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                )
+            else:
+                # Clear any pre-existing staged changes so only stackmind files are committed.
+                subprocess.run(["git", "reset"], cwd=str(path), capture_output=True, check=False, text=True)
+                subprocess.run(
+                    ["git", "add", "."],
+                    cwd=str(path),
+                    capture_output=True,
+                    check=True,
+                    text=True,
                 )
             subprocess.run(
                 ["git", "commit", "-m", "Initial stackmind runtime"],

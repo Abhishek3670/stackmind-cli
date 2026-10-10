@@ -65,9 +65,12 @@ def prepare_project(workspace: Path, *, yes: bool, interactive: bool) -> None:
                     raise click.ClickException("Project adoption cancelled.")
         click.echo("Preparing StackMind runtime...")
         try:
+            # Adoption keeps git untouched (never init or commit inside a
+            # project we do not own); an empty directory gets the same git
+            # initialization and initial commit as `stackmind init`.
             initialized = initialize(
                 project_path=workspace,
-                no_git=True,
+                no_git=(state == "adopt"),
                 preserve_existing=(state == "adopt"),
             )
         except (RuntimeError, FileNotFoundError, OSError, UnicodeError) as exc:
