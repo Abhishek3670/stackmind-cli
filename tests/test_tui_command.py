@@ -194,7 +194,7 @@ def test_tui_with_explicit_daemon_url(tmp_path: Path):
         user_inputs = ":status\n:exit\n"
         result = CliRunner().invoke(
             cli,
-            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path), "--yes"],
             input=user_inputs,
         )
         assert result.exit_code == 0, result.output

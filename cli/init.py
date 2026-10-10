@@ -508,6 +508,7 @@ def init(
     name: Optional[str] = None,
     agents: Optional[list[str]] = None,
     no_git: bool = False,
+    preserve_existing: bool = False,
 ) -> bool:
     """Initialize a new stackmind runtime at the given path.
 
@@ -518,6 +519,9 @@ def init(
         name: Project name. Defaults to directory name.
         agents: List of agent names. Defaults to all 5 agents.
         no_git: If True, skip git initialization.
+        preserve_existing: If True, create only missing project-root files and
+            merge StackMind ignore entries into an existing .gitignore. This is
+            intended for adoption by ``stackmind tui``; .sync must still be absent.
 
     Returns:
         True if initialization succeeded, False otherwise.
@@ -590,36 +594,44 @@ def init(
 
     # ── Step 4: Render AGENTS.md and README.md to project root ─
     agents_template = templates_dir / "AGENTS.template.md"
-    render_template_file(
-        agents_template,
-        project_path / "AGENTS.md",
-        context,
-    )
+    if not preserve_existing or not (project_path / "AGENTS.md").exists():
+        render_template_file(agents_template, project_path / "AGENTS.md", context)
 
     readme_template = templates_dir / "README.template.md"
-    if readme_template.exists():
+    readme_path = project_path / "README.md"
+    if readme_template.exists() and (not preserve_existing or not readme_path.exists()):
         render_template_file(
             readme_template,
-            project_path / "README.md",
+            readme_path,
             context,
         )
-        
+    elif preserve_existing and readme_path.exists():
+        _append_stackmind_readme_section(readme_path)
+
     plan_template = templates_dir / "PLAN.template.md"
-    if plan_template.exists():
+    if plan_template.exists() and (
+        not preserve_existing or not (project_path / "PLAN.md").exists()
+    ):
         render_template_file(plan_template, project_path / "PLAN.md", context)
-        
+
     changelog_template = templates_dir / "CHANGELOG.template.md"
-    if changelog_template.exists():
+    if changelog_template.exists() and (
+        not preserve_existing or not (project_path / "CHANGELOG.md").exists()
+    ):
         render_template_file(changelog_template, project_path / "CHANGELOG.md", context)
-        
+
     version_template = templates_dir / "VERSION.template"
-    if version_template.exists():
+    if version_template.exists() and (
+        not preserve_existing or not (project_path / "VERSION").exists()
+    ):
         render_template_file(version_template, project_path / "VERSION", context)
 
     gitignore_template = templates_dir / ".gitignore.template"
     gitignore_path = project_path / ".gitignore"
-    if gitignore_template.exists():
+    if gitignore_template.exists() and (not preserve_existing or not gitignore_path.exists()):
         render_template_file(gitignore_template, gitignore_path, context)
+    elif preserve_existing and gitignore_path.exists():
+        _merge_stackmind_gitignore(gitignore_path)
     elif not gitignore_path.exists():
         gitignore_path.write_text(".sync/\ngraphify-out/\n", encoding="utf-8", newline="\n")
     else:
@@ -688,3 +700,47 @@ def init(
     )
 
     return True
+
+
+def _append_stackmind_readme_section(path: Path) -> None:
+    """Add a small managed adoption note once, preserving existing README text."""
+    marker = "<!-- stackmind-runtime:start -->"
+    content, encoding = _read_preserving_text(path)
+    if marker in content:
+        return
+    section = (
+        "## StackMind Runtime\n\n"
+        "This project uses StackMind for its governed agent runtime. Run "
+        "`stackmind tui` to validate the runtime, refresh the project knowledge "
+        "graph when needed, and start the terminal interface.\n"
+    )
+    newline = "\r\n" if "\r\n" in content else "\n"
+    section = section.replace("\n", newline)
+    separator = "" if not content or content.endswith(("\n", "\r")) else newline * 2
+    block = marker + newline + section + "<!-- stackmind-runtime:end -->" + newline
+    path.write_text(content + separator + block, encoding=encoding, newline="")
+
+
+def _merge_stackmind_gitignore(path: Path) -> None:
+    """Append only missing runtime ignore entries without removing user patterns."""
+    content, encoding = _read_preserving_text(path)
+    lines = content.splitlines()
+    additions = [entry for entry in (".sync/", "graphify-out/") if entry not in lines]
+    if not additions:
+        return
+    newline = "\r\n" if "\r\n" in content else "\n"
+    separator = "" if not content or content.endswith(("\n", "\r")) else newline * 2
+    merged = content + separator + newline.join(additions) + newline
+    path.write_text(merged, encoding=encoding, newline="")
+
+
+def _read_preserving_text(path: Path) -> tuple[str, str]:
+    """Read common Unicode encodings while retaining BOM/encoding on write."""
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        encoding = "utf-8"
+    return raw.decode(encoding), encoding
