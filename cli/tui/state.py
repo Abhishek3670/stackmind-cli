@@ -186,11 +186,36 @@ class ActionsGroup:
         status: str = "COMPLETED",
         duration_seconds: float | None = None,
         error: str | None = None,
+        tool_name: str | None = None,
     ) -> TurnAction | None:
         if status.upper() in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}:
             self.expanded = True
-        for a in self.actions:
-            if a.action_id == action_id:
+        # 1. Match exact action_id if provided
+        if action_id:
+            for a in self.actions:
+                if a.action_id == action_id:
+                    a.status = status
+                    if duration_seconds is not None:
+                        a.duration_seconds = duration_seconds
+                    if error is not None:
+                        a.error = error
+                    return a
+        # 2. Match by tool_name in description or action_id
+        if tool_name:
+            norm_tool = tool_name.lower().replace("_", " ")
+            for a in reversed(self.actions):
+                if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                    desc_norm = a.description.lower().replace("_", " ")
+                    if norm_tool in desc_norm or tool_name.lower() in a.action_id.lower():
+                        a.status = status
+                        if duration_seconds is not None:
+                            a.duration_seconds = duration_seconds
+                        if error is not None:
+                            a.error = error
+                        return a
+        # 3. Fallback: match most recent in-flight action
+        for a in reversed(self.actions):
+            if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
                 a.status = status
                 if duration_seconds is not None:
                     a.duration_seconds = duration_seconds
@@ -198,14 +223,21 @@ class ActionsGroup:
                     a.error = error
                 return a
         act = TurnAction(
-            action_id=action_id,
-            description=action_id,
+            action_id=action_id or f"act-{len(self.actions)+1}",
+            description=tool_name or action_id or "Action",
             status=status,
             duration_seconds=duration_seconds,
             error=error,
         )
         self.actions.append(act)
         return act
+
+    def complete_all(self, status: str = "COMPLETED") -> None:
+        """Complete all in-flight actions and mark group inactive."""
+        self.active = False
+        for a in self.actions:
+            if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                a.status = status
 
     def toggle(self) -> bool:
         """Toggle disclosure expansion (§22, §23)."""
@@ -543,10 +575,12 @@ class AutonomousDeliveryState:
 
         msg_actions = actions
         if role == "assistant":
+            from cli.tui.chat import format_contract_payload
+            msg_content = format_contract_payload(msg_content)
             if msg_actions is None and self.current_turn_actions and not self.current_turn_actions.is_empty:
                 msg_actions = self.current_turn_actions
             if msg_actions is not None:
-                msg_actions.active = False
+                msg_actions.complete_all()
             if msg_actions is self.current_turn_actions:
                 self.current_turn_actions = ActionsGroup(active=False)
 
@@ -611,6 +645,7 @@ class AutonomousDeliveryState:
         status: str = "COMPLETED",
         duration_seconds: float | None = None,
         error: str | None = None,
+        tool_name: str | None = None,
     ) -> TurnAction | None:
         """Complete a turn action in-place (§21)."""
         act = self.current_turn_actions.complete_action(
@@ -618,6 +653,7 @@ class AutonomousDeliveryState:
             status=status,
             duration_seconds=duration_seconds,
             error=error,
+            tool_name=tool_name,
         )
         if self.messages and self.messages[-1].role == "assistant":
             if self.messages[-1].actions is None:
@@ -785,6 +821,17 @@ class AutonomousDeliveryState:
         if not isinstance(wo_records, list):
             return
         items = []
+        completed_ids = {
+            str(r.get("id") or r.get("wo_id"))
+            for r in wo_records
+            if isinstance(r, Mapping) and str(r.get("status", "")).upper() == "COMPLETED"
+        }
+        running_op_wos = {
+            getattr(op, "work_order_id", None) or op.name
+            for op in self.operations.values()
+            if op.status == "RUNNING"
+        }
+        first_runnable = None
         for r in wo_records:
             if not isinstance(r, Mapping):
                 continue
@@ -793,7 +840,21 @@ class AutonomousDeliveryState:
             agents = r.get("assigned_agents")
             role = agents[0].title() if isinstance(agents, list) and agents else "Backend"
             priority = str(r.get("priority", "P0"))
-            status = str(r.get("status", "WAITING"))
+            raw_st = str(r.get("status", "WAITING")).upper()
+            deps = r.get("dependencies") or []
+            if raw_st in {"COMPLETED", "BLOCKED", "CANCELLED"}:
+                status = raw_st
+            else:
+                has_unmet_deps = isinstance(deps, list) and any(d not in completed_ids for d in deps)
+                if has_unmet_deps:
+                    status = "WAITING"
+                elif wo_id in running_op_wos:
+                    status = "RUNNING"
+                elif first_runnable is None:
+                    first_runnable = wo_id
+                    status = "RUNNING"
+                else:
+                    status = "WAITING"
             items.append(WorkOrderItem(wo_id, title, role=role, priority=priority, status=status))
         if items:
             self.work_orders = items
@@ -866,6 +927,35 @@ class AutonomousDeliveryState:
 
             if not disk_statuses and not disk_orders:
                 return
+
+            # Compute effective statuses using dependencies and running operations
+            completed_ids = {oid for oid, st in disk_statuses.items() if st == "COMPLETED"}
+            running_op_wos = {
+                getattr(op, "work_order_id", None) or op.name
+                for op in self.operations.values()
+                if op.status == "RUNNING"
+            }
+            active_candidates = [
+                oid for oid in sorted(disk_orders.keys())
+                if disk_statuses.get(oid) not in {"COMPLETED", "BLOCKED", "CANCELLED"}
+            ]
+
+            first_runnable = None
+            for oid in active_candidates:
+                o = disk_orders[oid]
+                deps = o.get("dependencies") or []
+                has_unmet_deps = isinstance(deps, list) and any(
+                    dep in disk_orders and dep not in completed_ids for dep in deps
+                )
+                if has_unmet_deps:
+                    disk_statuses[oid] = "WAITING"
+                elif oid in running_op_wos:
+                    disk_statuses[oid] = "RUNNING"
+                elif first_runnable is None:
+                    first_runnable = oid
+                    disk_statuses[oid] = "RUNNING"
+                else:
+                    disk_statuses[oid] = "WAITING"
 
             default_titles = {
                 "Architecture & Orchestration",
@@ -1137,17 +1227,18 @@ class AutonomousDeliveryState:
                 self.plan["approval_reason"] = payload.get("reason", "")
             if self.plan_revisions:
                 self.plan_revisions[-1].state = "APPROVED"
-            # Update roles to implementing
-            if "Backend" in self.roles:
-                self.roles["Backend"].state = "RUNNING"
-            if "Frontend" in self.roles:
-                self.roles["Frontend"].state = "RUNNING"
-            if "Q/A" in self.roles:
-                self.roles["Q/A"].state = "WAITING"
             # Sync created work orders
             created_records = payload.get("created_records") or payload.get("work_orders")
             if isinstance(created_records, list) and created_records and isinstance(created_records[0], Mapping):
                 self.sync_work_orders(created_records)
+            first_role = self.work_orders[0].role if self.work_orders else "Backend"
+            for r_name, r_obj in self.roles.items():
+                if r_name.lower() in {"architecture", "lead"}:
+                    r_obj.state = "RUNNING"
+                elif r_name.lower() == first_role.lower():
+                    r_obj.state = "RUNNING"
+                else:
+                    r_obj.state = "WAITING"
             self.add_activity("Architecture", f"plan approved: {plan_id}")
 
         elif name == "plan.rejected":
@@ -1213,6 +1304,7 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, "started", op_name or (wo_id or ""))
 
         elif name in {"operation.completed", "turn.completed"}:
+            self.current_turn_actions.complete_all()
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -1339,7 +1431,7 @@ class AutonomousDeliveryState:
             err = clean_error_message(payload.get("error")) if payload.get("error") else None
             if norm_status in {"FAILED", "BLOCKED"}:
                 self.current_turn_actions.expanded = True
-            self.complete_turn_action(call_id, status=norm_status, error=err)
+            self.complete_turn_action(call_id, status=norm_status, error=err, tool_name=tool_name)
 
         elif name in {"agent.thinking", "turn.thinking", "reasoning.delta"}:
             raw_think = payload.get("text") or payload.get("thinking") or payload.get("thought") or payload.get("reasoning") or payload.get("delta") or ""

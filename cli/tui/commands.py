@@ -184,6 +184,10 @@ def get_status_str(
 
     parts = []
 
+    sid = session.get("session_id") or (getattr(state, "session_id", None) if state else None)
+    if sid:
+        parts.append(f"Session: {sid}")
+
     if state is not None:
         run_state = _compute_run_state(state)
         progress_done, progress_total = _compute_progress(state)
@@ -1793,6 +1797,8 @@ def dispatch_delivery_command(
         else:
             click.echo(err_box)
     finally:
+        if hasattr(state, "current_turn_actions") and state.current_turn_actions:
+            state.current_turn_actions.complete_all()
         if live_manager is not None and not getattr(live_manager, "is_active", False):
             live_manager.start(include_composer=False)
     restore_composer_focus(state)

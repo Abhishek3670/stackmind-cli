@@ -93,10 +93,87 @@ def _set_cached_render(cache_key: str, rendered: str) -> None:
 # ─── Message Rendering Helpers ──────────────────────────────────────────────
 
 
+def format_contract_payload(content: str) -> str:
+    """Detect and format raw task contract completion JSON into clean assistant text.
+
+    If content is pure contract JSON (e.g. {"status": "completed", "modified_files": ["PLAN.md"]}),
+    converts it into a human-readable summary. If conversational commentary exists before the
+    contract JSON, the trailing technical JSON block is cleanly stripped.
+    """
+    if not content or not isinstance(content, str):
+        return content
+
+    text = content.strip()
+
+    # Check for markdown code fences wrapping JSON
+    unfenced = text
+    if unfenced.startswith("```"):
+        _, _, rest = unfenced.partition("\n")
+        if "```" in rest:
+            body, _, _ = rest.rpartition("```")
+            unfenced = body.strip()
+
+    def _is_contract_dict(d: Any) -> bool:
+        if not isinstance(d, dict):
+            return False
+        st = d.get("status")
+        return isinstance(st, str) and (
+            "modified_files" in d or "blockers" in d or "decision" in d
+        )
+
+    def _format_dict(d: dict[str, Any]) -> str:
+        st = str(d.get("status", "")).lower()
+        mods = d.get("modified_files") or []
+        blockers = d.get("blockers") or []
+        if st in {"completed", "success", "done"}:
+            if mods:
+                files_str = ", ".join(f"`{f}`" for f in mods)
+                if any("PLAN.md" in str(f) for f in mods):
+                    return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                return f"Completed turn. Modified files: {files_str}."
+            return "Completed turn via tools."
+        if st in {"blocked", "failed", "cancelled"}:
+            if blockers:
+                b_str = "; ".join(str(b) for b in blockers)
+                return f"Turn {st}: {b_str}"
+            reason = d.get("reason") or d.get("error") or "No details provided"
+            return f"Turn {st}: {reason}"
+        return text
+
+    if unfenced.startswith("{") and unfenced.endswith("}"):
+        try:
+            import json
+            parsed = json.loads(unfenced)
+            if _is_contract_dict(parsed):
+                return _format_dict(parsed)
+        except Exception:
+            pass
+
+    # Check if text ends with a JSON block after conversational text
+    match = re.search(r"\n*```(?:json)?\s*(\{[\s\S]*?\})\s*```\s*$", text)
+    if not match:
+        match = re.search(r"\n*(\{[\s\S]*?\})\s*$", text)
+    if match:
+        json_candidate = match.group(1).strip()
+        try:
+            import json
+            parsed = json.loads(json_candidate)
+            if _is_contract_dict(parsed):
+                leading_text = text[:match.start()].strip()
+                if leading_text:
+                    return leading_text
+                return _format_dict(parsed)
+        except Exception:
+            pass
+
+    return text
+
+
 def strip_internal_reasoning(content: str) -> str:
     """Remove provider-delimited private reasoning without altering final Markdown."""
     clean = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", content, flags=re.IGNORECASE | re.DOTALL)
-    return re.sub(r"<think\b[^>]*>.*$", "", clean, flags=re.IGNORECASE | re.DOTALL).strip()
+    clean = re.sub(r"<think\b[^>]*>.*$", "", clean, flags=re.IGNORECASE | re.DOTALL).strip()
+    return format_contract_payload(clean)
 
 
 def extract_internal_reasoning(content: str) -> str | None:

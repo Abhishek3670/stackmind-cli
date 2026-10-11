@@ -386,6 +386,13 @@ def extract_assistant_response(
     # 1. Inspect direct result dict
     result = payload.get("result")
     if isinstance(result, Mapping):
+        if "status" in result and ("modified_files" in result or "blockers" in result):
+            import json
+            try:
+                return clean_response(json.dumps(dict(result)))
+            except Exception:
+                pass
+
         report_path_raw = result.get("report_path")
         if report_path_raw:
             report_path = Path(report_path_raw)
