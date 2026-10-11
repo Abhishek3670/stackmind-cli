@@ -254,17 +254,21 @@ class AuthoringGate:
         if isinstance(existing_data, dict) and isinstance(data, dict) and existing_data == data:
             return
 
-        # Bootstrap-synthesized artifacts are scaffolding: an authorized
-        # author (Architect/CEO) may supersede them with the real authored
-        # artifact. Workers never reach this check (role gate runs first).
-        if (
-            isinstance(existing_data, dict)
-            and str(existing_data.get("synthesized_by", "")) == "bootstrap"
-            and str(author or "").lower() in self.AUTHORIZED_AUTHORS
-        ):
-            return
+        # Scaffolding or repair artifacts: an authorized author (Architect/CEO)
+        # may supersede synthesized artifacts or amend contracts with incremented revision.
+        # Workers never reach this check (role gate runs first).
+        if str(author or "").lower() in self.AUTHORIZED_AUTHORS and isinstance(existing_data, dict):
+            existing_synth = str(existing_data.get("synthesized_by", "")).lower()
+            new_synth = str(data.get("synthesized_by", "") if isinstance(data, dict) else "").lower()
+            if existing_synth in {"bootstrap", "recovery-repair"} or new_synth in {"bootstrap", "recovery-repair"}:
+                return
+            if is_contract and isinstance(data, dict):
+                existing_rev = existing_data.get("contract_revision", 1)
+                new_rev = data.get("contract_revision")
+                if isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev:
+                    return
 
-        # Conflict: attempting to overwrite an active artifact with different content
+        # Conflict: attempting to overwrite an active artifact from another task or unauthorized update
         artifact_label = "work order" if is_active_wo else "contract"
         errors.append(
             f"Overwrite conflict: active {artifact_label} '{norm_path}' already exists on disk "

@@ -782,3 +782,65 @@ def test_bootstrap_synthesized_artifact_may_be_superseded_by_architect(tmp_path)
     )
     assert not second_pass.passed
     assert any("Overwrite conflict" in e for e in second_pass.errors)
+
+
+def test_authoring_gate_allows_recovery_repair_contract_overwrite(tmp_path: Path):
+    """AuthoringGate allows Architect to supersede transitional recovery-repair contracts."""
+    contract_dir = tmp_path / ".sync" / "contracts"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    repair_contract = {
+        "schema_version": 1,
+        "agent_id": "claude",
+        "work_order": "WO-002",
+        "identity": {"role": "architecture", "reports_to": "ceo"},
+        "scope": {"allow": [{"module": "index.html"}], "deny": [{"module": ".git/**"}], "write": "read-write"},
+        "budget": {"max_files_touched": 10, "max_tokens": 50000},
+        "synthesized_by": "recovery-repair",
+    }
+    (contract_dir / "WO-002.yaml").write_text(yaml.safe_dump(repair_contract, sort_keys=False), encoding="utf-8")
+
+    gate = AuthoringGate(project_root=tmp_path)
+    amended = {
+        "schema_version": 1,
+        "agent_id": "gemini",
+        "work_order": "WO-002",
+        "contract_revision": 2,
+        "guidelines": ["Provide alt tags on all img elements"],
+        "identity": {"role": "frontend", "reports_to": "claude"},
+        "scope": {"allow": [{"module": "index.html"}, {"module": "css/**"}], "deny": [{"module": ".git/**"}], "write": "read-write"},
+        "budget": {"max_files_touched": 10, "max_tokens": 50000},
+    }
+    decision = gate.validate_artifact_content(
+        ".sync/contracts/WO-002.yaml",
+        yaml.safe_dump(amended, sort_keys=False),
+        agent="claude",
+    )
+    assert decision.passed, decision.errors
+
+
+def test_authoring_gate_allows_contract_revision_increment_overwrite(tmp_path: Path):
+    """AuthoringGate allows amending an existing contract when contract_revision is incremented."""
+    contract_dir = tmp_path / ".sync" / "contracts"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    orig_contract = {
+        "schema_version": 1,
+        "agent_id": "gemini",
+        "work_order": "WO-002",
+        "contract_revision": 1,
+        "identity": {"role": "frontend", "reports_to": "claude"},
+        "scope": {"allow": [{"module": "index.html"}], "deny": [{"module": ".git/**"}], "write": "read-write"},
+        "budget": {"max_files_touched": 5, "max_tokens": 30000},
+    }
+    (contract_dir / "WO-002.yaml").write_text(yaml.safe_dump(orig_contract, sort_keys=False), encoding="utf-8")
+
+    gate = AuthoringGate(project_root=tmp_path)
+    amended = dict(orig_contract)
+    amended["contract_revision"] = 2
+    amended["budget"] = {"max_files_touched": 10, "max_tokens": 50000}
+    decision = gate.validate_artifact_content(
+        ".sync/contracts/WO-002.yaml",
+        yaml.safe_dump(amended, sort_keys=False),
+        agent="claude",
+    )
+    assert decision.passed, decision.errors
+

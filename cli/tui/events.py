@@ -386,12 +386,13 @@ def extract_assistant_response(
     # 1. Inspect direct result dict
     result = payload.get("result")
     if isinstance(result, Mapping):
-        if "status" in result and ("modified_files" in result or "blockers" in result):
-            import json
-            try:
-                return clean_response(json.dumps(dict(result)))
-            except Exception:
-                pass
+        review_notes = result.get("review_notes")
+        verdict = result.get("verdict")
+        if review_notes and isinstance(review_notes, str) and review_notes.strip():
+            clean_rn = review_notes.strip()
+            if verdict:
+                return clean_response(f"### QA Verdict: {verdict}\n\n{clean_rn}")
+            return clean_response(clean_rn)
 
         report_path_raw = result.get("report_path")
         if report_path_raw:
@@ -425,8 +426,11 @@ def extract_assistant_response(
         if response and isinstance(response, str) and response.strip():
             return clean_response(response)
 
-        reason = result.get("reason")
+        reason = result.get("reason") or result.get("error")
         if reason and isinstance(reason, str) and reason.strip():
+            st = str(result.get("status", "")).lower()
+            if st in {"blocked", "failed", "cancelled"}:
+                return clean_response(f"Turn {st}: {reason.strip()}")
             return clean_response(reason)
 
         message = result.get("message")
@@ -440,6 +444,31 @@ def extract_assistant_response(
         output = result.get("output")
         if output and isinstance(output, str) and output.strip():
             return clean_response(output)
+
+        mods = result.get("modified_files")
+        if isinstance(mods, list) and mods:
+            files_str = ", ".join(f"`{f}`" for f in mods)
+            if any("PLAN.md" in str(f) for f in mods):
+                return clean_response(
+                    f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                )
+            return clean_response(f"Completed turn. Modified files: {files_str}.")
+
+        blockers = result.get("blockers")
+        if isinstance(blockers, list) and blockers:
+            b_str = "; ".join(str(b) for b in blockers)
+            st = str(result.get("status", "blocked")).lower()
+            return clean_response(f"Turn {st}: {b_str}")
+
+        if verdict and isinstance(verdict, str) and verdict.strip():
+            return clean_response(f"### QA Verdict: {verdict.strip()}")
+
+        st_val = result.get("status")
+        if isinstance(st_val, str) and st_val.strip():
+            s_low = st_val.lower().strip()
+            if s_low in {"completed", "success", "done"}:
+                return clean_response("Completed turn via tools.")
+            return clean_response(f"Turn {s_low}.")
 
     # 2. Inspect direct payload keys
     if isinstance(payload.get("response"), str) and payload["response"].strip():
@@ -648,7 +677,8 @@ class OperationalEventManager:
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
-                state.add_message("assistant", assistant_response, thinking=assistant_thinking)
+                acts = self.current_actions if not self.current_actions.is_empty else None
+                state.add_message("assistant", assistant_response, actions=acts, thinking=assistant_thinking)
 
             return render_tool_activity(activity), assistant_response
 
@@ -658,7 +688,8 @@ class OperationalEventManager:
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
-                state.add_message("assistant", assistant_response, thinking=assistant_thinking)
+                acts = self.current_actions if not self.current_actions.is_empty else None
+                state.add_message("assistant", assistant_response, actions=acts, thinking=assistant_thinking)
 
         return render_operational_event(event), assistant_response
 

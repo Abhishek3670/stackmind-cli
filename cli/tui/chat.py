@@ -116,12 +116,36 @@ def format_contract_payload(content: str) -> str:
     def _is_contract_dict(d: Any) -> bool:
         if not isinstance(d, dict):
             return False
-        st = d.get("status")
-        return isinstance(st, str) and (
-            "modified_files" in d or "blockers" in d or "decision" in d
+        return (
+            "status" in d
+            or "verdict" in d
+            or "modified_files" in d
+            or "blockers" in d
+            or "decision" in d
+            or "review_notes" in d
         )
 
     def _format_dict(d: dict[str, Any]) -> str:
+        verdict = d.get("verdict")
+        review_notes = d.get("review_notes")
+        if review_notes and isinstance(review_notes, str) and review_notes.strip():
+            clean_rn = review_notes.strip()
+            if verdict:
+                return f"### QA Verdict: {verdict}\n\n{clean_rn}"
+            return clean_rn
+
+        report_md = d.get("report_markdown")
+        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
+            return report_md.strip()
+
+        summary = d.get("summary")
+        if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
+            return summary.strip()
+
+        response = d.get("response")
+        if response and isinstance(response, str) and response.strip():
+            return response.strip()
+
         st = str(d.get("status", "")).lower()
         mods = d.get("modified_files") or []
         blockers = d.get("blockers") or []
@@ -131,6 +155,8 @@ def format_contract_payload(content: str) -> str:
                 if any("PLAN.md" in str(f) for f in mods):
                     return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
                 return f"Completed turn. Modified files: {files_str}."
+            if verdict:
+                return f"### QA Verdict: {verdict}"
             return "Completed turn via tools."
         if st in {"blocked", "failed", "cancelled"}:
             if blockers:
@@ -138,6 +164,11 @@ def format_contract_payload(content: str) -> str:
                 return f"Turn {st}: {b_str}"
             reason = d.get("reason") or d.get("error") or "No details provided"
             return f"Turn {st}: {reason}"
+        if verdict:
+            return f"### QA Verdict: {verdict}"
+        if "reason" in d or "error" in d:
+            reason = d.get("reason") or d.get("error")
+            return str(reason)
         return text
 
     if unfenced.startswith("{") and unfenced.endswith("}"):

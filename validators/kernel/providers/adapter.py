@@ -246,6 +246,9 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         payload = self._prepare_payload(messages, tools, stream=True, **kwargs)
         raw_stream = self._execute_request(payload, stream=True, timeout=timeout, cancellation_token=cancellation_token)
 
+        if isinstance(raw_stream, dict):
+            raw_stream = [raw_stream]
+
         if isinstance(raw_stream, (list, tuple, Iterator)):
             for item in raw_stream:
                 self._check_cancellation(cancellation_token)
@@ -286,7 +289,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         if choices:
             first = choices[0] or {}
             finish_reason = first.get("finish_reason")
-            delta = first.get("delta") or {}
+            delta = first.get("delta") or first.get("message") or {}
             delta_content = delta.get("content") or ""
             raw_tcs = delta.get("tool_calls") or []
             for tc in raw_tcs:

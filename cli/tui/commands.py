@@ -404,8 +404,44 @@ def _stream_turn_execution(
                     _streaming_diagnostics["last_event_time"] = t_event_start
             except StopIteration:
                 now = time.time()
+                if workspace:
+                    try:
+                        state.sync_work_orders_from_disk(workspace)
+                    except Exception:
+                        pass
+                if is_tty and (now - last_progress_time >= 0.2):
+                    layout = compute_layout(shutil.get_terminal_size().columns)
+                    tick_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=placeholder,
+                        conversation_content=tick_content,
+                        live_manager=live_manager,
+                    )
+                    last_progress_time = now
+
                 if now - last_poll_time >= 0.5:
                     last_poll_time = now
+                    try:
+                        sid = session.get("session_id")
+                        if sid and hasattr(client, "get_session"):
+                            fresh_sess = client.get_session(sid)
+                            if isinstance(fresh_sess, Mapping):
+                                state.update_from_session(fresh_sess)
+                    except Exception:
+                        pass
                     try:
                         op_rec = (
                             client.operation_get(op_id)
@@ -496,7 +532,7 @@ def _stream_turn_execution(
             ev_name = str(ev.get("name", ""))
             ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
 
-            if workspace and state.phase == ProjectPhase.AUTONOMOUS_EXECUTION:
+            if workspace:
                 state.sync_work_orders_from_disk(workspace)
 
             # Check for incremental text delta (stream/token/chunk)

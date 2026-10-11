@@ -3122,7 +3122,15 @@ class LifecycleSupervisor:
             action = state.repair_context.get("action")
             if wo_id:
                 contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
-                if not contract_file.is_file():
+                needs_auth = not contract_file.is_file()
+                if not needs_auth and action == "amend_contract":
+                    try:
+                        c_data = yaml.safe_load(contract_file.read_text(encoding="utf-8")) or {}
+                        if c_data.get("synthesized_by") != "recovery-repair" or c_data.get("agent_id") != "claude":
+                            needs_auth = True
+                    except Exception:
+                        needs_auth = True
+                if needs_auth:
                     self._write_recovery_repair_authorization(
                         ws,
                         str(wo_id),
@@ -3168,6 +3176,7 @@ class LifecycleSupervisor:
                 f"conforming to schemas/contract.schema.json. The budget must be explicitly sized "
                 f"from the task's real file footprint (ensure max_files_touched is at least 5 or sized to accommodate all files touched plus test/db fixtures). "
                 f"Preserve existing allowed paths (including the work order deliverable) and append the new path requested by the recovery decision.{existing_rules_str}"
+                f"Contract required properties: schema_version, agent_id, work_order, identity (role, reports_to), scope (allow, deny, write), budget (max_files_touched, max_tokens). Optional: contract_revision, guidelines. "
                 f"A transitional repair contract is already in place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )
@@ -3832,9 +3841,14 @@ class LifecycleSupervisor:
 
         _ensure(f".sync/contracts/{wo_id}.yaml")
         _ensure(".sync/decisions/**")
-        if action in ("split_work_order", "create_dependency_work_order"):
+        _ensure("schemas/**")
+        if action == "amend_contract":
+            _ensure(".sync/contracts/**")
+            _ensure(".sync/work-orders/**")
+        elif action in ("split_work_order", "create_dependency_work_order"):
             _ensure(".sync/work-orders/**")
             _ensure(".sync/contracts/**")
+        deny = [r for r in deny if not (isinstance(r, dict) and "schemas" in str(r.get("module", "")))]
 
         # Also ensure work order's declared deliverable is allowed
         for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):

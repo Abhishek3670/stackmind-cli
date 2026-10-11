@@ -169,7 +169,7 @@ def test_tui_repl_landing_and_chat_transition(tmp_path: Path):
 
         result = CliRunner().invoke(
             main_cli,
-            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            ["tui", "--yes", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
             input=user_inputs,
         )
 
@@ -193,7 +193,7 @@ def test_tui_treats_slash_prefixed_input_as_prompt(tmp_path: Path):
     with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
         result = CliRunner().invoke(
             main_cli,
-            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            ["tui", "--yes", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
             input="/status\n:exit\n",
         )
 
@@ -720,4 +720,75 @@ def test_landing_block_metadata_deduplication_and_tight_padding():
     assert any("Status:" in line for line in lines)
 
 
+def test_format_contract_payload_qa_verdict_and_failure():
+    """Verify format_contract_payload converts QA verdicts and failure dicts into clean markdown."""
+    from cli.tui.chat import format_contract_payload
 
+    # QA verdict with review notes
+    qa_json = '{"verdict": "NEEDS_CHANGES", "review_notes": "index.html missing alt tags on image elements"}'
+    out = format_contract_payload(qa_json)
+    assert "### QA Verdict: NEEDS_CHANGES" in out
+    assert "missing alt tags" in out
+    assert "{" not in out
+
+    # Fenced QA verdict
+    fenced_qa = '```json\n{"verdict": "APPROVED", "review_notes": "All checks passed cleanly"}\n```'
+    out_fenced = format_contract_payload(fenced_qa)
+    assert "### QA Verdict: APPROVED" in out_fenced
+    assert "All checks passed cleanly" in out_fenced
+
+    # Failure payload
+    fail_json = '{"status": "failed", "reason": "Operation amend_contract failed due to scope restriction"}'
+    out_fail = format_contract_payload(fail_json)
+    assert "Turn failed: Operation amend_contract failed" in out_fail
+    assert "{" not in out_fail
+
+
+def test_extract_assistant_response_never_dumps_raw_json():
+    """Verify extract_assistant_response extracts clean markdown without raw JSON dumps."""
+    from cli.tui.events import extract_assistant_response
+
+    # Completion dictionary with modified files
+    payload_completed = {
+        "result": {
+            "status": "completed",
+            "modified_files": ["index.html", "css/style.css"],
+        }
+    }
+    resp = extract_assistant_response(payload_completed)
+    assert resp == "Completed turn. Modified files: `index.html`, `css/style.css`."
+    assert "{" not in resp
+
+    # Plan creation
+    payload_plan = {
+        "result": {
+            "status": "completed",
+            "modified_files": ["PLAN.md"],
+        }
+    }
+    resp_plan = extract_assistant_response(payload_plan)
+    assert "Created implementation plan in `PLAN.md`" in resp_plan
+    assert "{" not in resp_plan
+
+    # QA Verdict
+    payload_qa = {
+        "result": {
+            "verdict": "NEEDS_CHANGES",
+            "review_notes": "Image elements in index.html lack alt tags.",
+        }
+    }
+    resp_qa = extract_assistant_response(payload_qa)
+    assert "### QA Verdict: NEEDS_CHANGES" in resp_qa
+    assert "Image elements in index.html lack alt tags." in resp_qa
+    assert "{" not in resp_qa
+
+    # Blocked failure
+    payload_blocked = {
+        "result": {
+            "status": "blocked",
+            "reason": "Repeated missing argument 'path' in write_file",
+        }
+    }
+    resp_blocked = extract_assistant_response(payload_blocked)
+    assert "Turn blocked: Repeated missing argument 'path' in write_file" in resp_blocked
+    assert "{" not in resp_blocked
