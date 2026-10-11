@@ -296,9 +296,18 @@ def _read_escape_sequence_posix(fd: int = 0) -> str:
     return seq
 
 
-def _read_raw_key_windows() -> str:
+def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
     """Read a single decoded key on Windows using msvcrt."""
     import msvcrt
+
+    if timeout is not None:
+        start_t = time.monotonic()
+        while time.monotonic() - start_t < timeout:
+            if msvcrt.kbhit():
+                break
+            time.sleep(0.01)
+        else:
+            return None
 
     ch = msvcrt.getwch()
     debug_parts = [f"ch={repr(ch)}(ord={ord(ch) if len(ch) == 1 else [ord(c) for c in ch]})"]
@@ -595,7 +604,7 @@ class Win32ConsoleReader:
 _win32_reader = Win32ConsoleReader()
 
 
-def _read_raw_key_windows_v2(handle: Any = None) -> str:
+def _read_raw_key_windows_v2(handle: Any = None, timeout: Optional[float] = None) -> Optional[str]:
     """Read a single decoded key on Windows using Win32 ReadConsoleInputW.
 
     Replaces msvcrt.getwch() to natively capture MOUSE_EVENT records for
@@ -606,29 +615,39 @@ def _read_raw_key_windows_v2(handle: Any = None) -> str:
         _win32_reader = Win32ConsoleReader(handle)
 
     err_count = 0
+    start_t = time.monotonic()
+    t_step = min(0.1, timeout) if timeout is not None else 0.1
     while True:
-        key = _win32_reader.read_key(timeout=0.1)
+        key = _win32_reader.read_key(timeout=t_step)
         if key is not None:
             _log_debug_key(f"[_read_raw_key_windows_v2] decoded={repr(key)}")
             return key
+        if timeout is not None and time.monotonic() - start_t >= timeout:
+            return None
         h = _win32_reader._get_input_handle()
         if not h or h in (0, -1):
-            return _read_raw_key_windows()
+            return _read_raw_key_windows(timeout=timeout)
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             num_events = ctypes.c_uint32()
             if not kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
                 err_count += 1
                 if err_count > 3:
-                    return _read_raw_key_windows()
+                    return _read_raw_key_windows(timeout=timeout)
             else:
                 err_count = 0
         except Exception:
-            return _read_raw_key_windows()
+            return _read_raw_key_windows(timeout=timeout)
 
 
-def _read_raw_key_posix(fd: int = 0) -> str:
+def _read_raw_key_posix(fd: int = 0, timeout: Optional[float] = None) -> Optional[str]:
     """Read a single decoded key on POSIX using raw stdin read."""
+    if timeout is not None:
+        import select
+
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            return None
     ch = os.read(fd, 1).decode("utf-8", errors="replace")
     debug_parts = [f"ch={repr(ch)}(ord={ord(ch) if len(ch) == 1 else [ord(c) for c in ch]})"]
     if ch == Key.ESCAPE:
@@ -645,7 +664,10 @@ def _read_raw_key_posix(fd: int = 0) -> str:
     return res
 
 
-def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
+def read_next_key(
+    key_stream: Optional[Iterator[str]] = None,
+    timeout: Optional[float] = None,
+) -> Optional[str]:
     """Read next single decoded key from key_stream or platform raw console."""
     if key_stream is not None:
         try:
@@ -674,14 +696,15 @@ def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
 
         if use_v2:
             try:
-                res = _read_raw_key_windows_v2()
+                res = _read_raw_key_windows_v2(timeout=timeout)
             except Exception:
-                res = _read_raw_key_windows()
+                res = _read_raw_key_windows(timeout=timeout)
         else:
-            res = _read_raw_key_windows()
+            res = _read_raw_key_windows(timeout=timeout)
     else:
-        res = _read_raw_key_posix(fd=0)
-    _log_debug_key(f"[read_next_key] final returned {repr(res)}")
+        res = _read_raw_key_posix(fd=0, timeout=timeout)
+    if res is not None:
+        _log_debug_key(f"[read_next_key] final returned {repr(res)}")
     return res
 
 
@@ -1257,6 +1280,7 @@ def raw_prompt_input(
     commands: Optional[list[tuple[str, str, bool]]] = None,
     key_stream: Optional[Iterator[str]] = None,
     top_border_renderer: Optional[Callable[[bool], str]] = None,
+    on_idle: Optional[Callable[[Any], None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -1384,7 +1408,14 @@ def raw_prompt_input(
         editor.redraw_line()
         while True:
             try:
-                k = read_next_key(key_stream=key_stream)
+                k = read_next_key(key_stream=key_stream, timeout=0.08 if on_idle else None)
+                if k is None:
+                    if on_idle:
+                        try:
+                            on_idle(editor)
+                        except Exception:
+                            pass
+                    continue
                 done = editor.handle_key(k)
                 if done:
                     if editor._last_dropdown_lines_count > 0:

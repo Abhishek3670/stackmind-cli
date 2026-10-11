@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -426,6 +427,7 @@ def tui(
 
         term_size = shutil.get_terminal_size(fallback=(80, 24))
         current_cols, current_lines = term_size.columns, term_size.lines
+        last_idle_poll_time = 0.0
         while True:
             try:
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
@@ -627,6 +629,58 @@ def tui(
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
+                def _handle_idle(editor: Any = None) -> None:
+                    if not is_tty or client is None:
+                        return
+                    sid = session.get("session_id")
+                    if not sid:
+                        return
+                    nonlocal last_idle_poll_time
+                    now = time.monotonic()
+                    if now - last_idle_poll_time < 0.15:
+                        return
+                    last_idle_poll_time = now
+                    try:
+                        missed = client.events(sid, after=state.last_sequence)
+                        did_update = False
+                        if missed:
+                            recover_transcript_from_events(
+                                missed, state, workspace=workspace.resolve()
+                            )
+                            did_update = True
+                        if workspace:
+                            prev_wos = [(w.id, w.status) for w in state.work_orders]
+                            state.sync_work_orders_from_disk(workspace.resolve())
+                            new_wos = [(w.id, w.status) for w in state.work_orders]
+                            if prev_wos != new_wos:
+                                did_update = True
+                        if did_update:
+                            current_text = (
+                                "".join(editor.buffer)
+                                if (
+                                    editor is not None
+                                    and isinstance(getattr(editor, "buffer", None), list)
+                                )
+                                else None
+                            )
+                            term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                            redraw_full_screen(
+                                session,
+                                state,
+                                clear=False,
+                                include_composer=True,
+                                composer_is_active=True,
+                                composer_content=current_text,
+                                live_manager=live_ws,
+                            )
+                            cursor_col = _compute_cursor_col(editor)
+                            sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                            sys.stdout.flush()
+                            if editor is not None and hasattr(editor, "redraw_line"):
+                                editor.redraw_line()
+                    except Exception:
+                        pass
+
                 text = prompt_composer_input(
                     width=comp_width,
                     terminal_width=term_cols,
@@ -638,6 +692,7 @@ def tui(
                     on_page_down=_handle_page_down,
                     on_wheel_up=_handle_wheel_up,
                     on_wheel_down=_handle_wheel_down,
+                    on_idle=_handle_idle,
                     show_footer=False if is_tty else not getattr(state, "has_conversation", False),
                     live_manager=live_ws,
                     full_screen=is_tty,

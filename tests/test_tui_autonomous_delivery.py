@@ -1026,4 +1026,58 @@ def test_status_command_not_required_for_state_propagation():
     assert state.plan["state"] == "APPROVED"
 
 
+def test_approve_in_interactive_terminal_streams_execution(monkeypatch):
+    """In interactive terminal, :approve should enter _stream_turn_execution."""
+    import sys
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+    import cli.tui.commands as cmd_mod
+
+    mock_client = _MockDaemonClient()
+    adapter = StackMindTuiAdapter(mock_client)  # type: ignore[arg-type]
+    session = mock_client.get_session("session-test-stream")
+    state = AutonomousDeliveryState("test-stream", session_id="session-test-stream")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+
+    streamed_calls = []
+
+    def fake_stream(*args, **kwargs):
+        streamed_calls.append((args, kwargs))
+        return session, False
+
+    monkeypatch.setattr(cmd_mod, "_stream_turn_execution", fake_stream)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    dispatch_delivery_command(adapter, mock_client, session, ":approve ready", state)
+    assert len(streamed_calls) == 1
+    _, kwargs = streamed_calls[0]
+    assert kwargs.get("op_id") == "turn"
+    assert kwargs.get("is_tty") is True
+
+
+def test_keyboard_raw_prompt_input_invokes_on_idle_when_no_input(monkeypatch):
+    """raw_prompt_input should call on_idle callback when no keystroke is received."""
+    import sys
+    from cli.tui import keyboard
+
+    idle_calls = []
+
+    def fake_idle(editor):
+        idle_calls.append(editor)
+        # Stop after 2 idle ticks by raising KeyboardInterrupt
+        if len(idle_calls) >= 2:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(keyboard, "read_next_key", lambda *args, **kwargs: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        keyboard.raw_prompt_input(on_idle=fake_idle)
+
+    assert len(idle_calls) >= 2
+
+
+
 

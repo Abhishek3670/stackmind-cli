@@ -184,9 +184,10 @@ def get_status_str(
 
     parts = []
 
-    sid = session.get("session_id") or (getattr(state, "session_id", None) if state else None)
-    if sid:
-        parts.append(f"Session: {sid}")
+    if state is None:
+        sid = session.get("session_id")
+        if sid:
+            parts.append(f"Session: {sid}")
 
     if state is not None:
         run_state = _compute_run_state(state)
@@ -317,6 +318,721 @@ def _build_in_progress_turn_content(
 
     in_progress = "\n\n".join(parts)
     return f"{transcript}\n\n{in_progress}" if transcript else in_progress
+
+
+def _stream_turn_execution(
+    adapter: StackMindTuiAdapter,
+    client: DaemonClient,
+    session: dict[str, Any],
+    state: AutonomousDeliveryState,
+    *,
+    op_id: str = "turn",
+    placeholder: str = "Generating response... (Ctrl+C to cancel)",
+    effective_timeout: float = 0.0,
+    is_tty: bool = True,
+    live_manager: Any | None = None,
+    initial_activity_desc: str = "Turn submitted",
+    model_name: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Synchronously await turn completion while consuming events via native SSE."""
+    workspace = Path(session["workspace"]) if session.get("workspace") else None
+    max_wait = effective_timeout
+    start_time = time.time()
+    completed = False
+    assistant_rendered = False
+    streaming_active = False
+    streamed_chunks: list[str] = []
+    last_progress_time = start_time
+    last_poll_time = start_time
+    last_redraw_time: float = -1.0
+    latest_act_desc = initial_activity_desc
+    op_rec: dict[str, Any] | None = None
+    op_status: str | None = None
+
+    _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
+    _diagnostics_start = time.monotonic()
+    _streaming_diagnostics = {
+        "redraw_count": 0,
+        "event_count": 0,
+        "render_sum_ms": 0,
+        "render_count": 0,
+        "write_sum_ms": 0,
+        "write_count": 0,
+        "last_event_time": 0.0,
+        "last_redraw_time": 0.0,
+        "inter_redraw_sum_ms": 0.0,
+        "inter_redraw_count": 0,
+        "inter_event_sum_ms": 0.0,
+        "inter_event_count": 0,
+        "max_render_ms": 0.0,
+        "max_write_ms": 0.0,
+        "max_inter_event_ms": 0.0,
+        "max_inter_redraw_ms": 0.0,
+    }
+
+    install_resize_handler()
+    init_term = shutil.get_terminal_size(fallback=(80, 24))
+    current_cols, current_lines = init_term.columns, init_term.lines
+
+    try:
+        stream_gen = adapter.stream(
+            session["session_id"],
+            live=True,
+            timeout=1.0,
+            after=state.last_sequence,
+        )
+        while (max_wait <= 0 or time.time() - start_time < max_wait) and not completed:
+            resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
+            if resized:
+                current_cols, current_lines = new_cols, new_lines
+                if live_manager is not None and getattr(live_manager, "is_active", False):
+                    live_manager.handle_resize(new_cols, new_lines)
+            try:
+                t_event_start = time.monotonic()
+                ev = next(stream_gen)
+                t_event_end = time.monotonic()
+                if _diagnostics_enabled:
+                    _streaming_diagnostics["event_count"] += 1
+                    if _streaming_diagnostics["last_event_time"] > 0.0:
+                        inter = (
+                            t_event_start - _streaming_diagnostics["last_event_time"]
+                        ) * 1000
+                        _streaming_diagnostics["inter_event_sum_ms"] += inter
+                        _streaming_diagnostics["inter_event_count"] += 1
+                        if inter > _streaming_diagnostics["max_inter_event_ms"]:
+                            _streaming_diagnostics["max_inter_event_ms"] = inter
+                    _streaming_diagnostics["last_event_time"] = t_event_start
+            except StopIteration:
+                now = time.time()
+                if now - last_poll_time >= 0.5:
+                    last_poll_time = now
+                    try:
+                        op_rec = (
+                            client.operation_get(op_id)
+                            if hasattr(client, "operation_get") and op_id and op_id != "turn"
+                            else None
+                        )
+                        if op_rec and isinstance(op_rec, dict):
+                            op_status = op_rec.get("status")
+                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                completed = True
+                                break
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+                stream_gen = adapter.stream(
+                    session["session_id"],
+                    live=True,
+                    timeout=1.0,
+                    after=state.last_sequence,
+                )
+                continue
+            except Exception:
+                time.sleep(0.05)
+                continue
+
+            now = time.time()
+
+            # 1. Handle heartbeat / keepalive
+            if isinstance(ev, dict) and (
+                ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"
+            ):
+                if not streaming_active and (now - last_progress_time >= 2.0):
+                    render_start = time.monotonic()
+                    layout = compute_layout(shutil.get_terminal_size().columns)
+                    tick_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    render_ms = (time.monotonic() - render_start) * 1000
+
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=placeholder,
+                        conversation_content=tick_content,
+                        live_manager=live_manager,
+                    )
+
+                    if _diagnostics_enabled:
+                        _streaming_diagnostics["redraw_count"] += 1
+                        _streaming_diagnostics["render_sum_ms"] += render_ms
+                        _streaming_diagnostics["render_count"] += 1
+                        _streaming_diagnostics["last_redraw_time"] = time.monotonic()
+                    last_progress_time = now
+
+                if now - last_poll_time >= 1.5:
+                    last_poll_time = now
+                    try:
+                        op_rec = (
+                            client.operation_get(op_id)
+                            if hasattr(client, "operation_get") and op_id and op_id != "turn"
+                            else None
+                        )
+                        if op_rec and isinstance(op_rec, dict):
+                            op_status = op_rec.get("status")
+                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                completed = True
+                                break
+                    except Exception:
+                        pass
+                continue
+
+            # 2. Process concrete domain event
+            if not isinstance(ev, dict):
+                continue
+            sequence = ev.get("sequence")
+            if isinstance(sequence, int) and sequence <= state.last_sequence:
+                continue
+            state.process_event(ev)
+            ev_name = str(ev.get("name", ""))
+            ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
+
+            if workspace and state.phase == ProjectPhase.AUTONOMOUS_EXECUTION:
+                state.sync_work_orders_from_disk(workspace)
+
+            # Check for incremental text delta (stream/token/chunk)
+            delta = extract_text_delta(ev)
+            if delta:
+                if not streaming_active:
+                    streaming_active = True
+                    if model_name is None:
+                        if op_rec and isinstance(op_rec, dict):
+                            model_name = op_rec.get("model")
+                        elif session and isinstance(session, dict):
+                            model_name = session.get("model")
+
+                streamed_chunks.append(delta)
+
+                now_mono = time.monotonic()
+                if now_mono - last_redraw_time >= 0.1:
+                    render_start = time.monotonic()
+                    layout = compute_layout(shutil.get_terminal_size().columns)
+                    full_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    render_end = time.monotonic()
+                    render_ms = (render_end - render_start) * 1000
+
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=placeholder,
+                        conversation_content=full_content,
+                        live_manager=live_manager,
+                    )
+
+                    write_end = time.monotonic()
+                    write_ms = (write_end - render_end) * 1000
+
+                    if _diagnostics_enabled:
+                        _streaming_diagnostics["redraw_count"] += 1
+                        _streaming_diagnostics["render_sum_ms"] += render_ms
+                        _streaming_diagnostics["render_count"] += 1
+                        if render_ms > _streaming_diagnostics["max_render_ms"]:
+                            _streaming_diagnostics["max_render_ms"] = render_ms
+                        _streaming_diagnostics["write_sum_ms"] += write_ms
+                        _streaming_diagnostics["write_count"] += 1
+                        if write_ms > _streaming_diagnostics["max_write_ms"]:
+                            _streaming_diagnostics["max_write_ms"] = write_ms
+                        if _streaming_diagnostics["last_redraw_time"] > 0.0:
+                            inter_redraw = (
+                                now_mono - _streaming_diagnostics["last_redraw_time"]
+                            ) * 1000
+                            _streaming_diagnostics["inter_redraw_sum_ms"] += inter_redraw
+                            _streaming_diagnostics["inter_redraw_count"] += 1
+                            if inter_redraw > _streaming_diagnostics["max_inter_redraw_ms"]:
+                                _streaming_diagnostics["max_inter_redraw_ms"] = inter_redraw
+                        _streaming_diagnostics["last_redraw_time"] = now_mono
+                    last_redraw_time = now_mono
+            else:
+                ev_str = (
+                    ""
+                    if ev_name in {"operation.started", "turn.started", "operation.completed"}
+                    else render_operational_event_str(ev)
+                )
+                if ev_str:
+                    if not streaming_active and not is_tty:
+                        click.echo(ev_str)
+                    from cli.tui.events import format_action_description
+                    latest_act_desc = format_action_description(ev_name)
+                elif ev_name in {"event.toolCall", "tool.call"}:
+                    t_name = ev_payload.get("tool_name") or ev_payload.get("tool") or "tool"
+                    t_args = ev_payload.get("arguments", {})
+                    t_target = str(
+                        t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
+                    )
+                    latest_act_desc = f"{t_name} {t_target}".strip() if t_target else t_name
+
+                now_mono = time.monotonic()
+                if is_tty and (now_mono - last_redraw_time >= 0.1):
+                    layout = compute_layout(shutil.get_terminal_size().columns)
+                    full_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=placeholder,
+                        conversation_content=full_content,
+                        live_manager=live_manager,
+                    )
+                    last_redraw_time = now_mono
+
+                # Only terminal turn/operation completion events finalize the response
+                resp = None
+                thinking = None
+                response_events = {"operation.completed", "turn.completed"}
+                if ev_name in response_events:
+                    resp = extract_assistant_response(ev_payload, workspace=workspace)
+                    thinking = extract_assistant_thinking(ev_payload, workspace=workspace)
+                if resp and not assistant_rendered and not streamed_chunks:
+                    turn_acts = state.current_turn_actions
+                    state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
+                    if is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            live_manager=live_manager,
+                        )
+                    else:
+                        click.echo(
+                            render_assistant_message_str(
+                                resp, actions=turn_acts, thinking=thinking
+                            )
+                        )
+                    assistant_rendered = True
+
+            # Check terminal event status
+            if ev_name in {
+                "operation.completed",
+                "operation.failed",
+                "operation.cancelled",
+                "operation.blocked",
+                "turn.completed",
+                "turn.blocked",
+            }:
+                target_op = ev_payload.get("operation_id") or ev.get("operation_id")
+                if (
+                    ev_name in {"turn.completed", "turn.blocked"}
+                    or (target_op and target_op == op_id)
+                    or (not target_op and op_id in {"turn", "all"})
+                    or op_id == "all"
+                ):
+                    completed = True
+                    if ev_name in {
+                        "operation.failed",
+                        "operation.cancelled",
+                        "operation.blocked",
+                        "turn.blocked",
+                    }:
+                        op_status = (
+                            "FAILED"
+                            if ev_name == "operation.failed"
+                            else "BLOCKED"
+                            if ev_name in {"operation.blocked", "turn.blocked"}
+                            else "CANCELLED"
+                        )
+                        if op_rec is None:
+                            op_rec = {"status": op_status, "result": ev_payload}
+                        elif isinstance(op_rec, dict):
+                            op_rec["status"] = op_status
+                            if "result" not in op_rec:
+                                op_rec["result"] = ev_payload
+                    break
+
+            if now - last_poll_time >= 2.0:
+                last_poll_time = now
+                try:
+                    op_rec = (
+                        client.operation_get(op_id)
+                        if hasattr(client, "operation_get") and op_id and op_id != "turn"
+                        else None
+                    )
+                    if op_rec and isinstance(op_rec, dict):
+                        op_status = op_rec.get("status")
+                        if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                            completed = True
+                            break
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        try:
+            if op_id and op_id != "turn" and hasattr(client, "operation_cancel"):
+                client.operation_cancel(op_id, cascade=True)
+            elif hasattr(client, "cancel"):
+                client.cancel(session["session_id"])
+        except Exception:
+            try:
+                adapter.command(f":cancel {op_id}", session_id=session["session_id"])
+            except Exception:
+                pass
+
+        if op_id in state.operations:
+            state.operations[op_id].status = "CANCELLED"
+        for role_obj in state.roles.values():
+            if getattr(role_obj, "state", "").upper() in {"RUNNING", "ACTIVE"}:
+                role_obj.state = "CANCELLED"
+        state.add_activity("User", "interrupted turn", op_id)
+
+        if streaming_active and not is_tty:
+            click.echo("")
+
+        cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
+        turn_acts = state.current_turn_actions
+        state.add_message("assistant", cancel_msg, actions=turn_acts)
+        if is_tty:
+            redraw_full_screen(
+                session,
+                state,
+                clear=False,
+                include_composer=True,
+                composer_is_active=False,
+                live_manager=live_manager,
+            )
+        else:
+            click.echo(
+                render_error_box_str(
+                    cancel_msg,
+                    title="TURN INTERRUPTED",
+                    hint="In-flight turn operation was cancelled. Daemon process remains running.",
+                )
+            )
+        if hasattr(state, "current_turn_actions") and state.current_turn_actions:
+            state.current_turn_actions.complete_all()
+        if live_manager is not None and not getattr(live_manager, "is_active", False):
+            live_manager.start(include_composer=False)
+        restore_composer_focus(state)
+        return session, False
+
+    # Finalize streaming if active
+    if streamed_chunks and not assistant_rendered:
+        full_resp = "".join(streamed_chunks).strip()
+        turn_acts = state.current_turn_actions
+        thinking = getattr(state, "current_turn_thinking", None) or None
+        state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
+        assistant_rendered = True
+        streamed_chunks = []
+        redraw_full_screen(
+            session,
+            state,
+            clear=False,
+            include_composer=True,
+            composer_is_active=False,
+            composer_placeholder=placeholder,
+            live_manager=live_manager,
+        )
+
+    if _diagnostics_enabled:
+        duration = time.monotonic() - _diagnostics_start
+        n = _streaming_diagnostics["redraw_count"]
+        render_median = (_streaming_diagnostics["render_sum_ms"] / n) if n > 0 else 0.0
+        write_median = (_streaming_diagnostics["write_sum_ms"] / n) if n > 0 else 0.0
+        inter_redraw_median = (
+            (_streaming_diagnostics["inter_redraw_sum_ms"] / _streaming_diagnostics["inter_redraw_count"])
+            if _streaming_diagnostics["inter_redraw_count"] > 0
+            else 0.0
+        )
+        inter_event_median = (
+            (_streaming_diagnostics["inter_event_sum_ms"] / _streaming_diagnostics["inter_event_count"])
+            if _streaming_diagnostics["inter_event_count"] > 0
+            else 0.0
+        )
+        try:
+            sys.stderr.write("\n=== STACKMIND TUI DIAGNOSTICS ===\n")
+            sys.stderr.write(
+                f"Turn duration: {duration:.2f}s | Events: {_streaming_diagnostics['event_count']} | Redraws: {n}\n"
+            )
+            sys.stderr.write(
+                f"Render: median={render_median:.1f}ms | max={_streaming_diagnostics['max_render_ms']:.1f}ms\n"
+            )
+            sys.stderr.write(
+                f"Write: median={write_median:.1f}ms | max={_streaming_diagnostics['max_write_ms']:.1f}ms\n"
+            )
+            sys.stderr.write(
+                f"Event gap: median={inter_event_median:.1f}ms | max={_streaming_diagnostics['max_inter_event_ms']:.1f}ms\n"
+            )
+            sys.stderr.write(
+                f"Redraw interval: median={inter_redraw_median:.1f}ms | max={_streaming_diagnostics['max_inter_redraw_ms']:.1f}ms\n"
+            )
+            sys.stderr.write("=== END DIAGNOSTICS ===\n\n")
+        except Exception:
+            pass
+
+    if not assistant_rendered:
+        try:
+            if (
+                op_rec is None
+                or not completed
+                or op_status in {"FAILED", "CANCELLED", "BLOCKED"}
+            ) and hasattr(client, "operation_get") and op_id and op_id != "turn":
+                fresh_op = client.operation_get(op_id)
+                if fresh_op and isinstance(fresh_op, dict):
+                    op_rec = fresh_op
+                    op_status = op_rec.get("status")
+                    if op_status in {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}:
+                        completed = True
+        except Exception:
+            pass
+
+        try:
+            if hasattr(client, "events"):
+                remaining_events = list(
+                    client.events(session["session_id"], after=state.last_sequence)
+                )
+                for ev in remaining_events:
+                    state.process_event(ev)
+                    ev_str = (
+                        ""
+                        if ev.get("name")
+                        in {"operation.started", "turn.started", "operation.completed"}
+                        else render_operational_event_str(ev)
+                    )
+                    if ev_str and not is_tty:
+                        click.echo(ev_str)
+                    resp = None
+                    thinking = None
+                    response_events = {
+                        "operation.completed",
+                        "turn.completed",
+                    }
+                    if ev.get("name") in response_events:
+                        resp = extract_assistant_response(
+                            ev.get("payload", {}), workspace=workspace
+                        )
+                        thinking = extract_assistant_thinking(
+                            ev.get("payload", {}), workspace=workspace
+                        )
+                    if resp and not assistant_rendered:
+                        turn_acts = state.current_turn_actions
+                        state.add_message(
+                            "assistant", resp, actions=turn_acts, thinking=thinking
+                        )
+                        if is_tty:
+                            redraw_full_screen(
+                                session,
+                                state,
+                                clear=False,
+                                include_composer=True,
+                                composer_is_active=False,
+                                live_manager=live_manager,
+                            )
+                        else:
+                            click.echo(
+                                render_assistant_message_str(
+                                    resp, actions=turn_acts, thinking=thinking
+                                )
+                            )
+                        assistant_rendered = True
+        except Exception:
+            pass
+
+        if not assistant_rendered and op_rec and isinstance(op_rec, dict):
+            res = op_rec.get("result") or {}
+            summary = res.get("report_markdown") or res.get("summary") or res.get("reason")
+            thinking = (
+                res.get("thinking")
+                or res.get("thought")
+                or res.get("reasoning")
+                or res.get("reasoning_content")
+                or op_rec.get("thinking")
+                or op_rec.get("thought")
+            )
+            report_path_raw = res.get("report_path")
+            if report_path_raw:
+                rp = Path(report_path_raw)
+                if not rp.is_absolute() and workspace:
+                    rp = workspace / rp
+                if rp.exists():
+                    try:
+                        cnt = rp.read_text(encoding="utf-8")
+                        if "## Thinking" in cnt and not thinking:
+                            _, _, tp = cnt.partition("## Thinking")
+                            tb, _, _ = tp.partition("## ")
+                            thinking = tb.strip() or None
+                        if "## Report" in cnt:
+                            _, _, b = cnt.partition("## Report")
+                            rb, _, _ = b.partition("## Meta")
+                            rep_body = rb.strip()
+                            if rep_body and rep_body != "Completed task via tools":
+                                summary = rep_body
+                            elif not summary or summary == "Completed task via tools":
+                                summary = rep_body or cnt.strip()
+                        elif not summary or summary == "Completed task via tools":
+                            summary = cnt.strip()
+                    except Exception:
+                        pass
+            if op_status in {"FAILED", "CANCELLED", "BLOCKED"}:
+                from cli.tui.events import clean_error_message
+
+                err_raw = (
+                    res.get("error")
+                    or res.get("reason")
+                    or res.get("message")
+                    or op_rec.get("error")
+                    or summary
+                    or f"Operation {op_status.lower() if op_status else 'failed'}."
+                )
+                err_msg = (
+                    clean_error_message(err_raw)
+                    or f"Operation {op_status.lower() if op_status else 'failed'}."
+                )
+                err_title = (
+                    "OLLAMA ERROR"
+                    if "ollama" in err_msg.lower()
+                    else (f"OPERATION {op_status}" if op_status else "OPERATION FAILED")
+                )
+                turn_acts = state.current_turn_actions
+                if turn_acts:
+                    turn_acts.expanded = True
+                state.add_message(
+                    "assistant",
+                    f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}",
+                    actions=turn_acts,
+                )
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_error_box_str(err_msg, title=err_title))
+                assistant_rendered = True
+            elif summary:
+                if summary.strip() == "Completed task via tools":
+                    summary = "Completed turn via tools. All executed actions are recorded in the Actions group above."
+                turn_acts = state.current_turn_actions
+                state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(
+                        render_assistant_message_str(
+                            summary, actions=turn_acts, thinking=thinking
+                        )
+                    )
+                assistant_rendered = True
+
+        if not assistant_rendered:
+            if (
+                op_rec
+                and isinstance(op_rec, dict)
+                and op_rec.get("status") in {"FAILED", "CANCELLED", "BLOCKED"}
+            ):
+                op_status = op_rec.get("status")
+                from cli.tui.events import clean_error_message
+
+                err_raw = (
+                    (op_rec.get("result") or {}).get("error")
+                    or (op_rec.get("result") or {}).get("reason")
+                    or (op_rec.get("result") or {}).get("message")
+                    or op_rec.get("error")
+                    or f"Operation {op_status.lower()}."
+                )
+                err_msg = clean_error_message(err_raw) or f"Operation {op_status.lower()}."
+                err_title = (
+                    "OLLAMA ERROR" if "ollama" in err_msg.lower() else f"OPERATION {op_status}"
+                )
+                turn_acts = state.current_turn_actions
+                if turn_acts:
+                    turn_acts.expanded = True
+                state.add_message(
+                    "assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts
+                )
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_error_box_str(err_msg, title=err_title))
+                assistant_rendered = True
+            elif completed:
+                completion_msg = f"Turn operation {op_id} completed."
+                turn_acts = state.current_turn_actions
+                state.add_message("assistant", completion_msg, actions=turn_acts)
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
+            else:
+                timeout_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
+                state.add_message("system", timeout_msg)
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(
+                        render_error_box_str(
+                            timeout_msg,
+                            title="REQUEST TIMEOUT",
+                            hint="Use :status or :events to inspect.",
+                        )
+                    )
+
+    if hasattr(state, "current_turn_actions") and state.current_turn_actions:
+        state.current_turn_actions.complete_all()
+    if live_manager is not None and not getattr(live_manager, "is_active", False):
+        live_manager.start(include_composer=False)
+    restore_composer_focus(state)
+    return session, False
 
 
 def dispatch_delivery_command(
@@ -652,7 +1368,19 @@ def dispatch_delivery_command(
                 state.add_message("assistant", f"✓ {feedback_msg} (reason: {clean_reason})")
                 if not is_tty:
                     click.echo(feedback_msg)
-                return session, False
+                    return session, False
+                return _stream_turn_execution(
+                    adapter,
+                    client,
+                    session,
+                    state,
+                    op_id="turn",
+                    placeholder="Autonomous delivery in progress... (Ctrl+C to pause/cancel)",
+                    effective_timeout=effective_timeout,
+                    is_tty=is_tty,
+                    live_manager=live_manager,
+                    initial_activity_desc="Authoring work orders and contracts",
+                )
             except Exception as e:
                 err_msg = f"Plan approval error: {e}"
                 state.add_message("user", normalized)
@@ -666,7 +1394,19 @@ def dispatch_delivery_command(
         state.add_message("assistant", f"✓ HITL Approval recorded: {clean_reason}")
         if not is_tty:
             click.echo("Approval recorded.")
-        return session, False
+            return session, False
+        return _stream_turn_execution(
+            adapter,
+            client,
+            session,
+            state,
+            op_id="turn",
+            placeholder="Execution in progress... (Ctrl+C to pause/cancel)",
+            effective_timeout=effective_timeout,
+            is_tty=is_tty,
+            live_manager=live_manager,
+            initial_activity_desc="Execution resumed after HITL approval",
+        )
 
     if normalized.startswith(":reject"):
         _, _, reason = normalized.partition(" ")
@@ -1015,27 +1755,6 @@ def dispatch_delivery_command(
         click.echo(render_user_message_str(prompt_text))
     op_id = "turn"
 
-    # TUI diagnostic instrumentation (opt-in via environment variable)
-    _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
-    _diagnostics_start = time.monotonic()
-    _streaming_diagnostics = {
-        "redraw_count": 0,
-        "event_count": 0,
-        "render_sum_ms": 0,
-        "render_count": 0,
-        "write_sum_ms": 0,
-        "write_count": 0,
-        "last_event_time": 0.0,
-        "last_redraw_time": 0.0,
-        "inter_redraw_sum_ms": 0.0,
-        "inter_redraw_count": 0,
-        "inter_event_sum_ms": 0.0,
-        "inter_event_count": 0,
-        "max_render_ms": 0.0,
-        "max_write_ms": 0.0,
-        "max_inter_event_ms": 0.0,
-        "max_inter_redraw_ms": 0.0,
-    }
     try:
         result = adapter.command(normalized, session_id=session["session_id"])
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
@@ -1077,695 +1796,18 @@ def dispatch_delivery_command(
             status_line = Text(msg, style="dim cyan")
             click.echo(status_line)
 
-        # Synchronously await turn completion while consuming events via native SSE
-        workspace = Path(session["workspace"]) if session.get("workspace") else None
-        max_wait = effective_timeout
-        start_time = time.time()
-        completed = False
-        assistant_rendered = False
-        streaming_active = False
-        streamed_chunks: list[str] = []
-        last_progress_time = start_time
-        last_poll_time = start_time
-        last_redraw_time: float = -1.0
-        model_name: str | None = None
-        latest_act_desc = "Turn submitted"
-        op_rec: dict[str, Any] | None = None
-        op_status: str | None = None
-
-        # Track terminal dimensions and install resize handler (WO-003)
-        install_resize_handler()
-        init_term = shutil.get_terminal_size(fallback=(80, 24))
-        current_cols, current_lines = init_term.columns, init_term.lines
-
-        try:
-            stream_gen = adapter.stream(
-                session["session_id"],
-                live=True,
-                timeout=1.0,
-                after=state.last_sequence,
-            )
-            while (max_wait <= 0 or time.time() - start_time < max_wait) and not completed:
-                # Check for dynamic terminal resize during active streaming / turn (WO-003)
-                resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
-                if resized:
-                    current_cols, current_lines = new_cols, new_lines
-                    if live_manager is not None and getattr(live_manager, "is_active", False):
-                        live_manager.handle_resize(new_cols, new_lines)
-                try:
-                    t_event_start = time.monotonic()
-                    ev = next(stream_gen)
-                    t_event_end = time.monotonic()
-                    if _diagnostics_enabled:
-                        _streaming_diagnostics["event_count"] += 1
-                        if _streaming_diagnostics["last_event_time"] > 0.0:
-                            inter = (
-                                t_event_start - _streaming_diagnostics["last_event_time"]
-                            ) * 1000
-                            _streaming_diagnostics["inter_event_sum_ms"] += inter
-                            _streaming_diagnostics["inter_event_count"] += 1
-                            if inter > _streaming_diagnostics["max_inter_event_ms"]:
-                                _streaming_diagnostics["max_inter_event_ms"] = inter
-                        _streaming_diagnostics["last_event_time"] = t_event_start
-                except StopIteration:
-                    now = time.time()
-                    if now - last_poll_time >= 0.5:
-                        last_poll_time = now
-                        try:
-                            op_rec = (
-                                client.operation_get(op_id)
-                                if hasattr(client, "operation_get")
-                                else None
-                            )
-                            if op_rec and isinstance(op_rec, dict):
-                                op_status = op_rec.get("status")
-                                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                    completed = True
-                                    break
-                        except Exception:
-                            pass
-                    time.sleep(0.05)
-                    stream_gen = adapter.stream(
-                        session["session_id"],
-                        live=True,
-                        timeout=1.0,
-                        after=state.last_sequence,
-                    )
-                    continue
-                except Exception:
-                    time.sleep(0.05)
-                    continue
-
-                now = time.time()
-
-                # 1. Handle heartbeat / keepalive
-                if isinstance(ev, dict) and (
-                    ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"
-                ):
-                    if not streaming_active and (now - last_progress_time >= 2.0):
-                        render_start = time.monotonic()
-                        layout = compute_layout(shutil.get_terminal_size().columns)
-                        tick_content = _build_in_progress_turn_content(
-                            state,
-                            model_name,
-                            streamed_chunks,
-                            latest_act_desc,
-                            start_time,
-                            max_wait,
-                            layout.conversation_width,
-                        )
-                        render_ms = (time.monotonic() - render_start) * 1000
-
-                        redraw_full_screen(
-                            session,
-                            state,
-                            clear=False,
-                            include_composer=True,
-                            composer_is_active=False,
-                            composer_placeholder=placeholder,
-                            conversation_content=tick_content,
-                            live_manager=live_manager,
-                        )
-
-                        if _diagnostics_enabled:
-                            _streaming_diagnostics["redraw_count"] += 1
-                            _streaming_diagnostics["render_sum_ms"] += render_ms
-                            _streaming_diagnostics["render_count"] += 1
-                            _streaming_diagnostics["last_redraw_time"] = time.monotonic()
-                        last_progress_time = now
-
-                    if now - last_poll_time >= 1.5:
-                        last_poll_time = now
-                        try:
-                            op_rec = (
-                                client.operation_get(op_id)
-                                if hasattr(client, "operation_get")
-                                else None
-                            )
-                            if op_rec and isinstance(op_rec, dict):
-                                op_status = op_rec.get("status")
-                                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                    completed = True
-                                    break
-                        except Exception:
-                            pass
-                    continue
-
-                # 2. Process concrete domain event
-                if not isinstance(ev, dict):
-                    continue
-                sequence = ev.get("sequence")
-                if isinstance(sequence, int) and sequence <= state.last_sequence:
-                    # A reconnecting transport can replay events already folded
-                    # into the canonical transcript. Do not feed their deltas
-                    # into this turn's transient response buffer.
-                    continue
-                state.process_event(ev)
-                ev_name = str(ev.get("name", ""))
-                ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
-
-                # Check for incremental text delta (stream/token/chunk)
-                delta = extract_text_delta(ev)
-                if delta:
-                    if not streaming_active:
-                        streaming_active = True
-                        if model_name is None:
-                            if op_rec and isinstance(op_rec, dict):
-                                model_name = op_rec.get("model")
-                            elif session and isinstance(session, dict):
-                                model_name = session.get("model")
-
-                    streamed_chunks.append(delta)
-
-                    # AC-3: Rate-limit redraw_full_screen calls to ~8-10 Hz (100ms gate)
-                    now_mono = time.monotonic()
-                    if now_mono - last_redraw_time >= 0.1:
-                        # Diagnostic instrumentation for render time
-                        render_start = time.monotonic()
-                        layout = compute_layout(shutil.get_terminal_size().columns)
-                        full_content = _build_in_progress_turn_content(
-                            state,
-                            model_name,
-                            streamed_chunks,
-                            latest_act_desc,
-                            start_time,
-                            max_wait,
-                            layout.conversation_width,
-                        )
-                        render_end = time.monotonic()
-                        render_ms = (render_end - render_start) * 1000
-
-                        redraw_full_screen(
-                            session,
-                            state,
-                            clear=False,
-                            include_composer=True,
-                            composer_is_active=False,
-                            composer_placeholder=placeholder,
-                            conversation_content=full_content,
-                            live_manager=live_manager,
-                        )
-
-                        # Write timing captured in redraw_full_screen
-                        write_end = time.monotonic()
-                        write_ms = (write_end - render_end) * 1000
-
-                        if _diagnostics_enabled:
-                            _streaming_diagnostics["redraw_count"] += 1
-                            _streaming_diagnostics["render_sum_ms"] += render_ms
-                            _streaming_diagnostics["render_count"] += 1
-                            if render_ms > _streaming_diagnostics["max_render_ms"]:
-                                _streaming_diagnostics["max_render_ms"] = render_ms
-                            _streaming_diagnostics["write_sum_ms"] += write_ms
-                            _streaming_diagnostics["write_count"] += 1
-                            if write_ms > _streaming_diagnostics["max_write_ms"]:
-                                _streaming_diagnostics["max_write_ms"] = write_ms
-                            if _streaming_diagnostics["last_redraw_time"] > 0.0:
-                                inter_redraw = (
-                                    now_mono - _streaming_diagnostics["last_redraw_time"]
-                                ) * 1000
-                                _streaming_diagnostics["inter_redraw_sum_ms"] += inter_redraw
-                                _streaming_diagnostics["inter_redraw_count"] += 1
-                                if inter_redraw > _streaming_diagnostics["max_inter_redraw_ms"]:
-                                    _streaming_diagnostics["max_inter_redraw_ms"] = inter_redraw
-                            _streaming_diagnostics["last_redraw_time"] = now_mono
-                        last_redraw_time = now_mono
-                else:
-                    # Operational event line
-                    ev_str = (
-                        ""
-                        if ev_name in {"operation.started", "turn.started", "operation.completed"}
-                        else render_operational_event_str(ev)
-                    )
-                    if ev_str:
-                        if not streaming_active and not is_tty:
-                            click.echo(ev_str)
-                        latest_act_desc = (
-                            format_action_description(ev_name)
-                            if "format_action_description" in globals()
-                            else ev_name
-                        )
-                    elif ev_name == "event.toolCall":
-                        t_name = ev_payload.get("tool_name", "tool")
-                        t_args = ev_payload.get("arguments", {})
-                        t_target = str(
-                            t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
-                        )
-                        latest_act_desc = f"{t_name} {t_target}".strip() if t_target else t_name
-
-                    # In interactive TTY, trigger rate-limited redraw so tool calls, actions, and thinking appear live
-                    now_mono = time.monotonic()
-                    if is_tty and (now_mono - last_redraw_time >= 0.1):
-                        layout = compute_layout(shutil.get_terminal_size().columns)
-                        full_content = _build_in_progress_turn_content(
-                            state,
-                            model_name,
-                            streamed_chunks,
-                            latest_act_desc,
-                            start_time,
-                            max_wait,
-                            layout.conversation_width,
-                        )
-                        redraw_full_screen(
-                            session,
-                            state,
-                            clear=False,
-                            include_composer=True,
-                            composer_is_active=False,
-                            composer_placeholder=placeholder,
-                            conversation_content=full_content,
-                            live_manager=live_manager,
-                        )
-                        last_redraw_time = now_mono
-
-                    # Only result/completion events can carry a finalized response.
-                    # Reasoning deltas also carry `text`, but are transient summaries.
-                    resp = None
-                    thinking = None
-                    response_events = {"event.toolResult", "operation.completed", "turn.completed"}
-                    if ev_name in response_events:
-                        resp = extract_assistant_response(ev_payload, workspace=workspace)
-                        thinking = extract_assistant_thinking(ev_payload, workspace=workspace)
-                    if resp and not assistant_rendered and not streamed_chunks:
-                        turn_acts = state.current_turn_actions
-                        state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
-                        if is_tty:
-                            redraw_full_screen(
-                                session,
-                                state,
-                                clear=False,
-                                include_composer=True,
-                                composer_is_active=False,
-                                live_manager=live_manager,
-                            )
-                        else:
-                            click.echo(
-                                render_assistant_message_str(
-                                    resp, actions=turn_acts, thinking=thinking
-                                )
-                            )
-                        assistant_rendered = True
-
-                # Check terminal event status
-                if ev_name in {
-                    "operation.completed",
-                    "operation.failed",
-                    "operation.cancelled",
-                    "operation.blocked",
-                    "turn.completed",
-                    "turn.blocked",
-                }:
-                    target_op = ev_payload.get("operation_id") or ev.get("operation_id")
-                    if not target_op or target_op == op_id:
-                        completed = True
-                        if ev_name in {
-                            "operation.failed",
-                            "operation.cancelled",
-                            "operation.blocked",
-                            "turn.blocked",
-                        }:
-                            op_status = (
-                                "FAILED"
-                                if ev_name == "operation.failed"
-                                else "BLOCKED"
-                                if ev_name in {"operation.blocked", "turn.blocked"}
-                                else "CANCELLED"
-                            )
-                            if op_rec is None:
-                                op_rec = {"status": op_status, "result": ev_payload}
-                            elif isinstance(op_rec, dict):
-                                op_rec["status"] = op_status
-                                if "result" not in op_rec:
-                                    op_rec["result"] = ev_payload
-                        break
-
-                # Periodic operation check
-                if now - last_poll_time >= 2.0:
-                    last_poll_time = now
-                    try:
-                        op_rec = (
-                            client.operation_get(op_id)
-                            if hasattr(client, "operation_get")
-                            else None
-                        )
-                        if op_rec and isinstance(op_rec, dict):
-                            op_status = op_rec.get("status")
-                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                completed = True
-                                break
-                    except Exception:
-                        pass
-        except KeyboardInterrupt:
-            # Gracefully intercept Ctrl+C during turn execution: Cancel turn, do NOT kill daemon!
-            try:
-                if op_id and op_id != "turn" and hasattr(client, "operation_cancel"):
-                    client.operation_cancel(op_id, cascade=True)
-                elif hasattr(client, "cancel"):
-                    client.cancel(session["session_id"])
-            except Exception:
-                try:
-                    adapter.command(f":cancel {op_id}", session_id=session["session_id"])
-                except Exception:
-                    pass
-
-            if op_id in state.operations:
-                state.operations[op_id].status = "CANCELLED"
-            for role_obj in state.roles.values():
-                if getattr(role_obj, "state", "").upper() in {"RUNNING", "ACTIVE"}:
-                    role_obj.state = "CANCELLED"
-            state.add_activity("User", "interrupted turn", op_id)
-
-            if streaming_active and not is_tty:
-                click.echo("")
-
-            cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
-            turn_acts = state.current_turn_actions
-            state.add_message("assistant", cancel_msg, actions=turn_acts)
-            if is_tty:
-                redraw_full_screen(
-                    session,
-                    state,
-                    clear=False,
-                    include_composer=True,
-                    composer_is_active=False,
-                    live_manager=live_manager,
-                )
-            else:
-                click.echo(
-                    render_error_box_str(
-                        cancel_msg,
-                        title="TURN INTERRUPTED",
-                        hint="In-flight turn operation was cancelled. Daemon process remains running.",
-                    )
-                )
-            restore_composer_focus(state)
-            return session, False
-
-        # Finalize streaming if active
-        if streamed_chunks and not assistant_rendered:
-            full_resp = "".join(streamed_chunks).strip()
-            turn_acts = state.current_turn_actions
-            thinking = getattr(state, "current_turn_thinking", None) or None
-            state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
-            assistant_rendered = True
-            streamed_chunks = []
-            # WO-013 (AC-3): Perform final settle redraw_full_screen when the stream completes
-            # keeping disabled busy composer visible until the next prompt_composer_input activation.
-            redraw_full_screen(
-                session,
-                state,
-                clear=False,
-                include_composer=True,
-                composer_is_active=False,
-                composer_placeholder=placeholder,
-                live_manager=live_manager,
-            )
-
-        # Output diagnostic summary at turn end (non-invasive stderr logging)
-        if _diagnostics_enabled:
-            duration = time.monotonic() - _diagnostics_start
-            n = _streaming_diagnostics["redraw_count"]
-            if n > 0:
-                render_median = _streaming_diagnostics["render_sum_ms"] / n
-                write_median = _streaming_diagnostics["write_sum_ms"] / n
-            else:
-                render_median = write_median = 0.0
-            if _streaming_diagnostics["inter_redraw_count"] > 0:
-                inter_redraw_median = (
-                    _streaming_diagnostics["inter_redraw_sum_ms"]
-                    / _streaming_diagnostics["inter_redraw_count"]
-                )
-            else:
-                inter_redraw_median = 0.0
-            if _streaming_diagnostics["inter_event_count"] > 0:
-                inter_event_median = (
-                    _streaming_diagnostics["inter_event_sum_ms"]
-                    / _streaming_diagnostics["inter_event_count"]
-                )
-            else:
-                inter_event_median = 0.0
-            try:
-                sys.stderr.write("\n=== STACKMIND TUI DIAGNOSTICS ===\n")
-                sys.stderr.write(
-                    f"Turn duration: {duration:.2f}s | Events: {_streaming_diagnostics['event_count']} | Redraws: {n}\n"
-                )
-                sys.stderr.write(
-                    f"Render: median={render_median:.1f}ms | max={_streaming_diagnostics['max_render_ms']:.1f}ms\n"
-                )
-                sys.stderr.write(
-                    f"Write: median={write_median:.1f}ms | max={_streaming_diagnostics['max_write_ms']:.1f}ms\n"
-                )
-                sys.stderr.write(
-                    f"Event gap: median={inter_event_median:.1f}ms | max={_streaming_diagnostics['max_inter_event_ms']:.1f}ms\n"
-                )
-                sys.stderr.write(
-                    f"Redraw interval: median={inter_redraw_median:.1f}ms | max={_streaming_diagnostics['max_inter_redraw_ms']:.1f}ms\n"
-                )
-                sys.stderr.write("=== END DIAGNOSTICS ===\n\n")
-            except Exception:
-                pass
-
-        # If assistant was not rendered from streaming or events, fetch final operation status
-        if not assistant_rendered:
-            try:
-                if (
-                    op_rec is None
-                    or not completed
-                    or op_status in {"FAILED", "CANCELLED", "BLOCKED"}
-                ) and hasattr(client, "operation_get"):
-                    fresh_op = client.operation_get(op_id)
-                    if fresh_op and isinstance(fresh_op, dict):
-                        op_rec = fresh_op
-                        op_status = op_rec.get("status")
-                        if op_status in {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}:
-                            completed = True
-            except Exception:
-                pass
-
-            # Drain any remaining events
-            try:
-                if hasattr(client, "events"):
-                    remaining_events = list(
-                        client.events(session["session_id"], after=state.last_sequence)
-                    )
-                    for ev in remaining_events:
-                        state.process_event(ev)
-                        ev_str = (
-                            ""
-                            if ev.get("name")
-                            in {"operation.started", "turn.started", "operation.completed"}
-                            else render_operational_event_str(ev)
-                        )
-                        if ev_str and not is_tty:
-                            click.echo(ev_str)
-                        resp = None
-                        thinking = None
-                        response_events = {
-                            "event.toolResult",
-                            "operation.completed",
-                            "turn.completed",
-                        }
-                        if ev.get("name") in response_events:
-                            resp = extract_assistant_response(
-                                ev.get("payload", {}), workspace=workspace
-                            )
-                            thinking = extract_assistant_thinking(
-                                ev.get("payload", {}), workspace=workspace
-                            )
-                        if resp and not assistant_rendered:
-                            turn_acts = state.current_turn_actions
-                            state.add_message(
-                                "assistant", resp, actions=turn_acts, thinking=thinking
-                            )
-                            if is_tty:
-                                redraw_full_screen(
-                                    session,
-                                    state,
-                                    clear=False,
-                                    include_composer=True,
-                                    composer_is_active=False,
-                                    live_manager=live_manager,
-                                )
-                            else:
-                                click.echo(
-                                    render_assistant_message_str(
-                                        resp, actions=turn_acts, thinking=thinking
-                                    )
-                                )
-                            assistant_rendered = True
-            except Exception:
-                pass
-
-            if not assistant_rendered and op_rec and isinstance(op_rec, dict):
-                res = op_rec.get("result") or {}
-                summary = res.get("report_markdown") or res.get("summary") or res.get("reason")
-                thinking = (
-                    res.get("thinking")
-                    or res.get("thought")
-                    or res.get("reasoning")
-                    or res.get("reasoning_content")
-                    or op_rec.get("thinking")
-                    or op_rec.get("thought")
-                )
-                report_path_raw = res.get("report_path")
-                if report_path_raw:
-                    rp = Path(report_path_raw)
-                    if not rp.is_absolute() and workspace:
-                        rp = workspace / rp
-                    if rp.exists():
-                        try:
-                            cnt = rp.read_text(encoding="utf-8")
-                            if "## Thinking" in cnt and not thinking:
-                                _, _, tp = cnt.partition("## Thinking")
-                                tb, _, _ = tp.partition("## ")
-                                thinking = tb.strip() or None
-                            if "## Report" in cnt:
-                                _, _, b = cnt.partition("## Report")
-                                rb, _, _ = b.partition("## Meta")
-                                rep_body = rb.strip()
-                                if rep_body and rep_body != "Completed task via tools":
-                                    summary = rep_body
-                                elif not summary or summary == "Completed task via tools":
-                                    summary = rep_body or cnt.strip()
-                            elif not summary or summary == "Completed task via tools":
-                                summary = cnt.strip()
-                        except Exception:
-                            pass
-                if op_status in {"FAILED", "CANCELLED", "BLOCKED"}:
-                    from cli.tui.events import clean_error_message
-
-                    err_raw = (
-                        res.get("error")
-                        or res.get("reason")
-                        or res.get("message")
-                        or op_rec.get("error")
-                        or summary
-                        or f"Operation {op_status.lower() if op_status else 'failed'}."
-                    )
-                    err_msg = (
-                        clean_error_message(err_raw)
-                        or f"Operation {op_status.lower() if op_status else 'failed'}."
-                    )
-                    err_title = (
-                        "OLLAMA ERROR"
-                        if "ollama" in err_msg.lower()
-                        else (f"OPERATION {op_status}" if op_status else "OPERATION FAILED")
-                    )
-                    turn_acts = state.current_turn_actions
-                    if turn_acts:
-                        turn_acts.expanded = True
-                    state.add_message(
-                        "assistant",
-                        f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}",
-                        actions=turn_acts,
-                    )
-                    if is_tty:
-                        redraw_full_screen(
-                            session,
-                            state,
-                            clear=False,
-                            include_composer=True,
-                            composer_is_active=False,
-                            live_manager=live_manager,
-                        )
-                    else:
-                        click.echo(render_error_box_str(err_msg, title=err_title))
-                    assistant_rendered = True
-                elif summary:
-                    if summary.strip() == "Completed task via tools":
-                        summary = "Completed turn via tools. All executed actions are recorded in the Actions group above."
-                    turn_acts = state.current_turn_actions
-                    state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
-                    if is_tty:
-                        redraw_full_screen(
-                            session,
-                            state,
-                            clear=False,
-                            include_composer=True,
-                            composer_is_active=False,
-                            live_manager=live_manager,
-                        )
-                    else:
-                        click.echo(
-                            render_assistant_message_str(
-                                summary, actions=turn_acts, thinking=thinking
-                            )
-                        )
-                    assistant_rendered = True
-
-        if not assistant_rendered:
-            if (
-                op_rec
-                and isinstance(op_rec, dict)
-                and op_rec.get("status") in {"FAILED", "CANCELLED", "BLOCKED"}
-            ):
-                op_status = op_rec.get("status")
-                from cli.tui.events import clean_error_message
-
-                err_raw = (
-                    (op_rec.get("result") or {}).get("error")
-                    or (op_rec.get("result") or {}).get("reason")
-                    or (op_rec.get("result") or {}).get("message")
-                    or op_rec.get("error")
-                    or f"Operation {op_status.lower()}."
-                )
-                err_msg = clean_error_message(err_raw) or f"Operation {op_status.lower()}."
-                err_title = (
-                    "OLLAMA ERROR" if "ollama" in err_msg.lower() else f"OPERATION {op_status}"
-                )
-                turn_acts = state.current_turn_actions
-                if turn_acts:
-                    turn_acts.expanded = True
-                state.add_message(
-                    "assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts
-                )
-                if is_tty:
-                    redraw_full_screen(
-                        session,
-                        state,
-                        clear=False,
-                        include_composer=True,
-                        composer_is_active=False,
-                        live_manager=live_manager,
-                    )
-                else:
-                    click.echo(render_error_box_str(err_msg, title=err_title))
-                assistant_rendered = True
-            elif completed:
-                completion_msg = f"Turn operation {op_id} completed."
-                turn_acts = state.current_turn_actions
-                state.add_message("assistant", completion_msg, actions=turn_acts)
-                if is_tty:
-                    redraw_full_screen(
-                        session,
-                        state,
-                        clear=False,
-                        include_composer=True,
-                        composer_is_active=False,
-                        live_manager=live_manager,
-                    )
-                else:
-                    click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
-            else:
-                timeout_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
-                state.add_message("system", timeout_msg)
-                if is_tty:
-                    redraw_full_screen(
-                        session,
-                        state,
-                        clear=False,
-                        include_composer=True,
-                        composer_is_active=False,
-                        live_manager=live_manager,
-                    )
-                else:
-                    click.echo(
-                        render_error_box_str(
-                            timeout_msg,
-                            title="REQUEST TIMEOUT",
-                            hint="Use :status or :events to inspect.",
-                        )
-                    )
+        return _stream_turn_execution(
+            adapter,
+            client,
+            session,
+            state,
+            op_id=op_id,
+            placeholder=placeholder,
+            effective_timeout=effective_timeout,
+            is_tty=is_tty,
+            live_manager=live_manager,
+            initial_activity_desc="Routing goal to Architecture" if is_goal else "Turn submitted",
+        )
     except KeyboardInterrupt:
         click.echo()
         restore_composer_focus(state)

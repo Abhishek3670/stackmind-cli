@@ -728,6 +728,7 @@ def prompt_composer_input(
     terminal_width: int | None = None,
     full_screen: bool = False,
     key_stream: Optional[Iterator[str]] = None,
+    on_idle: Optional[Callable[[Any], None]] = None,
 ) -> str:
     """Prompt user for input inside styled composer box border."""
     term_width = terminal_width if terminal_width is not None else width
@@ -835,6 +836,7 @@ def prompt_composer_input(
                     is_active=True,
                     has_content=has_c,
                 ),
+                on_idle=on_idle,
             )
         finally:
             if state is not None:
