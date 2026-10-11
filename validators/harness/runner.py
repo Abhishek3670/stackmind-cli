@@ -32,6 +32,14 @@ from validators.harness.retrieval import (
     SessionSearchTool,
 )
 from validators.harness.task_contract import reconcile_modified_files
+from validators.harness.orchestration import (
+    ReviewOutcome,
+    ReviewResult,
+    ReleaseDecision,
+    structured_output_validator,
+    release_decision,
+    evaluate_release_gates,
+)
 from validators.knowledge.api import ContextBundle, KnowledgeAPI
 
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / 'schemas' / 'harness-output.schema.json'
@@ -2515,7 +2523,11 @@ class AgentRunner:
         has_staged_writes: bool,
         tool_runtime: Any = None,
     ) -> Any:
-        """Derive verification flags from the staged filesystem and command telemetry."""
+        """Derive verification flags from the staged filesystem and command telemetry.
+
+        Fail-closed semantics: any exception during verification is captured and
+        treated as a failure, preventing false success returns.
+        """
         from validators.harness.contract_gate import verify_post_execution
         from validators.harness.snapshot import VerificationDimensions
 
@@ -2865,6 +2877,85 @@ class AgentRunner:
                 and not decision.blockers
                 and (bool(changed_files) or has_staged_writes)
             )
+
+        # Evaluate centralized release gates (Fix 7)
+        # Clean delivery gate check - only for final project deliverables
+        clean_delivery_passed = True
+        if task.kind == 'work_order' and task.deliverable_path:
+            from validators.harness.clean_delivery_gate import CleanDeliveryGate
+            gate = CleanDeliveryGate(self.project_path)
+            clean_delivery_passed, _ = gate.validate()
+
+        # Requirements coverage check
+        requirements_passed = True
+        requirements_blockers: tuple[str, ...] = ()
+        if task.work_order_id:
+            from validators.harness.requirements import validate_requirements_coverage
+            ledger_path = self.sync_path / 'state' / 'requirements.yaml'
+            if ledger_path.exists():
+                try:
+                    from validators.harness.requirements import RequirementsLedger
+                    ledger = RequirementsLedger.load(ledger_path)
+                    # Collect all work order IDs for the project
+                    all_wo_ids: list[str] = []
+                    import os
+                    for status_dir in ('ACTIVE', 'COMPLETED', 'BLOCKED'):
+                        wo_dir = self.sync_path / 'work-orders' / status_dir
+                        if wo_dir.exists():
+                            all_wo_ids.extend(f.stem for f in wo_dir.glob('*.yaml'))
+                    requirements_passed, requirements_blockers = validate_requirements_coverage(ledger, all_wo_ids)
+                except Exception:
+                    pass
+
+        # Check evidence freshness (stale detection)
+        has_stale_evidence = False
+        if task.work_order_id:
+            from validators.harness.snapshot import WorkspaceSnapshot
+            try:
+                current_snapshot = WorkspaceSnapshot.capture(self.project_path)
+                # Check if requirements evidence hashes match current files
+                from validators.harness.requirements import RequirementsLedger
+                ledger_path = self.sync_path / 'state' / 'requirements.yaml'
+                if ledger_path.exists():
+                    ledger = RequirementsLedger.load(ledger_path)
+                    for req in ledger.requirements:
+                        if req.evidence and req.evidence.get('content_hash'):
+                            # Check if any changed file has matching hash - stale if mismatch
+                            for changed_file in changed_files:
+                                candidate = staged_root / changed_file
+                                if candidate.exists():
+                                    current_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()[:16]
+                                    if current_hash != req.evidence.get('content_hash'):
+                                        has_stale_evidence = True
+                                        break
+            except Exception:
+                pass
+
+        # Execution QA check
+        execution_qa_passed = True
+        execution_blockers: tuple[str, ...] = ()
+        if self.agent in ('gemma', 'qa'):
+            if decision.status != 'completed' or decision.blockers:
+                execution_qa_passed = False
+                execution_blockers = (decision.blockers if decision.blockers else ('QA verification not completed',))
+
+        # Call centralized gate evaluation
+        approved, blocking_reasons = evaluate_release_gates(
+            clean_delivery_passed=clean_delivery_passed,
+            d024_passed=d024_passed,
+            requirements_passed=requirements_passed,
+            execution_qa_passed=execution_qa_passed,
+            has_stale_evidence=has_stale_evidence,
+            has_requirements_blocked=not requirements_passed,
+            requirements_blockers=requirements_blockers,
+            execution_qa_blocked=not execution_qa_passed,
+            execution_blockers=execution_blockers,
+        )
+
+        # Append centralized gate blocking reasons
+        if not approved:
+            staged_errors.append(f"Release gates blocked: {'; '.join(blocking_reasons)}")
+
         return VerificationDimensions(
             scope_verified=scope_verified,
             state_verified=state_verified,
