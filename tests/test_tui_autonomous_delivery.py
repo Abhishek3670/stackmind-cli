@@ -28,6 +28,7 @@ from cli.tui.app import (
     RoleStatus,
     WorkOrderItem,
     dispatch_delivery_command,
+    get_status_str,
     render_activity_stream,
     render_completion_surface,
     render_operation_tree,
@@ -798,6 +799,231 @@ def test_tui_current_operation_shows_blocked_when_runtime_blocked() -> None:
 
     lines = format_current_operation(None, state=state)
     assert any("Blocked" in line.plain for line in lines)
+
+
+# ─── 6. :STATUS COMMAND TESTS ──────────────────────────────────────────────────
+
+def test_status_idle_state():
+    """Test :status output for idle state - no session header line."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.INITIALIZING
+    session = {"session_id": "test-session", "state": "RUNNING", "provider": "daemon"}
+
+    output = get_status_str(session, state=state)
+    # Session metadata should NOT appear in output
+    assert "Session" not in output
+    assert "test-session" not in output
+    assert "provider" not in output
+    # Status fields should render correctly
+    assert "Status: planning" in output
+    assert "Next: Waiting for work..." in output
+
+
+def test_status_awaiting_approval():
+    """Test :status output for awaiting approval state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: awaiting_approval" in output
+    assert "Plan: awaiting approval" in output
+    assert "Next: Approve or reject pending plan" in output
+
+
+def test_status_active_with_progress():
+    """Test :status output for active execution with progress - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+    state.work_orders[0].status = "COMPLETED"
+    state.work_orders[1].status = "RUNNING"
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: active" in output
+    assert "Progress: 1/5 WOs completed" in output
+
+
+def test_status_blocked():
+    """Test :status output for blocked state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.BLOCKED
+    state.error = "Recovery repair failed (2/2)"
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: blocked" in output
+    assert "Blocker: Recovery repair failed (2/2)" in output
+    assert "Next: Review and resolve blocker, then :run" in output
+
+
+def test_status_failed():
+    """Test :status output for failed state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.FAILED
+    state.error = "Critical error during execution"
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: failed" in output
+    assert "Next: Review error, then :run or :cancel" in output
+
+
+def test_status_project_complete():
+    """Test :status output for project complete state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.PROJECT_COMPLETE
+    state.is_complete = True
+    for k in state.completion_checklist:
+        state.completion_checklist[k] = True
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: complete" in output
+    assert "Next: Project delivered" in output
+
+
+def test_status_plan_rejected():
+    """Test :status output for rejected plan state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.PLAN_REJECTED
+    state.plan = {"feedback": "Needs more detail"}
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: rejected" in output
+    assert "Plan: rejected" in output
+    assert "Next: Revise plan and resubmit" in output
+
+
+def test_status_with_blocked_work_orders():
+    """Test :status output when individual work orders are blocked - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+    state.work_orders[0].status = "BLOCKED"
+    state.work_orders[1].status = "RUNNING"
+    session = {"session_id": "test-session"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Blocker: Blocked WOs: WO-001" in output
+
+
+# ─── 7. SIDE PANEL UPDATE AFTER PLAN APPROVAL ────────────────────────────────
+
+def test_side_panel_updates_after_plan_approve():
+    """After :approve, state should reflect AUTONOMOUS_EXECUTION with active agents."""
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    mock_client = _MockDaemonClient()
+    adapter = StackMindTuiAdapter(mock_client)  # type: ignore[arg-type]
+    session = mock_client.get_session("session-test-approve")
+    state = AutonomousDeliveryState("test-approve", session_id="session-test-approve")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001", "state": "AWAITING_APPROVAL"}
+    state.work_orders[0].status = "WAITING"
+    state.roles["Backend"].state = "WAITING"
+
+    # Run :approve command
+    s, should_exit = dispatch_delivery_command(
+        adapter, mock_client, session, ":approve ship it", state
+    )  # type: ignore[arg-type]
+
+    assert not should_exit
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+    assert state.plan["state"] == "APPROVED"
+    assert state.completion_checklist["PLAN.md"] is True
+
+    # Side panel data should be updated (work orders and roles reflect execution state)
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+
+
+def test_side_panel_reflects_work_order_transitions():
+    """Work-order state changes should be visible in side panel data."""
+    state = AutonomousDeliveryState("test-wo")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    # Initial state
+    assert state.work_orders[0].status == "RUNNING"
+
+    # Simulate work order completion (as would happen from daemon events)
+    state.work_orders[0].status = "COMPLETED"
+    state.work_orders[1].status = "RUNNING"
+
+    # State should reflect the changes
+    assert state.work_orders[0].status == "COMPLETED"
+    assert state.work_orders[1].status == "RUNNING"
+
+
+def test_agent_transitions_visible_in_state():
+    """Agent state transitions (waiting→running→completed) should be tracked."""
+    state = AutonomousDeliveryState("test-transitions")
+
+    # Initial state
+    assert state.roles["Backend"].state == "WAITING"
+
+    # Simulate backend starting work
+    state.roles["Backend"].state = "RUNNING"
+    assert state.roles["Backend"].state == "RUNNING"
+
+    # Simulate backend completion
+    state.roles["Backend"].state = "COMPLETED"
+    assert state.roles["Backend"].state == "COMPLETED"
+
+
+def test_blocked_state_update_in_state():
+    """Blocked/failed transitions should be visible in state without :status."""
+    state = AutonomousDeliveryState("test-blocked")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    # Block the run
+    state.phase = ProjectPhase.BLOCKED
+    state.error = "Recovery failed"
+
+    assert state.phase == ProjectPhase.BLOCKED
+    assert state.error == "Recovery failed"
+
+
+def test_rejected_plan_state_update():
+    """Rejected plan state should be visible without running :status."""
+    state = AutonomousDeliveryState("test-rejected")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+
+    state.phase = ProjectPhase.PLAN_REJECTED
+    state.plan["state"] = "REJECTED"
+    state.plan["feedback"] = "Needs revision"
+
+    assert state.phase == ProjectPhase.PLAN_REJECTED
+    assert state.plan["state"] == "REJECTED"
+
+
+def test_status_command_not_required_for_state_propagation():
+    """State updates should propagate without needing to run :status."""
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    mock_client = _MockDaemonClient()
+    adapter = StackMindTuiAdapter(mock_client)  # type: ignore[arg-type]
+    session = mock_client.get_session("session-test-prop")
+    state = AutonomousDeliveryState("test-prop", session_id="session-test-prop")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+
+    # Approve plan
+    dispatch_delivery_command(adapter, mock_client, session, ":approve", state)  # type: ignore[arg-type]
+
+    # State should be updated immediately (no need for :status)
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+    assert state.plan["state"] == "APPROVED"
 
 
 

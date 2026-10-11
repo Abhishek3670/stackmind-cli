@@ -1398,23 +1398,101 @@ def reconnect_and_sync(
         return False, []
 
 
+def _compute_run_state(state: AutonomousDeliveryState) -> str:
+    """Derive current run state from phase and work order activity."""
+    phase = state.phase
+    if phase == ProjectPhase.PROJECT_COMPLETE:
+        return "complete"
+    if phase == ProjectPhase.FAILED:
+        return "failed"
+    if phase == ProjectPhase.BLOCKED:
+        return "blocked"
+    if phase == ProjectPhase.PLAN_REJECTED:
+        return "rejected"
+    if phase in (ProjectPhase.AWAITING_APPROVAL, ProjectPhase.PLAN_PROPOSED):
+        return "awaiting_approval"
+    if phase in (ProjectPhase.INITIALIZING, ProjectPhase.PLAN_APPROVED):
+        return "planning"
+    if phase == ProjectPhase.AUTONOMOUS_EXECUTION:
+        if state.work_orders and any(wo.status.upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS"} for wo in state.work_orders):
+            return "active"
+        return "idle"
+    return "idle"
+
+
+def _compute_progress(state: AutonomousDeliveryState) -> tuple[int, int]:
+    """Count completed and total work orders for progress reporting."""
+    if not state.work_orders:
+        return (0, 0)
+    total = len(state.work_orders)
+    completed = sum(1 for wo in state.work_orders if wo.status.upper() in {"COMPLETED", "DONE", "SUCCESS"})
+    return (completed, total)
+
+
+def _compute_blocker(state: AutonomousDeliveryState) -> str:
+    """Extract current blocker message if any."""
+    if state.error:
+        return state.error
+    # Check for blocked work orders
+    blocked_wos = [wo.id for wo in state.work_orders if wo.status.upper() == "BLOCKED"]
+    if blocked_wos:
+        return f"Blocked WOs: {', '.join(blocked_wos)}"
+    return ""
+
+
+def _compute_next_action(state: AutonomousDeliveryState) -> str:
+    """Determine next valid operator action based on current state."""
+    run_state = _compute_run_state(state)
+    if run_state == "awaiting_approval":
+        return "Approve or reject pending plan (:approve/:reject)"
+    if run_state == "blocked":
+        return "Review and resolve blocker, then :run"
+    if run_state == "failed":
+        return "Review error, then :run or :cancel"
+    if run_state == "rejected":
+        return "Revise plan and resubmit"
+    if run_state == "complete":
+        return "Project delivered; use :wo or :activity for details"
+    return "Waiting for work..."
+
+
 def get_status_str(
     session: dict[str, Any],
     state: AutonomousDeliveryState | None = None,
     width: int = 80,
 ) -> str:
-    """Build status header, contract HUD, and delivery view as a formatted string."""
+    """Build compact, state-aware status summary for :status command."""
     if state is not None:
         state.update_from_session(session)
-    conn_status = state.connection_status if state else "online"
-    parts = [
-        format_session_header(session, width=width, status=conn_status),
-        render_contract_hud_str(session.get("contract", {}), width=width),
-    ]
+
+    parts = []
+
     if state is not None:
-        parts.append(state.context_meter_text)
-        parts.append("")
-        parts.append(render_project_delivery_view(state))
+        run_state = _compute_run_state(state)
+        progress_done, progress_total = _compute_progress(state)
+        blocker = _compute_blocker(state)
+        next_action = _compute_next_action(state)
+
+        # Status line
+        parts.append(f"Status: {run_state}")
+
+        # Progress (only if there are work orders)
+        if progress_total > 0:
+            parts.append(f"Progress: {progress_done}/{progress_total} WOs completed")
+
+        # Plan approval state
+        if state.phase in (ProjectPhase.AWAITING_APPROVAL, ProjectPhase.PLAN_PROPOSED):
+            parts.append("Plan: awaiting approval")
+        elif state.phase == ProjectPhase.PLAN_REJECTED:
+            parts.append("Plan: rejected")
+
+        # Blocker (only if present)
+        if blocker:
+            parts.append(f"Blocker: {blocker}")
+
+        # Next action
+        parts.append(f"Next: {next_action}")
+
     return "\n".join(parts)
 
 
@@ -1948,6 +2026,12 @@ def dispatch_delivery_command(
         if (state.phase == ProjectPhase.AWAITING_APPROVAL or state.plan.get("state") == "AWAITING_APPROVAL") and plan_id:
             try:
                 client.plan_approve(session["session_id"], plan_id, reason=clean_reason)
+                # Fetch and process events to sync state with daemon (e.g., plan.approved, operation.started)
+                sid = session.get("session_id")
+                if sid:
+                    events = client.events(sid, after=state.last_sequence)
+                    for ev in events:
+                        state.process_event(ev)
                 state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
                 state.completion_checklist["PLAN.md"] = True
                 if state.plan:
