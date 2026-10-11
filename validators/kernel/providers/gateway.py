@@ -21,6 +21,7 @@ from .errors import (
     ConsecutiveToolFailureError,
     NoProgressLoopError,
     OperationCancelledError,
+    ProviderError,
     TimeoutError,
     ToolLimitExceededError,
     ToolLoopExhaustedError,
@@ -1339,11 +1340,19 @@ class ProviderGateway:
         self.consecutive_failures: int = 0
         self.written_files: list[str] = []
         self.read_counts: dict[str, int] = {}
+        self._step_count: int = 0
+        self._file_write_count: int = 0
+        self.budget_status: dict[str, Any] = {"tokens_used": 0, "max_tokens": None, "tool_calls_used": 0, "max_tool_calls": None, "steps": 0}
         provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
         is_local = provider in ("ollama", "local", "llamacpp")
         if max_tool_output_chars == DEFAULT_MAX_TOOL_OUTPUT_CHARS and is_local:
             max_tool_output_chars = int(os.environ.get("LOCAL_TOOL_OUTPUT_CHARS", "4000"))
         self.max_tool_output_chars: int = max_tool_output_chars
+
+        # Track budget status
+        if self.contract and hasattr(self.contract, "budget") and self.contract.budget:
+            self.budget_status["max_tokens"] = self.contract.budget.get("max_tokens")
+            self.budget_status["max_tool_calls"] = self.contract.budget.get("max_tool_calls")
 
     def has_written_deliverable(self, required_deliverable: str | None) -> bool:
         if not required_deliverable:
@@ -1837,6 +1846,8 @@ class ProviderGateway:
                         pass
 
         self._record_and_check_budget(response.usage)
+        self.budget_status["tokens_used"] = self.total_usage.total_tokens
+        self.budget_status["tool_calls_used"] = self.total_tool_calls
 
         messages.append(response.message)
 
@@ -1881,6 +1892,16 @@ class ProviderGateway:
 
         return response
 
+    def is_budget_exhausted(self) -> bool:
+        """Check if any budget limit has been exhausted."""
+        max_tokens = self.budget_status.get("max_tokens")
+        if max_tokens is not None and self.budget_status["tokens_used"] >= max_tokens:
+            return True
+        max_tool_calls = self.budget_status.get("max_tool_calls")
+        if max_tool_calls is not None and self.budget_status["tool_calls_used"] >= max_tool_calls:
+            return True
+        return False
+
     def run_loop(
         self,
         messages: list[Message],
@@ -1901,6 +1922,8 @@ class ProviderGateway:
                 self.active_tools_list.append(request_tools_def)
         active_tools = self.active_tools_list
 
+        self.budget_status["steps"] = 0
+
         budget_turns = self.contract.budget.get("max_turns") if (self.contract and hasattr(self.contract, "budget") and self.contract.budget) else None
         effective_max_turns = max_turns or budget_turns or DEFAULT_MAX_TURNS
 
@@ -1919,6 +1942,7 @@ class ProviderGateway:
         for turn_idx in range(effective_max_turns):
             check_cancellation(cancellation_token)
             self._compact_messages_for_context(messages)
+            self.budget_status["steps"] += 1
 
             if deadline is not None:
                 remaining = deadline - time.monotonic()

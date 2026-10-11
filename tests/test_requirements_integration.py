@@ -164,6 +164,7 @@ class TestRequirementsCoverageGate:
             status="PASS",
             work_order_ids=["WO-001"],
             evidence={"test_result": "PASS", "verified_by": "gemma"},
+            verification_details=[{"name": "acceptance_check", "passed": True}],
         ))
         ledger.add_requirement(Requirement(
             id="R002",
@@ -173,6 +174,7 @@ class TestRequirementsCoverageGate:
             status="PASS",
             work_order_ids=["WO-002"],
             evidence={"test_result": "PASS"},
+            verification_details=[{"name": "acceptance_check", "passed": True}],
         ))
 
         passed, issues = validate_requirements_coverage(ledger, ["WO-001", "WO-002"])

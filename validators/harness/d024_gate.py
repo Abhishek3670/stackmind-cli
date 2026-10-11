@@ -573,6 +573,7 @@ class D024Gate:
 
         for target_wo in target_wos:
             # 1. Implementation deliverable completeness check
+            from validators.harness.deliverable_verifier import DeliverableVerifier
             target_file = self.find_work_order_file(project_path, target_wo)
             target_data: dict[str, Any] = {}
             if target_file:
@@ -600,7 +601,9 @@ class D024Gate:
                             deliv_paths.append(str(d.get("path") or d.get("file")).strip())
 
                     for deliv_path_str in deliv_paths:
+                        deliverable_issues = []
                         deliv_file = project_path / deliv_path_str
+
                         if not deliv_file.exists():
                             decision = D024GateDecision(
                                 passed=False,
@@ -629,7 +632,6 @@ class D024Gate:
                             return decision
 
                         # Quality & Security validations on existing deliverable
-                        deliverable_issues: list[str] = []
                         if deliv_file.is_file():
                             from validators.kernel.security import scan_for_credential_leaks
                             content = deliv_file.read_text(encoding="utf-8", errors="replace")
@@ -683,6 +685,15 @@ class D024Gate:
                                 if not sat_res.passed:
                                     deliverable_issues.append(sat_res.diagnostic or f"import satisfiability failed for {deliv_path_str}")
 
+                        # Content-aware verification (Fix 3)
+                        verifier = DeliverableVerifier()
+                        verification_result = verifier.verify(deliv_file)
+
+                        if not verification_result.passed:
+                            for check in verification_result.checks:
+                                if not check.passed and check.severity == "error":
+                                    deliverable_issues.append(f"content verification failed ({check.name}): {check.message}")
+
                         if deliverable_issues:
                             decision = D024GateDecision(
                                 passed=False,
@@ -693,6 +704,13 @@ class D024Gate:
                                 deliverable_exists=True,
                                 deliverable_path=deliv_path_str,
                                 reason="; ".join(deliverable_issues),
+                                evidence={
+                                    "verification_hash": verification_result.content_hash,
+                                    "verification_checks": [
+                                        {"name": c.name, "passed": c.passed, "severity": c.severity, "message": c.message}
+                                        for c in verification_result.checks
+                                    ],
+                                },
                             )
                             self.log_decision(project_path, decision)
                             return decision

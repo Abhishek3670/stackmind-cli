@@ -2879,8 +2879,13 @@ class AgentRunner:
             )
 
         # Evaluate centralized release gates (Fix 7)
-        # Clean delivery gate check - only for final project deliverables
+        # Clean delivery gate check - runs for any work_order with a declared deliverable
+        # CleanDeliveryGate is skipped for intermediate harness operations (tests, development)
+        # because they work with development files (validators/harness/, .sync/, etc.)
+        # The deliverable_path flag indicates a product is being delivered, regardless of task classification
         clean_delivery_passed = True
+        # Run CleanDeliveryGate whenever a work_order declares a deliverable_path
+        # This ensures all final product releases are checked, not just authoring tasks
         if task.kind == 'work_order' and task.deliverable_path:
             from validators.harness.clean_delivery_gate import CleanDeliveryGate
             gate = CleanDeliveryGate(self.project_path)

@@ -24,6 +24,9 @@ REQUIREMENT_STATUS = (
     "ARCHIVED",
 )
 
+# Default ledger path
+DEFAULT_LEDGER_PATH: Path = Path(".sync/state/requirements.yaml")
+
 
 @dataclass
 class Requirement:
@@ -32,12 +35,15 @@ class Requirement:
     text: str  # Original requirement text
     type: str  # e.g., "FUNCTIONAL", "NON_FUNCTIONAL", "CONSTRAINT", "INTEGRATION"
     priority: str  # e.g., "HIGH", "MEDIUM", "LOW"
+    milestone_id: str | None = None  # PLAN milestone this requirement derives from
     acceptance_criteria: list[str] = field(default_factory=list)
     source_location: str | None = None  # Where in user goal/plan this came from
     work_order_ids: list[str] = field(default_factory=list)  # Owning WOs
+    blocker_ids: list[str] = field(default_factory=list)  # Blocking WOs
     status: str = "PENDING"  # Current verification status
     verification_method: str | None = None  # How to verify (e.g., "TEST", "MANUAL", "STATIC_ANALYSIS")
-    evidence: dict[str, Any] = field(default_factory=dict)  # Verification evidence
+    evidence: dict[str, Any] = field(default_factory=dict)  # Verification evidence with content_hash, timestamp, etc.
+    verification_details: list[dict[str, Any]] = field(default_factory=list)  # Detailed check results per criterion
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -47,9 +53,11 @@ class Requirement:
             "text": self.text,
             "type": self.type,
             "priority": self.priority,
+            "milestone_id": self.milestone_id,
             "acceptance_criteria": self.acceptance_criteria,
             "source_location": self.source_location,
             "work_order_ids": self.work_order_ids,
+            "blocker_ids": self.blocker_ids,
             "status": self.status,
             "verification_method": self.verification_method,
             "evidence": self.evidence,
@@ -64,9 +72,11 @@ class Requirement:
             text=data["text"],
             type=data.get("type", "FUNCTIONAL"),
             priority=data.get("priority", "MEDIUM"),
+            milestone_id=data.get("milestone_id"),
             acceptance_criteria=data.get("acceptance_criteria", []),
             source_location=data.get("source_location"),
             work_order_ids=data.get("work_order_ids", []),
+            blocker_ids=data.get("blocker_ids", []),
             status=data.get("status", "PENDING"),
             verification_method=data.get("verification_method"),
             evidence=data.get("evidence", {}),
@@ -221,16 +231,14 @@ def validate_requirements_coverage(ledger: RequirementsLedger, work_order_ids: l
     issues: list[str] = []
 
     # Check for requirements without owning work orders
-    missing_wo = ledger.get_requirements_with_missing_wo()
-    if missing_wo:
-        for r in missing_wo:
+    for r in ledger.requirements:
+        if not r.work_order_ids:
             issues.append(f"Requirement {r.id} ({r.text[:50]}...) has no owning work order")
 
     # Check for requirements that are not PASS
     non_pass = [r for r in ledger.requirements if r.status not in ("PASS", "ARCHIVED")]
     for r in non_pass:
         if not r.work_order_ids:
-            # Already reported above
             continue
         if r.status == "PENDING":
             issues.append(f"Requirement {r.id} is PENDING (work order {r.work_order_ids[0]} not complete)")
@@ -243,8 +251,14 @@ def validate_requirements_coverage(ledger: RequirementsLedger, work_order_ids: l
 
     # Check for PASS without evidence
     for r in ledger.get_requirements_by_status("PASS"):
-        if not r.evidence:
+        if not r.evidence and not r.verification_details:
             issues.append(f"Requirement {r.id} is PASS but has no verification evidence")
+
+    # Check milestone→requirement mapping validity
+    for r in ledger.requirements:
+        if r.milestone_id:
+            # Would need milestone context to validate; skip for now
+            pass
 
     return len(issues) == 0, issues
 
@@ -256,4 +270,5 @@ __all__ = [
     "compile_requirements_from_plan",
     "validate_requirements_coverage",
     "REQUIREMENT_STATUS",
+    "DEFAULT_LEDGER_PATH",
 ]
