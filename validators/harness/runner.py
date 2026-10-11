@@ -930,9 +930,10 @@ class AgentRunner:
                             )
                         if hasattr(tool_runtime, "gateway") and hasattr(tool_runtime.gateway, "written_files"):
                             tool_written.update(Path(p).as_posix().lstrip('/') for p in tool_runtime.gateway.written_files)
-                    for tc in (getattr(completion, "meta", None) or {}).get("tool_calls_audit", []):
-                        if isinstance(tc, dict) and tc.get("tool") == "write_file" and tc.get("path"):
-                            tool_written.add(Path(str(tc["path"])).as_posix().lstrip('/'))
+                    if not tool_written:
+                        for tc in (getattr(completion, "meta", None) or {}).get("tool_calls_audit", []):
+                            if isinstance(tc, dict) and tc.get("tool") == "write_file" and tc.get("path"):
+                                tool_written.add(Path(str(tc["path"])).as_posix().lstrip('/'))
                     if self.agent in ("local-llm", "gitops"):
                         for rel_file in ("VERSION.md", "CHANGELOG.md"):
                             if rel_file in dec_norm and (staged_root / rel_file).is_file():
@@ -1650,6 +1651,7 @@ class AgentRunner:
                 "the parent Work Order (e.g. index.html) MUST explicitly declare the exact markup, container classes, and "
                 "element IDs (e.g. #animated-name) in its deliverable description and acceptance criteria so downstream "
                 "scripts and styles hook into existing elements. Never leave parent deliverables as empty placeholder scaffolding.\n"
+                "FILE OWNERSHIP RULE: In each Work Order's description and acceptance_criteria, you must ONLY instruct the worker to create or modify the specific file declared in its own `deliverable.path`. Never instruct a worker to initialize, create, or stub files that are the assigned deliverable of another work order (e.g. do not tell a scaffolding worker to touch index.html or main.js if those are deliverables of subsequent work orders), as runtime contract policies will deny out-of-scope file operations.\n"
                 "Only worker roles may be assigned to implementation work orders (e.g. codex for backend, gemini for frontend, gemma for qa, local-llm for gitops). "
                 "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
@@ -1811,9 +1813,18 @@ class AgentRunner:
             # Check what files have been written so far
             written_files_so_far: list[str] = list(getattr(gateway, "written_files", []))
             if not written_files_so_far:
+                failed_call_ids: set[str] = set()
+                for msg in messages:
+                    if getattr(msg, 'role', '') == 'tool':
+                        content_str = str(msg.content or '')
+                        if content_str.startswith("Error:") or content_str.startswith("Warning:") or "PermissionError" in content_str:
+                            if getattr(msg, 'tool_call_id', None):
+                                failed_call_ids.add(msg.tool_call_id)
                 for msg in messages:
                     if msg.tool_calls:
                         for tc in msg.tool_calls:
+                            if tc.id and tc.id in failed_call_ids:
+                                continue
                             tc_args = getattr(tc, 'arguments', None) or {}
                             if tc.name == 'write_file' and 'path' in tc_args:
                                 p = str(tc_args['path'])
@@ -1894,18 +1905,25 @@ class AgentRunner:
                 pass
         payload = self._parse_json_payload(raw_text)
 
-        written_files: list[str] = []
-        for msg in history:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tc_args = getattr(tc, 'arguments', None) or {}
-                    if tc.name == 'write_file' and 'path' in tc_args:
-                        p = str(tc_args['path'])
-                        if p not in written_files:
-                            written_files.append(p)
-        for wf in getattr(gateway, "written_files", []):
-            if wf not in written_files:
-                written_files.append(wf)
+        written_files: list[str] = list(getattr(gateway, "written_files", []))
+        if not written_files:
+            failed_call_ids: set[str] = set()
+            for msg in history:
+                if getattr(msg, 'role', '') == 'tool':
+                    content_str = str(msg.content or '')
+                    if content_str.startswith("Error:") or content_str.startswith("Warning:") or "PermissionError" in content_str:
+                        if getattr(msg, 'tool_call_id', None):
+                            failed_call_ids.add(msg.tool_call_id)
+            for msg in history:
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc.id and tc.id in failed_call_ids:
+                            continue
+                        tc_args = getattr(tc, 'arguments', None) or {}
+                        if tc.name == 'write_file' and 'path' in tc_args:
+                            p = str(tc_args['path'])
+                            if p not in written_files:
+                                written_files.append(p)
 
         # Executed-tool audit for the governed loop: deterministic evidence of
         # what the model actually ran (e.g. run_tests for QA work orders).

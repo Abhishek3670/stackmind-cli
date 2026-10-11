@@ -148,3 +148,30 @@ class TestCleanDeliveryGate:
             assert not passed, "Gate should detect StackMind runtime references"
             assert any("stackmind" in f["issue"].lower() for f in findings), \
                 "Should flag StackMind term"
+
+    def test_plan_md_excluded_from_clean_delivery_scan(self):
+        """PLAN.md contains architectural agent assignments and must be excluded from product scan."""
+        from validators.harness.clean_delivery_gate import CleanDeliveryGate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = Path(tmp)
+            # PLAN.md with standard agent annotations produced by Architecture
+            plan = project_path / "PLAN.md"
+            plan.write_text(
+                "# Project Plan: My Product\n\n"
+                "## Milestones & Roadmap\n"
+                "- [ ] Milestone 1: Setup (Agent: codex)\n"
+                "- [ ] Milestone 2: UI (Agent: gemini)\n"
+                "- [ ] Milestone 3: QA (Agent: gemma)\n"
+                "- [ ] Milestone 4: Release (Agent: local-llm)\n"
+            )
+
+            # Product file is clean
+            src = project_path / "app.py"
+            src.write_text("print('hello world')\n")
+
+            gate = CleanDeliveryGate(project_path)
+            passed, findings = gate.validate()
+
+            assert passed, f"PLAN.md should not trigger clean delivery errors: {findings}"
+            assert len(findings) == 0, "No findings should be raised for clean project with PLAN.md"
