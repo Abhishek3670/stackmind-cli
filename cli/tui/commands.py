@@ -676,10 +676,25 @@ def _stream_turn_execution(
                 "operation.blocked",
                 "turn.completed",
                 "turn.blocked",
-            }:
+                "run.complete",
+                "run.failed",
+                "run.blocked",
+                "project.completed",
+                "project.complete",
+            } or state.is_complete or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE:
                 target_op = ev_payload.get("operation_id") or ev.get("operation_id")
                 if (
-                    ev_name in {"turn.completed", "turn.blocked"}
+                    ev_name in {
+                        "turn.completed",
+                        "turn.blocked",
+                        "run.complete",
+                        "run.failed",
+                        "run.blocked",
+                        "project.completed",
+                        "project.complete",
+                    }
+                    or state.is_complete
+                    or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE
                     or (target_op and target_op == op_id)
                     or (not target_op and op_id in {"turn", "all"})
                     or op_id == "all"
@@ -690,12 +705,14 @@ def _stream_turn_execution(
                         "operation.cancelled",
                         "operation.blocked",
                         "turn.blocked",
+                        "run.failed",
+                        "run.blocked",
                     }:
                         op_status = (
                             "FAILED"
-                            if ev_name == "operation.failed"
+                            if ev_name in {"operation.failed", "run.failed"}
                             else "BLOCKED"
-                            if ev_name in {"operation.blocked", "turn.blocked"}
+                            if ev_name in {"operation.blocked", "turn.blocked", "run.blocked"}
                             else "CANCELLED"
                         )
                         if op_rec is None:
@@ -1028,7 +1045,10 @@ def _stream_turn_execution(
                     click.echo(render_error_box_str(err_msg, title=err_title))
                 assistant_rendered = True
             elif completed:
-                completion_msg = f"Turn operation {op_id} completed."
+                if state.is_complete or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE:
+                    completion_msg = "✓ Autonomous delivery complete. All work orders implemented, verified, and released."
+                else:
+                    completion_msg = f"Turn operation {op_id} completed."
                 turn_acts = state.current_turn_actions
                 state.add_message("assistant", completion_msg, actions=turn_acts)
                 if is_tty:
