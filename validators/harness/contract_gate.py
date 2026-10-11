@@ -241,8 +241,11 @@ def verify_post_execution(
     # 3. Check scope allowed/denied for each modified file
     api = KnowledgeAPI(project_path)
     for file_path in files_to_check:
-        mod = path_to_module(file_path)
-        norm_fp = file_path.replace("\\", "/")
+        # Normalize file path for comparison
+        norm_fp = file_path.replace("\\", "/").lstrip("/")
+        if norm_fp.startswith("./"):
+            norm_fp = norm_fp[2:]
+        mod = path_to_module(norm_fp)
         if norm_fp.startswith("./"):
             norm_fp = norm_fp[2:]
         elif norm_fp.startswith("/"):

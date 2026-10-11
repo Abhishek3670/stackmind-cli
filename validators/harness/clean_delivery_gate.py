@@ -73,6 +73,7 @@ class CleanDeliveryGate:
             "validators/harness/",
             "cli/",
             "templates/",
+            "schemas/",
             ".venv/",
             ".pytest_cache/",
         ]
@@ -94,7 +95,7 @@ class CleanDeliveryGate:
                 rel_path = str(full_path.relative_to(self.project_path))
 
                 # Skip infrastructure paths - these are development-time, not product
-                if any(rel_path.startswith(prefix) for prefix in internal_prefixes):
+                if any(rel_path.replace('\\', '/').startswith(prefix) for prefix in internal_prefixes):
                     continue
 
                 yield full_path

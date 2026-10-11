@@ -2531,7 +2531,15 @@ class AgentRunner:
         from validators.harness.contract_gate import verify_post_execution
         from validators.harness.snapshot import VerificationDimensions
 
-        changed_files = tuple(Path(p).as_posix().lstrip('/') for p in diff.all_changed_files)
+        # Include tool-written files in changed files for scope verification
+        tool_written_files = []
+        if tool_runtime and hasattr(tool_runtime.gateway, 'written_files'):
+            tool_written_files = [
+                Path(p).as_posix().lstrip('/') for p in tool_runtime.gateway.written_files
+            ]
+
+        diff_changed = tuple(Path(p).as_posix().lstrip('/') for p in diff.all_changed_files)
+        changed_files = diff_changed + tuple(tool_written_files)
         bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/')
         dec_norm = {Path(p).as_posix().lstrip('/') for p in decision.modified_files if p}
         task_changed_files = tuple(
@@ -2540,14 +2548,22 @@ class AgentRunner:
             and not (relative_path.startswith('.sync/work-orders/') and relative_path not in dec_norm)
         )
         scope_verified = declaration_matches
-        if task_changed_files:
+        # Include tool-written files for scope verification
+        files_for_scope = list(task_changed_files)
+        if tool_runtime and hasattr(tool_runtime.gateway, 'written_files'):
+            for wf in tool_runtime.gateway.written_files:
+                norm_w = Path(wf).as_posix().lstrip('/')
+                if norm_w not in files_for_scope:
+                    files_for_scope.append(norm_w)
+
+        if files_for_scope:
             try:
                 verify_post_execution(
                     self.project_path,
                     self.agent,
                     task,
                     decision,
-                    observed_files=task_changed_files,
+                    observed_files=tuple(files_for_scope),
                 )
             except Exception as exc:
                 scope_verified = False
@@ -2736,6 +2752,11 @@ class AgentRunner:
             staged_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
             staged_modified = {Path(p).as_posix().lstrip('/') for p in diff.modified}
             deliverable_touched = (norm_deliv in staged_added or norm_deliv in staged_modified)
+            if not deliverable_touched and tool_runtime:
+                written_files = getattr(tool_runtime.gateway, 'written_files', [])
+                deliverable_touched = any(
+                    Path(w).as_posix().lstrip('/') == norm_deliv for w in written_files
+                )
 
         authored_artifacts = any(
             (p.startswith('.sync/work-orders/') or p.startswith('.sync/contracts/'))
@@ -2830,19 +2851,21 @@ class AgentRunner:
                 )
             )
         elif task.work_order_id and task.deliverable_path:
+            # Check both scratch (staged) and project root for the deliverable
+            staged_deliverable = staged_root / task.deliverable_path
+            project_deliverable = self.project_path / task.deliverable_path
+            deliverable_exists = staged_deliverable.exists() or project_deliverable.exists()
             if tool_runtime is not None:
-                deliverable = staged_root / task.deliverable_path
                 outcome_verified = (
                     decision.status == 'completed'
                     and not decision.blockers
-                    and (deliverable_touched or (authored_artifacts and deliverable.exists()))
+                    and (deliverable_touched or deliverable_exists or (authored_artifacts and deliverable_exists))
                 )
             else:
-                deliverable = staged_root / task.deliverable_path
                 outcome_verified = (
                     decision.status == 'completed'
                     and not decision.blockers
-                    and (deliverable_touched or deliverable.exists() or bool(changed_files) or has_staged_writes)
+                    and (deliverable_touched or deliverable_exists or bool(changed_files) or has_staged_writes)
                 )
         elif task.work_order_id and not task.deliverable_path:
             is_non_code_task = (
