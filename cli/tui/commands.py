@@ -1,0 +1,1817 @@
+"""Autonomous Delivery Command Dispatcher and REPL Execution for StackMind TUI.
+
+Handles interactive colon commands (:plan, :approve, :reject, :roles, :rebind,
+:tree, :wo, :completion, :diff, :events, :status, :help, etc.), prompt turns,
+and streaming event dispatch.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any, Mapping
+
+import click
+from rich.text import Text
+
+from cli.tui.chat import (
+    render_actions_group_str,
+    render_assistant_message_str,
+    render_assistant_stream_header,
+    render_chat_transcript_str,
+    render_user_message_str,
+)
+from cli.tui.diff import (
+    render_unified_diff_str,
+)
+from cli.tui.events import (
+    extract_assistant_response,
+    extract_assistant_thinking,
+    extract_text_delta,
+    is_connection_error,
+    recover_transcript_from_events,
+    render_connection_status_str,
+    render_error_box_str,
+    render_operational_event_str,
+)
+from cli.tui.governance import (
+    render_contract_hud_str,
+    render_plan_panel_str,
+    render_verification_matrix_str,
+)
+from cli.tui.landing import (
+    render_landing_block_str,
+)
+from cli.tui.layout import (
+    compute_layout,
+    render_runtime_panel_str,
+)
+from cli.tui.state import (
+    AutonomousDeliveryState,
+    OperationNode,
+    ProjectPhase,
+)
+from cli.tui.terminal import (
+    _wrap_text_to_width,
+    check_terminal_resize,
+    disable_mouse_reporting,
+    install_resize_handler,
+    redraw_full_screen as _terminal_redraw_full_screen,
+    render_top_header_bar_str,
+    restore_composer_focus,
+)
+
+
+def redraw_full_screen(*args: Any, **kwargs: Any) -> Any:
+    app_mod = sys.modules.get("cli.tui.app")
+    fn = getattr(app_mod, "redraw_full_screen", None) if app_mod is not None else None
+    if fn is not None and fn is not redraw_full_screen and fn is not _terminal_redraw_full_screen:
+        return fn(*args, **kwargs)
+    return _terminal_redraw_full_screen(*args, **kwargs)
+
+
+from cli.tui.views import (
+    render_completion_surface,
+    render_operation_tree,
+    render_roles_panel,
+    render_work_orders_panel,
+)
+from validators.kernel.tui import DaemonClient, StackMindTuiAdapter
+
+
+def reconnect_and_sync(
+    client: DaemonClient,
+    adapter: StackMindTuiAdapter,
+    state: AutonomousDeliveryState,
+    session: dict[str, Any],
+    workspace: Path | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Attempt reconnection to daemon and replay missed events without duplication."""
+    state.connection_status = "reconnecting"
+    sid = session.get("session_id")
+    try:
+        if sid:
+            updated_session = client.get_session(sid)
+            session.update(updated_session)
+            state.update_from_session(updated_session)
+        else:
+            client.health_version()
+
+        state.connection_status = "online"
+        missed: list[dict[str, Any]] = []
+        if sid:
+            missed = client.events(sid, after=state.last_sequence)
+            recover_transcript_from_events(missed, state, workspace=workspace)
+        return True, missed
+    except Exception:
+        state.connection_status = "offline"
+        return False, []
+
+
+def _compute_run_state(state: AutonomousDeliveryState) -> str:
+    """Derive current run state from phase and work order activity."""
+    phase = state.phase
+    if phase == ProjectPhase.PROJECT_COMPLETE:
+        return "complete"
+    if phase == ProjectPhase.FAILED:
+        return "failed"
+    if phase == ProjectPhase.BLOCKED:
+        return "blocked"
+    if phase == ProjectPhase.PLAN_REJECTED:
+        return "rejected"
+    if phase in (ProjectPhase.AWAITING_APPROVAL, ProjectPhase.PLAN_PROPOSED):
+        return "awaiting_approval"
+    if phase in (ProjectPhase.INITIALIZING, ProjectPhase.PLAN_APPROVED):
+        return "planning"
+    if phase == ProjectPhase.AUTONOMOUS_EXECUTION:
+        if state.work_orders and any(
+            wo.status.upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS"} for wo in state.work_orders
+        ):
+            return "active"
+        return "idle"
+    return "idle"
+
+
+def _compute_progress(state: AutonomousDeliveryState) -> tuple[int, int]:
+    """Count completed and total work orders for progress reporting."""
+    if not state.work_orders:
+        return (0, 0)
+    total = len(state.work_orders)
+    completed = sum(
+        1 for wo in state.work_orders if wo.status.upper() in {"COMPLETED", "DONE", "SUCCESS"}
+    )
+    return (completed, total)
+
+
+def _compute_blocker(state: AutonomousDeliveryState) -> str:
+    """Extract current blocker message if any."""
+    if state.error:
+        return state.error
+    # Check for blocked work orders
+    blocked_wos = [wo.id for wo in state.work_orders if wo.status.upper() == "BLOCKED"]
+    if blocked_wos:
+        return f"Blocked WOs: {', '.join(blocked_wos)}"
+    return ""
+
+
+def _compute_next_action(state: AutonomousDeliveryState) -> str:
+    """Determine next valid operator action based on current state."""
+    run_state = _compute_run_state(state)
+    if run_state == "awaiting_approval":
+        return "Approve or reject pending plan (:approve/:reject)"
+    if run_state == "blocked":
+        return "Review and resolve blocker, then :run"
+    if run_state == "failed":
+        return "Review error, then :run or :cancel"
+    if run_state == "rejected":
+        return "Revise plan and resubmit"
+    if run_state == "complete":
+        return "Project delivered; use :wo or :activity for details"
+    return "Waiting for work..."
+
+
+def get_status_str(
+    session: dict[str, Any],
+    state: AutonomousDeliveryState | None = None,
+    width: int = 80,
+) -> str:
+    """Build compact, state-aware status summary for :status command."""
+    if state is not None:
+        state.update_from_session(session)
+
+    parts = []
+
+    if state is not None:
+        run_state = _compute_run_state(state)
+        progress_done, progress_total = _compute_progress(state)
+        blocker = _compute_blocker(state)
+        next_action = _compute_next_action(state)
+
+        # Status line
+        parts.append(f"Status: {run_state}")
+
+        # Progress (only if there are work orders)
+        if progress_total > 0:
+            parts.append(f"Progress: {progress_done}/{progress_total} WOs completed")
+
+        # Plan approval state
+        if state.phase in (ProjectPhase.AWAITING_APPROVAL, ProjectPhase.PLAN_PROPOSED):
+            parts.append("Plan: awaiting approval")
+        elif state.phase == ProjectPhase.PLAN_REJECTED:
+            parts.append("Plan: rejected")
+
+        # Blocker (only if present)
+        if blocker:
+            parts.append(f"Blocker: {blocker}")
+
+        # Next action
+        parts.append(f"Next: {next_action}")
+
+    return "\n".join(parts)
+
+
+def _show_status(
+    session: dict[str, Any],
+    state: AutonomousDeliveryState | None = None,
+    width: int = 80,
+) -> str:
+    out = get_status_str(session, state=state, width=width)
+    click.echo(out)
+    return out
+
+
+def get_help_str() -> str:
+    """Return available commands and shortcuts help text."""
+    return (
+        "Available commands:\n"
+        "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
+        "  :contract         Display Contract Boundary HUD and write permissions\n"
+        "  :reconnect        Reconnect to daemon and replay missed events\n"
+        "  :roles            Display Agent Roles & Execution Backend bindings\n"
+        "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
+        "  :settings         Interactive cloud providers, API keys & models config (settings.json)\n"
+        "  :wo               Display Work Orders table and progress\n"
+        "  :tree, :agents    Display Hierarchical Operation Tree\n"
+        "  :plan             Display Plan Approval surface and revision history\n"
+        "  :goal <request>   Submit product goal to Architecture (claude)\n"
+        "  :approve [reason] Submit Plan approval or HITL approval\n"
+        "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
+        "  :completion       Display Project Complete handover checklist\n"
+        "  :cancel [target]  Cancel in-flight session turn, agent, or operation\n"
+        "  :diff             Display Unified Diff viewer for staged changes\n"
+        "  :matrix           Display 6-Dimensional Verification Matrix\n"
+        "  :events           Stream incremental sequenced events from daemon\n"
+        "  :pause            Pause active session turn\n"
+        "  :resume           Resume active session\n"
+        "  :chat             Display conversation transcript\n"
+        "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
+        "  :compact          Compact older transcript turns to protect context window\n"
+        "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
+        "  :landing          Display branded landing block\n"
+        "  :help             Show this help menu\n"
+        "  :exit, :quit, q   Gracefully stop daemon and exit\n"
+        "  <prompt text>     Submit a governed turn to the agent\n\n"
+        "Shortcuts:\n"
+        "  Ctrl+K            Open this help menu\n"
+        "  Ctrl+L            Redraw full screen\n"
+        "  PgUp / PgDn       Scroll conversation viewport\n"
+        "  Ctrl+C / Ctrl+D   Cancel turn or exit\n"
+        "  Esc               Cancel current prompt"
+    )
+
+
+def _build_in_progress_turn_content(
+    state: AutonomousDeliveryState,
+    model_name: str | None,
+    streamed_chunks: list[str],
+    latest_act_desc: str,
+    start_time: float,
+    max_wait: float,
+    layout_width: int,
+) -> str:
+    """Build unified live in-progress turn content: transcript + active turn."""
+    transcript = (
+        render_chat_transcript_str(state.messages, width=layout_width)
+        if getattr(state, "messages", None)
+        else ""
+    )
+    hdr = render_assistant_stream_header(model=model_name, width=layout_width)
+    parts = [hdr]
+
+    # In-progress actions (expanded during active execution so tools are visible live)
+    turn_acts = getattr(state, "current_turn_actions", None)
+    if turn_acts and not getattr(turn_acts, "is_empty", True):
+        turn_acts.expanded = True
+        act_str = render_actions_group_str(turn_acts, width=layout_width)
+        if act_str:
+            parts.append(act_str)
+
+    # In-progress thinking - shows before and during answer streaming
+    # Thinking is NOT added to final message to avoid duplication
+    thinking = getattr(state, "current_turn_thinking", None)
+    if thinking and thinking.strip():
+        clean_think = thinking.strip()
+        wrapped_thinking = _wrap_text_to_width(clean_think, layout_width)
+        parts.append(f"Thinking...\n{wrapped_thinking}")
+
+    # In-progress streamed response text or progress line
+    if streamed_chunks:
+        curr_text = "".join(streamed_chunks)
+        wrapped_text = _wrap_text_to_width(curr_text, layout_width)
+        if wrapped_text:
+            parts.append(wrapped_text)
+    else:
+        elapsed = time.time() - start_time
+        if max_wait > 0:
+            prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
+        else:
+            prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
+        parts.append(_wrap_text_to_width(prog_text, layout_width))
+
+    in_progress = "\n\n".join(parts)
+    return f"{transcript}\n\n{in_progress}" if transcript else in_progress
+
+
+def dispatch_delivery_command(
+    adapter: StackMindTuiAdapter,
+    client: DaemonClient,
+    session: dict[str, Any],
+    text: str,
+    state: AutonomousDeliveryState,
+    *,
+    client_timeout: float | None = None,
+    live_manager: Any | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Dispatch interactive TUI commands, updating delivery state reactively."""
+    effective_timeout = (
+        client_timeout if client_timeout is not None else getattr(state, "client_timeout", 0.0)
+    )
+    state.client_timeout = effective_timeout
+    # Clear thinking buffer at start of new turn to prevent stale thinking from previous turn
+    state.current_turn_thinking = ""
+    normalized = text.strip()
+    if not normalized:
+        return session, False
+
+    if normalized in {":exit", ":quit", "q"}:
+        disable_mouse_reporting()
+        if live_manager is not None and getattr(live_manager, "is_active", False):
+            live_manager.stop()
+        return session, True
+
+    is_tty = False
+    try:
+        is_tty = sys.stdout.isatty()
+    except Exception:
+        pass
+
+    if normalized == ":help":
+        output_str = get_help_str()
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":debugkeys":
+        from cli.tui.keyboard import DEBUG_KEYS_ENABLED, DEBUG_LOG_FILE, set_debug_keys
+
+        new_state = not DEBUG_KEYS_ENABLED
+        set_debug_keys(new_state)
+        status_str = (
+            f"[DEBUG KEYS] Logging ENABLED -> writing raw key events to {DEBUG_LOG_FILE}"
+            if new_state
+            else "[DEBUG KEYS] Logging DISABLED."
+        )
+        state.add_message("user", normalized)
+        state.add_message("system", status_str)
+        if not is_tty:
+            click.echo(status_str)
+        return session, False
+
+    if normalized == ":reconnect":
+        output_parts = [render_connection_status_str("reconnecting")]
+        ok, missed = reconnect_and_sync(client, adapter, state, session)
+        if ok:
+            output_parts.append(
+                f"{render_connection_status_str('online')} (reconnected, {len(missed)} missed events synced)"
+            )
+        else:
+            output_parts.append(
+                render_error_box_str(
+                    f"Could not reconnect to daemon at {client.url}",
+                    title="RECONNECTION FAILED",
+                    hint="Verify that the daemon process is running and reachable.",
+                )
+            )
+        output_str = "\n".join(output_parts)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":status":
+        error_str = None
+        try:
+            session = adapter.command(":status", session_id=session["session_id"])
+            state.connection_status = "online"
+            sid = session.get("session_id")
+            if sid:
+                missed = client.events(sid, after=state.last_sequence)
+                if missed:
+                    workspace = Path(session["workspace"]) if session.get("workspace") else None
+                    recover_transcript_from_events(missed, state, workspace=workspace)
+        except Exception as err:
+            if is_connection_error(err):
+                state.connection_status = "reconnecting"
+                error_str = render_error_box_str(
+                    f"Daemon connection failed: {err}",
+                    title="CONNECTION ERROR",
+                    hint="Daemon appears unreachable. Use :reconnect or check daemon status.",
+                )
+            else:
+                error_str = render_error_box_str(str(err), title="STATUS ERROR")
+
+        output_parts = []
+        if error_str:
+            output_parts.append(error_str)
+        output_parts.append(get_status_str(session, state=state))
+        output_str = "\n".join(output_parts)
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":contract":
+        contract_data = session.get("contract", {})
+        output_str = render_contract_hud_str(contract_data)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":roles":
+        # Query daemon role bindings if supported, and render detailed role panel
+        try:
+            roles_data = client.list_roles()
+            if roles_data and isinstance(roles_data, list):
+                for rd in roles_data:
+                    role_key = rd.get("role", "").title()
+                    normalized_key = "Q/A" if role_key.upper() in {"QA", "Q/A"} else role_key
+                    if normalized_key in state.roles:
+                        state.roles[normalized_key].backend = rd.get(
+                            "backend", state.roles[normalized_key].backend
+                        )
+                        state.roles[normalized_key].model = rd.get("model")
+        except Exception:
+            pass
+        output_str = render_roles_panel(state, detailed=True)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":rebind") or normalized.startswith(":configure"):
+        parts = normalized.split()
+        if len(parts) >= 3:
+            role_arg = parts[1]
+            backend_arg = parts[2]
+            model_arg = " ".join(parts[3:]).strip() if len(parts) >= 4 else None
+            from validators.kernel.settings import load_settings, sanitize_model_name, save_settings
+
+            if model_arg:
+                model_arg = sanitize_model_name(model_arg, backend_arg)
+            try:
+                client.configure_role_backend(role=role_arg, backend=backend_arg, model=model_arg)
+                role_key = role_arg.title()
+                normalized_key = "Q/A" if role_key.upper() in {"QA", "Q/A"} else role_key
+                ws = Path(session["workspace"]) if session.get("workspace") else None
+                s = load_settings(ws)
+                m_to_save = model_arg or (
+                    s.providers.get(backend_arg).default_model
+                    if backend_arg in s.providers and s.providers[backend_arg].default_model
+                    else "default"
+                )
+                if role_arg.lower() in ("code", "coding"):
+                    for code_role in ("Backend", "Frontend"):
+                        if code_role in state.roles:
+                            state.roles[code_role].backend = backend_arg
+                            if model_arg:
+                                state.roles[code_role].model = model_arg
+                    s.roles["backend"] = {"provider": backend_arg, "model": m_to_save}
+                    s.roles["frontend"] = {"provider": backend_arg, "model": m_to_save}
+                else:
+                    if normalized_key in state.roles:
+                        state.roles[normalized_key].backend = backend_arg
+                        if model_arg:
+                            state.roles[normalized_key].model = model_arg
+                    s.roles["qa" if role_arg.lower() in ("qa", "q/a") else role_arg.lower()] = {
+                        "provider": backend_arg,
+                        "model": m_to_save,
+                    }
+                save_settings(s, ws)
+                output_str = f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'" + (
+                    f" (model: {model_arg})" if model_arg else ""
+                )
+            except Exception as err:
+                output_str = f"[ERROR] Failed to rebind role '{role_arg}': {err}"
+        else:
+            output_str = (
+                "Usage: :rebind <role> <backend> [model]  (e.g., :rebind gitops ollama llama3)"
+            )
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized == ":settings"
+        or normalized.startswith(":settings ")
+        or normalized in {":config", ":providers", ":models"}
+    ):
+        from cli.tui.settings_panel import (
+            run_arrow_navigation_settings_loop,
+            run_interactive_settings_panel,
+        )
+
+        ws = Path(session["workspace"]) if session.get("workspace") else None
+        subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        if is_tty and not subcmd:
+            output_str = run_arrow_navigation_settings_loop(
+                session=session,
+                state=state,
+                client=client,
+                live_manager=live_manager,
+                workspace=ws,
+                width=term_cols,
+            )
+        else:
+            output_str = run_interactive_settings_panel(
+                workspace=ws,
+                client=client,
+                width=term_cols,
+                initial_subcmd=subcmd,
+            )
+        try:
+            roles_data = client.list_roles()
+            if roles_data and isinstance(roles_data, list):
+                for rd in roles_data:
+                    role_key = rd.get("role", "").title()
+                    normalized_key = "Q/A" if role_key.upper() in {"QA", "Q/A"} else role_key
+                    if normalized_key in state.roles:
+                        state.roles[normalized_key].backend = rd.get(
+                            "backend", state.roles[normalized_key].backend
+                        )
+                        state.roles[normalized_key].model = rd.get("model")
+        except Exception:
+            pass
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":wo":
+        output_str = render_work_orders_panel(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized in {":tree", ":agents"}:
+        try:
+            agents_list = client.list_agents(session_id=session["session_id"])
+            if agents_list and isinstance(agents_list, list):
+                for a in agents_list:
+                    aid = a.get("agent_id")
+                    rname = (a.get("role") or "Backend").title()
+                    normalized_rname = "Q/A" if rname.upper() in {"QA", "Q/A"} else rname
+                    op_id = a.get("operation_id") or f"op-{aid}"
+                    parent_id = a.get("parent_operation_id") or "op-root"
+                    backend = a.get("backend", "Codex")
+                    status = a.get("status", "RUNNING")
+                    node = OperationNode(
+                        op_id,
+                        normalized_rname,
+                        role=normalized_rname,
+                        backend=backend,
+                        status=status,
+                        parent_id=parent_id,
+                    )
+                    state.operations[op_id] = node
+                    if (
+                        parent_id in state.operations
+                        and op_id not in state.operations[parent_id].children
+                    ):
+                        state.operations[parent_id].children.append(op_id)
+        except Exception:
+            pass
+        output_str = render_operation_tree(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":plan":
+        try:
+            plan_obj = client.plan_get(session["session_id"])
+            if plan_obj:
+                state.plan = dict(plan_obj)
+                if plan_obj.get("state") == "AWAITING_APPROVAL":
+                    state.phase = ProjectPhase.AWAITING_APPROVAL
+        except Exception:
+            pass
+        output_str = render_plan_panel_str(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":approve"):
+        _, _, reason = normalized.partition(" ")
+        clean_reason = reason.strip() or "Approved by operator"
+        # Check if plan is awaiting approval
+        plan_id = state.plan.get("plan_id") or state.plan.get("id")
+        if (
+            state.phase == ProjectPhase.AWAITING_APPROVAL
+            or state.plan.get("state") == "AWAITING_APPROVAL"
+        ) and plan_id:
+            try:
+                client.plan_approve(session["session_id"], plan_id, reason=clean_reason)
+                # Fetch and process events to sync state with daemon (e.g., plan.approved, operation.started)
+                sid = session.get("session_id")
+                if sid:
+                    events = client.events(sid, after=state.last_sequence)
+                    for ev in events:
+                        state.process_event(ev)
+                state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                state.completion_checklist["PLAN.md"] = True
+                if state.plan:
+                    state.plan["state"] = "APPROVED"
+                if state.plan_revisions:
+                    state.plan_revisions[-1].state = "APPROVED"
+                feedback_msg = f"Plan '{plan_id}' approved. Approval recorded."
+                state.add_message("user", normalized)
+                state.add_message("assistant", f"✓ {feedback_msg} (reason: {clean_reason})")
+                if not is_tty:
+                    click.echo(feedback_msg)
+                return session, False
+            except Exception as e:
+                err_msg = f"Plan approval error: {e}"
+                state.add_message("user", normalized)
+                state.add_message("system", err_msg)
+                if not is_tty:
+                    click.echo(err_msg)
+                return session, False
+        # Fallback to standard HITL approval
+        adapter.command(f":approve {clean_reason}".strip(), session_id=session["session_id"])
+        state.add_message("user", normalized)
+        state.add_message("assistant", f"✓ HITL Approval recorded: {clean_reason}")
+        if not is_tty:
+            click.echo("Approval recorded.")
+        return session, False
+
+    if normalized.startswith(":reject"):
+        _, _, reason = normalized.partition(" ")
+        clean_feedback = reason.strip() or "Operator requested revision"
+        plan_id = state.plan.get("plan_id") or state.plan.get("id")
+        if (
+            state.phase == ProjectPhase.AWAITING_APPROVAL
+            or state.plan.get("state") == "AWAITING_APPROVAL"
+        ) and plan_id:
+            try:
+                client.plan_reject(session["session_id"], plan_id, reason=clean_feedback)
+                state.phase = ProjectPhase.PLAN_REJECTED
+                if state.plan:
+                    state.plan["state"] = "REJECTED"
+                    state.plan["feedback"] = clean_feedback
+                if state.plan_revisions:
+                    state.plan_revisions[-1].state = "REJECTED"
+                    state.plan_revisions[-1].feedback = clean_feedback
+                feedback_msg = f"Plan '{plan_id}' rejected. Rejection recorded."
+                state.add_message("user", normalized)
+                state.add_message("assistant", f"✗ {feedback_msg} (feedback: {clean_feedback})")
+                if not is_tty:
+                    click.echo(feedback_msg)
+                return session, False
+            except Exception as e:
+                err_msg = f"Plan rejection error: {e}"
+                state.add_message("user", normalized)
+                state.add_message("system", err_msg)
+                if not is_tty:
+                    click.echo(err_msg)
+                return session, False
+        # Fallback to standard HITL rejection
+        adapter.command(f":reject {clean_feedback}".strip(), session_id=session["session_id"])
+        state.add_message("user", normalized)
+        state.add_message("assistant", f"✗ HITL Rejection recorded: {clean_feedback}")
+        if not is_tty:
+            click.echo("Rejection recorded.")
+        return session, False
+
+    if normalized == ":completion":
+        output_str = render_completion_surface(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":cancel"):
+        _, _, target = normalized.partition(" ")
+        clean_target = target.strip()
+        if clean_target:
+            try:
+                client.cancel_agent(clean_target, session_id=session["session_id"])
+                if clean_target in state.operations:
+                    state.operations[clean_target].status = "CANCELLED"
+                for role_key, role_obj in state.roles.items():
+                    if (
+                        role_key.lower() == clean_target.lower()
+                        or getattr(role_obj, "agent_id", "") == clean_target
+                    ):
+                        role_obj.state = "CANCELLED"
+                output_str = f"Agent/Operation {clean_target} CANCELLED"
+            except Exception:
+                try:
+                    client.operation_cancel(clean_target)
+                    if clean_target in state.operations:
+                        state.operations[clean_target].status = "CANCELLED"
+                    output_str = f"Operation {clean_target} CANCELLED"
+                except Exception as e:
+                    output_str = render_error_box_str(
+                        f"Cancellation error: {e}", title="CANCEL ERROR"
+                    )
+        else:
+            # General session turn cancellation
+            session = adapter.command(":cancel", session_id=session["session_id"])
+            state.update_from_session(session)
+            output_str = f"Session {session.get('state', 'CANCELLED')}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":pause":
+        session = adapter.command(":pause", session_id=session["session_id"])
+        output_str = f"Session {session.get('state', 'PAUSED')}"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":resume"):
+        _, _, run_arg = normalized.partition(" ")
+        run_id_clean = run_arg.strip() or None
+        run_resumed_msg = ""
+        try:
+            session = adapter.command(":resume", session_id=session["session_id"])
+        except Exception:
+            try:
+                session = client.get_session(session["session_id"])
+            except Exception:
+                pass
+        try:
+            resumed_run = client.run_resume(session["session_id"], run_id=run_id_clean)
+            if resumed_run:
+                run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {resumed_run.get('phase')}"
+                state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                state.error = None
+        except Exception as run_err:
+            if run_id_clean:
+                run_resumed_msg = f" (supervisor note: {run_err})"
+        if session.get("workspace"):
+            state.sync_work_orders_from_disk(session.get("workspace"))
+        output_str = f"Session {session.get('state', 'RUNNING')}{run_resumed_msg}"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":diff"):
+        _, _, diff_arg = normalized.partition(" ")
+        diff_val = diff_arg.strip() if diff_arg.strip() else None
+        if diff_val:
+            raw_diff = adapter.command(
+                f":diff diff={diff_val}", session_id=session["session_id"], diff=diff_val
+            )
+        else:
+            raw_diff = adapter.command(":diff", session_id=session["session_id"])
+        output_str = render_unified_diff_str(str(raw_diff))
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":matrix":
+        dims = state.verification_dimensions if state is not None else None
+        output_str = render_verification_matrix_str(dims)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":events":
+        output_parts = []
+        try:
+            events = adapter.command(":events", session_id=session["session_id"])
+            rendered_any = False
+            if events:
+                workspace = Path(session["workspace"]) if session.get("workspace") else None
+                recovered_msgs = recover_transcript_from_events(events, state, workspace=workspace)
+                for event in events:
+                    ev_str = render_operational_event_str(event)
+                    if ev_str:
+                        output_parts.append(ev_str)
+                        rendered_any = True
+                for msg in recovered_msgs:
+                    if msg.role == "assistant":
+                        output_parts.append(
+                            render_assistant_message_str(
+                                msg.content, actions=msg.actions, thinking=msg.thinking
+                            )
+                        )
+                        rendered_any = True
+            if not rendered_any:
+                output_parts.append("No new events.")
+        except Exception as err:
+            if is_connection_error(err):
+                state.connection_status = "reconnecting"
+                output_parts.append(
+                    render_error_box_str(
+                        f"Event stream disconnected: {err}",
+                        title="CONNECTION ERROR",
+                        hint="Use :reconnect to recover missed events once daemon is restored.",
+                    )
+                )
+            else:
+                output_parts.append(render_error_box_str(str(err), title="EVENT ERROR"))
+        output_str = "\n".join(output_parts)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized in {":chat", ":history"}:
+        output_str = render_chat_transcript_str(state.messages)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":landing":
+        output_str = f"{render_top_header_bar_str(session, width=80)}\n{render_landing_block_str(session=session, status=state.connection_status, width=80)}"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":runtime":
+        output_str = render_runtime_panel_str(width=36, state=state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":actions"):
+        _, _, subcmd = normalized.partition(" ")
+        subcmd = subcmd.strip().lower()
+        target_group = state.get_latest_actions_group()
+        if not target_group or target_group.is_empty:
+            output_str = "No actions recorded for the current turn."
+            state.add_message("user", normalized)
+            state.add_message("system", output_str)
+            if not is_tty:
+                click.echo(output_str)
+            return session, False
+
+        if subcmd in {"expand", "open"}:
+            target_group.expand()
+        elif subcmd in {"collapse", "close"}:
+            target_group.collapse()
+        elif subcmd.isdigit():
+            idx = int(subcmd)
+            state.toggle_actions(turn_index=idx)
+            target_group = state.get_latest_actions_group()
+        else:
+            target_group.toggle()
+
+        output_str = render_actions_group_str(target_group)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized in {":click actions", ":mouse click actions", ":click"}
+        or normalized.startswith("\x1b[<")
+        or normalized.startswith("\x1b[M")
+    ):
+        target_group = state.get_latest_actions_group()
+        if target_group and not target_group.is_empty:
+            target_group.handle_click()
+            output_str = render_actions_group_str(target_group)
+        else:
+            output_str = "No actions to toggle."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":timeout"):
+        _, _, to_arg = normalized.partition(" ")
+        clean_to = to_arg.strip()
+        if clean_to:
+            try:
+                new_to = float(clean_to)
+                if new_to < 0:
+                    output_str = "Timeout must be zero (no timeout) or a positive number."
+                elif new_to == 0:
+                    state.client_timeout = 0.0
+                    output_str = "Client timeout disabled (no timeout — will wait until operation completes)."
+                else:
+                    state.client_timeout = new_to
+                    output_str = f"Client timeout set to {new_to:.1f}s."
+            except ValueError:
+                output_str = f"Invalid timeout '{clean_to}'. Provide seconds (e.g., :timeout 60) or 0 to disable."
+        else:
+            cur_to = getattr(state, "client_timeout", effective_timeout)
+            if cur_to <= 0:
+                output_str = "Current client timeout: disabled (no timeout)."
+            else:
+                output_str = f"Current client timeout: {cur_to:.1f}s."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":compact":
+        compacted = state.compact_transcript()
+        output_str = (
+            "Transcript compacted."
+            if compacted
+            else "Transcript is already within its compact retention window."
+        )
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":goal" or (normalized.startswith(":goal ") and not normalized[6:].strip()):
+        output_str = "Usage: :goal <product goal or feature request>"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized.startswith(":")
+        and not normalized.startswith(":prompt ")
+        and not normalized.startswith(":goal ")
+    ):
+        output_str = "Unknown command. Type :help."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    # Governed turn prompt
+    if live_manager is not None and getattr(live_manager, "is_active", False):
+        live_manager.stop()
+
+    is_goal = normalized.startswith(":goal ")
+    if is_goal:
+        prompt_text = normalized
+        placeholder = "Routing goal to Architecture (claude)... (Ctrl+C to cancel)"
+    elif normalized.startswith(":prompt "):
+        prompt_text = normalized[8:].strip()
+        placeholder = "Generating response... (Ctrl+C to cancel)"
+    else:
+        prompt_text = normalized
+        placeholder = "Generating response... (Ctrl+C to cancel)"
+    state.add_message("user", prompt_text)
+    # Redraw at prompt submission time; reuse is_tty from top of function
+    if is_tty:
+        redraw_full_screen(
+            session,
+            state,
+            clear=False,
+            include_composer=True,
+            composer_is_active=False,
+            composer_placeholder=placeholder,
+            live_manager=live_manager,
+        )
+    else:
+        click.echo(render_user_message_str(prompt_text))
+    op_id = "turn"
+
+    # TUI diagnostic instrumentation (opt-in via environment variable)
+    _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
+    _diagnostics_start = time.monotonic()
+    _streaming_diagnostics = {
+        "redraw_count": 0,
+        "event_count": 0,
+        "render_sum_ms": 0,
+        "render_count": 0,
+        "write_sum_ms": 0,
+        "write_count": 0,
+        "last_event_time": 0.0,
+        "last_redraw_time": 0.0,
+        "inter_redraw_sum_ms": 0.0,
+        "inter_redraw_count": 0,
+        "inter_event_sum_ms": 0.0,
+        "inter_event_count": 0,
+        "max_render_ms": 0.0,
+        "max_write_ms": 0.0,
+        "max_inter_event_ms": 0.0,
+        "max_inter_redraw_ms": 0.0,
+    }
+    try:
+        result = adapter.command(normalized, session_id=session["session_id"])
+        op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
+        if is_goal:
+            state.add_activity("User", "submitted goal to Architecture", op_id)
+            # Convention note: state.roles keys are Title-cased ("Architecture", "Q/A").
+            # The daemon registers operations under lowercase ("architecture").
+            if op_id and op_id not in state.operations:
+                arch_backend = (
+                    state.roles["Architecture"].backend
+                    if "Architecture" in state.roles and state.roles["Architecture"].backend
+                    else "Claude"
+                )
+                state.operations[op_id] = OperationNode(
+                    op_id, "Goal", role="Architecture", backend=arch_backend, status="RUNNING"
+                )
+            if "Architecture" in state.roles:
+                state.roles["Architecture"].state = "RUNNING"
+        else:
+            state.add_activity("User", "submitted turn to Architecture", op_id)
+            if op_id and op_id not in state.operations:
+                arch_backend = (
+                    state.roles["Architecture"].backend
+                    if "Architecture" in state.roles and state.roles["Architecture"].backend
+                    else "Claude"
+                )
+                state.operations[op_id] = OperationNode(
+                    op_id, "Turn", role="Architecture", backend=arch_backend, status="RUNNING"
+                )
+            if "Architecture" in state.roles:
+                state.roles["Architecture"].state = "RUNNING"
+        # This is a local wait indicator, not a claim about daemon state.
+        if not is_tty:
+            msg = (
+                "● Routing goal to Architecture (claude)... Turn submitted to the governed daemon."
+                if is_goal
+                else "● Thinking (Architecture / claude)... Turn submitted to the governed daemon."
+            )
+            status_line = Text(msg, style="dim cyan")
+            click.echo(status_line)
+
+        # Synchronously await turn completion while consuming events via native SSE
+        workspace = Path(session["workspace"]) if session.get("workspace") else None
+        max_wait = effective_timeout
+        start_time = time.time()
+        completed = False
+        assistant_rendered = False
+        streaming_active = False
+        streamed_chunks: list[str] = []
+        last_progress_time = start_time
+        last_poll_time = start_time
+        last_redraw_time: float = -1.0
+        model_name: str | None = None
+        latest_act_desc = "Turn submitted"
+        op_rec: dict[str, Any] | None = None
+        op_status: str | None = None
+
+        # Track terminal dimensions and install resize handler (WO-003)
+        install_resize_handler()
+        init_term = shutil.get_terminal_size(fallback=(80, 24))
+        current_cols, current_lines = init_term.columns, init_term.lines
+
+        try:
+            stream_gen = adapter.stream(
+                session["session_id"],
+                live=True,
+                timeout=1.0,
+                after=state.last_sequence,
+            )
+            while (max_wait <= 0 or time.time() - start_time < max_wait) and not completed:
+                # Check for dynamic terminal resize during active streaming / turn (WO-003)
+                resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
+                if resized:
+                    current_cols, current_lines = new_cols, new_lines
+                    if live_manager is not None and getattr(live_manager, "is_active", False):
+                        live_manager.handle_resize(new_cols, new_lines)
+                try:
+                    t_event_start = time.monotonic()
+                    ev = next(stream_gen)
+                    t_event_end = time.monotonic()
+                    if _diagnostics_enabled:
+                        _streaming_diagnostics["event_count"] += 1
+                        if _streaming_diagnostics["last_event_time"] > 0.0:
+                            inter = (
+                                t_event_start - _streaming_diagnostics["last_event_time"]
+                            ) * 1000
+                            _streaming_diagnostics["inter_event_sum_ms"] += inter
+                            _streaming_diagnostics["inter_event_count"] += 1
+                            if inter > _streaming_diagnostics["max_inter_event_ms"]:
+                                _streaming_diagnostics["max_inter_event_ms"] = inter
+                        _streaming_diagnostics["last_event_time"] = t_event_start
+                except StopIteration:
+                    now = time.time()
+                    if now - last_poll_time >= 0.5:
+                        last_poll_time = now
+                        try:
+                            op_rec = (
+                                client.operation_get(op_id)
+                                if hasattr(client, "operation_get")
+                                else None
+                            )
+                            if op_rec and isinstance(op_rec, dict):
+                                op_status = op_rec.get("status")
+                                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                    completed = True
+                                    break
+                        except Exception:
+                            pass
+                    time.sleep(0.05)
+                    stream_gen = adapter.stream(
+                        session["session_id"],
+                        live=True,
+                        timeout=1.0,
+                        after=state.last_sequence,
+                    )
+                    continue
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+
+                now = time.time()
+
+                # 1. Handle heartbeat / keepalive
+                if isinstance(ev, dict) and (
+                    ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"
+                ):
+                    if not streaming_active and (now - last_progress_time >= 2.0):
+                        render_start = time.monotonic()
+                        layout = compute_layout(shutil.get_terminal_size().columns)
+                        tick_content = _build_in_progress_turn_content(
+                            state,
+                            model_name,
+                            streamed_chunks,
+                            latest_act_desc,
+                            start_time,
+                            max_wait,
+                            layout.conversation_width,
+                        )
+                        render_ms = (time.monotonic() - render_start) * 1000
+
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            composer_placeholder=placeholder,
+                            conversation_content=tick_content,
+                            live_manager=live_manager,
+                        )
+
+                        if _diagnostics_enabled:
+                            _streaming_diagnostics["redraw_count"] += 1
+                            _streaming_diagnostics["render_sum_ms"] += render_ms
+                            _streaming_diagnostics["render_count"] += 1
+                            _streaming_diagnostics["last_redraw_time"] = time.monotonic()
+                        last_progress_time = now
+
+                    if now - last_poll_time >= 1.5:
+                        last_poll_time = now
+                        try:
+                            op_rec = (
+                                client.operation_get(op_id)
+                                if hasattr(client, "operation_get")
+                                else None
+                            )
+                            if op_rec and isinstance(op_rec, dict):
+                                op_status = op_rec.get("status")
+                                if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                    completed = True
+                                    break
+                        except Exception:
+                            pass
+                    continue
+
+                # 2. Process concrete domain event
+                if not isinstance(ev, dict):
+                    continue
+                sequence = ev.get("sequence")
+                if isinstance(sequence, int) and sequence <= state.last_sequence:
+                    # A reconnecting transport can replay events already folded
+                    # into the canonical transcript. Do not feed their deltas
+                    # into this turn's transient response buffer.
+                    continue
+                state.process_event(ev)
+                ev_name = str(ev.get("name", ""))
+                ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
+
+                # Check for incremental text delta (stream/token/chunk)
+                delta = extract_text_delta(ev)
+                if delta:
+                    if not streaming_active:
+                        streaming_active = True
+                        if model_name is None:
+                            if op_rec and isinstance(op_rec, dict):
+                                model_name = op_rec.get("model")
+                            elif session and isinstance(session, dict):
+                                model_name = session.get("model")
+
+                    streamed_chunks.append(delta)
+
+                    # AC-3: Rate-limit redraw_full_screen calls to ~8-10 Hz (100ms gate)
+                    now_mono = time.monotonic()
+                    if now_mono - last_redraw_time >= 0.1:
+                        # Diagnostic instrumentation for render time
+                        render_start = time.monotonic()
+                        layout = compute_layout(shutil.get_terminal_size().columns)
+                        full_content = _build_in_progress_turn_content(
+                            state,
+                            model_name,
+                            streamed_chunks,
+                            latest_act_desc,
+                            start_time,
+                            max_wait,
+                            layout.conversation_width,
+                        )
+                        render_end = time.monotonic()
+                        render_ms = (render_end - render_start) * 1000
+
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            composer_placeholder=placeholder,
+                            conversation_content=full_content,
+                            live_manager=live_manager,
+                        )
+
+                        # Write timing captured in redraw_full_screen
+                        write_end = time.monotonic()
+                        write_ms = (write_end - render_end) * 1000
+
+                        if _diagnostics_enabled:
+                            _streaming_diagnostics["redraw_count"] += 1
+                            _streaming_diagnostics["render_sum_ms"] += render_ms
+                            _streaming_diagnostics["render_count"] += 1
+                            if render_ms > _streaming_diagnostics["max_render_ms"]:
+                                _streaming_diagnostics["max_render_ms"] = render_ms
+                            _streaming_diagnostics["write_sum_ms"] += write_ms
+                            _streaming_diagnostics["write_count"] += 1
+                            if write_ms > _streaming_diagnostics["max_write_ms"]:
+                                _streaming_diagnostics["max_write_ms"] = write_ms
+                            if _streaming_diagnostics["last_redraw_time"] > 0.0:
+                                inter_redraw = (
+                                    now_mono - _streaming_diagnostics["last_redraw_time"]
+                                ) * 1000
+                                _streaming_diagnostics["inter_redraw_sum_ms"] += inter_redraw
+                                _streaming_diagnostics["inter_redraw_count"] += 1
+                                if inter_redraw > _streaming_diagnostics["max_inter_redraw_ms"]:
+                                    _streaming_diagnostics["max_inter_redraw_ms"] = inter_redraw
+                            _streaming_diagnostics["last_redraw_time"] = now_mono
+                        last_redraw_time = now_mono
+                else:
+                    # Operational event line
+                    ev_str = (
+                        ""
+                        if ev_name in {"operation.started", "turn.started", "operation.completed"}
+                        else render_operational_event_str(ev)
+                    )
+                    if ev_str:
+                        if not streaming_active and not is_tty:
+                            click.echo(ev_str)
+                        latest_act_desc = (
+                            format_action_description(ev_name)
+                            if "format_action_description" in globals()
+                            else ev_name
+                        )
+                    elif ev_name == "event.toolCall":
+                        t_name = ev_payload.get("tool_name", "tool")
+                        t_args = ev_payload.get("arguments", {})
+                        t_target = str(
+                            t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
+                        )
+                        latest_act_desc = f"{t_name} {t_target}".strip() if t_target else t_name
+
+                    # In interactive TTY, trigger rate-limited redraw so tool calls, actions, and thinking appear live
+                    now_mono = time.monotonic()
+                    if is_tty and (now_mono - last_redraw_time >= 0.1):
+                        layout = compute_layout(shutil.get_terminal_size().columns)
+                        full_content = _build_in_progress_turn_content(
+                            state,
+                            model_name,
+                            streamed_chunks,
+                            latest_act_desc,
+                            start_time,
+                            max_wait,
+                            layout.conversation_width,
+                        )
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            composer_placeholder=placeholder,
+                            conversation_content=full_content,
+                            live_manager=live_manager,
+                        )
+                        last_redraw_time = now_mono
+
+                    # Only result/completion events can carry a finalized response.
+                    # Reasoning deltas also carry `text`, but are transient summaries.
+                    resp = None
+                    thinking = None
+                    response_events = {"event.toolResult", "operation.completed", "turn.completed"}
+                    if ev_name in response_events:
+                        resp = extract_assistant_response(ev_payload, workspace=workspace)
+                        thinking = extract_assistant_thinking(ev_payload, workspace=workspace)
+                    if resp and not assistant_rendered and not streamed_chunks:
+                        turn_acts = state.current_turn_actions
+                        state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
+                        if is_tty:
+                            redraw_full_screen(
+                                session,
+                                state,
+                                clear=False,
+                                include_composer=True,
+                                composer_is_active=False,
+                                live_manager=live_manager,
+                            )
+                        else:
+                            click.echo(
+                                render_assistant_message_str(
+                                    resp, actions=turn_acts, thinking=thinking
+                                )
+                            )
+                        assistant_rendered = True
+
+                # Check terminal event status
+                if ev_name in {
+                    "operation.completed",
+                    "operation.failed",
+                    "operation.cancelled",
+                    "operation.blocked",
+                    "turn.completed",
+                    "turn.blocked",
+                }:
+                    target_op = ev_payload.get("operation_id") or ev.get("operation_id")
+                    if not target_op or target_op == op_id:
+                        completed = True
+                        if ev_name in {
+                            "operation.failed",
+                            "operation.cancelled",
+                            "operation.blocked",
+                            "turn.blocked",
+                        }:
+                            op_status = (
+                                "FAILED"
+                                if ev_name == "operation.failed"
+                                else "BLOCKED"
+                                if ev_name in {"operation.blocked", "turn.blocked"}
+                                else "CANCELLED"
+                            )
+                            if op_rec is None:
+                                op_rec = {"status": op_status, "result": ev_payload}
+                            elif isinstance(op_rec, dict):
+                                op_rec["status"] = op_status
+                                if "result" not in op_rec:
+                                    op_rec["result"] = ev_payload
+                        break
+
+                # Periodic operation check
+                if now - last_poll_time >= 2.0:
+                    last_poll_time = now
+                    try:
+                        op_rec = (
+                            client.operation_get(op_id)
+                            if hasattr(client, "operation_get")
+                            else None
+                        )
+                        if op_rec and isinstance(op_rec, dict):
+                            op_status = op_rec.get("status")
+                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                completed = True
+                                break
+                    except Exception:
+                        pass
+        except KeyboardInterrupt:
+            # Gracefully intercept Ctrl+C during turn execution: Cancel turn, do NOT kill daemon!
+            try:
+                if op_id and op_id != "turn" and hasattr(client, "operation_cancel"):
+                    client.operation_cancel(op_id, cascade=True)
+                elif hasattr(client, "cancel"):
+                    client.cancel(session["session_id"])
+            except Exception:
+                try:
+                    adapter.command(f":cancel {op_id}", session_id=session["session_id"])
+                except Exception:
+                    pass
+
+            if op_id in state.operations:
+                state.operations[op_id].status = "CANCELLED"
+            for role_obj in state.roles.values():
+                if getattr(role_obj, "state", "").upper() in {"RUNNING", "ACTIVE"}:
+                    role_obj.state = "CANCELLED"
+            state.add_activity("User", "interrupted turn", op_id)
+
+            if streaming_active and not is_tty:
+                click.echo("")
+
+            cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
+            turn_acts = state.current_turn_actions
+            state.add_message("assistant", cancel_msg, actions=turn_acts)
+            if is_tty:
+                redraw_full_screen(
+                    session,
+                    state,
+                    clear=False,
+                    include_composer=True,
+                    composer_is_active=False,
+                    live_manager=live_manager,
+                )
+            else:
+                click.echo(
+                    render_error_box_str(
+                        cancel_msg,
+                        title="TURN INTERRUPTED",
+                        hint="In-flight turn operation was cancelled. Daemon process remains running.",
+                    )
+                )
+            restore_composer_focus(state)
+            return session, False
+
+        # Finalize streaming if active
+        if streamed_chunks and not assistant_rendered:
+            full_resp = "".join(streamed_chunks).strip()
+            turn_acts = state.current_turn_actions
+            thinking = getattr(state, "current_turn_thinking", None) or None
+            state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
+            assistant_rendered = True
+            streamed_chunks = []
+            # WO-013 (AC-3): Perform final settle redraw_full_screen when the stream completes
+            # keeping disabled busy composer visible until the next prompt_composer_input activation.
+            redraw_full_screen(
+                session,
+                state,
+                clear=False,
+                include_composer=True,
+                composer_is_active=False,
+                composer_placeholder=placeholder,
+                live_manager=live_manager,
+            )
+
+        # Output diagnostic summary at turn end (non-invasive stderr logging)
+        if _diagnostics_enabled:
+            duration = time.monotonic() - _diagnostics_start
+            n = _streaming_diagnostics["redraw_count"]
+            if n > 0:
+                render_median = _streaming_diagnostics["render_sum_ms"] / n
+                write_median = _streaming_diagnostics["write_sum_ms"] / n
+            else:
+                render_median = write_median = 0.0
+            if _streaming_diagnostics["inter_redraw_count"] > 0:
+                inter_redraw_median = (
+                    _streaming_diagnostics["inter_redraw_sum_ms"]
+                    / _streaming_diagnostics["inter_redraw_count"]
+                )
+            else:
+                inter_redraw_median = 0.0
+            if _streaming_diagnostics["inter_event_count"] > 0:
+                inter_event_median = (
+                    _streaming_diagnostics["inter_event_sum_ms"]
+                    / _streaming_diagnostics["inter_event_count"]
+                )
+            else:
+                inter_event_median = 0.0
+            try:
+                sys.stderr.write("\n=== STACKMIND TUI DIAGNOSTICS ===\n")
+                sys.stderr.write(
+                    f"Turn duration: {duration:.2f}s | Events: {_streaming_diagnostics['event_count']} | Redraws: {n}\n"
+                )
+                sys.stderr.write(
+                    f"Render: median={render_median:.1f}ms | max={_streaming_diagnostics['max_render_ms']:.1f}ms\n"
+                )
+                sys.stderr.write(
+                    f"Write: median={write_median:.1f}ms | max={_streaming_diagnostics['max_write_ms']:.1f}ms\n"
+                )
+                sys.stderr.write(
+                    f"Event gap: median={inter_event_median:.1f}ms | max={_streaming_diagnostics['max_inter_event_ms']:.1f}ms\n"
+                )
+                sys.stderr.write(
+                    f"Redraw interval: median={inter_redraw_median:.1f}ms | max={_streaming_diagnostics['max_inter_redraw_ms']:.1f}ms\n"
+                )
+                sys.stderr.write("=== END DIAGNOSTICS ===\n\n")
+            except Exception:
+                pass
+
+        # If assistant was not rendered from streaming or events, fetch final operation status
+        if not assistant_rendered:
+            try:
+                if (
+                    op_rec is None
+                    or not completed
+                    or op_status in {"FAILED", "CANCELLED", "BLOCKED"}
+                ) and hasattr(client, "operation_get"):
+                    fresh_op = client.operation_get(op_id)
+                    if fresh_op and isinstance(fresh_op, dict):
+                        op_rec = fresh_op
+                        op_status = op_rec.get("status")
+                        if op_status in {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}:
+                            completed = True
+            except Exception:
+                pass
+
+            # Drain any remaining events
+            try:
+                if hasattr(client, "events"):
+                    remaining_events = list(
+                        client.events(session["session_id"], after=state.last_sequence)
+                    )
+                    for ev in remaining_events:
+                        state.process_event(ev)
+                        ev_str = (
+                            ""
+                            if ev.get("name")
+                            in {"operation.started", "turn.started", "operation.completed"}
+                            else render_operational_event_str(ev)
+                        )
+                        if ev_str and not is_tty:
+                            click.echo(ev_str)
+                        resp = None
+                        thinking = None
+                        response_events = {
+                            "event.toolResult",
+                            "operation.completed",
+                            "turn.completed",
+                        }
+                        if ev.get("name") in response_events:
+                            resp = extract_assistant_response(
+                                ev.get("payload", {}), workspace=workspace
+                            )
+                            thinking = extract_assistant_thinking(
+                                ev.get("payload", {}), workspace=workspace
+                            )
+                        if resp and not assistant_rendered:
+                            turn_acts = state.current_turn_actions
+                            state.add_message(
+                                "assistant", resp, actions=turn_acts, thinking=thinking
+                            )
+                            if is_tty:
+                                redraw_full_screen(
+                                    session,
+                                    state,
+                                    clear=False,
+                                    include_composer=True,
+                                    composer_is_active=False,
+                                    live_manager=live_manager,
+                                )
+                            else:
+                                click.echo(
+                                    render_assistant_message_str(
+                                        resp, actions=turn_acts, thinking=thinking
+                                    )
+                                )
+                            assistant_rendered = True
+            except Exception:
+                pass
+
+            if not assistant_rendered and op_rec and isinstance(op_rec, dict):
+                res = op_rec.get("result") or {}
+                summary = res.get("report_markdown") or res.get("summary") or res.get("reason")
+                thinking = (
+                    res.get("thinking")
+                    or res.get("thought")
+                    or res.get("reasoning")
+                    or res.get("reasoning_content")
+                    or op_rec.get("thinking")
+                    or op_rec.get("thought")
+                )
+                report_path_raw = res.get("report_path")
+                if report_path_raw:
+                    rp = Path(report_path_raw)
+                    if not rp.is_absolute() and workspace:
+                        rp = workspace / rp
+                    if rp.exists():
+                        try:
+                            cnt = rp.read_text(encoding="utf-8")
+                            if "## Thinking" in cnt and not thinking:
+                                _, _, tp = cnt.partition("## Thinking")
+                                tb, _, _ = tp.partition("## ")
+                                thinking = tb.strip() or None
+                            if "## Report" in cnt:
+                                _, _, b = cnt.partition("## Report")
+                                rb, _, _ = b.partition("## Meta")
+                                rep_body = rb.strip()
+                                if rep_body and rep_body != "Completed task via tools":
+                                    summary = rep_body
+                                elif not summary or summary == "Completed task via tools":
+                                    summary = rep_body or cnt.strip()
+                            elif not summary or summary == "Completed task via tools":
+                                summary = cnt.strip()
+                        except Exception:
+                            pass
+                if op_status in {"FAILED", "CANCELLED", "BLOCKED"}:
+                    from cli.tui.events import clean_error_message
+
+                    err_raw = (
+                        res.get("error")
+                        or res.get("reason")
+                        or res.get("message")
+                        or op_rec.get("error")
+                        or summary
+                        or f"Operation {op_status.lower() if op_status else 'failed'}."
+                    )
+                    err_msg = (
+                        clean_error_message(err_raw)
+                        or f"Operation {op_status.lower() if op_status else 'failed'}."
+                    )
+                    err_title = (
+                        "OLLAMA ERROR"
+                        if "ollama" in err_msg.lower()
+                        else (f"OPERATION {op_status}" if op_status else "OPERATION FAILED")
+                    )
+                    turn_acts = state.current_turn_actions
+                    if turn_acts:
+                        turn_acts.expanded = True
+                    state.add_message(
+                        "assistant",
+                        f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}",
+                        actions=turn_acts,
+                    )
+                    if is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            live_manager=live_manager,
+                        )
+                    else:
+                        click.echo(render_error_box_str(err_msg, title=err_title))
+                    assistant_rendered = True
+                elif summary:
+                    if summary.strip() == "Completed task via tools":
+                        summary = "Completed turn via tools. All executed actions are recorded in the Actions group above."
+                    turn_acts = state.current_turn_actions
+                    state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
+                    if is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=False,
+                            live_manager=live_manager,
+                        )
+                    else:
+                        click.echo(
+                            render_assistant_message_str(
+                                summary, actions=turn_acts, thinking=thinking
+                            )
+                        )
+                    assistant_rendered = True
+
+        if not assistant_rendered:
+            if (
+                op_rec
+                and isinstance(op_rec, dict)
+                and op_rec.get("status") in {"FAILED", "CANCELLED", "BLOCKED"}
+            ):
+                op_status = op_rec.get("status")
+                from cli.tui.events import clean_error_message
+
+                err_raw = (
+                    (op_rec.get("result") or {}).get("error")
+                    or (op_rec.get("result") or {}).get("reason")
+                    or (op_rec.get("result") or {}).get("message")
+                    or op_rec.get("error")
+                    or f"Operation {op_status.lower()}."
+                )
+                err_msg = clean_error_message(err_raw) or f"Operation {op_status.lower()}."
+                err_title = (
+                    "OLLAMA ERROR" if "ollama" in err_msg.lower() else f"OPERATION {op_status}"
+                )
+                turn_acts = state.current_turn_actions
+                if turn_acts:
+                    turn_acts.expanded = True
+                state.add_message(
+                    "assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts
+                )
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_error_box_str(err_msg, title=err_title))
+                assistant_rendered = True
+            elif completed:
+                completion_msg = f"Turn operation {op_id} completed."
+                turn_acts = state.current_turn_actions
+                state.add_message("assistant", completion_msg, actions=turn_acts)
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(render_assistant_message_str(completion_msg, actions=turn_acts))
+            else:
+                timeout_msg = "No response within client wait time. Operation may still be running. Use :status or :events to inspect."
+                state.add_message("system", timeout_msg)
+                if is_tty:
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        live_manager=live_manager,
+                    )
+                else:
+                    click.echo(
+                        render_error_box_str(
+                            timeout_msg,
+                            title="REQUEST TIMEOUT",
+                            hint="Use :status or :events to inspect.",
+                        )
+                    )
+    except KeyboardInterrupt:
+        click.echo()
+        restore_composer_focus(state)
+        return session, False
+    except Exception as err:
+        if is_connection_error(err):
+            state.connection_status = "reconnecting"
+            err_box = render_error_box_str(
+                f"Could not submit turn: {err}",
+                title="CONNECTION ERROR",
+                hint="Daemon connection was lost. Use :reconnect to restore connection.",
+            )
+        else:
+            err_box = render_error_box_str(
+                f"Could not submit turn: {err}",
+                title="TURN SUBMISSION ERROR",
+                hint="An operation may already be in flight. Use :status, :cancel, or :reconnect.",
+            )
+        state.add_message("system", f"[ERROR] Could not submit turn: {err}")
+        if is_tty:
+            redraw_full_screen(
+                session,
+                state,
+                clear=False,
+                include_composer=True,
+                composer_is_active=False,
+                live_manager=live_manager,
+            )
+        else:
+            click.echo(err_box)
+    finally:
+        if live_manager is not None and not getattr(live_manager, "is_active", False):
+            live_manager.start(include_composer=False)
+    restore_composer_focus(state)
+    return session, False
+
+
+# Legacy dispatch adapter wrapper for backward compatibility with _dispatch_command
+def _dispatch_command(
+    adapter: StackMindTuiAdapter,
+    client: DaemonClient,
+    session: dict[str, Any],
+    text: str,
+    state: AutonomousDeliveryState | None = None,
+    *,
+    client_timeout: float = 0.0,
+) -> tuple[dict[str, Any], bool]:
+    if state is None:
+        state = AutonomousDeliveryState(session_id=session.get("session_id", "session-1"))
+        state.update_from_session(session)
+    return dispatch_delivery_command(
+        adapter, client, session, text, state, client_timeout=client_timeout
+    )
