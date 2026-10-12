@@ -40,6 +40,7 @@ from cli.tui.events import (
 from cli.tui.governance import (
     render_contract_hud_str,
     render_plan_panel_str,
+    render_skills_panel_str,
     render_verification_matrix_str,
 )
 from cli.tui.landing import (
@@ -241,6 +242,7 @@ def get_help_str() -> str:
         "  :wo               Display Work Orders table and progress\n"
         "  :tree, :agents    Display Hierarchical Operation Tree\n"
         "  :plan             Display Plan Approval surface and revision history\n"
+        "  :skills [name]    Display available procedural skills & verified runbooks\n"
         "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
@@ -1390,6 +1392,17 @@ def dispatch_delivery_command(
         except Exception:
             pass
         output_str = render_plan_panel_str(state)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":skills" or normalized.startswith(":skills ") or normalized.startswith(":skill"):
+        _, _, filter_arg = normalized.partition(" ")
+        clean_filter = filter_arg.strip() or None
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        output_str = render_skills_panel_str(ws_path, skill_filter=clean_filter)
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

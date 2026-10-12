@@ -9,6 +9,7 @@ Renders on-demand governance surfaces without permanent dashboard clutter:
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from rich import box
@@ -278,12 +279,142 @@ def render_plan_panel_str(state: AutonomousDeliveryState, width: int = 80) -> st
     return console.export_text().rstrip()
 
 
+def render_skills_panel(
+    project_path: Path | str | None = None,
+    skill_filter: str | None = None,
+) -> Panel:
+    """Render procedural skills overview or specific skill runbook."""
+    from validators.skill.store import SkillStore
+    from validators.skill.models import SkillStatus
+
+    path = Path(project_path).resolve() if project_path else Path(".").resolve()
+    store = SkillStore(path)
+    skills = store.list_skills()
+
+    if skill_filter:
+        filt = skill_filter.strip().lower()
+        matched = [s for s in skills if filt in s.name.lower() or filt in s.skill_id.lower()]
+        if len(matched) == 1:
+            skill = matched[0]
+            lines: list[RenderableType] = []
+            lines.append(Text(f"Name: {skill.name} (v{skill.version})", style="bold white"))
+            lines.append(
+                Text(
+                    f"ID: {skill.skill_id}  |  Status: {skill.status.value.upper()}  |  Risk: {skill.risk_tier.value.upper()}  |  Confidence: {skill.metrics.confidence_score:.2f}",
+                    style="dim",
+                )
+            )
+            lines.append(Text(f"Description: {skill.description}\n", style="white"))
+
+            if skill.applicability.preconditions:
+                lines.append(Text("Preconditions:", style="bold cyan"))
+                for pre in skill.applicability.preconditions:
+                    lines.append(Text(f"  • {pre}", style="dim"))
+                lines.append(Text(""))
+
+            lines.append(Text("Execution Procedure:", style="bold cyan"))
+            for step in skill.steps:
+                cmd_str = f" [{step.command_template}]" if step.command_template else ""
+                lines.append(
+                    Text(f"  {step.step_index}. [{step.tool}] ", style="bold green")
+                    .append(step.action, style="white")
+                    .append(cmd_str, style="dim")
+                )
+
+            if skill.fallback_procedure:
+                lines.append(Text(f"\nFallback: {skill.fallback_procedure}", style="yellow dim"))
+
+            return Panel(
+                Group(*lines),
+                title=Text(f" SKILL: {skill.name} ", style="bold cyan"),
+                title_align="left",
+                box=box.ROUNDED,
+                border_style="cyan",
+                padding=(0, 1),
+            )
+        skills = matched
+
+    title = Text(" AVAILABLE PROCEDURAL SKILLS (:skills) ", style="bold cyan")
+
+    if not skills:
+        msg = Text()
+        msg.append("\nNo procedural skills found in .sync/skills/.\n", style="yellow")
+        msg.append("StackMind learns procedural skills from verified execution trajectories.\n", style="dim")
+        msg.append("To discover and distill skills, run:\n", style="dim")
+        msg.append("  stackmind learn mine --min-support 2\n", style="bold white")
+        return Panel(
+            msg,
+            title=title,
+            title_align="left",
+            box=box.ROUNDED,
+            border_style="cyan",
+            padding=(0, 1),
+        )
+
+    table = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
+    table.add_column("Skill ID", style="bold cyan", no_wrap=True)
+    table.add_column("Name", style="bold white")
+    table.add_column("Ver", justify="right", style="dim")
+    table.add_column("Status", style="bold")
+    table.add_column("Risk", style="bold")
+    table.add_column("Conf", justify="right")
+    table.add_column("Modules", style="dim")
+
+    for s in skills:
+        status_style = (
+            "green"
+            if s.status == SkillStatus.ACTIVE
+            else ("yellow" if s.status == SkillStatus.CANDIDATE else "red")
+        )
+        risk_style = (
+            "red"
+            if s.risk_tier.value in ("high", "critical")
+            else ("yellow" if s.risk_tier.value == "medium" else "green")
+        )
+        mods = ", ".join(s.applicability.target_modules[:2])
+        if len(s.applicability.target_modules) > 2:
+            mods += "..."
+        table.add_row(
+            s.skill_id,
+            s.name,
+            f"v{s.version}",
+            Text(s.status.value.upper(), style=status_style),
+            Text(s.risk_tier.value.upper(), style=risk_style),
+            f"{s.metrics.confidence_score:.2f}",
+            mods or "*",
+        )
+
+    summary = Text(f"\nTotal: {len(skills)} skill(s). Type ':skill <name>' for detailed steps.", style="dim")
+    return Panel(
+        Group(table, summary),
+        title=title,
+        title_align="left",
+        box=box.ROUNDED,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+
+def render_skills_panel_str(
+    project_path: Path | str | None = None,
+    skill_filter: str | None = None,
+    width: int = 80,
+) -> str:
+    """Render procedural skills panel as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_skills_panel(project_path, skill_filter))
+    return console.export_text().rstrip()
+
+
 __all__ = [
     "VERIFICATION_DIMENSIONS",
     "render_contract_hud",
     "render_contract_hud_str",
     "render_plan_panel",
     "render_plan_panel_str",
+    "render_skills_panel",
+    "render_skills_panel_str",
     "render_verification_matrix",
     "render_verification_matrix_str",
 ]

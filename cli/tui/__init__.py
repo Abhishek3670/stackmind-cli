@@ -59,6 +59,8 @@ from .governance import (
     render_contract_hud_str,
     render_plan_panel,
     render_plan_panel_str,
+    render_skills_panel,
+    render_skills_panel_str,
     render_verification_matrix,
     render_verification_matrix_str,
 )
@@ -126,6 +128,8 @@ __all__ = [
     "render_plan_surface",
     "render_project_delivery_view",
     "render_roles_panel",
+    "render_skills_panel",
+    "render_skills_panel_str",
     "render_top_header_bar",
     "render_top_header_bar_str",
     "render_tool_activity",

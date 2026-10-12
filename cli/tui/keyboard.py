@@ -737,6 +737,8 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":compact", "Compact older transcript turns", False),
     (":timeout", "Get or set client turn wait timeout", False),
     (":landing", "Display branded landing block", False),
+    (":skills", "Display available procedural skills & runbooks", False),
+    (":skill", "Display available procedural skills & runbooks", False),
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
     (":exit", "Gracefully stop daemon and exit", False),

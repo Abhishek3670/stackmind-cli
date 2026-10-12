@@ -17,6 +17,7 @@ from cli.tui import (
     render_contract_hud_str,
     render_plan_panel_str,
     render_roles_panel,
+    render_skills_panel_str,
     render_verification_matrix_str,
     render_work_orders_panel,
 )
@@ -240,6 +241,98 @@ def test_contextual_delivery_panels_inspection():
     assert "Write Mode: GORVERNED" not in hud  # check spelling
     assert "Write Mode:" in hud
     assert "src/*" in hud
+
+
+def test_skills_panel_rendering_and_dispatch(tmp_path: Path):
+    """Verify procedural skills panel renders empty state, table, and details via :skills dispatch."""
+    from validators.skill.store import SkillStore
+    from validators.skill.models import (
+        RiskTier,
+        SkillApplicability,
+        SkillMetrics,
+        SkillProvenance,
+        SkillRecord,
+        SkillStatus,
+        SkillStep,
+    )
+
+    # 1. Empty state
+    empty_panel = render_skills_panel_str(tmp_path)
+    assert "AVAILABLE PROCEDURAL SKILLS" in empty_panel
+    assert "No procedural skills found in .sync/skills/" in empty_panel
+    assert "stackmind learn mine" in empty_panel
+
+    # 2. Add a skill to the store
+    store = SkillStore(tmp_path)
+    skill = SkillRecord(
+        skill_id="SKL-TEST-001",
+        name="pytest_run_and_fix",
+        version=1,
+        status=SkillStatus.ACTIVE,
+        risk_tier=RiskTier.LOW,
+        description="Run test suite and execute auto-repair on failures",
+        applicability=SkillApplicability(preconditions=("pytest is installed", "tests/ directory exists")),
+        steps=(
+            SkillStep(
+                step_index=1,
+                tool="terminal",
+                action="Run test suite",
+                command_template="pytest -v",
+            ),
+            SkillStep(
+                step_index=2,
+                tool="patch",
+                action="Apply fixes to failing modules",
+            ),
+        ),
+        provenance=SkillProvenance(
+            source_experience_ids=("exp-1",),
+            created_at="2026-10-12T00:00:00Z",
+            author_agent="codex",
+        ),
+        metrics=SkillMetrics(confidence_score=0.95),
+        fallback_procedure="Notify operator and abort execution",
+    )
+    store.save_version(skill)
+
+    # 3. Table rendering
+    table_panel = render_skills_panel_str(tmp_path)
+    assert "AVAILABLE PROCEDURAL SKILLS" in table_panel
+    assert "SKL-TEST-001" in table_panel
+    assert "pytest_run_and_fix" in table_panel
+
+    # 4. Detail rendering with filter
+    detail_panel = render_skills_panel_str(tmp_path, skill_filter="pytest_run_and_fix")
+    assert "SKILL: pytest_run_and_fix" in detail_panel
+    assert "Preconditions:" in detail_panel
+    assert "pytest is installed" in detail_panel
+    assert "Execution Procedure:" in detail_panel
+    assert "Run test suite" in detail_panel
+    assert "[pytest -v]" in detail_panel
+    assert "Fallback: Notify operator and abort execution" in detail_panel
+
+    # 5. Dispatch via dispatch_delivery_command
+    client = MockDaemonClient()
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    session = {"session_id": "session-42", "workspace": str(tmp_path)}
+    state = AutonomousDeliveryState(session_id="session-42")
+
+    sess, should_exit = dispatch_delivery_command(
+        adapter, client, session, ":skills", state  # type: ignore[arg-type]
+    )
+    assert not should_exit
+    assert state.messages[-2].content == ":skills"
+    assert "AVAILABLE PROCEDURAL SKILLS" in state.messages[-1].content
+    assert "pytest_run_and_fix" in state.messages[-1].content
+
+    # Dispatch single skill detail
+    sess, should_exit = dispatch_delivery_command(
+        adapter, client, session, ":skill pytest_run_and_fix", state  # type: ignore[arg-type]
+    )
+    assert not should_exit
+    assert state.messages[-2].content == ":skill pytest_run_and_fix"
+    assert "SKILL: pytest_run_and_fix" in state.messages[-1].content
+    assert "Execution Procedure:" in state.messages[-1].content
 
 
 def test_tui_repl_governance_and_hitl_interactive(tmp_path: Path):
