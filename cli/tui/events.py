@@ -377,10 +377,12 @@ def extract_assistant_response(
     if not isinstance(payload, Mapping):
         return None
 
-    from cli.tui.chat import strip_internal_reasoning
+    from cli.tui.chat import format_contract_payload, strip_internal_reasoning
 
     def clean_response(value: str) -> str | None:
         clean = strip_internal_reasoning(value)
+        if clean:
+            clean = format_contract_payload(clean)
         return clean or None
 
     # 1. Inspect direct result dict

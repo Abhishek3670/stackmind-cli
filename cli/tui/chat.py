@@ -113,6 +113,37 @@ def format_contract_payload(content: str) -> str:
             body, _, _ = rest.rpartition("```")
             unfenced = body.strip()
 
+    def _safe_json_parse(s: str) -> dict[str, Any] | None:
+        if not s or not isinstance(s, str):
+            return None
+        s_clean = s.strip()
+        if not (s_clean.startswith("{") and s_clean.endswith("}")):
+            return None
+        try:
+            import json
+            obj = json.loads(s_clean, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # Healing pass for invalid JSON escapes (regexes like \s, \d, \w, \.)
+        try:
+            import json
+            healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
+            obj = json.loads(healed, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        try:
+            import json
+            obj, _ = json.JSONDecoder(strict=False).raw_decode(s_clean)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        return None
+
     def _is_contract_dict(d: Any) -> bool:
         if not isinstance(d, dict):
             return False
@@ -123,6 +154,8 @@ def format_contract_payload(content: str) -> str:
             or "blockers" in d
             or "decision" in d
             or "review_notes" in d
+            or "report_markdown" in d
+            or "summary" in d
         )
 
     def _format_dict(d: dict[str, Any]) -> str:
@@ -136,11 +169,17 @@ def format_contract_payload(content: str) -> str:
 
         report_md = d.get("report_markdown")
         if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
-            return report_md.strip()
+            stripped = report_md.strip()
+            if stripped.startswith("```") or (stripped.startswith("{") and stripped.endswith("}")):
+                return format_contract_payload(stripped)
+            return stripped
 
         summary = d.get("summary")
         if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
-            return summary.strip()
+            stripped = summary.strip()
+            if stripped.startswith("```") or (stripped.startswith("{") and stripped.endswith("}")):
+                return format_contract_payload(stripped)
+            return stripped
 
         response = d.get("response")
         if response and isinstance(response, str) and response.strip():
@@ -171,14 +210,9 @@ def format_contract_payload(content: str) -> str:
             return str(reason)
         return text
 
-    if unfenced.startswith("{") and unfenced.endswith("}"):
-        try:
-            import json
-            parsed = json.loads(unfenced)
-            if _is_contract_dict(parsed):
-                return _format_dict(parsed)
-        except Exception:
-            pass
+    parsed = _safe_json_parse(unfenced)
+    if parsed and _is_contract_dict(parsed):
+        return _format_dict(parsed)
 
     # Check if text ends with a JSON block after conversational text
     match = re.search(r"\n*```(?:json)?\s*(\{[\s\S]*?\})\s*```\s*$", text)
@@ -186,16 +220,21 @@ def format_contract_payload(content: str) -> str:
         match = re.search(r"\n*(\{[\s\S]*?\})\s*$", text)
     if match:
         json_candidate = match.group(1).strip()
-        try:
-            import json
-            parsed = json.loads(json_candidate)
-            if _is_contract_dict(parsed):
-                leading_text = text[:match.start()].strip()
-                if leading_text:
-                    return leading_text
-                return _format_dict(parsed)
-        except Exception:
-            pass
+        parsed = _safe_json_parse(json_candidate)
+        if parsed and _is_contract_dict(parsed):
+            leading_text = text[:match.start()].strip()
+            if leading_text:
+                return leading_text
+            return _format_dict(parsed)
+
+    # Fallback: if unfenced looks like JSON with report_markdown or summary but was unparseable
+    for key in ("report_markdown", "summary", "response", "review_notes"):
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', unfenced, re.DOTALL)
+        if m:
+            val = m.group(1)
+            val = val.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+            if val.strip() and val.strip() != "Completed task via tools":
+                return val.strip()
 
     return text
 

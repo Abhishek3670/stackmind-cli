@@ -792,3 +792,45 @@ def test_extract_assistant_response_never_dumps_raw_json():
     resp_blocked = extract_assistant_response(payload_blocked)
     assert "Turn blocked: Repeated missing argument 'path' in write_file" in resp_blocked
     assert "{" not in resp_blocked
+
+
+def test_format_contract_payload_unescaped_regex_healing():
+    """Verify format_contract_payload heals unescaped regex patterns (like \\s, \\d) in contract JSON."""
+    from cli.tui.chat import format_contract_payload
+
+    # Raw JSON with regex patterns that contain invalid JSON escapes like \s, \d, \.
+    raw_json_with_regex = (
+        '```json\n'
+        '{\n'
+        '  "status": "completed",\n'
+        '  "summary": "Fixed email validation regex in js/main.js to satisfy QA audit requirements.",\n'
+        '  "report_markdown": "Form Validation: Implemented client-side validation using the exact regex: `/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/`."\n'
+        '}\n'
+        '```'
+    )
+    out = format_contract_payload(raw_json_with_regex)
+    assert not out.strip().startswith("```json")
+    assert not out.strip().startswith("{")
+    assert "Form Validation: Implemented client-side validation" in out
+    assert "@" in out
+
+
+def test_runner_parse_json_payload_unescaped_regex_healing():
+    """Verify HarnessRunner._parse_json_payload parses payloads containing unescaped regex backslashes."""
+    from validators.harness.runner import HarnessRunner
+
+    raw = (
+        '```json\n'
+        '{\n'
+        '  "status": "completed",\n'
+        '  "summary": "Fixed email validation regex in js/main.js",\n'
+        '  "report_markdown": "Validation regex: `/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/`"\n'
+        '}\n'
+        '```'
+    )
+    parsed = HarnessRunner._parse_json_payload(raw)
+    assert isinstance(parsed, dict)
+    assert parsed.get("status") == "completed"
+    assert parsed.get("summary") == "Fixed email validation regex in js/main.js"
+    assert "Validation regex:" in parsed.get("report_markdown", "")
+

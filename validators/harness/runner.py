@@ -1451,30 +1451,61 @@ class AgentRunner:
         raw_text = (raw_text or '').strip()
         payload = None
 
+        def _try_load(s: str) -> dict[str, Any] | None:
+            if not s:
+                return None
+            s_clean = s.strip()
+            try:
+                obj = json.loads(s_clean, strict=False)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            # Healing pass: double-escape invalid JSON escape backslashes (e.g. \s, \d, \w, \.)
+            try:
+                healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
+                obj = json.loads(healed, strict=False)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            return None
+
         # 1. Try markdown code block
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
         if match:
-            try:
-                payload = json.loads(match.group(1).strip())
-            except Exception:
-                pass
+            payload = _try_load(match.group(1))
 
         # 2. Try raw json loads
         if payload is None:
-            try:
-                payload = json.loads(raw_text)
-            except Exception:
-                pass
+            payload = _try_load(raw_text)
 
-        # 3. Try raw_decode from first {
+        # 3. Try slice from first '{' to last '}'
+        if payload is None and '{' in raw_text and '}' in raw_text:
+            first_brace = raw_text.find('{')
+            last_brace = raw_text.rfind('}')
+            if last_brace > first_brace:
+                payload = _try_load(raw_text[first_brace:last_brace + 1])
+
+        # 4. Try raw_decode from first {
         if payload is None and '{' in raw_text:
             idx = raw_text.find('{')
             try:
-                obj, _ = json.JSONDecoder().raw_decode(raw_text, idx)
+                obj, _ = json.JSONDecoder(strict=False).raw_decode(raw_text, idx)
                 if isinstance(obj, dict):
                     payload = obj
             except Exception:
                 pass
+            if payload is None:
+                try:
+                    healed_full = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', raw_text)
+                    idx = healed_full.find('{')
+                    if idx != -1:
+                        obj, _ = json.JSONDecoder(strict=False).raw_decode(healed_full, idx)
+                        if isinstance(obj, dict):
+                            payload = obj
+                except Exception:
+                    pass
 
         # If payload was emitted as a wrapped dictionary or tool call format:
         if isinstance(payload, dict):
@@ -2032,29 +2063,45 @@ class AgentRunner:
                 ))
             )
 
+            # If raw_text contains unparsed JSON-like text with report_markdown or summary, extract clean text
+            extracted_report = None
+            extracted_summary = None
+            if raw_text:
+                for key in ("report_markdown", "summary", "response", "review_notes"):
+                    m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text, re.DOTALL)
+                    if m:
+                        val = m.group(1).replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+                        if val.strip() and val.strip() != "Completed task via tools":
+                            if key == "report_markdown":
+                                extracted_report = val.strip()
+                            elif not extracted_summary:
+                                extracted_summary = val.strip()
+
+            effective_raw_text = extracted_report or raw_text
+
             if is_unfulfilled_deliverable:
                 payload = {
                     'status': 'blocked',
-                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {raw_text[:200]}",
-                    'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {raw_text}",
+                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {effective_raw_text[:200]}",
+                    'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {effective_raw_text}",
                     'modified_files': written_files,
                     'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
                 }
             elif is_validation_or_review:
-                blocker_detail = raw_text[:200] if raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
+                blocker_detail = effective_raw_text[:200] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
                 payload = {
                     'status': 'blocked',
                     'summary': f"Validation review requires resolution: {blocker_detail}",
-                    'report_markdown': raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
+                    'report_markdown': effective_raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
                     'modified_files': written_files,
                     'blockers': [blocker_detail],
                 }
             else:
-                summary_text = raw_text if (request.task.kind == 'adhoc' and raw_text) else (raw_text[:200] if raw_text else None)
+                summary_text = extracted_summary or (effective_raw_text if (request.task.kind == 'adhoc' and effective_raw_text) else (effective_raw_text[:200] if effective_raw_text else None))
                 payload = {
                     'status': 'completed',
                     'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
-                    'report_markdown': raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                    'report_markdown': effective_raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
                     'modified_files': written_files,
                     'blockers': [],
                 }
