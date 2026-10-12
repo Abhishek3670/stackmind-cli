@@ -795,7 +795,7 @@ def prompt_composer_input(
                 sys.stdout.write(f"\n{bottom_border}\x1b[1A\r")
             sys.stdout.flush()
 
-        def _clear_dropdown() -> None:
+        def _clear_dropdown() -> bool:
             if is_full_screen and session is not None and state is not None:
                 try:
                     redraw_full_screen(
@@ -807,8 +807,13 @@ def prompt_composer_input(
                         composer_content=getattr(state, "composer_buffer", ""),
                         live_manager=live_manager,
                     )
+                    term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+                    sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                    sys.stdout.flush()
+                    return True
                 except Exception:
                     pass
+            return False
 
         try:
             _raw_prompt_fn = getattr(

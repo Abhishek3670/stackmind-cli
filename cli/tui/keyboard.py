@@ -848,8 +848,10 @@ class RawLineEditor:
         width: int = 80,
         right_border: Optional[str] = None,
         commands: Optional[list[tuple[str, str, bool]]] = None,
-        on_clear_dropdown: Optional[Callable[[], None]] = None,
+        on_clear_dropdown: Optional[Callable[[], Any]] = None,
+        out: Any = sys.stdout,
     ) -> None:
+        self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
         self.buffer: list[str] = list(initial_text)
         self.cursor: int = len(self.buffer)
@@ -908,30 +910,42 @@ class RawLineEditor:
         self.dropdown_matches = []
         self.dropdown_index = 0
 
-    def _erase_dropdown(self, out: Any = sys.stdout) -> None:
+    def _erase_dropdown(self, out: Any = None) -> None:
+        target = out if out is not None else getattr(self, "out", sys.stdout)
         if self._last_dropdown_lines_count <= 0:
             return
         H = self._last_dropdown_lines_count
         self._last_dropdown_lines_count = 0
+        cleared_via_callback = False
         if getattr(self, "on_clear_dropdown", None):
             try:
-                self.on_clear_dropdown()
+                res = self.on_clear_dropdown()
+                cleared_via_callback = (res is True)
             except Exception:
                 pass
-        offset_up = H + (1 if self.has_borders else 0)
-        try:
-            out.write(f"\x1b[{offset_up}A")
-            for _ in range(H):
-                out.write("\r\x1b[2K\x1b[1B")
-            down_steps = 1 if self.has_borders else 0
-            if down_steps > 0:
-                out.write(f"\x1b[{down_steps}B")
-            visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
-            cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
-            out.write(f"\x1b[{cursor_col}G")
-            out.flush()
-        except Exception:
-            pass
+        if not cleared_via_callback:
+            offset_up = H + (1 if self.has_borders else 0)
+            try:
+                target.write(f"\x1b[{offset_up}A")
+                for _ in range(H):
+                    target.write("\r\x1b[2K\x1b[1B")
+                down_steps = 1 if self.has_borders else 0
+                if down_steps > 0:
+                    target.write(f"\x1b[{down_steps}B")
+                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+                cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+                target.write(f"\x1b[{cursor_col}G")
+                target.flush()
+            except Exception:
+                pass
+        else:
+            try:
+                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+                cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+                target.write(f"\x1b[{cursor_col}G")
+                target.flush()
+            except Exception:
+                pass
 
     def insert_char(self, ch: str) -> None:
         was_empty = len(self.buffer) == 0
@@ -1171,16 +1185,17 @@ class RawLineEditor:
             _log_debug_key(f"[handle_key] UNHANDLED key ignored: {repr(key)}")
         return False
 
-    def redraw_line(self, out: Any = sys.stdout) -> None:
+    def redraw_line(self, out: Any = None) -> None:
         """Redraw current line with exact cursor placement and composer border preservation."""
+        target = out if out is not None else getattr(self, "out", sys.stdout)
         buf_str = "".join(self.buffer)
         if not getattr(self, "has_borders", False):
             line_out = f"\r{self.prompt_prefix}{buf_str}\x1b[K"
-            out.write(line_out)
+            target.write(line_out)
             offset_back = len(self.buffer) - self.cursor
             if offset_back > 0:
-                out.write(f"\x1b[{offset_back}D")
-            out.flush()
+                target.write(f"\x1b[{offset_back}D")
+            target.flush()
             return
 
         visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
@@ -1229,38 +1244,52 @@ class RawLineEditor:
         self.displayed_cursor = displayed_cursor
         spaces_count = max(0, inner_available - len(displayed))
         line_out = f"\r{self.prompt_prefix}{displayed}{' ' * spaces_count}{self.right_border}"
-        out.write(line_out)
+        target.write(line_out)
 
         # Move cursor to active edit position inside composer box
         cursor_col = visible_prefix_len + displayed_cursor + 1
-        out.write(f"\x1b[{cursor_col}G")
+        target.write(f"\x1b[{cursor_col}G")
 
         # Dropdown management
-        if self._last_dropdown_lines_count > 0 and not self.dropdown_active:
-            self._erase_dropdown(out)
+        prev_H = self._last_dropdown_lines_count
 
-        if self.dropdown_active and self.dropdown_matches:
+        if not self.dropdown_active or not self.dropdown_matches:
+            if prev_H > 0:
+                self._erase_dropdown(target)
+        else:
             dropdown_lines = format_dropdown_lines(
                 self.dropdown_matches,
                 self.dropdown_index,
                 width=self.width,
             )
             if dropdown_lines:
-                H = len(dropdown_lines)
-                self._last_dropdown_lines_count = H
-                offset_up = H + (1 if self.has_borders else 0)
+                new_H = len(dropdown_lines)
+                self._last_dropdown_lines_count = new_H
                 try:
-                    out.write(f"\x1b[{offset_up}A")
+                    # If previous dropdown was taller, clear the excess top lines first
+                    if prev_H > new_H:
+                        offset_top = prev_H + (1 if self.has_borders else 0)
+                        target.write(f"\x1b[{offset_top}A")
+                        excess = prev_H - new_H
+                        for _ in range(excess):
+                            target.write("\r\x1b[2K\x1b[1B")
+                    else:
+                        offset_up = new_H + (1 if self.has_borders else 0)
+                        target.write(f"\x1b[{offset_up}A")
+
                     for d_line in dropdown_lines:
-                        out.write(f"\r{d_line}\x1b[K\x1b[1B")
+                        target.write(f"\r{d_line}\x1b[K\x1b[1B")
+
                     down_steps = 1 if self.has_borders else 0
                     if down_steps > 0:
-                        out.write(f"\x1b[{down_steps}B")
-                    out.write(f"\x1b[{cursor_col}G")
+                        target.write(f"\x1b[{down_steps}B")
+                    target.write(f"\x1b[{cursor_col}G")
                 except Exception:
                     pass
+            elif prev_H > 0:
+                self._erase_dropdown(target)
 
-        out.flush()
+        target.flush()
 
 
 def raw_prompt_input(
