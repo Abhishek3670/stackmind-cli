@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.7.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.8.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -46,6 +46,7 @@ stackmind <command> --help
 | Command | What it does |
 |---------|--------------|
 | `init <path> [-n NAME] [-a claude,codex,…] [--no-git]` | Create a new governed runtime |
+| `projects {list|add|remove|switch|current}` | Central multi-project workspace manager (`~/.stackmind/`) |
 | `validate [path] [--fix]` | Schema / structure / protocol / boot / knowledge checks |
 | `doctor [path]` | Compatibility + agent + migration status |
 | `migrate [path] [--to VER] [--check] [--rollback]` | Apply YAML migrations in `migrations/` |
@@ -58,7 +59,7 @@ stackmind <command> --help
 | `harness run-once <agent> [-p PATH] [--release-target X]` | One governed worker turn |
 | `analyze {runtime -- <cmd>|flows <paths>}` | Runtime tracing + bounded static flow (`FLOWS_TO`) |
 | `experience {list|show|stats|compile|search|capture}` | Experience records (SQLite/FTS5) |
-| `skill {list|show|create|test|promote|…|retrieve|audit}` | Procedural skills with 3-stage verification |
+| `skill {list|show|create|test|promote|…|retrieve|audit}` | Procedural skills with execution profiles & 3-stage verification |
 | `learn {clusters|mine|distill}` | Pattern mining → candidate skills |
 
 Full reference: [`docs/cli-reference.md`](docs/cli-reference.md), [`docs/getting-started.md`](docs/getting-started.md), [`docs/protocols.md`](docs/protocols.md).
@@ -108,6 +109,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.7.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.8.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

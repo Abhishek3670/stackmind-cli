@@ -5,7 +5,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.0] - 2026-10-13
+
 ### Added
+- **Tolerant Contract Shorthand Normalization & Autonomous Recovery Resilience**:
+  - `schemas/contract.schema.json` relaxed to accept float/number versions (`schema_version`, `contract_revision`), string rule lists for `scope.allow` and `scope.deny`, and write target arrays for `scope.write`.
+  - `AuthoringGate.normalize_contract_data` automatically coerces LLM shorthand into canonical schema dicts (`[{"module": ...}]`, `"read-write"`) and attaches `normalized_content` to `AuthoringGateDecision`.
+  - `ToolGateway.write_file` and `apply_patch` write canonicalized YAML to disk, guaranteeing consistent structured format for all subsequent validation gates and runner turns.
+  - Transparent bundled schema fallback in `ToolGateway.read_file` when reading `schemas/**` or `.sync/schemas/**` without a local workspace copy.
+  - Schema mirroring in `cli/init.py#ensure_workspace_protocol_scaffolding` to ensure bundled schemas exist in `<workspace>/schemas/`.
+  - Actionable error feedback in provider gateway for authoring validation failures, eliminating false "out of scope" warnings.
+  - Multi-layer tolerance in `ContractNormalizer.normalize` and `AgentContract.is_node_in_scope` for list `write` modes and string-shaped rules.
+  - Explicit schema structure guidance in `LifecycleSupervisor._recovery_repair_prompt`.
+- **Procedural Skills & Execution Profiles System**:
+  - Multi-tier execution profiles (`lite`, `medium`, `full`, `ultra`) tuning skill injection budgets and tool latency.
+  - Automated skill consumer, store, and selector for dynamic runtime procedural knowledge injection.
+  - Architectural skill selection and runbook audit tools.
+- **Central Home & Projects Workspace Management**:
+  - Multi-project registry management in `~/.stackmind/` via `cli/projects.py` and `validators/kernel/home.py`.
+- **GitOps & Security Scan Autonomous Recovery**:
+  - Authorized `run_security_scan` across root workspace directories without false contract denials.
+  - Bounded GitOps recovery retries with structured feedback in `_advance_gitops`.
+  - Allowlisted standard container credentials (`postgres`, `localhost`, `root`) in security credential leak detector.
+- **TUI Visual Fidelity & Streaming Robustness**:
+  - `:skills` and `:skill` commands for exploring registered procedural skills.
+  - Robust healing of invalid JSON escapes and unwrap decision blocks to markdown in stream turns.
+  - Dropdown line clearing on shrunk command matches and stream termination on autonomous delivery completion.
 - **Live Autonomous Lifecycle & Integration Review Hardening**:
   - Dedicated read-only integration review contract (`WO-005`) binding Claude's review turn strictly to declared deliverables and tests without write permissions.
   - Integration review harness schema validation with structured JSON failure feedback and bounded retries.
