@@ -580,6 +580,9 @@ def render_anchored_settings_panel_str(
             else " [↑/↓] Navigate  [←/→] Adjust  [Enter] Select  [Esc] Close "
         )
 
+        # Top padding
+        grid.add_row(Text(" ", style="dim"))
+
         table = Table(
             box=None,
             show_header=False,
@@ -599,16 +602,16 @@ def render_anchored_settings_panel_str(
         prof_val = getattr(settings, "effective_profile", "medium").upper()
         prof_color = "#38bdf8" if prof_val == "LOW" else ("#4ade80" if prof_val == "MEDIUM" else "#c084fc")
         if prof_val == "LOW":
-            prof_desc = "Fast: 0 optional skills, strict safety (←/→ cycle)"
+            prof_desc = "Fast: 0 optional skills, strict safety"
         elif prof_val == "MEDIUM":
-            prof_desc = "Balanced: 2 skills, 600 tok budget (←/→ cycle)"
+            prof_desc = "Balanced: 2 skills, 600 tok budget"
         else:
-            prof_desc = "Deep: 5 skills, 1500 tok budget (←/→ cycle)"
+            prof_desc = "Deep: 5 skills, 1500 tok budget"
         table.add_row(
             Text("▸", style="bold #38bdf8") if is_sel_0 else Text(" ", style="dim"),
             Text("Execution Profile", style="bold white" if is_sel_0 else "white"),
             Text(f"[{prof_val}]", style=f"bold {prof_color}"),
-            Text(prof_desc, style="#93c5fd" if is_sel_0 else "dim #64748b"),
+            Text(prof_desc, style="#93c5fd" if is_sel_0 else "dim #94a3b8"),
         )
 
         # Row 1: Client Turn Timeout
@@ -621,7 +624,7 @@ def render_anchored_settings_panel_str(
             Text("▸", style="bold #38bdf8") if is_sel_1 else Text(" ", style="dim"),
             Text("Client Turn Timeout", style="bold white" if is_sel_1 else "white"),
             Text(to_str, style="bold #f59e0b" if to_val else "dim #94a3b8"),
-            Text("Cycle: 0s / 30s / 60s / 120s / 300s (←/→)", style="#93c5fd" if is_sel_1 else "dim #64748b"),
+            Text("Governance turn response timeout threshold", style="#93c5fd" if is_sel_1 else "dim #94a3b8"),
         )
 
         # Row 2: Decision Engine (Laya)
@@ -630,7 +633,7 @@ def render_anchored_settings_panel_str(
             Text("▸", style="bold #38bdf8") if is_sel_2 else Text(" ", style="dim"),
             Text("Decision Engine (Laya)", style="bold white" if is_sel_2 else "white"),
             Text("[DETERMINISTIC]", style="bold #38bdf8" if is_sel_2 else "dim #60a5fa"),
-            Text("Offline standby; contracts enforced", style="#93c5fd" if is_sel_2 else "dim #64748b"),
+            Text("Offline standby; contracts enforced", style="#93c5fd" if is_sel_2 else "dim #94a3b8"),
         )
 
         # Row 3: LLM Providers & Models
@@ -641,7 +644,7 @@ def render_anchored_settings_panel_str(
             Text("▸", style="bold #38bdf8") if is_sel_3 else Text(" ", style="dim"),
             Text("LLM Providers & Models", style="bold white" if is_sel_3 else "white"),
             Text(f"[{enabled_count}/{total_count} ENABLED]", style="bold #4ade80" if is_sel_3 else "dim #22c55e"),
-            Text("Press Enter to open :providers", style="#93c5fd" if is_sel_3 else "dim #64748b"),
+            Text("Configure endpoints, API keys & models", style="#93c5fd" if is_sel_3 else "dim #94a3b8"),
         )
 
         # Row 4: Agent Role Bindings
@@ -650,7 +653,7 @@ def render_anchored_settings_panel_str(
             Text("▸", style="bold #38bdf8") if is_sel_4 else Text(" ", style="dim"),
             Text("Agent Role Bindings", style="bold white" if is_sel_4 else "white"),
             Text("[CONFIGURED]", style="bold #38bdf8" if is_sel_4 else "dim #60a5fa"),
-            Text("Press Enter to open :roles", style="#93c5fd" if is_sel_4 else "dim #64748b"),
+            Text("Configure agent contracts & role mappings", style="#93c5fd" if is_sel_4 else "dim #94a3b8"),
         )
 
         # Row 5: Save Settings
@@ -659,19 +662,28 @@ def render_anchored_settings_panel_str(
             Text("▸", style="bold #38bdf8") if is_sel_5 else Text(" ", style="dim"),
             Text("Save Settings to Disk", style="bold #f59e0b" if is_sel_5 else "white"),
             Text("[SAVE & APPLY]", style="bold #f59e0b" if is_sel_5 else "dim #fbbf24"),
-            Text("Persist to settings.json & runtime (Press Enter)", style="#fde047" if is_sel_5 else "dim #64748b"),
+            Text("Persist configuration to settings.json", style="#fde047" if is_sel_5 else "dim #94a3b8"),
         )
 
         grid.add_row(table)
 
-        # Row 6: Hint
-        grid.add_row(Text("  Hint: Use arrow keys to navigate. Press Enter to select or save.", style="dim #64748b", no_wrap=True))
-
-        # Row 7: Status message or empty line
+        # Row 7: Empty separator or status message
         if status_msg:
-            grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
+            grid.add_row(Text(f"  >> {status_msg}", style="bold #f59e0b", no_wrap=True))
         else:
             grid.add_row(Text(" ", style="dim"))
+
+        # Row 8: Shifted hint at bottom
+        hints_by_row = {
+            0: "Hint: Press [←/→] to cycle execution profile (Low / Medium / High).",
+            1: "Hint: Press [←/→] to adjust turn timeout (0s / 30s / 60s / 120s / 300s).",
+            2: "Hint: Laya decision engine runs offline in deterministic fallback mode.",
+            3: "Hint: Press [Enter] to open :providers (configure API keys & models).",
+            4: "Hint: Press [Enter] to open :roles (configure agent role bindings).",
+            5: "Hint: Press [Enter] to save settings to disk and apply changes.",
+        }
+        current_hint = hints_by_row.get(sel, "Hint: Use arrow keys to navigate. Press Enter to select or save.")
+        grid.add_row(Text(f"  {current_hint}", style="dim #94a3b8", no_wrap=True))
 
     elif view in ("main", "providers"):
         title = " Cloud Providers & Models Configuration (settings.json) "
