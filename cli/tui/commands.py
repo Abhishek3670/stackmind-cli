@@ -260,7 +260,6 @@ def get_help_str() -> str:
         "  :skills [name]    Display available procedural skills & verified runbooks\n"
         "  :consume-skills <p> Ingest and install procedural skills from file or directory\n"
         "  :projects         Display registered projects and centralized root (~/.stackmindcli)\n"
-        "  :profile [name]   Get or set execution profile (low | medium | high)\n"
         "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
@@ -1624,53 +1623,7 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":profile" or normalized.startswith(":profile "):
-        _, _, prof_arg = normalized.partition(" ")
-        clean_prof = prof_arg.strip().lower()
-        ws_path = session.get("workspace") if isinstance(session, dict) else None
-        from validators.kernel.settings import load_settings, save_settings
-        from validators.kernel.profile import ExecutionProfile, get_profile_policy
-        try:
-            settings_obj = load_settings(ws_path)
-        except Exception:
-            from validators.kernel.settings import StackMindSettings
-            settings_obj = StackMindSettings()
-
-        if clean_prof:
-            if clean_prof in ("low", "medium", "high"):
-                settings_obj.execution_profile = clean_prof
-                save_settings(settings_obj, ws_path)
-                state.execution_profile = clean_prof
-                if client and hasattr(client, "settings_update"):
-                    try:
-                        client.settings_update(settings_obj.to_dict())
-                    except Exception:
-                        pass
-                policy = get_profile_policy(clean_prof)
-                output_str = (
-                    f"Execution profile updated to: {clean_prof.upper()}\n"
-                    f"Policy details: skills_enabled={policy.skills_enabled}, "
-                    f"skill_limit={policy.skill_limit}, "
-                    f"token_budget={policy.skill_token_budget}, "
-                    f"verification_depth={policy.verification_depth.value}\n"
-                    f"Changes will take effect at the start of the next execution cycle."
-                )
-            else:
-                output_str = f"Invalid execution profile '{clean_prof}'. Supported values: low, medium, high."
-        else:
-            if is_tty:
-                from cli.tui.settings_panel import run_interactive_profile_selector
-                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-                output_str = run_interactive_profile_selector(
-                    session=session,
-                    state=state,
-                    client=client,
-                    live_manager=live_manager,
-                    workspace=Path(ws_path) if ws_path else None,
-                    width=term_cols,
-                )
-            else:
-                from cli.tui.settings_panel import render_profile_overview_str
-                output_str = render_profile_overview_str(settings_obj)
+        output_str = "':profile' has been merged into ':config'. Open ':config' to configure execution profile and skills policy."
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

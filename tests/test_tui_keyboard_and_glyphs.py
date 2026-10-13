@@ -1124,17 +1124,17 @@ def test_dropdown_height_shrink_clears_excess_top_lines():
     editor.redraw_line()
     assert editor._last_dropdown_lines_count == 8
 
-    # 2. Type 'p' (matches: :plan, :pause, :providers, :projects, :profile -> 5 items -> 7 total lines)
+    # 2. Type 'p' (matches: :plan, :pause, :providers, :projects -> 4 items -> 6 total lines)
     out.seek(0)
     out.truncate(0)
     editor.handle_key("p")
     editor.redraw_line()
     step_p = out.getvalue()
-    assert editor._last_dropdown_lines_count == 7
+    assert editor._last_dropdown_lines_count == 6
     # Must have moved up to row of old 8-line dropdown (8 + 1 border = 9)
     assert "\x1b[9A" in step_p
-    # Must have cleared the 1 excess line (8 - 7 = 1) with \x1b[2K
-    assert len(re.findall(r"\x1b\[2K", step_p)) == 1
+    # Must have cleared the 2 excess lines (8 - 6 = 2) with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_p)) == 2
 
     # 3. Type 'l' (matches: :plan -> 1 item -> 3 total lines)
     out.seek(0)
@@ -1143,10 +1143,10 @@ def test_dropdown_height_shrink_clears_excess_top_lines():
     editor.redraw_line()
     step_pl = out.getvalue()
     assert editor._last_dropdown_lines_count == 3
-    # Must have moved up to row of old 7-line dropdown (7 + 1 border = 8)
-    assert "\x1b[8A" in step_pl
-    # Must have cleared the 4 excess lines (7 - 3 = 4) with \x1b[2K
-    assert len(re.findall(r"\x1b\[2K", step_pl)) == 4
+    # Must have moved up to row of old 6-line dropdown (6 + 1 border = 7)
+    assert "\x1b[7A" in step_pl
+    # Must have cleared the 3 excess lines (6 - 3 = 3) with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_pl)) == 3
 
 
 def test_dropdown_dismiss_clears_all_lines():

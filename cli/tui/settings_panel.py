@@ -184,62 +184,74 @@ def render_stackmind_settings_str(
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
-    """Render StackMind system settings overview (Execution Profile, Roles, Policies, Governance)."""
+    """Render StackMind system settings overview in tabular layout without lines."""
     if settings is None:
         settings = load_settings()
 
     box_w = max(40, min(width - 2, 88))
-    content = Table.grid(expand=True, padding=(0, 0))
-
-    content.add_row(Text("StackMind System Settings & Governance\n", style="bold white"))
+    table = Table(
+        box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        collapse_padding=True,
+        expand=True,
+        padding=(0, 1),
+    )
+    table.add_column("name", style="bold white", width=25, no_wrap=True)
+    table.add_column("value", width=18, no_wrap=True)
+    table.add_column("desc", style="dim #94a3b8", ratio=1, no_wrap=True)
 
     # 1. Execution Profile
     prof_val = getattr(settings, "effective_profile", "medium").upper()
     prof_color = "#38bdf8" if prof_val == "LOW" else ("#4ade80" if prof_val == "MEDIUM" else "#c084fc")
-    p_header = Text()
-    p_header.append("Execution Profile: ", style="bold white")
-    p_header.append(f"[{prof_val}]", style=f"bold {prof_color}")
     if prof_val == "LOW":
-        p_desc = " (Fast: 0 optional skills, strict contracts & verification)"
+        prof_desc = "Fast: 0 optional skills, strict safety"
     elif prof_val == "MEDIUM":
-        p_desc = " (Balanced: 2 skills, 600 tok budget, progressive summaries)"
+        prof_desc = "Balanced: 2 skills, 600 tok budget"
     else:
-        p_desc = " (Deep: 5 skills, 1500 tok budget, extended verification)"
-    p_header.append(p_desc, style="dim #94a3b8")
-    content.add_row(p_header)
+        prof_desc = "Deep: 5 skills, 1500 tok budget"
+    table.add_row(
+        Text("Execution Profile", style="bold white"),
+        Text(f"[{prof_val}]", style=f"bold {prof_color}"),
+        Text(prof_desc, style="dim #94a3b8"),
+    )
 
-    # 2. Skills Retrieval & Token Context Policy
-    content.add_row(Text("\nSkills Retrieval & Token Policy:", style="bold white"))
-    if prof_val == "LOW":
-        sk_info = "  • Context: 0 optional skills / 0 token budget (direct deterministic execution)"
-    elif prof_val == "MEDIUM":
-        sk_info = "  • Context: Up to 2 relevant skills, 600-token budget (compact summaries first)"
-    else:
-        sk_info = "  • Context: Up to 5 relevant skills, 1500-token budget (progressive deep runbooks)"
-    content.add_row(Text(sk_info, style="#34d399"))
-
-    # 3. Turn Timeout & Governance
+    # 2. Client Turn Timeout
     to_val = getattr(settings, "client_timeout", 0)
-    to_str = f"{to_val}s" if to_val and to_val > 0 else "Disabled"
-    content.add_row(Text(f"\nClient Turn Timeout: {to_str}", style="bold white"))
+    to_str = f"[{to_val}s]" if to_val and to_val > 0 else "[DISABLED]"
+    table.add_row(
+        Text("Client Turn Timeout", style="bold white"),
+        Text(to_str, style="bold #f59e0b" if to_val else "dim #94a3b8"),
+        Text("Governance response timeout threshold", style="dim #94a3b8"),
+    )
 
-    # 4. Decision Engine (Laya)
-    content.add_row(Text("\nDecision Engine (Laya): [DETERMINISTIC FALLBACK] (Offline standby; contracts enforced)", style="bold white"))
+    # 3. Decision Engine
+    table.add_row(
+        Text("Decision Engine (Laya)", style="bold white"),
+        Text("[DETERMINISTIC]", style="dim #60a5fa"),
+        Text("Offline standby; contracts enforced", style="dim #94a3b8"),
+    )
 
-    # 5. LLM Cloud Providers & Models
+    # 4. LLM Providers & Models
     enabled_count = sum(1 for p in settings.providers.values() if p.enabled)
     total_count = len(settings.providers)
-    prov_line = Text()
-    prov_line.append("\nLLM Cloud Providers & Models: ", style="bold white")
-    prov_line.append(f"[{enabled_count}/{total_count} ENABLED] ", style="bold #4ade80")
-    prov_line.append("— Configure Cloud Providers with :providers", style="dim #94a3b8")
-    content.add_row(prov_line)
+    table.add_row(
+        Text("LLM Providers & Models", style="bold white"),
+        Text(f"[{enabled_count}/{total_count} ENABLED]", style="bold #4ade80"),
+        Text("Configure with :providers", style="dim #94a3b8"),
+    )
 
-    # 6. Agent Role Bindings
-    roles_line = Text()
-    roles_line.append("\nAgent Role Bindings: ", style="bold white")
-    roles_line.append("Configure & rebind with :roles", style="#38bdf8")
-    content.add_row(roles_line)
+    # 5. Agent Role Bindings
+    table.add_row(
+        Text("Agent Role Bindings", style="bold white"),
+        Text("[CONFIGURED]", style="#38bdf8"),
+        Text("Configure & rebind with :roles", style="dim #94a3b8"),
+    )
+
+    content = Table.grid(expand=True)
+    content.add_row(Text("StackMind System Settings & Governance\n", style="bold white"))
+    content.add_row(table)
 
     if status_msg:
         content.add_row(Text(f"\n>> {status_msg}", style="bold #f59e0b"))
@@ -247,10 +259,9 @@ def render_stackmind_settings_str(
     content.add_row(
         Text(
             "\nCommands:\n"
-            "  :config                Open interactive StackMind configuration panel\n"
-            "  :profile [low|med|hi]  Change execution profile\n"
-            "  :providers             Configure LLM providers, API keys & base URLs\n"
-            "  :roles                 Interactive Agent Roles & Execution Backend bindings",
+            "  :config      Open interactive StackMind configuration panel\n"
+            "  :providers   Configure LLM providers, API keys & base URLs\n"
+            "  :roles       Interactive Agent Roles & Execution Backend bindings",
             style="dim #64748b",
         )
     )
@@ -569,96 +580,94 @@ def render_anchored_settings_panel_str(
             else " [↑/↓] Navigate  [←/→] Adjust  [Enter] Select  [Esc] Close "
         )
 
-        # Row 0: Execution Profile
-        is_sel_prof = (sel == 0)
-        ptr_prof = "▸ " if is_sel_prof else "  "
-        prof_txt = Text(no_wrap=True)
-        prof_txt.append(ptr_prof, style="bold #38bdf8" if is_sel_prof else "dim")
+        table = Table(
+            box=None,
+            show_header=False,
+            show_edge=False,
+            pad_edge=False,
+            collapse_padding=True,
+            expand=True,
+            padding=(0, 1),
+        )
+        table.add_column("ptr", width=2, justify="left", no_wrap=True)
+        table.add_column("name", width=25, no_wrap=True)
+        table.add_column("value", width=18, no_wrap=True)
+        table.add_column("desc", ratio=1, no_wrap=True)
+
+        # Row 0: Execution Profile (merged with skills policy)
+        is_sel_0 = (sel == 0)
         prof_val = getattr(settings, "effective_profile", "medium").upper()
         prof_color = "#38bdf8" if prof_val == "LOW" else ("#4ade80" if prof_val == "MEDIUM" else "#c084fc")
-        prof_txt.append("Execution Profile ", style="bold white" if is_sel_prof else "white")
-        prof_txt.append(f"[{prof_val}] ", style=f"bold {prof_color}")
         if prof_val == "LOW":
-            p_desc = "(Fast: 0 optional skills, strict safety)"
+            prof_desc = "Fast: 0 optional skills, strict safety (←/→ cycle)"
         elif prof_val == "MEDIUM":
-            p_desc = "(Balanced: 2 skills, 600 tok budget)"
+            prof_desc = "Balanced: 2 skills, 600 tok budget (←/→ cycle)"
         else:
-            p_desc = "(Deep: 5 skills, 1500 tok budget)"
-        prof_txt.append(p_desc, style="#93c5fd" if is_sel_prof else "dim #64748b")
-        grid.add_row(prof_txt)
+            prof_desc = "Deep: 5 skills, 1500 tok budget (←/→ cycle)"
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_0 else Text(" ", style="dim"),
+            Text("Execution Profile", style="bold white" if is_sel_0 else "white"),
+            Text(f"[{prof_val}]", style=f"bold {prof_color}"),
+            Text(prof_desc, style="#93c5fd" if is_sel_0 else "dim #64748b"),
+        )
 
-        # Row 1: Skills Retrieval Policy
-        is_sel_skills = (sel == 1)
-        ptr_skills = "▸ " if is_sel_skills else "  "
-        skills_txt = Text(no_wrap=True)
-        skills_txt.append(ptr_skills, style="bold #38bdf8" if is_sel_skills else "dim")
-        skills_txt.append("Skills Retrieval Policy ", style="bold white" if is_sel_skills else "white")
-        if prof_val == "LOW":
-            sk_desc = "[0 SKILLS / 0 TOK] (Mandatory runbooks only)"
-        elif prof_val == "MEDIUM":
-            sk_desc = "[2 SKILLS / 600 TOK] (Relevance-ranked, summaries first)"
-        else:
-            sk_desc = "[5 SKILLS / 1500 TOK] (Progressive deep instructions)"
-        skills_txt.append(sk_desc, style="#34d399" if is_sel_skills else "#10b981")
-        grid.add_row(skills_txt)
-
-        # Row 2: Client Turn Timeout
-        is_sel_timeout = (sel == 2)
-        ptr_timeout = "▸ " if is_sel_timeout else "  "
+        # Row 1: Client Turn Timeout
+        is_sel_1 = (sel == 1)
         to_val = getattr(state, "turn_timeout", None)
         if to_val is None:
             to_val = getattr(settings, "client_timeout", 0)
         to_str = f"[{to_val}s]" if to_val and to_val > 0 else "[DISABLED]"
-        to_txt = Text(no_wrap=True)
-        to_txt.append(ptr_timeout, style="bold #38bdf8" if is_sel_timeout else "dim")
-        to_txt.append("Client Turn Timeout ", style="bold white" if is_sel_timeout else "white")
-        to_txt.append(f"{to_str} ", style="bold #f59e0b" if to_val else "dim #94a3b8")
-        to_txt.append("(←/→ cycle: 0s / 30s / 60s / 120s / 300s)", style="#93c5fd" if is_sel_timeout else "dim #64748b")
-        grid.add_row(to_txt)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_1 else Text(" ", style="dim"),
+            Text("Client Turn Timeout", style="bold white" if is_sel_1 else "white"),
+            Text(to_str, style="bold #f59e0b" if to_val else "dim #94a3b8"),
+            Text("Cycle: 0s / 30s / 60s / 120s / 300s (←/→)", style="#93c5fd" if is_sel_1 else "dim #64748b"),
+        )
 
-        # Row 3: Decision Engine (Laya)
-        is_sel_laya = (sel == 3)
-        ptr_laya = "▸ " if is_sel_laya else "  "
-        laya_txt = Text(no_wrap=True)
-        laya_txt.append(ptr_laya, style="bold #38bdf8" if is_sel_laya else "dim")
-        laya_txt.append("Decision Engine (Laya) ", style="bold white" if is_sel_laya else "white")
-        laya_txt.append("[DETERMINISTIC FALLBACK] ", style="bold #38bdf8" if is_sel_laya else "dim #60a5fa")
-        laya_txt.append("(Offline standby; contracts enforced)", style="dim #64748b")
-        grid.add_row(laya_txt)
+        # Row 2: Decision Engine (Laya)
+        is_sel_2 = (sel == 2)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_2 else Text(" ", style="dim"),
+            Text("Decision Engine (Laya)", style="bold white" if is_sel_2 else "white"),
+            Text("[DETERMINISTIC]", style="bold #38bdf8" if is_sel_2 else "dim #60a5fa"),
+            Text("Offline standby; contracts enforced", style="#93c5fd" if is_sel_2 else "dim #64748b"),
+        )
 
-        # Row 4: LLM Providers & Models
-        is_sel_prov = (sel == 4)
-        ptr_prov = "▸ " if is_sel_prov else "  "
-        prov_txt = Text(no_wrap=True)
-        prov_txt.append(ptr_prov, style="bold #38bdf8" if is_sel_prov else "dim")
+        # Row 3: LLM Providers & Models
+        is_sel_3 = (sel == 3)
         enabled_count = sum(1 for p in settings.providers.values() if p.enabled)
         total_count = len(settings.providers)
-        prov_txt.append("LLM Providers & Models ", style="bold white" if is_sel_prov else "white")
-        prov_txt.append(f"[{enabled_count}/{total_count} ENABLED] ", style="bold #4ade80" if is_sel_prov else "dim #22c55e")
-        prov_txt.append("(Press Enter to open :providers)", style="#93c5fd" if is_sel_prov else "dim #64748b")
-        grid.add_row(prov_txt)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_3 else Text(" ", style="dim"),
+            Text("LLM Providers & Models", style="bold white" if is_sel_3 else "white"),
+            Text(f"[{enabled_count}/{total_count} ENABLED]", style="bold #4ade80" if is_sel_3 else "dim #22c55e"),
+            Text("Press Enter to open :providers", style="#93c5fd" if is_sel_3 else "dim #64748b"),
+        )
 
-        # Row 5: Agent Role Bindings
-        is_sel_roles = (sel == 5)
-        ptr_roles = "▸ " if is_sel_roles else "  "
-        roles_txt = Text(no_wrap=True)
-        roles_txt.append(ptr_roles, style="bold #38bdf8" if is_sel_roles else "dim")
-        roles_txt.append("Agent Role Bindings ", style="bold white" if is_sel_roles else "white")
-        roles_txt.append("(Press Enter to open :roles)", style="#93c5fd" if is_sel_roles else "dim #64748b")
-        grid.add_row(roles_txt)
+        # Row 4: Agent Role Bindings
+        is_sel_4 = (sel == 4)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_4 else Text(" ", style="dim"),
+            Text("Agent Role Bindings", style="bold white" if is_sel_4 else "white"),
+            Text("[CONFIGURED]", style="bold #38bdf8" if is_sel_4 else "dim #60a5fa"),
+            Text("Press Enter to open :roles", style="#93c5fd" if is_sel_4 else "dim #64748b"),
+        )
 
-        # Row 6: Save & Exit
-        is_sel_save = (sel == 6)
-        ptr_save = "▸ " if is_sel_save else "  "
-        save_txt = Text(no_wrap=True)
-        save_txt.append(ptr_save, style="bold #38bdf8" if is_sel_save else "dim")
-        save_txt.append("Save Settings to Disk & Apply to Runtime", style="bold #f59e0b" if is_sel_save else "dim #fbbf24")
-        grid.add_row(save_txt)
+        # Row 5: Save Settings
+        is_sel_5 = (sel == 5)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_5 else Text(" ", style="dim"),
+            Text("Save Settings to Disk", style="bold #f59e0b" if is_sel_5 else "white"),
+            Text("[SAVE & APPLY]", style="bold #f59e0b" if is_sel_5 else "dim #fbbf24"),
+            Text("Persist to settings.json & runtime (Press Enter)", style="#fde047" if is_sel_5 else "dim #64748b"),
+        )
 
-        # Row 7: Hint
+        grid.add_row(table)
+
+        # Row 6: Hint
         grid.add_row(Text("  Hint: Use arrow keys to navigate. Press Enter to select or save.", style="dim #64748b", no_wrap=True))
 
-        # Row 8: Status message or empty line
+        # Row 7: Status message or empty line
         if status_msg:
             grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
         else:
@@ -1025,7 +1034,7 @@ def run_arrow_navigation_settings_loop(
 
         # Max rows per view
         if view in ("settings", "stackmind", "config"):
-            max_rows = 7  # 0: Profile, 1: Roles, 2: Skills Policy, 3: Timeout, 4: Laya, 5: Providers, 6: Save
+            max_rows = 6  # 0: Profile, 1: Timeout, 2: Laya, 3: Providers, 4: Roles, 5: Save
         elif view == "providers":
             max_rows = num_prov + 2  # 0..num_prov-1: Providers, num_prov: Return, num_prov+1: Save
         elif view == "main":
@@ -1054,7 +1063,7 @@ def run_arrow_navigation_settings_loop(
         if key in (Key.LEFT, Key.RIGHT):
             step = 1 if key == Key.RIGHT else -1
             if view in ("settings", "stackmind", "config"):
-                if sel in (0, 1):  # Execution Profile or Skills Context Policy
+                if sel == 0:  # Execution Profile
                     curr_p = getattr(settings, "effective_profile", "medium").lower()
                     curr_idx = profile_keys.index(curr_p) if curr_p in profile_keys else 1
                     next_idx = (curr_idx + step) % len(profile_keys)
@@ -1063,7 +1072,7 @@ def run_arrow_navigation_settings_loop(
                     state.execution_profile = new_p
                     state.settings_status_msg = f"Execution profile set to {new_p.upper()}."
                     _redraw()
-                elif sel == 2:  # Client turn timeout cycle
+                elif sel == 1:  # Client turn timeout cycle
                     timeouts = [0, 30, 60, 120, 300]
                     curr_to = getattr(state, "turn_timeout", None)
                     if curr_to is None:
@@ -1141,19 +1150,16 @@ def run_arrow_navigation_settings_loop(
 
         if key in (Key.ENTER, Key.NEWLINE):
             if view in ("settings", "stackmind", "config"):
-                if sel == 0:  # Profile
-                    state.settings_current_view = "profile"
-                    cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                    state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                    state.settings_status_msg = ""
+                if sel == 0:  # Profile: cycle next profile
+                    curr_p = getattr(settings, "effective_profile", "medium").lower()
+                    curr_idx = profile_keys.index(curr_p) if curr_p in profile_keys else 1
+                    next_idx = (curr_idx + 1) % len(profile_keys)
+                    new_p = profile_keys[next_idx]
+                    settings.execution_profile = new_p
+                    state.execution_profile = new_p
+                    state.settings_status_msg = f"Execution profile set to {new_p.upper()}."
                     _redraw()
-                elif sel == 1:  # Skills context policy
-                    state.settings_current_view = "profile"
-                    cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                    state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                    state.settings_status_msg = ""
-                    _redraw()
-                elif sel == 2:  # Client turn timeout cycle
+                elif sel == 1:  # Client turn timeout cycle
                     timeouts = [0, 30, 60, 120, 300]
                     curr_to = getattr(state, "turn_timeout", None)
                     if curr_to is None:
@@ -1165,20 +1171,20 @@ def run_arrow_navigation_settings_loop(
                     settings.client_timeout = new_to
                     state.settings_status_msg = f"Turn timeout set to {new_to}s." if new_to else "Turn timeout disabled."
                     _redraw()
-                elif sel == 3:  # Decision engine info
+                elif sel == 2:  # Decision engine info
                     state.settings_status_msg = "Laya decision engine in deterministic fallback mode."
                     _redraw()
-                elif sel == 4:  # Switch to LLM providers view
+                elif sel == 3:  # Switch to LLM providers view
                     state.settings_current_view = "providers"
                     state.settings_selected_row = 0
                     state.settings_status_msg = ""
                     _redraw()
-                elif sel == 5:  # Switch to Roles view
+                elif sel == 4:  # Switch to Roles view
                     state.settings_current_view = "roles"
                     state.settings_selected_row = 0
                     state.settings_status_msg = ""
                     _redraw()
-                elif sel == 6:  # Save & Exit
+                elif sel == 5:  # Save & Exit
                     save_settings(settings, workspace)
                     if client and hasattr(client, "settings_update"):
                         try:
@@ -1195,8 +1201,8 @@ def run_arrow_navigation_settings_loop(
                     state.settings_status_msg = ""
                     _redraw()
                 elif sel == num_prov:  # ◄ Return to StackMind Settings
-                    state.settings_current_view = "settings"
-                    state.settings_selected_row = 4
+                    state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
+                    state.settings_selected_row = 3
                     state.settings_status_msg = ""
                     _redraw()
                 elif sel == num_prov + 1:  # Save & Exit
@@ -1353,9 +1359,9 @@ def run_arrow_navigation_settings_loop(
                         state.close_settings()
                         _redraw()
                         return "[SUCCESS] Agent role bindings saved to settings.json and applied to runtime."
-                    elif initial_view in ("settings", "stackmind"):
-                        state.settings_current_view = "settings"
-                        state.settings_selected_row = 5
+                    elif initial_view in ("settings", "stackmind", "config"):
+                        state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
+                        state.settings_selected_row = 4
                         state.settings_status_msg = "Role bindings saved to settings.json."
                         _redraw()
                     else:
@@ -1404,13 +1410,13 @@ def run_arrow_navigation_settings_loop(
                     break
                 else:
                     state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
-                    state.settings_selected_row = 4
+                    state.settings_selected_row = 3
                     state.settings_status_msg = ""
                     _redraw()
             elif view == "roles":
                 if initial_view in ("settings", "stackmind", "config"):
                     state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
-                    state.settings_selected_row = 5
+                    state.settings_selected_row = 4
                     state.settings_status_msg = ""
                     _redraw()
                 else:
@@ -1507,9 +1513,9 @@ def render_profile_overview_str(
     content.add_row(
         Text(
             "Commands:\n"
-            "  :profile               Open interactive profile selection layout\n"
-            "  :profile low|medium|high Set profile directly\n"
-            "  :settings              Open full settings panel (Providers, Profiles, Roles)",
+            "  :config                Open interactive configuration panel\n"
+            "  :config profile low|medium|high Set profile directly\n"
+            "  :providers             Configure LLM providers and models",
             style="dim #64748b",
         )
     )

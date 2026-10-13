@@ -230,7 +230,8 @@ def test_tui_dispatch_settings_command(tmp_path: Path):
     assert should_exit is False
     assert len(state.messages) == 2
     assert state.messages[0].content == ":settings list"
-    assert "Cloud Providers" in state.messages[1].content
+    assert "StackMind System Settings" in state.messages[1].content
+    assert "Execution Profile" in state.messages[1].content
 
 
 def test_settings_panel_viewport_and_layout():
@@ -676,11 +677,11 @@ def test_render_stackmind_settings_panel_view():
     assert len(lines) == 11
     assert "StackMind System Settings" in rendered
     assert "Execution Profile" in rendered
-    assert "Agent Role Bindings" in rendered
-    assert "Skills Retrieval Policy" in rendered
     assert "Client Turn Timeout" in rendered
     assert "Decision Engine (Laya)" in rendered
     assert "LLM Providers & Models" in rendered
+    assert "Agent Role Bindings" in rendered
+    assert "Save Settings to Disk" in rendered
 
 
 def test_render_providers_panel_view():
@@ -711,14 +712,12 @@ def test_navigation_between_settings_and_providers(tmp_path: Path):
     session = {"session_id": "s1", "workspace": str(tmp_path)}
 
     # Sequence starting in "settings":
-    # 1. DOWN x 5 -> select row 5: LLM Providers & Models
+    # 1. DOWN x 3 -> select row 3: LLM Providers & Models
     # 2. ENTER -> opens "providers" view
     # 3. DOWN x 6 -> select row 6: Return to StackMind Settings
     # 4. ENTER -> returns to "settings" view
     # 5. ESCAPE -> save & exit
     key_seq = [
-        Key.DOWN,
-        Key.DOWN,
         Key.DOWN,
         Key.DOWN,
         Key.DOWN,
@@ -767,7 +766,6 @@ def test_dispatch_settings_and_providers_separation(tmp_path: Path):
     settings_output = state.messages[-1].content
     assert "StackMind System Settings" in settings_output
     assert "Execution Profile" in settings_output
-    assert "Skills Retrieval & Token Policy" in settings_output
     assert "Agent Role Bindings" in settings_output
     assert ":roles" in settings_output
     assert "(Arch:" not in settings_output

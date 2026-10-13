@@ -741,7 +741,6 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":consume-skills", "Install/import procedural skills from file or directory", True),
     (":consume-skill", "Install/import procedural skill from file or directory", True),
     (":projects", "List registered projects and runtime home", False),
-    (":profile", "Get or set execution profile (low|medium|high)", True),
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
     (":exit", "Gracefully stop daemon and exit", False),
