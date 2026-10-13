@@ -339,14 +339,14 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                 except Exception:
                     pass
 
-        # 5. Mirror bundled schemas into workspace schemas/ directory
-        ws_schemas_dir = ws_path / "schemas"
-        ws_schemas_dir.mkdir(parents=True, exist_ok=True)
+        # 5. Mirror bundled schemas into .sync/schemas/ directory (not workspace root)
+        sync_schemas_dir = sync_path / "schemas"
+        sync_schemas_dir.mkdir(parents=True, exist_ok=True)
         try:
             bundled_schemas = Path(__file__).resolve().parents[1] / "schemas"
             if bundled_schemas.is_dir():
                 for s_file in bundled_schemas.glob("*.json"):
-                    dest_file = ws_schemas_dir / s_file.name
+                    dest_file = sync_schemas_dir / s_file.name
                     if not dest_file.exists():
                         shutil.copy2(s_file, dest_file)
         except Exception:
@@ -686,6 +686,20 @@ def init(
     # ── Step 5: Create .sync/ structure ───────────────────────
     sync_path.mkdir(parents=True, exist_ok=True)
     create_sync_structure(templates_sync_dir, sync_path, context, agents)
+
+    # Mirror bundled schemas into .sync/schemas/ (not polluting workspace root)
+    sync_schemas_dir = sync_path / "schemas"
+    sync_schemas_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        bundled_schemas = Path(__file__).resolve().parents[1] / "schemas"
+        if bundled_schemas.is_dir():
+            for s_file in bundled_schemas.glob("*.json"):
+                dest_file = sync_schemas_dir / s_file.name
+                if not dest_file.exists():
+                    shutil.copy2(s_file, dest_file)
+    except Exception:
+        pass
+
     console.print("[bold green][+][/bold green] Created .sync/ directory structure")
 
     # ── Step 6: Generate PROTOCOL_DIGEST.hash ─────────────────
@@ -739,10 +753,13 @@ def init(
             border_style="green",
         )
     )
-    # Register project in centralized ~/.stackmindcli/projects.json
+    # Register project in centralized ~/.stackmindcli/projects.json and seed initial PLAN.v1.md
     try:
-        from validators.kernel.home import register_project
+        from validators.kernel.home import register_project, save_authoritative_plan
         register_project(project_path, name=name, agents=agents)
+        plan_f = project_path / "PLAN.md"
+        if plan_f.is_file():
+            save_authoritative_plan(project_path, plan_f.read_text(encoding="utf-8"), version=1)
     except Exception:
         pass
 

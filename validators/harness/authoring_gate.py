@@ -59,12 +59,16 @@ class AuthoringGate:
         candidate = Path(__file__).resolve().parents[2] / "schemas"
         if candidate.exists() and (candidate / "contract.schema.json").exists():
             return candidate
-        # 2. Check current working directory / schemas
+        # 2. Check current working directory / .sync / schemas
+        candidate = Path.cwd() / ".sync" / "schemas"
+        if candidate.exists() and (candidate / "contract.schema.json").exists():
+            return candidate
+        # 3. Check current working directory / schemas
         candidate = Path.cwd() / "schemas"
         if candidate.exists() and (candidate / "contract.schema.json").exists():
             return candidate
         # Fallback to repo candidate
-        return candidate
+        return Path(__file__).resolve().parents[2] / "schemas"
 
     def get_schema(self, schema_name: str) -> dict[str, Any] | None:
         if schema_name in self._schema_cache:

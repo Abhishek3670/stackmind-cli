@@ -226,9 +226,13 @@ class SkillRecord:
         errors: list[str] = []
         schema_path = None
         if project_path:
-            cand = Path(project_path) / "schemas" / "skill.schema.json"
+            cand = Path(project_path) / ".sync" / "schemas" / "skill.schema.json"
             if cand.exists():
                 schema_path = cand
+            else:
+                cand = Path(project_path) / "schemas" / "skill.schema.json"
+                if cand.exists():
+                    schema_path = cand
 
         if not schema_path:
             root = Path(__file__).resolve().parent.parent.parent

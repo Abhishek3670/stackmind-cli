@@ -1068,6 +1068,17 @@ class SessionManager:
             meta = metadata or {}
             work_orders = meta.get("work_orders", [])
 
+            # Save authoritative plan directly as PLAN.v{N}.md under central ~/.stackmindcli/projects/<slug>/
+            workspace = session.get("workspace")
+            if workspace and content:
+                try:
+                    from validators.kernel.home import save_authoritative_plan
+                    auth_path, auth_ver = save_authoritative_plan(workspace, content)
+                    meta["authoritative_plan_file"] = str(auth_path)
+                    meta["version"] = auth_ver
+                except Exception:
+                    pass
+
             if plan_id in plans:
                 existing = plans[plan_id]
                 if existing.get("state") == "APPROVED":
@@ -1175,6 +1186,17 @@ class SessionManager:
             plan["state"] = "APPROVED"
             plan["updated_at"] = now
             plan["approval_reason"] = reason
+
+            # Copy approved golden plan to workspace PLAN.md
+            try:
+                from validators.kernel.home import copy_approved_plan_to_workspace, save_authoritative_plan
+                ver = plan.get("metadata", {}).get("version")
+                if not ver and plan.get("content"):
+                    _, ver = save_authoritative_plan(session["workspace"], plan["content"])
+                    plan.setdefault("metadata", {})["version"] = ver
+                copy_approved_plan_to_workspace(session["workspace"], version=ver)
+            except Exception:
+                pass
 
             created_work_orders: list[dict[str, Any]] = []
             proposed_wos = plan.get("metadata", {}).get("work_orders", [])
