@@ -427,32 +427,9 @@ def render_actions_group(
         return Text("")
 
     arrow = "▾" if actions_obj.expanded else "▸"
-    count = getattr(actions_obj, "count", len(getattr(actions_obj, "actions", [])))
-    all_acts: list[Any] = []
-    for a in getattr(actions_obj, "actions", []):
-        all_acts.append(a)
-        all_acts.extend(getattr(a, "sub_actions", []))
-    failed_count = sum(1 for a in all_acts if str(getattr(a, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"})
-    completed_count = getattr(
-        actions_obj,
-        "completed_count",
-        sum(1 for a in all_acts if str(getattr(a, "status", "")).upper() in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}),
-    )
-
-    if failed_count > 0:
-        if getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
-            suffix = f"{count} ({failed_count} failed)"
-        elif completed_count > 0:
-            suffix = f"{completed_count} completed, {failed_count} failed"
-        else:
-            suffix = f"{failed_count} failed"
-        suffix_style = "bold red"
-    elif getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
-        suffix = f"{count}"
-        suffix_style = "dim white"
-    else:
-        suffix = f"{count} completed"
-        suffix_style = "dim white"
+    failed_count = getattr(actions_obj, "failed_count", 0)
+    suffix = getattr(actions_obj, "header_suffix", f"{getattr(actions_obj, 'count', len(getattr(actions_obj, 'actions', [])))}")
+    suffix_style = "bold red" if failed_count > 0 else "dim white"
 
     header = Text()
     header.append(f"{arrow} ", style="bold red" if failed_count > 0 else "bold cyan")

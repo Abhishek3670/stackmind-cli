@@ -162,13 +162,22 @@ class ActionsGroup:
     verbosity: str = "tree"  # "tree" | "flat" | "compact"
 
     @property
+    def all_actions(self) -> list[TurnAction]:
+        """Flattened list of all top-level and nested sub-actions."""
+        res: list[TurnAction] = []
+        for a in self.actions:
+            res.append(a)
+            res.extend(a.sub_actions)
+        return res
+
+    @property
+    def failed_count(self) -> int:
+        return sum(1 for a in self.all_actions if a.status.upper() in {"FAILED", "FAILURE", "ERROR"})
+
+    @property
     def latest_preview_action(self) -> TurnAction | None:
         """Find the running action, or the most recent completed action with code/diff/output/error."""
-        all_acts: list[TurnAction] = []
-        for a in self.actions:
-            all_acts.append(a)
-            all_acts.extend(a.sub_actions)
-
+        all_acts = self.all_actions
         for a in reversed(all_acts):
             if a.status.upper() == "RUNNING":
                 return a
@@ -180,9 +189,7 @@ class ActionsGroup:
                 or (a.error and a.error.strip())
             ):
                 return a
-        if all_acts:
-            return all_acts[-1]
-        return None
+        return all_acts[-1] if all_acts else None
 
     def get_visible_actions(self, verbosity: str | None = None) -> list[tuple[TurnAction, int]]:
         """Return list of (action, indent_level) according to verbosity mode."""
@@ -216,7 +223,7 @@ class ActionsGroup:
     ) -> TurnAction:
         """Add new action or update existing invocation in-place (§21)."""
         # 1. Update if already exists in top-level or sub_actions
-        for a in self.actions:
+        for a in self.all_actions:
             if a.action_id == action_id:
                 a.status = status
                 if description and (not a.description or a.description == a.action_id):
@@ -236,26 +243,6 @@ class ActionsGroup:
                 if output is not None:
                     a.output = output
                 return a
-            for sa in a.sub_actions:
-                if sa.action_id == action_id:
-                    sa.status = status
-                    if description and (not sa.description or sa.description == sa.action_id):
-                        sa.description = description
-                    if duration_seconds is not None:
-                        sa.duration_seconds = duration_seconds
-                    if error is not None:
-                        sa.error = error
-                    if tool_name is not None:
-                        sa.tool_name = tool_name
-                    if target is not None:
-                        sa.target = target
-                    if code is not None:
-                        sa.code = code
-                    if diff is not None:
-                        sa.diff = diff
-                    if output is not None:
-                        sa.output = output
-                    return sa
 
         # 2. Check if this is a sub-action under a parent
         target_parent = None
@@ -307,15 +294,9 @@ class ActionsGroup:
         matched = None
         # 1. Match exact action_id if provided
         if action_id:
-            for a in self.actions:
+            for a in self.all_actions:
                 if a.action_id == action_id:
                     matched = a
-                    break
-                for sa in a.sub_actions:
-                    if sa.action_id == action_id:
-                        matched = sa
-                        break
-                if matched:
                     break
 
         # 2. Match by tool_name in description or action_id (checking running sub-actions first)
@@ -378,12 +359,9 @@ class ActionsGroup:
     def complete_all(self, status: str = "COMPLETED") -> None:
         """Complete all in-flight actions and mark group inactive."""
         self.active = False
-        for a in self.actions:
+        for a in self.all_actions:
             if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
                 a.status = status
-            for sa in a.sub_actions:
-                if sa.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
-                    sa.status = status
 
     def toggle(self) -> bool:
         """Toggle disclosure expansion (§22, §23)."""
@@ -408,13 +386,7 @@ class ActionsGroup:
 
     @property
     def has_running(self) -> bool:
-        for a in self.actions:
-            if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
-                return True
-            for sa in a.sub_actions:
-                if sa.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
-                    return True
-        return False
+        return any(a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"} for a in self.all_actions)
 
     @property
     def count(self) -> int:
@@ -427,27 +399,25 @@ class ActionsGroup:
         items = [item[0] for item in vis] if vis else self.actions
         return sum(1 for a in items if a.status.upper() in {"COMPLETED", "SUCCESS", "DONE", "PASSED"})
 
+    @property
+    def header_suffix(self) -> str:
+        """Summary suffix describing completed and failed action counts."""
+        failed = self.failed_count
+        count = self.count
+        if failed > 0:
+            if self.active or self.has_running:
+                return f"{count} ({failed} failed)"
+            if self.completed_count > 0:
+                return f"{self.completed_count} completed, {failed} failed"
+            return f"{failed} failed"
+        if self.active or self.has_running:
+            return f"{count}"
+        return f"{count} completed"
+
     def format_header_text(self) -> str:
         """Format the summary header line per §20 and §21."""
         arrow = "▾" if self.expanded else "▸"
-        count = self.count
-        all_acts: list[TurnAction] = []
-        for a in self.actions:
-            all_acts.append(a)
-            all_acts.extend(a.sub_actions)
-        failed_count = sum(1 for a in all_acts if a.status.upper() in {"FAILED", "FAILURE", "ERROR"})
-        if failed_count > 0:
-            if self.active or self.has_running:
-                suffix = f"{count} ({failed_count} failed)"
-            elif self.completed_count > 0:
-                suffix = f"{self.completed_count} completed, {failed_count} failed"
-            else:
-                suffix = f"{failed_count} failed"
-        elif self.active or self.has_running:
-            suffix = f"{count}"
-        else:
-            suffix = f"{count} completed"
-        return f"{arrow} Actions · {suffix}"
+        return f"{arrow} Actions · {self.header_suffix}"
 
 
 @dataclass

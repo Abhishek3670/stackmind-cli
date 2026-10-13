@@ -582,6 +582,17 @@ def extract_tool_output(payload: Mapping[str, Any] | Any) -> str | None:
     return None
 
 
+def extract_action_target(args: Mapping[str, Any] | None) -> str:
+    """Extract primary target path, command, or selector from tool arguments."""
+    if not isinstance(args, Mapping):
+        return ""
+    for k in ("path", "file", "test_path", "test_name", "selector", "command", "target", "directory", "dir_path", "name"):
+        v = args.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
 def extract_tool_diff(payload: Mapping[str, Any] | Any, args: Mapping[str, Any] | None = None) -> str | None:
     """Extract unified diff text or synthetic diff summary from edit tool call or result."""
     if isinstance(payload, Mapping):
@@ -611,7 +622,7 @@ def extract_tool_diff(payload: Mapping[str, Any] | Any, args: Mapping[str, Any] 
                 return v.strip()
         old_str = args.get("target_content") or args.get("old_str") or args.get("old_string") or args.get("find")
         new_str = args.get("replacement") or args.get("replacement_content") or args.get("new_str") or args.get("new_string") or args.get("replace")
-        target_f = args.get("path") or args.get("file") or "file"
+        target_f = extract_action_target(args) or "file"
         if old_str is not None or new_str is not None:
             lines = [f"--- a/{target_f}", f"+++ b/{target_f}"]
             if old_str:
@@ -717,19 +728,7 @@ class OperationalEventManager:
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.tool_history)}")
             tool_name = str(payload.get("tool_name", "tool"))
             args = payload.get("arguments", {}) if isinstance(payload.get("arguments"), Mapping) else {}
-            target = str(
-                args.get("path")
-                or args.get("file")
-                or args.get("test_path")
-                or args.get("test_name")
-                or args.get("selector")
-                or args.get("command")
-                or args.get("target")
-                or args.get("directory")
-                or args.get("dir_path")
-                or args.get("name")
-                or ""
-            )
+            target = extract_action_target(args)
             start_t = time.time()
             self._tool_start_times[call_id] = start_t
             activity = ToolActivity(
