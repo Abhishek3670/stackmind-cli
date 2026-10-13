@@ -47,7 +47,7 @@ def test_get_stackmind_home_creates_directories(monkeypatch, tmp_path: Path):
 
 
 def test_legacy_settings_migration(monkeypatch, tmp_path: Path):
-    """Verify settings from legacy ~/.stackmind/ are copied to ~/.stackmindcli/."""
+    """Verify settings from legacy ~/.stackmind/ are moved to ~/.stackmindcli/ and legacy is deleted."""
     custom_home = tmp_path / ".stackmindcli"
     fake_user_home = tmp_path / "user_home"
     legacy_dir = fake_user_home / ".stackmind"
@@ -62,10 +62,11 @@ def test_legacy_settings_migration(monkeypatch, tmp_path: Path):
     target_settings = home / "settings.json"
     assert target_settings.is_file()
     assert json.loads(target_settings.read_text(encoding="utf-8")) == {"execution_profile": "high"}
+    assert not legacy_dir.exists()
 
 
-def test_find_settings_file_prioritizes_stackmindcli(monkeypatch, tmp_path: Path):
-    """Verify find_settings_file prefers ~/.stackmindcli/settings.json over legacy ~/.stackmind/."""
+def test_find_settings_file_ignores_legacy_stackmind(monkeypatch, tmp_path: Path):
+    """Verify find_settings_file ignores ~/.stackmind/ and only uses ~/.stackmindcli/."""
     custom_home = tmp_path / ".stackmindcli"
     custom_home.mkdir(parents=True, exist_ok=True)
     cli_settings = custom_home / "settings.json"
@@ -220,8 +221,8 @@ def test_cli_projects_commands(monkeypatch, tmp_path: Path):
     assert "No projects registered" in res_empty.output
 
 
-def test_auto_provision_global_settings_and_mirroring(monkeypatch, tmp_path: Path):
-    """Verify settings.json and setting.json are automatically provisioned in both ~/.stackmindcli and ~/.stackmind."""
+def test_auto_provision_global_settings_in_stackmindcli(monkeypatch, tmp_path: Path):
+    """Verify settings.json and setting.json are automatically provisioned in ~/.stackmindcli and not ~/.stackmind."""
     custom_home = tmp_path / ".stackmindcli"
     fake_user_home = tmp_path / "user_home"
     monkeypatch.setattr(Path, "home", lambda: fake_user_home)
@@ -230,14 +231,13 @@ def test_auto_provision_global_settings_and_mirroring(monkeypatch, tmp_path: Pat
     # Before calling get_stackmind_home, neither directory has settings
     home = get_stackmind_home()
 
-    # Both ~/.stackmindcli and ~/.stackmind have settings.json and setting.json
+    # Only ~/.stackmindcli has settings.json and setting.json
     legacy_home = fake_user_home / ".stackmind"
     assert (home / "settings.json").is_file()
     assert (home / "setting.json").is_file()
-    assert (legacy_home / "settings.json").is_file()
-    assert (legacy_home / "setting.json").is_file()
+    assert not legacy_home.exists()
 
     # Content is valid JSON
-    data = json.loads((legacy_home / "settings.json").read_text(encoding="utf-8"))
+    data = json.loads((home / "settings.json").read_text(encoding="utf-8"))
     assert "providers" in data
     assert "roles" in data

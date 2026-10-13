@@ -362,16 +362,6 @@ class AutonomousDeliveryState:
         self.error: str | None = None
         self.plan: dict[str, Any] = {}
         self.plan_revisions: list[PlanRevision] = []
-        if roles is not None:
-            self.roles = dict(roles)
-        else:
-            self.roles = {
-                "Architecture": RoleStatus("Architecture", backend="Claude", work_order_id="WO-001", state="RUNNING"),
-                "Backend": RoleStatus("Backend", backend="Codex", work_order_id="WO-002", state="WAITING"),
-                "Frontend": RoleStatus("Frontend", backend="AGY", work_order_id="WO-003", state="WAITING"),
-                "Q/A": RoleStatus("Q/A", backend="Ollama", work_order_id="WO-004", state="WAITING"),
-                "GitOps": RoleStatus("GitOps", backend="Ollama", work_order_id="WO-005", state="WAITING"),
-            }
         if work_orders is not None:
             self.work_orders = list(work_orders)
         elif roles is not None:
@@ -384,9 +374,19 @@ class AutonomousDeliveryState:
                 WorkOrderItem("WO-004", "Q/A Verification Suite", role="Q/A", priority="P0", status="WAITING"),
                 WorkOrderItem("WO-005", "GitOps Release & Hygiene", role="GitOps", priority="P0", status="WAITING"),
             ]
+        if roles is not None:
+            self.roles = dict(roles)
+        else:
+            self.roles = {
+                "Architecture": RoleStatus("Architecture", backend="Claude", work_order_id="WO-001" if self.work_orders else None, state="RUNNING" if self.work_orders else "WAITING"),
+                "Backend": RoleStatus("Backend", backend="Codex", work_order_id="WO-002" if self.work_orders else None, state="WAITING"),
+                "Frontend": RoleStatus("Frontend", backend="AGY", work_order_id="WO-003" if self.work_orders else None, state="WAITING"),
+                "Q/A": RoleStatus("Q/A", backend="Ollama", work_order_id="WO-004" if self.work_orders else None, state="WAITING"),
+                "GitOps": RoleStatus("GitOps", backend="Ollama", work_order_id="WO-005" if self.work_orders else None, state="WAITING"),
+            }
         if operations is not None:
             self.operations = dict(operations)
-        elif roles is not None:
+        elif roles is not None or not self.work_orders:
             self.operations = {}
         else:
             self.operations = {
@@ -938,7 +938,22 @@ class AutonomousDeliveryState:
                 except Exception:
                     pass
 
+            default_titles = {
+                "Architecture & Orchestration",
+                "Backend API & Services",
+                "Frontend Client & Views",
+                "Q/A Verification Suite",
+                "GitOps Release & Hygiene",
+            }
+            is_dummy = bool(self.work_orders) and all(w.title in default_titles for w in self.work_orders)
+
             if not disk_statuses and not disk_orders:
+                if is_dummy:
+                    self.work_orders = []
+                    for r in self.roles.values():
+                        if r.work_order_id in {"WO-001", "WO-002", "WO-003", "WO-004", "WO-005"}:
+                            r.work_order_id = None
+                self.reconcile_roles_from_work_orders()
                 return
 
             # Compute effective statuses using dependencies and running operations
@@ -1180,11 +1195,15 @@ class AutonomousDeliveryState:
                         normalized = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name
                         b_end = str(item.get("backend") or "Codex")
                         m_del = item.get("model")
+                        is_running_arch = (
+                            normalized.lower() == "architecture"
+                            and (bool(self.operations) or any(w.status == "RUNNING" for w in self.work_orders))
+                        )
                         new_roles[normalized] = RoleStatus(
                             role=normalized,
                             backend=b_end,
                             model=m_del,
-                            state="RUNNING" if normalized.lower() == "architecture" else "WAITING",
+                            state="RUNNING" if is_running_arch else "WAITING",
                         )
                     if new_roles:
                         self.roles = new_roles
@@ -1241,6 +1260,20 @@ class AutonomousDeliveryState:
                             self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
             except Exception:
                 pass
+
+        default_titles = {
+            "Architecture & Orchestration",
+            "Backend API & Services",
+            "Frontend Client & Views",
+            "Q/A Verification Suite",
+            "GitOps Release & Hygiene",
+        }
+        if self.work_orders and all(w.title in default_titles for w in self.work_orders):
+            self.work_orders = []
+            for r in self.roles.values():
+                if r.work_order_id in {"WO-001", "WO-002", "WO-003", "WO-004", "WO-005"}:
+                    r.work_order_id = None
+        self.reconcile_roles_from_work_orders()
 
     def _infer_role_from_op(self, op_name: str) -> str:
         low = op_name.lower()

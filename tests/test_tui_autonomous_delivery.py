@@ -728,6 +728,48 @@ def test_tui_populate_from_runtime_syncs_disk_work_orders_and_plan(tmp_path: Pat
     assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
 
 
+def test_clean_workspace_initializes_with_no_work_orders(tmp_path: Path) -> None:
+    """When starting in a clean workspace with no work orders, work_orders is empty and panel renders 'No active orders'."""
+    import yaml
+    from cli.tui.runtime_panel import format_work_orders
+    from cli.tui.state import AutonomousDeliveryState
+    from cli.tui.views import render_work_orders_panel
+
+    # Case 1: Workspace with scaffolded empty INDEX.yaml (like stackmind init)
+    sync_wos = tmp_path / ".sync" / "work-orders"
+    sync_wos.mkdir(parents=True, exist_ok=True)
+    (sync_wos / "INDEX.yaml").write_text(
+        yaml.safe_dump({
+            "schema_version": 1,
+            "orders": [],
+            "total_active": 0,
+            "total_completed": 0,
+            "total_blocked": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    state = AutonomousDeliveryState(project_name="clean-proj", session_id="sess-clean", work_orders=[])
+    state.populate_from_runtime(workspace=tmp_path)
+
+    assert state.work_orders == []
+    for r in state.roles.values():
+        assert r.work_order_id is None
+
+    wo_panel = render_work_orders_panel(state)
+    assert "No active orders" in wo_panel
+
+    formatted = format_work_orders(state.work_orders)
+    assert any("No active orders" in str(line) for line in formatted)
+
+    # Case 2: Even if created without work_orders=[], populate_from_runtime clears dummy placeholders in clean ws
+    state2 = AutonomousDeliveryState(project_name="clean-proj-2", session_id="sess-clean-2")
+    state2.populate_from_runtime(workspace=tmp_path)
+    assert state2.work_orders == []
+    for r in state2.roles.values():
+        assert r.work_order_id is None
+
+
 def test_tui_update_from_session_clears_idle_op_root() -> None:
     """When a session has no active_operation, op-root is cleared so current_operation is None."""
     from cli.tui.state import AutonomousDeliveryState

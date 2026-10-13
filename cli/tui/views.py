@@ -123,6 +123,9 @@ def render_roles_panel(state: AutonomousDeliveryState, detailed: bool = False) -
 def render_work_orders_panel(state: AutonomousDeliveryState) -> str:
     """Renders the Work Orders panel (:wo command)."""
     lines = ["WORK ORDERS"]
+    if not state.work_orders:
+        lines.append("  No active orders")
+        return "\n".join(lines)
     for wo in state.work_orders:
         st = wo.status.upper()
         if st in {"COMPLETED", "DONE", "VERIFIED", "SUCCESS"}:

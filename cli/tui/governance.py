@@ -289,7 +289,7 @@ def render_skills_panel(
 
     path = Path(project_path).resolve() if project_path else Path(".").resolve()
     store = SkillStore(path)
-    skills = store.list_skills()
+    skills = store.list_skills(include_global=False)
 
     if skill_filter:
         filt = skill_filter.strip().lower()

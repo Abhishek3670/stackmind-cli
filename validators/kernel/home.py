@@ -7,8 +7,6 @@ Provides ~/.stackmindcli as the single authoritative root for:
 - Central daemon runtime & coordination (daemon/)
 - Central persistent sessions & transcripts (sessions/)
 - Shared scratch space, diff cache, and temporary sandboxes (tmp/)
-
-Handles seamless backward-compatibility and migration from legacy ~/.stackmind.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 STACKMIND_HOME_ENV = "STACKMIND_HOME"
-LEGACY_STACKMIND_DIR_NAME = ".stackmind"
 STACKMIND_CLI_DIR_NAME = ".stackmindcli"
 
 
@@ -29,8 +26,7 @@ def get_stackmind_home() -> Path:
     """Return the authoritative ~/.stackmindcli root directory.
 
     Respects STACKMIND_HOME environment variable if set.
-    Creates required root directories and performs one-time migration
-    from legacy ~/.stackmind if present.
+    Creates required root directories and moves any legacy ~/.stackmind contents.
     """
     override = os.environ.get(STACKMIND_HOME_ENV)
     if override:
@@ -38,12 +34,24 @@ def get_stackmind_home() -> Path:
     else:
         home_path = (Path.home() / STACKMIND_CLI_DIR_NAME).resolve()
 
+    # If legacy ~/.stackmind exists, move its contents into home_path and delete it
+    legacy = (Path.home() / ".stackmind").resolve()
+    if legacy.is_dir() and legacy != home_path:
+        try:
+            home_path.mkdir(parents=True, exist_ok=True)
+            for item in legacy.iterdir():
+                dest = home_path / item.name
+                if not dest.exists():
+                    shutil.move(str(item), str(dest))
+            shutil.rmtree(legacy, ignore_errors=True)
+        except Exception:
+            pass
+
     try:
         home_path.mkdir(parents=True, exist_ok=True)
         # Subdirectories
         for subdir in ("skills/global", "skills/cache", "daemon", "sessions", "tmp"):
             (home_path / subdir).mkdir(parents=True, exist_ok=True)
-        # Ensure global settings exist in both target home and ~/.stackmind/
         ensure_global_settings_file(home_path)
     except (PermissionError, OSError):
         pass
@@ -52,65 +60,27 @@ def get_stackmind_home() -> Path:
 
 
 def ensure_global_settings_file(target_home: Path | None = None) -> Path:
-    """Ensure settings.json exists in target home and ~/.stackmind/ with default values."""
+    """Ensure settings.json and alias setting.json exist in ~/.stackmindcli with default values."""
     cli_home = (target_home or get_stackmind_home()).resolve()
-    legacy_home = (Path.home() / LEGACY_STACKMIND_DIR_NAME).resolve()
-
     target_settings = cli_home / "settings.json"
-    legacy_settings = legacy_home / "settings.json"
 
-    # 1. Check if legacy settings already exist, copy to cli_home
-    if not target_settings.is_file() and legacy_settings.is_file():
+    if not target_settings.is_file():
         try:
-            shutil.copy2(legacy_settings, target_settings)
+            from validators.kernel.settings import get_default_settings
+            default_text = get_default_settings().to_json(indent=2)
         except Exception:
-            pass
-
-    # 2. If neither exists, generate default settings content
-    try:
-        from validators.kernel.settings import get_default_settings
-        default_text = get_default_settings().to_json(indent=2)
-    except Exception:
-        import json
-        default_text = json.dumps({"execution_profile": "medium", "providers": {}, "roles": {}}, indent=2)
-
-    content_to_write = default_text
-    if target_settings.is_file():
-        try:
-            raw_text = target_settings.read_text(encoding="utf-8").strip()
-            if raw_text and raw_text != '{\n  "providers": {},\n  "roles": {}\n}':
-                content_to_write = raw_text
-            else:
-                content_to_write = default_text
-                target_settings.write_text(default_text, encoding="utf-8")
-        except Exception:
-            content_to_write = default_text
-    elif legacy_settings.is_file():
-        try:
-            raw_text = legacy_settings.read_text(encoding="utf-8").strip()
-            if raw_text and raw_text != '{\n  "providers": {},\n  "roles": {}\n}':
-                content_to_write = raw_text
-            else:
-                content_to_write = default_text
-        except Exception:
-            content_to_write = default_text
-    else:
+            default_text = json.dumps({"execution_profile": "medium", "providers": {}, "roles": {}}, indent=2)
         try:
             cli_home.mkdir(parents=True, exist_ok=True)
             target_settings.write_text(default_text, encoding="utf-8")
         except Exception:
             pass
 
-    # 3. Mirror into ~/.stackmind/ and alias setting.json in both
-    for base_dir in (cli_home, legacy_home):
+    # Ensure alias setting.json exists in ~/.stackmindcli
+    alias = cli_home / "setting.json"
+    if not alias.is_file() and target_settings.is_file():
         try:
-            base_dir.mkdir(parents=True, exist_ok=True)
-            s_plural = base_dir / "settings.json"
-            if not s_plural.is_file() or s_plural.read_text(encoding="utf-8").strip() == '{\n  "providers": {},\n  "roles": {}\n}':
-                s_plural.write_text(content_to_write, encoding="utf-8")
-            s_singular = base_dir / "setting.json"
-            if not s_singular.is_file() or s_singular.read_text(encoding="utf-8").strip() == '{\n  "providers": {},\n  "roles": {}\n}':
-                s_singular.write_text(content_to_write, encoding="utf-8")
+            alias.write_text(target_settings.read_text(encoding="utf-8"), encoding="utf-8")
         except Exception:
             pass
 
@@ -118,7 +88,7 @@ def ensure_global_settings_file(target_home: Path | None = None) -> Path:
 
 
 def _migrate_legacy_settings_if_needed(target_home: Path) -> None:
-    """Migrate settings from legacy ~/.stackmind/ to target home if missing."""
+    """Ensure settings in target home."""
     ensure_global_settings_file(target_home)
 
 

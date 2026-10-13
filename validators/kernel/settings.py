@@ -319,9 +319,6 @@ def find_settings_file(workspace: Path | str | None = None) -> Path | None:
         ws / "setting.json",
         get_global_settings_path(),
         cli_home / "setting.json",
-        # Legacy fallback
-        Path.home() / ".stackmind" / "settings.json",
-        Path.home() / ".stackmind" / "setting.json",
     ]
     for p in candidate_paths:
         try:
@@ -409,20 +406,6 @@ def save_settings(settings: StackMindSettings, workspace: Path | str | None = No
         alias = target.parent / "setting.json"
         if alias != target:
             alias.write_text(text, encoding="utf-8")
-    except Exception:
-        pass
-
-    # If saving to global home, sync both ~/.stackmindcli and ~/.stackmind
-    try:
-        from validators.kernel.home import STACKMIND_CLI_DIR_NAME, LEGACY_STACKMIND_DIR_NAME
-        cli_home = (Path.home() / STACKMIND_CLI_DIR_NAME).resolve()
-        legacy_home = (Path.home() / LEGACY_STACKMIND_DIR_NAME).resolve()
-        if target.parent.resolve() in (cli_home, legacy_home):
-            for base in (cli_home, legacy_home):
-                if base != target.parent.resolve():
-                    base.mkdir(parents=True, exist_ok=True)
-                    (base / "settings.json").write_text(text, encoding="utf-8")
-                    (base / "setting.json").write_text(text, encoding="utf-8")
     except Exception:
         pass
 

@@ -46,7 +46,7 @@ stackmind <command> --help
 | Command | What it does |
 |---------|--------------|
 | `init <path> [-n NAME] [-a claude,codex,…] [--no-git]` | Create a new governed runtime |
-| `projects {list|add|remove|switch|current}` | Central multi-project workspace manager (`~/.stackmind/`) |
+| `projects {list|add|remove|switch|current}` | Central multi-project workspace manager (`~/.stackmindcli/`) |
 | `validate [path] [--fix]` | Schema / structure / protocol / boot / knowledge checks |
 | `doctor [path]` | Compatibility + agent + migration status |
 | `migrate [path] [--to VER] [--check] [--rollback]` | Apply YAML migrations in `migrations/` |

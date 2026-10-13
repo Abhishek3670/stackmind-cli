@@ -344,7 +344,9 @@ def tui(
                 workspace=str(workspace.resolve()),
             )
         state = AutonomousDeliveryState(
-            project_name=workspace.resolve().name, session_id=session["session_id"]
+            project_name=workspace.resolve().name,
+            session_id=session["session_id"],
+            work_orders=[],
         )
         state.client_timeout = client_timeout
         state.update_from_session(session)
