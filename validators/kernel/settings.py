@@ -154,6 +154,7 @@ class StackMindSettings:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     roles: dict[str, dict[str, str]] = field(default_factory=dict)
     execution_profile: str = "medium"
+    govern_verbosity: str = "tree"
 
     @property
     def effective_profile(self) -> Any:
@@ -163,6 +164,7 @@ class StackMindSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "execution_profile": self.execution_profile,
+            "govern_verbosity": self.govern_verbosity,
             "providers": {k: v.to_dict() for k, v in self.providers.items()},
             "roles": self.roles,
         }
@@ -180,6 +182,10 @@ class StackMindSettings:
         except ValueError:
             # Fallback gracefully to default for corrupted/invalid setting while logging
             profile_val = ExecutionProfile.MEDIUM.value
+
+        raw_verbosity = str(data.get("govern_verbosity") or "tree").lower().strip()
+        if raw_verbosity not in {"tree", "flat", "compact"}:
+            raw_verbosity = "tree"
 
         providers_data = data.get("providers") or {}
         providers: dict[str, ProviderConfig] = {}
@@ -211,7 +217,7 @@ class StackMindSettings:
                 mod = str(r_cfg.get("model", ""))
                 if mod:
                     r_cfg["model"] = sanitize_model_name(mod, prov)
-        return cls(providers=providers, roles=roles, execution_profile=profile_val)
+        return cls(providers=providers, roles=roles, execution_profile=profile_val, govern_verbosity=raw_verbosity)
 
 
 def get_default_settings() -> StackMindSettings:

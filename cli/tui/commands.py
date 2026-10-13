@@ -30,6 +30,7 @@ from cli.tui.diff import (
 from cli.tui.events import (
     extract_assistant_response,
     extract_assistant_thinking,
+    extract_reasoning_delta,
     extract_text_delta,
     is_connection_error,
     recover_transcript_from_events,
@@ -272,6 +273,7 @@ def get_help_str() -> str:
         "  :resume           Resume active session\n"
         "  :chat             Display conversation transcript\n"
         "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
+        "  :govern [mode]    Configure governance verbosity: tree | flat | compact\n"
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
@@ -301,23 +303,42 @@ def _build_in_progress_turn_content(
     hdr = render_assistant_stream_header(model=model_name, width=layout_width)
     parts = [hdr]
 
-    # In-progress actions (expanded during active execution so tools are visible live)
+    # In-progress actions (expanded during active execution so raw tool steps with new design are visible)
     turn_acts = getattr(state, "current_turn_actions", None)
     if turn_acts and not getattr(turn_acts, "is_empty", True):
         turn_acts.expanded = True
         act_str = render_actions_group_str(turn_acts, width=layout_width)
         if act_str:
             parts.append(act_str)
+    elif getattr(state, "active_tool_name", None) or (getattr(state, "last_tool_name", None) and not streamed_chunks):
+        from cli.tui.chat import render_action_preview_str
+        from cli.tui.state import TurnAction
 
-    # In-progress thinking - shows before and during answer streaming
-    # Thinking is NOT added to final message to avoid duplication
+        t_name = getattr(state, "active_tool_name", None) or getattr(state, "last_tool_name", None)
+        if t_name:
+            is_active = bool(getattr(state, "active_tool_name", None))
+            synth_act = TurnAction(
+                action_id="active",
+                description=t_name,
+                status="RUNNING" if is_active else "COMPLETED",
+                tool_name=t_name,
+                target=getattr(state, "active_tool_target", None) or (getattr(state, "last_tool_target", None) if not is_active else None),
+                code=getattr(state, "active_tool_code", None) or (getattr(state, "last_tool_code", None) if not is_active else None),
+                diff=getattr(state, "active_tool_diff", None) or (getattr(state, "last_tool_diff", None) if not is_active else None),
+                output=getattr(state, "active_tool_output", None) or (getattr(state, "last_tool_output", None) if not is_active else None),
+            )
+            prev_str = render_action_preview_str(synth_act, width=layout_width)
+            if prev_str:
+                parts.append(prev_str)
+
+    # In-progress thinking - shows live thinking stream before and during answer streaming
     thinking = getattr(state, "current_turn_thinking", None)
     if thinking and thinking.strip():
         clean_think = thinking.strip()
         wrapped_thinking = _wrap_text_to_width(clean_think, layout_width)
         parts.append(f"Thinking...\n{wrapped_thinking}")
 
-    # In-progress streamed response text or progress line
+    # In-progress streamed response text (Working... progress sits at composer text box)
     if streamed_chunks:
         curr_text = "".join(streamed_chunks)
         from cli.tui.chat import format_contract_payload
@@ -325,20 +346,6 @@ def _build_in_progress_turn_content(
         wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
         if wrapped_text:
             parts.append(wrapped_text)
-        else:
-            elapsed = time.time() - start_time
-            if max_wait > 0:
-                prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
-            else:
-                prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
-            parts.append(_wrap_text_to_width(prog_text, layout_width))
-    else:
-        elapsed = time.time() - start_time
-        if max_wait > 0:
-            prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
-        else:
-            prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
-        parts.append(_wrap_text_to_width(prog_text, layout_width))
 
     in_progress = "\n\n".join(parts)
     return f"{transcript}\n\n{in_progress}" if transcript else in_progress
@@ -375,6 +382,21 @@ def _stream_turn_execution(
 
     _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
     _diagnostics_start = time.monotonic()
+
+    def _format_token_usage_str(tokens: int) -> str:
+        if tokens < 1000:
+            return f"{tokens} tokens"
+        return f"{tokens / 1000:.1f}k tokens"
+
+    def _get_working_placeholder() -> str:
+        elapsed = time.time() - start_time
+        toks = (
+            getattr(state, "cumulative_turn_tokens", 0)
+            or AutonomousDeliveryState.estimate_tokens(
+                "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
+            )
+        )
+        return f"Working... [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
     _streaming_diagnostics = {
         "redraw_count": 0,
         "event_count": 0,
@@ -517,7 +539,8 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
                         conversation_content=tick_content,
                         live_manager=live_manager,
                     )
@@ -559,8 +582,42 @@ def _stream_turn_execution(
             if workspace:
                 state.sync_work_orders_from_disk(workspace)
 
-            # Check for incremental text delta (stream/token/chunk)
+            # Check for incremental text or reasoning delta (stream/token/chunk/thinking)
             delta = extract_text_delta(ev)
+            think_delta = extract_reasoning_delta(ev)
+            if think_delta:
+                if not streaming_active:
+                    streaming_active = True
+                    if model_name is None:
+                        if op_rec and isinstance(op_rec, dict):
+                            model_name = op_rec.get("model")
+                        elif session and isinstance(session, dict):
+                            model_name = session.get("model")
+                now_mono = time.monotonic()
+                if now_mono - last_redraw_time >= 0.1:
+                    layout = compute_layout(shutil.get_terminal_size().columns)
+                    full_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
+                        conversation_content=full_content,
+                        live_manager=live_manager,
+                    )
+                    last_redraw_time = now_mono
+
             if delta:
                 if not streaming_active:
                     streaming_active = True
@@ -594,7 +651,8 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
                         conversation_content=full_content,
                         live_manager=live_manager,
                     )
@@ -641,8 +699,11 @@ def _stream_turn_execution(
                     )
                     latest_act_desc = f"{t_name} {t_target}".strip() if t_target else t_name
 
+                is_tool_lifecycle = ev_name in {
+                    "event.toolCall", "tool.call", "event.toolResult", "tool.result"
+                } or ev_name.startswith(("tool_call.", "tool_result."))
                 now_mono = time.monotonic()
-                if is_tty and (now_mono - last_redraw_time >= 0.1):
+                if is_tty and (is_tool_lifecycle or now_mono - last_redraw_time >= 0.1):
                     layout = compute_layout(shutil.get_terminal_size().columns)
                     full_content = _build_in_progress_turn_content(
                         state,
@@ -659,7 +720,8 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
                         conversation_content=full_content,
                         live_manager=live_manager,
                     )
@@ -671,9 +733,15 @@ def _stream_turn_execution(
                 response_events = {"operation.completed", "turn.completed"}
                 if ev_name in response_events:
                     resp = extract_assistant_response(ev_payload, workspace=workspace)
-                    thinking = extract_assistant_thinking(ev_payload, workspace=workspace)
+                    thinking = (
+                        extract_assistant_thinking(ev_payload, workspace=workspace)
+                        or getattr(state, "current_turn_thinking", None)
+                        or None
+                    )
                 if resp and not assistant_rendered and not streamed_chunks:
                     turn_acts = state.current_turn_actions
+                    if turn_acts:
+                        turn_acts.expanded = True
                     state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
                     if is_tty:
                         redraw_full_screen(
@@ -817,6 +885,8 @@ def _stream_turn_execution(
         from cli.tui.chat import format_contract_payload
         full_resp = format_contract_payload(full_resp)
         turn_acts = state.current_turn_actions
+        if turn_acts:
+            turn_acts.expanded = True
         thinking = getattr(state, "current_turn_thinking", None) or None
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
@@ -828,7 +898,8 @@ def _stream_turn_execution(
                 clear=False,
                 include_composer=True,
                 composer_is_active=False,
-                composer_placeholder=placeholder,
+                composer_placeholder="Type a message...",
+                composer_content="",
                 live_manager=live_manager,
             )
         else:
@@ -915,8 +986,12 @@ def _stream_turn_execution(
                         resp = extract_assistant_response(
                             ev.get("payload", {}), workspace=workspace
                         )
-                        thinking = extract_assistant_thinking(
-                            ev.get("payload", {}), workspace=workspace
+                        thinking = (
+                            extract_assistant_thinking(
+                                ev.get("payload", {}), workspace=workspace
+                            )
+                            or getattr(state, "current_turn_thinking", None)
+                            or None
                         )
                     if resp and not assistant_rendered:
                         turn_acts = state.current_turn_actions
@@ -952,6 +1027,8 @@ def _stream_turn_execution(
                 or res.get("reasoning_content")
                 or op_rec.get("thinking")
                 or op_rec.get("thought")
+                or getattr(state, "current_turn_thinking", None)
+                or None
             )
             report_path_raw = res.get("report_path")
             if report_path_raw:
@@ -997,7 +1074,7 @@ def _stream_turn_execution(
                 )
                 turn_acts = state.current_turn_actions
                 if turn_acts:
-                    turn_acts.expanded = True
+                    turn_acts.expanded = False
                 state.add_message(
                     "assistant",
                     f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}",
@@ -1970,6 +2047,44 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
+    if normalized == ":govern" or normalized.startswith(":govern "):
+        _, _, mode = normalized.partition(" ")
+        clean_mode = mode.strip().lower()
+        if clean_mode in {"tree", "flat", "compact"}:
+            state.govern_verbosity = clean_mode
+            if hasattr(state, "current_turn_actions") and state.current_turn_actions:
+                state.current_turn_actions.verbosity = clean_mode
+            if hasattr(state, "turn_actions"):
+                for group in state.turn_actions.values():
+                    group.verbosity = clean_mode
+            ws = Path(session["workspace"]) if session and session.get("workspace") else None
+            if not ws and getattr(state, "workspace_path", None):
+                ws = Path(state.workspace_path)
+            try:
+                from validators.kernel.settings import load_settings, save_settings
+                s = load_settings(ws)
+                s.govern_verbosity = clean_mode
+                save_settings(s, ws)
+            except Exception:
+                pass
+            output_str = f"✓ Governance verbosity set to '{clean_mode}'."
+        elif clean_mode == "":
+            curr = getattr(state, "govern_verbosity", "tree")
+            output_str = (
+                f"Current governance verbosity: {curr}\n"
+                "Usage: :govern [tree|flat|compact]\n"
+                "  tree    - Show 'Run harness' with indented sub-actions (default)\n"
+                "  flat    - Direct linear stream of individual sub-actions\n"
+                "  compact - High-level harness summary only"
+            )
+        else:
+            output_str = f"Unknown governance verbosity '{clean_mode}'. Choose: tree | flat | compact"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
     if normalized.startswith(":timeout"):
         _, _, to_arg = normalized.partition(" ")
         clean_to = to_arg.strip()
@@ -2053,7 +2168,8 @@ def dispatch_delivery_command(
             clear=False,
             include_composer=True,
             composer_is_active=False,
-            composer_placeholder=placeholder,
+            composer_placeholder="Working... [0.0s] (0 tokens)",
+            composer_content="",
             live_manager=live_manager,
         )
     else:

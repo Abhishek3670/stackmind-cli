@@ -203,10 +203,15 @@ def format_contract_payload(content: str) -> str:
         blockers = d.get("blockers") or []
         if st in {"completed", "success", "done"}:
             if mods:
-                files_str = ", ".join(f"`{f}`" for f in mods)
-                if any("PLAN.md" in str(f) for f in mods):
-                    return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
-                return f"Completed turn. Modified files: {files_str}."
+                user_mods = [f for f in mods if not str(f).startswith((".sync", ".sync/"))]
+                if user_mods:
+                    files_str = ", ".join(f"`{f}`" for f in user_mods)
+                    if any("PLAN.md" in str(f) for f in user_mods):
+                        return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                    return f"Completed turn. Modified files: {files_str}."
+                elif any("PLAN.md" in str(f) for f in mods):
+                    return "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
+                return "Completed turn via tools."
             if verdict:
                 return f"### QA Verdict: {verdict}"
             return "Completed turn via tools."
@@ -260,11 +265,14 @@ def format_contract_payload(content: str) -> str:
         mods_m = re.search(r'["\']modified_files["\']\s*:\s*\[(.*?)\]', unfenced, re.DOTALL)
         if mods_m:
             files_raw = re.findall(r'["\']([^"\']+)["\']', mods_m.group(1))
-            if files_raw:
-                files_str = ", ".join(f"`{f}`" for f in files_raw)
-                if any("PLAN.md" in f for f in files_raw):
+            user_files = [f for f in files_raw if not f.startswith((".sync", ".sync/"))]
+            if user_files:
+                files_str = ", ".join(f"`{f}`" for f in user_files)
+                if any("PLAN.md" in f for f in user_files):
                     return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
                 return f"Completed turn. Modified files: {files_str}."
+            elif any("PLAN.md" in f for f in files_raw):
+                return "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
         if unfenced.endswith("}"):
             return "Completed turn."
         # While JSON is streaming before summary key arrives, don't dump raw syntax
@@ -419,17 +427,29 @@ def render_actions_group(
         return Text("")
 
     arrow = "▾" if actions_obj.expanded else "▸"
-    count = len(actions_obj.actions)
-    failed_count = sum(1 for a in actions_obj.actions if str(getattr(a, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"})
-    if getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
-        suffix = f"{count}"
-        suffix_style = "dim white"
-    elif failed_count > 0:
-        if getattr(actions_obj, "completed_count", 0) > 0:
-            suffix = f"{actions_obj.completed_count} completed, {failed_count} failed"
+    count = getattr(actions_obj, "count", len(getattr(actions_obj, "actions", [])))
+    all_acts: list[Any] = []
+    for a in getattr(actions_obj, "actions", []):
+        all_acts.append(a)
+        all_acts.extend(getattr(a, "sub_actions", []))
+    failed_count = sum(1 for a in all_acts if str(getattr(a, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"})
+    completed_count = getattr(
+        actions_obj,
+        "completed_count",
+        sum(1 for a in all_acts if str(getattr(a, "status", "")).upper() in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}),
+    )
+
+    if failed_count > 0:
+        if getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
+            suffix = f"{count} ({failed_count} failed)"
+        elif completed_count > 0:
+            suffix = f"{completed_count} completed, {failed_count} failed"
         else:
             suffix = f"{failed_count} failed"
         suffix_style = "bold red"
+    elif getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
+        suffix = f"{count}"
+        suffix_style = "dim white"
     else:
         suffix = f"{count} completed"
         suffix_style = "dim white"
@@ -444,8 +464,14 @@ def render_actions_group(
         return header
 
     lines: list[RenderableType] = [header]
-    for act in actions_obj.actions:
-        line = Text("  ")
+    vis_items = (
+        actions_obj.get_visible_actions()
+        if hasattr(actions_obj, "get_visible_actions")
+        else [(a, 0) for a in getattr(actions_obj, "actions", [])]
+    )
+    for act, indent_lvl in vis_items:
+        indent = "    " if indent_lvl > 0 else "  "
+        line = Text(indent)
         sym = act.symbol
         if sym == "✓":
             line.append(sym, style="bold green")
@@ -458,14 +484,180 @@ def render_actions_group(
         else:
             line.append(sym, style="white")
 
-        line.append(f" {act.description}", style="white")
+        desc = act.description
+        if "(" in desc and desc.endswith(")"):
+            action_part, _, target_part = desc.partition("(")
+            target_part = target_part[:-1].strip()
+            line.append(f" {action_part.strip()} ", style="white")
+            line.append(f"({target_part})", style="cyan")
+        else:
+            line.append(f" {desc}", style="white")
         if getattr(act, "error", None) and str(getattr(act, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"}:
             from cli.tui.events import clean_error_message
             clean_err = clean_error_message(act.error)
             line.append(f" ({clean_err})", style="bold red")
         lines.append(line)
 
+    prev_act = getattr(actions_obj, "latest_preview_action", None)
+    if prev_act:
+        prev_renderable = render_action_preview(prev_act)
+        if prev_renderable:
+            lines.append(Text(""))
+            lines.append(prev_renderable)
+    else:
+        preview_label = getattr(actions_obj, "preview_label", None)
+        preview_code = getattr(actions_obj, "preview_code", None)
+        if preview_label and preview_code and preview_code.strip():
+            lines.append(Text(""))
+            lines.append(Text(f"  {preview_label}", style="white"))
+            code_lines = preview_code.strip().splitlines()
+            preview_lines = code_lines[:6]
+            for cline in preview_lines:
+                lines.append(Text(f"    │ {cline}", style="dim #cbd5e1"))
+            if len(code_lines) > 6:
+                lines.append(Text(f"    │ ... (+{len(code_lines) - 6} more lines)", style="dim #64748b"))
+
     return Group(*lines)
+
+
+def render_action_preview(action: Any) -> RenderableType | None:
+    """Render live or completed action preview: diff for edits, output for bash, code for writes."""
+    if not action:
+        return None
+    t_name = str(getattr(action, "tool_name", "") or "").lower()
+    target = getattr(action, "target", "") or ""
+    status = str(getattr(action, "status", "")).upper()
+    is_running = status == "RUNNING"
+    is_failed = status in {"FAILED", "FAILURE", "ERROR"}
+
+    diff = getattr(action, "diff", None)
+    output = getattr(action, "output", None)
+    code = getattr(action, "code", None)
+    error = getattr(action, "error", None)
+
+    # 1. Edit action -> Diff
+    if diff or t_name in {"edit_file", "edit", "patch", "apply_patch"}:
+        if is_running:
+            lbl = Text("✍ Editing ", style="bold cyan").append(f"`{target}`...", style="cyan") if target else Text("✍ Editing file...", style="bold cyan")
+        elif is_failed:
+            lbl = Text("× Edit failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Edit failed", style="bold red")
+        else:
+            lbl = Text("✓ Edited ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Edited file", style="bold green")
+
+        lines: list[RenderableType] = [lbl]
+        diff_text = diff or code or ""
+        if diff_text.strip():
+            d_lines = diff_text.strip().splitlines()
+            preview = d_lines[:8]
+            for dl in preview:
+                t = Text("  │ ")
+                if dl.startswith("+") and not dl.startswith("+++"):
+                    t.append(dl, style="green")
+                elif dl.startswith("-") and not dl.startswith("---"):
+                    t.append(dl, style="red")
+                elif dl.startswith("@@"):
+                    t.append(dl, style="cyan dim")
+                elif dl.startswith("---") or dl.startswith("+++"):
+                    t.append(dl, style="dim white")
+                else:
+                    t.append(dl, style="white")
+                lines.append(t)
+            if len(d_lines) > 8:
+                lines.append(Text(f"  │ ... (+{len(d_lines) - 8} more lines)", style="dim #64748b"))
+        return Group(*lines)
+
+    # 2. Bash / Command / Test action -> Output
+    if t_name in {"exec_command", "run_command", "bash", "sh", "command", "run_tests", "pytest", "test", "harness"} or output:
+        is_test = t_name in {"run_tests", "pytest", "test"}
+        if is_running:
+            if is_test:
+                lbl = Text("⚡ Running tests: ", style="bold yellow").append(f"`{target}`...", style="yellow") if target else Text("⚡ Running tests...", style="bold yellow")
+            else:
+                lbl = Text("⚡ Running command: ", style="bold yellow").append(f"`{target}`...", style="yellow") if target else Text("⚡ Running command...", style="bold yellow")
+        elif is_failed:
+            if is_test:
+                lbl = Text("× Tests failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Tests failed", style="bold red")
+            else:
+                lbl = Text("× Command failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Command failed", style="bold red")
+        else:
+            if is_test:
+                lbl = Text("✓ Tests passed: ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Tests passed", style="bold green")
+            else:
+                lbl = Text("✓ Ran ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Ran command", style="bold green")
+
+        lines = [lbl]
+        body_text = output or error or ""
+        if body_text.strip():
+            b_lines = body_text.strip().splitlines()
+            preview = b_lines[:8]
+            for bl in preview:
+                t = Text("  │ ").append(bl, style="dim #cbd5e1" if not is_failed else "dim red")
+                lines.append(t)
+            if len(b_lines) > 8:
+                lines.append(Text(f"  │ ... (+{len(b_lines) - 8} more lines)", style="dim #64748b"))
+        return Group(*lines)
+
+    # 3. Write / Create action -> Code snippet
+    if t_name in {"write_file", "write", "create_file", "create"} or code:
+        if is_running:
+            lbl = Text("✍ Writing ", style="bold cyan").append(f"`{target}`...", style="cyan") if target else Text("✍ Writing code...", style="bold cyan")
+        elif is_failed:
+            lbl = Text("× Write failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Write failed", style="bold red")
+        else:
+            lbl = Text("✓ Wrote ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Wrote code", style="bold green")
+
+        lines = [lbl]
+        c_text = code or ""
+        if c_text.strip():
+            c_lines = c_text.strip().splitlines()
+            preview = c_lines[:8]
+            for cl in preview:
+                t = Text("  │ ").append(cl, style="dim #cbd5e1")
+                lines.append(t)
+            if len(c_lines) > 8:
+                lines.append(Text(f"  │ ... (+{len(c_lines) - 8} more lines)", style="dim #64748b"))
+        return Group(*lines)
+
+    # 4. Read action
+    if t_name in {"read_file", "read", "view_file", "cat"}:
+        if is_running:
+            return Text("🔍 Reading ", style="bold cyan").append(f"`{target}`...", style="cyan") if target else Text("🔍 Reading file...", style="bold cyan")
+        else:
+            return Text("✓ Read ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Read file", style="bold green")
+
+    # 5. Generic action
+    desc = getattr(action, "description", "") or t_name
+    if is_running:
+        return Text(f"⚡ {desc}...", style="bold yellow")
+    elif is_failed:
+        return Text(f"× {desc}", style="bold red")
+    elif getattr(action, "output", None) or getattr(action, "error", None):
+        out = action.output or action.error
+        lines = [Text(f"✓ {desc}", style="bold green")]
+        for bl in out.strip().splitlines()[:8]:
+            lines.append(Text(f"  │ {bl}", style="dim #cbd5e1"))
+        return Group(*lines)
+    return None
+
+
+def render_action_preview_str(
+    action: Any,
+    width: int = 80,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
+) -> str:
+    """Render action preview as plain or ANSI formatted string using in-memory capture."""
+    elem = render_action_preview(action)
+    if not elem:
+        return ""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
+    console.print(elem)
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def render_actions_group_str(
@@ -836,6 +1028,8 @@ __all__ = [
     "_make_capture_console",
     "extract_internal_reasoning",
     "is_stray_command_bar",
+    "render_action_preview",
+    "render_action_preview_str",
     "render_actions_group",
     "render_actions_group_str",
     "render_assistant_message",

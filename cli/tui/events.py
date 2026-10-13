@@ -122,24 +122,30 @@ def format_action_description(tool_name: str, target: str = "") -> str:
         .replace("event.", "")
         .strip()
     )
-    t = target.strip()
+    t = str(target).strip()
+    if t.startswith("(") and t.endswith(")"):
+        t = t[1:-1].strip()
     lower = cleaned_tool.lower()
-    if lower in {"read", "read_file", "read file"}:
-        return f"Read {t}".strip() if t else "Read file"
-    if lower in {"edit", "edit_file", "edit file"}:
-        return f"Edit {t}".strip() if t else "Edit file"
-    if lower in {"write", "write_file", "write file"}:
-        return f"Write {t}".strip() if t else "Write file"
-    if lower in {"create", "create_file", "create file"}:
-        return f"Create {t}".strip() if t else "Create file"
     if lower in {"test", "run_tests", "run_test", "run tests"}:
-        return f"Run tests {t}".strip() if t else "Run tests"
+        return f"Run tests ({t})" if t else "Run tests"
+    if lower in {"read", "read_file", "read file", "view_file"}:
+        return f"Read ({t})" if t else "Read file"
+    if lower in {"edit", "edit_file", "edit file"}:
+        return f"Edit ({t})" if t else "Edit file"
+    if lower in {"write", "write_file", "write file"}:
+        return f"Write ({t})" if t else "Write file"
+    if lower in {"create", "create_file", "create file"}:
+        return f"Create ({t})" if t else "Create file"
     if "harness" in lower:
-        return f"Run harness {t}".strip() if t and t != "long_running_task" else "Run harness"
+        return f"Run harness ({t})" if t and t != "long_running_task" else "Run harness"
+    if lower in {"exec_command", "run_command", "bash", "sh", "command"}:
+        return f"Run command ({t})" if t else "Run command"
+    if lower in {"list_dir", "list_directory", "ls"}:
+        return f"List directory ({t})" if t else "List directory"
     if "verify" in lower:
-        return f"Verify {t}".strip() if t else "Verify changes"
+        return f"Verify ({t})" if t else "Verify changes"
     base = cleaned_tool.replace("_", " ").title()
-    return f"{base} {t}".strip() if t else base
+    return f"{base} ({t})" if t else base
 
 
 @dataclass
@@ -269,6 +275,18 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
         "contract.loaded",
         "operation.requested",
         "operation.authorized",
+        "reasoning.delta",
+        "token.delta",
+        "stream.delta",
+        "content.delta",
+        "message.delta",
+        "text.delta",
+        "turn.delta",
+        "assistant.delta",
+        "agent.thinking",
+        "turn.thinking",
+        "cycle.telemetry",
+        "harness.telemetry",
     }:
         return None
 
@@ -449,12 +467,19 @@ def extract_assistant_response(
 
         mods = result.get("modified_files")
         if isinstance(mods, list) and mods:
-            files_str = ", ".join(f"`{f}`" for f in mods)
-            if any("PLAN.md" in str(f) for f in mods):
+            user_mods = [f for f in mods if not str(f).startswith((".sync", ".sync/"))]
+            if user_mods:
+                files_str = ", ".join(f"`{f}`" for f in user_mods)
+                if any("PLAN.md" in str(f) for f in user_mods):
+                    return clean_response(
+                        f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                    )
+                return clean_response(f"Completed turn. Modified files: {files_str}.")
+            elif any("PLAN.md" in str(f) for f in mods):
                 return clean_response(
-                    f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                    "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
                 )
-            return clean_response(f"Completed turn. Modified files: {files_str}.")
+            return clean_response("Completed turn.")
 
         blockers = result.get("blockers")
         if isinstance(blockers, list) and blockers:
@@ -528,12 +553,76 @@ def extract_reasoning_delta(event: Mapping[str, Any] | Any) -> str | None:
     payload = event.get("payload")
     if not isinstance(payload, Mapping):
         payload = {}
-    if name == "reasoning.delta":
+    if name in {"reasoning.delta", "agent.thinking", "turn.thinking"}:
         for key in ("text", "reasoning", "thinking", "delta"):
             val = payload.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
     return None
+
+
+def extract_tool_output(payload: Mapping[str, Any] | Any) -> str | None:
+    """Extract terminal stdout, output, or execution error from toolResult payload."""
+    if not isinstance(payload, Mapping):
+        return None
+    res = payload.get("result")
+    if isinstance(res, str) and res.strip():
+        return res.strip()
+    if isinstance(res, Mapping):
+        for k in ("output", "stdout", "result", "response", "message", "text", "stderr"):
+            v = res.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        if "error" in res and res["error"]:
+            return str(res["error"]).strip()
+    for k in ("output", "stdout", "stderr", "error", "response"):
+        v = payload.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def extract_tool_diff(payload: Mapping[str, Any] | Any, args: Mapping[str, Any] | None = None) -> str | None:
+    """Extract unified diff text or synthetic diff summary from edit tool call or result."""
+    if isinstance(payload, Mapping):
+        res = payload.get("result")
+        if isinstance(res, str) and ("--- " in res or "@@" in res or res.startswith("diff ")):
+            return res.strip()
+        if isinstance(res, Mapping):
+            for k in ("diff", "patch", "unified_diff"):
+                v = res.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            summary = res.get("diffSummary")
+            if isinstance(summary, Mapping):
+                f = summary.get("file", "file")
+                adds = summary.get("additions", 0)
+                dels = summary.get("deletions", 0)
+                return f"--- a/{f}\n+++ b/{f}\n@@ -1,{dels} +1,{adds} @@\n- ({dels} deletions)\n+ ({adds} additions)"
+        for k in ("diff", "patch", "unified_diff"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+    if args and isinstance(args, Mapping):
+        for k in ("diff", "patch", "unified_diff"):
+            v = args.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        old_str = args.get("target_content") or args.get("old_str") or args.get("old_string") or args.get("find")
+        new_str = args.get("replacement") or args.get("replacement_content") or args.get("new_str") or args.get("new_string") or args.get("replace")
+        target_f = args.get("path") or args.get("file") or "file"
+        if old_str is not None or new_str is not None:
+            lines = [f"--- a/{target_f}", f"+++ b/{target_f}"]
+            if old_str:
+                for l in str(old_str).splitlines()[:6]:
+                    lines.append(f"- {l}")
+            if new_str:
+                for l in str(new_str).splitlines()[:6]:
+                    lines.append(f"+ {l}")
+            return "\n".join(lines)
+    return None
+
 
 
 
@@ -627,8 +716,20 @@ class OperationalEventManager:
         if name == "event.toolCall":
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.tool_history)}")
             tool_name = str(payload.get("tool_name", "tool"))
-            args = payload.get("arguments", {})
-            target = str(args.get("path") or args.get("file") or args.get("command") or "")
+            args = payload.get("arguments", {}) if isinstance(payload.get("arguments"), Mapping) else {}
+            target = str(
+                args.get("path")
+                or args.get("file")
+                or args.get("test_path")
+                or args.get("test_name")
+                or args.get("selector")
+                or args.get("command")
+                or args.get("target")
+                or args.get("directory")
+                or args.get("dir_path")
+                or args.get("name")
+                or ""
+            )
             start_t = time.time()
             self._tool_start_times[call_id] = start_t
             activity = ToolActivity(
@@ -642,7 +743,23 @@ class OperationalEventManager:
             )
             self.active_tools[call_id] = activity
             desc = format_action_description(tool_name, target)
-            self.current_actions.add_or_update(call_id, desc, status=ToolStatus.RUNNING)
+            tool_code = None
+            tool_diff = None
+            if tool_name in {"write_file", "write", "create_file", "create"}:
+                tool_code = str(args.get("content") or args.get("code") or "")
+            elif tool_name in {"edit_file", "edit", "patch", "apply_patch"}:
+                tool_diff = extract_tool_diff(payload, args)
+                if not tool_diff:
+                    tool_code = str(args.get("content") or args.get("code") or "")
+            self.current_actions.add_or_update(
+                call_id,
+                desc,
+                status=ToolStatus.RUNNING,
+                tool_name=tool_name,
+                target=target,
+                code=tool_code,
+                diff=tool_diff,
+            )
             return render_tool_activity(activity), None
 
         if name == "event.toolResult":
@@ -666,13 +783,16 @@ class OperationalEventManager:
                     error=clean_error_message(payload.get("error")) if payload.get("error") else None,
                 )
             self.tool_history.append(activity)
-            if status in {ToolStatus.FAILED, ToolStatus.BLOCKED}:
-                self.current_actions.expanded = True
+            tool_output = extract_tool_output(payload)
+            tool_diff = extract_tool_diff(payload)
             self.current_actions.complete_action(
                 call_id,
                 status=status,
                 duration_seconds=duration,
                 error=activity.error,
+                tool_name=activity.tool_name,
+                output=tool_output,
+                diff=tool_diff,
             )
 
             # Check if this toolResult yields an assistant response
@@ -864,6 +984,8 @@ __all__ = [
     "clean_error_message",
     "extract_assistant_response",
     "extract_assistant_thinking",
+    "extract_tool_diff",
+    "extract_tool_output",
     "format_action_description",
     "format_tool_name",
     "is_connection_error",

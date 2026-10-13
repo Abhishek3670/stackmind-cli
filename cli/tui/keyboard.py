@@ -733,6 +733,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":reconnect", "Reconnect to daemon & replay missed events", False),
     (":chat", "Display conversation transcript", False),
     (":actions", "Toggle/expand/collapse turn Actions group", False),
+    (":govern", "Configure governance verbosity: tree | flat | compact", False),
     (":compact", "Compact older transcript turns", False),
     (":timeout", "Get or set client turn wait timeout", False),
     (":landing", "Display branded landing block", False),

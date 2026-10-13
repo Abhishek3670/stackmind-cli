@@ -77,7 +77,9 @@ def render_settings_overview_str(
     content.add_row(table)
 
     prof_name = getattr(settings, "effective_profile", "medium").upper()
+    gov_mode = getattr(settings, "govern_verbosity", "tree").upper()
     content.add_row(Text(f"\nExecution Profile: [{prof_name}] (Low | Medium | High)", style="bold #38bdf8"))
+    content.add_row(Text(f"Governance Verbosity: [{gov_mode}] (Tree | Flat | Compact)  (Switch via :govern)", style="dim #a5b4fc"))
     content.add_row(Text("Agent Role Bindings: Configure & rebind via :roles", style="dim #94a3b8"))
 
     nav_hint = active_nav_hint or "[↑/↓] Navigate  [←/→] Toggle  [Enter] Configure  [Esc] Close"
@@ -217,6 +219,21 @@ def render_stackmind_settings_str(
         Text(prof_desc, style="dim #94a3b8"),
     )
 
+    # 1b. Governance Verbosity
+    gov_val = getattr(settings, "govern_verbosity", "tree").upper()
+    gov_color = "#38bdf8" if gov_val == "TREE" else ("#4ade80" if gov_val == "FLAT" else "#f59e0b")
+    if gov_val == "TREE":
+        gov_desc = "Hierarchical tree: Run harness with indented sub-actions"
+    elif gov_val == "FLAT":
+        gov_desc = "Linear stream: direct individual sub-actions"
+    else:
+        gov_desc = "Compact: folded harness summary only"
+    table.add_row(
+        Text("Governance Verbosity", style="bold white"),
+        Text(f"[{gov_val}]", style=f"bold {gov_color}"),
+        Text(f"{gov_desc} (:govern)", style="dim #94a3b8"),
+    )
+
     # 2. Client Turn Timeout
     to_val = getattr(settings, "client_timeout", 0)
     to_str = f"[{to_val}s]" if to_val and to_val > 0 else "[DISABLED]"
@@ -316,6 +333,17 @@ def run_interactive_settings_panel(
                 else:
                     return f"[ERROR] Invalid profile '{prof_val}'. Available: low, medium, high"
             return f"Current execution profile: {settings.effective_profile.upper()}"
+
+        if cmd in ("govern", "govern-verbosity", "verbosity"):
+            if len(parts) >= 2:
+                g_val = parts[1].lower()
+                if g_val in ("tree", "flat", "compact"):
+                    settings.govern_verbosity = g_val
+                    save_settings(settings, workspace)
+                    return f"[SUCCESS] Governance verbosity set to {g_val.upper()} in settings.json"
+                else:
+                    return f"[ERROR] Invalid verbosity '{g_val}'. Available: tree, flat, compact"
+            return f"Current governance verbosity: {getattr(settings, 'govern_verbosity', 'tree').upper()}"
 
         if cmd == "set" and len(parts) >= 4:
             p_name = parts[1].lower()
@@ -543,6 +571,9 @@ def run_interactive_settings_panel(
             pass
 
     return "[SUCCESS] Settings updated in settings.json"
+
+
+handle_system_settings_command = run_interactive_settings_panel
 
 
 def render_anchored_settings_panel_str(
