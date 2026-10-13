@@ -67,9 +67,28 @@ class ContractNormalizer:
 
         agent_id = raw.get("agent_id") or raw.get("agent") or raw.get("agentId")
         work_order = raw.get("work_order") or raw.get("workOrder") or raw.get("wo")
-        allow = rules(scope.get("allow", scope.get("allowed")))
+        allow_rules_list = list(rules(scope.get("allow", scope.get("allowed"))))
         deny = rules(scope.get("deny", scope.get("denied")))
-        write_mode = scope.get("write", raw.get("write_mode", "read-only"))
+        raw_write = scope.get("write", raw.get("write_mode", "read-only"))
+        if isinstance(raw_write, list):
+            write_mode = "read-write" if len(raw_write) > 0 else "read-only"
+            for w in raw_write:
+                w_str = (w.get("module") or w.get("target")) if isinstance(w, Mapping) else w
+                if isinstance(w_str, str) and w_str.strip():
+                    norm_w = w_str.strip().replace("\\", "/")
+                    if norm_w not in allow_rules_list:
+                        allow_rules_list.append(norm_w)
+        elif isinstance(raw_write, str):
+            w_str = raw_write.strip().lower()
+            if w_str in ("read-write", "rw", "readwrite", "write"):
+                write_mode = "read-write"
+            elif w_str in ("read-only", "ro", "readonly", "read"):
+                write_mode = "read-only"
+            else:
+                write_mode = raw_write
+        else:
+            write_mode = "read-only"
+        allow = tuple(allow_rules_list)
         if (
             not isinstance(agent_id, str)
             or not agent_id
@@ -175,7 +194,7 @@ class ContractEvaluator:
         self, contract: AgentContract, operation_type: str, target: str
     ) -> tuple[bool, str]:
         if not target:
-            if operation_type in ("list_directory", "glob"):
+            if operation_type in ("list_directory", "glob", "run_security_scan"):
                 target = "."
             else:
                 return False, "missing target"
@@ -209,10 +228,10 @@ class ContractEvaluator:
         if is_protocol_target:
             return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
-            # For read-only directory enumeration (list_directory, glob), permit
-            # listing the workspace root or any directory that is an ancestor of
+            # For read-only directory enumeration (list_directory, glob) and security scans (run_security_scan),
+            # permit scanning/enumerating the workspace root or any directory that is an ancestor of
             # an explicitly allowed rule (so the agent can navigate to its deliverables).
-            if operation_type in ("list_directory", "glob"):
+            if operation_type in ("list_directory", "glob", "run_security_scan"):
                 import posixpath
                 norm_t = posixpath.normpath(target.replace("\\", "/").strip("/"))
                 if norm_t in ("workspace", ".", ""):
@@ -223,5 +242,9 @@ class ContractEvaluator:
                     norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
                     if norm_a_clean.startswith(norm_t_clean + "/") or norm_a.startswith(norm_t + "/"):
                         return True, "authorized"
+                # run_security_scan is a read-only static analysis tool; if target is within workspace
+                # and not explicitly denied above, authorize it.
+                if operation_type == "run_security_scan":
+                    return True, "authorized"
             return False, "target is outside allowed scope"
         return True, "authorized"

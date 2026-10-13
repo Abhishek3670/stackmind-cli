@@ -464,12 +464,13 @@ def test_tui_roles_model_cycling(tmp_path: Path):
     session = {"session_id": "s1", "workspace": str(tmp_path)}
 
     # Sequence:
-    # 1. DOWN x 6 -> select Roles row (row 6)
+    # 1. DOWN x 7 -> select Roles row (row 7, after 6 providers + 1 Execution Profile row)
     # 2. ENTER -> open Roles view
     # 3. ENTER -> cycle Architecture model from ornith-1.5-16k:latest to gemma4:31b-cloud
     # 4. ESCAPE -> back to main menu
     # 5. ESCAPE -> save and exit
     key_sequence = [
+        Key.DOWN,
         Key.DOWN,
         Key.DOWN,
         Key.DOWN,
@@ -658,6 +659,129 @@ def test_custom_provider_health_check_resilience():
         assert "2 model(s)" in msg
         assert "model-a" in disc
         assert "model-b" in disc
+
+
+def test_render_stackmind_settings_panel_view():
+    from cli.tui.settings_panel import render_anchored_settings_panel_str
+    from cli.tui.state import AutonomousDeliveryState
+    from validators.kernel.settings import load_settings
+
+    state = AutonomousDeliveryState()
+    state.settings_obj = load_settings()
+    state.settings_current_view = "settings"
+    state.settings_selected_row = 0
+
+    rendered = render_anchored_settings_panel_str(state, width=80, height=11)
+    lines = rendered.split("\n")
+    assert len(lines) == 11
+    assert "StackMind System Settings" in rendered
+    assert "Execution Profile" in rendered
+    assert "Agent Role Bindings" in rendered
+    assert "Skills Retrieval Policy" in rendered
+    assert "Client Turn Timeout" in rendered
+    assert "Decision Engine (Laya)" in rendered
+    assert "LLM Providers & Models" in rendered
+
+
+def test_render_providers_panel_view():
+    from cli.tui.settings_panel import render_anchored_settings_panel_str
+    from cli.tui.state import AutonomousDeliveryState
+    from validators.kernel.settings import load_settings
+
+    state = AutonomousDeliveryState()
+    state.settings_obj = load_settings()
+    state.settings_current_view = "providers"
+    state.settings_selected_row = 0
+
+    rendered = render_anchored_settings_panel_str(state, width=80, height=11)
+    lines = rendered.split("\n")
+    assert len(lines) == 11
+    assert "Cloud Providers & Models Configuration" in rendered
+    assert "Anthropic" in rendered
+    assert "OpenAI" in rendered
+    assert "Return to StackMind Settings" in rendered
+
+
+def test_navigation_between_settings_and_providers(tmp_path: Path):
+    from cli.tui.keyboard import Key
+    from cli.tui.settings_panel import run_arrow_navigation_settings_loop
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="s1")
+    session = {"session_id": "s1", "workspace": str(tmp_path)}
+
+    # Sequence starting in "settings":
+    # 1. DOWN x 5 -> select row 5: LLM Providers & Models
+    # 2. ENTER -> opens "providers" view
+    # 3. DOWN x 6 -> select row 6: Return to StackMind Settings
+    # 4. ENTER -> returns to "settings" view
+    # 5. ESCAPE -> save & exit
+    key_seq = [
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.ENTER,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.ENTER,
+        Key.ESCAPE,
+    ]
+
+    mock_client = MagicMock()
+    result = run_arrow_navigation_settings_loop(
+        session=session,
+        state=state,
+        client=mock_client,
+        key_stream=iter(key_seq),
+        workspace=tmp_path,
+        initial_view="settings",
+    )
+    assert "[SUCCESS]" in result
+    assert state.settings_panel_open is False
+
+
+def test_dispatch_settings_and_providers_separation(tmp_path: Path):
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="s1")
+    session = {"session_id": "s1", "workspace": str(tmp_path)}
+    client = MagicMock()
+    client.list_roles.return_value = []
+    adapter = MagicMock()
+
+    # 1. Dispatch :settings
+    _, _ = dispatch_delivery_command(
+        adapter=adapter,
+        client=client,
+        session=session,
+        text=":settings",
+        state=state,
+    )
+    settings_output = state.messages[-1].content
+    assert "StackMind System Settings" in settings_output
+    assert "Execution Profile" in settings_output
+    assert "Skills Retrieval & Token Policy" in settings_output
+
+    # 2. Dispatch :providers
+    _, _ = dispatch_delivery_command(
+        adapter=adapter,
+        client=client,
+        session=session,
+        text=":providers",
+        state=state,
+    )
+    providers_output = state.messages[-1].content
+    assert "Cloud Providers & Models Configuration" in providers_output
+    assert "Configured Providers & Endpoints:" in providers_output
+    assert "anthropic" in providers_output.lower()
+
 
 
 

@@ -11,6 +11,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 import yaml
+from pathlib import Path
 from typing import Any
 
 from .boundary import RuntimeBoundary
@@ -62,7 +63,25 @@ class ToolGateway:
         record = self._authorize(OperationType.READ_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        value = self.workspace.path_for(target).read_text(encoding="utf-8")
+        path = self.workspace.path_for(target)
+        if not path.is_file():
+            # Fallback for bundled schemas when workspace does not have a local schemas/ copy
+            norm_target = target.replace("\\", "/").strip().lstrip("/")
+            if norm_target.startswith("schemas/") or norm_target.startswith(".sync/schemas/"):
+                schema_name = norm_target.split("schemas/", 1)[1]
+                bundled_schemas_dir = Path(__file__).resolve().parents[2] / "schemas"
+                if not bundled_schemas_dir.is_dir():
+                    try:
+                        import schemas
+                        bundled_schemas_dir = Path(schemas.__file__).parent
+                    except Exception:
+                        pass
+                bundled_file = bundled_schemas_dir / schema_name
+                if bundled_file.is_file():
+                    value = bundled_file.read_text(encoding="utf-8")
+                    self.boundary.journal.complete(record.request.operation_id, "read")
+                    return value
+        value = path.read_text(encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "read")
         return value
 
@@ -129,6 +148,8 @@ class ToolGateway:
             )
             if not decision.passed:
                 raise PermissionError(f"Authoring validation failed for {target}: {'; '.join(decision.errors)}")
+            if decision.normalized_content is not None:
+                content = decision.normalized_content
 
         path = self.workspace.path_for(target)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +356,8 @@ class ToolGateway:
             )
             if not decision.passed:
                 raise PermissionError(f"Authoring validation failed for {target}: {'; '.join(decision.errors)}")
+            if decision.normalized_content is not None:
+                new_content = decision.normalized_content
 
         path.write_text(new_content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "patched")
@@ -712,19 +735,40 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        from validators.harness.security_scan import scan_directory
+        from validators.harness.security_scan import scan_directory, SecurityFinding
+        from validators.kernel.security import scan_for_credential_leaks
 
         target_path = self.workspace.path_for(target_loc)
         if target_path.is_file():
             rel = target_path.relative_to(self.workspace.root).as_posix()
             files = [rel]
-        else:
+        elif target_path.is_dir():
             files = [
                 f.relative_to(self.workspace.root).as_posix()
                 for f in target_path.rglob("*.py")
                 if not ({p.lower() for p in f.parts} & {".git", ".venv", "venv", "__pycache__", "node_modules", ".sync"})
             ]
-        findings = scan_directory(self.workspace.root, target_loc)
+        else:
+            files = []
+        findings = list(scan_directory(self.workspace.root, target_loc)) if (target_path.is_file() or target_path.is_dir()) else []
+
+        # In-turn credential leak scan over targeted files
+        for f_rel in files:
+            f_path = self.workspace.path_for(f_rel)
+            if f_path.is_file():
+                try:
+                    c = f_path.read_text(encoding="utf-8", errors="replace")
+                    leaks = scan_for_credential_leaks(c, file_path=f_rel)
+                    for leak in leaks:
+                        findings.append(SecurityFinding(
+                            code="CREDENTIAL_LEAK",
+                            severity="critical",
+                            path=f_rel,
+                            line=1,
+                            message=leak,
+                        ))
+                except Exception:
+                    pass
 
         out = {
             "success": len(findings) == 0,

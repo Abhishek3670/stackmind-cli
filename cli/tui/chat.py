@@ -112,6 +112,8 @@ def format_contract_payload(content: str) -> str:
         if "```" in rest:
             body, _, _ = rest.rpartition("```")
             unfenced = body.strip()
+        else:
+            unfenced = rest.strip()
 
     def _safe_json_parse(s: str) -> dict[str, Any] | None:
         if not s or not isinstance(s, str):
@@ -131,6 +133,14 @@ def format_contract_payload(content: str) -> str:
             import json
             healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
             obj = json.loads(healed, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # Healing pass for single-quoted dict strings
+        try:
+            import ast
+            obj = ast.literal_eval(s_clean)
             if isinstance(obj, dict):
                 return obj
         except Exception:
@@ -156,6 +166,9 @@ def format_contract_payload(content: str) -> str:
             or "review_notes" in d
             or "report_markdown" in d
             or "summary" in d
+            or "response" in d
+            or "reason" in d
+            or "message" in d
         )
 
     def _format_dict(d: dict[str, Any]) -> str:
@@ -167,16 +180,16 @@ def format_contract_payload(content: str) -> str:
                 return f"### QA Verdict: {verdict}\n\n{clean_rn}"
             return clean_rn
 
-        report_md = d.get("report_markdown")
-        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
-            stripped = report_md.strip()
+        summary = d.get("summary")
+        if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
+            stripped = summary.strip()
             if stripped.startswith("```") or (stripped.startswith("{") and stripped.endswith("}")):
                 return format_contract_payload(stripped)
             return stripped
 
-        summary = d.get("summary")
-        if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
-            stripped = summary.strip()
+        report_md = d.get("report_markdown")
+        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
+            stripped = report_md.strip()
             if stripped.startswith("```") or (stripped.startswith("{") and stripped.endswith("}")):
                 return format_contract_payload(stripped)
             return stripped
@@ -208,7 +221,7 @@ def format_contract_payload(content: str) -> str:
         if "reason" in d or "error" in d:
             reason = d.get("reason") or d.get("error")
             return str(reason)
-        return text
+        return ""
 
     parsed = _safe_json_parse(unfenced)
     if parsed and _is_contract_dict(parsed):
@@ -227,14 +240,35 @@ def format_contract_payload(content: str) -> str:
                 return leading_text
             return _format_dict(parsed)
 
-    # Fallback: if unfenced looks like JSON with report_markdown or summary but was unparseable
-    for key in ("report_markdown", "summary", "response", "review_notes"):
-        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', unfenced, re.DOTALL)
+    # Fallback: regex search for summary or key fields (handles single/double quotes, unclosed stream quotes)
+    for key in ("summary", "report_markdown", "response", "review_notes"):
+        m = re.search(rf'["\']{key}["\']\s*:\s*["\']((?:[^"\'\\]|\\.)*)["\']?', unfenced, re.DOTALL)
         if m:
             val = m.group(1)
-            val = val.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+            val = (
+                val.replace('\\n', '\n')
+                .replace('\\t', '\t')
+                .replace('\\"', '"')
+                .replace("\\'", "'")
+                .replace('\\\\', '\\')
+            )
             if val.strip() and val.strip() != "Completed task via tools":
                 return val.strip()
+
+    # Never dump raw JSON payloads or code fences
+    if unfenced.startswith("{") or unfenced.startswith("```"):
+        mods_m = re.search(r'["\']modified_files["\']\s*:\s*\[(.*?)\]', unfenced, re.DOTALL)
+        if mods_m:
+            files_raw = re.findall(r'["\']([^"\']+)["\']', mods_m.group(1))
+            if files_raw:
+                files_str = ", ".join(f"`{f}`" for f in files_raw)
+                if any("PLAN.md" in f for f in files_raw):
+                    return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                return f"Completed turn. Modified files: {files_str}."
+        if unfenced.endswith("}"):
+            return "Completed turn."
+        # While JSON is streaming before summary key arrives, don't dump raw syntax
+        return ""
 
     return text
 
@@ -527,6 +561,8 @@ def render_assistant_message(
         elements.append(think_text)
 
     cleaned = strip_internal_reasoning(working_content)
+    if cleaned:
+        cleaned = format_contract_payload(cleaned)
 
     # Dynamic Region 3: Final assistant response (§18, §32) with operational telemetry dimming
     if cleaned:

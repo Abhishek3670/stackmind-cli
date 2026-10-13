@@ -15,6 +15,7 @@ class PlanValidationError(ValueError):
 
 # Trailing "(Agent: <id>)" annotation on a milestone title — metadata, not title text.
 _MILESTONE_AGENT_ANNOTATION_RE = re.compile(r"\(\s*(?:Agent|agent)\s*:\s*([^)]+)\)\s*$")
+_MILESTONE_SKILLS_ANNOTATION_RE = re.compile(r"\(\s*(?:Skills?|skills?)\s*:\s*([^)]+)\)")
 
 
 PLAN_GENERATION_INSTRUCTIONS = (
@@ -24,22 +25,23 @@ PLAN_GENERATION_INSTRUCTIONS = (
     "<overview of system components, boundaries, and dependencies>\n"
     "Stack & Dependencies: Explicitly specify runtime stack and all third-party dependencies.\n\n"
     "## Milestones & Roadmap\n"
-    "- [ ] Milestone 1: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>)\n"
+    "- [ ] Milestone 1: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>) (Skills: <skill-name>)\n"
     "  - [ ] Task 1.1: <actionable task description>\n"
     "  - [ ] Task 1.2: <actionable task description>\n"
-    "- [ ] Milestone 2: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>)\n"
+    "- [ ] Milestone 2: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>) (Skills: <skill-name>)\n"
     "  - [ ] Task 2.1: <actionable task description>\n\n"
     "Structural requirements:\n"
     "1. Top-level '# ' heading must contain 'Plan' (e.g. '# Project Plan: <name>').\n"
     "2. Must include a '## Current Architecture' (or '## Architecture') section.\n"
     "3. Must include a '## Milestones & Roadmap' (or '## Roadmap') section.\n"
     "4. Milestones and tasks must use markdown checklist syntax ('- [ ]' or '- [x]').\n"
-    "5. Agent Assignment Decision: As Senior Architect, you decide the best specialist agent for each milestone:\n"
+    "5. Agent & Skill Assignment Decision: As Senior Architect, you decide the best specialist agent and applicable procedural skills for each milestone:\n"
     "   - `(Agent: codex)` (Role: backend): Backend implementation, algorithms, modules, and unit tests.\n"
     "   - `(Agent: gemini)` (Role: frontend): Web views, UI components, HTML/CSS/templates, frontend client state.\n"
     "   - `(Agent: gemma)` (Role: qa): Test suite execution, verification, coverage analysis, and quality audits.\n"
     "   - `(Agent: local-llm)` (Role: gitops): Release commits, version bumping, changelog updates, and git hygiene.\n"
-    "   Always append the chosen agent in parentheses to the milestone title, e.g. `- [ ] Milestone 1: Implementation of Rate Limiter (Agent: codex)`.\n"
+    "   - `(Skills: <skill>)`: Assign active procedural skills from the library (e.g. `(Skills: ponytail)` for lazy/minimal/clean code or `(Skills: database_migration)` for schema changes).\n"
+    "   Always append the chosen agent and skills in parentheses to the milestone title, e.g. `- [ ] Milestone 1: Implementation of Rate Limiter (Agent: codex) (Skills: ponytail)`.\n"
     "6. Architecture must explicitly decide third-party dependencies and sequence an explicit scaffolding Work Order before dependent feature Work Orders.\n"
 )
 
@@ -175,6 +177,7 @@ class PlanMilestone:
     status: str  # "COMPLETED" or "PENDING"
     tasks: list[str] = field(default_factory=list)
     agent: str | None = None  # semantic agent metadata parsed from "(Agent: <id>)"
+    skills: list[str] = field(default_factory=list)  # semantic skills chosen by architect "(Skills: <id>)"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,6 +186,7 @@ class PlanMilestone:
             "status": self.status,
             "tasks": list(self.tasks),
             "agent": self.agent,
+            "skills": list(self.skills),
         }
 
 
@@ -302,14 +306,23 @@ def parse_plan(content: str) -> PlanStructure:
                         m_id = f"M{len(milestones) + 1}"
                         m_title = m_id_or_title
 
-                    # Separate agent metadata from the semantic title: the plan
-                    # format appends "(Agent: <id>)" to milestone titles, but that
-                    # annotation is metadata, not title text.
+                    # Separate skills and agent metadata from the semantic title:
+                    # "(Skills: <id>)" and "(Agent: <id>)" are metadata annotations,
+                    # not part of the semantic milestone title.
+                    m_skills: list[str] = []
+                    skills_match = _MILESTONE_SKILLS_ANNOTATION_RE.search(m_title)
+                    if skills_match:
+                        raw_skills = skills_match.group(1).split(",")
+                        m_skills = [s.strip().lower() for s in raw_skills if s.strip()]
+                        m_title = (m_title[: skills_match.start()] + m_title[skills_match.end() :]).strip()
+                        m_title = m_title.rstrip("-–—,").strip()
+
                     m_agent: str | None = None
                     agent_match = _MILESTONE_AGENT_ANNOTATION_RE.search(m_title)
                     if agent_match:
                         m_agent = agent_match.group(1).strip().lower()
-                        m_title = m_title[: agent_match.start()].rstrip().rstrip("-–—,").rstrip()
+                        m_title = (m_title[: agent_match.start()] + m_title[agent_match.end() :]).strip()
+                        m_title = m_title.rstrip("-–—,").strip()
 
                     current_milestone = PlanMilestone(
                         id=m_id,
@@ -317,6 +330,7 @@ def parse_plan(content: str) -> PlanStructure:
                         status="COMPLETED" if checked else "PENDING",
                         tasks=[],
                         agent=m_agent,
+                        skills=m_skills,
                     )
                     milestones.append(current_milestone)
             elif current_milestone and re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str):

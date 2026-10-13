@@ -18,6 +18,7 @@ from urllib.request import ProxyHandler, build_opener
 import pytest
 from click.testing import CliRunner
 
+from cli.init import init
 from cli.main import cli
 from cli.tui.app import (
     ActivityEntry,
@@ -617,6 +618,7 @@ def test_tui_local_daemon_autonomous_delivery_lifecycle(tmp_path: Path):
 
 def test_tui_cli_repl_autonomous_delivery_commands(tmp_path: Path):
     """Verify CliRunner execution of new P7-4 colon commands."""
+    init(tmp_path, name="TestProject", no_git=True)
     with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
         user_inputs = "\n".join([
             ":status",
@@ -1077,6 +1079,67 @@ def test_keyboard_raw_prompt_input_invokes_on_idle_when_no_input(monkeypatch):
         keyboard.raw_prompt_input(on_idle=fake_idle)
 
     assert len(idle_calls) >= 2
+
+
+def test_all_agents_and_roles_transition_to_completed_on_project_delivery():
+    """Verify that after project delivery, Backend and Architecture transition to completed instead of implementing/orchestrating."""
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus, WorkOrderItem, ProjectPhase
+    from cli.tui.views import render_roles_panel, render_operation_tree
+
+    state = AutonomousDeliveryState(
+        roles={
+            "Architecture": RoleStatus("Architecture", backend="Claude", state="RUNNING"),
+            "Backend": RoleStatus("Backend", backend="Ollama", model="gemma4:31b-cloud", state="RUNNING"),
+            "Frontend": RoleStatus("Frontend", backend="AGY", state="COMPLETED"),
+            "Q/A": RoleStatus("Q/A", backend="Ollama", state="COMPLETED"),
+            "GitOps": RoleStatus("GitOps", backend="Ollama", state="COMPLETED"),
+        },
+        work_orders=[
+            WorkOrderItem("WO-001", "Backend Task", role="Backend", status="COMPLETED"),
+            WorkOrderItem("WO-002", "Frontend Task", role="Frontend", status="COMPLETED"),
+        ]
+    )
+
+    # 1. Test per-role reconciliation: Backend has all completed work orders
+    state.reconcile_roles_from_work_orders()
+    assert state.roles["Backend"].state == "COMPLETED"
+    assert state.roles["Backend"].display_state == "completed"
+
+    # Reset Backend to RUNNING to verify project completion event transition
+    state.roles["Backend"].state = "RUNNING"
+    assert state.roles["Backend"].display_state == "implementing"
+
+    # 2. Process run.complete event
+    state.process_event({
+        "name": "run.complete",
+        "payload": {"status": "SUCCESS"},
+    })
+
+    assert state.is_complete is True
+    assert state.phase == ProjectPhase.PROJECT_COMPLETE
+    assert state.roles["Backend"].state == "COMPLETED"
+    assert state.roles["Backend"].display_state == "completed"
+    assert state.roles["Architecture"].state == "COMPLETED"
+    assert state.roles["Architecture"].display_state == "completed"
+
+    # 3. Test agent hierarchy tree status
+    hierarchy = state.get_agent_hierarchy()
+    for entry in hierarchy:
+        assert entry["status"] == "completed", f"Entry {entry['name']} had status {entry['status']}"
+
+    # 4. Test render_roles_panel
+    rendered = render_roles_panel(state)
+    assert "✓ Architecture" in rendered
+    assert "✓ Backend" in rendered
+    assert "implementing" not in rendered
+    assert "orchestrating" not in rendered
+    assert "[ollama/gemma4:31b-cloud]" not in rendered
+
+    # 5. Test render_operation_tree
+    tree_rendered = render_operation_tree(state)
+    assert "✓ Architecture" in tree_rendered
+    assert "✓ Backend" in tree_rendered
+
 
 
 

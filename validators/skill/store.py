@@ -28,14 +28,23 @@ from validators.skill.models import (
 class SkillStore:
     """Manages versioned skill storage, lifecycle promotion, and rollback."""
 
-    def __init__(self, project_path: Path | str) -> None:
-        self.project_path = Path(project_path).resolve()
+    def __init__(self, project_path: Path | str | None = None) -> None:
+        self.project_path = Path(project_path if project_path is not None else Path.cwd()).resolve()
         self.skills_dir = self.project_path / ".sync" / "skills"
         self.manifests_dir = self.skills_dir / "manifests"
         self.active_dir = self.skills_dir / "active"
 
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
         self.active_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            from validators.kernel.home import get_global_skills_dir
+            self.global_skills_dir = get_global_skills_dir()
+            self.global_active_dir = self.global_skills_dir / "global"
+            self.global_active_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self.global_skills_dir = None
+            self.global_active_dir = None
 
     def _skill_manifest_dir(self, name: str) -> Path:
         slug = name.strip().lower()
@@ -99,6 +108,16 @@ class SkillStore:
         if latest_ver > 0:
             return self.get_skill(slug, latest_ver)
 
+        # Fallback to centralized global skills (~/.stackmindcli/skills/global)
+        if self.global_active_dir and self.global_active_dir.is_dir():
+            g_path = self.global_active_dir / f"{slug}.json"
+            if g_path.is_file():
+                try:
+                    with open(g_path, "r", encoding="utf-8") as f:
+                        return SkillRecord.from_dict(json.load(f))
+                except Exception:
+                    pass
+
         return None
 
     def get_latest_version_number(self, name: str) -> int:
@@ -119,8 +138,9 @@ class SkillStore:
         status: SkillStatus | None = None,
         active_only: bool = False,
         include_all_versions: bool = False,
+        include_global: bool = True,
     ) -> list[SkillRecord]:
-        """List skills in the repository."""
+        """List skills in the repository and global library."""
         records: list[SkillRecord] = []
 
         if active_only:
@@ -130,27 +150,53 @@ class SkillStore:
                         records.append(SkillRecord.from_dict(json.load(f)))
                 except Exception:
                     continue
-            return sorted(records, key=lambda s: s.name)
+        else:
+            # Iterate over all skill directories
+            for skill_dir in self.manifests_dir.iterdir():
+                if not skill_dir.is_dir():
+                    continue
+                if include_all_versions:
+                    for p in skill_dir.glob("v*.json"):
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                r = SkillRecord.from_dict(json.load(f))
+                                if status is None or r.status == status:
+                                    records.append(r)
+                        except Exception:
+                            continue
+                else:
+                    latest = self.get_skill(skill_dir.name)
+                    if latest and (status is None or latest.status == status):
+                        records.append(latest)
 
-        # Iterate over all skill directories
-        for skill_dir in self.manifests_dir.iterdir():
-            if not skill_dir.is_dir():
-                continue
-            if include_all_versions:
-                for p in skill_dir.glob("v*.json"):
-                    try:
-                        with open(p, "r", encoding="utf-8") as f:
-                            r = SkillRecord.from_dict(json.load(f))
-                            if status is None or r.status == status:
-                                records.append(r)
-                    except Exception:
-                        continue
-            else:
-                latest = self.get_skill(skill_dir.name)
-                if latest and (status is None or latest.status == status):
-                    records.append(latest)
+        # Merge in global skills from ~/.stackmindcli/skills/global
+        if include_global and self.global_active_dir and self.global_active_dir.is_dir():
+            local_slugs = {s.name.strip().lower() for s in records}
+            for p in self.global_active_dir.glob("*.json"):
+                slug = p.stem.strip().lower()
+                if slug in local_slugs:
+                    continue
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        g_rec = SkillRecord.from_dict(json.load(f))
+                        if status is None or g_rec.status == status:
+                            records.append(g_rec)
+                except Exception:
+                    continue
 
         return sorted(records, key=lambda s: s.name)
+
+    def save_global_skill(self, skill: SkillRecord) -> Path:
+        """Persist a procedural skill to the centralized ~/.stackmindcli/skills/global library."""
+        if not self.global_active_dir:
+            from validators.kernel.home import get_global_skills_dir
+            self.global_skills_dir = get_global_skills_dir()
+            self.global_active_dir = self.global_skills_dir / "global"
+            self.global_active_dir.mkdir(parents=True, exist_ok=True)
+        slug = skill.name.strip().lower()
+        target_path = self.global_active_dir / f"{slug}.json"
+        self._write_atomic(target_path, skill.to_dict())
+        return target_path
 
     def promote_version(
         self,

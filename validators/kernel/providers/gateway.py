@@ -1710,11 +1710,17 @@ class ProviderGateway:
                         or ("." if name in ("list_directory", "glob") else "")
                     )
                     target_display = f"'{target_str}'" if target_str else f"tool '{name}'"
-                    res = (
-                        f"Error: PermissionError: Operation on {target_display} was denied by runtime policy/contract: {ex}. "
-                        f"CRITICAL: Do NOT retry accessing or writing {target_display} as it is outside your assigned scope. "
-                        f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
-                    )
+                    if "Authoring validation failed" in str(ex):
+                        res = (
+                            f"Error: Authoring validation failed for {target_display}: {ex}. "
+                            f"Please correct the YAML syntax or schema structure and retry writing."
+                        )
+                    else:
+                        res = (
+                            f"Error: PermissionError: Operation on {target_display} was denied by runtime policy/contract: {ex}. "
+                            f"CRITICAL: Do NOT retry accessing or writing {target_display} as it is outside your assigned scope. "
+                            f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
+                        )
             else:
                 res = f"Error executing {name}: {type(ex).__name__}: {ex}"
 
@@ -1810,8 +1816,8 @@ class ProviderGateway:
                     model=getattr(self.adapter, "model_name", ""),
                     raw_payload={},
                 )
-            except (ProviderError, TimeoutError):
-                # Streaming failed, fall back to complete
+            except (ProviderError, TimeoutError, NotImplementedError):
+                # Streaming failed or not implemented, fall back to complete
                 response = self.adapter.complete(
                     messages,
                     tools=active_tools,

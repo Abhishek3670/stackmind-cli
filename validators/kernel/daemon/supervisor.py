@@ -164,6 +164,8 @@ class RunState:
     # QA defect routing: QA work order → developer work order IDs whose
     # rework must re-complete before the QA work order may be re-dispatched.
     qa_rework_targets: dict[str, list[str]] = field(default_factory=dict)
+    execution_profile: str = "medium"
+    gitops_feedback: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,6 +219,8 @@ class RunState:
             "contract_revisions": dict(self.contract_revisions),
             "integration_rework_rounds": self.integration_rework_rounds,
             "qa_rework_targets": dict(self.qa_rework_targets),
+            "execution_profile": self.execution_profile,
+            "gitops_feedback": self.gitops_feedback,
         }
 
     @classmethod
@@ -272,6 +276,8 @@ class RunState:
             contract_revisions=dict(data.get("contract_revisions", {}) or {}),
             integration_rework_rounds=int(data.get("integration_rework_rounds", 0)),
             qa_rework_targets=dict(data.get("qa_rework_targets", {}) or {}),
+            execution_profile=str(data.get("execution_profile", "medium")),
+            gitops_feedback=data.get("gitops_feedback"),
         )
 
 
@@ -370,6 +376,11 @@ class LifecycleSupervisor:
     ) -> RunState:
         """Create a new lifecycle run and transition to PLANNING."""
         now = _now()
+        from validators.kernel.settings import load_settings
+        try:
+            profile_val = load_settings(Path(workspace)).execution_profile
+        except Exception:
+            profile_val = "medium"
         state = RunState(
             run_id=run_id,
             product_goal=product_goal,
@@ -377,6 +388,7 @@ class LifecycleSupervisor:
             session_id=session_id,
             phase=Phase.INIT,
             bootstrap_mode=bootstrap_mode,
+            execution_profile=profile_val,
             created_at=now,
             updated_at=now,
         )
@@ -2636,15 +2648,19 @@ class LifecycleSupervisor:
                     self._transition(state, Phase.BLOCKED)
                     return AdvanceResult.BLOCKED
 
-                if "scope_verified" in err_msg and any(f in err_msg for f in ("VERSION.md", "CHANGELOG.md")):
-                    retries = state.retry_counts.get(wo_id, 0)
-                    if retries < state.max_retries:
-                        state.retry_counts[wo_id] = retries + 1
-                        state.gitops_operation_id = None
-                        state.error = None
-                        return self._advance_gitops(state)
+                # Bounded retry for GitOps blockers (verification gate failures, scope, budget, etc.)
+                retries = state.retry_counts.get(wo_id, 0)
+                if retries < state.max_retries:
+                    state.retry_counts[wo_id] = retries + 1
+                    op_id = op.get("operation_id")
+                    if op_id and op_id not in state.ignored_operation_ids:
+                        state.ignored_operation_ids.append(str(op_id))
+                    state.gitops_operation_id = None
+                    state.error = None
+                    state.gitops_feedback = err_msg
+                    return self._advance_gitops(state)
 
-                state.error = f"GitOps turn blocked: {err_msg}"
+                state.error = f"GitOps turn blocked: {err_msg} — retries exhausted ({retries}/{state.max_retries})"
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
 
@@ -2653,7 +2669,12 @@ class LifecycleSupervisor:
                 retries = state.retry_counts.get(wo_id, 0)
                 if retries < state.max_retries:
                     state.retry_counts[wo_id] = retries + 1
+                    op_id = op.get("operation_id")
+                    if op_id and op_id not in state.ignored_operation_ids:
+                        state.ignored_operation_ids.append(str(op_id))
                     state.gitops_operation_id = None
+                    state.error = None
+                    state.gitops_feedback = str(op_result.get("error", op.get("error", "GitOps turn failed")))
                     return self._advance_gitops(state)
                 state.error = f"GitOps turn failed: {op_result.get('error', op.get('error', 'unknown'))}"
                 self._transition(state, Phase.FAILED)
@@ -2724,8 +2745,21 @@ class LifecycleSupervisor:
                 "As GitOps Release Lead, finalize the release documentation:\n"
                 "1. Write VERSION.md with version '0.1.0'.\n"
                 "2. Write CHANGELOG.md summarizing the completed deliverables and the release.\n"
-                "3. Return the final HarnessDecision JSON with status 'completed'. Do not run git commands; the supervisor creates the release commit automatically."
+                "3. Ensure deployment manifests (e.g. docker-compose.yml, Dockerfile) contain NO hardcoded passwords, secrets, or keys — use environment variables (e.g. '${POSTGRES_PASSWORD:-postgres}') or placeholder values (e.g. 'dev_password', 'change-me').\n"
+                "4. Return the final HarnessDecision JSON with status 'completed'. Do not run git commands; the supervisor creates the release commit automatically."
             )
+            feedback = getattr(state, "gitops_feedback", None)
+            if feedback:
+                attempt = state.retry_counts.get(state.gitops_wo_id or "WO-GITOPS", 1)
+                gitops_prompt += (
+                    f"\n\nCRITICAL FIX REQUIRED (Attempt {attempt + 1}): The previous GitOps turn was BLOCKED:\n"
+                    f"{feedback}\n\n"
+                    "Please resolve all reported issues immediately:\n"
+                    "- If hardcoded credentials or passwords were detected (e.g. in docker-compose.yml), replace them with environment variables (e.g. '${POSTGRES_PASSWORD:-postgres}') or placeholder defaults ('dev_password', 'change-me').\n"
+                    "- Ensure required release deliverables (VERSION.md, CHANGELOG.md) exist and conform to scope.\n"
+                    "- Conclude your turn declaring status 'completed'."
+                )
+                state.gitops_feedback = None
             params: dict[str, Any] = {
                 "role": "gitops",
                 "agent_id": "local-llm",
@@ -2764,7 +2798,7 @@ class LifecycleSupervisor:
                 f"1. Author the declared test suite '{deliv_path}' with write_file — thorough "
                 f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.\n"
                 f"2. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
-                f"3. Run the run_security_scan tool over the deliverables (src/) and triage the output; "
+                f"3. Run the run_security_scan tool over the deliverables and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
                 f"4. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
                 f"5. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
@@ -3176,7 +3210,9 @@ class LifecycleSupervisor:
                 f"conforming to schemas/contract.schema.json. The budget must be explicitly sized "
                 f"from the task's real file footprint (ensure max_files_touched is at least 5 or sized to accommodate all files touched plus test/db fixtures). "
                 f"Preserve existing allowed paths (including the work order deliverable) and append the new path requested by the recovery decision.{existing_rules_str}"
-                f"Contract required properties: schema_version, agent_id, work_order, identity (role, reports_to), scope (allow, deny, write), budget (max_files_touched, max_tokens). Optional: contract_revision, guidelines. "
+                f"Contract schema requirements: schema_version: 1 (integer), agent_id, work_order, identity: {{role: ..., reports_to: ...}}, "
+                f"scope: allow must be a list of rule mappings (e.g. - module: 'tests/**'), deny must be a list of rule mappings (e.g. - module: 'gacche.db'), "
+                f"write must be the string 'read-write', budget: {{max_files_touched: 10, max_tokens: 50000}}. Optional: contract_revision, guidelines. "
                 f"A transitional repair contract is already in place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )

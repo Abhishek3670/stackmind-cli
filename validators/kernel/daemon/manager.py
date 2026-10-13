@@ -776,8 +776,9 @@ class SessionManager:
                 t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
                 provider_adapter = GeminiAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
 
-            return AgentRunner(Path(workspace), agent, backend=backend, provider_adapter=provider_adapter)
-        return AgentRunner(Path(workspace), agent)
+            exec_prof = getattr(app_settings, 'execution_profile', 'medium') if app_settings else 'medium'
+            return AgentRunner(Path(workspace), agent, backend=backend, provider_adapter=provider_adapter, execution_profile=exec_prof)
+        return AgentRunner(Path(workspace), agent, execution_profile='medium')
 
     def get_settings(self, workspace: str | None = None) -> dict[str, Any]:
         """Fetch current settings from workspace settings.json."""
@@ -2469,11 +2470,16 @@ class SessionManager:
             res_status = getattr(result, "status", None) or res_payload.get("status") or "completed"
             blocker_list = res_meta.get("blockers") or res_payload.get("blockers") or ([res_reason] if res_reason else [])
             computed_err = res_reason or ("; ".join(str(b) for b in blocker_list) if blocker_list else None) or res_meta.get("summary") or res_payload.get("summary") or res_status
-            full_text = (
+            summary_text = (
+                res_meta.get("summary")
+                or res_payload.get("summary")
+                or res_meta.get("report_markdown")
+                or res_payload.get("report_markdown")
+            )
+            report_text = (
                 res_meta.get("report_markdown")
                 or res_payload.get("report_markdown")
-                or res_meta.get("summary")
-                or res_payload.get("summary")
+                or summary_text
             )
             result_data = {
                 "status": res_status,
@@ -2482,8 +2488,8 @@ class SessionManager:
                 "reason": res_reason,
                 "error": computed_err,
                 "report_path": str(result.report_path) if getattr(result, "report_path", None) else None,
-                "summary": full_text or res_meta.get("summary") or res_payload.get("summary"),
-                "report_markdown": full_text,
+                "summary": summary_text,
+                "report_markdown": report_text,
                 "blockers": blocker_list,
                 "backend_id": b_id if isinstance(b_id, str) else None,
                 "model": b_mod if isinstance(b_mod, str) else None,
@@ -2506,6 +2512,19 @@ class SessionManager:
                 result_data["scope_evidence"] = res_meta.get("scope_evidence")
             if res_meta.get("blocker_details"):
                 result_data["blocker_details"] = res_meta.get("blocker_details")
+            if "execution_profile" in res_meta:
+                result_data["execution_profile"] = res_meta.get("execution_profile")
+            if "telemetry" in res_meta:
+                result_data["telemetry"] = res_meta.get("telemetry")
+                self.events.publish(
+                    "cycle.telemetry",
+                    session_id,
+                    operation_id=operation_id,
+                    role=op_role,
+                    agent_id=agent,
+                    telemetry=res_meta.get("telemetry"),
+                    execution_profile=res_meta.get("execution_profile"),
+                )
             if res_status == "cancelled" or cancel_event.is_set():
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "cancelled", operation_id=operation_id,

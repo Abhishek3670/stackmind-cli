@@ -15,6 +15,7 @@ import yaml
 
 from validators.harness.authoring_gate import AuthoringGate
 from validators.harness.plan import parse_plan, PlanStructure
+from validators.skill.selector import select_skills_for_task
 
 
 from validators.clock import now as _now
@@ -51,7 +52,7 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
     candidate_paths: list[str] = []
     for m in matches:
         clean = m.strip().strip("`\"'.,()")
-        if clean.endswith((".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml")):
+        if clean.endswith((".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite")):
             if not clean.startswith(".sync") and not clean.startswith(".git") and clean != "PLAN.md":
                 candidate_paths.append(clean)
 
@@ -221,6 +222,7 @@ def build_child_work_order(
     deliverable: dict[str, str],
     implementation_estimate: dict[str, Any] | None = None,
     milestone_id: str | None = None,
+    skills: list[str] | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Work Order record."""
     now = _now()
@@ -248,6 +250,8 @@ def build_child_work_order(
         record["milestone_id"] = str(milestone_id).strip()
     if implementation_estimate:
         record["implementation_estimate"] = dict(implementation_estimate)
+    if skills:
+        record["skills"] = list(skills)
     return record
 
 
@@ -308,6 +312,7 @@ def build_child_contract(
     deliverable_path: str | None = None,
     candidate_paths: list[str] | None = None,
     max_files_touched: int | None = None,
+    skills: list[str] | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Contract record bound strictly to the assigned scope.
 
@@ -370,6 +375,8 @@ def build_child_contract(
             {"module": "Makefile"},
             {"module": "*.py"},
             {"module": "*.sql"},
+            {"module": "*.db"},
+            {"module": "*.sqlite"},
             {"module": "*.json"},
             {"module": "*.yaml"},
             {"module": "*.yml"},
@@ -402,6 +409,8 @@ def build_child_contract(
             {"module": "src/**"},
             {"module": "app/**"},
             {"module": "*.py"},
+            {"module": "*.db"},
+            {"module": "*.sqlite"},
             {"module": "pytest.ini"},
         ])
     elif role_norm in ("gitops", "local-llm"):
@@ -467,7 +476,7 @@ def build_child_contract(
             continue
         deny_rules.append({"module": f".sync/inbox/{other_agent}/**"})
 
-    return {
+    ret: dict[str, Any] = {
         "schema_version": 1,
         "agent_id": agent_id,
         "work_order": wo_id,
@@ -485,6 +494,9 @@ def build_child_contract(
             "max_tokens": 0,
         },
     }
+    if skills:
+        ret["skills"] = list(skills)
+    return ret
 
 
 def get_next_work_order_int(workspace: Path | str) -> int:
@@ -580,6 +592,7 @@ def synthesize_child_work_orders(
                         dependencies=deps,
                         priority="P0" if offset == 0 else "P1",
                         deliverable=deliv,
+                        skills=m.skills if m.skills else None,
                     )
                     proposed_wos.append(wo)
             except Exception:
@@ -601,6 +614,7 @@ def synthesize_child_work_orders(
                     dependencies=deps,
                     priority="P0" if offset == 0 else "P1",
                     deliverable=deliv,
+                    skills=m.skills if m.skills else None,
                 )
                 proposed_wos.append(wo)
         except Exception:
@@ -626,6 +640,7 @@ def synthesize_child_work_orders(
                         dependencies=deps,
                         priority="P0" if offset == 0 else "P1",
                         deliverable=deliv,
+                        skills=m.skills if m.skills else None,
                     )
                     proposed_wos.append(wo)
             except Exception:
@@ -709,7 +724,7 @@ def synthesize_child_work_orders(
         task_candidates: list[str] = []
         for cm in cand_matches:
             c_clean = cm.strip().strip("`\"'.,()")
-            if any(c_clean.endswith(ext) for ext in (".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml", ".sql")):
+            if any(c_clean.endswith(ext) for ext in (".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite")):
                 if not c_clean.startswith(".sync") and not c_clean.startswith(".git") and c_clean not in ("PLAN.md", ".env"):
                     task_candidates.append(c_clean)
 
@@ -729,6 +744,19 @@ def synthesize_child_work_orders(
                 implementation_estimate["expected_files"]
             )
 
+        # Resolve skills: preserve Architect's explicit designation if provided,
+        # otherwise match intelligently based on role, deliverable, and keywords.
+        explicit_wo_skills = wo.get("skills") or []
+        resolved_skills = select_skills_for_task(
+            title=title,
+            description=desc,
+            agent_id=primary_agent,
+            role=role,
+            deliverable_path=deliv.get("path"),
+            explicit_skills=explicit_wo_skills,
+            project_path=ws,
+        )
+
         contract_rec = build_child_contract(
             wo_id=wo_id,
             agent_id=primary_agent,
@@ -738,6 +766,7 @@ def synthesize_child_work_orders(
             max_files_touched=(
                 implementation_estimate["max_files_touched"] if implementation_estimate else None
             ),
+            skills=resolved_skills if resolved_skills else None,
         )
 
         wo_rec = build_child_work_order(
@@ -750,6 +779,7 @@ def synthesize_child_work_orders(
             deliverable=deliv,
             implementation_estimate=implementation_estimate,
             milestone_id=wo.get("milestone_id"),
+            skills=resolved_skills if resolved_skills else None,
         )
 
         # Provenance marker: bootstrap-synthesized artifacts are scaffolding an

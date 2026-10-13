@@ -4,6 +4,7 @@ Tests that genuine Ollama deltas traverse the full production path via
 Ollama adapter → EventDispatcher → SSE server → SSE client.
 """
 
+import os
 import tempfile
 import time
 import threading
@@ -17,6 +18,8 @@ from validators.kernel.providers.adapter import OllamaAdapter
 from validators.kernel.providers.models import Message
 from cli.tui.events import extract_text_delta
 
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
+
 
 class TestOllamaStreaming:
     """Tests for Ollama streaming through production path."""
@@ -25,7 +28,7 @@ class TestOllamaStreaming:
         """Ollama adapter produces genuine incremental deltas before completion."""
         adapter = OllamaAdapter(
             endpoint="http://localhost:11434",
-            model="gemma4:e4b",
+            model=OLLAMA_MODEL,
             default_timeout=60.0,
         )
 
@@ -69,7 +72,7 @@ class TestOllamaStreaming:
             manager = daemon.manager
             session_id = manager.create_session(
                 agent="claude",
-                provider="gemma4:e4b",
+                provider=OLLAMA_MODEL,
                 contract={},
                 workspace=tmpdir,
             )["session_id"]
@@ -100,7 +103,7 @@ class TestOllamaStreaming:
             # Create adapter and stream with on_token callback to EventDispatcher
             adapter = OllamaAdapter(
                 endpoint="http://localhost:11434",
-                model="gemma4:e4b",
+                model=OLLAMA_MODEL,
                 default_timeout=60.0,
             )
 

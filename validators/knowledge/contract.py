@@ -60,6 +60,7 @@ class AgentContract:
         self.allow_rules: List[Dict[str, Any]] = self.scope.get("allow", [])
         self.deny_rules: List[Dict[str, Any]] = self.scope.get("deny", [])
         self.write_mode: str = self.scope.get("write", "read-only")
+        self.skills: List[str] = list(data.get("skills", []))
 
     @classmethod
     def load(cls, path_or_data: Union[str, Path, Dict[str, Any]], project_path: Path) -> AgentContract:
@@ -150,7 +151,7 @@ class AgentContract:
         
         # 1. Deny rules (precedence)
         for deny_rule in self.deny_rules:
-            pattern = deny_rule.get("module")
+            pattern = (deny_rule.get("module") or deny_rule.get("target") or deny_rule.get("path")) if isinstance(deny_rule, dict) else str(deny_rule)
             if pattern and (module_matches(target_module, pattern) or module_matches(target_qname, pattern)):
                 return False
                 
@@ -165,10 +166,10 @@ class AgentContract:
             adj[edge.target_id].add(edge.source_id)
             
         for allow_rule in self.allow_rules:
-            pattern = allow_rule.get("module")
+            pattern = (allow_rule.get("module") or allow_rule.get("target") or allow_rule.get("path")) if isinstance(allow_rule, dict) else str(allow_rule)
             if not pattern:
                 continue
-            max_depth = allow_rule.get("depth", 0)
+            max_depth = allow_rule.get("depth", 0) if isinstance(allow_rule, dict) else 0
             
             # BFS up to depth
             queue = [(node_id, 0)]

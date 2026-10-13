@@ -32,6 +32,7 @@ class AuthoringGateDecision:
     path: str
     author: str = ""
     errors: list[str] = field(default_factory=list)
+    normalized_content: str | None = None
 
     @property
     def summary(self) -> str:
@@ -174,10 +175,17 @@ class AuthoringGate:
             )
 
         # 3. Schema & Semantic Validation by Artifact Type
+        normalized_content: str | None = None
         if artifact_type == "work_order":
             self._validate_work_order(norm_path, data, errors)
         elif artifact_type == "contract":
+            data = self.normalize_contract_data(data)
             self._validate_contract(norm_path, data, errors)
+            if not errors:
+                try:
+                    normalized_content = yaml.safe_dump(data, sort_keys=False)
+                except Exception:
+                    pass
         elif artifact_type == "index":
             self._validate_index(norm_path, data, errors)
         else:
@@ -199,6 +207,7 @@ class AuthoringGate:
             path=norm_path,
             author=author,
             errors=errors,
+            normalized_content=normalized_content if passed else None,
         )
 
     def _check_overwrite_conflict(
@@ -311,6 +320,107 @@ class AuthoringGate:
                 elif not ref.startswith("R"):
                     errors.append(f"requirement_refs entry '{ref}' must start with 'R' (e.g., R001)")
 
+    @staticmethod
+    def normalize_contract_data(data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize LLM shorthand in a contract dictionary into canonical schema shape."""
+        if not isinstance(data, dict):
+            return data
+
+        # 1. Coerce schema_version and contract_revision if float or numeric string
+        if "schema_version" in data:
+            try:
+                data["schema_version"] = int(float(data["schema_version"]))
+            except (ValueError, TypeError):
+                pass
+        if "contract_revision" in data:
+            try:
+                data["contract_revision"] = int(float(data["contract_revision"]))
+            except (ValueError, TypeError):
+                pass
+
+        scope = data.get("scope")
+        if isinstance(scope, dict):
+            # 2. Normalize scope.allow
+            raw_allow = scope.get("allow")
+            if isinstance(raw_allow, str):
+                raw_allow = [raw_allow]
+            if isinstance(raw_allow, list):
+                norm_allow: list[dict[str, Any]] = []
+                for item in raw_allow:
+                    if isinstance(item, str) and item.strip():
+                        norm_allow.append({"module": item.strip()})
+                    elif isinstance(item, dict):
+                        m = item.get("module") or item.get("target") or item.get("path")
+                        if m and isinstance(m, str) and m.strip():
+                            rule_dict: dict[str, Any] = {"module": m.strip()}
+                            if "depth" in item:
+                                try:
+                                    rule_dict["depth"] = int(item["depth"])
+                                except (ValueError, TypeError):
+                                    pass
+                            norm_allow.append(rule_dict)
+                        else:
+                            norm_allow.append(item)
+                    else:
+                        norm_allow.append(item)
+                scope["allow"] = norm_allow
+
+            # 3. Normalize scope.deny
+            raw_deny = scope.get("deny")
+            if isinstance(raw_deny, str):
+                raw_deny = [raw_deny]
+            if isinstance(raw_deny, list):
+                norm_deny: list[dict[str, Any]] = []
+                for item in raw_deny:
+                    if isinstance(item, str) and item.strip():
+                        norm_deny.append({"module": item.strip()})
+                    elif isinstance(item, dict):
+                        m = item.get("module") or item.get("target") or item.get("path")
+                        if m and isinstance(m, str) and m.strip():
+                            norm_deny.append({"module": m.strip()})
+                        else:
+                            norm_deny.append(item)
+                    else:
+                        norm_deny.append(item)
+                scope["deny"] = norm_deny
+
+            # 4. Normalize scope.write
+            raw_write = scope.get("write")
+            if isinstance(raw_write, list):
+                # When LLM provides a list of write paths, the agent intended read-write
+                if len(raw_write) > 0:
+                    scope["write"] = "read-write"
+                    allow_list = scope.get("allow", [])
+                    if isinstance(allow_list, list):
+                        existing_modules = {
+                            r.get("module") for r in allow_list if isinstance(r, dict) and r.get("module")
+                        }
+                        for w_item in raw_write:
+                            w_str = str(w_item or "").strip()
+                            if w_str and w_str not in existing_modules:
+                                allow_list.append({"module": w_str})
+                                existing_modules.add(w_str)
+                else:
+                    scope["write"] = "read-only"
+            elif isinstance(raw_write, str):
+                w_norm = raw_write.strip().lower()
+                if w_norm in ("rw", "readwrite", "write"):
+                    scope["write"] = "read-write"
+                elif w_norm in ("ro", "readonly", "read"):
+                    scope["write"] = "read-only"
+
+        # 5. Coerce budget numeric limits if string
+        budget = data.get("budget")
+        if isinstance(budget, dict):
+            for k in ("max_files_touched", "max_tokens"):
+                if k in budget:
+                    try:
+                        budget[k] = int(budget[k])
+                    except (ValueError, TypeError):
+                        pass
+
+        return data
+
     def _validate_contract(self, norm_path: str, data: dict[str, Any], errors: list[str]) -> None:
         schema = self.get_schema("contract.schema.json")
         if schema:
@@ -340,9 +450,16 @@ class AuthoringGate:
                 errors.append("Contract scope must define at least one 'allow' rule")
             else:
                 for idx, rule in enumerate(allow_rules):
-                    if not isinstance(rule, dict) or not rule.get("module"):
+                    target = (
+                        (rule.get("module") or rule.get("target") or rule.get("path"))
+                        if isinstance(rule, dict)
+                        else rule
+                    )
+                    if not target or not isinstance(target, str) or not target.strip():
                         errors.append(f"Contract allow rule #{idx} must specify a non-empty 'module'")
             write_mode = scope.get("write")
+            if isinstance(write_mode, list):
+                write_mode = "read-write" if len(write_mode) > 0 else "read-only"
             if write_mode not in ("read-only", "read-write"):
                 errors.append(f"Contract scope.write mode '{write_mode}' invalid; must be 'read-only' or 'read-write'")
 

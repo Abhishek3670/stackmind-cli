@@ -112,6 +112,13 @@ def prepare_project(workspace: Path, *, yes: bool, interactive: bool) -> None:
     else:
         click.echo("Knowledge graph is current.")
 
+    # Record active project in ~/.stackmindcli/projects.json
+    try:
+        from validators.kernel.home import register_project
+        register_project(workspace)
+    except Exception:
+        pass
+
 
 def _safe_generated_repair(issue: Any) -> bool:
     """Allow only additive directory/.gitkeep repair paths from validate --fix."""

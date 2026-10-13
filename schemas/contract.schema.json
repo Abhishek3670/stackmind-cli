@@ -10,7 +10,7 @@
   ],
   "properties": {
     "schema_version": {
-      "type": "integer"
+      "type": ["integer", "number"]
     },
     "synthesized_by": {
       "type": "string",
@@ -28,11 +28,18 @@
       "pattern": "^WO-[0-9]{3}$"
     },
     "contract_revision": {
-      "type": "integer",
+      "type": ["integer", "number"],
       "minimum": 1
     },
     "guidelines": {
       "type": ["string", "array"]
+    },
+    "skills": {
+      "type": "array",
+      "description": "Procedural skills assigned to this agent under contract",
+      "items": {
+        "type": "string"
+      }
     },
     "identity": {
       "type": "object",
@@ -59,42 +66,66 @@
         "allow": {
           "type": "array",
           "items": {
-            "type": "object",
-            "required": [
-              "module"
-            ],
-            "properties": {
-              "module": {
+            "anyOf": [
+              {
                 "type": "string"
               },
-              "depth": {
-                "type": "integer",
-                "minimum": 0
+              {
+                "type": "object",
+                "required": [
+                  "module"
+                ],
+                "properties": {
+                  "module": {
+                    "type": "string"
+                  },
+                  "depth": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
               }
-            },
-            "additionalProperties": false
+            ]
           }
         },
         "deny": {
           "type": "array",
           "items": {
-            "type": "object",
-            "required": [
-              "module"
-            ],
-            "properties": {
-              "module": {
+            "anyOf": [
+              {
                 "type": "string"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "module"
+                ],
+                "properties": {
+                  "module": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
               }
-            },
-            "additionalProperties": false
+            ]
           }
         },
         "write": {
-          "type": "string",
-          "enum": [
-            "read-write",
-            "read-only"
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "read-write",
+                "read-only"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           ]
         }
       },

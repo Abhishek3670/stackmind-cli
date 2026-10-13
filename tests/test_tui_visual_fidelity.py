@@ -21,6 +21,7 @@ import pytest
 from click.testing import CliRunner
 
 import cli
+from cli.init import init
 from cli.main import cli as main_cli
 from cli.tui import (
     AutonomousDeliveryState,
@@ -306,6 +307,7 @@ def test_composer_box_and_footer_bar():
 
 def test_tui_repl_startup_layout_fidelity(tmp_path: Path):
     """Verify full TUI startup displays header, landing card, composer, and footer."""
+    init(tmp_path, name="TestProject", no_git=True)
     with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
         runner = CliRunner()
         result = runner.invoke(
@@ -377,6 +379,7 @@ def test_tui_startup_unconditionally_renders_header_and_landing_even_with_prior_
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     """Verify top header and landing block are always rendered on startup even when prior outbox reports exist (WO-038)."""
+    init(tmp_path, name="TestProject", no_git=True)
     # Create prior outbox report
     outbox_dir = tmp_path / ".sync" / "outbox" / "codex"
     outbox_dir.mkdir(parents=True, exist_ok=True)
@@ -419,6 +422,7 @@ def test_tui_startup_unconditionally_renders_header_and_landing_even_with_prior_
 
 def test_tui_landing_command_renders_both_header_and_landing(tmp_path: Path):
     """Verify :landing command renders both the top header bar and landing block (WO-038)."""
+    init(tmp_path, name="TestProject", no_git=True)
     with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
         runner = CliRunner()
         result = runner.invoke(

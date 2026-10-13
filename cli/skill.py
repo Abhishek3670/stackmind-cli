@@ -818,3 +818,134 @@ def feedback_command(name: str, is_success: bool, error: str | None, version: in
         )
     except Exception as exc:
         console.print(f"[bold red]Feedback recording failed:[/bold red] {exc}")
+
+
+@skill_group.command("consume")
+@click.argument("source", type=str)
+@click.option(
+    "--local",
+    "-l",
+    is_flag=True,
+    help="Install locally into project repository (.sync/skills) instead of global library",
+)
+@click.option(
+    "--global",
+    "-g",
+    "is_global_flag",
+    is_flag=True,
+    help="Explicitly install into centralized library (~/.stackmindcli/skills/global)",
+)
+@click.option(
+    "--status",
+    "-s",
+    type=click.Choice([s.value for s in SkillStatus]),
+    default=SkillStatus.ACTIVE.value,
+    help="Initial lifecycle status (default: active)",
+)
+@click.option(
+    "--project",
+    "-p",
+    "project_path",
+    default=".",
+    type=click.Path(exists=True),
+    help="Project root directory",
+)
+def consume_command(source: str, local: bool, is_global_flag: bool, status: str, project_path: str):
+    """Consume and install procedural skills from file (SKILL.md, JSON, YAML) or directory."""
+    console = Console()
+    from validators.skill.consumer import consume_skills
+    from validators.kernel.home import get_global_skills_dir
+
+    is_global = not local  # Default to global unless --local is specified
+
+    try:
+        status_enum = SkillStatus(status)
+        records = consume_skills(
+            source=source,
+            project_path=project_path,
+            is_global=is_global,
+            status=status_enum,
+        )
+    except Exception as exc:
+        console.print(f"[bold red]Error consuming skills:[/bold red] {exc}")
+        return
+
+    dest_desc = (
+        f"Global Library ([dim]{get_global_skills_dir() / 'global'}[/dim])"
+        if is_global
+        else f"Local Project ([dim]{Path(project_path).resolve() / '.sync' / 'skills' / 'active'}[/dim])"
+    )
+
+    names_str = ", ".join(f"'{s.name}'" for s in records)
+    console.print(
+        f"[bold green][+] Successfully consumed {len(records)} procedural skill(s) ({names_str}) into {dest_desc}[/bold green]\n"
+    )
+
+    table = Table(title=f"Installed Procedural Skills ({len(records)} total)")
+    table.add_column("Skill ID", style="bold cyan", no_wrap=True)
+    table.add_column("Name", style="bold green", no_wrap=True)
+    table.add_column("Ver", justify="center", style="magenta")
+    table.add_column("Status", justify="center")
+    table.add_column("Risk", justify="center")
+    table.add_column("Steps", justify="right", style="cyan")
+    table.add_column("Scope", justify="center", style="yellow")
+    table.add_column("Description", style="italic")
+
+    for s in records:
+        table.add_row(
+            s.skill_id,
+            s.name,
+            f"v{s.version}",
+            s.status.value.upper(),
+            s.risk_tier.value.upper(),
+            str(len(s.steps)),
+            "GLOBAL" if is_global else "LOCAL",
+            s.description[:45] + ("..." if len(s.description) > 45 else ""),
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Run `stackmind skill show <name>` or `:skills` in TUI to inspect steps.[/dim]")
+
+
+@skill_group.command("install")
+@click.argument("source", type=str)
+@click.option(
+    "--local",
+    "-l",
+    is_flag=True,
+    help="Install locally into project repository (.sync/skills) instead of global library",
+)
+@click.option(
+    "--global",
+    "-g",
+    "is_global_flag",
+    is_flag=True,
+    help="Explicitly install into centralized library (~/.stackmindcli/skills/global)",
+)
+@click.option(
+    "--status",
+    "-s",
+    type=click.Choice([s.value for s in SkillStatus]),
+    default=SkillStatus.ACTIVE.value,
+    help="Initial lifecycle status (default: active)",
+)
+@click.option(
+    "--project",
+    "-p",
+    "project_path",
+    default=".",
+    type=click.Path(exists=True),
+    help="Project root directory",
+)
+@click.pass_context
+def install_command(ctx, source: str, local: bool, is_global_flag: bool, status: str, project_path: str):
+    """Alias for `stackmind skill consume`."""
+    ctx.invoke(
+        consume_command,
+        source=source,
+        local=local,
+        is_global_flag=is_global_flag,
+        status=status,
+        project_path=project_path,
+    )
+

@@ -51,6 +51,7 @@ DEFAULT_MODELS_BY_PROVIDER: dict[str, list[str]] = {
         "gemini-1.5-flash",
     ],
     "ollama": [
+        "gemma4:31b-cloud",
         "ornith-1.5-16k:latest",
         "qwen2.5-coder:7b",
         "llama3.1:8b",
@@ -152,15 +153,31 @@ class ProviderConfig:
 class StackMindSettings:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     roles: dict[str, dict[str, str]] = field(default_factory=dict)
+    execution_profile: str = "medium"
+
+    @property
+    def effective_profile(self) -> Any:
+        from validators.kernel.profile import ExecutionProfile
+        return ExecutionProfile.from_str(self.execution_profile)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "execution_profile": self.execution_profile,
             "providers": {k: v.to_dict() for k, v in self.providers.items()},
             "roles": self.roles,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> StackMindSettings:
+        from validators.kernel.profile import ExecutionProfile
+
+        raw_profile = data.get("execution_profile")
+        try:
+            profile_val = ExecutionProfile.from_str(raw_profile).value
+        except ValueError:
+            # Fallback gracefully to default for corrupted/invalid setting while logging
+            profile_val = ExecutionProfile.MEDIUM.value
+
         providers_data = data.get("providers") or {}
         providers: dict[str, ProviderConfig] = {}
         for p_name, p_val in providers_data.items():
@@ -191,7 +208,7 @@ class StackMindSettings:
                 mod = str(r_cfg.get("model", ""))
                 if mod:
                     r_cfg["model"] = sanitize_model_name(mod, prov)
-        return cls(providers=providers, roles=roles)
+        return cls(providers=providers, roles=roles, execution_profile=profile_val)
 
 
 def get_default_settings() -> StackMindSettings:
@@ -290,17 +307,25 @@ def get_default_settings() -> StackMindSettings:
 def find_settings_file(workspace: Path | str | None = None) -> Path | None:
     """Search for existing settings.json or setting.json across known paths."""
     ws = Path(workspace).resolve() if workspace else Path.cwd().resolve()
+    from validators.kernel.home import get_global_settings_path, get_stackmind_home
+    cli_home = get_stackmind_home()
     candidate_paths = [
         ws / ".sync" / "settings.json",
         ws / ".sync" / "setting.json",
         ws / "settings.json",
         ws / "setting.json",
+        get_global_settings_path(),
+        cli_home / "setting.json",
+        # Legacy fallback
         Path.home() / ".stackmind" / "settings.json",
         Path.home() / ".stackmind" / "setting.json",
     ]
     for p in candidate_paths:
-        if p.is_file():
-            return p
+        try:
+            if p.is_file():
+                return p
+        except (PermissionError, OSError):
+            continue
     return None
 
 

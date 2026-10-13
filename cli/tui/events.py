@@ -416,13 +416,13 @@ def extract_assistant_response(
                 except Exception:
                     pass
 
-        report_md = result.get("report_markdown")
-        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
-            return clean_response(report_md)
-
         summary = result.get("summary")
         if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
             return clean_response(summary)
+
+        report_md = result.get("report_markdown")
+        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
+            return clean_response(report_md)
 
         response = result.get("response")
         if response and isinstance(response, str) and response.strip():

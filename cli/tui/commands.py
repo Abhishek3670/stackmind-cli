@@ -38,8 +38,11 @@ from cli.tui.events import (
     render_operational_event_str,
 )
 from cli.tui.governance import (
+    render_consume_skills_help_str,
+    render_consumed_skills_summary_str,
     render_contract_hud_str,
     render_plan_panel_str,
+    render_projects_panel_str,
     render_skills_panel_str,
     render_verification_matrix_str,
 )
@@ -199,6 +202,16 @@ def get_status_str(
         # Status line
         parts.append(f"Status: {run_state}")
 
+        # Execution Profile
+        prof = getattr(state, "execution_profile", None) or session.get("execution_profile")
+        if not prof and session.get("workspace"):
+            try:
+                from validators.kernel.settings import load_settings
+                prof = load_settings(session["workspace"]).execution_profile
+            except Exception:
+                prof = "medium"
+        parts.append(f"Execution Profile: {(prof or 'medium').upper()}")
+
         # Progress (only if there are work orders)
         if progress_total > 0:
             parts.append(f"Progress: {progress_done}/{progress_total} WOs completed")
@@ -238,11 +251,17 @@ def get_help_str() -> str:
         "  :reconnect        Reconnect to daemon and replay missed events\n"
         "  :roles            Display Agent Roles & Execution Backend bindings\n"
         "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
-        "  :settings         Interactive cloud providers, API keys & models config (settings.json)\n"
+        "  :settings         StackMind system settings, execution profiles, roles & policies\n"
+        "  :config           Alias for :settings\n"
+        "  :providers        Configure cloud and local LLM providers, API keys & endpoints\n"
+        "  :models           Configure and list available provider models\n"
         "  :wo               Display Work Orders table and progress\n"
         "  :tree, :agents    Display Hierarchical Operation Tree\n"
         "  :plan             Display Plan Approval surface and revision history\n"
         "  :skills [name]    Display available procedural skills & verified runbooks\n"
+        "  :consume-skills <p> Ingest and install procedural skills from file or directory\n"
+        "  :projects         Display registered projects and centralized root (~/.stackmindcli)\n"
+        "  :profile [name]   Get or set execution profile (low | medium | high)\n"
         "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
@@ -307,9 +326,18 @@ def _build_in_progress_turn_content(
     # In-progress streamed response text or progress line
     if streamed_chunks:
         curr_text = "".join(streamed_chunks)
-        wrapped_text = _wrap_text_to_width(curr_text, layout_width)
+        from cli.tui.chat import format_contract_payload
+        formatted_text = format_contract_payload(curr_text)
+        wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
         if wrapped_text:
             parts.append(wrapped_text)
+        else:
+            elapsed = time.time() - start_time
+            if max_wait > 0:
+                prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
+            else:
+                prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
+            parts.append(_wrap_text_to_width(prog_text, layout_width))
     else:
         elapsed = time.time() - start_time
         if max_wait > 0:
@@ -792,20 +820,29 @@ def _stream_turn_execution(
     # Finalize streaming if active
     if streamed_chunks and not assistant_rendered:
         full_resp = "".join(streamed_chunks).strip()
+        from cli.tui.chat import format_contract_payload
+        full_resp = format_contract_payload(full_resp)
         turn_acts = state.current_turn_actions
         thinking = getattr(state, "current_turn_thinking", None) or None
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
         streamed_chunks = []
-        redraw_full_screen(
-            session,
-            state,
-            clear=False,
-            include_composer=True,
-            composer_is_active=False,
-            composer_placeholder=placeholder,
-            live_manager=live_manager,
-        )
+        if is_tty:
+            redraw_full_screen(
+                session,
+                state,
+                clear=False,
+                include_composer=True,
+                composer_is_active=False,
+                composer_placeholder=placeholder,
+                live_manager=live_manager,
+            )
+        else:
+            click.echo(
+                render_assistant_message_str(
+                    full_resp, actions=turn_acts, thinking=thinking
+                )
+            )
 
     if _diagnostics_enabled:
         duration = time.monotonic() - _diagnostics_start
@@ -913,7 +950,7 @@ def _stream_turn_execution(
 
         if not assistant_rendered and op_rec and isinstance(op_rec, dict):
             res = op_rec.get("result") or {}
-            summary = res.get("report_markdown") or res.get("summary") or res.get("reason")
+            summary = res.get("summary") or res.get("report_markdown") or res.get("reason")
             thinking = (
                 res.get("thinking")
                 or res.get("thought")
@@ -938,9 +975,7 @@ def _stream_turn_execution(
                             _, _, b = cnt.partition("## Report")
                             rb, _, _ = b.partition("## Meta")
                             rep_body = rb.strip()
-                            if rep_body and rep_body != "Completed task via tools":
-                                summary = rep_body
-                            elif not summary or summary == "Completed task via tools":
+                            if not summary or summary == "Completed task via tools":
                                 summary = rep_body or cnt.strip()
                         elif not summary or summary == "Completed task via tools":
                             summary = cnt.strip()
@@ -989,6 +1024,8 @@ def _stream_turn_execution(
             elif summary:
                 if summary.strip() == "Completed task via tools":
                     summary = "Completed turn via tools. All executed actions are recorded in the Actions group above."
+                from cli.tui.chat import format_contract_payload
+                summary = format_contract_payload(summary)
                 turn_acts = state.current_turn_actions
                 state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
                 if is_tty:
@@ -1197,8 +1234,17 @@ def dispatch_delivery_command(
         output_parts = []
         if error_str:
             output_parts.append(error_str)
+        sid = session.get("session_id") or (getattr(state, "session_id", None) if state else None)
+        if sid:
+            output_parts.append(f"Session: {sid}")
         output_parts.append(get_status_str(session, state=state))
-        output_str = "\n".join(output_parts)
+        contract_data = session.get("contract") or (getattr(state, "contract", None) if state else None)
+        if contract_data:
+            output_parts.append(render_contract_hud_str(contract_data))
+        if state is not None:
+            from cli.tui.views import render_project_delivery_view
+            output_parts.append(render_project_delivery_view(state))
+        output_str = "\n\n".join(output_parts)
 
         state.add_message("user", normalized)
         state.add_message("system", output_str)
@@ -1294,18 +1340,20 @@ def dispatch_delivery_command(
     if (
         normalized == ":settings"
         or normalized.startswith(":settings ")
-        or normalized in {":config", ":providers", ":models"}
+        or normalized in {":config", ":setting"}
+        or normalized.startswith(":config ")
     ):
         from cli.tui.settings_panel import (
-            run_arrow_navigation_settings_loop,
-            run_interactive_settings_panel,
+            render_stackmind_settings_str,
+            run_interactive_stackmind_settings,
         )
+        from validators.kernel.settings import load_settings, save_settings
 
         ws = Path(session["workspace"]) if session.get("workspace") else None
         subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
         term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
         if is_tty and not subcmd:
-            output_str = run_arrow_navigation_settings_loop(
+            output_str = run_interactive_stackmind_settings(
                 session=session,
                 state=state,
                 client=client,
@@ -1314,12 +1362,44 @@ def dispatch_delivery_command(
                 width=term_cols,
             )
         else:
-            output_str = run_interactive_settings_panel(
-                workspace=ws,
-                client=client,
-                width=term_cols,
-                initial_subcmd=subcmd,
-            )
+            settings_obj = load_settings(ws)
+            if subcmd:
+                parts = subcmd.strip().split()
+                scmd = parts[0].lower()
+                if scmd in ("profile", "execution-profile", "exec-profile"):
+                    if len(parts) >= 2:
+                        prof_val = parts[1].lower()
+                        if prof_val in ("low", "medium", "high"):
+                            settings_obj.execution_profile = prof_val
+                            save_settings(settings_obj, ws)
+                            state.execution_profile = prof_val
+                            if client and hasattr(client, "settings_update"):
+                                try:
+                                    client.settings_update(settings_obj.to_dict())
+                                except Exception:
+                                    pass
+                            output_str = f"[SUCCESS] Execution profile set to {prof_val.upper()} in settings.json"
+                        else:
+                            output_str = f"[ERROR] Invalid profile '{prof_val}'. Available: low, medium, high"
+                    else:
+                        output_str = f"Current execution profile: {settings_obj.effective_profile.upper()}"
+                elif scmd in ("timeout", "turn-timeout"):
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        t_val = int(parts[1])
+                        settings_obj.client_timeout = t_val
+                        state.turn_timeout = t_val
+                        save_settings(settings_obj, ws)
+                        output_str = f"[SUCCESS] Client turn timeout set to {t_val}s."
+                    else:
+                        output_str = f"Current client turn timeout: {getattr(settings_obj, 'client_timeout', 0)}s"
+                elif scmd in ("providers", "provider", "models"):
+                    from cli.tui.settings_panel import render_settings_overview_str
+
+                    output_str = render_settings_overview_str(settings_obj, width=term_cols)
+                else:
+                    output_str = render_stackmind_settings_str(settings_obj, width=term_cols)
+            else:
+                output_str = render_stackmind_settings_str(settings_obj, width=term_cols)
         try:
             roles_data = client.list_roles()
             if roles_data and isinstance(roles_data, list):
@@ -1333,6 +1413,48 @@ def dispatch_delivery_command(
                         state.roles[normalized_key].model = rd.get("model")
         except Exception:
             pass
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized == ":providers"
+        or normalized.startswith(":providers ")
+        or normalized in {":models", ":provider"}
+        or normalized.startswith(":models ")
+    ):
+        from cli.tui.settings_panel import (
+            render_settings_overview_str,
+            run_interactive_providers_panel,
+            run_interactive_settings_panel,
+        )
+        from validators.kernel.settings import load_settings, save_settings
+
+        ws = Path(session["workspace"]) if session.get("workspace") else None
+        subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        if is_tty and not subcmd:
+            output_str = run_interactive_providers_panel(
+                session=session,
+                state=state,
+                client=client,
+                live_manager=live_manager,
+                workspace=ws,
+                width=term_cols,
+            )
+        else:
+            if subcmd:
+                output_str = run_interactive_settings_panel(
+                    workspace=ws,
+                    client=client,
+                    width=term_cols,
+                    initial_subcmd=subcmd,
+                )
+            else:
+                settings_obj = load_settings(ws)
+                output_str = render_settings_overview_str(settings_obj, width=term_cols)
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -1403,6 +1525,125 @@ def dispatch_delivery_command(
         clean_filter = filter_arg.strip() or None
         ws_path = session.get("workspace") if isinstance(session, dict) else None
         output_str = render_skills_panel_str(ws_path, skill_filter=clean_filter)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized == ":consume-skills"
+        or normalized.startswith(":consume-skills ")
+        or normalized == ":consume-skill"
+        or normalized.startswith(":consume-skill ")
+    ):
+        _, _, raw_arg = normalized.partition(" ")
+        clean_arg = raw_arg.strip()
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+
+        if not clean_arg:
+            output_str = render_consume_skills_help_str()
+        else:
+            is_global = True
+            tokens = clean_arg.split()
+            filtered_tokens = []
+            for tok in tokens:
+                if tok in ("--local", "-l"):
+                    is_global = False
+                elif tok in ("--global", "-g"):
+                    is_global = True
+                else:
+                    filtered_tokens.append(tok)
+
+            source_target = " ".join(filtered_tokens).strip()
+            if (source_target.startswith('"') and source_target.endswith('"')) or (
+                source_target.startswith("'") and source_target.endswith("'")
+            ):
+                source_target = source_target[1:-1].strip()
+
+            if not source_target:
+                output_str = render_consume_skills_help_str()
+            else:
+                from validators.skill.consumer import consume_skills
+                from validators.kernel.home import get_global_skills_dir
+
+                try:
+                    records = consume_skills(
+                        source=source_target,
+                        project_path=ws_path,
+                        is_global=is_global,
+                    )
+                    dest_desc = (
+                        str(get_global_skills_dir() / "global")
+                        if is_global
+                        else str(Path(ws_path or ".").resolve() / ".sync" / "skills" / "active")
+                    )
+                    output_str = render_consumed_skills_summary_str(records, is_global, dest_desc)
+                except Exception as exc:
+                    output_str = f"[Error consuming skills] {exc}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":projects" or normalized.startswith(":projects "):
+        output_str = render_projects_panel_str()
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":profile" or normalized.startswith(":profile "):
+        _, _, prof_arg = normalized.partition(" ")
+        clean_prof = prof_arg.strip().lower()
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        from validators.kernel.settings import load_settings, save_settings
+        from validators.kernel.profile import ExecutionProfile, get_profile_policy
+        try:
+            settings_obj = load_settings(ws_path)
+        except Exception:
+            from validators.kernel.settings import StackMindSettings
+            settings_obj = StackMindSettings()
+
+        if clean_prof:
+            if clean_prof in ("low", "medium", "high"):
+                settings_obj.execution_profile = clean_prof
+                save_settings(settings_obj, ws_path)
+                state.execution_profile = clean_prof
+                if client and hasattr(client, "settings_update"):
+                    try:
+                        client.settings_update(settings_obj.to_dict())
+                    except Exception:
+                        pass
+                policy = get_profile_policy(clean_prof)
+                output_str = (
+                    f"Execution profile updated to: {clean_prof.upper()}\n"
+                    f"Policy details: skills_enabled={policy.skills_enabled}, "
+                    f"skill_limit={policy.skill_limit}, "
+                    f"token_budget={policy.skill_token_budget}, "
+                    f"verification_depth={policy.verification_depth.value}\n"
+                    f"Changes will take effect at the start of the next execution cycle."
+                )
+            else:
+                output_str = f"Invalid execution profile '{clean_prof}'. Supported values: low, medium, high."
+        else:
+            if is_tty:
+                from cli.tui.settings_panel import run_interactive_profile_selector
+                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                output_str = run_interactive_profile_selector(
+                    session=session,
+                    state=state,
+                    client=client,
+                    live_manager=live_manager,
+                    workspace=Path(ws_path) if ws_path else None,
+                    width=term_cols,
+                )
+            else:
+                from cli.tui.settings_panel import render_profile_overview_str
+                output_str = render_profile_overview_str(settings_obj)
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

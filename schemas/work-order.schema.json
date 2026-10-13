@@ -96,6 +96,13 @@
         "type": "string"
       }
     },
+    "skills": {
+      "type": "array",
+      "description": "Procedural skills selected by the Architect for this work order",
+      "items": {
+        "type": "string"
+      }
+    },
     "completion": {
       "type": "object",
       "additionalProperties": true

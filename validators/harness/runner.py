@@ -304,12 +304,27 @@ class AgentRunner:
         on_tool_call: Callable[[str, dict[str, Any], str], None] | None = None,
         on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        execution_profile: Any | None = None,
     ) -> None:
         self.project_path = project_path.resolve()
         self.sync_path = self.project_path / '.sync'
         self.agent = agent
         self.backend = backend
         self.provider_adapter = provider_adapter
+
+        # Canonical execution profile & policy resolution
+        from validators.kernel.profile import ExecutionProfile, get_profile_policy
+        if execution_profile is not None:
+            self.execution_profile = ExecutionProfile.from_str(execution_profile)
+        else:
+            try:
+                from validators.kernel.settings import load_settings
+                self.execution_profile = ExecutionProfile.from_str(
+                    load_settings(self.project_path).execution_profile
+                )
+            except Exception:
+                self.execution_profile = ExecutionProfile.MEDIUM
+        self.profile_policy = get_profile_policy(self.execution_profile)
         if backend is not None:
             self.backend_id = getattr(backend, 'backend_id', 'custom-backend')
             self.backend_model = getattr(backend, 'model', None) or 'default'
@@ -448,6 +463,19 @@ class AgentRunner:
             task_contract = load_harness_contract(
                 self.project_path, self.agent, task.work_order_id
             )
+            assigned_skills = list(getattr(task_contract, "skills", []) or [])
+            if not assigned_skills and task.work_order_id:
+                for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                    wo_path = self.sync_path / 'work-orders' / sub / f'{task.work_order_id}.yaml'
+                    if wo_path.exists():
+                        try:
+                            wo_data = yaml.safe_load(wo_path.read_text(encoding='utf-8'))
+                            if isinstance(wo_data, dict) and wo_data.get("skills"):
+                                assigned_skills = list(wo_data["skills"])
+                        except Exception:
+                            pass
+                        break
+
             knowledge_api = KnowledgeAPI(self.project_path)
             try:
                 context = knowledge_api.assemble_context(
@@ -455,6 +483,8 @@ class AgentRunner:
                     token_budget=self.token_budget,
                     limit=self.context_limit,
                     contract=task_contract,
+                    profile=self.execution_profile,
+                    skills=assigned_skills or None,
                 )
             except (ContractAccessDenied, ContractExpiredError) as contract_error:
                 # Fail closed, gracefully: the pre-execution gate would block
@@ -1430,7 +1460,12 @@ class AgentRunner:
 
         def graph_query(query: str) -> dict[str, Any]:
             bundle = knowledge_api.assemble_context(
-                query, token_budget=self.token_budget, limit=self.context_limit, contract=task_contract,
+                query,
+                token_budget=self.token_budget,
+                limit=self.context_limit,
+                contract=task_contract,
+                profile=self.execution_profile,
+                skills=getattr(task_contract, "skills", None),
             )
             return {
                 'revision': bundle.revision,
@@ -1641,17 +1676,25 @@ class AgentRunner:
                 WORK_ORDER_SCHEMA_TEMPLATE,
                 CONTRACT_SCHEMA_TEMPLATE,
             )
+            from validators.skill.selector import format_skills_for_architect_prompt
             task_text += f"\n{ARCHITECTURE_RESEARCH_INSTRUCTIONS}\n"
             task_text += f"\nGoverned Artifact Authoring Schemas (for reference when planning tasks):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
+            skills_prompt = format_skills_for_architect_prompt(self.project_path)
+            if skills_prompt:
+                task_text += f"\n{skills_prompt}\n"
 
         if is_architecture and is_authoring_task:
             from validators.harness.plan import (
                 WORK_ORDER_SCHEMA_TEMPLATE,
                 CONTRACT_SCHEMA_TEMPLATE,
             )
+            from validators.skill.selector import format_skills_for_architect_prompt
             task_text += f"\nGoverned Artifact Authoring Schemas (REQUIRED for writing child work orders and contracts):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
+            skills_prompt = format_skills_for_architect_prompt(self.project_path)
+            if skills_prompt:
+                task_text += f"\n{skills_prompt}\n"
 
         if is_architecture and is_integration_review:
             system_msg = (
@@ -1727,6 +1770,7 @@ class AgentRunner:
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
                 "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
+                "You also select and assign appropriate procedural skills from the workspace skills library, indicating `(Skills: <skill_name>)` in milestone titles. "
                 "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file).\n"
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
                 "Only after receiving the graph research results should you call `write_file` to write PLAN.md.\n"
@@ -2409,8 +2453,20 @@ class AgentRunner:
         diff = stage_inputs.get('diff')
         dimensions = stage_inputs.get('dimensions')
         exp_rec = stage_inputs.get('experience_record')
+        skill_diag = getattr(stage_inputs['context'], 'skill_diagnostics', None)
+        if isinstance(skill_diag, dict):
+            skills_injected = skill_diag.get('injected_ids') or skill_diag.get('injected', [])
+            skill_tokens_est = skill_diag.get('estimated_skill_tokens') or skill_diag.get('token_estimate', 0)
+        elif skill_diag is not None:
+            skills_injected = getattr(skill_diag, 'injected_ids', getattr(skill_diag, 'injected', []))
+            skill_tokens_est = getattr(skill_diag, 'estimated_skill_tokens', getattr(skill_diag, 'token_estimate', 0))
+        else:
+            skills_injected = []
+            skill_tokens_est = 0
+
         event = {
             'agent': self.agent,
+            'execution_profile': self.execution_profile.value,
             'benchmark_mode': stage_inputs['retrieval'].mode,
             'commands_audit': stage_inputs.get('commands_audit', []),
             'context_revision': stage_inputs['context'].revision,
@@ -2428,6 +2484,8 @@ class AgentRunner:
             'trust_level': trust_level.value if hasattr(trust_level, 'value') else str(trust_level or 'OBSERVABLE'),
             'verification_passed': dimensions.all_passed if dimensions else True,
             'write_ms': lock_hold_ms,
+            'skills_injected': list(skills_injected) if isinstance(skills_injected, (list, tuple)) else [],
+            'skill_tokens_estimated': int(skill_tokens_est) if isinstance(skill_tokens_est, (int, float)) else 0,
         }
         return FileWrite(
             Path('.sync') / 'state' / 'harness' / 'events.jsonl',
@@ -2451,6 +2509,7 @@ class AgentRunner:
             f'# Harness Report: {task.identifier}',
             '',
             f'- agent: `{self.agent}`',
+            f'- profile: `{self.execution_profile.value}`',
             f'- task: `{task.identifier}`',
             f'- kind: `{task.kind}`',
             f'- status: `{decision.status}`',
@@ -2508,8 +2567,9 @@ class AgentRunner:
         dimensions = stage_inputs.get('dimensions')
         diff = stage_inputs.get('diff')
         exp_rec = stage_inputs.get('experience_record')
-        return {
+        meta_out: dict[str, Any] = {
             'agent': self.agent,
+            'execution_profile': self.execution_profile.value,
             'benchmark_mode': retrieval.mode,
             'cache_hits': retrieval.cache_hits,
             'completion_tokens': completion.completion_tokens,
@@ -2561,6 +2621,64 @@ class AgentRunner:
             'uncertainty': list(decision.uncertainty),
             'verification_dimensions': dimensions.to_dict() if dimensions else {},
         }
+
+        # Skill retrieval diagnostics
+        skill_diag = getattr(context, 'skill_diagnostics', None)
+        if skill_diag is not None:
+            meta_out['skill_diagnostics'] = (
+                skill_diag.to_dict() if hasattr(skill_diag, 'to_dict') else dict(skill_diag)
+            )
+
+        if isinstance(skill_diag, dict):
+            skill_considered = skill_diag.get('considered_ids', skill_diag.get('considered', []))
+            skill_selected = skill_diag.get('selected_ids', skill_diag.get('selected', []))
+            skill_loaded = skill_diag.get('loaded_ids', skill_diag.get('loaded', []))
+            skill_injected = skill_diag.get('injected_ids', skill_diag.get('injected', []))
+            skill_token_est = skill_diag.get('estimated_skill_tokens', skill_diag.get('token_estimate', 0))
+        elif skill_diag is not None:
+            skill_considered = getattr(skill_diag, 'considered_ids', getattr(skill_diag, 'considered', []))
+            skill_selected = getattr(skill_diag, 'selected_ids', getattr(skill_diag, 'selected', []))
+            skill_loaded = getattr(skill_diag, 'loaded_ids', getattr(skill_diag, 'loaded', []))
+            skill_injected = getattr(skill_diag, 'injected_ids', getattr(skill_diag, 'injected', []))
+            skill_token_est = getattr(skill_diag, 'estimated_skill_tokens', getattr(skill_diag, 'token_estimate', 0))
+        else:
+            skill_considered = []
+            skill_selected = []
+            skill_loaded = []
+            skill_injected = []
+            skill_token_est = 0
+
+        # Cycle telemetry
+        llm_ms = stage_inputs.get('llm_ms', 0)
+        poll_ms = stage_inputs.get('poll_ms', 0)
+        retrieval_ms = stage_inputs.get('retrieval_ms', 0)
+        total_wall_ms = llm_ms + poll_ms + retrieval_ms + write_ms
+        meta_out['telemetry'] = {
+            'execution_profile': self.execution_profile.value,
+            'cycle_start': stage_inputs.get('run_at').isoformat() if stage_inputs.get('run_at') else None,
+            'latency_ms': {
+                'llm': llm_ms,
+                'poll': poll_ms,
+                'retrieval': retrieval_ms,
+                'write': write_ms,
+                'total_wall_ms': total_wall_ms,
+            },
+            'completion_tokens': completion.completion_tokens,
+            'prompt_tokens': completion.prompt_tokens,
+            'tokens_measured': bool(completion.completion_tokens > 0 or completion.prompt_tokens > 0),
+            'skill_candidates_considered': list(skill_considered) if isinstance(skill_considered, (list, tuple)) else [],
+            'skill_candidates_selected': list(skill_selected) if isinstance(skill_selected, (list, tuple)) else [],
+            'skill_loaded': list(skill_loaded) if isinstance(skill_loaded, (list, tuple)) else [],
+            'skill_injected': list(skill_injected) if isinstance(skill_injected, (list, tuple)) else [],
+            'skill_token_estimate': int(skill_token_est) if isinstance(skill_token_est, (int, float)) else 0,
+            'skill_token_usage_measured': False,
+            'model_calls': 1,
+            'tool_calls_count': len(stage_inputs.get('tool_calls_audit', [])),
+            'verification_passed': dimensions.all_passed if dimensions else True,
+            'status': decision.status,
+            'blockers': list(decision.blockers) if decision.blockers else [],
+        }
+
         if decision.status == 'blocked':
             gt = completion.meta.get('guard_trip') if hasattr(completion, 'meta') else None
             if gt:

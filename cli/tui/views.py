@@ -81,7 +81,10 @@ def render_roles_panel(state: AutonomousDeliveryState, detailed: bool = False) -
     lines = ["AGENTS"]
     for role_name, r in state.roles.items():
         disp_state = r.display_state
-        if state.phase == ProjectPhase.BLOCKED:
+        if state.is_complete or state.phase == ProjectPhase.PROJECT_COMPLETE:
+            if disp_state in {"implementing", "running", "waiting", "orchestrating"}:
+                disp_state = "completed"
+        elif state.phase == ProjectPhase.BLOCKED:
             if role_name.lower() == "gitops" and (
                 "gitops" in str(getattr(state, "error", "")).lower()
                 or any(
@@ -139,7 +142,8 @@ def render_work_orders_panel(state: AutonomousDeliveryState) -> str:
 
 def render_operation_tree(state: AutonomousDeliveryState) -> str:
     """Renders the hierarchical operation tree (:tree / :agents command)."""
-    lines = ["● Architecture"]
+    arch_marker = "✓" if (state.is_complete or state.phase == ProjectPhase.PROJECT_COMPLETE) else "●"
+    lines = [f"{arch_marker} Architecture"]
     root = state.operations.get("op-root")
     children = root.children if root else [k for k in state.operations if k != "op-root"]
 
@@ -155,7 +159,7 @@ def render_operation_tree(state: AutonomousDeliveryState) -> str:
             prefix = "  └─ " if is_last else "  ├─ "
             marker = (
                 "✓"
-                if r.state.upper() in {"COMPLETED", "DONE"}
+                if (state.is_complete or state.phase == ProjectPhase.PROJECT_COMPLETE or r.state.upper() in {"COMPLETED", "DONE"})
                 else ("●" if r.state.upper() in {"RUNNING", "ACTIVE"} else "○")
             )
             lines.append(f"{prefix}{marker} {name} / {r.backend}")
@@ -168,7 +172,7 @@ def render_operation_tree(state: AutonomousDeliveryState) -> str:
         if node:
             marker = (
                 "✓"
-                if node.status.upper() in {"COMPLETED", "DONE"}
+                if (state.is_complete or state.phase == ProjectPhase.PROJECT_COMPLETE or node.status.upper() in {"COMPLETED", "DONE"})
                 else ("●" if node.status.upper() in {"RUNNING", "ACTIVE"} else "○")
             )
             lines.append(f"{prefix}{marker} {node.role} / {node.backend}")
@@ -180,7 +184,7 @@ def render_operation_tree(state: AutonomousDeliveryState) -> str:
                 if sub_node:
                     sub_marker = (
                         "✓"
-                        if sub_node.status.upper() in {"COMPLETED", "DONE"}
+                        if (state.is_complete or state.phase == ProjectPhase.PROJECT_COMPLETE or sub_node.status.upper() in {"COMPLETED", "DONE"})
                         else ("●" if sub_node.status.upper() in {"RUNNING", "ACTIVE"} else "○")
                     )
                     lines.append(f"{sub_prefix}{sub_marker} {sub_node.name} ({sub_node.role})")

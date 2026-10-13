@@ -4,11 +4,14 @@ Tests genuine incremental output from Ollama through StackMind's production
 Ollama adapter with streaming enabled.
 """
 
+import os
 import time
 import pytest
 
 from validators.kernel.providers.adapter import OllamaAdapter
 from validators.kernel.providers.models import Message
+
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
 
 
 class TestOllamaStreamingLive:
@@ -18,7 +21,7 @@ class TestOllamaStreamingLive:
         """Ollama adapter with stream=True produces multiple non-empty deltas."""
         adapter = OllamaAdapter(
             endpoint="http://localhost:11434",
-            model="gemma4:e4b",
+            model=OLLAMA_MODEL,
             default_timeout=60.0,
         )
 
@@ -58,7 +61,7 @@ class TestOllamaStreamingLive:
         """Concatenating deltas produces expected response text."""
         adapter = OllamaAdapter(
             endpoint="http://localhost:11434",
-            model="gemma4:e4b",
+            model=OLLAMA_MODEL,
             default_timeout=60.0,
         )
 
@@ -78,6 +81,27 @@ class TestOllamaStreamingLive:
         except Exception as e:
             pytest.fail(f"Ollama content test failed: {e}")
 
+    def test_ollama_complete_produces_valid_response(self):
+        """Ollama adapter non-streaming complete() works with gemma4:31b-cloud."""
+        adapter = OllamaAdapter(
+            endpoint="http://localhost:11434",
+            model=OLLAMA_MODEL,
+            default_timeout=60.0,
+        )
+
+        messages = [
+            Message.user(content="Respond with the single word 'PONG'."),
+        ]
+
+        try:
+            response = adapter.complete(messages, timeout=30.0)
+            assert response is not None
+            assert response.message.content.strip() != ""
+            assert "PONG" in response.message.content.upper()
+        except Exception as e:
+            pytest.fail(f"Ollama complete test failed: {e}")
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

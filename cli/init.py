@@ -338,6 +338,19 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                             idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
                 except Exception:
                     pass
+
+        # 5. Mirror bundled schemas into workspace schemas/ directory
+        ws_schemas_dir = ws_path / "schemas"
+        ws_schemas_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            bundled_schemas = Path(__file__).resolve().parents[1] / "schemas"
+            if bundled_schemas.is_dir():
+                for s_file in bundled_schemas.glob("*.json"):
+                    dest_file = ws_schemas_dir / s_file.name
+                    if not dest_file.exists():
+                        shutil.copy2(s_file, dest_file)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -726,6 +739,12 @@ def init(
             border_style="green",
         )
     )
+    # Register project in centralized ~/.stackmindcli/projects.json
+    try:
+        from validators.kernel.home import register_project
+        register_project(project_path, name=name, agents=agents)
+    except Exception:
+        pass
 
     return True
 

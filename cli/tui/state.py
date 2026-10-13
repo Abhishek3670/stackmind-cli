@@ -76,7 +76,7 @@ class RoleStatus:
         if s in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
             return "implementing" if self.role.lower() != "architecture" else "orchestrating"
         if s in {"COMPLETED", "DONE", "VERIFIED"}:
-            return "completed" if self.role.lower() != "architecture" else "orchestrating"
+            return "completed"
         if s in {"CANCELLED", "CANCELED"}:
             return "cancelled"
         if s in {"FAILED", "ERROR"}:
@@ -440,12 +440,15 @@ class AutonomousDeliveryState:
         self.settings_field_idx: int = 0
         self.settings_status_msg: str = ""
         self.settings_obj: Any | None = None
+        self.execution_profile: str = "medium"
+        self.cycle_telemetry: list[dict[str, Any]] = []
+        self.last_telemetry: dict[str, Any] | None = None
 
-    def open_settings(self, settings_obj: Any | None = None) -> None:
+    def open_settings(self, settings_obj: Any | None = None, initial_view: str = "main") -> None:
         """Open the interactive settings panel anchored below the composer."""
         self.settings_panel_open = True
         self.settings_selected_row = 0
-        self.settings_current_view = "main"
+        self.settings_current_view = initial_view
         self.settings_status_msg = ""
         if settings_obj is not None:
             self.settings_obj = settings_obj
@@ -730,6 +733,8 @@ class AutonomousDeliveryState:
         if not session or not isinstance(session, Mapping):
             return
         self.session_id = str(session.get("session_id", self.session_id))
+        if "execution_profile" in session and session["execution_profile"]:
+            self.execution_profile = str(session["execution_profile"])
         for key in ("context_window_tokens", "context_window", "context_length", "num_ctx"):
             value = session.get(key)
             if isinstance(value, (int, float)) and value > 0:
@@ -808,6 +813,12 @@ class AutonomousDeliveryState:
                 self.error = None
                 for k in self.completion_checklist:
                     self.completion_checklist[k] = True
+                for r_obj in self.roles.values():
+                    if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
+                        r_obj.state = "COMPLETED"
+                for op in self.operations.values():
+                    if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                        op.status = "COMPLETED"
             elif rp_str == "BLOCKED":
                 self.phase = ProjectPhase.BLOCKED
             elif rp_str == "FAILED":
@@ -816,6 +827,7 @@ class AutonomousDeliveryState:
         ws_session = session.get("workspace")
         if ws_session:
             self.sync_work_orders_from_disk(ws_session)
+        self.reconcile_roles_from_work_orders()
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
         if not isinstance(wo_records, list):
@@ -858,6 +870,7 @@ class AutonomousDeliveryState:
             items.append(WorkOrderItem(wo_id, title, role=role, priority=priority, status=status))
         if items:
             self.work_orders = items
+        self.reconcile_roles_from_work_orders()
 
     def sync_work_orders_from_disk(self, workspace: Path | str | None = None) -> None:
         """Synchronize work order statuses accurately from disk (.sync/work-orders/INDEX.yaml and folders)."""
@@ -982,6 +995,53 @@ class AutonomousDeliveryState:
                         w.status = disk_statuses[w.id]
         except Exception:
             pass
+        self.reconcile_roles_from_work_orders()
+
+    def reconcile_roles_from_work_orders(self) -> None:
+        """Reconcile role statuses against completed work orders and operations."""
+        if not self.roles:
+            return
+
+        if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE:
+            for r_obj in self.roles.values():
+                if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
+                    r_obj.state = "COMPLETED"
+            for op in self.operations.values():
+                if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                    op.status = "COMPLETED"
+            return
+
+        # Check if all work orders in the project are complete
+        if self.work_orders and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in self.work_orders):
+            for r_obj in self.roles.values():
+                if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
+                    r_obj.state = "COMPLETED"
+            for op in self.operations.values():
+                if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                    op.status = "COMPLETED"
+            return
+
+        # Per-role reconciliation: if all work orders for a role are done and no op running
+        running_roles = {
+            (op.role or "").lower()
+            for op in self.operations.values()
+            if str(op.status).upper() in {"RUNNING", "ACTIVE"}
+        }
+
+        for r_name, r_obj in self.roles.items():
+            if r_name.lower() in {"architecture", "lead"}:
+                continue
+            role_wos = [
+                w for w in self.work_orders
+                if w.role.lower() == r_name.lower()
+                or (r_name.lower() == "backend" and w.role.lower() in {"codex", "backend"})
+                or (r_name.lower() == "frontend" and w.role.lower() in {"gemini", "frontend", "agy"})
+                or (r_name.lower() in {"qa", "q/a"} and w.role.lower() in {"gemma", "qa", "q/a"})
+                or (r_name.lower() == "gitops" and w.role.lower() in {"local-llm", "gitops"})
+            ]
+            if role_wos and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in role_wos):
+                if r_name.lower() not in running_roles and r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                    r_obj.state = "COMPLETED"
 
     def get_agent_hierarchy(self) -> list[dict[str, Any]]:
         """Return the dynamic agent hierarchy without hard-coding the agent roster (§7, §8).
@@ -1018,7 +1078,10 @@ class AutonomousDeliveryState:
                 children_objs = []
 
             if root_obj:
-                r_stat = "orchestrating" if "arch" in root_obj.role.lower() else root_obj.display_state
+                if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE or root_obj.state.upper() in {"COMPLETED", "DONE", "VERIFIED"}:
+                    r_stat = "completed"
+                else:
+                    r_stat = "orchestrating" if "arch" in root_obj.role.lower() else root_obj.display_state
                 entries.append({
                     "name": root_obj.role,
                     "role": root_obj.role,
@@ -1028,7 +1091,10 @@ class AutonomousDeliveryState:
                 })
             for w_obj in children_objs:
                 w_status = w_obj.display_state
-                if self.phase == ProjectPhase.BLOCKED:
+                if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE:
+                    if w_status in {"implementing", "running", "waiting", "orchestrating"}:
+                        w_status = "completed"
+                elif self.phase == ProjectPhase.BLOCKED:
                     if w_obj.role.lower() == "gitops" and (
                         "gitops" in str(getattr(self, "error", "")).lower()
                         or any(w.status == "BLOCKED" for w in self.work_orders if w.role.lower() in ("gitops", "local-llm"))
@@ -1050,9 +1116,12 @@ class AutonomousDeliveryState:
             root = self.operations.get("op-root")
             children_ids = root.children if root else [k for k in self.operations if k != "op-root"]
             if root:
-                r_status = "orchestrating" if (root.role or "").lower() == "architecture" else (
-                    "running" if str(root.status).upper() in {"RUNNING", "ACTIVE"} else str(root.status).lower()
-                )
+                if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE or str(root.status).upper() in {"COMPLETED", "DONE", "VERIFIED"}:
+                    r_status = "completed"
+                else:
+                    r_status = "orchestrating" if (root.role or "").lower() == "architecture" else (
+                        "running" if str(root.status).upper() in {"RUNNING", "ACTIVE"} else str(root.status).lower()
+                    )
                 entries.append({
                     "name": root.role or "Architecture",
                     "role": root.role or "Architecture",
@@ -1063,11 +1132,12 @@ class AutonomousDeliveryState:
             for cid in children_ids:
                 node = self.operations.get(cid)
                 if node:
+                    n_stat = "completed" if (self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE) else node.status.lower()
                     entries.append({
                         "name": node.name or node.role,
                         "role": node.role,
                         "backend": node.backend,
-                        "status": node.status.lower(),
+                        "status": n_stat,
                         "is_root": False,
                     })
             return entries
@@ -1338,6 +1408,7 @@ class AutonomousDeliveryState:
                 self.completion_checklist["Git"] = True
 
             self.add_activity(normalized_role, "completed", op_name or (wo_id or ""))
+            self.reconcile_roles_from_work_orders()
 
         elif name in {"operation.cancelled", "agent.cancelled", "turn.cancelled", "session.cancelled"}:
             role = (payload.get("role") or "Agent").title()
@@ -1433,6 +1504,15 @@ class AutonomousDeliveryState:
                 self.current_turn_actions.expanded = True
             self.complete_turn_action(call_id, status=norm_status, error=err, tool_name=tool_name)
 
+        elif name in {"cycle.telemetry", "harness.telemetry"}:
+            telem = payload.get("telemetry") or payload
+            if isinstance(telem, Mapping):
+                self.last_telemetry = dict(telem)
+                self.cycle_telemetry.append(dict(telem))
+                prof = telem.get("execution_profile") or payload.get("execution_profile")
+                if prof:
+                    self.execution_profile = str(prof)
+
         elif name in {"agent.thinking", "turn.thinking", "reasoning.delta"}:
             raw_think = payload.get("text") or payload.get("thinking") or payload.get("thought") or payload.get("reasoning") or payload.get("delta") or ""
             think_text = str(raw_think)
@@ -1466,7 +1546,14 @@ class AutonomousDeliveryState:
             for k in self.completion_checklist:
                 self.completion_checklist[k] = True
             self.is_complete = True
+            for r_obj in self.roles.values():
+                if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
+                    r_obj.state = "COMPLETED"
+            for op in self.operations.values():
+                if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                    op.status = "COMPLETED"
             self.add_activity("StackMind", "delivered project complete handover")
+            self.reconcile_roles_from_work_orders()
 
         elif name == "run.phase":
             phase_val = str(payload.get("phase", "")).upper()
@@ -1476,7 +1563,14 @@ class AutonomousDeliveryState:
                     self.completion_checklist[k] = True
                 self.is_complete = True
                 self.error = None
+                for r_obj in self.roles.values():
+                    if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
+                        r_obj.state = "COMPLETED"
+                for op in self.operations.values():
+                    if op.status.upper() in {"RUNNING", "ACTIVE"}:
+                        op.status = "COMPLETED"
                 self.add_activity("StackMind", "project complete")
+                self.reconcile_roles_from_work_orders()
             elif phase_val in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
                                "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION",
                                "PRODUCT_READY", "GITOPS"):
