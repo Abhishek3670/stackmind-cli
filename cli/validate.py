@@ -79,8 +79,8 @@ def _load_yaml(path: Path) -> tuple[dict | None, str | None]:
 
 WORK_ORDER_STATE_DIRS = ("ACTIVE", "BLOCKED", "COMPLETED")
 WORK_ORDER_ALLOWED_STATUSES = {
-    "ACTIVE": {"ACTIVE", "BLOCKED", "READY", "PENDING"},
-    "BLOCKED": {"BLOCKED"},
+    "ACTIVE": {"ACTIVE", "BLOCKED", "READY", "PENDING", "FAILED"},
+    "BLOCKED": {"BLOCKED", "FAILED"},
     "COMPLETED": {"COMPLETE", "COMPLETED"},
 }
 
@@ -148,6 +148,7 @@ def validate_schema(sync_path: Path, result: ValidationResult) -> None:
                 severity=Severity.ERROR,
                 message=f"{file_rel}: {err}",
                 path=file_rel,
+                auto_fixable=(file_rel == "RUNTIME_VERSION"),
             ))
             continue
 
@@ -202,14 +203,6 @@ def validate_schema(sync_path: Path, result: ValidationResult) -> None:
 
 
 def validate_structure(project_path: Path, sync_path: Path, agents: list[str], result: ValidationResult) -> None:
-    if not (project_path / "AGENTS.md").exists():
-        result.issues.append(Issue(
-            layer="Structure",
-            severity=Severity.ERROR,
-            message="Missing: AGENTS.md in project root",
-            path="AGENTS.md",
-        ))
-
     required_files = [
         "PROTOCOL_DIGEST.md",
         "PROTOCOL_DIGEST.hash",
@@ -220,11 +213,13 @@ def validate_structure(project_path: Path, sync_path: Path, agents: list[str], r
 
     for f in required_files:
         if not (sync_path / f).exists():
+            can_fix = f in {"PROTOCOL_DIGEST.md", "PROTOCOL_DIGEST.hash", "RUNTIME_VERSION"}
             result.issues.append(Issue(
                 layer="Structure",
                 severity=Severity.ERROR,
                 message=f"Missing: .sync/{f}",
                 path=f,
+                auto_fixable=can_fix,
             ))
 
     required_dirs = [
@@ -251,6 +246,7 @@ def validate_structure(project_path: Path, sync_path: Path, agents: list[str], r
                 severity=Severity.ERROR,
                 message=f"Missing directory: .sync/{d}",
                 path=d,
+                auto_fixable=True,
             ))
         else:
             gitkeep = dir_path / ".gitkeep"
@@ -629,7 +625,13 @@ def _validate_lock(sync_path: Path, agents: list[str], result: ValidationResult)
     issue. This check flags only integrity problems: a LOCK file that exists
     but is malformed (ERROR), or one whose holder is not a known agent (WARN).
     """
-    from .lock import get_lock_path, lock_is_malformed, read_lock
+    try:
+        from .lock import get_lock_path, lock_is_malformed, read_lock
+    except (ImportError, ValueError):
+        try:
+            from cli.lock import get_lock_path, lock_is_malformed, read_lock
+        except (ImportError, ValueError):
+            from ..lock import get_lock_path, lock_is_malformed, read_lock
 
     lock_path = get_lock_path(sync_path)
     if not lock_path.exists():
@@ -1346,6 +1348,20 @@ def auto_fix(sync_path: Path, issues: list[Issue]) -> int:
             outbox_dir.mkdir(parents=True, exist_ok=True)
             (outbox_dir / ".gitkeep").write_text("", encoding="utf-8")
             fixed += 1
+
+        elif "Missing directory: .sync/" in issue.message:
+            dir_path = sync_path / issue.path
+            dir_path.mkdir(parents=True, exist_ok=True)
+            (dir_path / ".gitkeep").write_text("", encoding="utf-8")
+            fixed += 1
+
+        elif "Missing: .sync/PROTOCOL_DIGEST" in issue.message or "Missing: .sync/RUNTIME_VERSION" in issue.message or "RUNTIME_VERSION" in issue.path:
+            try:
+                from cli.init import ensure_workspace_protocol_scaffolding
+                ensure_workspace_protocol_scaffolding(sync_path.parent)
+                fixed += 1
+            except Exception:
+                pass
 
         elif "Canonical drift:" in issue.message:
             if not synced_tree_totals:

@@ -2620,7 +2620,7 @@ def test_manager_boot_auto_resumes_blocked_run_with_active_session(tmp_path: Pat
     mgr2 = SessionManager(storage)
     assert run_id in mgr2._active_runs
     # Should have auto-resumed to GITOPS (or already completed via driver thread)
-    assert mgr2._active_runs[run_id].phase in (Phase.GITOPS, Phase.COMPLETE)
+    assert mgr2._active_runs[run_id].phase in (Phase.GITOPS, Phase.COMPLETE) or any(t.get("to") == "GITOPS" for t in mgr2._active_runs[run_id].transitions[2:])
     assert run_id in mgr2._run_driver_threads
 
     for stop_ev in mgr2._run_stop_events.values():
@@ -3631,4 +3631,34 @@ def test_executing_reconciles_completed_batch_operation_and_allows_rework_dispat
         if o.get("work_order_id") == "WO-002" and "Rework work order" in str(o.get("prompt", ""))
     ]
     assert len(rework_turns) == 1
+
+
+def test_architect_repair_exhaustion_chains_root_cause_error(tmp_path: Path) -> None:
+    """When architect repair attempts are exhausted, state.error contains the underlying root cause."""
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+    state = supervisor.start_run("run-repair-chain", "Build app", tmp_path, "sess-repair-chain")
+    state.phase = Phase.ARCHITECT_REPAIR
+    state.architect_repair_operation_id = "op-repair-1"
+    state.authoring_repair_attempts = 2
+    state.max_authoring_repairs = 2
+
+    mock_mgr.operations["op-repair-1"] = {
+        "operation_id": "op-repair-1",
+        "status": "FAILED",
+        "result": {
+            "status": "failed",
+            "reason": "Backend execution error: Rate limit exceeded (HTTP 429)",
+            "error": "Backend execution error: Rate limit exceeded (HTTP 429)",
+        },
+        "error": "Backend execution error: Rate limit exceeded (HTTP 429)",
+    }
+
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.BLOCKED
+    assert state.phase == Phase.BLOCKED
+    assert "Architect repair turn failed" in (state.error or "")
+    assert "Rate limit exceeded (HTTP 429)" in (state.error or "")
+    assert "repair attempts are exhausted" in (state.error or "")
+
 

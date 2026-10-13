@@ -1,5 +1,7 @@
 """stackmind CLI entry point."""
 
+import os
+import sys
 from pathlib import Path
 
 import click
@@ -8,7 +10,8 @@ from . import __version__
 from .analyze import analyze
 from .graph import graph
 from .harness import harness
-from .tui import tui
+from .tui import tui as tui_app
+from .tui_startup import check_provider_configuration, ensure_daemon, prepare_project
 
 
 @click.group()
@@ -391,6 +394,7 @@ from .experience import experience_group
 from .skill import skill_group
 from .learn import learn_group
 from .daemon import daemon_group
+from .projects import projects_group
 
 cli.add_command(graph)
 cli.add_command(harness)
@@ -399,6 +403,53 @@ cli.add_command(experience_group)
 cli.add_command(skill_group)
 cli.add_command(learn_group)
 cli.add_command(daemon_group)
+cli.add_command(projects_group)
+@click.command("tui")
+@click.option("--daemon-url", default=None, help="URL of an existing local daemon.")
+@click.option("--agent", "-a", default="claude", show_default=True)
+@click.option(
+    "--workspace",
+    "-w",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("."),
+)
+@click.option("--session-id", "-s", default=None, help="Attach to a specific daemon session ID.")
+@click.option("--demo", is_flag=True, help="Run the automated daemon-backed walkthrough.")
+@click.option("--timeout", "client_timeout", type=float, default=0, show_default=True)
+@click.option("--yes", is_flag=True, help="Confirm safe adoption of an existing project.")
+@click.pass_context
+def tui(ctx, daemon_url, agent, workspace, session_id, demo, client_timeout, yes):
+    """Prepare the current project and launch the governed terminal interface."""
+    workspace = workspace.resolve()
+    prepare_project(
+        workspace,
+        yes=yes,
+        interactive=sys.stdin.isatty(),
+    )
+    daemon = None
+    try:
+        daemon, ready_url = ensure_daemon(workspace, daemon_url)
+        check_provider_configuration(workspace)
+        click.echo("Launching StackMind TUI...")
+        ctx.invoke(
+            tui_app,
+            daemon_url=ready_url,
+            agent=agent,
+            workspace=workspace,
+            demo=demo,
+            client_timeout=client_timeout,
+            target_session_id=session_id,
+        )
+    finally:
+        if daemon is not None:
+            from cli.daemon import clear_daemon_pid
+
+            try:
+                daemon.stop()
+            finally:
+                clear_daemon_pid(workspace, expected_pid=os.getpid())
+
+
 cli.add_command(tui)
 
 if __name__ == "__main__":

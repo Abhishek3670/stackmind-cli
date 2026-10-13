@@ -18,6 +18,7 @@ class _Result:
     persisted: bool = False
     task_id: str | None = "turn-task"
     reason: str | None = None
+    meta: dict[str, Any] | None = None
 
 
 class _SuccessfulRunner:
@@ -144,4 +145,30 @@ def test_goal_turn_routes_to_architecture_claude(tmp_path):
         turn_started = next(event for event in events if event["name"] == "turn.started")
         assert turn_started["payload"]["role"] == "architecture"
         assert turn_started["payload"]["agent_id"] == "claude"
+
+
+def test_adhoc_turn_propagates_conversational_response(tmp_path):
+    class _ChatRunner:
+        def run_once(self, **kwargs) -> _Result:
+            return _Result(
+                "completed",
+                persisted=True,
+                meta={
+                    "summary": "Hello! How can I assist you with your project today?",
+                    "report_markdown": "Hello! How can I assist you with your project today?",
+                },
+            )
+
+    runner = _ChatRunner()
+    with LocalDaemon(tmp_path, runner_factory=lambda workspace, agent: runner) as daemon:
+        client = DaemonClient(daemon.url)
+        session = client.create_session(
+            agent="codex", provider="test", contract=_contract(), workspace="workspace"
+        )
+        op = client.turn(session["session_id"], "hello")
+        completed = _wait_for(client, op["operation_id"], "COMPLETED")
+        res = completed.get("result") or {}
+        assert res.get("summary") == "Hello! How can I assist you with your project today?"
+        assert res.get("report_markdown") == "Hello! How can I assist you with your project today?"
+
 

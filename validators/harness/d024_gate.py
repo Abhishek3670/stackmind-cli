@@ -324,6 +324,79 @@ class D024Gate:
                     pass
         return None
 
+    def _is_qa_work_order(self, wo_data: dict[str, Any]) -> bool:
+        """Check if work order represents a QA / verification task."""
+        assigned = [str(a).lower().strip() for a in wo_data.get("assigned_agents", [])]
+        if any(a in ("gemma", "qa") for a in assigned):
+            return True
+        wo_type = str(wo_data.get("type", "")).lower().strip()
+        if wo_type in ("qa", "verification", "validation"):
+            return True
+        title_lower = str(wo_data.get("title", "")).lower()
+        if any(kw in title_lower for kw in ("qa", "verification")):
+            return True
+        return False
+
+    def _is_doc_or_exempt_work_order(self, wo_data: dict[str, Any]) -> bool:
+        """Check if work order is documentation, audit, or scaffolding."""
+        wo_type = str(wo_data.get("type", "")).lower().strip()
+        if wo_type in ("doc", "docs", "documentation", "audit", "scaffolding", "review"):
+            return True
+        title_lower = str(wo_data.get("title", "")).lower()
+        if any(kw in title_lower for kw in ("documentation", "document", "docs", "readme", "audit")):
+            return True
+        deliverable = wo_data.get("deliverable")
+        if isinstance(deliverable, dict):
+            deliv_type = str(deliverable.get("type", "")).lower().strip()
+            if deliv_type in ("doc", "docs", "documentation", "audit"):
+                return True
+            deliv_path = str(deliverable.get("path") or deliverable.get("file") or "").lower().strip()
+            if deliv_path.endswith((".md", ".txt", ".rst", ".markdown")):
+                return True
+        elif isinstance(deliverable, str):
+            deliv_path = deliverable.lower().strip()
+            if deliv_path.endswith((".md", ".txt", ".rst", ".markdown")):
+                return True
+        return False
+
+    def _has_code_deliverables(self, wo_data: dict[str, Any]) -> bool:
+        """Check if work order declares any code deliverables."""
+        deliv_items: list[Any] = []
+        d = wo_data.get("deliverable")
+        if d:
+            deliv_items.append(d)
+        for extra in wo_data.get("deliverables", []):
+            if extra:
+                deliv_items.append(extra)
+
+        if not deliv_items:
+            return False
+
+        for item in deliv_items:
+            deliv_type = ""
+            deliv_path = ""
+            if isinstance(item, dict):
+                deliv_type = str(item.get("type", "")).lower().strip()
+                deliv_path = str(item.get("path") or item.get("file") or "").lower().strip()
+            elif isinstance(item, str):
+                deliv_path = item.lower().strip()
+
+            if deliv_path.endswith((".py", ".ts", ".js", ".go", ".rs", ".dart", ".java", ".c", ".cpp", ".cs", ".rb", ".php")):
+                return True
+            if deliv_type == "code" and not deliv_path.endswith((".md", ".txt", ".json", ".yaml", ".yml", ".rst", ".markdown")):
+                return True
+        return False
+
+    def _is_exempt_from_qa(self, wo_data: dict[str, Any]) -> bool:
+        """Determine if a work order is exempt from requiring Gemma QA verdicts."""
+        if self._is_qa_work_order(wo_data):
+            return True
+        if self._is_doc_or_exempt_work_order(wo_data):
+            return True
+        if not self._has_code_deliverables(wo_data):
+            return True
+        return False
+
     def resolve_target_work_orders(
         self, project_path: Path, work_order_id: str, wo_data: dict[str, Any]
     ) -> tuple[str, ...]:
@@ -345,12 +418,7 @@ class D024Gate:
                 if dep_file:
                     try:
                         dep_data = yaml.safe_load(dep_file.read_text(encoding="utf-8")) or {}
-                        is_dep_qa = (
-                            any(str(a).lower().strip() in ("gemma", "qa") for a in dep_data.get("assigned_agents", []))
-                            or any(kw in str(dep_data.get("title", "")).lower() for kw in ("qa", "verification"))
-                            or str(dep_data.get("type", "")).lower() in ("doc", "qa", "verification")
-                        )
-                        if is_dep_qa:
+                        if self._is_exempt_from_qa(dep_data):
                             qa_underlying_deps = [
                                 d for d in dep_data.get("dependencies", [])
                                 if isinstance(d, str) and WO_REF_PATTERN.match(d)
@@ -505,17 +573,16 @@ class D024Gate:
 
         for target_wo in target_wos:
             # 1. Implementation deliverable completeness check
+            from validators.harness.deliverable_verifier import DeliverableVerifier
             target_file = self.find_work_order_file(project_path, target_wo)
             target_data: dict[str, Any] = {}
             if target_file:
                 try:
                     target_data = yaml.safe_load(target_file.read_text(encoding="utf-8")) or {}
-                    is_qa_wo = (
-                        any(str(a).lower().strip() in ("gemma", "qa") for a in target_data.get("assigned_agents", []))
-                        or any(kw in str(target_data.get("title", "")).lower() for kw in ("qa", "verification"))
-                        or str(target_data.get("type", "")).lower() in ("doc", "qa", "verification")
-                    )
-                    if is_qa_wo and (str(target_data.get("status", "")).upper() == "COMPLETED" or target_file.parent.name == "COMPLETED"):
+                    if self._is_exempt_from_qa(target_data) and (
+                        str(target_data.get("status", "")).upper() == "COMPLETED"
+                        or target_file.parent.name == "COMPLETED"
+                    ):
                         continue
                     # Check deliverable
                     deliv_paths: list[str] = []
@@ -534,7 +601,9 @@ class D024Gate:
                             deliv_paths.append(str(d.get("path") or d.get("file")).strip())
 
                     for deliv_path_str in deliv_paths:
+                        deliverable_issues = []
                         deliv_file = project_path / deliv_path_str
+
                         if not deliv_file.exists():
                             decision = D024GateDecision(
                                 passed=False,
@@ -563,7 +632,6 @@ class D024Gate:
                             return decision
 
                         # Quality & Security validations on existing deliverable
-                        deliverable_issues: list[str] = []
                         if deliv_file.is_file():
                             from validators.kernel.security import scan_for_credential_leaks
                             content = deliv_file.read_text(encoding="utf-8", errors="replace")
@@ -617,6 +685,15 @@ class D024Gate:
                                 if not sat_res.passed:
                                     deliverable_issues.append(sat_res.diagnostic or f"import satisfiability failed for {deliv_path_str}")
 
+                        # Content-aware verification (Fix 3)
+                        verifier = DeliverableVerifier()
+                        verification_result = verifier.verify(deliv_file)
+
+                        if not verification_result.passed:
+                            for check in verification_result.checks:
+                                if not check.passed and check.severity == "error":
+                                    deliverable_issues.append(f"content verification failed ({check.name}): {check.message}")
+
                         if deliverable_issues:
                             decision = D024GateDecision(
                                 passed=False,
@@ -627,6 +704,13 @@ class D024Gate:
                                 deliverable_exists=True,
                                 deliverable_path=deliv_path_str,
                                 reason="; ".join(deliverable_issues),
+                                evidence={
+                                    "verification_hash": verification_result.content_hash,
+                                    "verification_checks": [
+                                        {"name": c.name, "passed": c.passed, "severity": c.severity, "message": c.message}
+                                        for c in verification_result.checks
+                                    ],
+                                },
                             )
                             self.log_decision(project_path, decision)
                             return decision
@@ -634,6 +718,9 @@ class D024Gate:
                     pass
 
             # 2. QA verdict inspection
+            if self._is_exempt_from_qa(target_data):
+                continue
+
             verdicts = self.find_qa_verdicts(project_path, target_wo)
             if not verdicts:
                 # Also check if a QA work order that depends on target_wo has completed
@@ -649,7 +736,7 @@ class D024Gate:
                     for wf in p_dir.glob("*.yaml"):
                         try:
                             wdata = yaml.safe_load(wf.read_text(encoding="utf-8")) or {}
-                            if any(str(a).lower().strip() in ("gemma", "qa") for a in wdata.get("assigned_agents", [])):
+                            if self._is_qa_work_order(wdata):
                                 is_wo_completed = (
                                     str(wdata.get("status", "")).upper() == "COMPLETED"
                                     or wf.parent.name == "COMPLETED"

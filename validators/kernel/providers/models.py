@@ -46,7 +46,7 @@ class ToolCallRequest:
     arguments: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_provider_call(cls, call_id: str, name: str, arguments: str | dict[str, Any]) -> ToolCallRequest:
+    def from_provider_call(cls, call_id: str | None, name: str | None, arguments: str | dict[str, Any] | None = None) -> ToolCallRequest:
         if isinstance(arguments, str):
             try:
                 parsed = json.loads(arguments) if arguments.strip() else {}
@@ -56,7 +56,7 @@ class ToolCallRequest:
             parsed = arguments
         else:
             parsed = {}
-        return cls(id=call_id, name=name, arguments=parsed)
+        return cls(id=str(call_id or ""), name=str(name or ""), arguments=parsed)
 
 
 @dataclass(frozen=True)
@@ -96,6 +96,8 @@ class Message:
             object.__setattr__(self, "role", self.role.value)
         if isinstance(self.tool_calls, list):
             object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
+        elif self.tool_calls is None:
+            object.__setattr__(self, "tool_calls", ())
 
     @classmethod
     def system(cls, content: str) -> Message:
@@ -109,12 +111,12 @@ class Message:
     def assistant(
         cls,
         content: str | None = None,
-        tool_calls: tuple[ToolCallRequest, ...] | list[ToolCallRequest] = (),
+        tool_calls: tuple[ToolCallRequest, ...] | list[ToolCallRequest] | None = (),
     ) -> Message:
         return cls(
             role=MessageRole.ASSISTANT.value,
             content=content,
-            tool_calls=tuple(tool_calls),
+            tool_calls=tuple(tool_calls or ()),
         )
 
     @classmethod
@@ -155,6 +157,7 @@ class StreamChunk:
 
     delta_content: str = ""
     delta_tool_calls: tuple[ToolCallRequest, ...] = ()
+    delta_thinking: str = ""
     finish_reason: str | None = None
     usage: TokenUsage | None = None
 

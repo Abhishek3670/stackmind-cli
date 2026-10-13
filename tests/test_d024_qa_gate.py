@@ -724,4 +724,109 @@ def test_gitops_release_scope_idempotent_write_recognized(tmp_path):
     assert dec_norm - all_observed == set()
 
 
+def test_d024_gate_passes_gitops_when_documentation_wo_completed(tmp_path: Path):
+    """GitOps depending on completed documentation work orders (e.g. README.md) must not require QA verdicts."""
+    project = _init_project(tmp_path)
+    gate = D024Gate()
+
+    completed_dir = project / ".sync" / "work-orders" / "COMPLETED"
+    active_dir = project / ".sync" / "work-orders" / "ACTIVE"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-010: Audit report
+    (project / "GAP_ANALYSIS.md").write_text("# Gap Analysis\n", encoding="utf-8")
+    _write_yaml(completed_dir / "WO-010.yaml", {
+        "id": "WO-010",
+        "type": "AUDIT",
+        "title": "Security & Logic Gap Analysis",
+        "status": "COMPLETED",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "doc", "path": "GAP_ANALYSIS.md", "description": "Audit findings"},
+    })
+
+    # WO-012: QA work order verified WO-010
+    (project / "tests").mkdir(parents=True, exist_ok=True)
+    (project / "tests" / "gap_verification.py").write_text("def test_gap(): pass\n", encoding="utf-8")
+    _write_yaml(completed_dir / "WO-012.yaml", {
+        "id": "WO-012",
+        "type": "VALIDATION",
+        "title": "QA & Verification Gap Analysis",
+        "status": "COMPLETED",
+        "assigned_agents": ["gemma"],
+        "dependencies": ["WO-010"],
+        "deliverable": {"type": "code", "path": "tests/gap_verification.py", "description": "Verification suite"},
+    })
+
+    # WO-013: Documentation & Project Finalization (type: FEATURE, deliverable: README.md)
+    (project / "README.md").write_text("# Project Docs\nSetup instructions...\n", encoding="utf-8")
+    _write_yaml(completed_dir / "WO-013.yaml", {
+        "id": "WO-013",
+        "type": "FEATURE",
+        "title": "Documentation & Project Finalization",
+        "status": "COMPLETED",
+        "assigned_agents": ["codex"],
+        "dependencies": ["WO-010", "WO-012"],
+        "deliverable": {"type": "doc", "path": "README.md", "description": "Project documentation"},
+    })
+
+    # WO-014: GitOps & Delivery depending on WO-013
+    (project / ".sync" / "delivery_manifest.yaml").write_text("status: ready\n", encoding="utf-8")
+    _write_yaml(active_dir / "WO-014.yaml", {
+        "id": "WO-014",
+        "type": "PHASE",
+        "title": "GitOps & Delivery",
+        "status": "ACTIVE",
+        "assigned_agents": ["local-llm"],
+        "dependencies": ["WO-013"],
+        "deliverable": {"type": "config", "path": ".sync/delivery_manifest.yaml", "description": "Delivery manifest"},
+    })
+
+    # Evaluating WO-014 must pass D024 Gate without requiring a QA verdict for WO-013
+    decision = gate.evaluate_work_order(project, "WO-014")
+    assert decision.passed is True
+    assert decision.work_order_id == "WO-014"
+
+    # Evaluating WO-013 directly must also pass
+    doc_decision = gate.evaluate_work_order(project, "WO-013")
+    assert doc_decision.passed is True
+
+
+def test_d024_gate_documentation_deliverable_validation(tmp_path: Path):
+    """Active documentation work orders are validated for deliverable presence without demanding code QA verdicts."""
+    project = _init_project(tmp_path)
+    gate = D024Gate()
+
+    active_dir = project / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # Active doc work order with missing deliverable
+    _write_yaml(active_dir / "WO-020.yaml", {
+        "id": "WO-020",
+        "type": "FEATURE",
+        "title": "Author User Guide",
+        "status": "ACTIVE",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "doc", "path": "GUIDE.md", "description": "User guide"},
+    })
+
+    dec_missing = gate.evaluate_work_order(project, "WO-020")
+    assert dec_missing.passed is False
+    assert "does not exist: GUIDE.md" in dec_missing.reason
+
+    # Create empty deliverable -> blocks as empty
+    (project / "GUIDE.md").write_text("", encoding="utf-8")
+    dec_empty = gate.evaluate_work_order(project, "WO-020")
+    assert dec_empty.passed is False
+    assert "empty (0 bytes)" in dec_empty.reason
+
+    # Create valid deliverable -> passes without needing Gemma QA verdict
+    (project / "GUIDE.md").write_text("# User Guide\nContent here.\n", encoding="utf-8")
+    dec_ok = gate.evaluate_work_order(project, "WO-020")
+    assert dec_ok.passed is True
+
+
+
 

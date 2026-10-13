@@ -42,7 +42,35 @@ from .providers import (
     ToolCallRequest,
     ToolDefinition,
 )
+from .home import (
+    get_daemon_home_dir,
+    get_global_settings_path,
+    get_global_skills_dir,
+    get_global_tmp_dir,
+    get_project_entry,
+    get_projects_registry_path,
+    get_sessions_home_dir,
+    get_stackmind_home,
+    list_registered_projects,
+    register_project,
+    touch_project,
+    unregister_project,
+)
+from .profile import (
+    ExecutionProfile,
+    ProfilePolicy,
+    VerificationDepth,
+    get_profile_policy,
+)
 from .session import AgentSession, Attempt, LifecycleState
+from .settings import (
+    ProviderConfig,
+    StackMindSettings,
+    get_default_settings,
+    load_settings,
+    save_settings,
+    test_provider_connection,
+)
 from .tools import ToolGateway
 from .tui import DaemonClient, StackMindTuiAdapter
 from .verification import SandboxCanaryVerifier
@@ -67,12 +95,16 @@ __all__ = [
     "EligibilityDecision",
     "EventDispatcher",
     "EnsembleMember",
+    "ExecutionProfile",
     "GovernedToolRegistry",
     "ExperienceEligibilityGate",
     "FileDiffSnapshot",
     "HumanIdentity",
     "HandoffRecord",
     "LifecycleState",
+    "ProfilePolicy",
+    "VerificationDepth",
+    "get_profile_policy",
     "JsonRpcProtocol",
     "LocalDaemon",
     "Message",
@@ -111,4 +143,16 @@ __all__ = [
     "ToolGateway",
     "WorkspaceEscapeError",
     "derive_verification_dimensions",
+    "get_daemon_home_dir",
+    "get_global_settings_path",
+    "get_global_skills_dir",
+    "get_global_tmp_dir",
+    "get_project_entry",
+    "get_projects_registry_path",
+    "get_sessions_home_dir",
+    "get_stackmind_home",
+    "list_registered_projects",
+    "register_project",
+    "touch_project",
+    "unregister_project",
 ]

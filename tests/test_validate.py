@@ -74,11 +74,6 @@ class TestValidate:
         assert not result.passed
         assert any("not a stackmind runtime" in i.message for i in result.errors)
 
-    def test_missing_agents_md(self, fresh_project):
-        (fresh_project / "AGENTS.md").unlink()
-        result = validate(fresh_project)
-        assert not result.passed
-        assert any("AGENTS.md" in i.message for i in result.errors)
 
     def test_corrupt_tree_yaml(self, sync_path):
         tree = sync_path / "runtime" / "TREE.yaml"
@@ -360,7 +355,9 @@ class TestAutoFix:
         assert (sync_path / "outbox" / "gemini").exists()
 
     def test_non_fixable_errors_remain(self, fresh_project, sync_path):
-        (fresh_project / "AGENTS.md").unlink()
+        # AGENTS.md is no longer required in product root (it's internal)
+        # Test missing .sync runtime instead
+        shutil.rmtree(sync_path / "runtime")
         result = validate(fresh_project, fix=True)
         assert not result.passed
 

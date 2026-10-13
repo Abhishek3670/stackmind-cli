@@ -41,7 +41,8 @@
         "ACTIVE",
         "BLOCKED",
         "COMPLETE",
-        "COMPLETED"
+        "COMPLETED",
+        "FAILED"
       ]
     },
     "priority": {
@@ -66,6 +67,14 @@
         "type": "string"
       }
     },
+    "requirement_refs": {
+      "type": "array",
+      "description": "Stable requirement IDs from the requirements ledger that this work order addresses (e.g., ['R001', 'R002']).",
+      "items": {
+        "type": "string",
+        "pattern": "^R[0-9]{3}$"
+      }
+    },
     "affected_services": {
       "type": "array",
       "items": {
@@ -83,6 +92,13 @@
     },
     "references": {
       "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "skills": {
+      "type": "array",
+      "description": "Procedural skills selected by the Architect for this work order",
       "items": {
         "type": "string"
       }
@@ -379,7 +395,8 @@
                 "ACTIVE",
                 "BLOCKED",
                 "COMPLETE",
-                "COMPLETED"
+                "COMPLETED",
+                "FAILED"
               ]
             },
             "completed_at": {

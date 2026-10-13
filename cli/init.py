@@ -3,7 +3,6 @@
 Handles:
 - Template rendering ({{PLACEHOLDER}} substitution)
 - Directory structure creation from templates/sync/
-- AGENTS.md rendering to project root
 - Git initialization for both project and .sync repos
 - PROTOCOL_DIGEST.hash generation (SHA-256)
 - RUNTIME_VERSION file creation
@@ -189,6 +188,9 @@ def _create_empty_dirs(sync_path: Path, agents: list[str]) -> None:
         "state",
         "runtime/drafts",
         "runtime/receipts",
+        "runtime/boot",
+        "runtime/supervisor",
+        "runtime/daemon",
         "experience/records",
         "experience/cache",
         "skills/manifests",
@@ -228,7 +230,7 @@ def _create_empty_dirs(sync_path: Path, agents: list[str]) -> None:
         (outbox_dir / ".gitkeep").write_text("", encoding="utf-8")
 
     # Work order subdirectories
-    for wo_dir in ["ACTIVE", "COMPLETED", "BLOCKED"]:
+    for wo_dir in ["ACTIVE", "COMPLETED", "BLOCKED", "TEMPLATES"]:
         dir_path = sync_path / "work-orders" / wo_dir
         dir_path.mkdir(parents=True, exist_ok=True)
         gitkeep = dir_path / ".gitkeep"
@@ -236,12 +238,140 @@ def _create_empty_dirs(sync_path: Path, agents: list[str]) -> None:
             gitkeep.write_text("", encoding="utf-8")
 
 
+def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
+    """Ensure baseline .sync/ directories and required protocol governance files exist.
+
+    Idempotent and safe to invoke on any active workspace. Creates missing directories
+    and populates PROTOCOL_DIGEST.md, PROTOCOL_DIGEST.hash, and RUNTIME_VERSION if missing.
+    Also repairs schema-invalid work-order status 'FAILED' to 'BLOCKED'.
+    """
+    try:
+        ws_path = Path(workspace).resolve()
+        sync_path = ws_path / ".sync"
+        sync_path.mkdir(parents=True, exist_ok=True)
+
+        templates_dir = get_templates_dir()
+        templates_sync_dir = templates_dir / "sync"
+
+        # 1. PROTOCOL_DIGEST.md & .hash
+        digest_path = sync_path / "PROTOCOL_DIGEST.md"
+        if not digest_path.exists():
+            src_digest = templates_sync_dir / "PROTOCOL_DIGEST.md"
+            if src_digest.exists():
+                shutil.copy2(src_digest, digest_path)
+            else:
+                digest_path.write_text("# StackMind Protocol Digest\n\nProtocol rules active.\n", encoding="utf-8")
+
+        hash_path = sync_path / "PROTOCOL_DIGEST.hash"
+        if not hash_path.exists() or hash_path.stat().st_size == 0:
+            hash_val = compute_protocol_hash(digest_path)
+            hash_path.write_text(f"{hash_val}\n", encoding="utf-8", newline="\n")
+
+        # 2. RUNTIME_VERSION
+        version_path = sync_path / "RUNTIME_VERSION"
+        needs_version_write = False
+        if not version_path.exists() or version_path.stat().st_size == 0:
+            needs_version_write = True
+        else:
+            try:
+                import yaml
+                v_data = yaml.safe_load(version_path.read_text(encoding="utf-8"))
+                if not isinstance(v_data, dict):
+                    needs_version_write = True
+            except Exception:
+                needs_version_write = True
+
+        if needs_version_write:
+            src_template = templates_sync_dir / "RUNTIME_VERSION.template"
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if src_template.exists():
+                tmpl_text = src_template.read_text(encoding="utf-8")
+                content = tmpl_text.replace("{{INIT_TIMESTAMP}}", now_iso).replace("{{RUNTIME_VERSION}}", RUNTIME_VERSION)
+                version_path.write_text(content, encoding="utf-8")
+            else:
+                default_content = (
+                    f'version: "{RUNTIME_VERSION}"\n\n'
+                    'schema_versions:\n'
+                    '  tree: 1\n'
+                    '  boot: 1\n'
+                    '  work_order: 1\n'
+                    '  index: 1\n\n'
+                    f'min_cli_version: "{RUNTIME_VERSION}"\n\n'
+                    f'created_at: "{now_iso}"\n'
+                    'created_by: "stackmind-init"\n\n'
+                    'upgraded_at: null\n'
+                    'upgraded_from: null\n'
+                    'upgraded_by: null\n\n'
+                    'migration_history: []\n'
+                )
+                version_path.write_text(default_content, encoding="utf-8")
+
+        # 3. Create all baseline directories with .gitkeep
+        _create_empty_dirs(sync_path, DEFAULT_AGENTS)
+
+        # 4. Repair schema-invalid FAILED status on work orders
+        import yaml
+        wos_dir = sync_path / "work-orders"
+        if wos_dir.is_dir():
+            for sub in ("ACTIVE", "BLOCKED"):
+                sub_dir = wos_dir / sub
+                if sub_dir.is_dir():
+                    for f in sub_dir.glob("*.yaml"):
+                        try:
+                            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                            if isinstance(data, dict) and str(data.get("status", "")).upper() == "FAILED":
+                                data["status"] = "BLOCKED"
+                                f.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+                        except Exception:
+                            pass
+            idx_file = wos_dir / "INDEX.yaml"
+            if idx_file.is_file():
+                try:
+                    idx_data = yaml.safe_load(idx_file.read_text(encoding="utf-8"))
+                    if isinstance(idx_data, dict) and isinstance(idx_data.get("orders"), list):
+                        changed = False
+                        for o in idx_data["orders"]:
+                            if isinstance(o, dict) and str(o.get("status", "")).upper() == "FAILED":
+                                o["status"] = "BLOCKED"
+                                changed = True
+                        if changed:
+                            idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                except Exception:
+                    pass
+
+        # 5. Mirror bundled schemas into workspace schemas/ directory
+        ws_schemas_dir = ws_path / "schemas"
+        ws_schemas_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            bundled_schemas = Path(__file__).resolve().parents[1] / "schemas"
+            if bundled_schemas.is_dir():
+                for s_file in bundled_schemas.glob("*.json"):
+                    dest_file = ws_schemas_dir / s_file.name
+                    if not dest_file.exists():
+                        shutil.copy2(s_file, dest_file)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+STACKMIND_ROOT_FILES = (
+    ".gitignore",
+    "README.md",
+    "PLAN.md",
+    "CHANGELOG.md",
+    "VERSION",
+)
+
+
 def init_git(path: Path, initial_commit: bool = True) -> bool:
     """Initialize a git repository at the given path.
 
     Args:
         path: Directory to initialize as a git repo.
-        initial_commit: If True, create an initial commit.
+        initial_commit: If True, create an initial commit of the StackMind
+            files only, and only when the repository has no commits yet.
+            Existing user files and history are never staged or rewritten.
 
     Returns:
         True if git init succeeded, False otherwise.
@@ -256,20 +386,48 @@ def init_git(path: Path, initial_commit: bool = True) -> bool:
         )
 
         if initial_commit:
-            subprocess.run(
-                ["git", "add", "."],
+            # Only the very first commit is created here; repositories with
+            # existing history are left untouched.
+            has_commits = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
                 cwd=str(path),
                 capture_output=True,
-                check=True,
+                check=False,
                 text=True,
-            )
-            # Ensure .sync is never staged into the outer repository
-            if (path / ".sync").exists() and path.name != ".sync":
+            ).returncode == 0
+            if has_commits:
+                return True
+            if path.name != ".sync":
+                # Stage only the StackMind-rendered root files so pre-existing
+                # user files are never swept into the initialization commit.
+                # (.sync/ is ignored via .gitignore; the .sync repo is separate.)
+                # Clear any pre-existing staged changes so only stackmind files are committed.
                 subprocess.run(
-                    ["git", "reset", ".sync"],
+                    ["git", "reset"],
                     cwd=str(path),
                     capture_output=True,
                     check=False,
+                    text=True,
+                )
+                existing = [f for f in STACKMIND_ROOT_FILES if (path / f).is_file()]
+                if not existing:
+                    return True
+                subprocess.run(
+                    ["git", "add", "--", *existing],
+                    cwd=str(path),
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                )
+            else:
+                # Clear any pre-existing staged changes so only stackmind files are committed.
+                subprocess.run(["git", "reset"], cwd=str(path), capture_output=True, check=False, text=True)
+                subprocess.run(
+                    ["git", "add", "."],
+                    cwd=str(path),
+                    capture_output=True,
+                    check=True,
+                    text=True,
                 )
             subprocess.run(
                 ["git", "commit", "-m", "Initial stackmind runtime"],
@@ -305,10 +463,6 @@ def validate_result(project_path: Path, agents: list[str]) -> list[str]:
     """
     errors: list[str] = []
     sync_path = project_path / ".sync"
-
-    # Required root files
-    if not (project_path / "AGENTS.md").exists():
-        errors.append("Missing: AGENTS.md in project root")
 
     # Required .sync files
     required_sync_files = [
@@ -401,6 +555,7 @@ def init(
     name: Optional[str] = None,
     agents: Optional[list[str]] = None,
     no_git: bool = False,
+    preserve_existing: bool = False,
 ) -> bool:
     """Initialize a new stackmind runtime at the given path.
 
@@ -411,6 +566,9 @@ def init(
         name: Project name. Defaults to directory name.
         agents: List of agent names. Defaults to all 5 agents.
         no_git: If True, skip git initialization.
+        preserve_existing: If True, create only missing project-root files and
+            merge StackMind ignore entries into an existing .gitignore. This is
+            intended for adoption by ``stackmind tui``; .sync must still be absent.
 
     Returns:
         True if initialization succeeded, False otherwise.
@@ -481,38 +639,41 @@ def init(
         "STACKMIND_BIN_PATH": stackmind_bin.replace("\\", "/"),
     }
 
-    # ── Step 4: Render AGENTS.md and README.md to project root ─
-    agents_template = templates_dir / "AGENTS.template.md"
-    render_template_file(
-        agents_template,
-        project_path / "AGENTS.md",
-        context,
-    )
-
+    # ── Step 4: Render product-facing documentation ─
+    # AGENTS.md is internal runtime metadata, stays in .sync/ only
     readme_template = templates_dir / "README.template.md"
-    if readme_template.exists():
+    readme_path = project_path / "README.md"
+    if readme_template.exists() and (not preserve_existing or not readme_path.exists()):
         render_template_file(
             readme_template,
-            project_path / "README.md",
+            readme_path,
             context,
         )
-        
+
     plan_template = templates_dir / "PLAN.template.md"
-    if plan_template.exists():
+    if plan_template.exists() and (
+        not preserve_existing or not (project_path / "PLAN.md").exists()
+    ):
         render_template_file(plan_template, project_path / "PLAN.md", context)
-        
+
     changelog_template = templates_dir / "CHANGELOG.template.md"
-    if changelog_template.exists():
+    if changelog_template.exists() and (
+        not preserve_existing or not (project_path / "CHANGELOG.md").exists()
+    ):
         render_template_file(changelog_template, project_path / "CHANGELOG.md", context)
-        
+
     version_template = templates_dir / "VERSION.template"
-    if version_template.exists():
+    if version_template.exists() and (
+        not preserve_existing or not (project_path / "VERSION").exists()
+    ):
         render_template_file(version_template, project_path / "VERSION", context)
 
     gitignore_template = templates_dir / ".gitignore.template"
     gitignore_path = project_path / ".gitignore"
-    if gitignore_template.exists():
+    if gitignore_template.exists() and (not preserve_existing or not gitignore_path.exists()):
         render_template_file(gitignore_template, gitignore_path, context)
+    elif preserve_existing and gitignore_path.exists():
+        _merge_stackmind_gitignore(gitignore_path)
     elif not gitignore_path.exists():
         gitignore_path.write_text(".sync/\ngraphify-out/\n", encoding="utf-8", newline="\n")
     else:
@@ -520,7 +681,7 @@ def init(
         if ".sync/" not in current_gi:
             gitignore_path.write_text(current_gi.rstrip() + "\n\n# Stackmind runtime\n.sync/\ngraphify-out/\n", encoding="utf-8", newline="\n")
 
-    console.print("[bold green][+][/bold green] Rendered AGENTS.md, PLAN.md, CHANGELOG.md, VERSION, .gitignore")
+    console.print("[bold green][+][/bold green] Rendered PLAN.md, CHANGELOG.md, VERSION, .gitignore")
 
     # ── Step 5: Create .sync/ structure ───────────────────────
     sync_path.mkdir(parents=True, exist_ok=True)
@@ -572,12 +733,61 @@ def init(
             f"  Runtime: [dim]{sync_path}[/dim]\n"
             f"  Version: [dim]v{RUNTIME_VERSION}[/dim]\n\n"
             f"[dim]Next steps:[/dim]\n"
-            f"  1. Review [bold]AGENTS.md[/bold] in project root\n"
-            f"  2. Customize agent contracts in [bold].sync/agents/[/bold]\n"
-            f"  3. Run [bold]stackmind validate {project_path}[/bold] to verify",
+            f"  1. Customize agent contracts in [bold].sync/agents/[/bold]\n"
+            f"  2. Run [bold]stackmind validate {project_path}[/bold] to verify",
             title="[bold] stackmind [/bold]",
             border_style="green",
         )
     )
+    # Register project in centralized ~/.stackmindcli/projects.json
+    try:
+        from validators.kernel.home import register_project
+        register_project(project_path, name=name, agents=agents)
+    except Exception:
+        pass
 
     return True
+
+
+def _append_stackmind_readme_section(path: Path) -> None:
+    """Add a small managed adoption note once, preserving existing README text."""
+    marker = "<!-- stackmind-runtime:start -->"
+    content, encoding = _read_preserving_text(path)
+    if marker in content:
+        return
+    section = (
+        "## StackMind Runtime\n\n"
+        "This project uses StackMind for its governed agent runtime. Run "
+        "`stackmind tui` to validate the runtime, refresh the project knowledge "
+        "graph when needed, and start the terminal interface.\n"
+    )
+    newline = "\r\n" if "\r\n" in content else "\n"
+    section = section.replace("\n", newline)
+    separator = "" if not content or content.endswith(("\n", "\r")) else newline * 2
+    block = marker + newline + section + "<!-- stackmind-runtime:end -->" + newline
+    path.write_text(content + separator + block, encoding=encoding, newline="")
+
+
+def _merge_stackmind_gitignore(path: Path) -> None:
+    """Append only missing runtime ignore entries without removing user patterns."""
+    content, encoding = _read_preserving_text(path)
+    lines = content.splitlines()
+    additions = [entry for entry in (".sync/", "graphify-out/") if entry not in lines]
+    if not additions:
+        return
+    newline = "\r\n" if "\r\n" in content else "\n"
+    separator = "" if not content or content.endswith(("\n", "\r")) else newline * 2
+    merged = content + separator + newline.join(additions) + newline
+    path.write_text(merged, encoding=encoding, newline="")
+
+
+def _read_preserving_text(path: Path) -> tuple[str, str]:
+    """Read common Unicode encodings while retaining BOM/encoding on write."""
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        encoding = "utf-8"
+    return raw.decode(encoding), encoding

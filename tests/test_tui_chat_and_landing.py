@@ -169,7 +169,7 @@ def test_tui_repl_landing_and_chat_transition(tmp_path: Path):
 
         result = CliRunner().invoke(
             main_cli,
-            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            ["tui", "--yes", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
             input=user_inputs,
         )
 
@@ -193,7 +193,7 @@ def test_tui_treats_slash_prefixed_input_as_prompt(tmp_path: Path):
     with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
         result = CliRunner().invoke(
             main_cli,
-            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
+            ["tui", "--yes", "--daemon-url", daemon.url, "--workspace", str(tmp_path)],
             input="/status\n:exit\n",
         )
 
@@ -720,4 +720,171 @@ def test_landing_block_metadata_deduplication_and_tight_padding():
     assert any("Status:" in line for line in lines)
 
 
+def test_format_contract_payload_qa_verdict_and_failure():
+    """Verify format_contract_payload converts QA verdicts and failure dicts into clean markdown."""
+    from cli.tui.chat import format_contract_payload
+
+    # QA verdict with review notes
+    qa_json = '{"verdict": "NEEDS_CHANGES", "review_notes": "index.html missing alt tags on image elements"}'
+    out = format_contract_payload(qa_json)
+    assert "### QA Verdict: NEEDS_CHANGES" in out
+    assert "missing alt tags" in out
+    assert "{" not in out
+
+    # Fenced QA verdict
+    fenced_qa = '```json\n{"verdict": "APPROVED", "review_notes": "All checks passed cleanly"}\n```'
+    out_fenced = format_contract_payload(fenced_qa)
+    assert "### QA Verdict: APPROVED" in out_fenced
+    assert "All checks passed cleanly" in out_fenced
+
+    # Failure payload
+    fail_json = '{"status": "failed", "reason": "Operation amend_contract failed due to scope restriction"}'
+    out_fail = format_contract_payload(fail_json)
+    assert "Turn failed: Operation amend_contract failed" in out_fail
+    assert "{" not in out_fail
+
+
+def test_extract_assistant_response_never_dumps_raw_json():
+    """Verify extract_assistant_response extracts clean markdown without raw JSON dumps."""
+    from cli.tui.events import extract_assistant_response
+
+    # Completion dictionary with modified files
+    payload_completed = {
+        "result": {
+            "status": "completed",
+            "modified_files": ["index.html", "css/style.css"],
+        }
+    }
+    resp = extract_assistant_response(payload_completed)
+    assert resp == "Completed turn. Modified files: `index.html`, `css/style.css`."
+    assert "{" not in resp
+
+    # Plan creation
+    payload_plan = {
+        "result": {
+            "status": "completed",
+            "modified_files": ["PLAN.md"],
+        }
+    }
+    resp_plan = extract_assistant_response(payload_plan)
+    assert "Created implementation plan in `PLAN.md`" in resp_plan
+    assert "{" not in resp_plan
+
+    # QA Verdict
+    payload_qa = {
+        "result": {
+            "verdict": "NEEDS_CHANGES",
+            "review_notes": "Image elements in index.html lack alt tags.",
+        }
+    }
+    resp_qa = extract_assistant_response(payload_qa)
+    assert "### QA Verdict: NEEDS_CHANGES" in resp_qa
+    assert "Image elements in index.html lack alt tags." in resp_qa
+    assert "{" not in resp_qa
+
+    # Blocked failure
+    payload_blocked = {
+        "result": {
+            "status": "blocked",
+            "reason": "Repeated missing argument 'path' in write_file",
+        }
+    }
+    resp_blocked = extract_assistant_response(payload_blocked)
+    assert "Turn blocked: Repeated missing argument 'path' in write_file" in resp_blocked
+    assert "{" not in resp_blocked
+
+
+def test_format_contract_payload_unescaped_regex_healing():
+    """Verify format_contract_payload heals unescaped regex patterns (like \\s, \\d) in contract JSON."""
+    from cli.tui.chat import format_contract_payload
+
+    # Raw JSON with regex patterns that contain invalid JSON escapes like \s, \d, \.
+    raw_json_with_regex = (
+        '```json\n'
+        '{\n'
+        '  "status": "completed",\n'
+        '  "summary": "Fixed email regex using `/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/` in js/main.js.",\n'
+        '  "report_markdown": "Form Validation: Implemented client-side validation using the exact regex: `/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/`."\n'
+        '}\n'
+        '```'
+    )
+    out = format_contract_payload(raw_json_with_regex)
+    assert not out.strip().startswith("```json")
+    assert not out.strip().startswith("{")
+    assert "Fixed email regex using" in out
+    assert "@" in out
+
+    # Also verify fallback to report_markdown when summary is absent
+    raw_without_summary = (
+        '```json\n'
+        '{\n'
+        '  "status": "completed",\n'
+        '  "report_markdown": "Form Validation: Implemented client-side validation using the exact regex: `/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/`."\n'
+        '}\n'
+        '```'
+    )
+    out_fallback = format_contract_payload(raw_without_summary)
+    assert "Form Validation: Implemented client-side validation" in out_fallback
+    assert "@" in out_fallback
+
+
+def test_runner_parse_json_payload_unescaped_regex_healing():
+    """Verify HarnessRunner._parse_json_payload parses payloads containing unescaped regex backslashes."""
+    from validators.harness.runner import HarnessRunner
+
+    raw = (
+        '```json\n'
+        '{\n'
+        '  "status": "completed",\n'
+        '  "summary": "Fixed email validation regex in js/main.js",\n'
+        '  "report_markdown": "Validation regex: `/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/`"\n'
+        '}\n'
+        '```'
+    )
+    parsed = HarnessRunner._parse_json_payload(raw)
+    assert isinstance(parsed, dict)
+    assert parsed.get("status") == "completed"
+    assert parsed.get("summary") == "Fixed email validation regex in js/main.js"
+    assert "Validation regex:" in parsed.get("report_markdown", "")
+
+
+def test_format_contract_payload_prioritizes_summary_over_report_markdown():
+    """Verify format_contract_payload extracts the concise summary value on screen instead of report_markdown."""
+    from cli.tui.chat import format_contract_payload
+
+    raw = (
+        '{\n'
+        '  "status": "completed",\n'
+        '  "summary": "Created requirements.txt with specified dependencies.",\n'
+        '  "report_markdown": "Created requirements.txt containing FastAPI...",\n'
+        '  "blockers": [],\n'
+        '  "modified_files": ["requirements.txt"],\n'
+        '  "release_target": "requirements.txt"\n'
+        '}'
+    )
+    out = format_contract_payload(raw)
+    assert out == "Created requirements.txt with specified dependencies."
+
+
+def test_format_contract_payload_streaming_and_single_quotes():
+    """Verify format_contract_payload extracts summary only even during live streaming or single quotes."""
+    from cli.tui.chat import format_contract_payload
+
+    # 1. Single quotes (Python dict string)
+    single_quoted = "{'status': 'completed', 'summary': 'Created requirements.txt with specified dependencies.'}"
+    assert format_contract_payload(single_quoted) == "Created requirements.txt with specified dependencies."
+
+    # 2. In-progress streaming with unclosed quote
+    streaming_chunk = '{"status": "completed", "summary": "Created requirements.txt with spec'
+    assert format_contract_payload(streaming_chunk) == "Created requirements.txt with spec"
+
+    # 3. In-progress streaming before summary key has arrived
+    streaming_pre_summary = '{"status": "completed", '
+    assert format_contract_payload(streaming_pre_summary) == ""
+
+    # 4. Unknown JSON structure never dumps raw JSON
+    unknown_json = '{"unknown_key": "some_value"}'
+    out = format_contract_payload(unknown_json)
+    assert "{" not in out
+    assert "}" not in out
 

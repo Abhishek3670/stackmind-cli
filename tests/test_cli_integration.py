@@ -47,7 +47,7 @@ class TestInitCLI:
         result = runner.invoke(cli, ["init", tmp_project, "--name", "CLI Test", "--no-git"])
         assert result.exit_code == 0
         assert Path(tmp_project).exists()
-        assert (Path(tmp_project) / "AGENTS.md").exists()
+        # AGENTS.md is internal runtime metadata, stays in .sync/ only
         assert (Path(tmp_project) / ".sync").exists()
 
     def test_init_with_agents_flag(self, runner, tmp_project):
@@ -66,7 +66,8 @@ class TestInitCLI:
     def test_init_defaults_name_to_dirname(self, runner, tmp_project):
         result = runner.invoke(cli, ["init", tmp_project, "--no-git"])
         assert result.exit_code == 0
-        content = (Path(tmp_project) / "AGENTS.md").read_text(encoding="utf-8")
+        # README should contain project name
+        content = (Path(tmp_project) / "README.md").read_text(encoding="utf-8")
         assert "cli-test-project" in content
 
 

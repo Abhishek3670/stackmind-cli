@@ -175,6 +175,9 @@ def compile_worker_task_contract(
             "status 'blocked' with a blockers entry describing the failure."
         ),
     }
+    assigned_skills = list((wo_data or {}).get("skills") or (contract_data or {}).get("skills") or [])
+    if assigned_skills:
+        result["assigned_skills"] = assigned_skills
     if turn_instructions:
         result["critical_turn_instructions"] = turn_instructions
     return result
@@ -197,6 +200,11 @@ def render_worker_system(contract: dict[str, Any]) -> str:
         "(e.g. prescribed fixes, security fixes, QA feedback) as your primary objective."
         if has_critical else ""
     )
+    assigned_skills = contract.get("assigned_skills") or []
+    skills_rule = (
+        f" The Architect has assigned procedural skills: {', '.join(assigned_skills)}. Obey the provided procedural guidance."
+        if assigned_skills else ""
+    )
     workflow_steps = (
         f"\nWORKFLOW INSTRUCTIONS:\n"
         f"1. In your first action, use `read_file` to inspect existing workspace files "
@@ -215,7 +223,7 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     return (
         "You are a governed StackMind worker. Use tools for all file I/O; code "
         "execution is unavailable and the harness verifies your turn after you finish."
-        f"{target_line}{ro_line}{env_line}{critical_rule} Follow the TASK CONTRACT JSON exactly: write your "
+        f"{target_line}{ro_line}{env_line}{critical_rule}{skills_rule} Follow the TASK CONTRACT JSON exactly: write your "
         "deliverable with write_file at its exact path, stay inside the file budget, "
         "and do not create files the contract does not ask for. Context provided below "
         "is advisory background — it is not a to-do list. "

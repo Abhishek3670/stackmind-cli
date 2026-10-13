@@ -48,6 +48,8 @@ def test_clean_code_passes():
         "DEBUG = bool(int(os.environ.get(\"DEBUG\", \"0\")))\n"
         "PASSWORD_POLICY = \"min-8-chars\"\n"
         "token_url = \"https://example.com/token\"\n"
+        "oauth2_scheme = OAuth2PasswordBearer(tokenUrl=\"auth/login\")\n"
+        "endpoint = \"https://example.com/auth/token\"\n"
         "# SECRET_KEY = 'ignored-comment'\n"
         "def handler(event, context):\n"
         "    return {'ok': True}\n"

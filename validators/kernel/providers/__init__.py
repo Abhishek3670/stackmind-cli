@@ -1,6 +1,12 @@
 """Provider adapters, gateway, and native communication models."""
 
-from .adapter import OllamaAdapter, OpenAICompatibleAdapter, ProviderAdapter
+from .adapter import (
+    AnthropicAdapter,
+    GeminiAdapter,
+    OllamaAdapter,
+    OpenAICompatibleAdapter,
+    ProviderAdapter,
+)
 from .errors import (
     AuthenticationError,
     BudgetExceededError,
@@ -26,10 +32,12 @@ from .models import (
 )
 
 __all__ = [
+    "AnthropicAdapter",
     "AuthenticationError",
     "BudgetExceededError",
     "ConsecutiveToolFailureError",
     "ContextLengthExceededError",
+    "GeminiAdapter",
     "Message",
     "MessageRole",
     "NoProgressLoopError",

@@ -170,9 +170,8 @@ class DaemonClient:
         if session_id is not None:
             params["session_id"] = session_id
         request = Request(f"{self.url}/events?{urlencode(params)}")
-        open_kwargs: dict[str, Any] = {}
-        if timeout is not None:
-            open_kwargs["timeout"] = timeout
+        # Apply timeout only to initial connection setup (5s default), not to SSE streaming
+        open_kwargs: dict[str, Any] = {"timeout": timeout if timeout is not None else 5.0}
         try:
             with self._opener.open(request, **open_kwargs) as response:
                 while True:
@@ -221,6 +220,24 @@ class DaemonClient:
         if credential_ref is not None:
             params["credentialRef"] = credential_ref
         return self.call("role.configureBackend", **params)
+
+    def settings_get(self, workspace: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if workspace is not None:
+            params["workspace"] = workspace
+        result = self.call("settings.get", **params)
+        if isinstance(result, dict) and "settings" in result:
+            return result["settings"]
+        return result or {}
+
+    def settings_update(self, settings: dict[str, Any], workspace: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"settings": settings}
+        if workspace is not None:
+            params["workspace"] = workspace
+        result = self.call("settings.update", **params)
+        if isinstance(result, dict) and "settings" in result:
+            return result["settings"]
+        return result or {}
 
     def list_agents(
         self, session_id: str | None = None, operation_id: str | None = None

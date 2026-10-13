@@ -18,6 +18,7 @@ from urllib.request import ProxyHandler, build_opener
 import pytest
 from click.testing import CliRunner
 
+from cli.init import init
 from cli.main import cli
 from cli.tui.app import (
     ActivityEntry,
@@ -28,6 +29,7 @@ from cli.tui.app import (
     RoleStatus,
     WorkOrderItem,
     dispatch_delivery_command,
+    get_status_str,
     render_activity_stream,
     render_completion_surface,
     render_operation_tree,
@@ -616,6 +618,7 @@ def test_tui_local_daemon_autonomous_delivery_lifecycle(tmp_path: Path):
 
 def test_tui_cli_repl_autonomous_delivery_commands(tmp_path: Path):
     """Verify CliRunner execution of new P7-4 colon commands."""
+    init(tmp_path, name="TestProject", no_git=True)
     with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
         user_inputs = "\n".join([
             ":status",
@@ -735,5 +738,409 @@ def test_tui_update_from_session_clears_idle_op_root() -> None:
     # Updating with session that has active_operation: None clears op-root
     state.update_from_session({"session_id": "sess-123", "state": "RUNNING", "active_operation": None})
     assert state.get_current_operation() is None
+
+
+def test_tui_blocked_phase_surfaced_in_state_and_banner() -> None:
+    """A blocked daemon run must be surfaced in state.phase and render_phase_banner."""
+    from cli.tui.app import render_phase_banner
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    session = {
+        "session_id": "sess-123",
+        "phase": "BLOCKED",
+        "error": "Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)",
+        "run": {
+            "phase": "BLOCKED",
+            "error": "Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)",
+        },
+    }
+    state.update_from_session(session)
+
+    assert state.phase == ProjectPhase.BLOCKED
+    assert state.error == "Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)"
+
+    banner = render_phase_banner(state)
+    assert "PHASE: BLOCKED" in banner
+    assert "⊘ Autonomous Execution (BLOCKED)" in banner
+    assert "Blocker: Recovery repair for WO-011 could not start — repair attempts exhausted (2/2)" in banner
+    assert "Use :resume to continue" in banner
+
+
+def test_tui_blocked_event_updates_state() -> None:
+    """Processing run.blocked event must update state.phase and state.error."""
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    event = {
+        "sequence": 1,
+        "name": "run.blocked",
+        "payload": {
+            "run_id": "run-6b31b8f5",
+            "phase": "BLOCKED",
+            "error": "Recovery repair for WO-011 could not start",
+        },
+    }
+    state.process_event(event)
+
+    assert state.phase == ProjectPhase.BLOCKED
+    assert state.error == "Recovery repair for WO-011 could not start"
+
+
+def test_tui_current_operation_shows_blocked_when_runtime_blocked() -> None:
+    """Current operation section must display ⊘ Blocked when runtime is in BLOCKED phase."""
+    from cli.tui.runtime_panel import format_current_operation
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState(project_name="clean-test", session_id="sess-123")
+    state.phase = ProjectPhase.BLOCKED
+
+    lines = format_current_operation(None, state=state)
+    assert any("Blocked" in line.plain for line in lines)
+
+
+# ─── 6. :STATUS COMMAND TESTS ──────────────────────────────────────────────────
+
+def test_status_idle_state():
+    """Test :status output for idle state - no session header line."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.INITIALIZING
+    session = {"session_id": "test-session", "state": "RUNNING", "provider": "daemon"}
+
+    output = get_status_str(session, state=state)
+    # Session metadata should NOT appear in output
+    assert "Session" not in output
+    assert "test-session" not in output
+    assert "provider" not in output
+    # Status fields should render correctly
+    assert "Status: planning" in output
+    assert "Next: Waiting for work..." in output
+
+
+def test_status_awaiting_approval():
+    """Test :status output for awaiting approval state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: awaiting_approval" in output
+    assert "Plan: awaiting approval" in output
+    assert "Next: Approve or reject pending plan" in output
+
+
+def test_status_active_with_progress():
+    """Test :status output for active execution with progress - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+    state.work_orders[0].status = "COMPLETED"
+    state.work_orders[1].status = "RUNNING"
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: active" in output
+    assert "Progress: 1/5 WOs completed" in output
+
+
+def test_status_blocked():
+    """Test :status output for blocked state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.BLOCKED
+    state.error = "Recovery repair failed (2/2)"
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: blocked" in output
+    assert "Blocker: Recovery repair failed (2/2)" in output
+    assert "Next: Review and resolve blocker, then :run" in output
+
+
+def test_status_failed():
+    """Test :status output for failed state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.FAILED
+    state.error = "Critical error during execution"
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: failed" in output
+    assert "Next: Review error, then :run or :cancel" in output
+
+
+def test_status_project_complete():
+    """Test :status output for project complete state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.PROJECT_COMPLETE
+    state.is_complete = True
+    for k in state.completion_checklist:
+        state.completion_checklist[k] = True
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: complete" in output
+    assert "Next: Project delivered" in output
+
+
+def test_status_plan_rejected():
+    """Test :status output for rejected plan state - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.PLAN_REJECTED
+    state.plan = {"feedback": "Needs more detail"}
+    session = {"session_id": "test-session", "state": "RUNNING"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Status: rejected" in output
+    assert "Plan: rejected" in output
+    assert "Next: Revise plan and resubmit" in output
+
+
+def test_status_with_blocked_work_orders():
+    """Test :status output when individual work orders are blocked - no session header."""
+    state = AutonomousDeliveryState("test-project")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+    state.work_orders[0].status = "BLOCKED"
+    state.work_orders[1].status = "RUNNING"
+    session = {"session_id": "test-session"}
+
+    output = get_status_str(session, state=state)
+    assert "Session" not in output
+    assert "Blocker: Blocked WOs: WO-001" in output
+
+
+# ─── 7. SIDE PANEL UPDATE AFTER PLAN APPROVAL ────────────────────────────────
+
+def test_side_panel_updates_after_plan_approve():
+    """After :approve, state should reflect AUTONOMOUS_EXECUTION with active agents."""
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    mock_client = _MockDaemonClient()
+    adapter = StackMindTuiAdapter(mock_client)  # type: ignore[arg-type]
+    session = mock_client.get_session("session-test-approve")
+    state = AutonomousDeliveryState("test-approve", session_id="session-test-approve")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001", "state": "AWAITING_APPROVAL"}
+    state.work_orders[0].status = "WAITING"
+    state.roles["Backend"].state = "WAITING"
+
+    # Run :approve command
+    s, should_exit = dispatch_delivery_command(
+        adapter, mock_client, session, ":approve ship it", state
+    )  # type: ignore[arg-type]
+
+    assert not should_exit
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+    assert state.plan["state"] == "APPROVED"
+    assert state.completion_checklist["PLAN.md"] is True
+
+    # Side panel data should be updated (work orders and roles reflect execution state)
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+
+
+def test_side_panel_reflects_work_order_transitions():
+    """Work-order state changes should be visible in side panel data."""
+    state = AutonomousDeliveryState("test-wo")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    # Initial state
+    assert state.work_orders[0].status == "RUNNING"
+
+    # Simulate work order completion (as would happen from daemon events)
+    state.work_orders[0].status = "COMPLETED"
+    state.work_orders[1].status = "RUNNING"
+
+    # State should reflect the changes
+    assert state.work_orders[0].status == "COMPLETED"
+    assert state.work_orders[1].status == "RUNNING"
+
+
+def test_agent_transitions_visible_in_state():
+    """Agent state transitions (waiting→running→completed) should be tracked."""
+    state = AutonomousDeliveryState("test-transitions")
+
+    # Initial state
+    assert state.roles["Backend"].state == "WAITING"
+
+    # Simulate backend starting work
+    state.roles["Backend"].state = "RUNNING"
+    assert state.roles["Backend"].state == "RUNNING"
+
+    # Simulate backend completion
+    state.roles["Backend"].state = "COMPLETED"
+    assert state.roles["Backend"].state == "COMPLETED"
+
+
+def test_blocked_state_update_in_state():
+    """Blocked/failed transitions should be visible in state without :status."""
+    state = AutonomousDeliveryState("test-blocked")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+
+    # Block the run
+    state.phase = ProjectPhase.BLOCKED
+    state.error = "Recovery failed"
+
+    assert state.phase == ProjectPhase.BLOCKED
+    assert state.error == "Recovery failed"
+
+
+def test_rejected_plan_state_update():
+    """Rejected plan state should be visible without running :status."""
+    state = AutonomousDeliveryState("test-rejected")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+
+    state.phase = ProjectPhase.PLAN_REJECTED
+    state.plan["state"] = "REJECTED"
+    state.plan["feedback"] = "Needs revision"
+
+    assert state.phase == ProjectPhase.PLAN_REJECTED
+    assert state.plan["state"] == "REJECTED"
+
+
+def test_status_command_not_required_for_state_propagation():
+    """State updates should propagate without needing to run :status."""
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    mock_client = _MockDaemonClient()
+    adapter = StackMindTuiAdapter(mock_client)  # type: ignore[arg-type]
+    session = mock_client.get_session("session-test-prop")
+    state = AutonomousDeliveryState("test-prop", session_id="session-test-prop")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+
+    # Approve plan
+    dispatch_delivery_command(adapter, mock_client, session, ":approve", state)  # type: ignore[arg-type]
+
+    # State should be updated immediately (no need for :status)
+    assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+    assert state.plan["state"] == "APPROVED"
+
+
+def test_approve_in_interactive_terminal_streams_execution(monkeypatch):
+    """In interactive terminal, :approve should enter _stream_turn_execution."""
+    import sys
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+    import cli.tui.commands as cmd_mod
+
+    mock_client = _MockDaemonClient()
+    adapter = StackMindTuiAdapter(mock_client)  # type: ignore[arg-type]
+    session = mock_client.get_session("session-test-stream")
+    state = AutonomousDeliveryState("test-stream", session_id="session-test-stream")
+    state.phase = ProjectPhase.AWAITING_APPROVAL
+    state.plan = {"plan_id": "PLAN-001"}
+
+    streamed_calls = []
+
+    def fake_stream(*args, **kwargs):
+        streamed_calls.append((args, kwargs))
+        return session, False
+
+    monkeypatch.setattr(cmd_mod, "_stream_turn_execution", fake_stream)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    dispatch_delivery_command(adapter, mock_client, session, ":approve ready", state)
+    assert len(streamed_calls) == 1
+    _, kwargs = streamed_calls[0]
+    assert kwargs.get("op_id") == "turn"
+    assert kwargs.get("is_tty") is True
+
+
+def test_keyboard_raw_prompt_input_invokes_on_idle_when_no_input(monkeypatch):
+    """raw_prompt_input should call on_idle callback when no keystroke is received."""
+    import sys
+    from cli.tui import keyboard
+
+    idle_calls = []
+
+    def fake_idle(editor):
+        idle_calls.append(editor)
+        # Stop after 2 idle ticks by raising KeyboardInterrupt
+        if len(idle_calls) >= 2:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(keyboard, "read_next_key", lambda *args, **kwargs: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        keyboard.raw_prompt_input(on_idle=fake_idle)
+
+    assert len(idle_calls) >= 2
+
+
+def test_all_agents_and_roles_transition_to_completed_on_project_delivery():
+    """Verify that after project delivery, Backend and Architecture transition to completed instead of implementing/orchestrating."""
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus, WorkOrderItem, ProjectPhase
+    from cli.tui.views import render_roles_panel, render_operation_tree
+
+    state = AutonomousDeliveryState(
+        roles={
+            "Architecture": RoleStatus("Architecture", backend="Claude", state="RUNNING"),
+            "Backend": RoleStatus("Backend", backend="Ollama", model="gemma4:31b-cloud", state="RUNNING"),
+            "Frontend": RoleStatus("Frontend", backend="AGY", state="COMPLETED"),
+            "Q/A": RoleStatus("Q/A", backend="Ollama", state="COMPLETED"),
+            "GitOps": RoleStatus("GitOps", backend="Ollama", state="COMPLETED"),
+        },
+        work_orders=[
+            WorkOrderItem("WO-001", "Backend Task", role="Backend", status="COMPLETED"),
+            WorkOrderItem("WO-002", "Frontend Task", role="Frontend", status="COMPLETED"),
+        ]
+    )
+
+    # 1. Test per-role reconciliation: Backend has all completed work orders
+    state.reconcile_roles_from_work_orders()
+    assert state.roles["Backend"].state == "COMPLETED"
+    assert state.roles["Backend"].display_state == "completed"
+
+    # Reset Backend to RUNNING to verify project completion event transition
+    state.roles["Backend"].state = "RUNNING"
+    assert state.roles["Backend"].display_state == "implementing"
+
+    # 2. Process run.complete event
+    state.process_event({
+        "name": "run.complete",
+        "payload": {"status": "SUCCESS"},
+    })
+
+    assert state.is_complete is True
+    assert state.phase == ProjectPhase.PROJECT_COMPLETE
+    assert state.roles["Backend"].state == "COMPLETED"
+    assert state.roles["Backend"].display_state == "completed"
+    assert state.roles["Architecture"].state == "COMPLETED"
+    assert state.roles["Architecture"].display_state == "completed"
+
+    # 3. Test agent hierarchy tree status
+    hierarchy = state.get_agent_hierarchy()
+    for entry in hierarchy:
+        assert entry["status"] == "completed", f"Entry {entry['name']} had status {entry['status']}"
+
+    # 4. Test render_roles_panel
+    rendered = render_roles_panel(state)
+    assert "✓ Architecture" in rendered
+    assert "✓ Backend" in rendered
+    assert "implementing" not in rendered
+    assert "orchestrating" not in rendered
+    assert "[ollama/gemma4:31b-cloud]" not in rendered
+
+    # 5. Test render_operation_tree
+    tree_rendered = render_operation_tree(state)
+    assert "✓ Architecture" in tree_rendered
+    assert "✓ Backend" in tree_rendered
+
+
+
 
 

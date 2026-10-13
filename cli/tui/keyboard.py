@@ -296,9 +296,18 @@ def _read_escape_sequence_posix(fd: int = 0) -> str:
     return seq
 
 
-def _read_raw_key_windows() -> str:
+def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
     """Read a single decoded key on Windows using msvcrt."""
     import msvcrt
+
+    if timeout is not None:
+        start_t = time.monotonic()
+        while time.monotonic() - start_t < timeout:
+            if msvcrt.kbhit():
+                break
+            time.sleep(0.01)
+        else:
+            return None
 
     ch = msvcrt.getwch()
     debug_parts = [f"ch={repr(ch)}(ord={ord(ch) if len(ch) == 1 else [ord(c) for c in ch]})"]
@@ -595,7 +604,7 @@ class Win32ConsoleReader:
 _win32_reader = Win32ConsoleReader()
 
 
-def _read_raw_key_windows_v2(handle: Any = None) -> str:
+def _read_raw_key_windows_v2(handle: Any = None, timeout: Optional[float] = None) -> Optional[str]:
     """Read a single decoded key on Windows using Win32 ReadConsoleInputW.
 
     Replaces msvcrt.getwch() to natively capture MOUSE_EVENT records for
@@ -606,29 +615,39 @@ def _read_raw_key_windows_v2(handle: Any = None) -> str:
         _win32_reader = Win32ConsoleReader(handle)
 
     err_count = 0
+    start_t = time.monotonic()
+    t_step = min(0.1, timeout) if timeout is not None else 0.1
     while True:
-        key = _win32_reader.read_key(timeout=0.1)
+        key = _win32_reader.read_key(timeout=t_step)
         if key is not None:
             _log_debug_key(f"[_read_raw_key_windows_v2] decoded={repr(key)}")
             return key
+        if timeout is not None and time.monotonic() - start_t >= timeout:
+            return None
         h = _win32_reader._get_input_handle()
         if not h or h in (0, -1):
-            return _read_raw_key_windows()
+            return _read_raw_key_windows(timeout=timeout)
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             num_events = ctypes.c_uint32()
             if not kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
                 err_count += 1
                 if err_count > 3:
-                    return _read_raw_key_windows()
+                    return _read_raw_key_windows(timeout=timeout)
             else:
                 err_count = 0
         except Exception:
-            return _read_raw_key_windows()
+            return _read_raw_key_windows(timeout=timeout)
 
 
-def _read_raw_key_posix(fd: int = 0) -> str:
+def _read_raw_key_posix(fd: int = 0, timeout: Optional[float] = None) -> Optional[str]:
     """Read a single decoded key on POSIX using raw stdin read."""
+    if timeout is not None:
+        import select
+
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            return None
     ch = os.read(fd, 1).decode("utf-8", errors="replace")
     debug_parts = [f"ch={repr(ch)}(ord={ord(ch) if len(ch) == 1 else [ord(c) for c in ch]})"]
     if ch == Key.ESCAPE:
@@ -645,7 +664,10 @@ def _read_raw_key_posix(fd: int = 0) -> str:
     return res
 
 
-def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
+def read_next_key(
+    key_stream: Optional[Iterator[str]] = None,
+    timeout: Optional[float] = None,
+) -> Optional[str]:
     """Read next single decoded key from key_stream or platform raw console."""
     if key_stream is not None:
         try:
@@ -674,14 +696,15 @@ def read_next_key(key_stream: Optional[Iterator[str]] = None) -> str:
 
         if use_v2:
             try:
-                res = _read_raw_key_windows_v2()
+                res = _read_raw_key_windows_v2(timeout=timeout)
             except Exception:
-                res = _read_raw_key_windows()
+                res = _read_raw_key_windows(timeout=timeout)
         else:
-            res = _read_raw_key_windows()
+            res = _read_raw_key_windows(timeout=timeout)
     else:
-        res = _read_raw_key_posix(fd=0)
-    _log_debug_key(f"[read_next_key] final returned {repr(res)}")
+        res = _read_raw_key_posix(fd=0, timeout=timeout)
+    if res is not None:
+        _log_debug_key(f"[read_next_key] final returned {repr(res)}")
     return res
 
 
@@ -689,12 +712,17 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":resume", "Resume active session", False),
     (":status", "Display current Session & Delivery View", False),
     (":plan", "Display Plan Approval surface & history", False),
+    (":pause", "Pause active session turn", False),
     (":wo", "Display Work Orders table and progress", False),
     (":goal", "Submit product goal to Architecture", True),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
     (":roles", "Display Agent Roles & Backend bindings", False),
     (":rebind", "Rebind agent role to backend", True),
+    (":settings", "Configure StackMind execution profile, roles & system policies", False),
+    (":config", "Configure StackMind execution profile, roles & system policies", False),
+    (":providers", "Configure cloud & local LLM providers, API keys & base URLs", False),
+    (":models", "Configure and list available provider models", False),
     (":tree", "Display Hierarchical Operation Tree", False),
     (":agents", "Display Hierarchical Agent Tree", False),
     (":completion", "Display Project Complete checklist", False),
@@ -704,12 +732,17 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":matrix", "Display 6-Dimensional Verification Matrix", False),
     (":events", "Stream incremental sequenced events", False),
     (":reconnect", "Reconnect to daemon & replay missed events", False),
-    (":pause", "Pause active session turn", False),
     (":chat", "Display conversation transcript", False),
     (":actions", "Toggle/expand/collapse turn Actions group", False),
     (":compact", "Compact older transcript turns", False),
     (":timeout", "Get or set client turn wait timeout", False),
     (":landing", "Display branded landing block", False),
+    (":skills", "Display available procedural skills & runbooks", False),
+    (":skill", "Display available procedural skills & runbooks", False),
+    (":consume-skills", "Install/import procedural skills from file or directory", True),
+    (":consume-skill", "Install/import procedural skill from file or directory", True),
+    (":projects", "List registered projects and runtime home", False),
+    (":profile", "Get or set execution profile (low|medium|high)", True),
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
     (":exit", "Gracefully stop daemon and exit", False),
@@ -821,8 +854,10 @@ class RawLineEditor:
         width: int = 80,
         right_border: Optional[str] = None,
         commands: Optional[list[tuple[str, str, bool]]] = None,
-        on_clear_dropdown: Optional[Callable[[], None]] = None,
+        on_clear_dropdown: Optional[Callable[[], Any]] = None,
+        out: Any = sys.stdout,
     ) -> None:
+        self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
         self.buffer: list[str] = list(initial_text)
         self.cursor: int = len(self.buffer)
@@ -881,30 +916,42 @@ class RawLineEditor:
         self.dropdown_matches = []
         self.dropdown_index = 0
 
-    def _erase_dropdown(self, out: Any = sys.stdout) -> None:
+    def _erase_dropdown(self, out: Any = None) -> None:
+        target = out if out is not None else getattr(self, "out", sys.stdout)
         if self._last_dropdown_lines_count <= 0:
             return
         H = self._last_dropdown_lines_count
         self._last_dropdown_lines_count = 0
+        cleared_via_callback = False
         if getattr(self, "on_clear_dropdown", None):
             try:
-                self.on_clear_dropdown()
+                res = self.on_clear_dropdown()
+                cleared_via_callback = (res is True)
             except Exception:
                 pass
-        offset_up = H + (1 if self.has_borders else 0)
-        try:
-            out.write(f"\x1b[{offset_up}A")
-            for _ in range(H):
-                out.write("\r\x1b[2K\x1b[1B")
-            down_steps = 1 if self.has_borders else 0
-            if down_steps > 0:
-                out.write(f"\x1b[{down_steps}B")
-            visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
-            cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
-            out.write(f"\x1b[{cursor_col}G")
-            out.flush()
-        except Exception:
-            pass
+        if not cleared_via_callback:
+            offset_up = H + (1 if self.has_borders else 0)
+            try:
+                target.write(f"\x1b[{offset_up}A")
+                for _ in range(H):
+                    target.write("\r\x1b[2K\x1b[1B")
+                down_steps = 1 if self.has_borders else 0
+                if down_steps > 0:
+                    target.write(f"\x1b[{down_steps}B")
+                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+                cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+                target.write(f"\x1b[{cursor_col}G")
+                target.flush()
+            except Exception:
+                pass
+        else:
+            try:
+                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+                cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+                target.write(f"\x1b[{cursor_col}G")
+                target.flush()
+            except Exception:
+                pass
 
     def insert_char(self, ch: str) -> None:
         was_empty = len(self.buffer) == 0
@@ -1144,16 +1191,17 @@ class RawLineEditor:
             _log_debug_key(f"[handle_key] UNHANDLED key ignored: {repr(key)}")
         return False
 
-    def redraw_line(self, out: Any = sys.stdout) -> None:
+    def redraw_line(self, out: Any = None) -> None:
         """Redraw current line with exact cursor placement and composer border preservation."""
+        target = out if out is not None else getattr(self, "out", sys.stdout)
         buf_str = "".join(self.buffer)
         if not getattr(self, "has_borders", False):
             line_out = f"\r{self.prompt_prefix}{buf_str}\x1b[K"
-            out.write(line_out)
+            target.write(line_out)
             offset_back = len(self.buffer) - self.cursor
             if offset_back > 0:
-                out.write(f"\x1b[{offset_back}D")
-            out.flush()
+                target.write(f"\x1b[{offset_back}D")
+            target.flush()
             return
 
         visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
@@ -1202,38 +1250,52 @@ class RawLineEditor:
         self.displayed_cursor = displayed_cursor
         spaces_count = max(0, inner_available - len(displayed))
         line_out = f"\r{self.prompt_prefix}{displayed}{' ' * spaces_count}{self.right_border}"
-        out.write(line_out)
+        target.write(line_out)
 
         # Move cursor to active edit position inside composer box
         cursor_col = visible_prefix_len + displayed_cursor + 1
-        out.write(f"\x1b[{cursor_col}G")
+        target.write(f"\x1b[{cursor_col}G")
 
         # Dropdown management
-        if self._last_dropdown_lines_count > 0 and not self.dropdown_active:
-            self._erase_dropdown(out)
+        prev_H = self._last_dropdown_lines_count
 
-        if self.dropdown_active and self.dropdown_matches:
+        if not self.dropdown_active or not self.dropdown_matches:
+            if prev_H > 0:
+                self._erase_dropdown(target)
+        else:
             dropdown_lines = format_dropdown_lines(
                 self.dropdown_matches,
                 self.dropdown_index,
                 width=self.width,
             )
             if dropdown_lines:
-                H = len(dropdown_lines)
-                self._last_dropdown_lines_count = H
-                offset_up = H + (1 if self.has_borders else 0)
+                new_H = len(dropdown_lines)
+                self._last_dropdown_lines_count = new_H
                 try:
-                    out.write(f"\x1b[{offset_up}A")
+                    # If previous dropdown was taller, clear the excess top lines first
+                    if prev_H > new_H:
+                        offset_top = prev_H + (1 if self.has_borders else 0)
+                        target.write(f"\x1b[{offset_top}A")
+                        excess = prev_H - new_H
+                        for _ in range(excess):
+                            target.write("\r\x1b[2K\x1b[1B")
+                    else:
+                        offset_up = new_H + (1 if self.has_borders else 0)
+                        target.write(f"\x1b[{offset_up}A")
+
                     for d_line in dropdown_lines:
-                        out.write(f"\r{d_line}\x1b[K\x1b[1B")
+                        target.write(f"\r{d_line}\x1b[K\x1b[1B")
+
                     down_steps = 1 if self.has_borders else 0
                     if down_steps > 0:
-                        out.write(f"\x1b[{down_steps}B")
-                    out.write(f"\x1b[{cursor_col}G")
+                        target.write(f"\x1b[{down_steps}B")
+                    target.write(f"\x1b[{cursor_col}G")
                 except Exception:
                     pass
+            elif prev_H > 0:
+                self._erase_dropdown(target)
 
-        out.flush()
+        target.flush()
 
 
 def raw_prompt_input(
@@ -1253,6 +1315,7 @@ def raw_prompt_input(
     commands: Optional[list[tuple[str, str, bool]]] = None,
     key_stream: Optional[Iterator[str]] = None,
     top_border_renderer: Optional[Callable[[bool], str]] = None,
+    on_idle: Optional[Callable[[Any], None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -1380,7 +1443,14 @@ def raw_prompt_input(
         editor.redraw_line()
         while True:
             try:
-                k = read_next_key(key_stream=key_stream)
+                k = read_next_key(key_stream=key_stream, timeout=0.08 if on_idle else None)
+                if k is None:
+                    if on_idle:
+                        try:
+                            on_idle(editor)
+                        except Exception:
+                            pass
+                    continue
                 done = editor.handle_key(k)
                 if done:
                     if editor._last_dropdown_lines_count > 0:

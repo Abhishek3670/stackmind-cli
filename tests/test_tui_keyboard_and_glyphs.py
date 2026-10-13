@@ -1083,6 +1083,67 @@ def test_format_dropdown_lines_structure():
     assert f"(1/{len(DEFAULT_COMMANDS)})" in lines[-1]
 
 
+def test_dropdown_height_shrink_clears_excess_top_lines():
+    """Verify typing prefix that narrows command matches clears excess top lines from taller dropdown."""
+    import io
+    import re
+
+    out = io.StringIO()
+    editor = RawLineEditor(width=80, out=out)
+
+    # 1. Type ':' (many matches -> max_visible 6 items -> 8 total lines)
+    editor.handle_key(":")
+    editor.redraw_line()
+    assert editor._last_dropdown_lines_count == 8
+
+    # 2. Type 'p' (matches: :plan, :providers, :profile, :pause -> 6 total lines)
+    out.seek(0)
+    out.truncate(0)
+    editor.handle_key("p")
+    editor.redraw_line()
+    step_p = out.getvalue()
+    assert editor._last_dropdown_lines_count == 6
+    # Must have moved up to row of old 8-line dropdown (8 + 1 border = 9)
+    assert "\x1b[9A" in step_p
+    # Must have cleared the 2 excess lines (8 - 6 = 2) with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_p)) == 2
+
+    # 3. Type 'l' (matches: :plan -> 3 total lines)
+    out.seek(0)
+    out.truncate(0)
+    editor.handle_key("l")
+    editor.redraw_line()
+    step_pl = out.getvalue()
+    assert editor._last_dropdown_lines_count == 3
+    # Must have moved up to row of old 6-line dropdown (6 + 1 border = 7)
+    assert "\x1b[7A" in step_pl
+    # Must have cleared the 3 excess lines (6 - 3 = 3) with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_pl)) == 3
+
+
+def test_dropdown_dismiss_clears_all_lines():
+    """Verify Escape dismisses dropdown and clears all active dropdown lines."""
+    import io
+    import re
+
+    out = io.StringIO()
+    editor = RawLineEditor(width=80, out=out)
+
+    editor.handle_key(":")
+    editor.redraw_line()
+    assert editor._last_dropdown_lines_count == 8
+
+    out.seek(0)
+    out.truncate(0)
+    editor.handle_key(Key.ESCAPE)
+    editor.redraw_line()
+    step_esc = out.getvalue()
+    assert editor._last_dropdown_lines_count == 0
+    # Must have cleared all 8 lines with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_esc)) == 8
+
+
+
 
 
 

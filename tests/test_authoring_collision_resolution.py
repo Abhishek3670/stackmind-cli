@@ -394,3 +394,112 @@ def test_prepare_run_for_resume_cleans_up_dual_state_collision(tmp_path: Path):
     assert (comp_dir / "WO-007.yaml").is_file()
     # planning_wo_id was cleared so next advance will allocate fresh ID
     assert run_state.planning_wo_id is None
+
+
+def test_sync_index_reconciles_completed_wo_with_stale_active_index_entry(tmp_path: Path):
+    """_sync_index_and_tree_yaml updates INDEX.yaml when COMPLETED file exists but index entry says ACTIVE."""
+    from validators.harness.runner import AgentRunner
+
+    sync_dir = tmp_path / ".sync"
+    act_dir = sync_dir / "work-orders" / "ACTIVE"
+    comp_dir = sync_dir / "work-orders" / "COMPLETED"
+    tree_dir = sync_dir / "runtime"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    tree_dir.mkdir(parents=True, exist_ok=True)
+
+    index_file = sync_dir / "work-orders" / "INDEX.yaml"
+    initial_index = {
+        "orders": [
+            {
+                "id": "WO-007",
+                "status": "ACTIVE",
+                "file": "work-orders/ACTIVE/WO-007.yaml",
+                "title": "Architecture turn",
+            },
+            {
+                "id": "WO-008",
+                "status": "ACTIVE",
+                "file": "work-orders/ACTIVE/WO-008.yaml",
+                "title": "Next turn",
+            },
+        ],
+        "total_active": 2,
+        "total_completed": 0,
+        "total_blocked": 0,
+    }
+    index_file.write_text(yaml.safe_dump(initial_index), encoding="utf-8")
+
+    tree_file = tree_dir / "TREE.yaml"
+    initial_tree = {
+        "work_orders": {"total_active": 2, "total_completed": 0, "total_blocked": 0},
+        "agents": {
+            "claude": {"assigned_work_orders": ["WO-007", "WO-008"]},
+        },
+    }
+    tree_file.write_text(yaml.safe_dump(initial_tree), encoding="utf-8")
+
+    # On disk: WO-007 is in COMPLETED/, WO-008 is in ACTIVE/
+    (comp_dir / "WO-007.yaml").write_text(yaml.safe_dump({"id": "WO-007", "status": "COMPLETED"}), encoding="utf-8")
+    (act_dir / "WO-008.yaml").write_text(yaml.safe_dump({"id": "WO-008", "status": "ACTIVE"}), encoding="utf-8")
+
+    AgentRunner._sync_index_and_tree_yaml(tmp_path)
+
+    updated_index = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    wo7 = next(o for o in updated_index["orders"] if o["id"] == "WO-007")
+    wo8 = next(o for o in updated_index["orders"] if o["id"] == "WO-008")
+
+    assert wo7["status"] == "COMPLETED"
+    assert wo7["file"] == "work-orders/COMPLETED/WO-007.yaml"
+    assert wo8["status"] == "ACTIVE"
+    assert wo8["file"] == "work-orders/ACTIVE/WO-008.yaml"
+    assert updated_index["total_completed"] == 1
+    assert updated_index["total_active"] == 1
+
+    updated_tree = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
+    assert updated_tree["work_orders"]["total_completed"] == 1
+    assert updated_tree["work_orders"]["total_active"] == 1
+    assert updated_tree["agents"]["claude"]["assigned_work_orders"] == ["WO-008"]
+
+
+def test_unblock_in_flight_work_orders_resets_failed_planning_wo(tmp_path: Path):
+    """unblock_in_flight_work_orders unblocks planning_wo_id when resuming from Phase.FAILED."""
+    from validators.kernel.daemon.supervisor import Phase, LifecycleSupervisor
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    sync_dir = tmp_path / ".sync"
+    act_dir = sync_dir / "work-orders" / "ACTIVE"
+    act_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-008 is currently FAILED on disk
+    (act_dir / "WO-008.yaml").write_text(
+        yaml.safe_dump({"id": "WO-008", "status": "FAILED", "error": "validation failed"}),
+        encoding="utf-8",
+    )
+
+    index_file = sync_dir / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "orders": [{"id": "WO-008", "status": "FAILED", "file": "work-orders/ACTIVE/WO-008.yaml"}],
+            "total_active": 0,
+            "total_completed": 0,
+            "total_blocked": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    storage = DaemonStorage(tmp_path / ".daemon_storage")
+    manager = SessionManager(storage)
+    session = manager.create_session("claude", "mock-provider", {"allow": ["*"], "deny": []}, str(tmp_path))
+    sid = session["session_id"]
+
+    run_state = manager.supervisor.start_run("run-unblock", "Goal", tmp_path, sid)
+    run_state.phase = Phase.FAILED
+    run_state.planning_wo_id = "WO-008"
+    run_state.completed_wo_ids = ["WO-007"]
+
+    manager.supervisor.unblock_in_flight_work_orders(run_state)
+
+    wo8_disk = yaml.safe_load((act_dir / "WO-008.yaml").read_text(encoding="utf-8"))
+    assert wo8_disk["status"] == "ACTIVE"
+    assert "error" not in wo8_disk

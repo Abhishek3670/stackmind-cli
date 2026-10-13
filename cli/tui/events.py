@@ -57,6 +57,38 @@ def normalize_status(raw_status: str | None) -> str:
     return val
 
 
+def clean_error_message(err: Any) -> str:
+    """Extract a concise human-readable error string avoiding raw dicts or traces."""
+    if not err:
+        return ""
+    if isinstance(err, Mapping):
+        for key in ("message", "error", "reason", "summary", "detail"):
+            val = err.get(key)
+            if val and val != err:
+                cleaned = clean_error_message(val)
+                if cleaned and cleaned.lower() not in {"failed", "blocked", "error"}:
+                    return cleaned
+        for val in err.values():
+            if isinstance(val, str) and val.strip() and val.strip().lower() not in {"failed", "blocked", "error"}:
+                return val.strip()
+        return "Operation failed"
+
+    msg = str(err).strip()
+    if msg.startswith("{") and msg.endswith("}") and ("'reason':" in msg or "'error':" in msg or "'message':" in msg):
+        try:
+            import ast
+            parsed = ast.literal_eval(msg)
+            if isinstance(parsed, Mapping):
+                return clean_error_message(parsed)
+        except Exception:
+            pass
+    if "Traceback (most recent call last):" in msg:
+        lines = [line.strip() for line in msg.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    return msg
+
+
 def format_tool_name(tool_name: str) -> str:
     """Clean up and format tool name for terminal presentation."""
     cleaned = (
@@ -289,7 +321,7 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
 
     if name in {"operation.failed", "operation.error"}:
         op_id = payload.get("operation_id") or "op"
-        err = payload.get("error", "FAILED")
+        err = clean_error_message(payload.get("error", "FAILED"))
         text = Text("✗ Operation ", style="red")
         text.append(str(op_id), style="bold red")
         text.append(f" failed ({err})", style="white")
@@ -345,15 +377,25 @@ def extract_assistant_response(
     if not isinstance(payload, Mapping):
         return None
 
-    from cli.tui.chat import strip_internal_reasoning
+    from cli.tui.chat import format_contract_payload, strip_internal_reasoning
 
     def clean_response(value: str) -> str | None:
         clean = strip_internal_reasoning(value)
+        if clean:
+            clean = format_contract_payload(clean)
         return clean or None
 
     # 1. Inspect direct result dict
     result = payload.get("result")
     if isinstance(result, Mapping):
+        review_notes = result.get("review_notes")
+        verdict = result.get("verdict")
+        if review_notes and isinstance(review_notes, str) and review_notes.strip():
+            clean_rn = review_notes.strip()
+            if verdict:
+                return clean_response(f"### QA Verdict: {verdict}\n\n{clean_rn}")
+            return clean_response(clean_rn)
+
         report_path_raw = result.get("report_path")
         if report_path_raw:
             report_path = Path(report_path_raw)
@@ -367,22 +409,30 @@ def extract_assistant_response(
                         _, _, body = content.partition("## Report")
                         report_body, _, _ = body.partition("## Meta")
                         clean = report_body.strip()
-                        if clean:
+                        if clean and clean != "Completed task via tools":
                             return clean_response(clean)
-                    return clean_response(content)
+                    if content.strip() and content.strip() != "Completed task via tools":
+                        return clean_response(content)
                 except Exception:
                     pass
 
         summary = result.get("summary")
-        if summary and isinstance(summary, str) and summary.strip():
+        if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
             return clean_response(summary)
+
+        report_md = result.get("report_markdown")
+        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
+            return clean_response(report_md)
 
         response = result.get("response")
         if response and isinstance(response, str) and response.strip():
             return clean_response(response)
 
-        reason = result.get("reason")
+        reason = result.get("reason") or result.get("error")
         if reason and isinstance(reason, str) and reason.strip():
+            st = str(result.get("status", "")).lower()
+            if st in {"blocked", "failed", "cancelled"}:
+                return clean_response(f"Turn {st}: {reason.strip()}")
             return clean_response(reason)
 
         message = result.get("message")
@@ -396,6 +446,31 @@ def extract_assistant_response(
         output = result.get("output")
         if output and isinstance(output, str) and output.strip():
             return clean_response(output)
+
+        mods = result.get("modified_files")
+        if isinstance(mods, list) and mods:
+            files_str = ", ".join(f"`{f}`" for f in mods)
+            if any("PLAN.md" in str(f) for f in mods):
+                return clean_response(
+                    f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                )
+            return clean_response(f"Completed turn. Modified files: {files_str}.")
+
+        blockers = result.get("blockers")
+        if isinstance(blockers, list) and blockers:
+            b_str = "; ".join(str(b) for b in blockers)
+            st = str(result.get("status", "blocked")).lower()
+            return clean_response(f"Turn {st}: {b_str}")
+
+        if verdict and isinstance(verdict, str) and verdict.strip():
+            return clean_response(f"### QA Verdict: {verdict.strip()}")
+
+        st_val = result.get("status")
+        if isinstance(st_val, str) and st_val.strip():
+            s_low = st_val.lower().strip()
+            if s_low in {"completed", "success", "done"}:
+                return clean_response("Completed turn via tools.")
+            return clean_response(f"Turn {s_low}.")
 
     # 2. Inspect direct payload keys
     if isinstance(payload.get("response"), str) and payload["response"].strip():
@@ -442,6 +517,22 @@ def extract_text_delta(event: Mapping[str, Any] | Any) -> str | None:
     # Also check if payload has an explicit delta field
     if "delta" in payload and isinstance(payload["delta"], str) and payload["delta"]:
         return payload["delta"]
+    return None
+
+
+def extract_reasoning_delta(event: Mapping[str, Any] | Any) -> str | None:
+    """Extract normalized reasoning/thinking delta from streaming event."""
+    if not isinstance(event, Mapping):
+        return None
+    name = str(event.get("name", "")).lower()
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    if name == "reasoning.delta":
+        for key in ("text", "reasoning", "thinking", "delta"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     return None
 
 
@@ -565,16 +656,18 @@ class OperationalEventManager:
                 activity.status = status
                 activity.duration_seconds = duration
                 if payload.get("error"):
-                    activity.error = str(payload["error"])
+                    activity.error = clean_error_message(payload["error"])
             else:
                 activity = ToolActivity(
                     tool_name=str(payload.get("tool_name", "tool")),
                     status=status,
                     call_id=call_id,
                     duration_seconds=duration,
-                    error=str(payload.get("error")) if payload.get("error") else None,
+                    error=clean_error_message(payload.get("error")) if payload.get("error") else None,
                 )
             self.tool_history.append(activity)
+            if status in {ToolStatus.FAILED, ToolStatus.BLOCKED}:
+                self.current_actions.expanded = True
             self.current_actions.complete_action(
                 call_id,
                 status=status,
@@ -586,7 +679,8 @@ class OperationalEventManager:
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
-                state.add_message("assistant", assistant_response, thinking=assistant_thinking)
+                acts = self.current_actions if not self.current_actions.is_empty else None
+                state.add_message("assistant", assistant_response, actions=acts, thinking=assistant_thinking)
 
             return render_tool_activity(activity), assistant_response
 
@@ -596,7 +690,8 @@ class OperationalEventManager:
             assistant_response = extract_assistant_response(payload, workspace=self.workspace)
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
-                state.add_message("assistant", assistant_response, thinking=assistant_thinking)
+                acts = self.current_actions if not self.current_actions.is_empty else None
+                state.add_message("assistant", assistant_response, actions=acts, thinking=assistant_thinking)
 
         return render_operational_event(event), assistant_response
 
@@ -766,6 +861,7 @@ __all__ = [
     "STATUS_MARKERS",
     "ToolActivity",
     "ToolStatus",
+    "clean_error_message",
     "extract_assistant_response",
     "extract_assistant_thinking",
     "format_action_description",

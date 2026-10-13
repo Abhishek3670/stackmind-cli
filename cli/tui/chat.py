@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import os
 import re
@@ -19,10 +20,264 @@ if TYPE_CHECKING:
     from cli.tui.state import ChatMessage
 
 
+# ─── Transcript Render Cache ─────────────────────────────────────────────────
+
+# Cache for rendered transcript strings keyed by (transcript_hash, width, options)
+# Uses string output rather than Rich renderables to avoid console/mutable-state issues
+_TRANSCRIPT_CACHE: dict[str, str] = {}
+_TRANSCRIPT_CACHE_MAX_SIZE = 500  # Prevent unbounded growth in long sessions
+_TRANSCRIPT_CACHE_VERSION = "v1"  # Schema version for cache invalidation on rendering changes
+
+
+def _compute_transcript_hash(messages: list[ChatMessage]) -> str:
+    """Compute a deterministic hash for the complete ordered transcript.
+
+    Includes ALL messages to detect:
+    - Earlier-message content changes
+    - Last-message content changes
+    - Message additions, removals, or reordering
+    - Role or metadata changes
+    - Full content (no truncation)
+    """
+    key_parts = [
+        _TRANSCRIPT_CACHE_VERSION,
+        str(len(messages)),  # Detect additions/removals
+    ]
+    for msg in messages:
+        # Include full content (no truncation) to avoid collisions
+        # Use hashlib.md5 for each message to handle arbitrarily long content
+        msg_content = getattr(msg, "content", "")
+        msg_role = getattr(msg, "role", "")
+        msg_actions = str(getattr(msg, "actions", None))
+        msg_thinking = getattr(msg, "thinking", None) or ""
+        msg_model = getattr(msg, "model", None) or ""
+
+        # Hash individual message to handle long content efficiently
+        msg_hash = hashlib.md5(
+            "{}|{}|{}|{}|{}".format(
+                msg_role, msg_content, msg_actions, msg_thinking, msg_model
+            ).encode("utf-8")
+        ).hexdigest()
+        key_parts.append(msg_hash)
+
+    return hashlib.md5("|".join(key_parts).encode("utf-8")).hexdigest()
+
+
+def _compute_cache_key(transcript_hash: str, width: int,
+                       inline_diffs: bool = True, show_timestamps: bool = False,
+                       accent: bool = True) -> str:
+    """Compute cache key including all rendering-relevant parameters."""
+    return "{}|{}|{}|{}|{}".format(
+        transcript_hash, width, inline_diffs, show_timestamps, accent
+    )
+
+
+def _clear_cache_if_needed() -> None:
+    """Evict oldest entries if cache exceeds max size (FIFO eviction)."""
+    if len(_TRANSCRIPT_CACHE) > _TRANSCRIPT_CACHE_MAX_SIZE:
+        # Clear entire cache when over limit (simplest FIFO approximation)
+        _TRANSCRIPT_CACHE.clear()
+
+
+def _get_cached_render(cache_key: str) -> str | None:
+    """Get cached render if exists."""
+    return _TRANSCRIPT_CACHE.get(cache_key)
+
+
+def _set_cached_render(cache_key: str, rendered: str) -> None:
+    """Store render in cache, evicting if necessary."""
+    _clear_cache_if_needed()
+    _TRANSCRIPT_CACHE[cache_key] = rendered
+
+
+# ─── Message Rendering Helpers ──────────────────────────────────────────────
+
+
+def format_contract_payload(content: str) -> str:
+    """Detect and format raw task contract completion JSON into clean assistant text.
+
+    If content is pure contract JSON (e.g. {"status": "completed", "modified_files": ["PLAN.md"]}),
+    converts it into a human-readable summary. If conversational commentary exists before the
+    contract JSON, the trailing technical JSON block is cleanly stripped.
+    """
+    if not content or not isinstance(content, str):
+        return content
+
+    text = content.strip()
+
+    # Check for markdown code fences wrapping JSON
+    unfenced = text
+    if unfenced.startswith("```"):
+        _, _, rest = unfenced.partition("\n")
+        if "```" in rest:
+            body, _, _ = rest.rpartition("```")
+            unfenced = body.strip()
+        else:
+            unfenced = rest.strip()
+
+    def _safe_json_parse(s: str) -> dict[str, Any] | None:
+        if not s or not isinstance(s, str):
+            return None
+        s_clean = s.strip()
+        if not (s_clean.startswith("{") and s_clean.endswith("}")):
+            return None
+        try:
+            import json
+            obj = json.loads(s_clean, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # Healing pass for invalid JSON escapes (regexes like \s, \d, \w, \.)
+        try:
+            import json
+            healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
+            obj = json.loads(healed, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # Healing pass for single-quoted dict strings
+        try:
+            import ast
+            obj = ast.literal_eval(s_clean)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        try:
+            import json
+            obj, _ = json.JSONDecoder(strict=False).raw_decode(s_clean)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        return None
+
+    def _is_contract_dict(d: Any) -> bool:
+        if not isinstance(d, dict):
+            return False
+        return (
+            "status" in d
+            or "verdict" in d
+            or "modified_files" in d
+            or "blockers" in d
+            or "decision" in d
+            or "review_notes" in d
+            or "report_markdown" in d
+            or "summary" in d
+            or "response" in d
+            or "reason" in d
+            or "message" in d
+        )
+
+    def _format_dict(d: dict[str, Any]) -> str:
+        verdict = d.get("verdict")
+        review_notes = d.get("review_notes")
+        if review_notes and isinstance(review_notes, str) and review_notes.strip():
+            clean_rn = review_notes.strip()
+            if verdict:
+                return f"### QA Verdict: {verdict}\n\n{clean_rn}"
+            return clean_rn
+
+        summary = d.get("summary")
+        if summary and isinstance(summary, str) and summary.strip() and summary.strip() != "Completed task via tools":
+            stripped = summary.strip()
+            if stripped.startswith("```") or (stripped.startswith("{") and stripped.endswith("}")):
+                return format_contract_payload(stripped)
+            return stripped
+
+        report_md = d.get("report_markdown")
+        if report_md and isinstance(report_md, str) and report_md.strip() and report_md.strip() != "Completed task via tools":
+            stripped = report_md.strip()
+            if stripped.startswith("```") or (stripped.startswith("{") and stripped.endswith("}")):
+                return format_contract_payload(stripped)
+            return stripped
+
+        response = d.get("response")
+        if response and isinstance(response, str) and response.strip():
+            return response.strip()
+
+        st = str(d.get("status", "")).lower()
+        mods = d.get("modified_files") or []
+        blockers = d.get("blockers") or []
+        if st in {"completed", "success", "done"}:
+            if mods:
+                files_str = ", ".join(f"`{f}`" for f in mods)
+                if any("PLAN.md" in str(f) for f in mods):
+                    return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                return f"Completed turn. Modified files: {files_str}."
+            if verdict:
+                return f"### QA Verdict: {verdict}"
+            return "Completed turn via tools."
+        if st in {"blocked", "failed", "cancelled"}:
+            if blockers:
+                b_str = "; ".join(str(b) for b in blockers)
+                return f"Turn {st}: {b_str}"
+            reason = d.get("reason") or d.get("error") or "No details provided"
+            return f"Turn {st}: {reason}"
+        if verdict:
+            return f"### QA Verdict: {verdict}"
+        if "reason" in d or "error" in d:
+            reason = d.get("reason") or d.get("error")
+            return str(reason)
+        return ""
+
+    parsed = _safe_json_parse(unfenced)
+    if parsed and _is_contract_dict(parsed):
+        return _format_dict(parsed)
+
+    # Check if text ends with a JSON block after conversational text
+    match = re.search(r"\n*```(?:json)?\s*(\{[\s\S]*?\})\s*```\s*$", text)
+    if not match:
+        match = re.search(r"\n*(\{[\s\S]*?\})\s*$", text)
+    if match:
+        json_candidate = match.group(1).strip()
+        parsed = _safe_json_parse(json_candidate)
+        if parsed and _is_contract_dict(parsed):
+            leading_text = text[:match.start()].strip()
+            if leading_text:
+                return leading_text
+            return _format_dict(parsed)
+
+    # Fallback: regex search for summary or key fields (handles single/double quotes, unclosed stream quotes)
+    for key in ("summary", "report_markdown", "response", "review_notes"):
+        m = re.search(rf'["\']{key}["\']\s*:\s*["\']((?:[^"\'\\]|\\.)*)["\']?', unfenced, re.DOTALL)
+        if m:
+            val = m.group(1)
+            val = (
+                val.replace('\\n', '\n')
+                .replace('\\t', '\t')
+                .replace('\\"', '"')
+                .replace("\\'", "'")
+                .replace('\\\\', '\\')
+            )
+            if val.strip() and val.strip() != "Completed task via tools":
+                return val.strip()
+
+    # Never dump raw JSON payloads or code fences
+    if unfenced.startswith("{") or unfenced.startswith("```"):
+        mods_m = re.search(r'["\']modified_files["\']\s*:\s*\[(.*?)\]', unfenced, re.DOTALL)
+        if mods_m:
+            files_raw = re.findall(r'["\']([^"\']+)["\']', mods_m.group(1))
+            if files_raw:
+                files_str = ", ".join(f"`{f}`" for f in files_raw)
+                if any("PLAN.md" in f for f in files_raw):
+                    return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                return f"Completed turn. Modified files: {files_str}."
+        if unfenced.endswith("}"):
+            return "Completed turn."
+        # While JSON is streaming before summary key arrives, don't dump raw syntax
+        return ""
+
+    return text
+
+
 def strip_internal_reasoning(content: str) -> str:
     """Remove provider-delimited private reasoning without altering final Markdown."""
     clean = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", content, flags=re.IGNORECASE | re.DOTALL)
-    return re.sub(r"<think\b[^>]*>.*$", "", clean, flags=re.IGNORECASE | re.DOTALL).strip()
+    clean = re.sub(r"<think\b[^>]*>.*$", "", clean, flags=re.IGNORECASE | re.DOTALL).strip()
+    return format_contract_payload(clean)
 
 
 def extract_internal_reasoning(content: str) -> str | None:
@@ -165,16 +420,25 @@ def render_actions_group(
 
     arrow = "▾" if actions_obj.expanded else "▸"
     count = len(actions_obj.actions)
+    failed_count = sum(1 for a in actions_obj.actions if str(getattr(a, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"})
     if getattr(actions_obj, "active", False) or getattr(actions_obj, "has_running", False):
         suffix = f"{count}"
+        suffix_style = "dim white"
+    elif failed_count > 0:
+        if getattr(actions_obj, "completed_count", 0) > 0:
+            suffix = f"{actions_obj.completed_count} completed, {failed_count} failed"
+        else:
+            suffix = f"{failed_count} failed"
+        suffix_style = "bold red"
     else:
         suffix = f"{count} completed"
+        suffix_style = "dim white"
 
     header = Text()
-    header.append(f"{arrow} ", style="bold cyan")
+    header.append(f"{arrow} ", style="bold red" if failed_count > 0 else "bold cyan")
     header.append("Actions", style="bold white")
     header.append(" · ", style="dim")
-    header.append(suffix, style="dim white")
+    header.append(suffix, style=suffix_style)
 
     if not actions_obj.expanded:
         return header
@@ -196,7 +460,9 @@ def render_actions_group(
 
         line.append(f" {act.description}", style="white")
         if getattr(act, "error", None) and str(getattr(act, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"}:
-            line.append(f" ({act.error})", style="bold red")
+            from cli.tui.events import clean_error_message
+            clean_err = clean_error_message(act.error)
+            line.append(f" ({clean_err})", style="bold red")
         lines.append(line)
 
     return Group(*lines)
@@ -295,6 +561,8 @@ def render_assistant_message(
         elements.append(think_text)
 
     cleaned = strip_internal_reasoning(working_content)
+    if cleaned:
+        cleaned = format_contract_payload(cleaned)
 
     # Dynamic Region 3: Final assistant response (§18, §32) with operational telemetry dimming
     if cleaned:
@@ -446,8 +714,12 @@ def render_chat_transcript(
     padding: tuple[int, int] = (0, 1),
     show_timestamps: bool = False,
     accent: bool = True,
+    inline_diffs: bool = True,
 ) -> RenderableType:
-    """Render the full conversation transcript with left alignment, small horizontal padding (§13), and inline diffs (§33)."""
+    """Render the full conversation transcript with left alignment, small horizontal padding (§13), and inline diffs (§33).
+
+    Caches rendered message strings to avoid repeated Markdown parsing for stable messages.
+    """
     if not messages:
         empty_text = Text("(No messages in conversation yet.)", style="dim italic")
         return Padding(empty_text, padding) if padding else empty_text
@@ -475,6 +747,7 @@ def render_chat_transcript(
                     actions=getattr(msg, "actions", None),
                     thinking=getattr(msg, "thinking", None),
                     model=getattr(msg, "model", None),
+                    inline_diffs=inline_diffs,
                 )
             )
         elif role == "system":
@@ -517,8 +790,27 @@ def render_chat_transcript_str(
     accent: bool = True,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    inline_diffs: bool = True,
 ) -> str:
-    """Render the full conversation transcript as plain or ANSI formatted string using in-memory capture."""
+    """Render the full conversation transcript as plain or ANSI formatted string using in-memory capture.
+
+    Caches rendered output to avoid repeated Markdown parsing for unchanged transcripts.
+    Cache key includes ALL messages to prevent stale output when earlier messages change.
+    """
+    # Generate cache key from complete transcript and render parameters
+    cache_key = None
+    if messages:
+        transcript_hash = _compute_transcript_hash(messages)
+        cache_key = _compute_cache_key(
+            transcript_hash, width,
+            inline_diffs=inline_diffs,
+            show_timestamps=show_timestamps,
+            accent=accent,
+        )
+        cached = _get_cached_render(cache_key)
+        if cached is not None:
+            return cached
+
     console, use_ansi = _make_capture_console(
         width=width,
         force_color=force_color,
@@ -531,9 +823,13 @@ def render_chat_transcript_str(
             padding=padding,
             show_timestamps=show_timestamps,
             accent=accent,
+            inline_diffs=inline_diffs,
         )
     )
-    return console.export_text(styles=use_ansi).rstrip()
+    result = console.export_text(styles=use_ansi).rstrip()
+    if cache_key is not None:
+        _set_cached_render(cache_key, result)
+    return result
 
 
 __all__ = [
@@ -552,4 +848,7 @@ __all__ = [
     "render_user_message",
     "render_user_message_str",
     "should_render_ansi",
+    "_TRANSCRIPT_CACHE",
+    "_TRANSCRIPT_CACHE_MAX_SIZE",
+    "_clear_cache_if_needed",
 ]

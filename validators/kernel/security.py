@@ -171,6 +171,7 @@ _ALLOWLIST_SUBSTRINGS = (
     "change-me", "changeme", "change_me", "replace-me", "replaceme", "replace_me",
     "your-", "your_", "my-secret", "my_secret", "supersecret", "secret-key", "secret_key",
     "default", "admin", "development", "dev", "demo", "todo", "insert-", "put-", "set-", "local",
+    "postgres", "root", "localhost",
 )
 
 

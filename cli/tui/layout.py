@@ -62,18 +62,23 @@ RUNTIME_SECTIONS = ("AGENTS", "WORK ORDERS", "CURRENT OPERATION")
 COMPOSER_BOX_HEIGHT = 3
 STATUS_BAR_HEIGHT = 1
 VERTICAL_CHROME_LINES = COMPOSER_BOX_HEIGHT + STATUS_BAR_HEIGHT  # 4 lines total
+SETTINGS_PANEL_HEIGHT = 11
 MIN_VIEWPORT_HEIGHT = 4
 
 
-def compute_viewport_height(height: int | None = None) -> int:
+def compute_viewport_height(height: int | None = None, state: Any | None = None) -> int:
     """Calculate the conversation/workspace viewport height for a given terminal height.
 
-    Reserves lines for the pinned bottom composer box (3 lines) and the bottom status bar
-    (1 line), ensuring at least MIN_VIEWPORT_HEIGHT rows remain for the workspace.
+    Reserves lines for the pinned bottom composer box (3 lines), the bottom status bar
+    (1 line), and the anchored settings panel (11 lines) when open, ensuring at least
+    MIN_VIEWPORT_HEIGHT rows remain for the workspace.
     This is the single canonical source of truth for vertical viewport sizing in the TUI.
     """
     lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
-    return max(MIN_VIEWPORT_HEIGHT, lines - VERTICAL_CHROME_LINES)
+    chrome = VERTICAL_CHROME_LINES
+    if state is not None and getattr(state, "settings_panel_open", False):
+        chrome += SETTINGS_PANEL_HEIGHT
+    return max(MIN_VIEWPORT_HEIGHT, lines - chrome)
 
 
 # ── Layout Calculation & Tiers ───────────────────────────────────────────────
@@ -754,8 +759,8 @@ def render_full_screen_workspace(
         no_color=no_color,
     )
 
-    # 2. Viewport height (reserved 1 line for bottom status bar, plus 3 lines for composer box)
-    viewport_height = compute_viewport_height(height)
+    # 2. Viewport height (reserved 1 line for bottom status bar, 3 lines for composer box, and settings panel if open)
+    viewport_height = compute_viewport_height(height, state=state)
 
     # 3. Conversation content
     if conversation_content is not None:
@@ -786,10 +791,22 @@ def render_full_screen_workspace(
         no_color=no_color,
     )
 
+    settings_open = getattr(state, "settings_panel_open", False) if state is not None else False
+    settings_panel_str = ""
+    if settings_open:
+        from cli.tui.settings_panel import render_anchored_settings_panel_str
+
+        settings_width = layout.conversation_width if layout.show_runtime else width
+        settings_panel_str = render_anchored_settings_panel_str(
+            state, width=settings_width, height=SETTINGS_PANEL_HEIGHT
+        )
+
     if not include_composer:
+        if settings_open and settings_panel_str:
+            return f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}"
         return f"{workspace_str}\n{status_bar_str}"
 
-    # 5. Pinned bottom composer box (3 lines) placed above bottom status bar
+    # 5. Pinned bottom composer box (3 lines) placed above bottom status bar / settings panel
     comp_width = layout.conversation_width if layout.show_runtime else width
     composer_str = render_composer_box_str(
         placeholder=composer_placeholder,
@@ -801,6 +818,9 @@ def render_full_screen_workspace(
         force_color=force_color,
         no_color=no_color,
     )
+
+    if settings_open and settings_panel_str:
+        return f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}"
 
     return f"{workspace_str}\n{composer_str}\n{status_bar_str}"
 
@@ -1015,6 +1035,7 @@ __all__ = [
     "RUNTIME_MIN_WIDTH",
     "RUNTIME_SECTIONS",
     "STATUS_BAR_HEIGHT",
+    "SETTINGS_PANEL_HEIGHT",
     "VERTICAL_CHROME_LINES",
     "ColumnLayout",
     "LayoutTier",

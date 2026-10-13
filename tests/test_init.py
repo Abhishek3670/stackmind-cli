@@ -116,14 +116,10 @@ class TestInit:
         result = init(tmp_project, name="Test Project", no_git=True)
         assert result is True
 
-    def test_creates_agents_md(self, tmp_project):
-        """AGENTS.md must exist in project root."""
+    def test_does_not_create_root_agents_md(self, tmp_project):
+        """AGENTS.md should NOT be rendered to project root - it's internal runtime metadata."""
         init(tmp_project, name="Test Project", no_git=True)
-        agents_md = tmp_project / "AGENTS.md"
-        assert agents_md.exists()
-        content = agents_md.read_text(encoding="utf-8")
-        assert "Test Project" in content
-        assert "Authority: CEO → Claude → Gemma → Workers" in content
+        assert not (tmp_project / "AGENTS.md").exists()
 
     def test_creates_sync_directory(self, tmp_project):
         """The .sync/ directory must be created."""
@@ -294,7 +290,10 @@ class TestInit:
     def test_name_defaults_to_directory(self, tmp_project):
         """When no name is given, use directory name."""
         init(tmp_project, no_git=True)
-        content = (tmp_project / "AGENTS.md").read_text(encoding="utf-8")
+        # Verify README was created with project info
+        readme = tmp_project / "README.md"
+        assert readme.exists()
+        content = readme.read_text(encoding="utf-8")
         assert tmp_project.name in content
 
     def test_rejects_existing_sync(self, tmp_project):
@@ -333,13 +332,6 @@ class TestValidateResult:
         init(tmp_project, name="Test Project", no_git=True)
         errors = validate_result(tmp_project, DEFAULT_AGENTS)
         assert errors == []
-
-    def test_missing_agents_md_detected(self, tmp_project):
-        """Validation detects missing AGENTS.md."""
-        init(tmp_project, name="Test Project", no_git=True)
-        (tmp_project / "AGENTS.md").unlink()
-        errors = validate_result(tmp_project, DEFAULT_AGENTS)
-        assert any("AGENTS.md" in e for e in errors)
 
     def test_missing_boot_file_detected(self, tmp_project):
         """Validation detects missing boot snapshots."""

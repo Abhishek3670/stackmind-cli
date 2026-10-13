@@ -122,15 +122,19 @@ class ContextBundle:
     entries: tuple[ContextEntry, ...]
     text: str
     scope_filtered_count: int = 0
+    skill_diagnostics: dict[str, Any] | None = None
+    execution_profile: str = "medium"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             'entries': [item.to_dict() for item in self.entries],
             'estimated_tokens': self.estimated_tokens,
+            'execution_profile': self.execution_profile,
             'git_commit': self.git_commit,
             'revision': self.revision,
             'scope_filtered_count': self.scope_filtered_count,
             'semantic': self.semantic,
+            'skill_diagnostics': self.skill_diagnostics,
             'stale': self.stale,
             'text': self.text,
             'token_budget': self.token_budget,
@@ -657,10 +661,24 @@ class KnowledgeAPI:
         query_embedding: Sequence[float] | None = None,
         contract: AgentContract | str | Path | None = None,
         include_skills: bool = True,
+        profile: Any | None = None,
+        skills: Sequence[str] | None = None,
     ) -> ContextBundle:
         """Assemble a bounded context bundle for agent prompts, including verified active procedural skills."""
         self._check_expiration(contract)
         self.pop_scope_filter_stats()  # reset exclusion ledger for this assembly
+
+        # Resolve effective execution profile & policy
+        from validators.kernel.profile import ExecutionProfile, get_profile_policy
+        if profile is None:
+            try:
+                from validators.kernel.settings import load_settings
+                profile = load_settings(self.project_path).execution_profile
+            except Exception:
+                profile = ExecutionProfile.MEDIUM
+        effective_policy = get_profile_policy(profile)
+        effective_profile_str = effective_policy.profile.value
+
         # Context assembly is a prompt-builder, not a governed data API: a single
         # denied node must not abort the bundle. Skip-and-ledger keeps the turn
         # alive while preserving an inspectable record of exclusions.
@@ -709,12 +727,19 @@ class KnowledgeAPI:
         truncation_reason = None
         scope_skips: list[tuple[str, str]] = []
 
-        # 1. Retrieve matching verified active skills (Phase 7 Procedural Learning Integration)
-        if include_skills:
+        skill_diag_dict: dict[str, Any] | None = None
+        # 1. Retrieve matching verified active skills according to execution profile policy
+        if include_skills and effective_policy.skills_enabled:
             try:
                 from validators.skill.retriever import SkillRetriever
                 retriever = SkillRetriever(self.project_path)
-                matched_skills = retriever.retrieve_skills(query, contract=contract, limit=2)
+                matched_skills, skill_diag = retriever.retrieve_skills_with_diagnostics(
+                    query,
+                    contract=contract,
+                    policy=effective_policy,
+                    explicit_skills=skills,
+                )
+                skill_diag_dict = skill_diag.to_dict()
                 for res in matched_skills:
                     skill_block = res.formatted_guidance
                     skill_tokens = _estimate_tokens(skill_block)
@@ -726,7 +751,11 @@ class KnowledgeAPI:
                                 confidence=res.skill.metrics.confidence_score,
                                 text=skill_block,
                                 reason="procedural_skill",
-                                why_retrieved=("verified_procedural_skill", f"relevance={res.relevance_score:.2f}"),
+                                why_retrieved=(
+                                    "verified_procedural_skill",
+                                    f"relevance={res.relevance_score:.2f}",
+                                    f"mode={res.loading_mode}",
+                                ),
                                 access_status="allowed",
                             )
                         )
@@ -735,6 +764,24 @@ class KnowledgeAPI:
             except Exception:
                 # Skill retrieval failures must fail open for standard graph context
                 pass
+        elif include_skills and not effective_policy.skills_enabled:
+            # Low profile records zero-skill diagnostic
+            skill_diag_dict = {
+                "budget_exceeded": False,
+                "considered_count": 0,
+                "considered_ids": [],
+                "estimated_skill_tokens": 0,
+                "exclusions": [],
+                "injected_count": 0,
+                "injected_ids": [],
+                "loaded_count": 0,
+                "loaded_ids": [],
+                "profile": effective_profile_str,
+                "selected_count": 0,
+                "selected_ids": [],
+                "skill_token_budget": 0,
+                "skills_enabled": False,
+            }
 
         for rank, result in sorted(
             ranked.values(),
@@ -783,6 +830,8 @@ class KnowledgeAPI:
             entries=tuple(entries),
             text='\n\n'.join(text_blocks),
             scope_filtered_count=len(scope_skips),
+            skill_diagnostics=skill_diag_dict,
+            execution_profile=effective_profile_str,
         )
 
     def _active_records(self) -> list[dict[str, Any]]:

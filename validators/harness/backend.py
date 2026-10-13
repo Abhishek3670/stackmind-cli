@@ -318,6 +318,20 @@ class BaseExecutionBackend:
         self._events[operation_id].append(event)
         return {"operation_id": operation_id, "status": op["status"]}
 
+    def publish(
+        self,
+        operation_id: str,
+        name: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Publish an event to the operation's event stream."""
+        if operation_id not in self._operations:
+            raise KeyError(f"Operation '{operation_id}' not found")
+        now = _now()
+        event = {"event": name, "operation_id": operation_id, "timestamp": now, **kwargs}
+        self._events.setdefault(operation_id, []).append(event)
+        return event
+
     def stream_events(
         self,
         operation_id: str,
@@ -840,9 +854,28 @@ def get_default_registry() -> BackendRegistry:
             )
         )
 
-        # Register cloud providers if environment variables are present
+        # Register cloud providers from settings.json and environment
+        try:
+            from validators.kernel.settings import load_settings
+            app_settings = load_settings()
+            for p_name, prov in app_settings.providers.items():
+                if prov.enabled and prov.name not in reg:
+                    has_cred = bool(prov.api_key) or prov.name == "ollama"
+                    reg.register(
+                        ModelExecutionBackend(
+                            backend_id=prov.name,
+                            model=prov.default_model or (prov.models[0] if prov.models else None),
+                            endpoint=prov.base_url,
+                            credential_ref=f"settings:{prov.name}" if prov.api_key else None,
+                            available=has_cred,
+                        )
+                    )
+        except Exception:
+            pass
+
+        # Register cloud providers if environment variables are present (fallback)
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-        if anthropic_key:
+        if anthropic_key and "anthropic" not in reg:
             reg.register(
                 ModelExecutionBackend(
                     backend_id="anthropic",
@@ -854,7 +887,7 @@ def get_default_registry() -> BackendRegistry:
             )
 
         openai_key = os.environ.get("OPENAI_API_KEY")
-        if openai_key:
+        if openai_key and "openai" not in reg:
             reg.register(
                 ModelExecutionBackend(
                     backend_id="openai",

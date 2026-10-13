@@ -158,7 +158,11 @@ def load_harness_contract(project_path: Path, agent: str, work_order_id: str | N
     agent_contract_path = project_path / ".sync" / "agents" / f"{agent}.contract.yaml"
     if agent_contract_path.exists():
         try:
-            return AgentContract.load(agent_contract_path, project_path)
+            contract = AgentContract.load(agent_contract_path, project_path)
+            if work_order_id:
+                contract.work_order = work_order_id
+                contract.data["work_order"] = work_order_id
+            return contract
         except Exception:
             pass
         
@@ -186,9 +190,13 @@ def verify_pre_execution(
         
     # Verify work order ID matching
     if task.work_order_id and task.work_order_id != contract.work_order:
-        raise ContractAccessDenied(
-            f"Task work order {task.work_order_id} does not match contract work order {contract.work_order}"
-        )
+        if contract.work_order == "WO-000":
+            contract.work_order = task.work_order_id
+            contract.data["work_order"] = task.work_order_id
+        else:
+            raise ContractAccessDenied(
+                f"Task work order {task.work_order_id} does not match contract work order {contract.work_order}"
+            )
 
 def verify_post_execution(
     project_path: Path,
@@ -233,8 +241,11 @@ def verify_post_execution(
     # 3. Check scope allowed/denied for each modified file
     api = KnowledgeAPI(project_path)
     for file_path in files_to_check:
-        mod = path_to_module(file_path)
-        norm_fp = file_path.replace("\\", "/")
+        # Normalize file path for comparison
+        norm_fp = file_path.replace("\\", "/").lstrip("/")
+        if norm_fp.startswith("./"):
+            norm_fp = norm_fp[2:]
+        mod = path_to_module(norm_fp)
         if norm_fp.startswith("./"):
             norm_fp = norm_fp[2:]
         elif norm_fp.startswith("/"):

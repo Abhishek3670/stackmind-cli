@@ -28,12 +28,13 @@ SECRET_NAME_PATTERN = (
 )
 
 # Variable-name suffixes that indicate a non-secret concept even when the name
-# contains a keyword (token_url, password_policy, secret_name, ...).
+# contains a keyword (token_url, tokenUrl, password_policy, secret_name, ...).
 _NON_SECRET_NAME_PATTERN = re.compile(
-    r"(?i)^(?:.*_)?(?:url|header|name|policy|rule|prompt|hint|label|placeholder|"
+    r"^(?:(?:.*_)?(?:url|uri|endpoint|header|name|policy|rule|prompt|hint|label|placeholder|"
     r"field|column|type|kind|format|file|path|prefix|length|min|max|rotation|"
     r"expiry|ttl|hash|algorithm|help|doc|docstring|message|msg|error|title|"
-    r"description|count|list|cache|scope|header_name)$"
+    r"description|count|list|cache|scope|header_name)|.*(?:url|uri|endpoint))$",
+    re.IGNORECASE,
 )
 
 _COMMENT_LINE_PATTERN = re.compile(r"^\s*(#|//)")
@@ -87,8 +88,8 @@ class SecurityFinding:
 
 
 def _is_non_secret_name(name: str) -> bool:
-    base = name.lower().strip("_")
-    return bool(_NON_SECRET_NAME_PATTERN.match(base))
+    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).lower().strip("_")
+    return bool(_NON_SECRET_NAME_PATTERN.match(snake))
 
 
 def scan_file(rel_path: str, content: str, *, allow_debug: bool = False) -> list[SecurityFinding]:

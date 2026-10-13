@@ -196,12 +196,16 @@ def test_panel_aware_streaming_rate_limiting():
         assert mock_redraw.call_count <= 2
         assert mock_redraw.call_count >= 1
 
-        # Verify arguments on the final redraw call (WO-013):
+        # The final settle redraw uses the same full-frame, no-clear contract
+        # as streaming, while rendering canonical state (not transient content).
         final_call = mock_redraw.call_args_list[-1]
         assert final_call.kwargs.get("clear") is False
+        assert "conversation_content" not in final_call.kwargs
         assert final_call.kwargs.get("include_composer") is True
         assert final_call.kwargs.get("composer_is_active") is False
-        assert final_call.kwargs.get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
+        assert final_call.kwargs.get("composer_placeholder") == (
+            "Generating response... (Ctrl+C to cancel)"
+        )
         assert final_call.kwargs.get("live_manager") == mock_live
 
         # Verify assistant message has accumulated all 50 tokens
@@ -245,7 +249,8 @@ def test_panel_aware_streaming_periodic_redraw_at_100ms_intervals():
     mock_client = MagicMock()
     mock_client.operation_get.return_value = {"status": "COMPLETED"}
 
-    with patch("time.monotonic", side_effect=lambda: next(time_iter, 1.0)), \
+    with patch("sys.stdout.isatty", lambda: True), \
+         patch("time.monotonic", side_effect=lambda: next(time_iter, 1.0)), \
          patch("cli.tui.app.redraw_full_screen") as mock_redraw:
         dispatch_delivery_command(
             mock_adapter,
@@ -262,12 +267,29 @@ def test_panel_aware_streaming_periodic_redraw_at_100ms_intervals():
         # 4. final completion redraw
         assert mock_redraw.call_count == 4
 
-        # Verify all streaming redraws have include_composer=True, composer_is_active=False, clear=False (WO-013)
-        for call in mock_redraw.call_args_list:
+        # Check the rate-limited streaming frames separately from the final
+        # canonical-state settle redraw.
+        streaming_calls = mock_redraw.call_args_list[:-1]
+        assert len(streaming_calls) == 3
+        for call in streaming_calls:
             assert call.kwargs.get("clear") is False
             assert call.kwargs.get("include_composer") is True
             assert call.kwargs.get("composer_is_active") is False
-            assert call.kwargs.get("composer_placeholder") == "Generating response... (Ctrl+C to cancel)"
+            assert call.kwargs.get("composer_placeholder") == (
+                "Generating response... (Ctrl+C to cancel)"
+            )
+
+        final_call = mock_redraw.call_args_list[-1]
+        assert final_call.kwargs.get("clear") is False
+        assert "conversation_content" not in final_call.kwargs
+        assert final_call.kwargs.get("include_composer") is True
+        assert final_call.kwargs.get("composer_is_active") is False
+        assert final_call.kwargs.get("composer_placeholder") == (
+            "Generating response... (Ctrl+C to cancel)"
+        )
+        assistant_msgs = [m for m in state.messages if m.role == "assistant"]
+        assert len(assistant_msgs) == 1
+        assert assistant_msgs[0].content == "chunk0 chunk1 chunk2 chunk3 chunk4 chunk5"
 
 
 def test_heartbeat_tick_suppression_during_active_streaming():

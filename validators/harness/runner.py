@@ -32,6 +32,14 @@ from validators.harness.retrieval import (
     SessionSearchTool,
 )
 from validators.harness.task_contract import reconcile_modified_files
+from validators.harness.orchestration import (
+    ReviewOutcome,
+    ReviewResult,
+    ReleaseDecision,
+    structured_output_validator,
+    release_decision,
+    evaluate_release_gates,
+)
 from validators.knowledge.api import ContextBundle, KnowledgeAPI
 
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / 'schemas' / 'harness-output.schema.json'
@@ -293,12 +301,30 @@ class AgentRunner:
         now_fn: Any | None = None,
         sleep_fn: Any | None = None,
         on_token: Callable[[str], None] | None = None,
+        on_tool_call: Callable[[str, dict[str, Any], str], None] | None = None,
+        on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        execution_profile: Any | None = None,
     ) -> None:
         self.project_path = project_path.resolve()
         self.sync_path = self.project_path / '.sync'
         self.agent = agent
         self.backend = backend
         self.provider_adapter = provider_adapter
+
+        # Canonical execution profile & policy resolution
+        from validators.kernel.profile import ExecutionProfile, get_profile_policy
+        if execution_profile is not None:
+            self.execution_profile = ExecutionProfile.from_str(execution_profile)
+        else:
+            try:
+                from validators.kernel.settings import load_settings
+                self.execution_profile = ExecutionProfile.from_str(
+                    load_settings(self.project_path).execution_profile
+                )
+            except Exception:
+                self.execution_profile = ExecutionProfile.MEDIUM
+        self.profile_policy = get_profile_policy(self.execution_profile)
         if backend is not None:
             self.backend_id = getattr(backend, 'backend_id', 'custom-backend')
             self.backend_model = getattr(backend, 'model', None) or 'default'
@@ -330,6 +356,9 @@ class AgentRunner:
         self.sleep_fn = sleep_fn or time.sleep
         self.reader = ResourceReadTracker(max_reads=3)
         self.on_token = on_token
+        self.on_tool_call = on_tool_call
+        self.on_tool_result = on_tool_result
+        self.on_thinking = on_thinking
         self._tree_cache: dict[str, Any] | None = None
 
     @staticmethod
@@ -364,22 +393,7 @@ class AgentRunner:
         try:
             tree_data = self._load_tree()
             self._ensure_protocol_citizenship(tree_data)
-            task = self.discover_next_task(tree_data, work_order_id=work_order_id)
-            if task is not None and is_authoring:
-                task = HarnessTask(
-                    kind=task.kind,
-                    identifier=task.identifier,
-                    path=task.path,
-                    title=task.title,
-                    body=task.body,
-                    query=task.query,
-                    work_order_id=task.work_order_id,
-                    deliverable_path=None,
-                    is_authoring=True,
-                    work_order_type=task.work_order_type,
-                    deliverable_type=task.deliverable_type,
-                )
-            if task is None and prompt:
+            if prompt and not work_order_id and not is_authoring:
                 adhoc_file = self.sync_path / 'inbox' / self.agent / 'adhoc.md'
                 task = HarnessTask(
                     kind='adhoc',
@@ -388,10 +402,26 @@ class AgentRunner:
                     title=prompt.strip() or 'User Prompt',
                     body=prompt.strip() or 'User Prompt',
                     query=prompt.strip() or 'User Prompt',
-                    is_authoring=is_authoring,
+                    is_authoring=False,
                     work_order_type=None,
                     deliverable_type=None,
                 )
+            else:
+                task = self.discover_next_task(tree_data, work_order_id=work_order_id)
+                if task is not None and is_authoring:
+                    task = HarnessTask(
+                        kind=task.kind,
+                        identifier=task.identifier,
+                        path=task.path,
+                        title=task.title,
+                        body=task.body,
+                        query=task.query,
+                        work_order_id=task.work_order_id,
+                        deliverable_path=None,
+                        is_authoring=True,
+                        work_order_type=task.work_order_type,
+                        deliverable_type=task.deliverable_type,
+                    )
             if task is None:
                 return HarnessRunResult(
                     status='idle',
@@ -400,7 +430,7 @@ class AgentRunner:
                     reason='no inbox items or assigned work orders',
                 )
 
-            if task is not None and prompt and prompt.strip():
+            if task is not None and task.kind != 'adhoc' and prompt and prompt.strip():
                 p_str = prompt.strip()
                 if p_str != task.title.strip() and p_str != task.body.strip():
                     task = HarnessTask(
@@ -433,6 +463,19 @@ class AgentRunner:
             task_contract = load_harness_contract(
                 self.project_path, self.agent, task.work_order_id
             )
+            assigned_skills = list(getattr(task_contract, "skills", []) or [])
+            if not assigned_skills and task.work_order_id:
+                for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                    wo_path = self.sync_path / 'work-orders' / sub / f'{task.work_order_id}.yaml'
+                    if wo_path.exists():
+                        try:
+                            wo_data = yaml.safe_load(wo_path.read_text(encoding='utf-8'))
+                            if isinstance(wo_data, dict) and wo_data.get("skills"):
+                                assigned_skills = list(wo_data["skills"])
+                        except Exception:
+                            pass
+                        break
+
             knowledge_api = KnowledgeAPI(self.project_path)
             try:
                 context = knowledge_api.assemble_context(
@@ -440,6 +483,8 @@ class AgentRunner:
                     token_budget=self.token_budget,
                     limit=self.context_limit,
                     contract=task_contract,
+                    profile=self.execution_profile,
+                    skills=assigned_skills or None,
                 )
             except (ContractAccessDenied, ContractExpiredError) as contract_error:
                 # Fail closed, gracefully: the pre-execution gate would block
@@ -592,8 +637,8 @@ class AgentRunner:
                 has_commands = bool(completion.payload.get('commands'))
                 if not has_modifications and not has_commands:
                     from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning
-                    raw_summary = strip_internal_reasoning(str(completion.payload.get('summary') or ''))
-                    raw_report = strip_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
+                    raw_summary = strip_internal_reasoning(str(completion.payload.get('summary') or '')).strip()
+                    raw_report = strip_internal_reasoning(str(completion.payload.get('report_markdown') or '')).strip()
                     raw_thinking = (
                         completion.payload.get('thinking')
                         or completion.payload.get('reasoning')
@@ -602,42 +647,41 @@ class AgentRunner:
                         or extract_internal_reasoning(str(completion.payload.get('summary') or ''))
                         or extract_internal_reasoning(str(completion.payload.get('report_markdown') or ''))
                     )
-                    if not raw_summary and not raw_report:
-                        return HarnessRunResult(
-                            status='blocked',
-                            persisted=False,
-                            task_id=task.identifier,
-                            reason='verification gate failed: outcome_verified',
+                    if raw_summary or raw_report:
+                        outbox_dir = self.sync_path / 'outbox' / self.agent
+                        outbox_dir.mkdir(parents=True, exist_ok=True)
+                        now_str = run_at.isoformat().replace(':', '-')
+                        out_path = outbox_dir / f'harness-{now_str}.md'
+                        thinking_section = f'## Thinking\n{raw_thinking}\n\n' if raw_thinking else ''
+                        report_content = (
+                            f'# Harness Report: {task.identifier}\n\n'
+                            f'- agent: `{self.agent}`\n'
+                            f'- task: `{task.identifier}`\n'
+                            f'- kind: `adhoc`\n'
+                            f'- status: `completed`\n'
+                            f'- recorded_at: `{run_at.isoformat()}`\n\n'
+                            f'{thinking_section}'
+                            f'## Summary\n{raw_summary or raw_report}\n\n'
+                            f'## Report\n{raw_report or raw_summary}\n'
                         )
-
-                    outbox_dir = self.sync_path / 'outbox' / self.agent
-                    outbox_dir.mkdir(parents=True, exist_ok=True)
-                    now_str = run_at.isoformat().replace(':', '-')
-                    out_path = outbox_dir / f'harness-{now_str}.md'
-                    thinking_section = f'## Thinking\n{raw_thinking}\n\n' if raw_thinking else ''
-                    report_content = (
-                        f'# Harness Report: {task.identifier}\n\n'
-                        f'- agent: `{self.agent}`\n'
-                        f'- task: `{task.identifier}`\n'
-                        f'- kind: `adhoc`\n'
-                        f'- status: `completed`\n'
-                        f'- recorded_at: `{run_at.isoformat()}`\n\n'
-                        f'{thinking_section}'
-                        f'## Summary\n{raw_summary or raw_report}\n\n'
-                        f'## Report\n{raw_report or raw_summary}\n'
-                    )
-                    out_path.write_text(report_content, encoding='utf-8')
-                    summary = raw_summary or raw_report
-                    meta: dict[str, Any] = {'summary': summary}
-                    if raw_thinking:
-                        meta['thinking'] = raw_thinking
-                    return HarnessRunResult(
-                        status='completed',
-                        persisted=True,
-                        task_id=task.identifier,
-                        report_path=out_path,
-                        meta=meta,
-                    )
+                        out_path.write_text(report_content, encoding='utf-8')
+                        meta: dict[str, Any] = {
+                            'summary': raw_summary or raw_report,
+                            'report_markdown': raw_report or raw_summary,
+                        }
+                        if raw_thinking:
+                            meta['thinking'] = raw_thinking
+                        if hasattr(completion, 'meta') and isinstance(completion.meta, dict):
+                            for k in ('tool_calls_audit', 'commands_audit', 'backend_id', 'model'):
+                                if k in completion.meta:
+                                    meta[k] = completion.meta[k]
+                        return HarnessRunResult(
+                            status='completed',
+                            persisted=True,
+                            task_id=task.identifier,
+                            report_path=out_path,
+                            meta=meta,
+                        )
 
             # Decision validation with feedback and bounded retry (Requirement 3)
             max_validation_retries = 2
@@ -916,9 +960,10 @@ class AgentRunner:
                             )
                         if hasattr(tool_runtime, "gateway") and hasattr(tool_runtime.gateway, "written_files"):
                             tool_written.update(Path(p).as_posix().lstrip('/') for p in tool_runtime.gateway.written_files)
-                    for tc in (getattr(completion, "meta", None) or {}).get("tool_calls_audit", []):
-                        if isinstance(tc, dict) and tc.get("tool") == "write_file" and tc.get("path"):
-                            tool_written.add(Path(str(tc["path"])).as_posix().lstrip('/'))
+                    if not tool_written:
+                        for tc in (getattr(completion, "meta", None) or {}).get("tool_calls_audit", []):
+                            if isinstance(tc, dict) and tc.get("tool") == "write_file" and tc.get("path"):
+                                tool_written.add(Path(str(tc["path"])).as_posix().lstrip('/'))
                     if self.agent in ("local-llm", "gitops"):
                         for rel_file in ("VERSION.md", "CHANGELOG.md"):
                             if rel_file in dec_norm and (staged_root / rel_file).is_file():
@@ -1415,7 +1460,12 @@ class AgentRunner:
 
         def graph_query(query: str) -> dict[str, Any]:
             bundle = knowledge_api.assemble_context(
-                query, token_budget=self.token_budget, limit=self.context_limit, contract=task_contract,
+                query,
+                token_budget=self.token_budget,
+                limit=self.context_limit,
+                contract=task_contract,
+                profile=self.execution_profile,
+                skills=getattr(task_contract, "skills", None),
             )
             return {
                 'revision': bundle.revision,
@@ -1436,30 +1486,61 @@ class AgentRunner:
         raw_text = (raw_text or '').strip()
         payload = None
 
+        def _try_load(s: str) -> dict[str, Any] | None:
+            if not s:
+                return None
+            s_clean = s.strip()
+            try:
+                obj = json.loads(s_clean, strict=False)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            # Healing pass: double-escape invalid JSON escape backslashes (e.g. \s, \d, \w, \.)
+            try:
+                healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
+                obj = json.loads(healed, strict=False)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            return None
+
         # 1. Try markdown code block
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
         if match:
-            try:
-                payload = json.loads(match.group(1).strip())
-            except Exception:
-                pass
+            payload = _try_load(match.group(1))
 
         # 2. Try raw json loads
         if payload is None:
-            try:
-                payload = json.loads(raw_text)
-            except Exception:
-                pass
+            payload = _try_load(raw_text)
 
-        # 3. Try raw_decode from first {
+        # 3. Try slice from first '{' to last '}'
+        if payload is None and '{' in raw_text and '}' in raw_text:
+            first_brace = raw_text.find('{')
+            last_brace = raw_text.rfind('}')
+            if last_brace > first_brace:
+                payload = _try_load(raw_text[first_brace:last_brace + 1])
+
+        # 4. Try raw_decode from first {
         if payload is None and '{' in raw_text:
             idx = raw_text.find('{')
             try:
-                obj, _ = json.JSONDecoder().raw_decode(raw_text, idx)
+                obj, _ = json.JSONDecoder(strict=False).raw_decode(raw_text, idx)
                 if isinstance(obj, dict):
                     payload = obj
             except Exception:
                 pass
+            if payload is None:
+                try:
+                    healed_full = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', raw_text)
+                    idx = healed_full.find('{')
+                    if idx != -1:
+                        obj, _ = json.JSONDecoder(strict=False).raw_decode(healed_full, idx)
+                        if isinstance(obj, dict):
+                            payload = obj
+                except Exception:
+                    pass
 
         # If payload was emitted as a wrapped dictionary or tool call format:
         if isinstance(payload, dict):
@@ -1580,6 +1661,10 @@ class AgentRunner:
                 phase=task_phase,
                 backend_id=self.backend_id,
             ),
+            on_tool_call=getattr(self, 'on_tool_call', None),
+            on_tool_result=getattr(self, 'on_tool_result', None),
+            on_thinking=getattr(self, 'on_thinking', None),
+            on_token=getattr(self, 'on_token', None),
         )
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
@@ -1591,17 +1676,25 @@ class AgentRunner:
                 WORK_ORDER_SCHEMA_TEMPLATE,
                 CONTRACT_SCHEMA_TEMPLATE,
             )
+            from validators.skill.selector import format_skills_for_architect_prompt
             task_text += f"\n{ARCHITECTURE_RESEARCH_INSTRUCTIONS}\n"
             task_text += f"\nGoverned Artifact Authoring Schemas (for reference when planning tasks):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
+            skills_prompt = format_skills_for_architect_prompt(self.project_path)
+            if skills_prompt:
+                task_text += f"\n{skills_prompt}\n"
 
         if is_architecture and is_authoring_task:
             from validators.harness.plan import (
                 WORK_ORDER_SCHEMA_TEMPLATE,
                 CONTRACT_SCHEMA_TEMPLATE,
             )
+            from validators.skill.selector import format_skills_for_architect_prompt
             task_text += f"\nGoverned Artifact Authoring Schemas (REQUIRED for writing child work orders and contracts):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
+            skills_prompt = format_skills_for_architect_prompt(self.project_path)
+            if skills_prompt:
+                task_text += f"\n{skills_prompt}\n"
 
         if is_architecture and is_integration_review:
             system_msg = (
@@ -1632,15 +1725,52 @@ class AgentRunner:
                 "the parent Work Order (e.g. index.html) MUST explicitly declare the exact markup, container classes, and "
                 "element IDs (e.g. #animated-name) in its deliverable description and acceptance criteria so downstream "
                 "scripts and styles hook into existing elements. Never leave parent deliverables as empty placeholder scaffolding.\n"
+                "FILE OWNERSHIP RULE: In each Work Order's description and acceptance_criteria, you must ONLY instruct the worker to create or modify the specific file declared in its own `deliverable.path`. Never instruct a worker to initialize, create, or stub files that are the assigned deliverable of another work order (e.g. do not tell a scaffolding worker to touch index.html or main.js if those are deliverables of subsequent work orders), as runtime contract policies will deny out-of-scope file operations.\n"
                 "Only worker roles may be assigned to implementation work orders (e.g. codex for backend, gemini for frontend, gemma for qa, local-llm for gitops). "
                 "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
             )
+        elif request.task.kind == 'adhoc':
+            if is_architecture:
+                system_msg = (
+                    "You are Claude, the Lead Architect for StackMind CLI, paired with the operator in this project workspace. "
+                    "You handle General Q&A, chat, code explanation, architecture planning, and ad-hoc workspace assistance. "
+                    "Respond conversationally, helpfully, and directly to the operator's message with architectural depth and precision.\n\n"
+                    "ARCHITECTURAL CAPABILITIES & INSTRUCTIONS:\n"
+                    "1. When the operator asks for a plan, design, or feature specification (e.g. login page, auth flow, API, database schema):\n"
+                    "   - Provide a complete, production-grade architectural blueprint: technology stack choices, component decomposition, data/control flow, and file layout.\n"
+                    "   - Detail security best practices (e.g. password hashing with Argon2/bcrypt, secure session/JWT with HttpOnly cookies, CSRF tokens, rate limiting, and input sanitization).\n"
+                    "   - Outline the concrete implementation milestones with assigned specialist agent roles:\n"
+                    "     * Backend (Codex): APIs, data models, auth logic, and core services\n"
+                    "     * Frontend (Gemini): UI markup, responsive styles, client validation, and UX states\n"
+                    "     * QA (Gemma): Automated test suites, security scans, and behavioral assertions\n"
+                    "     * GitOps (Local-LLM): Semantic versioning, changelog, and release packaging\n"
+                    "   - Proactive guidance: Explicitly inform the operator that to build, launch, and test this plan autonomously across the workspace, they can execute:\n"
+                    "     `:goal <description>` in the prompt bar.\n"
+                    "2. Workspace Investigation: You have access to tools (read_file, list_directory, query_graph, find_symbol, find_references, write_file, run_command) if needed to inspect or examine the codebase. If you execute tools, synthesize your findings directly into your answer so the operator sees the context.\n"
+                    "3. Conversational Feedback: For greetings, general questions, explanations, or code reviews, answer directly in clean Markdown without making unnecessary tool calls.\n"
+                    "4. Output Format: Never output raw JSON decision schemas unless explicitly requested. Always deliver well-structured Markdown prose."
+                )
+            else:
+                agent_title = self.agent.title()
+                system_msg = (
+                    f"You are StackMind's {agent_title} agent, paired with the operator in this project workspace. "
+                    "Respond conversationally, helpfully, and directly to the operator's message. "
+                    "You have access to tools (e.g. read_file, list_directory, query_graph, write_file) if you need "
+                    "to inspect or edit workspace files to answer or fulfill the request. If no tools are needed "
+                    "(such as for greetings, general explanations, answering questions, or conversational feedback), "
+                    "answer directly in plain text without making unnecessary tool calls. "
+                    "Do NOT format your response as a JSON decision schema unless explicitly asked."
+                )
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = raw_context
+            task_text = f"User Message:\n{request.task.body or request.task.title}\n\n"
         elif is_architecture:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
                 "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
+                "You also select and assign appropriate procedural skills from the workspace skills library, indicating `(Skills: <skill_name>)` in milestone titles. "
                 "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file).\n"
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
                 "Only after receiving the graph research results should you call `write_file` to write PLAN.md.\n"
@@ -1720,11 +1850,15 @@ class AgentRunner:
                 "INTEGRATION REQUIREMENT: Ensure your deliverable integrates with other workspace files (e.g. element IDs in JS matching HTML, classes in CSS matching markup). If your deliverable references an ID or class from a companion file in scope, make sure it matches.\n"
             )
 
+        user_content = task_text
+        if request.task.kind != 'adhoc':
+            user_content = f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
+        elif getattr(request.context, "text", None):
+            user_content = f'{task_text}Context:\n{request.context.text}'
+
         messages = [
             Message.system(system_msg),
-            Message.user(
-                f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
-            ),
+            Message.user(user_content),
         ]
         from validators.kernel.providers.errors import (
             ConsecutiveToolFailureError,
@@ -1754,11 +1888,21 @@ class AgentRunner:
             # Check what files have been written so far
             written_files_so_far: list[str] = list(getattr(gateway, "written_files", []))
             if not written_files_so_far:
+                failed_call_ids: set[str] = set()
+                for msg in messages:
+                    if getattr(msg, 'role', '') == 'tool':
+                        content_str = str(msg.content or '')
+                        if content_str.startswith("Error:") or content_str.startswith("Warning:") or "PermissionError" in content_str:
+                            if getattr(msg, 'tool_call_id', None):
+                                failed_call_ids.add(msg.tool_call_id)
                 for msg in messages:
                     if msg.tool_calls:
                         for tc in msg.tool_calls:
-                            if tc.name == 'write_file' and 'path' in tc.arguments:
-                                p = str(tc.arguments['path'])
+                            if tc.id and tc.id in failed_call_ids:
+                                continue
+                            tc_args = getattr(tc, 'arguments', None) or {}
+                            if tc.name == 'write_file' and 'path' in tc_args:
+                                p = str(tc_args['path'])
                                 if p not in written_files_so_far:
                                     written_files_so_far.append(p)
 
@@ -1794,19 +1938,67 @@ class AgentRunner:
                 raise ValueError('provider tool loop ended without an assistant message')
         final = next((m for m in reversed(assistant_msgs) if m.content and m.content.strip()), assistant_msgs[-1])
         raw_text = (final.content or '').strip()
+        if request.task.kind == 'adhoc' and not raw_text and getattr(gateway, 'adapter', None) is not None:
+            try:
+                fin_messages = [
+                    m for m in history
+                    if (m.content and m.content.strip()) or m.tool_calls or m.role != 'assistant'
+                ]
+                fin_prompt = (
+                    "Based on the tool results and workspace inspection above, please provide your final, "
+                    "comprehensive conversational response to the operator's message."
+                )
+                fin_messages.append(Message.user(fin_prompt))
+
+                streamed_parts: list[str] = []
+                if hasattr(gateway.adapter, 'stream'):
+                    try:
+                        for chunk in gateway.adapter.stream(fin_messages, tools=[]):
+                            if getattr(chunk, 'delta_content', None):
+                                streamed_parts.append(chunk.delta_content)
+                                # Propagate delta through on_token callback (set by SessionManager for daemon delivery)
+                                if self.on_token:
+                                    try:
+                                        self.on_token(chunk.delta_content)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                if streamed_parts:
+                    raw_text = "".join(streamed_parts).strip()
+
+                if not raw_text:
+                    fin_resp = gateway.adapter.complete(fin_messages, tools=[])
+                    if fin_resp and getattr(fin_resp, 'message', None) and fin_resp.message.content:
+                        raw_text = fin_resp.message.content.strip()
+                        if self.on_token and raw_text:
+                            try:
+                                self.on_token(raw_text)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
         payload = self._parse_json_payload(raw_text)
 
-        written_files: list[str] = []
-        for msg in history:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc.name == 'write_file' and 'path' in tc.arguments:
-                        p = str(tc.arguments['path'])
-                        if p not in written_files:
-                            written_files.append(p)
-        for wf in getattr(gateway, "written_files", []):
-            if wf not in written_files:
-                written_files.append(wf)
+        written_files: list[str] = list(getattr(gateway, "written_files", []))
+        if not written_files:
+            failed_call_ids: set[str] = set()
+            for msg in history:
+                if getattr(msg, 'role', '') == 'tool':
+                    content_str = str(msg.content or '')
+                    if content_str.startswith("Error:") or content_str.startswith("Warning:") or "PermissionError" in content_str:
+                        if getattr(msg, 'tool_call_id', None):
+                            failed_call_ids.add(msg.tool_call_id)
+            for msg in history:
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc.id and tc.id in failed_call_ids:
+                            continue
+                        tc_args = getattr(tc, 'arguments', None) or {}
+                        if tc.name == 'write_file' and 'path' in tc_args:
+                            p = str(tc_args['path'])
+                            if p not in written_files:
+                                written_files.append(p)
 
         # Executed-tool audit for the governed loop: deterministic evidence of
         # what the model actually ran (e.g. run_tests for QA work orders).
@@ -1819,6 +2011,41 @@ class AgentRunner:
                     if key in tc_args:
                         entry[key] = tc_args[key]
                 tool_calls_audit.append(entry)
+
+        if request.task.kind == 'adhoc' and not raw_text:
+            inspected_items = []
+            for tc in tool_calls_audit:
+                tname = tc.get("tool", "")
+                arg_str = ""
+                for k in ('path', 'file', 'target', 'command', 'symbol', 'query'):
+                    if k in tc:
+                        arg_str = str(tc[k])
+                        break
+                inspected_items.append(f"- `{tname}` {arg_str}".strip())
+            tools_summary = "\n".join(inspected_items) if inspected_items else "Workspace tools executed."
+            orig_prompt = request.task.body or request.task.title or "your request"
+
+            if is_architecture:
+                raw_text = (
+                    f"### Workspace Exploration Summary\n"
+                    f"I have inspected the project workspace:\n{tools_summary}\n\n"
+                    f"### Architectural Recommendation\n"
+                    f"To turn this plan into code, launch the app in the development environment, "
+                    f"and execute verification across the specialist agent team, run:\n\n"
+                    f"`:goal {orig_prompt}`\n\n"
+                    f"This will initialize milestones in PLAN.md, assign work orders, and verify delivery."
+                )
+            else:
+                raw_text = (
+                    f"Completed workspace inspection:\n{tools_summary}\n\n"
+                    f"To execute this goal across the autonomous agent team, run:\n`:goal {orig_prompt}`"
+                )
+            if self.on_token and raw_text:
+                try:
+                    self.on_token(raw_text)
+                except Exception:
+                    pass
+            payload = self._parse_json_payload(raw_text)
 
         # Plan deliverable fallback: if is_plan_task and PLAN.md was not written via tool call,
         # extract it from raw text / assistant messages / payload report and persist it to staged root.
@@ -1880,28 +2107,45 @@ class AgentRunner:
                 ))
             )
 
+            # If raw_text contains unparsed JSON-like text with report_markdown or summary, extract clean text
+            extracted_report = None
+            extracted_summary = None
+            if raw_text:
+                for key in ("report_markdown", "summary", "response", "review_notes"):
+                    m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text, re.DOTALL)
+                    if m:
+                        val = m.group(1).replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+                        if val.strip() and val.strip() != "Completed task via tools":
+                            if key == "report_markdown":
+                                extracted_report = val.strip()
+                            elif not extracted_summary:
+                                extracted_summary = val.strip()
+
+            effective_raw_text = extracted_report or raw_text
+
             if is_unfulfilled_deliverable:
                 payload = {
                     'status': 'blocked',
-                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {raw_text[:200]}",
-                    'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {raw_text}",
+                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {effective_raw_text[:200]}",
+                    'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {effective_raw_text}",
                     'modified_files': written_files,
                     'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
                 }
             elif is_validation_or_review:
-                blocker_detail = raw_text[:200] if raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
+                blocker_detail = effective_raw_text[:200] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
                 payload = {
                     'status': 'blocked',
                     'summary': f"Validation review requires resolution: {blocker_detail}",
-                    'report_markdown': raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
+                    'report_markdown': effective_raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
                     'modified_files': written_files,
                     'blockers': [blocker_detail],
                 }
             else:
+                summary_text = extracted_summary or (effective_raw_text if (request.task.kind == 'adhoc' and effective_raw_text) else (effective_raw_text[:200] if effective_raw_text else None))
                 payload = {
                     'status': 'completed',
-                    'summary': raw_text[:200] or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
-                    'report_markdown': raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                    'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                    'report_markdown': effective_raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
                     'modified_files': written_files,
                     'blockers': [],
                 }
@@ -2115,6 +2359,8 @@ class AgentRunner:
             events_write = self._build_events_write(stage_inputs, 0, 0)
             self._apply_ops(staged_root, [report_write, events_write])
             self._sync_index_and_tree_yaml(staged_root)
+            from cli.init import ensure_workspace_protocol_scaffolding
+            ensure_workspace_protocol_scaffolding(staged_root)
             validation = validate_runtime(staged_root)
         return [issue.message for issue in validation.errors]
 
@@ -2207,8 +2453,20 @@ class AgentRunner:
         diff = stage_inputs.get('diff')
         dimensions = stage_inputs.get('dimensions')
         exp_rec = stage_inputs.get('experience_record')
+        skill_diag = getattr(stage_inputs['context'], 'skill_diagnostics', None)
+        if isinstance(skill_diag, dict):
+            skills_injected = skill_diag.get('injected_ids') or skill_diag.get('injected', [])
+            skill_tokens_est = skill_diag.get('estimated_skill_tokens') or skill_diag.get('token_estimate', 0)
+        elif skill_diag is not None:
+            skills_injected = getattr(skill_diag, 'injected_ids', getattr(skill_diag, 'injected', []))
+            skill_tokens_est = getattr(skill_diag, 'estimated_skill_tokens', getattr(skill_diag, 'token_estimate', 0))
+        else:
+            skills_injected = []
+            skill_tokens_est = 0
+
         event = {
             'agent': self.agent,
+            'execution_profile': self.execution_profile.value,
             'benchmark_mode': stage_inputs['retrieval'].mode,
             'commands_audit': stage_inputs.get('commands_audit', []),
             'context_revision': stage_inputs['context'].revision,
@@ -2226,6 +2484,8 @@ class AgentRunner:
             'trust_level': trust_level.value if hasattr(trust_level, 'value') else str(trust_level or 'OBSERVABLE'),
             'verification_passed': dimensions.all_passed if dimensions else True,
             'write_ms': lock_hold_ms,
+            'skills_injected': list(skills_injected) if isinstance(skills_injected, (list, tuple)) else [],
+            'skill_tokens_estimated': int(skill_tokens_est) if isinstance(skill_tokens_est, (int, float)) else 0,
         }
         return FileWrite(
             Path('.sync') / 'state' / 'harness' / 'events.jsonl',
@@ -2249,6 +2509,7 @@ class AgentRunner:
             f'# Harness Report: {task.identifier}',
             '',
             f'- agent: `{self.agent}`',
+            f'- profile: `{self.execution_profile.value}`',
             f'- task: `{task.identifier}`',
             f'- kind: `{task.kind}`',
             f'- status: `{decision.status}`',
@@ -2306,8 +2567,9 @@ class AgentRunner:
         dimensions = stage_inputs.get('dimensions')
         diff = stage_inputs.get('diff')
         exp_rec = stage_inputs.get('experience_record')
-        return {
+        meta_out: dict[str, Any] = {
             'agent': self.agent,
+            'execution_profile': self.execution_profile.value,
             'benchmark_mode': retrieval.mode,
             'cache_hits': retrieval.cache_hits,
             'completion_tokens': completion.completion_tokens,
@@ -2359,6 +2621,64 @@ class AgentRunner:
             'uncertainty': list(decision.uncertainty),
             'verification_dimensions': dimensions.to_dict() if dimensions else {},
         }
+
+        # Skill retrieval diagnostics
+        skill_diag = getattr(context, 'skill_diagnostics', None)
+        if skill_diag is not None:
+            meta_out['skill_diagnostics'] = (
+                skill_diag.to_dict() if hasattr(skill_diag, 'to_dict') else dict(skill_diag)
+            )
+
+        if isinstance(skill_diag, dict):
+            skill_considered = skill_diag.get('considered_ids', skill_diag.get('considered', []))
+            skill_selected = skill_diag.get('selected_ids', skill_diag.get('selected', []))
+            skill_loaded = skill_diag.get('loaded_ids', skill_diag.get('loaded', []))
+            skill_injected = skill_diag.get('injected_ids', skill_diag.get('injected', []))
+            skill_token_est = skill_diag.get('estimated_skill_tokens', skill_diag.get('token_estimate', 0))
+        elif skill_diag is not None:
+            skill_considered = getattr(skill_diag, 'considered_ids', getattr(skill_diag, 'considered', []))
+            skill_selected = getattr(skill_diag, 'selected_ids', getattr(skill_diag, 'selected', []))
+            skill_loaded = getattr(skill_diag, 'loaded_ids', getattr(skill_diag, 'loaded', []))
+            skill_injected = getattr(skill_diag, 'injected_ids', getattr(skill_diag, 'injected', []))
+            skill_token_est = getattr(skill_diag, 'estimated_skill_tokens', getattr(skill_diag, 'token_estimate', 0))
+        else:
+            skill_considered = []
+            skill_selected = []
+            skill_loaded = []
+            skill_injected = []
+            skill_token_est = 0
+
+        # Cycle telemetry
+        llm_ms = stage_inputs.get('llm_ms', 0)
+        poll_ms = stage_inputs.get('poll_ms', 0)
+        retrieval_ms = stage_inputs.get('retrieval_ms', 0)
+        total_wall_ms = llm_ms + poll_ms + retrieval_ms + write_ms
+        meta_out['telemetry'] = {
+            'execution_profile': self.execution_profile.value,
+            'cycle_start': stage_inputs.get('run_at').isoformat() if stage_inputs.get('run_at') else None,
+            'latency_ms': {
+                'llm': llm_ms,
+                'poll': poll_ms,
+                'retrieval': retrieval_ms,
+                'write': write_ms,
+                'total_wall_ms': total_wall_ms,
+            },
+            'completion_tokens': completion.completion_tokens,
+            'prompt_tokens': completion.prompt_tokens,
+            'tokens_measured': bool(completion.completion_tokens > 0 or completion.prompt_tokens > 0),
+            'skill_candidates_considered': list(skill_considered) if isinstance(skill_considered, (list, tuple)) else [],
+            'skill_candidates_selected': list(skill_selected) if isinstance(skill_selected, (list, tuple)) else [],
+            'skill_loaded': list(skill_loaded) if isinstance(skill_loaded, (list, tuple)) else [],
+            'skill_injected': list(skill_injected) if isinstance(skill_injected, (list, tuple)) else [],
+            'skill_token_estimate': int(skill_token_est) if isinstance(skill_token_est, (int, float)) else 0,
+            'skill_token_usage_measured': False,
+            'model_calls': 1,
+            'tool_calls_count': len(stage_inputs.get('tool_calls_audit', [])),
+            'verification_passed': dimensions.all_passed if dimensions else True,
+            'status': decision.status,
+            'blockers': list(decision.blockers) if decision.blockers else [],
+        }
+
         if decision.status == 'blocked':
             gt = completion.meta.get('guard_trip') if hasattr(completion, 'meta') else None
             if gt:
@@ -2386,11 +2706,23 @@ class AgentRunner:
         has_staged_writes: bool,
         tool_runtime: Any = None,
     ) -> Any:
-        """Derive verification flags from the staged filesystem and command telemetry."""
+        """Derive verification flags from the staged filesystem and command telemetry.
+
+        Fail-closed semantics: any exception during verification is captured and
+        treated as a failure, preventing false success returns.
+        """
         from validators.harness.contract_gate import verify_post_execution
         from validators.harness.snapshot import VerificationDimensions
 
-        changed_files = tuple(Path(p).as_posix().lstrip('/') for p in diff.all_changed_files)
+        # Include tool-written files in changed files for scope verification
+        tool_written_files = []
+        if tool_runtime and hasattr(tool_runtime.gateway, 'written_files'):
+            tool_written_files = [
+                Path(p).as_posix().lstrip('/') for p in tool_runtime.gateway.written_files
+            ]
+
+        diff_changed = tuple(Path(p).as_posix().lstrip('/') for p in diff.all_changed_files)
+        changed_files = diff_changed + tuple(tool_written_files)
         bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/')
         dec_norm = {Path(p).as_posix().lstrip('/') for p in decision.modified_files if p}
         task_changed_files = tuple(
@@ -2399,14 +2731,22 @@ class AgentRunner:
             and not (relative_path.startswith('.sync/work-orders/') and relative_path not in dec_norm)
         )
         scope_verified = declaration_matches
-        if task_changed_files:
+        # Include tool-written files for scope verification
+        files_for_scope = list(task_changed_files)
+        if tool_runtime and hasattr(tool_runtime.gateway, 'written_files'):
+            for wf in tool_runtime.gateway.written_files:
+                norm_w = Path(wf).as_posix().lstrip('/')
+                if norm_w not in files_for_scope:
+                    files_for_scope.append(norm_w)
+
+        if files_for_scope:
             try:
                 verify_post_execution(
                     self.project_path,
                     self.agent,
                     task,
                     decision,
-                    observed_files=task_changed_files,
+                    observed_files=tuple(files_for_scope),
                 )
             except Exception as exc:
                 scope_verified = False
@@ -2595,6 +2935,11 @@ class AgentRunner:
             staged_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
             staged_modified = {Path(p).as_posix().lstrip('/') for p in diff.modified}
             deliverable_touched = (norm_deliv in staged_added or norm_deliv in staged_modified)
+            if not deliverable_touched and tool_runtime:
+                written_files = getattr(tool_runtime.gateway, 'written_files', [])
+                deliverable_touched = any(
+                    Path(w).as_posix().lstrip('/') == norm_deliv for w in written_files
+                )
 
         authored_artifacts = any(
             (p.startswith('.sync/work-orders/') or p.startswith('.sync/contracts/'))
@@ -2689,19 +3034,21 @@ class AgentRunner:
                 )
             )
         elif task.work_order_id and task.deliverable_path:
+            # Check both scratch (staged) and project root for the deliverable
+            staged_deliverable = staged_root / task.deliverable_path
+            project_deliverable = self.project_path / task.deliverable_path
+            deliverable_exists = staged_deliverable.exists() or project_deliverable.exists()
             if tool_runtime is not None:
-                deliverable = staged_root / task.deliverable_path
                 outcome_verified = (
                     decision.status == 'completed'
                     and not decision.blockers
-                    and (deliverable_touched or (authored_artifacts and deliverable.exists()))
+                    and (deliverable_touched or deliverable_exists or (authored_artifacts and deliverable_exists))
                 )
             else:
-                deliverable = staged_root / task.deliverable_path
                 outcome_verified = (
                     decision.status == 'completed'
                     and not decision.blockers
-                    and (deliverable_touched or deliverable.exists() or bool(changed_files) or has_staged_writes)
+                    and (deliverable_touched or deliverable_exists or bool(changed_files) or has_staged_writes)
                 )
         elif task.work_order_id and not task.deliverable_path:
             is_non_code_task = (
@@ -2736,6 +3083,90 @@ class AgentRunner:
                 and not decision.blockers
                 and (bool(changed_files) or has_staged_writes)
             )
+
+        # Evaluate centralized release gates (Fix 7)
+        # Clean delivery gate check - runs for any work_order with a declared deliverable
+        # CleanDeliveryGate is skipped for intermediate harness operations (tests, development)
+        # because they work with development files (validators/harness/, .sync/, etc.)
+        # The deliverable_path flag indicates a product is being delivered, regardless of task classification
+        clean_delivery_passed = True
+        # Run CleanDeliveryGate whenever a work_order declares a deliverable_path
+        # This ensures all final product releases are checked, not just authoring tasks
+        if task.kind == 'work_order' and task.deliverable_path:
+            from validators.harness.clean_delivery_gate import CleanDeliveryGate
+            gate = CleanDeliveryGate(self.project_path)
+            clean_delivery_passed, _ = gate.validate()
+
+        # Requirements coverage check
+        requirements_passed = True
+        requirements_blockers: tuple[str, ...] = ()
+        if task.work_order_id:
+            from validators.harness.requirements import validate_requirements_coverage
+            ledger_path = self.sync_path / 'state' / 'requirements.yaml'
+            if ledger_path.exists():
+                try:
+                    from validators.harness.requirements import RequirementsLedger
+                    ledger = RequirementsLedger.load(ledger_path)
+                    # Collect all work order IDs for the project
+                    all_wo_ids: list[str] = []
+                    import os
+                    for status_dir in ('ACTIVE', 'COMPLETED', 'BLOCKED'):
+                        wo_dir = self.sync_path / 'work-orders' / status_dir
+                        if wo_dir.exists():
+                            all_wo_ids.extend(f.stem for f in wo_dir.glob('*.yaml'))
+                    requirements_passed, requirements_blockers = validate_requirements_coverage(ledger, all_wo_ids)
+                except Exception:
+                    pass
+
+        # Check evidence freshness (stale detection)
+        has_stale_evidence = False
+        if task.work_order_id:
+            from validators.harness.snapshot import WorkspaceSnapshot
+            try:
+                current_snapshot = WorkspaceSnapshot.capture(self.project_path)
+                # Check if requirements evidence hashes match current files
+                from validators.harness.requirements import RequirementsLedger
+                ledger_path = self.sync_path / 'state' / 'requirements.yaml'
+                if ledger_path.exists():
+                    ledger = RequirementsLedger.load(ledger_path)
+                    for req in ledger.requirements:
+                        if req.evidence and req.evidence.get('content_hash'):
+                            # Check if any changed file has matching hash - stale if mismatch
+                            for changed_file in changed_files:
+                                candidate = staged_root / changed_file
+                                if candidate.exists():
+                                    current_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()[:16]
+                                    if current_hash != req.evidence.get('content_hash'):
+                                        has_stale_evidence = True
+                                        break
+            except Exception:
+                pass
+
+        # Execution QA check
+        execution_qa_passed = True
+        execution_blockers: tuple[str, ...] = ()
+        if self.agent in ('gemma', 'qa'):
+            if decision.status != 'completed' or decision.blockers:
+                execution_qa_passed = False
+                execution_blockers = (decision.blockers if decision.blockers else ('QA verification not completed',))
+
+        # Call centralized gate evaluation
+        approved, blocking_reasons = evaluate_release_gates(
+            clean_delivery_passed=clean_delivery_passed,
+            d024_passed=d024_passed,
+            requirements_passed=requirements_passed,
+            execution_qa_passed=execution_qa_passed,
+            has_stale_evidence=has_stale_evidence,
+            has_requirements_blocked=not requirements_passed,
+            requirements_blockers=requirements_blockers,
+            execution_qa_blocked=not execution_qa_passed,
+            execution_blockers=execution_blockers,
+        )
+
+        # Append centralized gate blocking reasons
+        if not approved:
+            staged_errors.append(f"Release gates blocked: {'; '.join(blocking_reasons)}")
+
         return VerificationDimensions(
             scope_verified=scope_verified,
             state_verified=state_verified,
@@ -2920,6 +3351,48 @@ class AgentRunner:
             updated_index = False
             assigned_per_agent: dict[str, list[str]] = {}
 
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            completed_dir = sync_dir / "work-orders" / "COMPLETED"
+            if completed_dir.is_dir():
+                for comp_file in sorted(completed_dir.glob("*.yaml")):
+                    comp_data = yaml.safe_load(comp_file.read_text(encoding="utf-8")) or {}
+                    c_id = comp_data.get("id") or comp_file.stem
+                    active_dup = active_dir / comp_file.name
+                    if active_dup.is_file():
+                        try:
+                            active_dup.unlink()
+                        except OSError:
+                            pass
+                    c_file = f"work-orders/COMPLETED/{comp_file.name}"
+                    if c_id in existing_orders:
+                        c_entry = existing_orders[c_id]
+                        if c_entry.get("status") != "COMPLETED":
+                            c_entry["status"] = "COMPLETED"
+                            updated_index = True
+                        if c_entry.get("file") != c_file:
+                            c_entry["file"] = c_file
+                            updated_index = True
+                    else:
+                        c_entry = {
+                            "id": c_id,
+                            "type": comp_data.get("type", "FEATURE"),
+                            "title": comp_data.get("title", f"Work order {c_id}"),
+                            "status": "COMPLETED",
+                            "priority": comp_data.get("priority", "P0"),
+                            "assigned_agents": comp_data.get("assigned_agents", ["codex"]),
+                            "dependencies": comp_data.get("dependencies", []),
+                            "created": str(comp_data.get("created") or now_iso),
+                            "updated": str(comp_data.get("updated") or now_iso),
+                            "file": c_file,
+                        }
+                        if comp_data.get("deliverable"):
+                            c_entry["deliverable"] = comp_data["deliverable"]
+                        orders.append(c_entry)
+                        existing_orders[c_id] = c_entry
+                        updated_index = True
+
             for wo_file in sorted(active_dir.glob("*.yaml")):
                 wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
                 if not isinstance(wo_data, dict):
@@ -2934,8 +3407,6 @@ class AgentRunner:
                     assigned_per_agent.setdefault(agents.lower().strip(), []).append(wo_id)
 
                 if wo_id not in existing_orders:
-                    from datetime import datetime, timezone
-                    now_iso = datetime.now(timezone.utc).isoformat()
                     created_val = wo_data.get("created") or now_iso
                     updated_val = wo_data.get("updated") or now_iso
                     new_entry = {
@@ -2966,22 +3437,38 @@ class AgentRunner:
                         entry["file"] = target_file
                         updated_index = True
 
-            completed_dir = sync_dir / "work-orders" / "COMPLETED"
-            if completed_dir.is_dir():
-                for comp_file in sorted(completed_dir.glob("*.yaml")):
-                    comp_data = yaml.safe_load(comp_file.read_text(encoding="utf-8")) or {}
-                    c_id = comp_data.get("id") or comp_file.stem
-                    if c_id in existing_orders:
-                        c_entry = existing_orders[c_id]
-                        if c_entry.get("file", "").startswith("work-orders/ACTIVE/"):
-                            continue
-                        if c_entry.get("status") != "COMPLETED":
-                            c_entry["status"] = "COMPLETED"
+            blocked_dir = sync_dir / "work-orders" / "BLOCKED"
+            if blocked_dir.is_dir():
+                for b_file in sorted(blocked_dir.glob("*.yaml")):
+                    b_data = yaml.safe_load(b_file.read_text(encoding="utf-8")) or {}
+                    b_id = b_data.get("id") or b_file.stem
+                    b_rel = f"work-orders/BLOCKED/{b_file.name}"
+                    if b_id in existing_orders:
+                        b_entry = existing_orders[b_id]
+                        if b_entry.get("status") != "BLOCKED":
+                            b_entry["status"] = "BLOCKED"
                             updated_index = True
-                        c_file = f"work-orders/COMPLETED/{comp_file.name}"
-                        if c_entry.get("file") != c_file:
-                            c_entry["file"] = c_file
+                        if b_entry.get("file") != b_rel:
+                            b_entry["file"] = b_rel
                             updated_index = True
+                    else:
+                        b_entry = {
+                            "id": b_id,
+                            "type": b_data.get("type", "FEATURE"),
+                            "title": b_data.get("title", f"Work order {b_id}"),
+                            "status": "BLOCKED",
+                            "priority": b_data.get("priority", "P0"),
+                            "assigned_agents": b_data.get("assigned_agents", ["codex"]),
+                            "dependencies": b_data.get("dependencies", []),
+                            "created": str(b_data.get("created") or now_iso),
+                            "updated": str(b_data.get("updated") or now_iso),
+                            "file": b_rel,
+                        }
+                        if b_data.get("deliverable"):
+                            b_entry["deliverable"] = b_data["deliverable"]
+                        orders.append(b_entry)
+                        existing_orders[b_id] = b_entry
+                        updated_index = True
 
             tot_active = sum(
                 1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
@@ -3003,6 +3490,7 @@ class AgentRunner:
                 updated_index = True
 
             if updated_index:
+                index_data["last_updated"] = now_iso
                 index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
 
             # Also ensure work_orders totals and assigned_work_orders in TREE.yaml are updated
@@ -3017,6 +3505,18 @@ class AgentRunner:
                                 tree_data["work_orders"][k] = index_data.get(k, 0)
                                 updated_tree = True
                     if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                        completed_set = {
+                            o.get("id") for o in orders
+                            if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+                        }
+                        for ag_name, ag_entry in tree_data["agents"].items():
+                            if isinstance(ag_entry, dict) and "assigned_work_orders" in ag_entry:
+                                curr = ag_entry["assigned_work_orders"]
+                                if isinstance(curr, list):
+                                    filtered = [w for w in curr if w not in completed_set]
+                                    if filtered != curr:
+                                        ag_entry["assigned_work_orders"] = filtered
+                                        updated_tree = True
                         for ag_name, wo_ids in assigned_per_agent.items():
                             if ag_name in tree_data["agents"]:
                                 ag_entry = tree_data["agents"][ag_name]

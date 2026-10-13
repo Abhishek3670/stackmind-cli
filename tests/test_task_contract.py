@@ -238,3 +238,19 @@ class TestReconcileModifiedFiles:
         merged, auto_added = reconcile_modified_files(decision, ("index.html",))
         assert auto_added == []
         assert merged is decision
+
+    def test_unwritten_denied_files_not_reconciled_or_added(self) -> None:
+        """Files denied by TaskOwnership must not be added to observed or modified_files."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Decision:
+            modified_files: tuple
+
+        decision = _Decision(modified_files=("manifest.json", "css/style.css"))
+        # Denied files like index.html and js/main.js are never in observed writes
+        observed = ("manifest.json", "css/style.css")
+        merged, auto_added = reconcile_modified_files(decision, observed)
+        assert auto_added == []
+        assert "index.html" not in merged.modified_files
+        assert "js/main.js" not in merged.modified_files

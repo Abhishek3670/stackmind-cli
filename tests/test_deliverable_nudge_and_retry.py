@@ -163,6 +163,39 @@ def test_gateway_nudge_exhaustion_on_unwritten_deliverable(tmp_path):
     assert not gateway.written_files
 
 
+def test_gateway_does_not_nudge_when_no_required_deliverable(tmp_path):
+    """When required_deliverable is None (e.g. adhoc/conversational turn), pure text response is accepted immediately."""
+    authoritative, workspace, tool_gw, attempt, contract = _setup_test_gateway(tmp_path)
+
+    turn_count = 0
+
+    def mock_transport(payload: dict[str, Any], stream: bool, timeout: float | None) -> dict[str, Any]:
+        nonlocal turn_count
+        turn_count += 1
+        return {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello! How can I assist you today?",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    adapter = OpenAICompatibleAdapter(transport=mock_transport)
+    gateway = ProviderGateway(adapter, tool_gw, attempt=attempt, contract=contract)
+
+    messages = [Message.user("hello")]
+    history = gateway.run_loop(messages, max_turns=5, required_deliverable=None)
+
+    # Exactly 1 turn: no nudges, pure text returned
+    assert turn_count == 1
+    assert history[-1].role == "assistant"
+    assert history[-1].content == "Hello! How can I assist you today?"
+
+
+
 def test_ollama_adapter_extracts_all_standard_tools():
     """OllamaAdapter recognizes list_directory, request_tools, and all standard tools in raw text."""
     adapter = OllamaAdapter()

@@ -9,6 +9,7 @@ Renders on-demand governance surfaces without permanent dashboard clutter:
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from rich import box
@@ -278,12 +279,295 @@ def render_plan_panel_str(state: AutonomousDeliveryState, width: int = 80) -> st
     return console.export_text().rstrip()
 
 
+def render_skills_panel(
+    project_path: Path | str | None = None,
+    skill_filter: str | None = None,
+) -> Panel:
+    """Render procedural skills overview or specific skill runbook."""
+    from validators.skill.store import SkillStore
+    from validators.skill.models import SkillStatus
+
+    path = Path(project_path).resolve() if project_path else Path(".").resolve()
+    store = SkillStore(path)
+    skills = store.list_skills()
+
+    if skill_filter:
+        filt = skill_filter.strip().lower()
+        matched = [s for s in skills if filt in s.name.lower() or filt in s.skill_id.lower()]
+        if len(matched) == 1:
+            skill = matched[0]
+            lines: list[RenderableType] = []
+            lines.append(Text(f"Name: {skill.name} (v{skill.version})", style="bold white"))
+            lines.append(
+                Text(
+                    f"ID: {skill.skill_id}  |  Status: {skill.status.value.upper()}  |  Risk: {skill.risk_tier.value.upper()}  |  Confidence: {skill.metrics.confidence_score:.2f}",
+                    style="dim",
+                )
+            )
+            lines.append(Text(f"Description: {skill.description}\n", style="white"))
+
+            if skill.applicability.preconditions:
+                lines.append(Text("Preconditions:", style="bold cyan"))
+                for pre in skill.applicability.preconditions:
+                    lines.append(Text(f"  • {pre}", style="dim"))
+                lines.append(Text(""))
+
+            lines.append(Text("Execution Procedure:", style="bold cyan"))
+            for step in skill.steps:
+                cmd_str = f" [{step.command_template}]" if step.command_template else ""
+                lines.append(
+                    Text(f"  {step.step_index}. [{step.tool}] ", style="bold green")
+                    .append(step.action, style="white")
+                    .append(cmd_str, style="dim")
+                )
+
+            if skill.fallback_procedure:
+                lines.append(Text(f"\nFallback: {skill.fallback_procedure}", style="yellow dim"))
+
+            return Panel(
+                Group(*lines),
+                title=Text(f" SKILL: {skill.name} ", style="bold cyan"),
+                title_align="left",
+                box=box.ROUNDED,
+                border_style="cyan",
+                padding=(0, 1),
+            )
+        skills = matched
+
+    title = Text(" AVAILABLE PROCEDURAL SKILLS (:skills) ", style="bold cyan")
+
+    if not skills:
+        msg = Text()
+        msg.append("\nNo procedural skills found in .sync/skills/.\n", style="yellow")
+        msg.append("StackMind learns procedural skills from verified execution trajectories.\n", style="dim")
+        msg.append("To discover and distill skills, run:\n", style="dim")
+        msg.append("  stackmind learn mine --min-support 2\n", style="bold white")
+        return Panel(
+            msg,
+            title=title,
+            title_align="left",
+            box=box.ROUNDED,
+            border_style="cyan",
+            padding=(0, 1),
+        )
+
+    table = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
+    table.add_column("Skill ID", style="bold cyan", no_wrap=True)
+    table.add_column("Name", style="bold white")
+    table.add_column("Ver", justify="right", style="dim")
+    table.add_column("Status", style="bold")
+    table.add_column("Risk", style="bold")
+    table.add_column("Conf", justify="right")
+    table.add_column("Modules", style="dim")
+
+    for s in skills:
+        status_style = (
+            "green"
+            if s.status == SkillStatus.ACTIVE
+            else ("yellow" if s.status == SkillStatus.CANDIDATE else "red")
+        )
+        risk_style = (
+            "red"
+            if s.risk_tier.value in ("high", "critical")
+            else ("yellow" if s.risk_tier.value == "medium" else "green")
+        )
+        mods = ", ".join(s.applicability.target_modules[:2])
+        if len(s.applicability.target_modules) > 2:
+            mods += "..."
+        table.add_row(
+            s.skill_id,
+            s.name,
+            f"v{s.version}",
+            Text(s.status.value.upper(), style=status_style),
+            Text(s.risk_tier.value.upper(), style=risk_style),
+            f"{s.metrics.confidence_score:.2f}",
+            mods or "*",
+        )
+
+    summary = Text(f"\nTotal: {len(skills)} skill(s). Type ':skill <name>' for detailed steps.", style="dim")
+    return Panel(
+        Group(table, summary),
+        title=title,
+        title_align="left",
+        box=box.ROUNDED,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+
+def render_skills_panel_str(
+    project_path: Path | str | None = None,
+    skill_filter: str | None = None,
+    width: int = 80,
+) -> str:
+    """Render procedural skills panel as plain string using in-memory capture."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_skills_panel(project_path, skill_filter))
+    return console.export_text().rstrip()
+
+
+def render_consume_skills_help() -> Panel:
+    """Render informative usage guide for :consume-skills command."""
+    title = Text(" CONSUME PROCEDURAL SKILLS (:consume-skills) ", style="bold cyan")
+    msg = Text()
+    msg.append("Ingest and register any skill into StackMind's verified procedural library.\n\n", style="white")
+    msg.append("Usage:\n", style="bold yellow")
+    msg.append("  :consume-skills <path> [--local]   Install skills from file or directory\n", style="white")
+    msg.append("  :consume-skill  <path> [--local]   Alias for :consume-skills\n\n", style="white")
+    msg.append("Supported Formats:\n", style="bold yellow")
+    msg.append("  [+] Markdown (*.md, SKILL.md) with YAML frontmatter or structured steps\n", style="green")
+    msg.append("  [+] JSON manifests (*.json) in native or simplified schemas\n", style="green")
+    msg.append("  [+] YAML manifests (*.yaml, *.yml)\n", style="green")
+    msg.append("  [+] Directories containing SKILL.md or multiple skill packages\n\n", style="green")
+    msg.append("Installation Targets:\n", style="bold yellow")
+    msg.append("  [+] Global (default): ~/.stackmindcli/skills/global/ (shared across projects)\n", style="cyan")
+    msg.append("  [+] Local (--local):   .sync/skills/active/ (current workspace only)\n\n", style="dim")
+    msg.append("Examples:\n", style="bold yellow")
+    msg.append("  :consume-skills ./skills/my-skill/SKILL.md\n", style="white dim")
+    msg.append("  :consume-skills ~/.gemini/config/plugins/ponytail/skills/ponytail/SKILL.md\n", style="white dim")
+    msg.append("  :consume-skills ./custom_skills/ --local\n", style="white dim")
+
+    return Panel(
+        msg,
+        title=title,
+        title_align="left",
+        box=box.ROUNDED,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+
+def render_consume_skills_help_str(width: int = 80) -> str:
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_consume_skills_help())
+    return console.export_text().rstrip()
+
+
+def render_consumed_skills_summary(
+    records: Sequence[Any],
+    is_global: bool,
+    dest_path: str,
+) -> Panel:
+    """Render summary table of consumed procedural skills."""
+    title = Text(" CONSUMED PROCEDURAL SKILLS (:consume-skills) ", style="bold green")
+    table = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
+    table.add_column("Skill ID", style="bold cyan", no_wrap=True)
+    table.add_column("Name", style="bold white", no_wrap=True)
+    table.add_column("Ver", justify="right", style="dim")
+    table.add_column("Status", style="bold green")
+    table.add_column("Risk", style="bold")
+    table.add_column("Steps", justify="right", style="cyan")
+    table.add_column("Scope", justify="center", style="yellow")
+    table.add_column("Description", style="dim")
+
+    for s in records:
+        risk_style = (
+            "red"
+            if s.risk_tier.value in ("high", "critical")
+            else ("yellow" if s.risk_tier.value == "medium" else "green")
+        )
+        table.add_row(
+            s.skill_id,
+            s.name,
+            f"v{s.version}",
+            s.status.value.upper(),
+            Text(s.risk_tier.value.upper(), style=risk_style),
+            str(len(s.steps)),
+            "GLOBAL" if is_global else "LOCAL",
+            s.description[:40] + ("..." if len(s.description) > 40 else ""),
+        )
+
+    summary = Text()
+    names_str = ", ".join(f"'{s.name}'" for s in records)
+    summary.append(f"\n[+] Successfully installed {len(records)} skill(s) ({names_str}) into ", style="bold green")
+    summary.append(f"{dest_path}\n", style="bold white")
+    summary.append("Run ':skills' to view all active skills, or ':skill <name>' for detailed steps.", style="dim")
+
+    return Panel(
+        Group(table, summary),
+        title=title,
+        title_align="left",
+        box=box.ROUNDED,
+        border_style="green",
+        padding=(0, 1),
+    )
+
+
+def render_consumed_skills_summary_str(
+    records: Sequence[Any],
+    is_global: bool,
+    dest_path: str,
+    width: int = 80,
+) -> str:
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_consumed_skills_summary(records, is_global, dest_path))
+    return console.export_text().rstrip()
+
+
+def render_projects_panel() -> Panel:
+    """Render registered projects panel (:projects)."""
+    from validators.kernel.home import get_stackmind_home, list_registered_projects
+
+    projects = list_registered_projects()
+    home = get_stackmind_home()
+    title = Text(" REGISTERED STACKMIND PROJECTS (:projects) ", style="bold cyan")
+
+    if not projects:
+        msg = Text()
+        msg.append("\nNo projects registered yet in ~/.stackmindcli/projects.json.\n", style="yellow")
+        msg.append(f"StackMind Central Home: {home}\n", style="dim")
+        msg.append("Run 'stackmind init <path>' or 'stackmind projects register <path>' to register.", style="dim")
+        return Panel(msg, title=title, title_align="left", box=box.ROUNDED, border_style="cyan", padding=(0, 1))
+
+    table = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Path", style="white")
+    table.add_column("Sync Runtime", style="green")
+    table.add_column("Last Accessed", style="dim")
+
+    for p in projects:
+        sync_badge = "[+] .sync" if p.get("has_sync") else "no .sync"
+        if not p.get("exists", True):
+            sync_badge = "missing"
+        last_acc = str(p.get("last_accessed") or "")
+        if "T" in last_acc:
+            last_acc = last_acc.split("T")[0] + " " + last_acc.split("T")[1][:5]
+        table.add_row(
+            str(p.get("name", "unnamed")),
+            str(p.get("path", "")),
+            sync_badge,
+            last_acc,
+        )
+
+    summary = Text(f"\nCentral Root: {home} | Total Registered: {len(projects)}", style="dim")
+    return Panel(Group(table, summary), title=title, title_align="left", box=box.ROUNDED, border_style="cyan", padding=(0, 1))
+
+
+def render_projects_panel_str(width: int = 80) -> str:
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_projects_panel())
+    return console.export_text().rstrip()
+
+
 __all__ = [
     "VERIFICATION_DIMENSIONS",
+    "render_consume_skills_help",
+    "render_consume_skills_help_str",
+    "render_consumed_skills_summary",
+    "render_consumed_skills_summary_str",
     "render_contract_hud",
     "render_contract_hud_str",
     "render_plan_panel",
     "render_plan_panel_str",
+    "render_projects_panel",
+    "render_projects_panel_str",
+    "render_skills_panel",
+    "render_skills_panel_str",
     "render_verification_matrix",
     "render_verification_matrix_str",
 ]
+

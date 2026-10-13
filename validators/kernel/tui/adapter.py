@@ -120,6 +120,8 @@ class StackMindTuiAdapter:
         turn_params = {key: value for key, value in params.items() if key != "session_id"}
         if command == ":prompt":
             prompt = argument
+            turn_params.setdefault("role", "architecture")
+            turn_params.setdefault("agent_id", "claude")
         elif command == ":goal":
             if not argument:
                 raise ValueError("goal description required for :goal")
@@ -131,6 +133,8 @@ class StackMindTuiAdapter:
             turn_params.setdefault("is_goal", True)
         elif not command.startswith(":"):
             prompt = stripped
+            turn_params.setdefault("role", "architecture")
+            turn_params.setdefault("agent_id", "claude")
         else:
             raise ValueError("unknown TUI command")
         if "session_id" not in params:

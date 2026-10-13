@@ -27,7 +27,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -41,6 +41,28 @@ logger = logging.getLogger("stackmind.supervisor")
 def _strip_code_fences(text: str) -> str:
     """Strip markdown code fences from model output used in run-state messages."""
     return re.sub(r"```[a-zA-Z]*\n?", "", str(text or "")).strip()
+
+
+def _extract_op_error(op: Any) -> str | None:
+    """Extract a concise human-readable error or reason from an operation record."""
+    if not isinstance(op, Mapping):
+        return None
+    res = op.get("result")
+    candidates = []
+    if isinstance(res, Mapping):
+        candidates.extend([res.get("error"), res.get("reason"), res.get("message"), res.get("summary")])
+    candidates.extend([op.get("error"), op.get("reason")])
+    for c in candidates:
+        if c:
+            if isinstance(c, Mapping):
+                msg = c.get("message") or c.get("error") or c.get("reason")
+                if msg:
+                    return str(msg).strip()
+            elif isinstance(c, str) and c.strip():
+                s = c.strip()
+                if s.lower() not in {"failed", "blocked", "completed", "cancelled", "unknown"}:
+                    return s
+    return None
 
 
 # ─── Lifecycle phases ─────────────────────────────────────────────────
@@ -142,6 +164,8 @@ class RunState:
     # QA defect routing: QA work order → developer work order IDs whose
     # rework must re-complete before the QA work order may be re-dispatched.
     qa_rework_targets: dict[str, list[str]] = field(default_factory=dict)
+    execution_profile: str = "medium"
+    gitops_feedback: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +219,8 @@ class RunState:
             "contract_revisions": dict(self.contract_revisions),
             "integration_rework_rounds": self.integration_rework_rounds,
             "qa_rework_targets": dict(self.qa_rework_targets),
+            "execution_profile": self.execution_profile,
+            "gitops_feedback": self.gitops_feedback,
         }
 
     @classmethod
@@ -250,6 +276,8 @@ class RunState:
             contract_revisions=dict(data.get("contract_revisions", {}) or {}),
             integration_rework_rounds=int(data.get("integration_rework_rounds", 0)),
             qa_rework_targets=dict(data.get("qa_rework_targets", {}) or {}),
+            execution_profile=str(data.get("execution_profile", "medium")),
+            gitops_feedback=data.get("gitops_feedback"),
         )
 
 
@@ -348,6 +376,11 @@ class LifecycleSupervisor:
     ) -> RunState:
         """Create a new lifecycle run and transition to PLANNING."""
         now = _now()
+        from validators.kernel.settings import load_settings
+        try:
+            profile_val = load_settings(Path(workspace)).execution_profile
+        except Exception:
+            profile_val = "medium"
         state = RunState(
             run_id=run_id,
             product_goal=product_goal,
@@ -355,6 +388,7 @@ class LifecycleSupervisor:
             session_id=session_id,
             phase=Phase.INIT,
             bootstrap_mode=bootstrap_mode,
+            execution_profile=profile_val,
             created_at=now,
             updated_at=now,
         )
@@ -526,13 +560,7 @@ class LifecycleSupervisor:
             if status not in _OPERATION_TERMINAL:
                 return AdvanceResult.WAITING_FOR_OPERATION
             if status in ("FAILED", "BLOCKED", "CANCELLED"):
-                op_result = op.get("result", {}) or {}
-                err_detail = (
-                    op_result.get("error")
-                    or op_result.get("reason")
-                    or op.get("error")
-                    or "unknown"
-                )
+                err_detail = _extract_op_error(op) or op.get("error") or "unknown"
                 state.error = f"Planning turn failed ({status.lower()}): {err_detail}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED
@@ -866,8 +894,10 @@ class LifecycleSupervisor:
             if op_failed:
                 state.authoring_repair_attempts += 1
                 if state.authoring_repair_attempts > state.max_authoring_repairs:
+                    err_cause = _extract_op_error(op)
+                    detail = f" [{err_cause}]" if err_cause else f" ({status})"
                     state.error = (
-                        f"Architect repair turn failed ({status}) and repair attempts are exhausted "
+                        f"Architect repair turn failed{detail} and repair attempts are exhausted "
                         f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
                         f"operator intervention required"
                     )
@@ -936,6 +966,7 @@ class LifecycleSupervisor:
             state.readiness_issues = []
             state.error = None
             state.architect_repair_operation_id = None
+            state.authoring_repair_attempts = 0
             if source == "recovery" and wo_id:
                 action = str(action or "")
                 if action == "split_work_order":
@@ -1033,8 +1064,16 @@ class LifecycleSupervisor:
             state.recovery_decision_operation_id = new_op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
 
-        # Decision operation lost (crash/resume) — re-dispatch from stored evidence.
+        # Decision operation lost (crash/resume) — check if decision file already exists on disk,
+        # otherwise re-dispatch from stored evidence.
         if wo_id:
+            decision, decision_error = self._load_recovery_decision(ws, str(wo_id), {})
+            if decision and decision_error is None:
+                advance, apply_error = self._apply_recovery_decision(
+                    state, ws, str(wo_id), decision
+                )
+                if apply_error is None:
+                    return advance if advance is not None else AdvanceResult.WAITING_FOR_OPERATION
             new_op = self._dispatch_recovery_decision(state, ws, str(wo_id), None)
             if new_op is not None:
                 state.recovery_decision_operation_id = new_op.get("operation_id")
@@ -2513,28 +2552,28 @@ class LifecycleSupervisor:
         return code_wos + qa_wos
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
-        """Return a completed work order to ACTIVE so rework can re-dispatch it."""
+        """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""
         active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if active.is_file():
             return self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
-        completed = ws / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
-        if not completed.is_file():
-            return False
-        try:
-            data = yaml.safe_load(completed.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return False
-            data["status"] = "ACTIVE"
-            data["updated"] = _now()
-            data.pop("error", None)
-            data.pop("blocked_reason", None)
-            active.parent.mkdir(parents=True, exist_ok=True)
-            active.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-            completed.unlink()
-            self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
-            return True
-        except Exception:
-            return False
+        for sub in ("COMPLETED", "BLOCKED"):
+            cand = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+            if cand.is_file():
+                try:
+                    data = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        data["status"] = "ACTIVE"
+                        data["updated"] = _now()
+                        data.pop("error", None)
+                        data.pop("blocked_reason", None)
+                        active.parent.mkdir(parents=True, exist_ok=True)
+                        active.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+                        cand.unlink()
+                        self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+                        return True
+                except Exception:
+                    pass
+        return False
 
     def _advance_product_ready(self, state: RunState) -> AdvanceResult:
         """PRODUCT_READY: discover or create GitOps WO and dispatch."""
@@ -2609,15 +2648,19 @@ class LifecycleSupervisor:
                     self._transition(state, Phase.BLOCKED)
                     return AdvanceResult.BLOCKED
 
-                if "scope_verified" in err_msg and any(f in err_msg for f in ("VERSION.md", "CHANGELOG.md")):
-                    retries = state.retry_counts.get(wo_id, 0)
-                    if retries < state.max_retries:
-                        state.retry_counts[wo_id] = retries + 1
-                        state.gitops_operation_id = None
-                        state.error = None
-                        return self._advance_gitops(state)
+                # Bounded retry for GitOps blockers (verification gate failures, scope, budget, etc.)
+                retries = state.retry_counts.get(wo_id, 0)
+                if retries < state.max_retries:
+                    state.retry_counts[wo_id] = retries + 1
+                    op_id = op.get("operation_id")
+                    if op_id and op_id not in state.ignored_operation_ids:
+                        state.ignored_operation_ids.append(str(op_id))
+                    state.gitops_operation_id = None
+                    state.error = None
+                    state.gitops_feedback = err_msg
+                    return self._advance_gitops(state)
 
-                state.error = f"GitOps turn blocked: {err_msg}"
+                state.error = f"GitOps turn blocked: {err_msg} — retries exhausted ({retries}/{state.max_retries})"
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
 
@@ -2626,7 +2669,12 @@ class LifecycleSupervisor:
                 retries = state.retry_counts.get(wo_id, 0)
                 if retries < state.max_retries:
                     state.retry_counts[wo_id] = retries + 1
+                    op_id = op.get("operation_id")
+                    if op_id and op_id not in state.ignored_operation_ids:
+                        state.ignored_operation_ids.append(str(op_id))
                     state.gitops_operation_id = None
+                    state.error = None
+                    state.gitops_feedback = str(op_result.get("error", op.get("error", "GitOps turn failed")))
                     return self._advance_gitops(state)
                 state.error = f"GitOps turn failed: {op_result.get('error', op.get('error', 'unknown'))}"
                 self._transition(state, Phase.FAILED)
@@ -2697,14 +2745,28 @@ class LifecycleSupervisor:
                 "As GitOps Release Lead, finalize the release documentation:\n"
                 "1. Write VERSION.md with version '0.1.0'.\n"
                 "2. Write CHANGELOG.md summarizing the completed deliverables and the release.\n"
-                "3. Return the final HarnessDecision JSON with status 'completed'. Do not run git commands; the supervisor creates the release commit automatically."
+                "3. Ensure deployment manifests (e.g. docker-compose.yml, Dockerfile) contain NO hardcoded passwords, secrets, or keys — use environment variables (e.g. '${POSTGRES_PASSWORD:-postgres}') or placeholder values (e.g. 'dev_password', 'change-me').\n"
+                "4. Return the final HarnessDecision JSON with status 'completed'. Do not run git commands; the supervisor creates the release commit automatically."
             )
+            feedback = getattr(state, "gitops_feedback", None)
+            if feedback:
+                attempt = state.retry_counts.get(state.gitops_wo_id or "WO-GITOPS", 1)
+                gitops_prompt += (
+                    f"\n\nCRITICAL FIX REQUIRED (Attempt {attempt + 1}): The previous GitOps turn was BLOCKED:\n"
+                    f"{feedback}\n\n"
+                    "Please resolve all reported issues immediately:\n"
+                    "- If hardcoded credentials or passwords were detected (e.g. in docker-compose.yml), replace them with environment variables (e.g. '${POSTGRES_PASSWORD:-postgres}') or placeholder defaults ('dev_password', 'change-me').\n"
+                    "- Ensure required release deliverables (VERSION.md, CHANGELOG.md) exist and conform to scope.\n"
+                    "- Conclude your turn declaring status 'completed'."
+                )
+                state.gitops_feedback = None
             params: dict[str, Any] = {
                 "role": "gitops",
                 "agent_id": "local-llm",
             }
             if state.gitops_wo_id:
                 params["work_order_id"] = state.gitops_wo_id
+                self._mark_wo_status_on_disk(ws, state.gitops_wo_id, "ACTIVE", clear_error=True)
             op = self.manager.start_turn(
                 state.session_id,
                 gitops_prompt,
@@ -2736,7 +2798,7 @@ class LifecycleSupervisor:
                 f"1. Author the declared test suite '{deliv_path}' with write_file — thorough "
                 f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.\n"
                 f"2. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
-                f"3. Run the run_security_scan tool over the deliverables (src/) and triage the output; "
+                f"3. Run the run_security_scan tool over the deliverables and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
                 f"4. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
                 f"5. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
@@ -3090,6 +3152,26 @@ class LifecycleSupervisor:
         """Dispatch the dedicated Architect repair turn with bounded diagnostics."""
         source = str(state.repair_context.get("source", "authoring"))
         if source == "recovery":
+            wo_id = state.repair_context.get("work_order")
+            action = state.repair_context.get("action")
+            if wo_id:
+                contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+                needs_auth = not contract_file.is_file()
+                if not needs_auth and action == "amend_contract":
+                    try:
+                        c_data = yaml.safe_load(contract_file.read_text(encoding="utf-8")) or {}
+                        if c_data.get("synthesized_by") != "recovery-repair" or c_data.get("agent_id") != "claude":
+                            needs_auth = True
+                    except Exception:
+                        needs_auth = True
+                if needs_auth:
+                    self._write_recovery_repair_authorization(
+                        ws,
+                        str(wo_id),
+                        str(action or ""),
+                        state.repair_context.get("original_contract") or {},
+                        state=state,
+                    )
             prompt = self._recovery_repair_prompt(state)
         else:
             prompt = self._authoring_repair_prompt(state)
@@ -3107,16 +3189,31 @@ class LifecycleSupervisor:
         child_ids = ctx.get("replacement_work_orders") or []
         children_lines = "\n".join(f"- {c}" for c in child_ids) if child_ids else "- (none declared)"
         post_check_error = ctx.get("post_check_error")
+        orig = ctx.get("original_contract") or {}
+        orig_allow = [
+            r.get("module") for r in (orig.get("scope", {}).get("allow") or [])
+            if isinstance(r, dict) and r.get("module")
+        ]
+        orig_agent = orig.get("agent_id") or "worker"
+        existing_rules_str = (
+            f"\nExisting allowed modules for {orig_agent} on {wo_id}:\n"
+            + "".join(f"  - {m}\n" for m in orig_allow)
+            if orig_allow else ""
+        )
         return (
             f"ARCHITECT RECOVERY REPAIR for work order {wo_id} (approved action: {action}).\n\n"
             f"Recovery decision:\n{decision_lines}\n\n"
             f"Post-repair validation error: {post_check_error or 'none yet (first application pass)'}\n\n"
             "Apply the decision by authoring governed artifacts with write_file:\n"
             + (
-                "- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
-                "conforming to schemas/contract.schema.json. The budget must be explicitly sized "
-                "from the task's real file footprint. A transitional repair contract is already in "
-                "place at that path — overwrite it with the amended contract; do not delete it.\n"
+                f"- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
+                f"conforming to schemas/contract.schema.json. The budget must be explicitly sized "
+                f"from the task's real file footprint (ensure max_files_touched is at least 5 or sized to accommodate all files touched plus test/db fixtures). "
+                f"Preserve existing allowed paths (including the work order deliverable) and append the new path requested by the recovery decision.{existing_rules_str}"
+                f"Contract schema requirements: schema_version: 1 (integer), agent_id, work_order, identity: {{role: ..., reports_to: ...}}, "
+                f"scope: allow must be a list of rule mappings (e.g. - module: 'tests/**'), deny must be a list of rule mappings (e.g. - module: 'gacche.db'), "
+                f"write must be the string 'read-write', budget: {{max_files_touched: 10, max_tokens: 50000}}. Optional: contract_revision, guidelines. "
+                f"A transitional repair contract is already in place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )
             + (
@@ -3536,6 +3633,8 @@ class LifecycleSupervisor:
                         original_contract = loaded
                 except Exception:
                     pass
+            if not original_contract:
+                original_contract = self._find_latest_contract_for_wo(ws, state.run_id, wo_id)
             self._archive_recovery_artifact(
                 ws, state.run_id, f".sync/contracts/{wo_id}.yaml"
             )
@@ -3672,13 +3771,7 @@ class LifecycleSupervisor:
         self, state: RunState, ws: Path, record: dict[str, Any],
     ) -> tuple[AdvanceResult | None, str | None]:
         """Route a recovery application into the bounded ARCHITECT_REPAIR turn."""
-        if state.authoring_repair_attempts >= state.max_authoring_repairs:
-            state.error = (
-                f"Recovery repair for {record.get('work_order')} could not start — repair attempts "
-                f"exhausted ({state.authoring_repair_attempts}/{state.max_authoring_repairs})"
-            )
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED, None
+        state.authoring_repair_attempts = 0
         # Deterministic bookkeeping: place/extend the transitional
         # repair-authorization contract so the repair turn passes pre-execution
         # validation (task WO matches contract WO) and is authorized to write
@@ -3688,6 +3781,7 @@ class LifecycleSupervisor:
             str(state.repair_context.get("work_order") or ""),
             str(state.repair_context.get("action") or ""),
             state.repair_context.get("original_contract") or {},
+            state=state,
         )
         self._archive_stale_inbox_notices(ws)
         state.recovery_decisions.append({**record, "applied": True, "stage": "repair_dispatched"})
@@ -3705,8 +3799,53 @@ class LifecycleSupervisor:
         state.architect_repair_operation_id = op.get("operation_id")
         return AdvanceResult.WAITING_FOR_OPERATION, None
 
+    def _find_latest_contract_for_wo(
+        self, ws: Path, run_id: str, wo_id: str
+    ) -> dict[str, Any]:
+        """Find the most recent contract for a work order across live, superseded, and audit paths."""
+        c_path = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+        if c_path.is_file():
+            try:
+                data = yaml.safe_load(c_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        if run_id:
+            superseded_dir = ws / ".sync" / "reports" / "authoring" / run_id / "superseded"
+            if superseded_dir.is_dir():
+                candidates = sorted(
+                    superseded_dir.glob(f"{wo_id}*.yaml"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for cand in candidates:
+                    try:
+                        data = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                        if isinstance(data, dict) and data.get("scope"):
+                            return data
+                    except Exception:
+                        pass
+            report_dir = ws / ".sync" / "reports" / "authoring" / run_id
+            if report_dir.is_dir():
+                for rev_dir in sorted(report_dir.glob("rev*"), reverse=True):
+                    cand = rev_dir / f"{wo_id}.yaml"
+                    if cand.is_file():
+                        try:
+                            data = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                            if isinstance(data, dict) and data.get("scope"):
+                                return data
+                        except Exception:
+                            pass
+        return {}
+
     def _write_recovery_repair_authorization(
-        self, ws: Path, wo_id: str, action: str, original_contract: dict[str, Any],
+        self,
+        ws: Path,
+        wo_id: str,
+        action: str,
+        original_contract: dict[str, Any],
+        state: RunState | None = None,
     ) -> None:
         """Place or extend the transitional repair-authorization contract.
 
@@ -3723,6 +3862,10 @@ class LifecycleSupervisor:
         from validators.harness.authoring_gate import AuthoringGate
 
         contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+        if not original_contract:
+            run_id = getattr(state, "run_id", "") if state else ""
+            original_contract = self._find_latest_contract_for_wo(ws, run_id, wo_id)
+
         original_scope = original_contract.get("scope") if isinstance(original_contract, dict) else None
         allow = list((original_scope or {}).get("allow") or [])
         deny = list((original_scope or {}).get("deny") or [{"module": ".git/**"}])
@@ -3734,9 +3877,28 @@ class LifecycleSupervisor:
 
         _ensure(f".sync/contracts/{wo_id}.yaml")
         _ensure(".sync/decisions/**")
-        if action in ("split_work_order", "create_dependency_work_order"):
+        _ensure("schemas/**")
+        if action == "amend_contract":
+            _ensure(".sync/contracts/**")
+            _ensure(".sync/work-orders/**")
+        elif action in ("split_work_order", "create_dependency_work_order"):
             _ensure(".sync/work-orders/**")
             _ensure(".sync/contracts/**")
+        deny = [r for r in deny if not (isinstance(r, dict) and "schemas" in str(r.get("module", "")))]
+
+        # Also ensure work order's declared deliverable is allowed
+        for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+            wo_cand = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+            if wo_cand.is_file():
+                try:
+                    wo_data = yaml.safe_load(wo_cand.read_text(encoding="utf-8"))
+                    if isinstance(wo_data, dict):
+                        deliv = wo_data.get("deliverable")
+                        if isinstance(deliv, dict) and deliv.get("path"):
+                            _ensure(str(deliv["path"]))
+                    break
+                except Exception:
+                    pass
 
         if action == "create_dependency_work_order" and contract_file.is_file():
             # The original contract stays authoritative for the surviving work
@@ -3759,6 +3921,17 @@ class LifecycleSupervisor:
             except Exception:
                 pass
 
+        evidence = (state.worker_blockers.get(wo_id) or {}) if state else {}
+        observed_count = int(evidence.get("observed_file_count", 0)) if isinstance(evidence, dict) else 0
+        if action == "amend_contract" or (isinstance(evidence, dict) and evidence.get("failure_code") == "CONTRACT_FILE_BUDGET_EXCEEDED"):
+            repair_budget = {"max_files_touched": max(10, observed_count + 5), "max_tokens": 50000}
+        else:
+            repair_budget = (
+                budget
+                if isinstance(budget, dict) and budget.get("max_files_touched")
+                else {"max_files_touched": 10, "max_tokens": 50000}
+            )
+
         record: dict[str, Any] = {
             "schema_version": 1,
             "agent_id": "claude",
@@ -3769,11 +3942,7 @@ class LifecycleSupervisor:
                 "deny": deny,
                 "write": "read-write",
             },
-            "budget": (
-                budget
-                if isinstance(budget, dict) and budget.get("max_files_touched")
-                else {"max_files_touched": 10, "max_tokens": 50000}
-            ),
+            "budget": repair_budget,
             "synthesized_by": "recovery-repair",
         }
         gate = AuthoringGate(project_root=ws)
@@ -4072,7 +4241,7 @@ class LifecycleSupervisor:
         """Reset non-completed work orders on disk back to ACTIVE when resuming a run."""
         ws = Path(state.workspace)
         candidate_ids: list[str] = []
-        if state.planning_wo_id and state.phase == Phase.PLANNING:
+        if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
             candidate_ids.append(state.planning_wo_id)
         candidate_ids.extend(state.worker_wo_ids)
         if state.integration_wo_id:
@@ -4182,8 +4351,9 @@ class LifecycleSupervisor:
                     else:
                         wo_ids.append(wo_id)
             except Exception:
-                wo_ids.append(wo_id)  # Include even if we can't read it
-        state.worker_wo_ids = wo_ids
+                wo_ids.append(wo_id)
+        if wo_ids or not state.worker_wo_ids:
+            state.worker_wo_ids = wo_ids
 
     def _dependencies_met(self, state: RunState, wo_id: str, ws: Path) -> bool:
         """Check that all dependencies of a WO are in completed_wo_ids."""
@@ -4685,6 +4855,11 @@ def archive_completed_work_orders(
             pass
         archived.append(wo_id)
 
+    # Also include any target_ids that are already in completed_dir
+    for target_id in target_ids:
+        if (completed_dir / f"{target_id}.yaml").is_file() and target_id not in archived:
+            archived.append(target_id)
+
     if not archived:
         return []
 
@@ -4735,6 +4910,12 @@ def archive_completed_work_orders(
             tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
         except Exception:
             pass
+
+    try:
+        from validators.harness.runner import HarnessRunner
+        HarnessRunner._sync_index_and_tree_yaml(ws)
+    except Exception:
+        pass
 
     return archived
 

@@ -129,7 +129,7 @@ def test_tui_adapter_whitespace_and_argument_hardening():
 
     # Prompt with whitespace preserved cleanly
     adapter.command("   write unit test   ", session_id="sess-abc")
-    assert stub.calls[-1] == ("turn", "sess-abc", "write unit test", {})
+    assert stub.calls[-1] == ("turn", "sess-abc", "write unit test", {"role": "architecture", "agent_id": "claude"})
 
 
 def test_daemon_client_http_error_and_safe_lists(monkeypatch):
@@ -191,7 +191,7 @@ def test_daemon_client_stream_events_malformed_tolerance(monkeypatch):
         def __exit__(self, *args):
             pass
 
-    monkeypatch.setattr(client._opener, "open", lambda req: _FakeResponse())
+    monkeypatch.setattr(client._opener, "open", lambda req, **kwargs: _FakeResponse())
 
     events = list(client.stream_events(session_id="s1"))
     assert len(events) == 1
