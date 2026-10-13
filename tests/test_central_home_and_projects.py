@@ -218,3 +218,26 @@ def test_cli_projects_commands(monkeypatch, tmp_path: Path):
     res_empty = runner.invoke(cli, ["projects", "list"])
     assert res_empty.exit_code == 0
     assert "No projects registered" in res_empty.output
+
+
+def test_auto_provision_global_settings_and_mirroring(monkeypatch, tmp_path: Path):
+    """Verify settings.json and setting.json are automatically provisioned in both ~/.stackmindcli and ~/.stackmind."""
+    custom_home = tmp_path / ".stackmindcli"
+    fake_user_home = tmp_path / "user_home"
+    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
+    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
+
+    # Before calling get_stackmind_home, neither directory has settings
+    home = get_stackmind_home()
+
+    # Both ~/.stackmindcli and ~/.stackmind have settings.json and setting.json
+    legacy_home = fake_user_home / ".stackmind"
+    assert (home / "settings.json").is_file()
+    assert (home / "setting.json").is_file()
+    assert (legacy_home / "settings.json").is_file()
+    assert (legacy_home / "setting.json").is_file()
+
+    # Content is valid JSON
+    data = json.loads((legacy_home / "settings.json").read_text(encoding="utf-8"))
+    assert "providers" in data
+    assert "roles" in data

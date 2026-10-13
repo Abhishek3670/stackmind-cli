@@ -167,6 +167,9 @@ class StackMindSettings:
             "roles": self.roles,
         }
 
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> StackMindSettings:
         from validators.kernel.profile import ExecutionProfile
@@ -400,6 +403,28 @@ def save_settings(settings: StackMindSettings, workspace: Path | str | None = No
             root_json.write_text(text, encoding="utf-8")
         except Exception:
             pass
+
+    # Mirror setting.json alias in target directory
+    try:
+        alias = target.parent / "setting.json"
+        if alias != target:
+            alias.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+    # If saving to global home, sync both ~/.stackmindcli and ~/.stackmind
+    try:
+        from validators.kernel.home import STACKMIND_CLI_DIR_NAME, LEGACY_STACKMIND_DIR_NAME
+        cli_home = (Path.home() / STACKMIND_CLI_DIR_NAME).resolve()
+        legacy_home = (Path.home() / LEGACY_STACKMIND_DIR_NAME).resolve()
+        if target.parent.resolve() in (cli_home, legacy_home):
+            for base in (cli_home, legacy_home):
+                if base != target.parent.resolve():
+                    base.mkdir(parents=True, exist_ok=True)
+                    (base / "settings.json").write_text(text, encoding="utf-8")
+                    (base / "setting.json").write_text(text, encoding="utf-8")
+    except Exception:
+        pass
 
     return target
 
