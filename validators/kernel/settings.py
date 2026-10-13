@@ -385,7 +385,23 @@ def load_settings(workspace: Path | str | None = None) -> StackMindSettings:
 
 def save_settings(settings: StackMindSettings, workspace: Path | str | None = None) -> Path:
     """Save settings to disk in settings.json (and update any mirrored setting.json)."""
-    target = find_settings_file(workspace) or get_default_settings_path(workspace)
+    if workspace:
+        ws = Path(workspace).resolve()
+        target = None
+        for cand in [
+            ws / ".sync" / "settings.json",
+            ws / ".sync" / "setting.json",
+            ws / "settings.json",
+            ws / "setting.json",
+        ]:
+            if cand.is_file():
+                target = cand
+                break
+        if not target:
+            target = get_default_settings_path(workspace)
+    else:
+        target = find_settings_file(None) or get_default_settings_path(None)
+
     target.parent.mkdir(parents=True, exist_ok=True)
 
     data = settings.to_dict()
