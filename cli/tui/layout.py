@@ -817,6 +817,7 @@ def render_full_screen_workspace(
         has_content=bool(composer_content),
         force_color=force_color,
         no_color=no_color,
+        alert=getattr(state, "composer_alert", None) if state is not None else None,
     )
 
     if settings_open and settings_panel_str:

@@ -717,10 +717,9 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":goal", "Submit product goal to Architecture", True),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
-    (":roles", "Display Agent Roles & Backend bindings", False),
+    (":roles", "Interactive Agent Roles & Execution Backend bindings panel", False),
     (":rebind", "Rebind agent role to backend", True),
-    (":settings", "Configure StackMind execution profile, roles & system policies", False),
-    (":config", "Configure StackMind execution profile, roles & system policies", False),
+    (":config", "Configure StackMind execution profile, governance & system policies", False),
     (":providers", "Configure cloud & local LLM providers, API keys & base URLs", False),
     (":models", "Configure and list available provider models", False),
     (":tree", "Display Hierarchical Operation Tree", False),
@@ -746,7 +745,6 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
     (":exit", "Gracefully stop daemon and exit", False),
-    (":quit", "Gracefully stop daemon and exit", False),
 ]
 
 
@@ -778,7 +776,7 @@ def format_dropdown_lines(
             start_idx = selected_index - half
             end_idx = start_idx + max_visible
 
-    box_w = max(36, min(width - 2, 74))
+    box_w = max(20, width)
     inner_w = box_w - 4
 
     border_color = "\033[90m"
@@ -798,20 +796,31 @@ def format_dropdown_lines(
         top_line = f"{border_color}┌{top_mid}{'─' * rem_short}┐{reset}"
 
     lines = [top_line]
-    cmd_col_w = 14
+    visible_matches = matches[start_idx:end_idx]
+    max_cmd_len = max(len(m[0]) for m in visible_matches) if visible_matches else 14
+    if inner_w < 32:
+        cmd_col_w = min(16, max(8, inner_w // 2))
+    else:
+        cmd_col_w = max(16, max_cmd_len + 1)
 
     for i in range(start_idx, end_idx):
         cmd, desc, _ = matches[i]
         is_sel = (i == selected_index)
 
-        avail_desc_w = inner_w - cmd_col_w - 2
+        cmd_padded = cmd.ljust(cmd_col_w)
+        if len(cmd_padded) > max(8, inner_w - 4):
+            cmd_padded = cmd_padded[:max(8, inner_w - 4)]
+
+        avail_desc_w = max(0, inner_w - len(cmd_padded) - 2)
         if len(desc) > avail_desc_w:
-            desc_str = desc[:max(0, avail_desc_w - 3)] + "..."
+            if avail_desc_w >= 4:
+                desc_str = desc[:avail_desc_w - 3] + "..."
+            else:
+                desc_str = desc[:avail_desc_w]
         else:
             desc_str = desc
 
-        padding_w = max(0, inner_w - (2 + cmd_col_w + len(desc_str)))
-        cmd_padded = cmd.ljust(cmd_col_w)
+        padding_w = max(0, inner_w - (2 + len(cmd_padded) + len(desc_str)))
 
         if is_sel:
             marker = f"{cyan_bold}> {reset}"
@@ -856,6 +865,8 @@ class RawLineEditor:
         commands: Optional[list[tuple[str, str, bool]]] = None,
         on_clear_dropdown: Optional[Callable[[], Any]] = None,
         out: Any = sys.stdout,
+        bottom_border_renderer: Optional[Callable[[Optional[str]], str]] = None,
+        on_alert: Optional[Callable[[Optional[str]], None]] = None,
     ) -> None:
         self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
@@ -890,6 +901,13 @@ class RawLineEditor:
         self._last_dropdown_lines_count: int = 0
         self._dropdown_dismissed: bool = False
         self.on_clear_dropdown = on_clear_dropdown
+
+        self._ctrl_c_timestamp: Optional[float] = None
+        self._ctrl_c_timeout: float = 3.0
+        self._confirmed_exit: bool = False
+        self.alert: Optional[str] = None
+        self.bottom_border_renderer = bottom_border_renderer
+        self.on_alert = on_alert
 
         self._update_state()
         self._update_dropdown()
@@ -1044,7 +1062,51 @@ class RawLineEditor:
             _log_debug_key(f"[handle_key] received key={repr(key)}")
 
         if key == Key.CTRL_C:
-            raise KeyboardInterrupt()
+            now = time.monotonic()
+            if self._ctrl_c_timestamp is not None and (now - self._ctrl_c_timestamp) <= self._ctrl_c_timeout:
+                self._ctrl_c_timestamp = None
+                self.alert = None
+                self._confirmed_exit = True
+                if self.state is not None and hasattr(self.state, "composer_alert"):
+                    self.state.composer_alert = None
+                if self.on_alert:
+                    try:
+                        self.on_alert(None)
+                    except Exception:
+                        pass
+                raise KeyboardInterrupt()
+            else:
+                self._ctrl_c_timestamp = now
+                self.alert = "press ctrl + C again"
+                self._confirmed_exit = False
+                if self.state is not None and hasattr(self.state, "composer_alert"):
+                    self.state.composer_alert = self.alert
+                if self.on_alert:
+                    try:
+                        self.on_alert(self.alert)
+                    except Exception:
+                        pass
+                return False
+
+        if self.alert is not None:
+            self.alert = None
+            self._ctrl_c_timestamp = None
+            self._confirmed_exit = False
+            if self.state is not None and hasattr(self.state, "composer_alert"):
+                self.state.composer_alert = None
+            if self.on_alert:
+                try:
+                    self.on_alert(None)
+                except Exception:
+                    pass
+            if self.bottom_border_renderer and self.has_borders:
+                try:
+                    border_str = self.bottom_border_renderer(None)
+                    target = getattr(self, "out", sys.stdout)
+                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+                    target.flush()
+                except Exception:
+                    pass
 
         if key == Key.CTRL_D:
             if not self.buffer:
@@ -1256,6 +1318,13 @@ class RawLineEditor:
         cursor_col = visible_prefix_len + displayed_cursor + 1
         target.write(f"\x1b[{cursor_col}G")
 
+        if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
+            try:
+                border_str = self.bottom_border_renderer(self.alert)
+                target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+            except Exception:
+                pass
+
         # Dropdown management
         prev_H = self._last_dropdown_lines_count
 
@@ -1315,6 +1384,8 @@ def raw_prompt_input(
     commands: Optional[list[tuple[str, str, bool]]] = None,
     key_stream: Optional[Iterator[str]] = None,
     top_border_renderer: Optional[Callable[[bool], str]] = None,
+    bottom_border_renderer: Optional[Callable[[Optional[str]], str]] = None,
+    on_alert: Optional[Callable[[Optional[str]], None]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
@@ -1437,43 +1508,78 @@ def raw_prompt_input(
         width=width,
         commands=commands,
         on_clear_dropdown=on_clear_dropdown,
+        bottom_border_renderer=bottom_border_renderer,
+        on_alert=on_alert,
     )
 
-    with TerminalStateRestorer():
-        editor.redraw_line()
-        while True:
-            try:
-                k = read_next_key(key_stream=key_stream, timeout=0.08 if on_idle else None)
-                if k is None:
-                    if on_idle:
-                        try:
-                            on_idle(editor)
-                        except Exception:
-                            pass
-                    continue
-                done = editor.handle_key(k)
-                if done:
+    try:
+        with TerminalStateRestorer():
+            editor.redraw_line()
+            while True:
+                try:
+                    read_timeout = 0.08 if (on_idle or editor.alert is not None) else None
+                    k = read_next_key(key_stream=key_stream, timeout=read_timeout)
+                    if k is None:
+                        if editor.alert is not None and editor._ctrl_c_timestamp is not None:
+                            if (time.monotonic() - editor._ctrl_c_timestamp) > editor._ctrl_c_timeout:
+                                editor.alert = None
+                                editor._ctrl_c_timestamp = None
+                                if editor.state is not None and hasattr(editor.state, "composer_alert"):
+                                    editor.state.composer_alert = None
+                                if editor.on_alert:
+                                    try:
+                                        editor.on_alert(None)
+                                    except Exception:
+                                        pass
+                                editor.redraw_line()
+                        if on_idle:
+                            try:
+                                on_idle(editor)
+                            except Exception:
+                                pass
+                        continue
+                    done = editor.handle_key(k)
+                    if done:
+                        if editor._last_dropdown_lines_count > 0:
+                            editor._erase_dropdown()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        break
+                    editor.redraw_line()
+                except KeyboardInterrupt:
+                    if getattr(editor, "_confirmed_exit", False):
+                        if editor._last_dropdown_lines_count > 0:
+                            editor._erase_dropdown()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        raise
+                    try:
+                        editor.handle_key(Key.CTRL_C)
+                        editor.redraw_line()
+                        continue
+                    except KeyboardInterrupt:
+                        if editor._last_dropdown_lines_count > 0:
+                            editor._erase_dropdown()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        raise
+                except EOFError:
                     if editor._last_dropdown_lines_count > 0:
                         editor._erase_dropdown()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
-                    break
-                editor.redraw_line()
-            except (KeyboardInterrupt, EOFError):
-                if editor._last_dropdown_lines_count > 0:
-                    editor._erase_dropdown()
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                raise
+                    raise
+    finally:
+        if state is not None:
+            state.is_typing = False
+            state.composer_buffer = ""
+            if hasattr(state, "composer_alert"):
+                state.composer_alert = None
 
     result = editor.text
     if result.strip():
         GLOBAL_HISTORY.append(result)
         if history is not None and result not in history:
             history.append(result)
-
-    if state is not None:
-        state.is_typing = False
-        state.composer_buffer = ""
 
     return result

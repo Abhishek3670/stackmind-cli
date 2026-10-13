@@ -768,6 +768,9 @@ def test_dispatch_settings_and_providers_separation(tmp_path: Path):
     assert "StackMind System Settings" in settings_output
     assert "Execution Profile" in settings_output
     assert "Skills Retrieval & Token Policy" in settings_output
+    assert "Agent Role Bindings" in settings_output
+    assert ":roles" in settings_output
+    assert "(Arch:" not in settings_output
 
     # 2. Dispatch :providers
     _, _ = dispatch_delivery_command(
@@ -781,6 +784,88 @@ def test_dispatch_settings_and_providers_separation(tmp_path: Path):
     assert "Cloud Providers & Models Configuration" in providers_output
     assert "Configured Providers & Endpoints:" in providers_output
     assert "anthropic" in providers_output.lower()
+    assert "AGENT ROLE ASSIGNMENTS" not in providers_output
+    assert "Arch:" not in providers_output
+
+    # 3. Dispatch :roles
+    _, _ = dispatch_delivery_command(
+        adapter=adapter,
+        client=client,
+        session=session,
+        text=":roles",
+        state=state,
+    )
+    roles_output = state.messages[-1].content
+    assert "AGENT ROLES" in roles_output
+    assert "Architecture" in roles_output
+    assert "Backend" in roles_output
+
+
+def test_render_roles_panel_view():
+    from cli.tui.settings_panel import render_anchored_settings_panel_str
+    from cli.tui.state import AutonomousDeliveryState
+    from validators.kernel.settings import load_settings
+
+    state = AutonomousDeliveryState()
+    state.settings_obj = load_settings()
+    state.settings_current_view = "roles"
+    state.settings_selected_row = 0
+
+    rendered = render_anchored_settings_panel_str(state, width=80, height=11)
+    lines = rendered.split("\n")
+    assert len(lines) == 11
+    assert "Agent Role Assignments (:roles)" in rendered
+    assert "Architecture" in rendered
+    assert "Backend" in rendered
+    assert "Frontend" in rendered
+    assert "Q/A" in rendered
+    assert "Gitops" in rendered
+    assert "Save Role Bindings" in rendered
+
+
+def test_interactive_roles_panel_loop(tmp_path: Path):
+    from cli.tui.keyboard import Key
+    from cli.tui.settings_panel import run_interactive_roles_panel
+    from cli.tui.state import AutonomousDeliveryState
+    from validators.kernel.settings import load_settings
+
+    state = AutonomousDeliveryState(session_id="s1")
+    session = {"session_id": "s1", "workspace": str(tmp_path)}
+
+    # Sequence (pure arrow navigation, no letter shortcuts):
+    # Row 0 is Architecture
+    # 1. RIGHT -> cycle provider to openrouter
+    # 2. ENTER -> cycle model
+    # 3. DOWN x 5 -> navigate cursor to Save row (Row 5)
+    # 4. ENTER -> save bindings and apply
+    key_seq = [
+        Key.RIGHT,
+        Key.ENTER,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.DOWN,
+        Key.ENTER,
+    ]
+
+    mock_client = MagicMock()
+    result = run_interactive_roles_panel(
+        session=session,
+        state=state,
+        client=mock_client,
+        key_stream=iter(key_seq),
+        workspace=tmp_path,
+    )
+    assert "[SUCCESS]" in result
+    assert "saved to settings.json" in result
+
+    # Verify persistence in settings.json
+    reloaded = load_settings(tmp_path)
+    assert reloaded.roles["architecture"]["provider"] == "openrouter"
+    # Verify runtime state was updated
+    assert state.roles["Architecture"].backend == "openrouter"
+
 
 
 

@@ -232,10 +232,11 @@ def render_composer_box(
     content: str | list[str] | None = None,
     is_active: bool = False,
     has_content: bool = False,
+    alert: str | None = None,
 ) -> Panel:
     """Render the rounded input composer box."""
     inner_width = max(10, width - 4)
-    border_color = "#60a5fa" if is_active else "#475569"
+    border_color = "#f59e0b" if alert else ("#60a5fa" if is_active else "#475569")
 
     shortcut_candidates = [
         shortcuts,
@@ -330,6 +331,7 @@ def render_composer_box(
         body,
         box=box.ROUNDED,
         border_style=border_color,
+        subtitle=f"[bold #f59e0b] {alert} [/]" if alert else None,
         padding=(0, 1),
     )
 
@@ -344,6 +346,7 @@ def render_composer_box_str(
     *,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    alert: str | None = None,
 ) -> str:
     """Render input composer box as plain or ANSI-styled string using in-memory capture."""
     console, use_ansi = _make_capture_console(
@@ -359,6 +362,7 @@ def render_composer_box_str(
             content=content,
             is_active=is_active,
             has_content=has_content,
+            alert=alert,
         )
     )
     return console.export_text(styles=use_ansi).rstrip()
@@ -692,19 +696,41 @@ def render_composer_top_border_str(
     return console.export_text().rstrip()
 
 
-def render_composer_bottom_border(width: int = 80, is_active: bool = False) -> RenderableType:
-    """Render the bottom rounded border of the composer box."""
-    border_color = "#60a5fa" if is_active else "#475569"
+def render_composer_bottom_border(
+    width: int = 80,
+    is_active: bool = False,
+    alert: str | None = None,
+) -> RenderableType:
+    """Render the bottom rounded border of the composer box, optionally embedding an alert."""
+    border_color = "#f59e0b" if alert else ("#60a5fa" if is_active else "#475569")
     text = Text()
+    if alert:
+        alert_text = f" {alert} "
+        fixed_len = len("╰─") + len(alert_text) + len("─╯")
+        if width >= fixed_len + 2:
+            fill_count = max(0, width - fixed_len)
+            text.append("╰─", style=border_color)
+            text.append(alert_text, style="bold #f59e0b")
+            text.append("─" * fill_count + "─╯", style=border_color)
+            return text
+        elif width >= len(alert) + 4:
+            text.append("╰─", style=border_color)
+            text.append(f" {alert} ", style="bold #f59e0b")
+            text.append("─╯", style=border_color)
+            return text
     text.append("╰" + "─" * max(2, width - 2) + "╯", style=border_color)
     return text
 
 
-def render_composer_bottom_border_str(width: int = 80, is_active: bool = False) -> str:
+def render_composer_bottom_border_str(
+    width: int = 80,
+    is_active: bool = False,
+    alert: str | None = None,
+) -> str:
     """Render bottom border of composer box as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_bottom_border(width=width, is_active=is_active))
+    console.print(render_composer_bottom_border(width=width, is_active=is_active, alert=alert))
     return console.export_text().rstrip()
 
 
@@ -815,6 +841,20 @@ def prompt_composer_input(
                     pass
             return False
 
+        def _handle_alert(alert_text: str | None) -> None:
+            if state is not None and hasattr(state, "composer_alert"):
+                state.composer_alert = alert_text
+            if is_live_active:
+                try:
+                    live_manager.update(
+                        composer_content=getattr(state, "composer_buffer", ""),
+                        composer_is_active=True,
+                        shortcuts=shortcuts,
+                        include_composer=True,
+                    )
+                except Exception:
+                    pass
+
         try:
             _raw_prompt_fn = getattr(
                 sys.modules.get("cli.tui.app"), "raw_prompt_input", raw_prompt_input
@@ -841,12 +881,20 @@ def prompt_composer_input(
                     is_active=True,
                     has_content=has_c,
                 ),
+                bottom_border_renderer=lambda alert: render_composer_bottom_border_str(
+                    width=comp_width,
+                    is_active=True,
+                    alert=alert,
+                ),
+                on_alert=_handle_alert,
                 on_idle=on_idle,
             )
         finally:
             if state is not None:
                 state.is_typing = False
                 state.composer_buffer = ""
+                if hasattr(state, "composer_alert"):
+                    state.composer_alert = None
 
         if is_live_active:
             live_manager.update(

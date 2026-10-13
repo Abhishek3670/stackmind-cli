@@ -249,10 +249,9 @@ def get_help_str() -> str:
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :reconnect        Reconnect to daemon and replay missed events\n"
-        "  :roles            Display Agent Roles & Execution Backend bindings\n"
+        "  :roles            Interactive Agent Roles & Execution Backend bindings panel\n"
         "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
-        "  :settings         StackMind system settings, execution profiles, roles & policies\n"
-        "  :config           Alias for :settings\n"
+        "  :config           StackMind system settings, execution profiles, governance & policies\n"
         "  :providers        Configure cloud and local LLM providers, API keys & endpoints\n"
         "  :models           Configure and list available provider models\n"
         "  :wo               Display Work Orders table and progress\n"
@@ -278,14 +277,10 @@ def get_help_str() -> str:
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
-        "  :exit, :quit, q   Gracefully stop daemon and exit\n"
+        "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
         "Shortcuts:\n"
-        "  Ctrl+K            Open this help menu\n"
-        "  Ctrl+L            Redraw full screen\n"
-        "  PgUp / PgDn       Scroll conversation viewport\n"
-        "  Ctrl+C / Ctrl+D   Cancel turn or exit\n"
-        "  Esc               Cancel current prompt"
+        "  Ctrl+C            Cancel active turn or abort"
     )
 
 
@@ -1158,8 +1153,10 @@ def dispatch_delivery_command(
         return session, True
 
     is_tty = False
+    is_interactive = False
     try:
         is_tty = sys.stdout.isatty()
+        is_interactive = is_tty and getattr(sys.stdin, "isatty", lambda: False)()
     except Exception:
         pass
 
@@ -1261,8 +1258,22 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized == ":roles":
-        # Query daemon role bindings if supported, and render detailed role panel
+    if (
+        normalized == ":roles"
+        or normalized.startswith(":roles ")
+        or normalized in {":role"}
+    ):
+        from cli.tui.settings_panel import (
+            render_roles_panel,
+            run_interactive_roles_panel,
+        )
+        from validators.kernel.settings import load_settings
+
+        ws = Path(session["workspace"]) if session.get("workspace") else None
+        subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+
+        # Query daemon role bindings if supported, and update state roles
         try:
             roles_data = client.list_roles()
             if roles_data and isinstance(roles_data, list):
@@ -1276,7 +1287,18 @@ def dispatch_delivery_command(
                         state.roles[normalized_key].model = rd.get("model")
         except Exception:
             pass
-        output_str = render_roles_panel(state, detailed=True)
+
+        if is_interactive and not subcmd:
+            output_str = run_interactive_roles_panel(
+                session=session,
+                state=state,
+                client=client,
+                live_manager=live_manager,
+                workspace=ws,
+                width=term_cols,
+            )
+        else:
+            output_str = render_roles_panel(state, detailed=True)
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -1338,10 +1360,11 @@ def dispatch_delivery_command(
         return session, False
 
     if (
-        normalized == ":settings"
-        or normalized.startswith(":settings ")
-        or normalized in {":config", ":setting"}
+        normalized == ":config"
         or normalized.startswith(":config ")
+        or normalized in {":settings", ":setting"}
+        or normalized.startswith(":settings ")
+        or normalized.startswith(":setting ")
     ):
         from cli.tui.settings_panel import (
             render_stackmind_settings_str,
@@ -1352,7 +1375,7 @@ def dispatch_delivery_command(
         ws = Path(session["workspace"]) if session.get("workspace") else None
         subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
         term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-        if is_tty and not subcmd:
+        if is_interactive and not subcmd:
             output_str = run_interactive_stackmind_settings(
                 session=session,
                 state=state,
@@ -1396,6 +1419,10 @@ def dispatch_delivery_command(
                     from cli.tui.settings_panel import render_settings_overview_str
 
                     output_str = render_settings_overview_str(settings_obj, width=term_cols)
+                elif scmd in ("roles", "role"):
+                    from cli.tui.settings_panel import render_roles_panel
+
+                    output_str = render_roles_panel(state, detailed=True)
                 else:
                     output_str = render_stackmind_settings_str(settings_obj, width=term_cols)
             else:
@@ -1435,7 +1462,7 @@ def dispatch_delivery_command(
         ws = Path(session["workspace"]) if session.get("workspace") else None
         subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
         term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-        if is_tty and not subcmd:
+        if is_interactive and not subcmd:
             output_str = run_interactive_providers_panel(
                 session=session,
                 state=state,

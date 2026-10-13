@@ -26,26 +26,12 @@ def get_stackmind_home() -> Path:
     """Return the authoritative ~/.stackmindcli root directory.
 
     Respects STACKMIND_HOME environment variable if set.
-    Creates required root directories and moves any legacy ~/.stackmind contents.
     """
     override = os.environ.get(STACKMIND_HOME_ENV)
     if override:
         home_path = Path(override).expanduser().resolve()
     else:
         home_path = (Path.home() / STACKMIND_CLI_DIR_NAME).resolve()
-
-    # If legacy ~/.stackmind exists, move its contents into home_path and delete it
-    legacy = (Path.home() / ".stackmind").resolve()
-    if legacy.is_dir() and legacy != home_path:
-        try:
-            home_path.mkdir(parents=True, exist_ok=True)
-            for item in legacy.iterdir():
-                dest = home_path / item.name
-                if not dest.exists():
-                    shutil.move(str(item), str(dest))
-            shutil.rmtree(legacy, ignore_errors=True)
-        except Exception:
-            pass
 
     try:
         home_path.mkdir(parents=True, exist_ok=True)
@@ -85,11 +71,6 @@ def ensure_global_settings_file(target_home: Path | None = None) -> Path:
             pass
 
     return target_settings
-
-
-def _migrate_legacy_settings_if_needed(target_home: Path) -> None:
-    """Ensure settings in target home."""
-    ensure_global_settings_file(target_home)
 
 
 def get_global_settings_path() -> Path:

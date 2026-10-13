@@ -46,38 +46,13 @@ def test_get_stackmind_home_creates_directories(monkeypatch, tmp_path: Path):
     assert get_sessions_home_dir() == home / "sessions"
 
 
-def test_legacy_settings_migration(monkeypatch, tmp_path: Path):
-    """Verify settings from legacy ~/.stackmind/ are moved to ~/.stackmindcli/ and legacy is deleted."""
-    custom_home = tmp_path / ".stackmindcli"
-    fake_user_home = tmp_path / "user_home"
-    legacy_dir = fake_user_home / ".stackmind"
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    legacy_settings = legacy_dir / "settings.json"
-    legacy_settings.write_text('{"execution_profile": "high"}', encoding="utf-8")
-
-    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
-    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
-
-    home = get_stackmind_home()
-    target_settings = home / "settings.json"
-    assert target_settings.is_file()
-    assert json.loads(target_settings.read_text(encoding="utf-8")) == {"execution_profile": "high"}
-    assert not legacy_dir.exists()
-
-
-def test_find_settings_file_ignores_legacy_stackmind(monkeypatch, tmp_path: Path):
-    """Verify find_settings_file ignores ~/.stackmind/ and only uses ~/.stackmindcli/."""
+def test_find_settings_file_global_fallback(monkeypatch, tmp_path: Path):
+    """Verify find_settings_file falls back to ~/.stackmindcli/settings.json when no workspace settings exist."""
     custom_home = tmp_path / ".stackmindcli"
     custom_home.mkdir(parents=True, exist_ok=True)
     cli_settings = custom_home / "settings.json"
     cli_settings.write_text('{"source": "stackmindcli"}', encoding="utf-8")
 
-    fake_user_home = tmp_path / "user_home"
-    legacy_dir = fake_user_home / ".stackmind"
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    (legacy_dir / "settings.json").write_text('{"source": "legacy"}', encoding="utf-8")
-
-    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
     monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
 
     # In an empty workspace without local settings
@@ -222,20 +197,19 @@ def test_cli_projects_commands(monkeypatch, tmp_path: Path):
 
 
 def test_auto_provision_global_settings_in_stackmindcli(monkeypatch, tmp_path: Path):
-    """Verify settings.json and setting.json are automatically provisioned in ~/.stackmindcli and not ~/.stackmind."""
+    """Verify settings.json and setting.json are automatically provisioned in ~/.stackmindcli."""
     custom_home = tmp_path / ".stackmindcli"
     fake_user_home = tmp_path / "user_home"
     monkeypatch.setattr(Path, "home", lambda: fake_user_home)
     monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
 
-    # Before calling get_stackmind_home, neither directory has settings
+    # Before calling get_stackmind_home, directory has no settings
     home = get_stackmind_home()
 
     # Only ~/.stackmindcli has settings.json and setting.json
-    legacy_home = fake_user_home / ".stackmind"
     assert (home / "settings.json").is_file()
     assert (home / "setting.json").is_file()
-    assert not legacy_home.exists()
+    assert not (fake_user_home / ".stackmind").exists()
 
     # Content is valid JSON
     data = json.loads((home / "settings.json").read_text(encoding="utf-8"))

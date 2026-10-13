@@ -397,6 +397,7 @@ class AutonomousDeliveryState:
             conversation_scroll if conversation_scroll is not None else ConversationScroll()
         )
         self.composer_buffer: str = ""
+        self.composer_alert: str | None = None
         self.is_typing: bool = False
         self.focus_target: str = "composer"
         self.activity_log: list[ActivityEntry] = []

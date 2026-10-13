@@ -278,14 +278,30 @@ def test_editor_history_navigation():
 
 
 def test_editor_ctrl_c_and_ctrl_d():
-    """Verify Ctrl+C raises KeyboardInterrupt and Ctrl+D raises EOFError when empty."""
+    """Verify Ctrl+C double-press alert behavior and Ctrl+D EOFError when empty."""
     editor = RawLineEditor()
 
+    # First Ctrl+C: sets alert, does NOT raise
+    done = editor.handle_key(Key.CTRL_C)
+    assert done is False
+    assert editor.alert == "press ctrl + C again"
+
+    # Second Ctrl+C within threshold: confirms exit with KeyboardInterrupt
     with pytest.raises(KeyboardInterrupt):
         editor.handle_key(Key.CTRL_C)
 
+    # Reset behavior: first Ctrl+C sets alert, another key clears it
+    editor = RawLineEditor()
+    editor.handle_key(Key.CTRL_C)
+    assert editor.alert == "press ctrl + C again"
+    editor.handle_key("a")
+    assert editor.alert is None
+    assert editor.text == "a"
+
+    # Empty buffer Ctrl+D raises EOFError
+    editor_empty = RawLineEditor()
     with pytest.raises(EOFError):
-        editor.handle_key(Key.CTRL_D)
+        editor_empty.handle_key(Key.CTRL_D)
 
     # Non-empty buffer: Ctrl+D acts like Delete forward
     editor = RawLineEditor(initial_text="test")
@@ -1083,6 +1099,18 @@ def test_format_dropdown_lines_structure():
     assert f"(1/{len(DEFAULT_COMMANDS)})" in lines[-1]
 
 
+def test_format_dropdown_lines_stretches_flexible_width():
+    """Verify dropdown stretches wide and flexible matching composer width."""
+    import re
+
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+    for w in (60, 80, 100, 120, 140, 160):
+        lines = format_dropdown_lines(DEFAULT_COMMANDS, selected_index=0, width=w)
+        assert len(lines) >= 3
+        for line in lines:
+            assert len(ansi_re.sub("", line)) == w
+
+
 def test_dropdown_height_shrink_clears_excess_top_lines():
     """Verify typing prefix that narrows command matches clears excess top lines from taller dropdown."""
     import io
@@ -1096,29 +1124,29 @@ def test_dropdown_height_shrink_clears_excess_top_lines():
     editor.redraw_line()
     assert editor._last_dropdown_lines_count == 8
 
-    # 2. Type 'p' (matches: :plan, :providers, :profile, :pause -> 6 total lines)
+    # 2. Type 'p' (matches: :plan, :pause, :providers, :projects, :profile -> 5 items -> 7 total lines)
     out.seek(0)
     out.truncate(0)
     editor.handle_key("p")
     editor.redraw_line()
     step_p = out.getvalue()
-    assert editor._last_dropdown_lines_count == 6
+    assert editor._last_dropdown_lines_count == 7
     # Must have moved up to row of old 8-line dropdown (8 + 1 border = 9)
     assert "\x1b[9A" in step_p
-    # Must have cleared the 2 excess lines (8 - 6 = 2) with \x1b[2K
-    assert len(re.findall(r"\x1b\[2K", step_p)) == 2
+    # Must have cleared the 1 excess line (8 - 7 = 1) with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_p)) == 1
 
-    # 3. Type 'l' (matches: :plan -> 3 total lines)
+    # 3. Type 'l' (matches: :plan -> 1 item -> 3 total lines)
     out.seek(0)
     out.truncate(0)
     editor.handle_key("l")
     editor.redraw_line()
     step_pl = out.getvalue()
     assert editor._last_dropdown_lines_count == 3
-    # Must have moved up to row of old 6-line dropdown (6 + 1 border = 7)
-    assert "\x1b[7A" in step_pl
-    # Must have cleared the 3 excess lines (6 - 3 = 3) with \x1b[2K
-    assert len(re.findall(r"\x1b\[2K", step_pl)) == 3
+    # Must have moved up to row of old 7-line dropdown (7 + 1 border = 8)
+    assert "\x1b[8A" in step_pl
+    # Must have cleared the 4 excess lines (7 - 3 = 4) with \x1b[2K
+    assert len(re.findall(r"\x1b\[2K", step_pl)) == 4
 
 
 def test_dropdown_dismiss_clears_all_lines():
@@ -1141,6 +1169,152 @@ def test_dropdown_dismiss_clears_all_lines():
     assert editor._last_dropdown_lines_count == 0
     # Must have cleared all 8 lines with \x1b[2K
     assert len(re.findall(r"\x1b\[2K", step_esc)) == 8
+
+
+def test_render_composer_bottom_border_with_alert():
+    """Verify render_composer_bottom_border embeds alert text on the border."""
+    from cli.tui.terminal import render_composer_bottom_border_str
+
+    border_no_alert = render_composer_bottom_border_str(width=80, alert=None)
+    assert "press ctrl + C again" not in border_no_alert
+
+    border_with_alert = render_composer_bottom_border_str(width=80, alert="press ctrl + C again")
+    assert "press ctrl + C again" in border_with_alert
+    assert "╰─" in border_with_alert
+    assert "─╯" in border_with_alert
+
+
+def test_raw_line_editor_redraw_renders_bottom_border_alert():
+    """Verify RawLineEditor redraws bottom border with alert on Ctrl+C."""
+    import io
+
+    out = io.StringIO()
+    renderer_called_with = []
+
+    def mock_border_renderer(alert_text):
+        renderer_called_with.append(alert_text)
+        return f"╰─ [{alert_text}] ─╯" if alert_text else "╰──────╯"
+
+    editor = RawLineEditor(
+        width=80,
+        out=out,
+        bottom_border_renderer=mock_border_renderer,
+    )
+
+    # First Ctrl+C
+    done = editor.handle_key(Key.CTRL_C)
+    assert done is False
+    assert editor.alert == "press ctrl + C again"
+
+    editor.redraw_line()
+    output = out.getvalue()
+    assert "\x1b[s\x1b[1B\r╰─ [press ctrl + C again] ─╯\x1b[u" in output
+    assert "press ctrl + C again" in renderer_called_with
+
+
+def test_raw_prompt_input_ctrl_c_double_press_and_alert():
+    """Verify raw_prompt_input alerts on first Ctrl+C and exits on second Ctrl+C."""
+    alerts = []
+    keys = iter([Key.CTRL_C, Key.CTRL_C])
+
+    with pytest.raises(KeyboardInterrupt):
+        raw_prompt_input(
+            width=80,
+            key_stream=keys,
+            on_alert=lambda a: alerts.append(a),
+        )
+
+    assert "press ctrl + C again" in alerts
+
+
+def test_raw_prompt_input_ctrl_c_alert_reset_on_typing():
+    """Verify typing any key after first Ctrl+C resets alert and proceeds with input."""
+    alerts = []
+    keys = iter([Key.CTRL_C, "h", "e", "l", "l", "o", Key.ENTER])
+
+    result = raw_prompt_input(
+        width=80,
+        key_stream=keys,
+        on_alert=lambda a: alerts.append(a),
+    )
+
+    assert result == "hello"
+    assert "press ctrl + C again" in alerts
+    # Last alert notification was None (cleared)
+    assert alerts[-1] is None
+
+
+def test_raw_prompt_input_async_keyboard_interrupt_double_press():
+    """Verify raw_prompt_input catches OS-level KeyboardInterrupt and requires a second press to exit."""
+    alerts = []
+
+    def failing_stream():
+        # First press: simulates OS signal KeyboardInterrupt
+        yield from ()
+        raise KeyboardInterrupt()
+
+    class SignalKeyStream:
+        def __init__(self):
+            self.calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt()
+            elif self.calls == 2:
+                raise KeyboardInterrupt()
+            return Key.ENTER
+
+    key_stream = SignalKeyStream()
+
+    with pytest.raises(KeyboardInterrupt):
+        raw_prompt_input(
+            width=80,
+            key_stream=key_stream,
+            on_alert=lambda a: alerts.append(a),
+        )
+
+    # First KeyboardInterrupt caught and set alert; second confirmed exit
+    assert key_stream.calls == 2
+    assert "press ctrl + C again" in alerts
+
+
+def test_raw_prompt_input_async_keyboard_interrupt_reset_on_typing():
+    """Verify first OS-level KeyboardInterrupt warns, then typing characters succeeds."""
+    alerts = []
+
+    class SignalThenTypeStream:
+        def __init__(self):
+            self.calls = 0
+            self.chars = ["a", "b", Key.ENTER]
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls == 1:
+                # First press: raises KeyboardInterrupt (warning)
+                raise KeyboardInterrupt()
+            # Followed by normal typing
+            return self.chars.pop(0)
+
+    key_stream = SignalThenTypeStream()
+
+    result = raw_prompt_input(
+        width=80,
+        key_stream=key_stream,
+        on_alert=lambda a: alerts.append(a),
+    )
+
+    assert result == "ab"
+    assert "press ctrl + C again" in alerts
+    assert alerts[-1] is None
+
+
 
 
 
