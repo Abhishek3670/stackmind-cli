@@ -1287,6 +1287,21 @@ def dispatch_delivery_command(
         except Exception:
             pass
 
+        # Also sync from disk settings if present
+        try:
+            from validators.kernel.settings import find_settings_file, load_settings
+            if find_settings_file(ws):
+                s = load_settings(ws)
+                for r_name, r_cfg in s.roles.items():
+                    r_title = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name.title()
+                    if r_title in state.roles:
+                        if r_cfg.get("provider"):
+                            state.roles[r_title].backend = r_cfg["provider"]
+                        if r_cfg.get("model"):
+                            state.roles[r_title].model = r_cfg["model"]
+        except Exception:
+            pass
+
         if is_interactive and not subcmd:
             output_str = run_interactive_roles_panel(
                 session=session,

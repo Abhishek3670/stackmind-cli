@@ -1211,6 +1211,22 @@ class AutonomousDeliveryState:
             except Exception:
                 pass
 
+            # Sync / enrich roles from settings on disk if available
+            try:
+                from validators.kernel.settings import find_settings_file, load_settings
+                ws = workspace or getattr(self, "workspace", None)
+                if find_settings_file(ws):
+                    s = load_settings(ws)
+                    for r_name, r_cfg in s.roles.items():
+                        r_title = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name.title()
+                        if r_title in self.roles:
+                            if r_cfg.get("provider"):
+                                self.roles[r_title].backend = r_cfg["provider"]
+                            if r_cfg.get("model"):
+                                self.roles[r_title].model = r_cfg["model"]
+            except Exception:
+                pass
+
             # 2. Fetch live agents/operations
             try:
                 sid = getattr(self, "session_id", None)
