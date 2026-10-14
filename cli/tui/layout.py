@@ -66,19 +66,118 @@ SETTINGS_PANEL_HEIGHT = 11
 MIN_VIEWPORT_HEIGHT = 4
 
 
-def compute_viewport_height(height: int | None = None, state: Any | None = None) -> int:
+def get_composer_line_limits(height: int | None = None) -> tuple[int, int]:
+    """Calculate the maximum composer box height and maximum input lines.
+
+    The composer can expand dynamically up to ~60% of the terminal height:
+    - max_box_height = max(3, int(lines * 0.60))
+    - max_input_lines = max(1, max_box_height - 2)
+    Returns (max_box_height, max_input_lines).
+    """
+    lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
+    max_box_height = max(3, int(lines * 0.60))
+    max_input_lines = max(1, max_box_height - 2)
+    return max_box_height, max_input_lines
+
+
+def compute_composer_height(
+    content: str | list[str] | None = None,
+    height: int | None = None,
+    state: Any | None = None,
+) -> int:
+    """Calculate dynamic composer box height (including borders) based on content lines.
+
+    Expands from 3 lines (1 input row) up to max 60% of terminal height.
+    """
+    if content is None and state is not None and getattr(state, "composer_buffer", ""):
+        content = state.composer_buffer
+
+    if isinstance(content, str):
+        lines_count = len(content.split("\n")) if content else 1
+    elif content:
+        lines_count = len(content)
+    else:
+        lines_count = 1
+
+    max_box_h, max_input_lines = get_composer_line_limits(height)
+    visible_lines = max(1, min(lines_count, max_input_lines))
+    return visible_lines + 2
+
+
+def compute_viewport_height(
+    height: int | None = None,
+    state: Any | None = None,
+    show_footer: bool = True,
+    composer_content: str | list[str] | None = None,
+    composer_height: int | None = None,
+) -> int:
     """Calculate the conversation/workspace viewport height for a given terminal height.
 
-    Reserves lines for the pinned bottom composer box (3 lines), the bottom status bar
-    (1 line), and the anchored settings panel (11 lines) when open, ensuring at least
-    MIN_VIEWPORT_HEIGHT rows remain for the workspace.
+    Reserves lines for the pinned bottom composer box (dynamic, from 3 lines up to ~60% of height),
+    the bottom status bar (1 line when show_footer is True), and the anchored settings panel
+    (11 lines) when open, ensuring at least MIN_VIEWPORT_HEIGHT rows remain for the workspace.
     This is the single canonical source of truth for vertical viewport sizing in the TUI.
     """
     lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
-    chrome = VERTICAL_CHROME_LINES
+    if composer_height is not None:
+        comp_h = composer_height
+    elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
+        comp_h = compute_composer_height(composer_content, height=lines, state=state)
+    else:
+        comp_h = COMPOSER_BOX_HEIGHT
+
+    chrome = comp_h + (STATUS_BAR_HEIGHT if show_footer else 0)
     if state is not None and getattr(state, "settings_panel_open", False):
         chrome += SETTINGS_PANEL_HEIGHT
     return max(MIN_VIEWPORT_HEIGHT, lines - chrome)
+
+
+def compute_composer_cursor_row(
+    height: int | None = None,
+    state: Any | None = None,
+    show_footer: bool = True,
+    conversation_content: Any | None = None,
+    composer_content: str | list[str] | None = None,
+    cursor_line: int | None = None,
+    composer_height: int | None = None,
+) -> int:
+    """Calculate the 1-based ANSI terminal row for the composer input cursor.
+
+    The composer box has comp_h lines:
+    - Top border: bottom_border_row - (comp_h - 1)
+    - Input rows: (bottom_border_row - comp_h + 2) through (bottom_border_row - 1)
+    - Bottom border: bottom_border_row
+
+    When show_footer is True (always by default), the bottom status bar takes the
+    last terminal row (height). If the settings panel is open, the composer is
+    pushed upwards by SETTINGS_PANEL_HEIGHT (11 lines).
+    """
+    lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
+    if composer_height is not None:
+        comp_h = composer_height
+    elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
+        comp_h = compute_composer_height(composer_content, height=lines, state=state)
+    else:
+        comp_h = COMPOSER_BOX_HEIGHT
+
+    footer_offset = 1 if show_footer else 0
+    settings_offset = (
+        SETTINGS_PANEL_HEIGHT
+        if (state is not None and getattr(state, "settings_panel_open", False))
+        else 0
+    )
+    bottom_border_row = lines - footer_offset - settings_offset
+
+    input_lines = comp_h - 2
+    first_input_row = bottom_border_row - input_lines
+
+    if cursor_line is not None and isinstance(cursor_line, int):
+        cl = max(0, min(cursor_line, input_lines - 1))
+    else:
+        cl = max(0, input_lines - 1)
+
+    return max(1, first_input_row + cl)
+
 
 
 # ── Layout Calculation & Tiers ───────────────────────────────────────────────
@@ -718,7 +817,7 @@ def render_full_screen_workspace(
     conversation_content: str | None = None,
     composer_content: str | list[str] | None = None,
     composer_is_active: bool = False,
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+    shortcuts: str = "",
     include_composer: bool = True,
     force_color: bool | None = None,
     no_color: bool | None = None,
@@ -731,7 +830,7 @@ def render_full_screen_workspace(
       (Left: conversation viewport; Right: persistent StackMind Runtime panel, or top badge bar in NARROW)
     - Rows (height - 4) to (height - 2): Pinned bottom composer box (3 lines)
       (omitted when include_composer is False to leave rows open for prompt_composer_input).
-    - Row (height - 1): Bottom status bar (1 line) aligned with conversation column.
+    - Row (height - 1): Bottom status bar (1 line) aligned with conversation column (shown when conversation started).
     """
     from cli.tui.app import (
         render_composer_box_str,
@@ -748,6 +847,11 @@ def render_full_screen_workspace(
         else None
     )
 
+    has_conversation = bool(
+        conversation_content is not None or (hasattr(state, "messages") and state.messages)
+    )
+    show_footer = True
+
     # 1. Bottom Status Bar (1 line, placed below composer, matches composer text box width / WO-018)
     status_width = layout.conversation_width if layout.show_runtime else width
     status_bar_str = render_top_header_bar_str(
@@ -759,8 +863,10 @@ def render_full_screen_workspace(
         no_color=no_color,
     )
 
-    # 2. Viewport height (reserved 1 line for bottom status bar, 3 lines for composer box, and settings panel if open)
-    viewport_height = compute_viewport_height(height, state=state)
+    # 2. Viewport height (reserved 1 line for bottom status bar, dynamic composer box height, and settings panel if open)
+    viewport_height = compute_viewport_height(
+        height, state=state, show_footer=True, composer_content=composer_content
+    )
 
     # 3. Conversation content
     if conversation_content is not None:
@@ -803,10 +909,10 @@ def render_full_screen_workspace(
 
     if not include_composer:
         if settings_open and settings_panel_str:
-            return f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}"
-        return f"{workspace_str}\n{status_bar_str}"
+            return f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{settings_panel_str}"
+        return f"{workspace_str}\n{status_bar_str}" if status_bar_str else workspace_str
 
-    # 5. Pinned bottom composer box (3 lines) placed above bottom status bar / settings panel
+    # 5. Dynamic bottom composer box placed above bottom status bar / settings panel
     comp_width = layout.conversation_width if layout.show_runtime else width
     composer_str = render_composer_box_str(
         placeholder=composer_placeholder,
@@ -818,12 +924,13 @@ def render_full_screen_workspace(
         force_color=force_color,
         no_color=no_color,
         alert=getattr(state, "composer_alert", None) if state is not None else None,
+        height=height,
     )
 
     if settings_open and settings_panel_str:
-        return f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}"
+        return f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}\n{settings_panel_str}"
 
-    return f"{workspace_str}\n{composer_str}\n{status_bar_str}"
+    return f"{workspace_str}\n{composer_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}"
 
 
 # ── Live Workspace Manager (Rich.Live Integration / WO-003) ───────────────────
@@ -885,7 +992,7 @@ class LiveWorkspaceManager:
         conversation_content: str | RenderableType | None = None,
         composer_content: str | None = None,
         composer_is_active: bool = False,
-        shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+        shortcuts: str = "",
         include_composer: bool = True,
         force_color: bool | None = None,
         no_color: bool | None = None,
@@ -965,7 +1072,7 @@ class LiveWorkspaceManager:
         conversation_content: str | RenderableType | None = None,
         composer_content: str | None = None,
         composer_is_active: bool = False,
-        shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+        shortcuts: str = "",
         include_composer: bool = False,
         refresh: bool = True,
         force_color: bool | None = None,
@@ -1046,11 +1153,14 @@ __all__ = [
     "VERY_WIDE_BREAKPOINT",
     "VERY_WIDE_RUNTIME_WIDTH",
     "WIDE_BREAKPOINT",
+    "compute_composer_cursor_row",
+    "compute_composer_height",
     "compute_layout",
     "compute_viewport_height",
     "create_live_workspace",
     "format_responsive_path",
     "format_responsive_title",
+    "get_composer_line_limits",
     "get_status_symbol",
     "render_conversation_column",
     "render_full_screen_workspace",

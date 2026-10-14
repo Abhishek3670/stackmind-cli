@@ -286,10 +286,15 @@ def render_completion_surface(state: AutonomousDeliveryState) -> str:
     return "\n".join(lines)
 
 
-def render_project_delivery_view(state: AutonomousDeliveryState) -> str:
-    """Renders the primary Project Delivery TUI view combining Phase, Roles, WOs, Activity."""
+def render_project_delivery_view(
+    state: AutonomousDeliveryState,
+    include_runtime_items: bool = True,
+) -> str:
+    """Renders the primary Project Delivery TUI view combining Phase, and optionally Roles, WOs, Activity."""
     header = f"STACKMIND • {state.project_name}\n" + "─" * 52
     phase = render_phase_banner(state)
+    if not include_runtime_items:
+        return f"{header}\n\n{phase}"
     agents = render_roles_panel(state, detailed=False)
     wos = render_work_orders_panel(state)
     activity = render_activity_stream(state, limit=8)

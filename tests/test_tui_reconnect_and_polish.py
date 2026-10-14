@@ -436,7 +436,7 @@ def test_composer_multiline_vertical_expansion():
     comp_single = render_composer_box_str(width=80)
     assert "> " in comp_single
     assert "Type a message..." in comp_single
-    assert "Ctrl+K commands | Ctrl+L clear" in comp_single
+    assert "Ctrl+K commands" not in comp_single
     single_lines = [line for line in comp_single.splitlines() if line.strip()]
     # Top border, single content line, bottom border -> 3 lines
     assert len(single_lines) == 3
@@ -447,7 +447,7 @@ def test_composer_multiline_vertical_expansion():
     assert "> def calculate_total():" in comp_multi
     assert "return sum(items)" in comp_multi
     assert "calculate_total()" in comp_multi
-    assert "Ctrl+K commands | Ctrl+L clear" in comp_multi
+    assert "Ctrl+K commands" not in comp_multi
     multi_lines = [line for line in comp_multi.splitlines() if line.strip()]
     # Top border + 3 content lines + bottom border -> 5 lines (expanded vertically!)
     assert len(multi_lines) == 5

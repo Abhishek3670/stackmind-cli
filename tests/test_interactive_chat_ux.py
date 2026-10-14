@@ -12,15 +12,16 @@ from cli.tui.state import ActionsGroup, AutonomousDeliveryState, TurnAction
 
 
 def test_format_action_description_new_design():
-    """Verify tool descriptions format as Action (<target>) per new design."""
-    assert format_action_description("run_tests", "tests/test_auth.py") == "Run tests (tests/test_auth.py)"
-    assert format_action_description("run_tests", "(tests/test_auth.py)") == "Run tests (tests/test_auth.py)"
-    assert format_action_description("run_tests", "") == "Run tests"
+    """Verify tool descriptions format as Action (<target>) per funky naming and meaningful agent tools."""
+    assert format_action_description("run_tests", "tests/test_auth.py") == "Test (tests/test_auth.py)"
+    assert format_action_description("run_tests", "(tests/test_auth.py)") == "Test (tests/test_auth.py)"
+    assert format_action_description("run_tests", "") == "Test"
     assert format_action_description("write_file", "backend/server.py") == "Write (backend/server.py)"
     assert format_action_description("read_file", "package.json") == "Read (package.json)"
     assert format_action_description("edit_file", "src/index.ts") == "Edit (src/index.ts)"
-    assert format_action_description("run_harness", "long_running_task") == "Run harness"
-    assert format_action_description("exec_command", "npm run build") == "Run command (npm run build)"
+    assert format_action_description("run_harness", "long_running_task") == "Harnessing"
+    assert format_action_description("query_graph", "") == "Graphing"
+    assert format_action_description("exec_command", "npm run build") == "Execute (npm run build)"
 
 
 def test_actions_group_rendered_with_new_design():
@@ -288,6 +289,27 @@ def test_bash_command_action_renders_terminal_output():
     assert "✓ Ran `npm test`" in completed_render
     assert "│ Test Suites: 5 passed" in completed_render
     assert "│ Tests: 24 passed" in completed_render
+
+    # 3. Generation action (harness / no command target)
+    harness_act = TurnAction(
+        action_id="act-gen",
+        description="Run harness",
+        status="COMPLETED",
+        tool_name="harness.run_once",
+        output="Hello! I'm Claude, ready to assist.",
+    )
+    harness_render = render_action_preview_str(harness_act, width=80)
+    assert "✓ Generating" in harness_render
+    assert "│ Hello! I'm Claude" in harness_render
+
+    harness_running = TurnAction(
+        action_id="act-gen-run",
+        description="Run harness",
+        status="RUNNING",
+        tool_name="harness.run_once",
+    )
+    harness_running_render = render_action_preview_str(harness_running, width=80)
+    assert "⚡ Generating..." in harness_running_render
 
 
 def test_actions_group_latest_preview_action_precedence():

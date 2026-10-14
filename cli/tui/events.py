@@ -89,7 +89,7 @@ def clean_error_message(err: Any) -> str:
     return msg
 
 
-def format_tool_name(tool_name: str) -> str:
+def format_tool_name(tool_name: str, role: str = "") -> str:
     """Clean up and format tool name for terminal presentation."""
     cleaned = (
         tool_name.replace("tool_call.", "")
@@ -99,6 +99,15 @@ def format_tool_name(tool_name: str) -> str:
         .strip()
     )
     lower = cleaned.lower()
+    if "graph" in lower:
+        return "Graphing"
+    if "harness" in lower:
+        if role:
+            cased = "QA" if role.lower() == "qa" else (role.title() if role.islower() else role)
+            return f"Agent ({cased})"
+        if "run_once" in tool_name.lower() or "run once" in lower or lower == "harness":
+            return "Agent"
+        return "Harnessing"
     if lower in {"read", "read file", "read_file"}:
         return "Read file"
     if lower in {"edit", "edit file", "edit_file"}:
@@ -109,12 +118,12 @@ def format_tool_name(tool_name: str) -> str:
         return "Create file"
     if lower in {"test", "run test", "run tests"}:
         return "Run tests"
-    if "harness" in lower:
-        return "Run harness"
+    if lower in {"exec command", "exec_command", "run command", "run_command", "bash", "sh", "command", "execute"}:
+        return "Execute"
     return cleaned.title()
 
 
-def format_action_description(tool_name: str, target: str = "") -> str:
+def format_action_description(tool_name: str, target: str = "", role: str = "") -> str:
     """Format an action description string for disclosure display per §19-§21."""
     cleaned_tool = (
         tool_name.replace("tool_call.", "")
@@ -126,24 +135,30 @@ def format_action_description(tool_name: str, target: str = "") -> str:
     if t.startswith("(") and t.endswith(")"):
         t = t[1:-1].strip()
     lower = cleaned_tool.lower()
-    if lower in {"test", "run_tests", "run_test", "run tests"}:
-        return f"Run tests ({t})" if t else "Run tests"
-    if lower in {"read", "read_file", "read file", "view_file"}:
-        return f"Read ({t})" if t else "Read file"
-    if lower in {"edit", "edit_file", "edit file"}:
-        return f"Edit ({t})" if t else "Edit file"
-    if lower in {"write", "write_file", "write file"}:
-        return f"Write ({t})" if t else "Write file"
-    if lower in {"create", "create_file", "create file"}:
-        return f"Create ({t})" if t else "Create file"
+    if "graph" in lower:
+        return f"Graphing ({t})" if t else "Graphing"
     if "harness" in lower:
-        return f"Run harness ({t})" if t and t != "long_running_task" else "Run harness"
-    if lower in {"exec_command", "run_command", "bash", "sh", "command"}:
-        return f"Run command ({t})" if t else "Run command"
+        agent_name = (role or (t if t and t != "long_running_task" else "")).strip()
+        if agent_name:
+            cased = "QA" if agent_name.lower() == "qa" else (agent_name.title() if agent_name.islower() else agent_name)
+            return f"Agent ({cased})"
+        if "run_once" in tool_name.lower() or "run once" in lower or lower == "harness":
+            return "Agent"
+        return "Harnessing"
+    if lower in {"test", "run_tests", "run_test", "run tests"}:
+        return f"Test ({t})" if t else "Test"
+    if lower in {"read", "read_file", "read file", "view_file"}:
+        return f"Read ({t})" if t else "Read"
+    if lower in {"edit", "edit_file", "edit file", "patch"}:
+        return f"Edit ({t})" if t else "Edit"
+    if lower in {"write", "write_file", "write file", "create", "create_file", "create file"}:
+        return f"Write ({t})" if t else "Write"
+    if lower in {"exec_command", "run_command", "bash", "sh", "command", "execute"}:
+        return f"Execute ({t})" if t else "Execute"
     if lower in {"list_dir", "list_directory", "ls"}:
-        return f"List directory ({t})" if t else "List directory"
+        return f"List ({t})" if t else "List"
     if "verify" in lower:
-        return f"Verify ({t})" if t else "Verify changes"
+        return f"Verify ({t})" if t else "Verify"
     base = cleaned_tool.replace("_", " ").title()
     return f"{base} ({t})" if t else base
 
@@ -741,7 +756,8 @@ class OperationalEventManager:
                 start_time=start_t,
             )
             self.active_tools[call_id] = activity
-            desc = format_action_description(tool_name, target)
+            role = str(payload.get("role") or payload.get("agent_id") or "").strip()
+            desc = format_action_description(tool_name, target, role=role)
             tool_code = None
             tool_diff = None
             if tool_name in {"write_file", "write", "create_file", "create"}:

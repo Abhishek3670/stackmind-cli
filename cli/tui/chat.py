@@ -506,6 +506,7 @@ def render_action_preview(action: Any) -> RenderableType | None:
     status = str(getattr(action, "status", "")).upper()
     is_running = status == "RUNNING"
     is_failed = status in {"FAILED", "FAILURE", "ERROR"}
+    desc = str(getattr(action, "description", "") or "")
 
     diff = getattr(action, "diff", None)
     output = getattr(action, "output", None)
@@ -544,23 +545,36 @@ def render_action_preview(action: Any) -> RenderableType | None:
         return Group(*lines)
 
     # 2. Bash / Command / Test action -> Output
-    if t_name in {"exec_command", "run_command", "bash", "sh", "command", "run_tests", "pytest", "test", "harness"} or output:
+    is_harness = "harness" in t_name or t_name in {"generate", "llm"}
+    if t_name in {"exec_command", "run_command", "bash", "sh", "command", "run_tests", "pytest", "test"} or is_harness or output:
         is_test = t_name in {"run_tests", "pytest", "test"}
         if is_running:
             if is_test:
                 lbl = Text("⚡ Running tests: ", style="bold yellow").append(f"`{target}`...", style="yellow") if target else Text("⚡ Running tests...", style="bold yellow")
+            elif desc.startswith("Agent"):
+                lbl = Text(f"⚡ {desc}...", style="bold yellow")
+            elif is_harness or not target:
+                lbl = Text("⚡ Generating...", style="bold yellow")
             else:
-                lbl = Text("⚡ Running command: ", style="bold yellow").append(f"`{target}`...", style="yellow") if target else Text("⚡ Running command...", style="bold yellow")
+                lbl = Text("⚡ Running command: ", style="bold yellow").append(f"`{target}`...", style="yellow")
         elif is_failed:
             if is_test:
                 lbl = Text("× Tests failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Tests failed", style="bold red")
+            elif desc.startswith("Agent"):
+                lbl = Text(f"× {desc} failed", style="bold red")
+            elif is_harness or not target:
+                lbl = Text("× Generation failed", style="bold red")
             else:
-                lbl = Text("× Command failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Command failed", style="bold red")
+                lbl = Text("× Command failed: ", style="bold red").append(f"`{target}`", style="red")
         else:
             if is_test:
                 lbl = Text("✓ Tests passed: ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Tests passed", style="bold green")
+            elif desc.startswith("Agent"):
+                lbl = Text(f"✓ {desc}", style="bold green")
+            elif is_harness or not target:
+                lbl = Text("✓ Generating", style="bold green")
             else:
-                lbl = Text("✓ Ran ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Ran command", style="bold green")
+                lbl = Text("✓ Ran ", style="bold green").append(f"`{target}`", style="white")
 
         lines = [lbl]
         body_text = output or error or ""
@@ -654,6 +668,67 @@ def render_actions_group_str(
     return console.export_text(styles=use_ansi).rstrip()
 
 
+def render_thinking_block(
+    thinking: str,
+    expanded: bool = False,
+    in_progress: bool = False,
+) -> RenderableType:
+    """Render collapsible styled thinking block (toggled via Ctrl+O)."""
+    clean_think = thinking.strip() if thinking else ""
+    if not clean_think:
+        return Text("")
+
+    if clean_think == "✓":
+        return Text("Thinking... ✓", style="dim italic #94a3b8")
+
+    arrow = "▾" if expanded else "▸"
+    label = "Thinking..."
+    shortcut_hint = "Ctrl+O to collapse" if expanded else "Ctrl+O to expand"
+
+    lines = clean_think.splitlines()
+    line_count = len(lines)
+    suffix = f" · {line_count} line{'s' if line_count != 1 else ''}" if (not in_progress and line_count > 1) else ""
+
+    header = Text()
+    header.append(f"{arrow} ", style="bold #a855f7")
+    header.append(label, style="bold #c084fc")
+    if suffix:
+        header.append(suffix, style="dim #94a3b8")
+    header.append(f"  ({shortcut_hint})", style="dim #64748b")
+
+    if not expanded:
+        return header
+
+    elements: list[RenderableType] = [header]
+    for tline in lines:
+        t = Text("  │ ", style="dim #a855f7")
+        t.append(tline, style="dim italic #cbd5e1")
+        elements.append(t)
+    return Group(*elements)
+
+
+def render_thinking_block_str(
+    thinking: str,
+    expanded: bool = False,
+    in_progress: bool = False,
+    width: int = 80,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
+) -> str:
+    """Render thinking block as string using in-memory capture."""
+    elem = render_thinking_block(thinking, expanded=expanded, in_progress=in_progress)
+    if not elem:
+        return ""
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
+    console.print(elem)
+    return console.export_text(styles=use_ansi).rstrip()
+
+
 def is_stray_command_bar(content: str) -> bool:
     """Detect unformatted command bar / footer remnants that bled into messages."""
     stripped = content.strip()
@@ -675,6 +750,7 @@ def render_assistant_message(
     inline_diffs: bool = True,
     actions: Any | None = None,
     thinking: str | None = None,
+    thinking_expanded: bool = True,
     model: str | None = None,
 ) -> RenderableType:
     """Render an assistant message with '✦ StackMind' header (§15), dynamic turn regions (§18, §20, §24), left-aligned model attribution, and rich Markdown (§32)."""
@@ -720,14 +796,7 @@ def render_assistant_message(
     # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24, §27)
     if thinking and thinking.strip():
         elements.append(Text(""))
-        clean_think = thinking.strip()
-        if clean_think == "✓":
-            think_text = Text("Thinking... ✓", style="dim italic #94a3b8")
-        else:
-            think_text = Text("Thinking...\n", style="dim italic #94a3b8")
-            for tline in clean_think.splitlines():
-                think_text.append(f"  {tline}\n", style="dim #cbd5e1")
-        elements.append(think_text)
+        elements.append(render_thinking_block(thinking, expanded=thinking_expanded, in_progress=False))
 
     cleaned = strip_internal_reasoning(working_content)
     if cleaned:
@@ -772,6 +841,7 @@ def render_assistant_message_str(
     inline_diffs: bool = True,
     actions: Any | None = None,
     thinking: str | None = None,
+    thinking_expanded: bool = False,
     model: str | None = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
@@ -790,6 +860,7 @@ def render_assistant_message_str(
             inline_diffs=inline_diffs,
             actions=actions,
             thinking=thinking,
+            thinking_expanded=thinking_expanded,
             model=model,
         )
     )
@@ -915,6 +986,7 @@ def render_chat_transcript(
                     show_timestamp=show_timestamps,
                     actions=getattr(msg, "actions", None),
                     thinking=getattr(msg, "thinking", None),
+                    thinking_expanded=getattr(msg, "thinking_expanded", False),
                     model=getattr(msg, "model", None),
                     inline_diffs=inline_diffs,
                 )

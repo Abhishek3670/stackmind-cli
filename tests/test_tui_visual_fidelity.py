@@ -120,7 +120,7 @@ def test_double_echo_elimination_in_str_renderers(capsys: pytest.CaptureFixture[
     hdr_out = render_top_header_bar_str({"session_id": "sess-12345", "agent": "codex", "provider": "daemon"})
     captured = capsys.readouterr()
     assert captured.out == "", "render_top_header_bar_str leaked to sys.stdout"
-    assert "stackmind" in hdr_out
+    assert "session: sess-123" in hdr_out
 
     comp_out = render_composer_box_str()
     captured = capsys.readouterr()
@@ -142,13 +142,13 @@ def test_top_header_bar_visual_fidelity():
         "workspace": "/users/developer/projects/stackmind",
     }
 
-    # Wide display
+    # Wide display: clean footer with session and online, no mock branding/agent/provider
     hdr_wide = render_top_header_bar_str(session, width=100, status="online")
-    assert "stackmind" in hdr_wide
-    assert "dev" in hdr_wide
+    assert "stackmind  |  dev" not in hdr_wide
+    assert " dev " not in hdr_wide
     assert "session: a7f3b19c" in hdr_wide
-    assert "agent: gemini" in hdr_wide
-    assert "provider: anthropic" in hdr_wide
+    assert "agent: gemini" not in hdr_wide
+    assert "provider: anthropic" not in hdr_wide
     assert "● online" in hdr_wide
 
     # Offline and reconnecting states
@@ -292,7 +292,10 @@ def test_composer_box_and_footer_bar():
     comp = render_composer_box_str(width=80)
     assert "> " in comp
     assert "Type a message..." in comp
-    assert "Ctrl+K commands | Ctrl+L clear" in comp
+    assert "Ctrl+K commands" not in comp
+
+    comp_with_sc = render_composer_box_str(width=80, shortcuts="Ctrl+K commands | Ctrl+L clear")
+    assert "Ctrl+K commands | Ctrl+L clear" in comp_with_sc
 
     foot = render_bottom_footer_bar_str(width=80)
     assert ":help" in foot
@@ -318,10 +321,6 @@ def test_tui_repl_startup_layout_fidelity(tmp_path: Path):
 
         assert result.exit_code == 0, result.output
 
-        # Top header bar
-        assert "stackmind" in result.output
-        assert "● online" in result.output
-
         # Landing card
         assert "✦" in result.output
         assert "StackMind" in result.output
@@ -330,12 +329,7 @@ def test_tui_repl_startup_layout_fidelity(tmp_path: Path):
 
         # Composer box
         assert "Type a message..." in result.output
-        assert "Ctrl+K commands | Ctrl+L clear" in result.output
-
-        # Footer bar
-        assert ":help" in result.output
-        assert ":status" in result.output
-        assert ":events" in result.output
+        assert "Ctrl+K commands" not in result.output
 
         # WO-035: No plain legacy prompt anywhere
         assert "stackmind [" not in result.output
@@ -346,9 +340,11 @@ def test_interactive_composer_box_borders():
     top = render_composer_top_border_str(width=80)
     assert top.startswith("╭─ ")
     assert "Type a message..." in top
-    assert "Ctrl+K commands | Ctrl+L clear" in top
-    assert top.endswith(" ─╮")
-    assert len(top) == 80
+    assert "Ctrl+K commands" not in top
+
+    top_sc = render_composer_top_border_str(width=80, shortcuts="Ctrl+K commands | Ctrl+L clear")
+    assert "Ctrl+K commands | Ctrl+L clear" in top_sc
+    assert top_sc.endswith(" ─╮")
 
     bot = render_composer_bottom_border_str(width=80)
     assert bot.startswith("╰")
@@ -358,10 +354,18 @@ def test_interactive_composer_box_borders():
 
 def test_interactive_composer_input_and_prompt(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     """Verify prompt_composer_input captures user input, displays borders and footer (WO-035)."""
+    from cli.tui.state import AutonomousDeliveryState
+
     monkeypatch.setattr("builtins.input", lambda prompt: "hello from test")
     capsys.readouterr()
 
-    received = prompt_composer_input(width=80)
+    state = AutonomousDeliveryState()
+    state.add_message("user", "hi")
+    received = prompt_composer_input(
+        width=80,
+        state=state,
+        shortcuts="Ctrl+K commands | Ctrl+L clear",
+    )
     assert received == "hello from test"
 
     captured = capsys.readouterr()
@@ -410,7 +414,6 @@ def test_tui_startup_unconditionally_renders_header_and_landing_even_with_prior_
         assert result.exit_code == 0, result.output
 
         # Top header bar must be present despite state.has_conversation being True
-        assert "stackmind" in result.output
         assert "● online" in result.output
 
         # Branded landing card must be present despite state.has_conversation being True
@@ -434,7 +437,6 @@ def test_tui_landing_command_renders_both_header_and_landing(tmp_path: Path):
         assert result.exit_code == 0, result.output
 
         # Both header bar and landing block should appear
-        assert "stackmind" in result.output
         assert "● online" in result.output
         assert "✦" in result.output
         assert "StackMind" in result.output

@@ -159,7 +159,7 @@ def test_top_header_bar_glyph_fallback():
 
 def test_composer_top_border_empty_state():
     """Verify empty composer displays 'Type a message...' placeholder."""
-    top_empty = render_composer_top_border_str(width=80, has_content=False)
+    top_empty = render_composer_top_border_str(width=80, has_content=False, shortcuts="Ctrl+K commands | Ctrl+L clear")
     assert "Type a message..." in top_empty
     assert "[Active Input]" not in top_empty
     assert "Ctrl+K commands | Ctrl+L clear" in top_empty
@@ -168,7 +168,7 @@ def test_composer_top_border_empty_state():
 
 def test_composer_top_border_populated_state():
     """Verify composer with content dynamically swaps placeholder to '[Active Input]'."""
-    top_active = render_composer_top_border_str(width=80, has_content=True)
+    top_active = render_composer_top_border_str(width=80, has_content=True, shortcuts="Ctrl+K commands | Ctrl+L clear")
     assert "[Active Input]" in top_active
     assert "Type a message..." not in top_active
     assert "Ctrl+K commands | Ctrl+L clear" in top_active
@@ -187,7 +187,7 @@ def test_composer_box_empty_vs_populated():
 
 def test_composer_top_border_empty_placeholder():
     """Verify top border renders cleanly when placeholder is empty."""
-    border = render_composer_top_border_str(placeholder="", width=80)
+    border = render_composer_top_border_str(placeholder="", width=80, shortcuts="Ctrl+K commands | Ctrl+L clear")
     assert "Ctrl+K commands | Ctrl+L clear" in border
     assert len(border) == 80
 
@@ -922,11 +922,11 @@ def test_composer_top_border_responsive_widths():
         assert len(border_active) == w, f"Border length {len(border_active)} != {w} at width {w}"
 
     # At 80 columns: full shortcuts fit
-    b80 = render_composer_top_border_str(width=80)
+    b80 = render_composer_top_border_str(width=80, shortcuts="Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll")
     assert "Ctrl+K commands | Ctrl+L clear" in b80
 
     # At 40 columns: shortcuts gracefully degrade or drop to preserve border
-    b40 = render_composer_top_border_str(width=40)
+    b40 = render_composer_top_border_str(width=40, shortcuts="Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll")
     assert len(b40) == 40
     assert b40.startswith("╭")
     assert b40.endswith("╮")
@@ -935,12 +935,12 @@ def test_composer_top_border_responsive_widths():
 def test_composer_box_responsive_content_and_shortcuts():
     """Verify render_composer_box preserves user content while responsively adjusting shortcuts."""
     # Narrow width (50 cols): short content keeps commands
-    box_50 = render_composer_box_str(width=50, content="hi")
+    box_50 = render_composer_box_str(width=50, content="hi", shortcuts="Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll")
     assert "hi" in box_50
     assert "Ctrl+K commands | Ctrl+L clear" in box_50
 
     # 40 cols with longer text: degrades to minimal shortcuts
-    box_40 = render_composer_box_str(width=40, content="def compute():")
+    box_40 = render_composer_box_str(width=40, content="def compute():", shortcuts="Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll")
     assert "def compute():" in box_40
     assert "Ctrl+K | Ctrl+L" in box_40
 

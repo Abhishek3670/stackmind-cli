@@ -78,7 +78,7 @@ def test_actions_group_completion_without_call_id():
     })
     group = state.current_turn_actions
     assert len(group.actions) == 1
-    assert "Run harness" in group.actions[0].description
+    assert ("Harnessing" in group.actions[0].description or "Agent" in group.actions[0].description or "Run harness" in group.actions[0].description)
     assert group.actions[0].status == "RUNNING"
     assert group.actions[0].symbol == "●"
 

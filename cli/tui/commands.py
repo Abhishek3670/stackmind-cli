@@ -273,6 +273,7 @@ def get_help_str() -> str:
         "  :resume           Resume active session\n"
         "  :chat             Display conversation transcript\n"
         "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
+        "  :thinking [cmd]   Toggle/expand/collapse thinking blocks (Ctrl+O)\n"
         "  :govern [mode]    Configure governance verbosity: tree | flat | compact\n"
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
@@ -281,6 +282,7 @@ def get_help_str() -> str:
         "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
         "Shortcuts:\n"
+        "  Ctrl+O            Toggle thinking block expansion\n"
         "  Ctrl+C            Cancel active turn or abort"
     )
 
@@ -335,8 +337,11 @@ def _build_in_progress_turn_content(
     thinking = getattr(state, "current_turn_thinking", None)
     if thinking and thinking.strip():
         clean_think = thinking.strip()
-        wrapped_thinking = _wrap_text_to_width(clean_think, layout_width)
-        parts.append(f"Thinking...\n{wrapped_thinking}")
+        from cli.tui.chat import render_thinking_block_str
+        is_exp = getattr(state, "live_thinking_expanded", True)
+        think_str = render_thinking_block_str(clean_think, expanded=is_exp, in_progress=True, width=layout_width)
+        if think_str:
+            parts.append(think_str)
 
     # In-progress streamed response text (Working... progress sits at composer text box)
     if streamed_chunks:
@@ -388,6 +393,14 @@ def _stream_turn_execution(
             return f"{tokens} tokens"
         return f"{tokens / 1000:.1f}k tokens"
 
+    SYNC_WORKING_WORDS = [
+        "Infusing...",
+        "Synthesizing...",
+        "Harmonizing...",
+        "Calibrating...",
+        "Transmuting...",
+    ]
+
     def _get_working_placeholder() -> str:
         elapsed = time.time() - start_time
         toks = (
@@ -396,7 +409,35 @@ def _stream_turn_execution(
                 "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
             )
         )
-        return f"Working... [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
+        is_sync_action = False
+        targets_to_check = [
+            getattr(state, "active_tool_target", ""),
+            getattr(state, "last_tool_target", ""),
+            getattr(state, "active_tool_name", ""),
+            latest_act_desc,
+        ]
+        turn_actions = getattr(state, "current_turn_actions", None)
+        if turn_actions and hasattr(turn_actions, "actions"):
+            for a in turn_actions.actions:
+                if getattr(a, "status", "").upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                    targets_to_check.extend([getattr(a, "target", ""), getattr(a, "description", ""), getattr(a, "tool_name", "")])
+                    for sa in getattr(a, "sub_actions", []):
+                        if getattr(sa, "status", "").upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                            targets_to_check.extend([getattr(sa, "target", ""), getattr(sa, "description", ""), getattr(sa, "tool_name", "")])
+
+        for t in targets_to_check:
+            if t and (".sync" in t or ".sync/" in t or ".sync\\" in t):
+                is_sync_action = True
+                break
+
+        sync_words = getattr(state, "sync_working_words", None) or SYNC_WORKING_WORDS
+        if getattr(state, "randomize_sync_verbs", False):
+            import random
+            verb = random.choice(sync_words)
+        else:
+            verb = getattr(state, "current_sync_verb", None) or sync_words[0]
+        prefix = verb if is_sync_action else "Working..."
+        return f"{prefix} [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
     _streaming_diagnostics = {
         "redraw_count": 0,
         "event_count": 0,
@@ -472,7 +513,7 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
                         conversation_content=tick_content,
                         live_manager=live_manager,
                     )
@@ -697,7 +738,9 @@ def _stream_turn_execution(
                     t_target = str(
                         t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
                     )
-                    latest_act_desc = f"{t_name} {t_target}".strip() if t_target else t_name
+                    t_role = str(ev_payload.get("role") or ev_payload.get("agent_id") or "")
+                    from cli.tui.events import format_action_description
+                    latest_act_desc = format_action_description(t_name, target=t_target, role=t_role)
 
                 is_tool_lifecycle = ev_name in {
                     "event.toolCall", "tool.call", "event.toolResult", "tool.result"
@@ -1311,12 +1354,9 @@ def dispatch_delivery_command(
         if sid:
             output_parts.append(f"Session: {sid}")
         output_parts.append(get_status_str(session, state=state))
-        contract_data = session.get("contract") or (getattr(state, "contract", None) if state else None)
-        if contract_data:
-            output_parts.append(render_contract_hud_str(contract_data))
         if state is not None:
             from cli.tui.views import render_project_delivery_view
-            output_parts.append(render_project_delivery_view(state))
+            output_parts.append(render_project_delivery_view(state, include_runtime_items=False))
         output_str = "\n\n".join(output_parts)
 
         state.add_message("user", normalized)
@@ -2030,6 +2070,26 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
+    if normalized.startswith(":thinking"):
+        _, _, subcmd = normalized.partition(" ")
+        subcmd = subcmd.strip().lower()
+        if subcmd in {"expand", "open"}:
+            state.expand_thinking()
+        elif subcmd in {"collapse", "close"}:
+            state.collapse_thinking()
+        elif subcmd.isdigit():
+            state.toggle_thinking(index=int(subcmd))
+        else:
+            state.toggle_thinking()
+
+        status_str = "EXPANDED" if getattr(state, "thinking_expanded", False) else "COLLAPSED"
+        output_str = f"Thinking blocks: {status_str} (toggle with Ctrl+O or :thinking)"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
     if (
         normalized in {":click actions", ":mouse click actions", ":click"}
         or normalized.startswith("\x1b[<")
@@ -2168,7 +2228,7 @@ def dispatch_delivery_command(
             clear=False,
             include_composer=True,
             composer_is_active=False,
-            composer_placeholder="Working... [0.0s] (0 tokens)",
+            composer_placeholder=placeholder,
             composer_content="",
             live_manager=live_manager,
         )

@@ -157,6 +157,7 @@ def test_tui_repl_interactive_session_execution(tmp_path: Path):
         ":help",
         ":goal",
         ":status",
+        ":contract",
         ":matrix",
         ":diff",
         ":events",
@@ -234,6 +235,10 @@ def test_dispatch_delivery_command_routes_colon_commands_to_conversation_viewpor
     assert state.messages[-2].content == ":status"
     assert state.messages[-1].role == "system"
     assert "session-1" in state.messages[-1].content
+    assert "CONTRACT BOUNDARY HUD" not in state.messages[-1].content
+    assert "AGENTS" not in state.messages[-1].content
+    assert "WORK ORDERS" not in state.messages[-1].content
+    assert "ACTIVITY" not in state.messages[-1].content
 
     # 4. Test :contract
     dispatch_delivery_command(adapter, client, session, ":contract", state)
