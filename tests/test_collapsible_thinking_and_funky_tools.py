@@ -12,34 +12,33 @@ from cli.tui.state import ActionsGroup, AutonomousDeliveryState, ChatMessage, Tu
 
 
 def test_render_thinking_block_collapsed():
-    """Verify collapsed thinking block renders ▸ with Ctrl+O hint and line count."""
+    """Verify collapsed thinking block renders ▸ Thought for {elapsed}s, {tokens} tokens and 2-line summary."""
     thinking = "Analyzing user intent\nLooking up relevant files\nPlanning response"
-    rendered = render_thinking_block_str(thinking, expanded=False, width=80)
-    assert "▸ Thinking" in rendered
-    assert "3 lines" in rendered
-    assert "Ctrl+O to expand" in rendered
-    # In collapsed mode, individual thinking lines are not printed
+    rendered = render_thinking_block_str(thinking, expanded=False, elapsed=0.2, tokens=15, width=80)
+    assert "▸ Thought for 0.2s, 15 tokens" in rendered
+    assert "  Planning response" in rendered
+    # In collapsed mode, previous thinking lines are not printed
     assert "Analyzing user intent" not in rendered
 
 
 def test_render_thinking_block_expanded():
-    """Verify expanded thinking block renders ▾ with indented │ lines and collapse hint."""
+    """Verify expanded thinking block renders ▾ Thought for ... with indented lines without heavy box borders."""
     thinking = "Analyzing user intent\nLooking up relevant files\nPlanning response"
-    rendered = render_thinking_block_str(thinking, expanded=True, width=80)
-    assert "▾ Thinking" in rendered
-    assert "Ctrl+O to collapse" in rendered
-    assert "│ Analyzing user intent" in rendered
-    assert "│ Looking up relevant files" in rendered
-    assert "│ Planning response" in rendered
+    rendered = render_thinking_block_str(thinking, expanded=True, elapsed=0.5, tokens=20, width=80)
+    assert "▾ Thought for 0.5s, 20 tokens" in rendered
+    assert "  Analyzing user intent" in rendered
+    assert "  Looking up relevant files" in rendered
+    assert "  Planning response" in rendered
+    # No heavy box border
+    assert "│" not in rendered
 
 
 def test_render_thinking_block_in_progress():
-    """Verify live in-progress thinking block shows Thinking... label."""
+    """Verify live in-progress thinking block shows ▸ or ▾ Thought for label."""
     thinking = "Evaluating dependencies..."
-    rendered = render_thinking_block_str(thinking, expanded=True, in_progress=True, width=80)
-    assert "▾ Thinking..." in rendered
-    assert "Ctrl+O to collapse" in rendered
-    assert "│ Evaluating dependencies..." in rendered
+    rendered = render_thinking_block_str(thinking, expanded=True, in_progress=True, elapsed=0.1, tokens=3, width=80)
+    assert "▾ Thought for 0.1s, 3 tokens" in rendered
+    assert "  Evaluating dependencies..." in rendered
 
 
 def test_assistant_message_reflects_thinking_expansion():
@@ -49,15 +48,15 @@ def test_assistant_message_reflects_thinking_expansion():
 
     # Collapsed by default
     collapsed = render_assistant_message_str(content, thinking=thinking, thinking_expanded=False, width=80)
-    assert "▸ Thinking" in collapsed
-    assert "Ctrl+O to expand" in collapsed
+    assert "▸ Thought for" in collapsed
+    assert "  Step 2: Commit" in collapsed
     assert "Step 1: Check git status" not in collapsed
 
     # Expanded
     expanded = render_assistant_message_str(content, thinking=thinking, thinking_expanded=True, width=80)
-    assert "▾ Thinking" in expanded
-    assert "Ctrl+O to collapse" in expanded
-    assert "│ Step 1: Check git status" in expanded
+    assert "▾ Thought for" in expanded
+    assert "  Step 1: Check git status" in expanded
+    assert "  Step 2: Commit" in expanded
 
 
 def test_state_toggle_thinking():
@@ -290,5 +289,96 @@ def test_landing_screen_full_frame_composer_and_footer_geometry():
     # Verify compute_composer_cursor_row matches row index 21 (1-based row 22)
     c_row = compute_composer_cursor_row(24, state=state)
     assert c_row == 22
+
+
+def test_sanitize_internal_llm_error_prompts_in_tool_output():
+    """Verify that CRITICAL: Do NOT retry LLM instructions are stripped and clean error badge rendered."""
+    from cli.tui.events import clean_error_message
+    from cli.tui.chat import render_actions_group_str
+
+    raw_err = (
+        "PermissionError: Operation on 'package.json' was denied by runtime policy/contract: "
+        "target is explicitly denied. CRITICAL: Do NOT retry accessing or writing to this file "
+        "or any file outside your work order scope. Doing so will result in immediate termination."
+    )
+    cleaned = clean_error_message(raw_err)
+    assert "CRITICAL" not in cleaned
+    assert "immediate termination" not in cleaned
+    assert cleaned == "Permission denied (outside assigned scope)"
+
+    act = TurnAction(
+        action_id="read-pkg",
+        description="Read (package.json)",
+        status="FAILED",
+        tool_name="read_file",
+        target="package.json",
+        error=raw_err,
+    )
+    group = ActionsGroup(actions=[act])
+    rendered = render_actions_group_str(group, width=80)
+    assert "● Read(package.json) — Permission denied (outside assigned scope)" in rendered
+    assert "CRITICAL" not in rendered
+
+
+def test_consecutive_subagent_tool_calls_no_duplicate_headers_and_deduplication():
+    """Verify consecutive sub-agent calls don't duplicate headers and identical tool calls collapse to (×N)."""
+    from cli.tui.chat import render_actions_group_str
+
+    acts = [
+        TurnAction("h1", "Agent (Backend)", status="COMPLETED", tool_name="harness.run_once"),
+        TurnAction("r1", "Read (src/backend/index.js)", status="COMPLETED", tool_name="read_file", target="src/backend/index.js"),
+        TurnAction("r2", "Read (src/backend/index.js)", status="COMPLETED", tool_name="read_file", target="src/backend/index.js"),
+        TurnAction("r3", "Read (src/backend/index.js)", status="COMPLETED", tool_name="read_file", target="src/backend/index.js"),
+        TurnAction("h2", "Agent (Backend)", status="COMPLETED", tool_name="harness.run_once"),
+        TurnAction("e1", "Edit (src/backend/index.js)", status="COMPLETED", tool_name="edit_file", target="src/backend/index.js"),
+    ]
+    group = ActionsGroup(actions=acts)
+    rendered = render_actions_group_str(group, width=80)
+
+    # Agent(Backend) header should only be rendered ONCE (not twice!)
+    assert rendered.count("Agent(Backend)") == 1
+    # Consecutive reads collapsed to (×3)
+    assert "● Read(src/backend/index.js) (×3)" in rendered
+    # Indented sub-agent tool calls
+    assert "  ● Edit(src/backend/index.js)" in rendered
+
+
+def test_thinking_collapsed_two_line_summary():
+    """Verify collapsed thoughts render as strictly 2 lines: ▸ Thought for ... + 1-line summary."""
+    from cli.tui.chat import render_thinking_block_str
+
+    thinking = "# Step 1: Analyze codebase\nInspecting layout.py and terminal.py.\n# Step 2: Formulate plan\nRefactoring chat rendering to flat stream."
+    rendered = render_thinking_block_str(thinking, expanded=False, elapsed=0.3, tokens=18, width=80)
+    lines = rendered.splitlines()
+    assert len(lines) == 2
+    assert lines[0].strip() == "▸ Thought for 0.3s, 18 tokens"
+    # Stripped of '#' markdown header
+    assert lines[1] == "  Refactoring chat rendering to flat stream."
+
+
+def test_chat_transcript_turn_header_deduplication():
+    """Verify render_chat_transcript does not repeat ✦ StackMind for micro-steps in the same turn."""
+    from cli.tui.chat import render_chat_transcript_str
+
+    act1 = TurnAction("1", "Read (file.txt)", status="COMPLETED", tool_name="read_file", target="file.txt")
+    g1 = ActionsGroup(actions=[act1])
+
+    act2 = TurnAction("2", "Edit (file.txt)", status="COMPLETED", tool_name="edit_file", target="file.txt")
+    g2 = ActionsGroup(actions=[act2])
+
+    messages = [
+        ChatMessage(role="user", content="Fix the file"),
+        ChatMessage(role="assistant", content="", actions=g1),
+        ChatMessage(role="assistant", content="", actions=g2),
+        ChatMessage(role="assistant", content="All edits finished!"),
+    ]
+
+    rendered = render_chat_transcript_str(messages, width=80)
+    # ✦ StackMind must only appear ONCE in this assistant turn
+    assert rendered.count("✦ StackMind") == 1
+    assert "● Read(file.txt)" in rendered
+    assert "● Edit(file.txt)" in rendered
+    assert "All edits finished!" in rendered
+
 
 

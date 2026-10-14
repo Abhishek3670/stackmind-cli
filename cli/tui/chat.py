@@ -418,10 +418,122 @@ def render_user_message_str(
     return console.export_text(styles=use_ansi).rstrip()
 
 
+def normalize_action_call(act: Any) -> tuple[str, str]:
+    """Extract canonical (tool_name, argument) pair from an action object or dictionary."""
+    t_name = str(getattr(act, "tool_name", "") or "").lower()
+    target = str(getattr(act, "target", "") or "").strip()
+    desc = str(getattr(act, "description", "") or "").strip()
+
+    if target.startswith("(") and target.endswith(")"):
+        target = target[1:-1].strip()
+
+    # Agent role resolution
+    if "harness" in t_name or desc.startswith("Agent"):
+        name = "Agent"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Agent "):
+            target = desc[6:].strip()
+        cased = "QA" if target.lower() == "qa" else (target.title() if target.islower() else target)
+        return name, cased
+
+    if t_name in {"read_file", "read", "view_file", "cat"} or desc.startswith("Read"):
+        name = "Read"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Read "):
+            target = desc[5:].strip()
+        return name, target
+
+    if t_name in {"write_file", "write", "create_file", "create"} or desc.startswith("Write"):
+        name = "Write"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Write "):
+            target = desc[6:].strip()
+        return name, target
+
+    if t_name in {"edit_file", "edit", "patch", "apply_patch"} or desc.startswith("Edit"):
+        name = "Edit"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Edit "):
+            target = desc[5:].strip()
+        return name, target
+
+    if t_name in {"exec_command", "run_command", "bash", "sh", "command", "execute"} or desc.startswith("Execute") or desc.startswith("Bash"):
+        name = "Bash"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and (desc.startswith("Execute ") or desc.startswith("Bash ")):
+            target = desc.split(" ", 1)[1].strip()
+        return name, target
+
+    if t_name in {"list_dir", "list_directory", "ls"} or desc.startswith("List"):
+        name = "List"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("List "):
+            target = desc[5:].strip()
+        return name, target
+
+    if "graph" in t_name or desc.startswith("Graph"):
+        name = "Graph"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Graph "):
+            target = desc[6:].strip()
+        return name, target
+
+    if t_name in {"run_tests", "test", "pytest"} or desc.startswith("Test") or desc.startswith("Run tests"):
+        name = "Test"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Run tests "):
+            target = desc[10:].strip()
+        elif not target and desc.startswith("Test "):
+            target = desc[5:].strip()
+        return name, target
+
+    if desc.startswith("Verify"):
+        name = "Verify"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Verify "):
+            target = desc[7:].strip()
+        return name, target
+
+    if desc.startswith("Deploy"):
+        name = "Deploy"
+        if not target and "(" in desc and desc.endswith(")"):
+            target = desc[desc.index("(") + 1 : -1].strip()
+        elif not target and desc.startswith("Deploy "):
+            target = desc[7:].strip()
+        return name, target
+
+    # Fallback parsing for desc like "ToolName (arg)"
+    if "(" in desc and desc.endswith(")"):
+        p1, _, p2 = desc.partition("(")
+        return p1.strip(), p2[:-1].strip()
+
+    clean_t = (
+        t_name.replace("tool_call.", "")
+        .replace("tool.", "")
+        .replace("event.", "")
+        .replace("_", " ")
+        .strip()
+        .title()
+    )
+    return clean_t or desc or "Tool", target
+
+
 def render_actions_group(
     group: Any,
+    *,
+    legacy_header: bool = False,
+    avail_width: int = 80,
 ) -> RenderableType:
-    """Render compact Actions disclosure group per §20, §21."""
+    """Render compact Actions stream using flat ● Tool(arg) syntax without noisy wrappers."""
     if isinstance(group, list):
         from cli.tui.state import ActionsGroup
         actions_obj = ActionsGroup(actions=group)
@@ -431,75 +543,122 @@ def render_actions_group(
     if not actions_obj or getattr(actions_obj, "is_empty", False):
         return Text("")
 
-    arrow = "▾" if actions_obj.expanded else "▸"
-    failed_count = getattr(actions_obj, "failed_count", 0)
-    suffix = getattr(actions_obj, "header_suffix", f"{getattr(actions_obj, 'count', len(getattr(actions_obj, 'actions', [])))}")
-    suffix_style = "bold red" if failed_count > 0 else "dim white"
+    lines: list[RenderableType] = []
 
-    header = Text()
-    header.append(f"{arrow} ", style="bold red" if failed_count > 0 else "bold cyan")
-    header.append("Actions", style="bold white")
-    header.append(" · ", style="dim")
-    header.append(suffix, style=suffix_style)
+    if legacy_header:
+        arrow = "▾" if actions_obj.expanded else "▸"
+        failed_count = getattr(actions_obj, "failed_count", 0)
+        suffix = getattr(actions_obj, "header_suffix", f"{getattr(actions_obj, 'count', len(getattr(actions_obj, 'actions', [])))}")
+        suffix_style = "bold red" if failed_count > 0 else "dim white"
+        hdr = Text()
+        hdr.append(f"{arrow} ", style="bold red" if failed_count > 0 else "bold cyan")
+        hdr.append("Actions", style="bold white")
+        hdr.append(" · ", style="dim")
+        hdr.append(suffix, style=suffix_style)
+        lines.append(hdr)
+        if not actions_obj.expanded:
+            return hdr
 
-    if not actions_obj.expanded:
-        return header
-
-    lines: list[RenderableType] = [header]
     vis_items = (
         actions_obj.get_visible_actions()
         if hasattr(actions_obj, "get_visible_actions")
         else [(a, 0) for a in getattr(actions_obj, "actions", [])]
     )
-    for act, indent_lvl in vis_items:
-        indent = "    " if indent_lvl > 0 else "  "
-        line = Text(indent)
-        sym = act.symbol
-        if sym == "✓":
-            line.append(sym, style="bold green")
-        elif sym == "●":
-            line.append(sym, style="bold yellow")
-        elif sym == "×":
-            line.append(sym, style="bold red")
-        elif sym == "⊘":
-            line.append(sym, style="dim white")
-        else:
-            line.append(sym, style="white")
 
-        desc = act.description
-        if "(" in desc and desc.endswith(")"):
-            action_part, _, target_part = desc.partition("(")
-            target_part = target_part[:-1].strip()
-            line.append(f" {action_part.strip()} ", style="white")
-            line.append(f"({target_part})", style="cyan")
+    # Pass 1: Collapse consecutive identical tool calls on same target
+    collapsed: list[tuple[Any, int, str, str, str, int]] = []
+    for act, indent_lvl in vis_items:
+        t_name, arg = normalize_action_call(act)
+        st = str(getattr(act, "status", "")).upper()
+        if (
+            collapsed
+            and collapsed[-1][2] == t_name
+            and collapsed[-1][3] == arg
+            and collapsed[-1][4] == st
+            and collapsed[-1][1] == indent_lvl
+            and t_name != "Agent"
+        ):
+            p_act, p_ind, p_name, p_arg, p_st, p_cnt = collapsed[-1]
+            collapsed[-1] = (p_act, p_ind, p_name, p_arg, p_st, p_cnt + 1)
         else:
-            line.append(f" {desc}", style="white")
-        if getattr(act, "error", None) and str(getattr(act, "status", "")).upper() in {"FAILED", "FAILURE", "ERROR"}:
+            collapsed.append((act, indent_lvl, t_name, arg, st, 1))
+
+    # Pass 2: Suppress duplicate consecutive Agent headers and render flat lines
+    active_agent: str | None = None
+
+    for act, indent_lvl, t_name, arg, st, count in collapsed:
+        if t_name == "Agent":
+            if arg and arg == active_agent:
+                continue
+            active_agent = arg
+        else:
+            if active_agent is not None and indent_lvl == 0:
+                indent_lvl = 1
+
+        is_indented = indent_lvl > 0
+        indent_prefix = "  " if is_indented else ""
+
+        # Status dot
+        if st in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}:
+            dot_color = "green"
+        elif st in {"RUNNING", "ACTIVE", "IN_PROGRESS"}:
+            dot_color = "yellow"
+        elif st in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}:
+            dot_color = "red"
+        elif st in {"CANCELLED", "CANCELED"}:
+            dot_color = "dim white"
+        else:
+            dot_color = "green"
+
+        name_style = "bold cyan" if t_name == "Agent" else "bold yellow"
+
+        max_arg_len = max(20, avail_width - len(t_name) - (4 if is_indented else 2) - 15)
+        display_arg = arg
+        if len(display_arg) > max_arg_len:
+            display_arg = display_arg[: max_arg_len - 3] + "..."
+
+        line = Text(indent_prefix)
+        line.append("●", style=dot_color)
+        line.append(" ")
+        line.append(t_name, style=name_style)
+        if display_arg:
+            line.append(f"({display_arg})", style="white")
+
+        if count > 1:
+            line.append(f" (×{count})", style="dim")
+
+        is_failed = st in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}
+        error_val = getattr(act, "error", None)
+
+        if is_failed and error_val:
             from cli.tui.events import clean_error_message
-            clean_err = clean_error_message(act.error)
-            line.append(f" ({clean_err})", style="bold red")
+            clean_err = clean_error_message(error_val)
+            if clean_err:
+                line.append(f" — {clean_err}", style="red")
+        else:
+            has_collapsible = bool(
+                getattr(act, "output", None)
+                or getattr(act, "diff", None)
+                or getattr(act, "code", None)
+                or t_name in {"Read", "Bash", "Edit", "Write"}
+            )
+            if has_collapsible and not actions_obj.expanded:
+                line.append(" (ctrl+o to expand)", style="dim")
+
         lines.append(line)
 
-    prev_act = getattr(actions_obj, "latest_preview_action", None)
-    if prev_act:
-        prev_renderable = render_action_preview(prev_act)
-        if prev_renderable:
-            lines.append(Text(""))
-            lines.append(prev_renderable)
-    else:
-        preview_label = getattr(actions_obj, "preview_label", None)
-        preview_code = getattr(actions_obj, "preview_code", None)
-        if preview_label and preview_code and preview_code.strip():
-            lines.append(Text(""))
-            lines.append(Text(f"  {preview_label}", style="white"))
-            code_lines = preview_code.strip().splitlines()
-            preview_lines = code_lines[:6]
-            for cline in preview_lines:
-                lines.append(Text(f"    │ {cline}", style="dim #cbd5e1"))
-            if len(code_lines) > 6:
-                lines.append(Text(f"    │ ... (+{len(code_lines) - 6} more lines)", style="dim #64748b"))
+        # Only render preview if explicitly expanded!
+        if actions_obj.expanded:
+            prev = render_action_preview(act)
+            if prev:
+                lines.append(prev)
 
+    if not lines:
+        return Text("")
+    if len(lines) == 1:
+        return lines[0]
     return Group(*lines)
+
 
 
 def render_action_preview(action: Any) -> RenderableType | None:
@@ -517,6 +676,11 @@ def render_action_preview(action: Any) -> RenderableType | None:
     output = getattr(action, "output", None)
     code = getattr(action, "code", None)
     error = getattr(action, "error", None)
+
+    # Suppress duplicate Agent preview headers
+    if desc.startswith("Agent") or "harness" in t_name:
+        if not (output or error or diff or code):
+            return None
 
     # 1. Edit action -> Diff
     if diff or t_name in {"edit_file", "edit", "patch", "apply_patch"}:
@@ -553,11 +717,21 @@ def render_action_preview(action: Any) -> RenderableType | None:
     is_harness = "harness" in t_name or t_name in {"generate", "llm"}
     if t_name in {"exec_command", "run_command", "bash", "sh", "command", "run_tests", "pytest", "test"} or is_harness or output:
         is_test = t_name in {"run_tests", "pytest", "test"}
+        if desc.startswith("Agent"):
+            body_text = output or error or ""
+            if not body_text.strip():
+                return None
+            b_lines = body_text.strip().splitlines()
+            lines = []
+            for bl in b_lines[:8]:
+                lines.append(Text("  │ ").append(bl, style="dim #cbd5e1" if not is_failed else "dim red"))
+            if len(b_lines) > 8:
+                lines.append(Text(f"  │ ... (+{len(b_lines) - 8} more lines)", style="dim #64748b"))
+            return Group(*lines)
+
         if is_running:
             if is_test:
                 lbl = Text("⚡ Running tests: ", style="bold yellow").append(f"`{target}`...", style="yellow") if target else Text("⚡ Running tests...", style="bold yellow")
-            elif desc.startswith("Agent"):
-                lbl = Text(f"⚡ {desc}...", style="bold yellow")
             elif is_harness or not target:
                 lbl = Text("⚡ Generating...", style="bold yellow")
             else:
@@ -565,8 +739,6 @@ def render_action_preview(action: Any) -> RenderableType | None:
         elif is_failed:
             if is_test:
                 lbl = Text("× Tests failed: ", style="bold red").append(f"`{target}`", style="red") if target else Text("× Tests failed", style="bold red")
-            elif desc.startswith("Agent"):
-                lbl = Text(f"× {desc} failed", style="bold red")
             elif is_harness or not target:
                 lbl = Text("× Generation failed", style="bold red")
             else:
@@ -574,8 +746,6 @@ def render_action_preview(action: Any) -> RenderableType | None:
         else:
             if is_test:
                 lbl = Text("✓ Tests passed: ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Tests passed", style="bold green")
-            elif desc.startswith("Agent"):
-                lbl = Text(f"✓ {desc}", style="bold green")
             elif is_harness or not target:
                 lbl = Text("✓ Generating", style="bold green")
             else:
@@ -616,10 +786,15 @@ def render_action_preview(action: Any) -> RenderableType | None:
 
     # 4. Read action
     if t_name in {"read_file", "read", "view_file", "cat"}:
-        if is_running:
-            return Text("🔍 Reading ", style="bold cyan").append(f"`{target}`...", style="cyan") if target else Text("🔍 Reading file...", style="bold cyan")
-        else:
-            return Text("✓ Read ", style="bold green").append(f"`{target}`", style="white") if target else Text("✓ Read file", style="bold green")
+        content_text = output or code
+        if not content_text or not content_text.strip():
+            return None
+        lines = []
+        for l in content_text.strip().splitlines()[:8]:
+            lines.append(Text(f"  │ {l}", style="dim #cbd5e1"))
+        if len(content_text.strip().splitlines()) > 8:
+            lines.append(Text(f"  │ ... (+{len(content_text.strip().splitlines()) - 8} more lines)", style="dim #64748b"))
+        return Group(*lines)
 
     # 5. Generic action
     desc = getattr(action, "description", "") or t_name
@@ -660,6 +835,7 @@ def render_actions_group_str(
     group: Any,
     width: int = 80,
     *,
+    legacy_header: bool = False,
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
@@ -669,16 +845,37 @@ def render_actions_group_str(
         force_color=force_color,
         no_color=no_color,
     )
-    console.print(render_actions_group(group))
+    console.print(render_actions_group(group, legacy_header=legacy_header, avail_width=width))
     return console.export_text(styles=use_ansi).rstrip()
+
+
+def extract_thinking_summary(thinking: str, max_width: int = 76) -> str:
+    """Extract single-line summary: last non-empty sentence/line, stripped of markdown headers."""
+    clean = thinking.strip() if thinking else ""
+    if not clean:
+        return ""
+    lines = [l.strip() for l in clean.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    last_line = lines[-1]
+    # Strip markdown headers (#, ##, etc.) and bullets (-, *, •)
+    last_line = re.sub(r"^[#\s*\-•>]+", "", last_line).strip()
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", last_line) if s.strip()]
+    summary = sentences[-1] if sentences else last_line
+    if len(summary) > max_width:
+        summary = summary[: max_width - 3] + "..."
+    return summary
 
 
 def render_thinking_block(
     thinking: str,
     expanded: bool = False,
     in_progress: bool = False,
+    elapsed: float | None = None,
+    tokens: int | None = None,
+    avail_width: int = 80,
 ) -> RenderableType:
-    """Render collapsible styled thinking block (toggled via Ctrl+O)."""
+    """Render collapsible styled thinking block (2-line ▸ Thought summary when collapsed)."""
     clean_think = thinking.strip() if thinking else ""
     if not clean_think:
         return Text("")
@@ -687,28 +884,24 @@ def render_thinking_block(
         return Text("Thinking... ✓", style="dim italic #94a3b8")
 
     arrow = "▾" if expanded else "▸"
-    label = "Thinking..."
-    shortcut_hint = "Ctrl+O to collapse" if expanded else "Ctrl+O to expand"
+    el_val = 0.0 if elapsed is None else elapsed
+    el_str = f"{el_val:.1f}s" if isinstance(el_val, float) else f"{el_val}s"
+    tok_val = max(1, len(clean_think.split())) if tokens is None else tokens
+
+    header_text = f"{arrow} Thought for {el_str}, {tok_val} tokens"
+    header = Text(header_text, style="dim white")
 
     lines = clean_think.splitlines()
-    line_count = len(lines)
-    suffix = f" · {line_count} line{'s' if line_count != 1 else ''}" if (not in_progress and line_count > 1) else ""
-
-    header = Text()
-    header.append(f"{arrow} ", style="bold #a855f7")
-    header.append(label, style="bold #c084fc")
-    if suffix:
-        header.append(suffix, style="dim #94a3b8")
-    header.append(f"  ({shortcut_hint})", style="dim #64748b")
-
     if not expanded:
+        summary = extract_thinking_summary(clean_think, max_width=max(20, avail_width - 4))
+        if summary:
+            summary_line = Text(f"  {summary}", style="dim")
+            return Group(header, summary_line)
         return header
 
     elements: list[RenderableType] = [header]
     for tline in lines:
-        t = Text("  │ ", style="dim #a855f7")
-        t.append(tline, style="dim italic #cbd5e1")
-        elements.append(t)
+        elements.append(Text(f"  {tline}", style="dim #cbd5e1"))
     return Group(*elements)
 
 
@@ -716,13 +909,22 @@ def render_thinking_block_str(
     thinking: str,
     expanded: bool = False,
     in_progress: bool = False,
+    elapsed: float | None = None,
+    tokens: int | None = None,
     width: int = 80,
     *,
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
     """Render thinking block as string using in-memory capture."""
-    elem = render_thinking_block(thinking, expanded=expanded, in_progress=in_progress)
+    elem = render_thinking_block(
+        thinking,
+        expanded=expanded,
+        in_progress=in_progress,
+        elapsed=elapsed,
+        tokens=tokens,
+        avail_width=width,
+    )
     if not elem:
         return ""
     console, use_ansi = _make_capture_console(
@@ -732,6 +934,7 @@ def render_thinking_block_str(
     )
     console.print(elem)
     return console.export_text(styles=use_ansi).rstrip()
+
 
 
 def is_stray_command_bar(content: str) -> bool:
@@ -757,6 +960,7 @@ def render_assistant_message(
     thinking: str | None = None,
     thinking_expanded: bool = True,
     model: str | None = None,
+    show_header: bool = True,
 ) -> RenderableType:
     """Render an assistant message with '✦ StackMind' header (§15), dynamic turn regions (§18, §20, §24), left-aligned model attribution, and rich Markdown (§32)."""
     model_val = model
@@ -785,7 +989,9 @@ def render_assistant_message(
     else:
         top_elem = hdr
 
-    elements: list[RenderableType] = [Text(""), top_elem]
+    elements: list[RenderableType] = []
+    if show_header:
+        elements.extend([Text(""), top_elem])
 
     # Dynamic Region 1: Turn Actions disclosure group (§18, §20, §21)
     if actions is not None:
@@ -970,11 +1176,13 @@ def render_chat_transcript(
         return Padding(empty_text, padding) if padding else empty_text
 
     elements: list[RenderableType] = []
+    assistant_header_shown = False
     for msg in messages:
         if is_stray_command_bar(msg.content):
             continue
         role = msg.role.lower()
         if role == "user":
+            assistant_header_shown = False
             elements.append(
                 render_user_message(
                     msg.content,
@@ -984,6 +1192,8 @@ def render_chat_transcript(
                 )
             )
         elif role == "assistant":
+            show_hdr = not assistant_header_shown
+            assistant_header_shown = True
             elements.append(
                 render_assistant_message(
                     msg.content,
@@ -994,9 +1204,11 @@ def render_chat_transcript(
                     thinking_expanded=getattr(msg, "thinking_expanded", False),
                     model=getattr(msg, "model", None),
                     inline_diffs=inline_diffs,
+                    show_header=show_hdr,
                 )
             )
         elif role == "system":
+            assistant_header_shown = False
             elements.append(
                 render_system_message(
                     msg.content,
@@ -1015,6 +1227,7 @@ def render_chat_transcript(
             from cli.tui.diff import render_unified_diff
             elements.append(render_unified_diff(msg.content))
         else:
+            assistant_header_shown = False
             header = Text(f"✦ {msg.role.title()}", style="dim cyan")
             elements.append(Group(header, Markdown(msg.content, code_theme="monokai")))
         elements.append(Text(""))

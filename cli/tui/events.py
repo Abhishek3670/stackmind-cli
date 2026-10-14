@@ -58,7 +58,7 @@ def normalize_status(raw_status: str | None) -> str:
 
 
 def clean_error_message(err: Any) -> str:
-    """Extract a concise human-readable error string avoiding raw dicts or traces."""
+    """Extract a concise human-readable error string avoiding raw dicts or traces, stripping internal LLM prompts."""
     if not err:
         return ""
     if isinstance(err, Mapping):
@@ -70,7 +70,7 @@ def clean_error_message(err: Any) -> str:
                     return cleaned
         for val in err.values():
             if isinstance(val, str) and val.strip() and val.strip().lower() not in {"failed", "blocked", "error"}:
-                return val.strip()
+                return clean_error_message(val)
         return "Operation failed"
 
     msg = str(err).strip()
@@ -85,8 +85,25 @@ def clean_error_message(err: Any) -> str:
     if "Traceback (most recent call last):" in msg:
         lines = [line.strip() for line in msg.splitlines() if line.strip()]
         if lines:
-            return lines[-1]
+            msg = lines[-1]
+
+    # Strip LLM prompt instructions (e.g. CRITICAL: Do NOT retry...)
+    import re
+    if re.search(r"\bCRITICAL\s*:", msg, flags=re.IGNORECASE):
+        msg = re.split(r"\bCRITICAL\s*:", msg, flags=re.IGNORECASE)[0].strip()
+
+    # Normalize runtime policy / scope / contract permission denials
+    lower_msg = msg.lower()
+    if (
+        "denied by runtime policy" in lower_msg
+        or "target is explicitly denied" in lower_msg
+        or "outside assigned scope" in lower_msg
+        or ("permissionerror" in lower_msg and "denied" in lower_msg)
+    ):
+        return "Permission denied (outside assigned scope)"
+
     return msg
+
 
 
 def format_tool_name(tool_name: str, role: str = "") -> str:

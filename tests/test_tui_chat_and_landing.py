@@ -339,7 +339,7 @@ def test_inline_diff_rendering_in_conversation():
 
 
 def test_actions_group_collapsed_default():
-    """Verify actions disclosure group is collapsed by default per §20 and §22."""
+    """Verify actions render using clean flat ● Tool(arg) syntax per new design."""
     actions = [
         TurnAction("1", "Read src/auth.py", status="COMPLETED"),
         TurnAction("2", "Read tests/test_auth.py", status="COMPLETED"),
@@ -350,15 +350,16 @@ def test_actions_group_collapsed_default():
     assert not group.expanded  # Collapsed by default
 
     plain = _extract_plain(render_actions_group(group))
-    assert "▸ Actions · 4 completed" in plain
-    assert "Read src/auth.py" not in plain  # Details hidden while collapsed
+    assert "● Read(src/auth.py)" in plain
+    assert "● Read(tests/test_auth.py)" in plain
+    assert "● Run harness" in plain
+    assert "● Verify(changes)" in plain
 
     # Render within assistant message
     asst_rendered = _extract_plain(render_assistant_message("Task finished.", actions=group))
     assert "✦ StackMind" in asst_rendered
-    assert "▸ Actions · 4 completed" in asst_rendered
+    assert "● Read(src/auth.py)" in asst_rendered
     assert "Task finished." in asst_rendered
-    assert "Read src/auth.py" not in asst_rendered
 
 
 def test_actions_group_expand_collapse_keyboard():
@@ -374,17 +375,15 @@ def test_actions_group_expand_collapse_keyboard():
     assert group.expanded
 
     plain_expanded = _extract_plain(render_actions_group(group))
-    assert "▾ Actions · 4 completed" in plain_expanded
-    assert "✓ Read src/auth.py" in plain_expanded
-    assert "✓ Read tests/test_auth.py" in plain_expanded
-    assert "✓ Run harness" in plain_expanded
-    assert "✓ Verify changes" in plain_expanded
+    assert "● Read(src/auth.py)" in plain_expanded
+    assert "● Read(tests/test_auth.py)" in plain_expanded
+    assert "● Run harness" in plain_expanded
+    assert "● Verify(changes)" in plain_expanded
 
     group.collapse()
     assert not group.expanded
     plain_collapsed = _extract_plain(render_actions_group(group))
-    assert "▸ Actions · 4 completed" in plain_collapsed
-    assert "✓ Read src/auth.py" not in plain_collapsed
+    assert "● Read(src/auth.py)" in plain_collapsed
 
     # Keyboard command via state
     state = AutonomousDeliveryState()
@@ -407,14 +406,13 @@ def test_actions_group_expand_collapse_mouse():
     group.handle_click()
     assert group.expanded
     plain_exp = _extract_plain(render_actions_group(group))
-    assert "▾ Actions · 1 completed" in plain_exp
-    assert "✓ Read src/auth.py" in plain_exp
+    assert "● Read(src/auth.py)" in plain_exp
 
     # Click to collapse
     group.handle_click()
     assert not group.expanded
     plain_col = _extract_plain(render_actions_group(group))
-    assert "▸ Actions · 1 completed" in plain_col
+    assert "● Read(src/auth.py)" in plain_col
 
     # Mouse click handling on state level
     state = AutonomousDeliveryState()
@@ -437,10 +435,9 @@ def test_actions_group_one_invocation_one_entry_and_inplace_update():
     assert group.actions[0].status == "RUNNING"
     assert group.actions[0].symbol == "●"
 
-    # Active header shows count without completed
+    # Flat stream shows ● Run harness
     plain_running = _extract_plain(render_actions_group(group))
-    assert "▸ Actions · 1" in plain_running
-    assert "completed" not in plain_running
+    assert "● Run harness" in plain_running
 
     group.expand()
     plain_running_exp = _extract_plain(render_actions_group(group))
@@ -454,9 +451,7 @@ def test_actions_group_one_invocation_one_entry_and_inplace_update():
 
     group.active = False
     plain_comp_exp = _extract_plain(render_actions_group(group))
-    assert "▾ Actions · 1 completed" in plain_comp_exp
-    assert "✓ Run harness" in plain_comp_exp
-    assert "● Run harness" not in plain_comp_exp
+    assert "● Run harness" in plain_comp_exp
 
     # 3. Add distinct invocation
     group.add_or_update("call-2", "Verify changes", status="COMPLETED")
@@ -465,7 +460,7 @@ def test_actions_group_one_invocation_one_entry_and_inplace_update():
 
 
 def test_actions_group_failed_and_cancelled_states():
-    """Verify actions symbols across completed (✓), running (●), failed (×), and cancelled (⊘)."""
+    """Verify actions symbols across completed, running, failed, and cancelled."""
     actions = [
         TurnAction("1", "Read src/auth.py", status="COMPLETED"),
         TurnAction("2", "Run harness", status="RUNNING"),
@@ -475,10 +470,11 @@ def test_actions_group_failed_and_cancelled_states():
     group = ActionsGroup(actions=actions, expanded=True)
     plain = _extract_plain(render_actions_group(group))
 
-    assert "✓ Read src/auth.py" in plain
+    assert "● Read(src/auth.py)" in plain
     assert "● Run harness" in plain
-    assert "× Run tests (1 test failed)" in plain
-    assert "⊘ Deploy changes" in plain
+    assert "● Test" in plain
+    assert "1 test failed" in plain
+    assert "● Deploy(changes)" in plain
 
 
 def test_actions_group_turn_expansion_preservation():
@@ -502,11 +498,11 @@ def test_actions_group_turn_expansion_preservation():
     ]
 
     transcript = render_chat_transcript_str(messages, width=80)
-    # Turn 1 rendered collapsed
-    assert "▸ Actions · 1 completed" in transcript
+    # Turn 1 rendered collapsed (has expand hint)
+    assert "● Read(file)" in transcript
+    assert "ctrl+o to expand" in transcript
     # Turn 2 rendered expanded
-    assert "▾ Actions · 1 completed" in transcript
-    assert "✓ Edit file" in transcript
+    assert "● Edit(file)" in transcript
 
 
 def test_tui_repl_actions_command_and_mouse_click():
@@ -543,7 +539,7 @@ def test_tui_repl_actions_command_and_mouse_click():
 
 
 def test_assistant_message_renders_genuine_thinking_when_present():
-    """If upstream provider exposes genuine thinking, render 'Thinking...' followed by reasoning text (§24)."""
+    """If upstream provider exposes genuine thinking, render 'Thought' followed by reasoning text (§24)."""
     reasoning = "Inspecting the existing authentication middleware...\nVerifying token expiration handling..."
     msg = "The authentication flow has been updated."
     rendered = _extract_plain(render_assistant_message(msg, thinking=reasoning))
@@ -551,13 +547,13 @@ def test_assistant_message_renders_genuine_thinking_when_present():
     # Header
     assert "✦ StackMind" in rendered
     # Region 2: Thinking
-    assert "Thinking..." in rendered
+    assert "Thought for" in rendered
     assert "Inspecting the existing authentication middleware..." in rendered
     assert "Verifying token expiration handling..." in rendered
     # Region 3: Response
     assert "The authentication flow has been updated." in rendered
     # Order: Header -> Thinking -> Content
-    think_idx = rendered.index("Thinking...")
+    think_idx = rendered.index("Thought for")
     content_idx = rendered.index("The authentication flow has been updated.")
     assert think_idx < content_idx
 
@@ -573,13 +569,14 @@ def test_assistant_message_clean_3_region_turn_structure():
 
     rendered = _extract_plain(render_assistant_message(content, actions=actions, thinking=reasoning))
 
-    assert "▸ Actions · 2 completed" in rendered
-    assert "Thinking..." in rendered
-    assert "Found missing bearer prefix verification" in rendered
+    assert "● Read(middleware.py)" in rendered
+    assert "● Edit(middleware.py)" in rendered
+    assert "Thought for" in rendered
+    assert "Found missing bearer verification" in rendered or "Found missing bearer prefix verification" in rendered
     assert "Patched token parsing in middleware.py." in rendered
 
-    actions_idx = rendered.index("Actions · 2 completed")
-    think_idx = rendered.index("Thinking...")
+    actions_idx = rendered.index("● Read(middleware.py)")
+    think_idx = rendered.index("Thought for")
     content_idx = rendered.index("Patched token parsing")
     assert actions_idx < think_idx < content_idx
 
