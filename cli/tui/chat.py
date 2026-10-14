@@ -695,7 +695,7 @@ def render_action_preview(action: Any) -> RenderableType | None:
         diff_text = diff or code or ""
         if diff_text.strip():
             d_lines = diff_text.strip().splitlines()
-            preview = d_lines[:8]
+            preview = d_lines[:6]
             for dl in preview:
                 t = Text("  │ ")
                 if dl.startswith("+") and not dl.startswith("+++"):
@@ -709,8 +709,8 @@ def render_action_preview(action: Any) -> RenderableType | None:
                 else:
                     t.append(dl, style="white")
                 lines.append(t)
-            if len(d_lines) > 8:
-                lines.append(Text(f"  │ ... (+{len(d_lines) - 8} more lines)", style="dim #64748b"))
+            if len(d_lines) > 6:
+                lines.append(Text(f"  │ ... (+{len(d_lines) - 6} more lines)", style="dim #64748b"))
         return Group(*lines)
 
     # 2. Bash / Command / Test action -> Output
@@ -721,12 +721,14 @@ def render_action_preview(action: Any) -> RenderableType | None:
             body_text = output or error or ""
             if not body_text.strip():
                 return None
+            if "\\n" in body_text and "\n" not in body_text:
+                body_text = body_text.replace("\\n", "\n").replace("\\t", "    ")
             b_lines = body_text.strip().splitlines()
             lines = []
-            for bl in b_lines[:8]:
+            for bl in b_lines[:6]:
                 lines.append(Text("  │ ").append(bl, style="dim #cbd5e1" if not is_failed else "dim red"))
-            if len(b_lines) > 8:
-                lines.append(Text(f"  │ ... (+{len(b_lines) - 8} more lines)", style="dim #64748b"))
+            if len(b_lines) > 6:
+                lines.append(Text(f"  │ ... (+{len(b_lines) - 6} more lines)", style="dim #64748b"))
             return Group(*lines)
 
         if is_running:
@@ -754,13 +756,15 @@ def render_action_preview(action: Any) -> RenderableType | None:
         lines = [lbl]
         body_text = output or error or ""
         if body_text.strip():
+            if "\\n" in body_text and "\n" not in body_text:
+                body_text = body_text.replace("\\n", "\n").replace("\\t", "    ")
             b_lines = body_text.strip().splitlines()
-            preview = b_lines[:8]
+            preview = b_lines[:6]
             for bl in preview:
                 t = Text("  │ ").append(bl, style="dim #cbd5e1" if not is_failed else "dim red")
                 lines.append(t)
-            if len(b_lines) > 8:
-                lines.append(Text(f"  │ ... (+{len(b_lines) - 8} more lines)", style="dim #64748b"))
+            if len(b_lines) > 6:
+                lines.append(Text(f"  │ ... (+{len(b_lines) - 6} more lines)", style="dim #64748b"))
         return Group(*lines)
 
     # 3. Write / Create action -> Code snippet
@@ -775,13 +779,15 @@ def render_action_preview(action: Any) -> RenderableType | None:
         lines = [lbl]
         c_text = code or ""
         if c_text.strip():
+            if "\\n" in c_text and "\n" not in c_text:
+                c_text = c_text.replace("\\n", "\n").replace("\\t", "    ")
             c_lines = c_text.strip().splitlines()
-            preview = c_lines[:8]
+            preview = c_lines[:6]
             for cl in preview:
                 t = Text("  │ ").append(cl, style="dim #cbd5e1")
                 lines.append(t)
-            if len(c_lines) > 8:
-                lines.append(Text(f"  │ ... (+{len(c_lines) - 8} more lines)", style="dim #64748b"))
+            if len(c_lines) > 6:
+                lines.append(Text(f"  │ ... (+{len(c_lines) - 6} more lines)", style="dim #64748b"))
         return Group(*lines)
 
     # 4. Read action
@@ -789,11 +795,13 @@ def render_action_preview(action: Any) -> RenderableType | None:
         content_text = output or code
         if not content_text or not content_text.strip():
             return None
+        if "\\n" in content_text and "\n" not in content_text:
+            content_text = content_text.replace("\\n", "\n").replace("\\t", "    ")
         lines = []
-        for l in content_text.strip().splitlines()[:8]:
+        for l in content_text.strip().splitlines()[:6]:
             lines.append(Text(f"  │ {l}", style="dim #cbd5e1"))
-        if len(content_text.strip().splitlines()) > 8:
-            lines.append(Text(f"  │ ... (+{len(content_text.strip().splitlines()) - 8} more lines)", style="dim #64748b"))
+        if len(content_text.strip().splitlines()) > 6:
+            lines.append(Text(f"  │ ... (+{len(content_text.strip().splitlines()) - 6} more lines)", style="dim #64748b"))
         return Group(*lines)
 
     # 5. Generic action
@@ -804,9 +812,13 @@ def render_action_preview(action: Any) -> RenderableType | None:
         return Text(f"× {desc}", style="bold red")
     elif getattr(action, "output", None) or getattr(action, "error", None):
         out = action.output or action.error
+        if "\\n" in out and "\n" not in out:
+            out = out.replace("\\n", "\n").replace("\\t", "    ")
         lines = [Text(f"✓ {desc}", style="bold green")]
-        for bl in out.strip().splitlines()[:8]:
+        for bl in out.strip().splitlines()[:6]:
             lines.append(Text(f"  │ {bl}", style="dim #cbd5e1"))
+        if len(out.strip().splitlines()) > 6:
+            lines.append(Text(f"  │ ... (+{len(out.strip().splitlines()) - 6} more lines)", style="dim #64748b"))
         return Group(*lines)
     return None
 

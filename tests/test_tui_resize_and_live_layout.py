@@ -599,4 +599,99 @@ def test_empty_conversation_landing_state_frame_strictly_fits_height():
         assert lines[-2][0] in ("╰", "└")
 
 
+def test_filenotfounderror_workspace_file_list_stripped_and_capped():
+    """Verify FileNotFoundError strips workspace file lists and hard-caps to <= 60 chars."""
+    from cli.tui.events import clean_error_message
+
+    raw_err = (
+        "FileNotFoundError: File 'src/frontend.html' does not exist in workspace. "
+        "Existing workspace files: .gitignore, CHANGELOG.md, package.json, src/index.ts, "
+        "src/styles.css, tests/test_app.py, README.md, tsconfig.json"
+    )
+    cleaned = clean_error_message(raw_err)
+    # File list must be completely stripped
+    assert "Existing workspace files:" not in cleaned
+    assert ".gitignore" not in cleaned
+    assert "CHANGELOG.md" not in cleaned
+    assert "tsconfig.json" not in cleaned
+    # Must be <= 60 chars
+    assert len(cleaned) <= 60
+    assert "FileNotFoundError:" in cleaned
+
+
+def test_tool_execution_no_duplicate_ran_block_when_collapsed():
+    """Verify tool executions do NOT emit a duplicate ✓ Ran / │ block during in-progress turn."""
+    from cli.tui.app import _build_in_progress_turn_content
+    from cli.tui.state import AutonomousDeliveryState, TurnAction
+
+    state = AutonomousDeliveryState("test-tools", session_id="test-sess")
+    state.record_turn_action(
+        "act-1",
+        "Write src/backend.py",
+        status="COMPLETED",
+        tool_name="write_file",
+        target="src/backend.py",
+        code="import os\nprint('hello world')",
+    )
+
+    content = _build_in_progress_turn_content(
+        state,
+        model_name="test-model",
+        streamed_chunks=[],
+        latest_act_desc="Working...",
+        start_time=0.0,
+        max_wait=0.0,
+        layout_width=100,
+    )
+
+    # Must contain single flat tool call line
+    assert "● Write(src/backend.py)" in content
+    # Must NOT contain duplicate legacy block
+    assert "✓ Ran" not in content
+    assert "✓ Wrote" not in content
+    assert "  │ " not in content
+
+
+def test_page_up_page_down_keys_and_viewport_scrolling():
+    """Verify PgUp/PgDn key sequences update scroll_offset, shift viewport sliced lines, and poll_scroll_key works."""
+    from cli.tui.keyboard import Key, _parse_escape_sequence, poll_scroll_key
+    from cli.tui.layout import slice_conversation_viewport
+    from cli.tui.state import AutonomousDeliveryState
+
+    # 1. Verify ANSI key sequence decoding
+    assert _parse_escape_sequence("[5~") == Key.PAGE_UP
+    assert _parse_escape_sequence("[6~") == Key.PAGE_DOWN
+
+    # 2. Viewport slicing with scroll_offset shifts lines
+    lines = [f"Line {i:03d}" for i in range(50)]
+    full_content = "\n".join(lines)
+
+    state = AutonomousDeliveryState("test-scroll", session_id="test-sess")
+    vp_h = 10
+
+    # At bottom (scroll_offset = 0)
+    bottom_slice = slice_conversation_viewport(full_content, viewport_height=vp_h, scroll=state.conversation_scroll)
+    assert "Line 049" in bottom_slice
+    assert "Line 000" not in bottom_slice
+
+    # Scroll up by 10 lines
+    state.scroll_conversation_up(10)
+    assert state.conversation_scroll.scroll_offset == 10
+    scrolled_slice = slice_conversation_viewport(full_content, viewport_height=vp_h, scroll=state.conversation_scroll)
+    assert "Line 039" in scrolled_slice
+    assert "Line 049" not in scrolled_slice
+
+    # Scroll down by 5 lines
+    state.scroll_conversation_down(5)
+    assert state.conversation_scroll.scroll_offset == 5
+    part_slice = slice_conversation_viewport(full_content, viewport_height=vp_h, scroll=state.conversation_scroll)
+    assert "Line 044" in part_slice
+
+    # Scroll to bottom resets to follow_bottom
+    state.scroll_conversation_to_bottom()
+    assert state.conversation_scroll.scroll_offset == 0
+    assert state.conversation_scroll.follow_bottom is True
+
+
+
 

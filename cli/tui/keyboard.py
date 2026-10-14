@@ -1840,3 +1840,35 @@ def raw_prompt_input(
             history.append(result)
 
     return result
+
+
+def poll_scroll_key() -> str | None:
+    """Non-blocking poll for scroll keys (PgUp/PgDn/WheelUp/WheelDown).
+
+    Returns Key.PAGE_UP, Key.PAGE_DOWN, Key.MOUSE_WHEEL_UP, Key.MOUSE_WHEEL_DOWN,
+    or None if no scroll key is pending. Consumes non-scroll keys silently.
+    Used during SSE streaming to allow users to scroll the viewport.
+    """
+    SCROLL_KEYS = {Key.PAGE_UP, Key.PAGE_DOWN, Key.MOUSE_WHEEL_UP, Key.MOUSE_WHEEL_DOWN}
+    if os.name == "nt":
+        import msvcrt
+        if not msvcrt.kbhit():
+            return None
+        key = _read_raw_key_windows(timeout=0.02)
+        if key in SCROLL_KEYS:
+            return key
+        return None
+    else:
+        import select
+        fd = sys.stdin.fileno()
+        r, _, _ = select.select([fd], [], [], 0.0)
+        if not r:
+            return None
+        ch = os.read(fd, 1).decode("utf-8", errors="replace")
+        if ch == "\x1b":
+            seq = _read_escape_sequence_posix(fd)
+            if seq:
+                key = _parse_escape_sequence(seq)
+                if key in SCROLL_KEYS:
+                    return key
+        return None

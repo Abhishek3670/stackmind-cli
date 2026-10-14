@@ -306,33 +306,12 @@ def _build_in_progress_turn_content(
     hdr = render_assistant_stream_header(model=model_name, width=layout_width)
     parts = [hdr]
 
-    # In-progress actions (expanded during active execution so raw tool steps with new design are visible)
+    # In-progress actions rendered as compact ● Tool(arg) lines (never expanded during streaming)
     turn_acts = getattr(state, "current_turn_actions", None)
     if turn_acts and not getattr(turn_acts, "is_empty", True):
-        turn_acts.expanded = True
         act_str = render_actions_group_str(turn_acts, width=layout_width)
         if act_str:
             parts.append(act_str)
-    elif getattr(state, "active_tool_name", None) or (getattr(state, "last_tool_name", None) and not streamed_chunks):
-        from cli.tui.chat import render_action_preview_str
-        from cli.tui.state import TurnAction
-
-        t_name = getattr(state, "active_tool_name", None) or getattr(state, "last_tool_name", None)
-        if t_name:
-            is_active = bool(getattr(state, "active_tool_name", None))
-            synth_act = TurnAction(
-                action_id="active",
-                description=t_name,
-                status="RUNNING" if is_active else "COMPLETED",
-                tool_name=t_name,
-                target=getattr(state, "active_tool_target", None) or (getattr(state, "last_tool_target", None) if not is_active else None),
-                code=getattr(state, "active_tool_code", None) or (getattr(state, "last_tool_code", None) if not is_active else None),
-                diff=getattr(state, "active_tool_diff", None) or (getattr(state, "last_tool_diff", None) if not is_active else None),
-                output=getattr(state, "active_tool_output", None) or (getattr(state, "last_tool_output", None) if not is_active else None),
-            )
-            prev_str = render_action_preview_str(synth_act, width=layout_width)
-            if prev_str:
-                parts.append(prev_str)
 
     # In-progress thinking - shows live thinking stream before and during answer streaming
     thinking = getattr(state, "current_turn_thinking", None)
@@ -476,6 +455,36 @@ def _stream_turn_execution(
                 clear_transcript_cache()
                 if live_manager is not None and getattr(live_manager, "is_active", False):
                     live_manager.handle_resize(new_cols, new_lines)
+
+            # Poll for scroll keys (PgUp/PgDn/Wheel) so users can scroll during streaming
+            if is_tty:
+                from cli.tui.keyboard import poll_scroll_key, Key as _Key
+                _scroll_key = poll_scroll_key()
+                if _scroll_key is not None:
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    vp_h = compute_viewport_height(term_lines, state=state)
+                    if _scroll_key in (_Key.PAGE_UP, _Key.MOUSE_WHEEL_UP):
+                        step = max(1, vp_h // 2) if _scroll_key == _Key.PAGE_UP else 3
+                        state.scroll_conversation_up(step)
+                    elif _scroll_key in (_Key.PAGE_DOWN, _Key.MOUSE_WHEEL_DOWN):
+                        step = max(1, vp_h // 2) if _scroll_key == _Key.PAGE_DOWN else 3
+                        state.scroll_conversation_down(step)
+                    # Immediate redraw after scroll
+                    _s_layout = compute_layout(shutil.get_terminal_size().columns)
+                    _s_content = _build_in_progress_turn_content(
+                        state, model_name, streamed_chunks,
+                        latest_act_desc, start_time, max_wait,
+                        _s_layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session, state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=_get_working_placeholder(),
+                        conversation_content=_s_content,
+                        live_manager=live_manager,
+                    )
             try:
                 t_event_start = time.monotonic()
                 ev = next(stream_gen)

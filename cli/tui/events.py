@@ -102,6 +102,22 @@ def clean_error_message(err: Any) -> str:
     ):
         return "Permission denied (outside assigned scope)"
 
+    # Strip verbose file lists from FileNotFoundError / ModuleNotFoundError
+    for cut_marker in ("Existing workspace files:", "Available workspace files:", "Available files:"):
+        if cut_marker in msg:
+            msg = msg[: msg.index(cut_marker)].rstrip(" .")
+            break
+
+    # Strip after first sentence boundary in *Error messages to avoid leaking implementation details
+    if re.match(r"^\w*Error:", msg):
+        sent_match = re.search(r"(?<=\.)\s", msg)
+        if sent_match:
+            msg = msg[: sent_match.start()].rstrip()
+
+    # Hard-cap inline error to 60 chars max
+    if len(msg) > 60:
+        msg = msg[:57] + "..."
+
     return msg
 
 
