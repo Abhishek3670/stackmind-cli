@@ -72,6 +72,11 @@ def _compute_cache_key(transcript_hash: str, width: int,
     )
 
 
+def clear_transcript_cache() -> None:
+    """Clear all cached rendered transcripts and visual lines."""
+    _TRANSCRIPT_CACHE.clear()
+
+
 def _clear_cache_if_needed() -> None:
     """Evict oldest entries if cache exceeds max size (FIFO eviction)."""
     if len(_TRANSCRIPT_CACHE) > _TRANSCRIPT_CACHE_MAX_SIZE:
@@ -1094,4 +1099,5 @@ __all__ = [
     "_TRANSCRIPT_CACHE",
     "_TRANSCRIPT_CACHE_MAX_SIZE",
     "_clear_cache_if_needed",
+    "clear_transcript_cache",
 ]

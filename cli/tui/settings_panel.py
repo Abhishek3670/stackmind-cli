@@ -963,6 +963,7 @@ def render_anchored_settings_panel_str(
         border_style="#3b82f6",
         width=box_w,
         padding=(0, 1),
+        expand=True,
     )
 
     sio = io.StringIO()

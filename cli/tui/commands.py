@@ -18,6 +18,7 @@ import click
 from rich.text import Text
 
 from cli.tui.chat import (
+    clear_transcript_cache,
     render_actions_group_str,
     render_assistant_message_str,
     render_assistant_stream_header,
@@ -472,6 +473,7 @@ def _stream_turn_execution(
             resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
             if resized:
                 current_cols, current_lines = new_cols, new_lines
+                clear_transcript_cache()
                 if live_manager is not None and getattr(live_manager, "is_active", False):
                     live_manager.handle_resize(new_cols, new_lines)
             try:

@@ -488,6 +488,7 @@ def render_runtime_panel(
         padding=(0, 1),
         width=width,
         height=height,
+        expand=True,
     )
 
 

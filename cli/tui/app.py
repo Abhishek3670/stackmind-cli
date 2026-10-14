@@ -30,6 +30,7 @@ from typing import Any
 import click
 
 from cli.daemon import DEFAULT_DAEMON_PORT, clear_daemon_pid, daemon_health, write_daemon_pid
+from cli.tui.chat import clear_transcript_cache
 from cli.tui.commands import (
     _build_in_progress_turn_content,
     _compute_blocker,
@@ -437,8 +438,21 @@ def tui(
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
                 if resized:
                     current_cols, current_lines = new_cols, new_lines
+                    clear_transcript_cache()
                     if live_ws is not None and getattr(live_ws, "is_active", False):
                         live_ws.handle_resize(new_cols, new_lines)
+                    elif is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            width=new_cols,
+                            height=new_lines,
+                            clear=True,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=getattr(state, "composer_buffer", ""),
+                            live_manager=live_ws,
+                        )
                 term_cols = current_cols
                 layout_info = compute_layout(term_cols)
                 conv_width = (

@@ -445,3 +445,77 @@ def test_resize_preserves_conversation_scroll_without_geometry_drift():
     assert state.conversation_scroll.scroll_offset >= 0
 
 
+def test_dynamic_resize_120_70_140_cache_invalidation_and_panel_visibility():
+    """Verify resizing across 120x40 -> 70x20 -> 140x50 adapts panels, cache, and line budgets."""
+    from cli.tui.chat import _TRANSCRIPT_CACHE, clear_transcript_cache
+
+    state = AutonomousDeliveryState("demo", session_id="test-resize-120-70-140")
+    state.add_message("user", "Can you refactor the backend database layer?")
+    state.add_message("assistant", "Sure, starting architectural decomposition.")
+    session = {"session_id": "test-resize-120-70-140", "agent": "architect", "provider": "daemon"}
+
+    manager = LiveWorkspaceManager(session=session, state=state, width=120, height=40)
+
+    # 1. At 120x40 (width >= 100, show_runtime is True)
+    renderable_120 = manager.build_renderable(include_composer=True)
+    lines_120 = renderable_120.plain.splitlines()
+    assert len(lines_120) == 40
+    layout_120 = compute_layout(120)
+    assert layout_120.show_runtime is True
+    assert "StackMind Runtime" in renderable_120.plain
+    # Cache was populated
+    assert len(_TRANSCRIPT_CACHE) > 0
+
+    # 2. Resize to 70x20 (width < 95 -> narrow, show_runtime is False, side panel collapsed)
+    with patch("cli.tui.chat.clear_transcript_cache", wraps=clear_transcript_cache) as mock_clear:
+        manager.handle_resize(70, 20)
+        mock_clear.assert_called()
+
+    renderable_70 = manager.build_renderable(include_composer=True)
+    lines_70 = renderable_70.plain.splitlines()
+    assert len(lines_70) == 20
+    layout_70 = compute_layout(70)
+    assert layout_70.show_runtime is False
+    assert "StackMind Runtime" not in renderable_70.plain
+
+    # 3. Resize to 140x50 (wide breakpoint, runtime panel re-appears)
+    with patch("cli.tui.chat.clear_transcript_cache", wraps=clear_transcript_cache) as mock_clear_2:
+        manager.handle_resize(140, 50)
+        mock_clear_2.assert_called()
+
+    renderable_140 = manager.build_renderable(include_composer=True)
+    lines_140 = renderable_140.plain.splitlines()
+    assert len(lines_140) == 50
+    layout_140 = compute_layout(140)
+    assert layout_140.show_runtime is True
+    assert "StackMind Runtime" in renderable_140.plain
+
+
+def test_long_multiline_composer_and_tall_code_blocks_visual_line_sliced():
+    """Verify long multiline pastes and tall assistant code blocks do not overflow viewport."""
+    state = AutonomousDeliveryState("demo", session_id="test-tall-blocks")
+    tall_code = "```python\n" + "\n".join(f"def func_{i}():\n    return {i}" for i in range(40)) + "\n```"
+    state.add_message("assistant", f"Here is the implementation:\n{tall_code}")
+    session = {"session_id": "test-tall-blocks", "agent": "architect", "provider": "daemon"}
+
+    # Large multiline composer paste
+    large_paste = "\n".join(f"paste line {i} with lots of additional text content" for i in range(25))
+
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=100,
+        height=24,
+        composer_content=large_paste,
+        include_composer=True,
+    )
+    lines = frame.split("\n")
+    # Total lines strictly equal to height
+    assert len(lines) == 24
+    # Status bar preserved at the bottom
+    assert "test-tal" in lines[-1]
+    assert "online" in lines[-1]
+    # Composer box bottom border at lines[-2]
+    assert lines[-2][0] in ("╰", "└")
+
+

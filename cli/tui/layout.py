@@ -581,6 +581,7 @@ def slice_conversation_viewport(
     viewport_height: int,
     scroll: ConversationScroll | int | None = None,
     pad: bool = True,
+    avail_width: int | None = None,
 ) -> str:
     """Slice conversation text to fit the viewport height based on scroll offset (§31).
 
@@ -591,7 +592,35 @@ def slice_conversation_viewport(
     if viewport_height <= 0:
         return content
 
-    lines = content.split("\n")
+    if avail_width is not None and avail_width > 0:
+        c, _ = _make_capture_console(width=avail_width)
+        visual_lines: list[str] = []
+        for raw_line in content.split("\n"):
+            if not raw_line:
+                visual_lines.append("")
+                continue
+            if len(raw_line) <= avail_width and "\x1b[" not in raw_line:
+                visual_lines.append(raw_line)
+                continue
+            t = Text.from_ansi(raw_line) if "\x1b[" in raw_line else Text(raw_line)
+            if t.cell_len <= avail_width:
+                visual_lines.append(raw_line)
+            else:
+                parts = t.wrap(c, avail_width)
+                if not parts:
+                    visual_lines.append("")
+                else:
+                    for part in parts:
+                        if "\x1b[" in raw_line:
+                            cap, _ = _make_capture_console(width=avail_width, force_color=True)
+                            cap.print(part, end="")
+                            visual_lines.append(cap.export_text(styles=True))
+                        else:
+                            visual_lines.append(part.plain)
+        lines = visual_lines
+    else:
+        lines = content.split("\n")
+
     total_lines = len(lines)
 
     if isinstance(scroll, int):
@@ -665,13 +694,14 @@ def render_workspace_layout(
     if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
         active_scroll = getattr(state, "conversation_scroll")
 
+    conv_w = layout.conversation_width if layout.show_runtime else width
     conv_column = render_conversation_column(
         conversation_renderable,
         scroll=active_scroll,
         state=state,
         show_scrollbar=(not layout.show_runtime),
         viewport_height=height,
-        width=width,
+        width=conv_w,
     )
 
     if not layout.show_runtime:
@@ -763,11 +793,13 @@ def render_workspace_layout_str(
         # 1806659: reserve 2 lines for the scroll activity badge when active (§31).
         if active_scroll is not None and getattr(active_scroll, "has_new_activity", False):
             effective_vp_height = max(1, effective_vp_height - 2)
+        conv_w = layout.conversation_width if layout.show_runtime else width
         conversation_text = slice_conversation_viewport(
             conversation_text,
             viewport_height=effective_vp_height,
             scroll=active_scroll,
             pad=True,
+            avail_width=conv_w,
         )
 
     console, use_ansi = _make_capture_console(
@@ -883,6 +915,7 @@ def render_full_screen_workspace(
             session=session,
             status=status,
             width=layout.conversation_width,
+            height=height,
         )
 
     # 4. Workspace layout with sliced conversation and persistent runtime panel
@@ -909,8 +942,18 @@ def render_full_screen_workspace(
 
     if not include_composer:
         if settings_open and settings_panel_str:
-            return f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{settings_panel_str}"
-        return f"{workspace_str}\n{status_bar_str}" if status_bar_str else workspace_str
+            res = f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{settings_panel_str}"
+        else:
+            res = f"{workspace_str}\n{status_bar_str}" if status_bar_str else workspace_str
+        all_lines = res.split("\n")
+        if height is not None:
+            comp_h = compute_composer_height(composer_content, height=height, state=state)
+            exp_lines = max(1, height - comp_h)
+            if len(all_lines) > exp_lines:
+                all_lines = all_lines[-exp_lines:]
+            elif len(all_lines) < exp_lines:
+                all_lines.extend([""] * (exp_lines - len(all_lines)))
+        return "\n".join(all_lines)
 
     # 5. Dynamic bottom composer box placed above bottom status bar / settings panel
     comp_width = layout.conversation_width if layout.show_runtime else width
@@ -928,9 +971,17 @@ def render_full_screen_workspace(
     )
 
     if settings_open and settings_panel_str:
-        return f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}\n{settings_panel_str}"
+        res = f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}\n{settings_panel_str}"
+    else:
+        res = f"{workspace_str}\n{composer_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}"
 
-    return f"{workspace_str}\n{composer_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}"
+    all_lines = res.split("\n")
+    if height is not None:
+        if len(all_lines) > height:
+            all_lines = all_lines[-height:]
+        elif len(all_lines) < height:
+            all_lines.extend([""] * (height - len(all_lines)))
+    return "\n".join(all_lines)
 
 
 # ── Live Workspace Manager (Rich.Live Integration / WO-003) ───────────────────
@@ -1097,8 +1148,16 @@ class LiveWorkspaceManager:
         """Dynamically adapt dimensions upon terminal resize."""
         self.width = max(20, width)
         self.height = max(4, height)
+        try:
+            from cli.tui.chat import clear_transcript_cache
+            clear_transcript_cache()
+        except Exception:
+            pass
         if self._live is not None and self._custom_console is None:
             try:
+                from rich.console import ConsoleDimensions
+
+                self._live.console.size = ConsoleDimensions(self.width, self.height)
                 self._live.console.width = self.width
                 self._live.console.height = self.height
             except Exception:

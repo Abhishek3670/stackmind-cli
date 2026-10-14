@@ -89,6 +89,8 @@ def render_landing_block(
     session_id: str | None = None,
     project: str | Path | None = None,
     show_hints: bool | None = None,
+    compact: bool = False,
+    height: int | None = None,
 ) -> RenderableType:
     """Render the locked StackMind landing block (IMPLEMENTATION_PLAN_TUI.md §5).
 
@@ -134,6 +136,14 @@ def render_landing_block(
     for ch, col in zip(LANDING_NAME, gradient_palette):
         title_line.append(ch, style=f"bold {col}")
     title_line.append(f" {ver_str}", style="dim white")
+
+    if compact or (height is not None and height < 20):
+        return Panel(
+            title_line,
+            box=box.ROUNDED,
+            border_style="dim #334155",
+            padding=(0, 1),
+        )
 
     # 2. Tagline
     tagline_text = Text(LANDING_TAGLINE, style="dim white", justify="center")
@@ -266,6 +276,8 @@ def render_landing_block_str(
     session_id: str | None = None,
     project: str | Path | None = None,
     show_hints: bool | None = None,
+    compact: bool = False,
+    height: int | None = None,
 ) -> str:
     """Render the landing block as plain formatted string using in-memory capture."""
     if isinstance(session, str):
@@ -282,6 +294,8 @@ def render_landing_block_str(
             session_id=session_id,
             project=project,
             show_hints=show_hints,
+            compact=compact,
+            height=height,
         )
     )
     return console.export_text().rstrip()
