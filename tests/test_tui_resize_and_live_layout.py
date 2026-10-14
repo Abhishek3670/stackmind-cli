@@ -519,3 +519,84 @@ def test_long_multiline_composer_and_tall_code_blocks_visual_line_sliced():
     assert lines[-2][0] in ("╰", "└")
 
 
+def test_resize_during_idle_prompt_input_triggers_atomic_repaint(monkeypatch):
+    """Verify that resizing while idle at prompt triggers on_resize and atomic screen repaint."""
+    import os
+    import shutil
+    from cli.tui.app import prompt_composer_input
+    from cli.tui.keyboard import Key
+
+    state = AutonomousDeliveryState("demo-resize-idle", session_id="test-sess-resize")
+    session = {"session_id": "test-sess-resize", "agent": "architect", "provider": "daemon"}
+
+    # Mock terminal sizes: start at 80x24, then resize to 100x30
+    sizes = [os.terminal_size((80, 24)), os.terminal_size((100, 30))]
+    def mock_get_terminal_size(fallback=(80, 24)):
+        if sizes:
+            return sizes[0]
+        return os.terminal_size((100, 30))
+
+    monkeypatch.setattr(shutil, "get_terminal_size", mock_get_terminal_size)
+
+    # Key stream: first None (idle tick where resize occurs), then ENTER to complete
+    called_resize = []
+    def mock_on_resize(cols, lines, ed=None):
+        called_resize.append((cols, lines))
+
+    # Trigger resize after first check
+    key_steps = [None, Key.ENTER]
+    def mock_read_next_key(key_stream=None, timeout=None):
+        if sizes and len(sizes) > 1:
+            # Pop size to simulate resize event during poll tick
+            sizes.pop(0)
+        if key_steps:
+            return key_steps.pop(0)
+        return Key.ENTER
+
+    monkeypatch.setattr("cli.tui.keyboard.read_next_key", mock_read_next_key)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    stdout_writes = []
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+
+    val = prompt_composer_input(
+        width=80,
+        state=state,
+        session=session,
+        on_resize=mock_on_resize,
+        full_screen=True,
+    )
+
+    # on_resize was called with the new dimensions
+    assert len(called_resize) >= 1
+    assert called_resize[0] == (100, 30)
+
+
+def test_empty_conversation_landing_state_frame_strictly_fits_height():
+    """Verify landing block + composer + status bar strictly fits within height lines without trailing newline."""
+    state = AutonomousDeliveryState("demo-empty", session_id="test-landing-height")
+    session = {"session_id": "test-landing-height", "agent": "codex", "provider": "daemon"}
+
+    for h in (16, 20, 24, 30):
+        frame = render_full_screen_workspace(
+            session=session,
+            state=state,
+            width=100,
+            height=h,
+            include_composer=True,
+        )
+        # Must have NO trailing newline
+        assert not frame.endswith("\n")
+        lines = frame.split("\n")
+        # Exactly h lines (h - 1 newlines)
+        assert len(lines) == h, f"Expected {h} lines for height={h}, got {len(lines)}"
+        # Last line must be status bar
+        assert "test-lan" in lines[-1]
+        assert "online" in lines[-1]
+        # Composer bottom border must be line h - 2
+        assert lines[-2][0] in ("╰", "└")
+
+
+

@@ -750,8 +750,71 @@ def tui(
                     sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                     sys.stdout.flush()
 
+                def _handle_resize(new_cols: int, new_lines: int, editor: Any = None) -> None:
+                    nonlocal current_cols, current_lines, term_cols, comp_width, layout_info
+                    current_cols, current_lines = new_cols, new_lines
+                    term_cols = new_cols
+                    layout_info = compute_layout(new_cols)
+                    conv_width = (
+                        layout_info.conversation_width if layout_info.show_runtime else new_cols
+                    )
+                    comp_width = conv_width if layout_info.show_runtime else new_cols
+
+                    clear_transcript_cache()
+                    if editor is not None:
+                        editor.width = comp_width
+
+                    if live_ws is not None and getattr(live_ws, "is_active", False):
+                        try:
+                            live_ws.handle_resize(new_cols, new_lines)
+                        except Exception:
+                            pass
+
+                    if is_tty:
+                        current_text = (
+                            "".join(editor.buffer)
+                            if (
+                                editor is not None
+                                and isinstance(getattr(editor, "buffer", None), list)
+                            )
+                            else getattr(state, "composer_buffer", "")
+                        )
+                        redraw_full_screen(
+                            session,
+                            state,
+                            width=new_cols,
+                            height=new_lines,
+                            clear=True,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=current_text,
+                            live_manager=live_ws,
+                        )
+                        cursor_col = _compute_cursor_col(editor) if editor else 5
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            new_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        try:
+                            editor.redraw_line()
+                        except Exception:
+                            pass
+
                 def _handle_idle(editor: Any = None) -> None:
-                    if not is_tty or client is None:
+                    if not is_tty:
+                        return
+                    term_size = shutil.get_terminal_size(fallback=(80, 24))
+                    if (term_size.columns, term_size.lines) != (current_cols, current_lines):
+                        _handle_resize(term_size.columns, term_size.lines, editor)
+                        return
+                    if client is None:
                         return
                     sid = session.get("session_id")
                     if not sid:
@@ -823,6 +886,7 @@ def tui(
                     on_wheel_down=_handle_wheel_down,
                     on_height_change=_handle_height_change,
                     on_idle=_handle_idle,
+                    on_resize=_handle_resize,
                     show_footer=True,
                     live_manager=live_ws,
                     full_screen=is_tty,

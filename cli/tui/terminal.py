@@ -822,6 +822,7 @@ def prompt_composer_input(
     full_screen: bool = False,
     key_stream: Optional[Iterator[str]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
+    on_resize: Optional[Callable[..., None]] = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
@@ -935,6 +936,75 @@ def prompt_composer_input(
                 except Exception:
                     pass
 
+        def _handle_prompt_resize(new_cols: int, new_lines: int, ed: Any = None) -> None:
+            nonlocal comp_width
+            try:
+                from cli.tui.chat import clear_transcript_cache
+                clear_transcript_cache()
+            except Exception:
+                pass
+
+            layout = compute_layout(new_cols)
+            comp_width = layout.conversation_width if layout.show_runtime else new_cols
+            if ed is not None:
+                ed.width = comp_width
+
+            if on_resize is not None:
+                try:
+                    on_resize(new_cols, new_lines, ed)
+                    return
+                except TypeError:
+                    try:
+                        on_resize(new_cols, new_lines)
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            if is_live_active:
+                try:
+                    live_manager.handle_resize(new_cols, new_lines)
+                except Exception:
+                    pass
+
+            if is_full_screen and session is not None and state is not None:
+                try:
+                    current_text = (
+                        "".join(ed.buffer)
+                        if (ed is not None and isinstance(getattr(ed, "buffer", None), list))
+                        else getattr(state, "composer_buffer", "")
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        width=new_cols,
+                        height=new_lines,
+                        clear=True,
+                        include_composer=True,
+                        composer_is_active=True,
+                        composer_content=current_text,
+                        live_manager=live_manager,
+                    )
+                    cursor_line = getattr(ed, "current_visible_line_index", None) if ed else None
+                    c_row = compute_composer_cursor_row(
+                        new_lines,
+                        state=state,
+                        composer_content=current_text,
+                        cursor_line=cursor_line,
+                    )
+                    c_col = _compute_cursor_col(ed) if ed else 5
+                    sys.stdout.write(f"\x1b[{c_row};{c_col}H")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+            if ed is not None and hasattr(ed, "redraw_line"):
+                try:
+                    ed.redraw_line()
+                except Exception:
+                    pass
+
         try:
             _raw_prompt_fn = getattr(
                 sys.modules.get("cli.tui.app"), "raw_prompt_input", raw_prompt_input
@@ -974,6 +1044,7 @@ def prompt_composer_input(
                 on_alert=_handle_alert,
                 on_idle=on_idle,
                 on_height_change=on_height_change,
+                on_resize=_handle_prompt_resize,
             )
         finally:
             if state is not None:

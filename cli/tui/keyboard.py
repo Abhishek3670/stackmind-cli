@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import shutil
 import sys
 import time
 from typing import Any, Callable, Iterator, Optional
@@ -1612,6 +1613,7 @@ def raw_prompt_input(
     on_alert: Optional[Callable[[Optional[str]], None]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
     on_height_change: Optional[Callable[[Any], None]] = None,
+    on_resize: Optional[Callable[..., None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -1751,10 +1753,29 @@ def raw_prompt_input(
     try:
         with TerminalStateRestorer():
             editor.redraw_line()
+            last_term_size = shutil.get_terminal_size(fallback=(width, 24))
             while True:
                 try:
-                    read_timeout = 0.08 if (on_idle or editor.alert is not None) else None
+                    read_timeout = 0.05 if key_stream is None else None
                     k = read_next_key(key_stream=key_stream, timeout=read_timeout)
+
+                    term_size = shutil.get_terminal_size(fallback=(width, 24))
+                    if (term_size.columns, term_size.lines) != (last_term_size.columns, last_term_size.lines):
+                        last_term_size = term_size
+                        if on_resize is not None:
+                            try:
+                                on_resize(term_size.columns, term_size.lines, editor)
+                            except TypeError:
+                                try:
+                                    on_resize(term_size.columns, term_size.lines)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        else:
+                            editor.width = term_size.columns
+                            editor.redraw_line()
+
                     if k is None:
                         if editor.alert is not None and editor._ctrl_c_timestamp is not None:
                             if (time.monotonic() - editor._ctrl_c_timestamp) > editor._ctrl_c_timeout:

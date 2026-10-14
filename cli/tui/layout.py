@@ -915,7 +915,7 @@ def render_full_screen_workspace(
             session=session,
             status=status,
             width=layout.conversation_width,
-            height=height,
+            height=min(height, viewport_height) if height is not None else None,
         )
 
     # 4. Workspace layout with sliced conversation and persistent runtime panel
