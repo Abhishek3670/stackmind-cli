@@ -968,6 +968,7 @@ def render_full_screen_workspace(
         no_color=no_color,
         alert=getattr(state, "composer_alert", None) if state is not None else None,
         height=height,
+        retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
     )
 
     if settings_open and settings_panel_str:

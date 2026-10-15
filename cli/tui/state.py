@@ -614,6 +614,73 @@ class AutonomousDeliveryState:
         self.execution_profile: str = "medium"
         self.cycle_telemetry: list[dict[str, Any]] = []
         self.last_telemetry: dict[str, Any] | None = None
+        self.attempt_count: int = 0
+        self.max_attempts: int = 10
+        self.retry_count: int = 0
+        self.max_retries: int = 10
+        self.retry_status: str | None = None
+
+    @property
+    def retry_status_display(self) -> str | None:
+        """Formatted retry/attempt status for top-right border display (§retry)."""
+        if self.retry_status is not None:
+            return self.retry_status
+        if self.attempt_count > 0 or self.retry_count > 0:
+            return f"({self.attempt_count}/{self.max_attempts} Attempt . {self.retry_count}/{self.max_retries} Retry)"
+        return None
+
+    def record_attempt(
+        self,
+        attempt: int | None = None,
+        retry: int | None = None,
+        max_attempts: int | None = None,
+        max_retries: int | None = None,
+        status: str | None = None,
+    ) -> str:
+        """Record an attempt/retry update according to two-tier retry mechanism."""
+        if max_attempts is not None:
+            try:
+                self.max_attempts = max(1, int(max_attempts))
+            except (ValueError, TypeError):
+                pass
+        if max_retries is not None:
+            try:
+                self.max_retries = max(1, int(max_retries))
+            except (ValueError, TypeError):
+                pass
+
+        if status is not None:
+            self.retry_status = str(status)
+            return self.retry_status
+
+        if attempt is not None:
+            try:
+                self.attempt_count = int(attempt)
+            except (ValueError, TypeError):
+                self.attempt_count += 1
+        else:
+            if self.attempt_count >= self.max_attempts:
+                self.attempt_count = 1
+            else:
+                self.attempt_count += 1
+
+        if retry is not None:
+            try:
+                self.retry_count = int(retry)
+            except (ValueError, TypeError):
+                pass
+        else:
+            # When attempts are exhausted, count as 1/10 retry
+            if self.attempt_count == self.max_attempts:
+                self.retry_count += 1
+
+        return self.retry_status_display or ""
+
+    def reset_attempts_and_retries(self) -> None:
+        """Reset attempt and retry counters for a fresh session or completed task."""
+        self.attempt_count = 0
+        self.retry_count = 0
+        self.retry_status = None
 
     def open_settings(self, settings_obj: Any | None = None, initial_view: str = "main") -> None:
         """Open the interactive settings panel anchored below the composer."""
@@ -1576,6 +1643,31 @@ class AutonomousDeliveryState:
         name = str(event.get("name", ""))
         payload_raw = event.get("payload")
         payload: Mapping[str, Any] = payload_raw if isinstance(payload_raw, Mapping) else {}
+
+        # Two-tier attempt and retry tracking (§retry)
+        if any(k in payload for k in ("attempt", "retry", "max_attempts", "max_retries", "retry_status")):
+            self.record_attempt(
+                attempt=payload.get("attempt"),
+                retry=payload.get("retry"),
+                max_attempts=payload.get("max_attempts"),
+                max_retries=payload.get("max_retries"),
+                status=payload.get("retry_status"),
+            )
+        elif payload.get("prompt"):
+            prompt_text = str(payload.get("prompt"))
+            import re
+            m = re.search(r"\((\d+)/(\d+)\s+Attempt\s+\.\s+(\d+)/(\d+)\s+Retry\)", prompt_text, re.IGNORECASE)
+            if m:
+                self.record_attempt(
+                    attempt=int(m.group(1)),
+                    max_attempts=int(m.group(2)),
+                    retry=int(m.group(3)),
+                    max_retries=int(m.group(4)),
+                )
+            else:
+                m_att = re.search(r"\(attempt\s+(\d+)\)", prompt_text, re.IGNORECASE)
+                if m_att:
+                    self.record_attempt(attempt=int(m_att.group(1)))
 
         if name == "plan.proposed":
             self.phase = ProjectPhase.AWAITING_APPROVAL

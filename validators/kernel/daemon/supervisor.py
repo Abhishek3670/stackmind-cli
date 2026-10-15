@@ -120,6 +120,7 @@ class RunState:
     failed_wo_ids: list[str] = field(default_factory=list)
     blocked_wo_ids: list[str] = field(default_factory=list)
     retry_counts: dict[str, int] = field(default_factory=dict)
+    attempt_counts: dict[str, int] = field(default_factory=dict)
     contention_count: int = 0
     integration_operation_id: str | None = None
     integration_wo_id: str | None = None
@@ -132,7 +133,8 @@ class RunState:
     updated_at: str = ""
     release_commit_sha: str | None = None
     transitions: list[dict[str, str]] = field(default_factory=list)
-    max_retries: int = 2
+    max_retries: int = 10
+    max_attempts: int = 10
     ignored_operation_ids: list[str] = field(default_factory=list)
     dependency_escalation_op_id: str | None = None
     dependency_escalation_wo_id: str | None = None
@@ -183,6 +185,7 @@ class RunState:
             "failed_wo_ids": list(self.failed_wo_ids),
             "blocked_wo_ids": list(self.blocked_wo_ids),
             "retry_counts": dict(self.retry_counts),
+            "attempt_counts": dict(self.attempt_counts),
             "contention_count": self.contention_count,
             "integration_operation_id": self.integration_operation_id,
             "integration_wo_id": self.integration_wo_id,
@@ -196,6 +199,7 @@ class RunState:
             "updated_at": self.updated_at,
             "transitions": list(self.transitions),
             "max_retries": self.max_retries,
+            "max_attempts": self.max_attempts,
             "ignored_operation_ids": list(self.ignored_operation_ids),
             "dependency_escalation_op_id": self.dependency_escalation_op_id,
             "dependency_escalation_wo_id": self.dependency_escalation_wo_id,
@@ -240,6 +244,7 @@ class RunState:
             failed_wo_ids=data.get("failed_wo_ids", []),
             blocked_wo_ids=data.get("blocked_wo_ids", []),
             retry_counts=data.get("retry_counts", {}),
+            attempt_counts=data.get("attempt_counts", {}),
             contention_count=data.get("contention_count", 0),
             integration_operation_id=data.get("integration_operation_id"),
             integration_wo_id=data.get("integration_wo_id"),
@@ -252,7 +257,8 @@ class RunState:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             transitions=data.get("transitions", []),
-            max_retries=data.get("max_retries", 2),
+            max_retries=data.get("max_retries", 10),
+            max_attempts=data.get("max_attempts", 10),
             ignored_operation_ids=list(data.get("ignored_operation_ids", [])),
             dependency_escalation_op_id=data.get("dependency_escalation_op_id"),
             dependency_escalation_wo_id=data.get("dependency_escalation_wo_id"),
@@ -2025,35 +2031,52 @@ class LifecycleSupervisor:
     def _retry_worker(
         self, state: RunState, ws: Path, wo_id: str, make_prompt: Callable[[int, str], str],
     ) -> bool:
-        """Bounded worker retry. True when a retry was attempted (budget left).
+        """Bounded worker retry: two-tier attempt and retry mechanism.
 
-        Budget exhaustion or a failed dispatch marks the work order failed.
+        Attempts count up to max_attempts (default 10). When attempts are exhausted,
+        it counts as 1 retry (1/10 Retry) and resets attempts for the next retry round.
+        Exhaustion of both attempts and retries marks the work order failed.
         """
+        attempts = state.attempt_counts.get(wo_id, 0) + 1
         retries = state.retry_counts.get(wo_id, 0)
+
         if retries >= state.max_retries:
             state.failed_wo_ids.append(wo_id)
             return False
+
+        if attempts > state.max_attempts:
+            retries += 1
+            state.retry_counts[wo_id] = retries
+            attempts = 1
+            if retries >= state.max_retries:
+                state.failed_wo_ids.append(wo_id)
+                return False
+        elif attempts == state.max_attempts and retries == 0:
+            retries = 1
+            state.retry_counts[wo_id] = retries
+
+        state.attempt_counts[wo_id] = attempts
+
         agent = self._agent_for_wo(wo_id, ws)
         try:
             self.manager.start_turn(
                 state.session_id,
-                make_prompt(retries + 2, agent),
+                make_prompt(attempts + 1, agent),
                 role=self._role_for_agent(agent),
                 agent_id=agent,
                 work_order_id=wo_id,
                 parent_operation_id=state.batch_operation_id,
+                attempt=attempts,
+                max_attempts=state.max_attempts,
+                retry=retries,
+                max_retries=state.max_retries,
             )
-            # Budget is consumed only after a successful dispatch — a
-            # contention failure never consumes a turn that never ran.
-            state.retry_counts[wo_id] = retries + 1
         except OperationContentionError:
-            # Parallel sibling turns share the session: roll the retry budget
-            # back and let advance() wait for the session to free — the retry
-            # is re-attempted without consuming budget on a turn that never ran.
-            state.retry_counts[wo_id] = retries
+            state.attempt_counts[wo_id] = max(0, attempts - 1)
             raise
         except Exception:
             state.failed_wo_ids.append(wo_id)
+            return False
         return True
 
     def _close_batch_operation(self, state: RunState, status: str) -> None:

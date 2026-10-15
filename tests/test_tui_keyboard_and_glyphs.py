@@ -1315,6 +1315,93 @@ def test_raw_prompt_input_async_keyboard_interrupt_reset_on_typing():
     assert alerts[-1] is None
 
 
+def test_two_tier_retry_and_attempt_state():
+    """Verify AutonomousDeliveryState two-tier attempt and retry counting logic."""
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState()
+    assert state.attempt_count == 0
+    assert state.max_attempts == 10
+    assert state.retry_count == 0
+    assert state.max_retries == 10
+    assert state.retry_status_display is None
+
+    # Step through 9 attempts: retry_count remains 0
+    for i in range(1, 10):
+        disp = state.record_attempt()
+        assert state.attempt_count == i
+        assert state.retry_count == 0
+        assert disp == f"({i}/10 Attempt . 0/10 Retry)"
+
+    # 10th attempt: attempts exhausted -> counts as 1/10 Retry
+    disp10 = state.record_attempt()
+    assert state.attempt_count == 10
+    assert state.retry_count == 1
+    assert disp10 == "(10/10 Attempt . 1/10 Retry)"
+    assert state.retry_status_display == "(10/10 Attempt . 1/10 Retry)"
+
+    # 11th attempt: resets attempt to 1 for the next retry round
+    disp11 = state.record_attempt()
+    assert state.attempt_count == 1
+    assert state.retry_count == 1
+    assert disp11 == "(1/10 Attempt . 1/10 Retry)"
+
+    # Reset
+    state.reset_attempts_and_retries()
+    assert state.attempt_count == 0
+    assert state.retry_count == 0
+    assert state.retry_status_display is None
+
+
+def test_composer_border_renders_retry_status_top_right():
+    """Verify composer box and top border render (10/10 Attempt . 1/10 Retry) on top-right."""
+    status_str = "(10/10 Attempt . 1/10 Retry)"
+
+    # 1. Box with retry_status only
+    box_out = render_composer_box_str(width=70, retry_status=status_str)
+    top_line = box_out.splitlines()[0]
+    assert status_str in top_line
+    # Top-right positioning: status appears in the right half of the line
+    assert top_line.rfind(status_str) > len(top_line) // 2
+
+    # 2. Box with both working status (left) and retry_status (right)
+    box_working = render_composer_box_str(width=80, title="Working...", retry_status=status_str)
+    working_top = box_working.splitlines()[0]
+    assert "Working..." in working_top
+    assert status_str in working_top
+    assert working_top.find("Working...") < working_top.find(status_str)
+
+    # 3. Interactive top border
+    border_out = render_composer_top_border_str(width=70, retry_status=status_str)
+    assert status_str in border_out
+    assert border_out.rfind(status_str) > len(border_out) // 2
+
+
+def test_layout_workspace_and_process_event_retry_display():
+    """Verify process_event updates retry status and layout reflects it in composer."""
+    from cli.tui.layout import render_full_screen_workspace
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState()
+    # Ingest event with attempt/retry payload
+    state.process_event({
+        "name": "turn.started",
+        "payload": {
+            "work_order_id": "WO-001",
+            "attempt": 10,
+            "max_attempts": 10,
+            "retry": 1,
+            "max_retries": 10,
+        },
+    })
+    assert state.retry_status_display == "(10/10 Attempt . 1/10 Retry)"
+
+    session = {"session_id": "sess-1", "agent": "claude", "state": "RUNNING"}
+    rendered = render_full_screen_workspace(session, state, width=80, height=24)
+    assert "(10/10 Attempt . 1/10 Retry)" in rendered
+
+
+
 
 
 

@@ -226,6 +226,7 @@ def render_composer_box(
     alert: str | None = None,
     title: str | None = None,
     height: int | None = None,
+    retry_status: str | None = None,
 ) -> Panel:
     """Render the rounded input composer box."""
     from cli.tui.layout import get_composer_line_limits
@@ -347,18 +348,45 @@ def render_composer_box(
         body = Group(*rendered_lines)
 
     panel_title = None
-    if working_status:
+    title_align = "left"
+
+    if working_status and retry_status:
+        gap = width - 5 - len(working_status) - len(retry_status) - 2
+        if gap >= 2:
+            panel_title = Text.assemble(
+                working_status,
+                style="bold #38bdf8",
+            )
+            panel_title.append(" " + "─" * gap + " ", style=border_color)
+            panel_title.append(retry_status, style="dim #94a3b8")
+            title_align = "left"
+        elif width >= len(working_status) + len(retry_status) + 6:
+            panel_title = Text.assemble(
+                working_status,
+                style="bold #38bdf8",
+            )
+            panel_title.append(" ", style=border_color)
+            panel_title.append(retry_status, style="dim #94a3b8")
+            title_align = "left"
+        else:
+            panel_title = Text(retry_status, style="dim #94a3b8")
+            title_align = "right"
+    elif working_status:
         panel_title = Text()
         panel_title.append(" ")
         panel_title.append(working_status, style="bold #38bdf8")
         panel_title.append(" ")
+        title_align = "left"
+    elif retry_status:
+        panel_title = Text(retry_status, style="dim #94a3b8")
+        title_align = "right"
 
     return Panel(
         body,
         box=box.ROUNDED,
         border_style=border_color,
         title=panel_title,
-        title_align="left",
+        title_align=title_align,
         subtitle=f"[bold #f59e0b] {alert} [/]" if alert else None,
         padding=(0, 1),
     )
@@ -377,6 +405,7 @@ def render_composer_box_str(
     alert: str | None = None,
     title: str | None = None,
     height: int | None = None,
+    retry_status: str | None = None,
 ) -> str:
     """Render input composer box as plain or ANSI-styled string using in-memory capture."""
     console, use_ansi = _make_capture_console(
@@ -395,6 +424,7 @@ def render_composer_box_str(
             alert=alert,
             title=title,
             height=height,
+            retry_status=retry_status,
         )
     )
     return console.export_text(styles=use_ansi).rstrip()
@@ -631,8 +661,9 @@ def render_composer_top_border(
     has_content: bool = False,
     content: str | list[str] | None = None,
     height: int | None = None,
+    retry_status: str | None = None,
 ) -> RenderableType:
-    """Render top border of composer box with placeholder and shortcuts."""
+    """Render top border of composer box with placeholder, shortcuts, and retry status."""
     from cli.tui.layout import get_composer_line_limits
 
     border_color = "#60a5fa" if is_active else "#475569"
@@ -669,24 +700,38 @@ def render_composer_top_border(
         sc for sc in shortcut_candidates if sc and not (sc in seen or seen.add(sc))
     ]
 
-    if label:
-        chosen_sc = None
+    right_label = retry_status
+    if not right_label:
         for sc in shortcut_candidates:
             fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(sc) + len(" ─╮")
             if width >= fixed_len + 2:
-                chosen_sc = sc
+                right_label = sc
                 break
 
-        if chosen_sc is not None:
-            fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(chosen_sc) + len(" ─╮")
-            fill_count = width - fixed_len
-            text = Text()
-            text.append("╭─ ", style=border_color)
-            text.append(label, style="bold #38bdf8" if (active_content or lines_count > max_input_lines) else "dim #94a3b8")
-            text.append(" " + "─" * fill_count + " ", style=border_color)
-            text.append(chosen_sc, style="dim #64748b")
-            text.append(" ─╮", style=border_color)
-            return text
+    if label:
+        if right_label is not None:
+            fixed_len = len("╭─ ") + len(label) + len(" ") + len(" ") + len(right_label) + len(" ─╮")
+            if width >= fixed_len:
+                fill_count = width - fixed_len
+                text = Text()
+                text.append("╭─ ", style=border_color)
+                text.append(label, style="bold #38bdf8" if (active_content or lines_count > max_input_lines) else "dim #94a3b8")
+                text.append(" " + "─" * fill_count + " ", style=border_color)
+                text.append(right_label, style="dim #94a3b8" if right_label == retry_status else "dim #64748b")
+                text.append(" ─╮", style=border_color)
+                return text
+            elif width >= len(right_label) + 8:
+                avail_label = width - len(right_label) - 8
+                trunc_lbl = (label[: max(0, avail_label - 3)] + "...") if len(label) > avail_label else label
+                fixed_len = len("╭─ ") + len(trunc_lbl) + len(" ") + len(" ") + len(right_label) + len(" ─╮")
+                fill_count = max(0, width - fixed_len)
+                text = Text()
+                text.append("╭─ ", style=border_color)
+                text.append(trunc_lbl, style="bold #38bdf8" if (active_content or lines_count > max_input_lines) else "dim #94a3b8")
+                text.append(" " + "─" * fill_count + " ", style=border_color)
+                text.append(right_label, style="dim #94a3b8" if right_label == retry_status else "dim #64748b")
+                text.append(" ─╮", style=border_color)
+                return text
 
         fixed_len_label_only = len("╭─ ") + len(label) + len(" ") + len("─╮")
         if width >= fixed_len_label_only + 2:
@@ -708,13 +753,13 @@ def render_composer_top_border(
             text.append(" " + "─" * fill_count + "─╮", style=border_color)
             return text
     else:
-        for sc in shortcut_candidates:
-            fixed_len = len("╭─") + len(" ") + len(sc) + len(" ─╮")
-            if width >= fixed_len + 2:
+        if right_label is not None:
+            fixed_len = len("╭─") + len(" ") + len(right_label) + len(" ─╮")
+            if width >= fixed_len:
                 fill_count = width - fixed_len
                 text = Text()
                 text.append("╭─" + "─" * fill_count + " ", style=border_color)
-                text.append(sc, style="dim #64748b")
+                text.append(right_label, style="dim #94a3b8" if right_label == retry_status else "dim #64748b")
                 text.append(" ─╮", style=border_color)
                 return text
 
@@ -734,6 +779,7 @@ def render_composer_top_border_str(
     force_color: bool | None = None,
     no_color: bool | None = None,
     height: int | None = None,
+    retry_status: str | None = None,
 ) -> str:
     """Render top border of composer box as plain string using in-memory capture."""
     console, use_ansi = _make_capture_console(
@@ -750,6 +796,7 @@ def render_composer_top_border_str(
             has_content=has_content,
             content=content,
             height=height,
+            retry_status=retry_status,
         )
     )
     return console.export_text(styles=use_ansi).rstrip()
@@ -870,6 +917,7 @@ def prompt_composer_input(
                     has_content=bool(initial_text),
                     force_color=force_color,
                     no_color=no_color,
+                    retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
                 )
             )
             status_bar_line = ""
@@ -1033,6 +1081,7 @@ def prompt_composer_input(
                     has_content=has_c,
                     force_color=force_color,
                     no_color=no_color,
+                    retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
                 ),
                 bottom_border_renderer=lambda alert: render_composer_bottom_border_str(
                     width=comp_width,
@@ -1100,6 +1149,7 @@ def prompt_composer_input(
                 width=comp_width,
                 is_active=True,
                 has_content=bool(initial_text),
+                retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
             )
         )
     prompt_str = "│ > "

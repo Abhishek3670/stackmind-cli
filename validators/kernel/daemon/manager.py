@@ -2293,6 +2293,10 @@ class SessionManager:
                 agent_id=agent_id_param,
                 work_order_id=params.get("work_order_id"),
                 run_id=created_run_id,
+                attempt=params.get("attempt"),
+                max_attempts=params.get("max_attempts"),
+                retry=params.get("retry"),
+                max_retries=params.get("max_retries"),
             )
             thread = Thread(
                 target=self._run_turn,
