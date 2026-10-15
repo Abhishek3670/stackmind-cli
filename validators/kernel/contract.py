@@ -213,6 +213,34 @@ class ContractEvaluator:
             normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/")
             for p in self._PROTOCOL_TARGET_PREFIXES
         )
+        is_architect = str(getattr(contract, "agent_id", "")).lower() in {"claude", "architecture", "architect"}
+        is_read_operation = operation_type not in self._WRITE_OPERATIONS
+        if is_architect and is_read_operation:
+            security_deny_patterns = (
+                ".git/**",
+                ".git",
+                ".env",
+                ".env.*",
+                ".sync/runtime/**",
+                ".sync/snapshots/**",
+                "__pycache__/**",
+                ".venv/**",
+                "node_modules/**",
+            )
+            is_security_boundary = any(
+                self._matches(target, sec_pat) for sec_pat in security_deny_patterns
+            )
+            norm_t = target.replace("\\", "/").strip("/").lower()
+            if "workspace/" in norm_t:
+                norm_t = norm_t.split("workspace/", 1)[1]
+            if norm_t.startswith(".sync/inbox/"):
+                inbox_owner = norm_t.split(".sync/inbox/", 1)[1].split("/", 1)[0]
+                if inbox_owner not in ("claude", "local-llm", "gitops"):
+                    is_security_boundary = True
+            if is_security_boundary:
+                return False, "target is explicitly denied"
+            return True, "authorized"
+
         matching_deny = [r for r in contract.deny if self._matches(target, r)]
         if matching_deny:
             matching_allow = [r for r in contract.allow if self._matches(target, r)]

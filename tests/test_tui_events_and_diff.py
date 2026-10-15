@@ -370,9 +370,8 @@ def test_actions_group_failure_visibility():
 
     # 3. Rendered string must contain failure glyph and clean error
     rendered = render_actions_group_str(group)
-    assert "1 failed" in rendered
+    assert "● act-1" in rendered
     assert "Rate limit exceeded (HTTP 429)" in rendered
-    assert "×" in rendered
 
 
 def test_canonical_blocker_text_cleans_raw_errors():

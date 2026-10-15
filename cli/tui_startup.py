@@ -415,9 +415,20 @@ def ensure_daemon(workspace: Path, daemon_url: str | None, *, timeout: float = 8
         try:
             write_daemon_pid(workspace, daemon.address[1])
             if not _wait_for_health(url, timeout):
-                raise click.ClickException(
-                    f"StackMind daemon did not report healthy at {url} within {timeout:g}s."
-                )
+                if daemon.address[1] == DEFAULT_DAEMON_PORT:
+                    daemon.stop()
+                    daemon = LocalDaemon(str(state_dir), port=0).start()
+                    url = daemon.url
+                    step.set_message(f"Starting StackMind daemon at {url}...")
+                    write_daemon_pid(workspace, daemon.address[1])
+                    if not _wait_for_health(url, timeout):
+                        raise click.ClickException(
+                            f"StackMind daemon did not report healthy at {url} within {timeout:g}s."
+                        )
+                else:
+                    raise click.ClickException(
+                        f"StackMind daemon did not report healthy at {url} within {timeout:g}s."
+                    )
         except BaseException:
             # BaseException so Ctrl+C (KeyboardInterrupt) still stops the owned
             # daemon and clears the pid file instead of leaking the process.

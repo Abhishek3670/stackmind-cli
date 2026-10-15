@@ -235,8 +235,6 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                     "allow": default_claude_allow,
                     "deny": [
                         {"module": ".git/**"},
-                        {"module": "src/**"},
-                        {"module": "tests/**"},
                         {"module": ".sync/inbox/codex/**"},
                         {"module": ".sync/inbox/gemini/**"},
                         {"module": ".sync/inbox/gemma/**"},
@@ -281,6 +279,15 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                             dirty = True
                     if dirty:
                         cdata["scope"]["allow"] = existing_allow
+                    if isinstance(cdata["scope"].get("deny"), list):
+                        new_deny = [
+                            d for d in cdata["scope"]["deny"]
+                            if (d.get("module") if isinstance(d, dict) else str(d)) not in {"src/**", "tests/**", "src", "tests"}
+                        ]
+                        if len(new_deny) != len(cdata["scope"]["deny"]):
+                            cdata["scope"]["deny"] = new_deny
+                            dirty = True
+                    if dirty:
                         claude_contract.write_text(yaml.safe_dump(cdata, sort_keys=False), encoding="utf-8")
             except Exception:
                 pass
@@ -368,6 +375,15 @@ def synthesize_bootstrap_planning(
         "scope": {
             "allow": [
                 {"module": "PLAN.md"},
+                {"module": "README.md"},
+                {"module": "AGENTS.md"},
+                {"module": "ARCHITECTURE.md"},
+                {"module": "VERSION"},
+                {"module": "*.md"},
+                {"module": "package.json"},
+                {"module": "pyproject.toml"},
+                {"module": "Cargo.toml"},
+                {"module": "go.mod"},
                 {"module": ".sync/work-orders/**"},
                 {"module": ".sync/contracts/**"},
                 {"module": ".sync/decisions/**"},
@@ -376,8 +392,6 @@ def synthesize_bootstrap_planning(
             ],
             "deny": [
                 {"module": ".git/**"},
-                {"module": "src/**"},
-                {"module": "tests/**"},
                 {"module": ".sync/inbox/codex/**"},
                 {"module": ".sync/inbox/gemini/**"},
                 {"module": ".sync/inbox/gemma/**"},

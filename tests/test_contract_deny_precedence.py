@@ -144,3 +144,66 @@ def test_supervisor_ensure_dependency_escalation_channel_cleans_deny(tmp_path: P
     assert ".sync/**" not in deny_modules
     assert "requirements.txt" not in deny_modules
     assert ".git/**" in deny_modules
+
+
+def test_architecture_agent_read_only_workspace_research():
+    """Verify Lead Architect (claude) is authorized for read-only codebase research across workspace."""
+    evaluator = ContractEvaluator()
+    contract = AgentContract(
+        agent_id="claude",
+        work_order="WO-000",
+        allow=("PLAN.md", ".sync/work-orders/**", ".sync/contracts/**"),
+        deny=(".git/**", "src/**", ".env"),
+        write_mode="read-write",
+    )
+
+    # 1. Reading assets and root documents not explicitly in allow is authorized for architecture
+    ok, msg = evaluator.authorize(contract, "read_file", "genset_full.svg")
+    assert ok is True
+    assert msg == "authorized"
+
+    ok, msg = evaluator.authorize(contract, "read_file", "index.html")
+    assert ok is True
+    assert msg == "authorized"
+
+    # 2. Reading and listing src/** is authorized for architecture research even if in old deny
+    ok, msg = evaluator.authorize(contract, "read_file", "src/backend.py")
+    assert ok is True
+    assert msg == "authorized"
+
+    ok, msg = evaluator.authorize(contract, "list_directory", "src")
+    assert ok is True
+    assert msg == "authorized"
+
+    # 3. Writing to src/backend.py or index.html is strictly DENIED (architects plan; workers code)
+    ok, msg = evaluator.authorize(contract, "write_file", "src/backend.py")
+    assert ok is False
+    assert "outside allowed scope" in msg or "denied" in msg
+
+    ok, msg = evaluator.authorize(contract, "write_file", "index.html")
+    assert ok is False
+    assert "outside allowed scope" in msg or "denied" in msg
+
+    # 4. Writing to allowed deliverables (PLAN.md) succeeds
+    ok, msg = evaluator.authorize(contract, "write_file", "PLAN.md")
+    assert ok is True
+    assert msg == "authorized"
+
+    # 5. Reading security boundaries (.git, .env, other agent inboxes) is strictly DENIED
+    ok, msg = evaluator.authorize(contract, "read_file", ".git/config")
+    assert ok is False
+    assert "explicitly denied" in msg
+
+    ok, msg = evaluator.authorize(contract, "read_file", ".env")
+    assert ok is False
+    assert "explicitly denied" in msg
+
+    ok, msg = evaluator.authorize(contract, "read_file", ".sync/inbox/codex/secret.md")
+    assert ok is False
+    assert "explicitly denied" in msg
+
+    # 6. Reading Claude's own inbox is allowed
+    ok, msg = evaluator.authorize(contract, "read_file", ".sync/inbox/claude/message.md")
+    assert ok is True
+    assert msg == "authorized"
+

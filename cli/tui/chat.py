@@ -546,7 +546,7 @@ def render_actions_group(
     lines: list[RenderableType] = []
 
     failed_count = getattr(actions_obj, "failed_count", 0)
-    if legacy_header or failed_count > 0:
+    if legacy_header:
         arrow = "▾" if actions_obj.expanded else "▸"
         suffix = getattr(actions_obj, "header_suffix", f"{getattr(actions_obj, 'count', len(getattr(actions_obj, 'actions', [])))}")
         suffix_style = "bold red" if failed_count > 0 else "dim white"
@@ -671,10 +671,11 @@ def render_actions_group(
                 indent="    " if is_indented else "  ",
             )
             lines.append(diff_block)
-        elif actions_obj.expanded:
-            prev = render_action_preview(act, avail_width=avail_width)
-            if prev:
-                lines.append(prev)
+        elif actions_obj.expanded and not is_failed:
+            if t_name not in {"Agent", "Read", "List", "Graph", "Verify", "Run Security Scan"} and "harness" not in t_name.lower():
+                prev = render_action_preview(act, avail_width=avail_width)
+                if prev:
+                    lines.append(prev)
 
     if not lines:
         return Text("")
@@ -738,7 +739,8 @@ def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType 
 
     # 2. Bash / Command / Test action -> Output
     is_harness = "harness" in t_name or t_name in {"generate", "llm"}
-    if t_name in {"exec_command", "run_command", "bash", "sh", "command", "run_tests", "pytest", "test"} or is_harness or output:
+    non_cmd_tools = {"read_file", "read", "view_file", "cat", "list_directory", "list_dir", "list", "glob", "query_graph", "graph", "verify", "run_security_scan"}
+    if t_name in {"exec_command", "run_command", "bash", "sh", "command", "run_tests", "pytest", "test"} or is_harness or (output and t_name not in non_cmd_tools):
         is_test = t_name in {"run_tests", "pytest", "test"}
         if desc.startswith("Agent"):
             body_text = output or error or ""
@@ -778,6 +780,9 @@ def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType 
 
         lines = [lbl]
         body_text = output or error or ""
+        if is_failed and error:
+            from cli.tui.events import clean_error_message
+            body_text = clean_error_message(error)
         if body_text.strip():
             if "\\n" in body_text and "\n" not in body_text:
                 body_text = body_text.replace("\\n", "\n").replace("\\t", "    ")

@@ -763,7 +763,7 @@ class AutonomousDeliveryState:
                 if last_c and last_n in {"write_file", "write", "edit_file", "edit", "create_file", "create"}:
                     msg_actions.preview_label = f"✓ Wrote `{last_t}`" if last_t else "✓ Wrote code"
                     msg_actions.preview_code = last_c
-                msg_actions.expanded = True
+                msg_actions.expanded = False
             elif msg_actions is not None:
                 msg_actions.complete_all()
             self.active_tool_name = None
