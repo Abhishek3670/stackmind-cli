@@ -241,6 +241,38 @@ def test_turn_response_extraction(tmp_path: Path):
     }
     assert extract_assistant_response(payload_report_md) == "Hello! I am ready to help you build your application."
 
+    # 4. Never leak raw harness report file into chat
+    harness_report_file = tmp_path / "harness-raw.md"
+    harness_report_file.write_text(
+        "# Harness Report: WO-002\n\n"
+        "- agent: claude\n"
+        "- profile: medium\n"
+        "- task: WO-002\n"
+        "- kind: work_order\n"
+        "- status: completed\n\n"
+        "## Summary\n"
+        "Completed task via tools\n\n"
+        "## Report\n"
+        "Completed task via tools\n\n"
+        "## Meta\n"
+        "```yaml\n"
+        "agent: claude\n"
+        "execution_profile: medium\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    payload_harness = {
+        "result": {
+            "status": "completed",
+            "report_path": str(harness_report_file),
+            "modified_files": ["requirements.txt"],
+        }
+    }
+    extracted_harness = extract_assistant_response(payload_harness, workspace=tmp_path)
+    assert extracted_harness != harness_report_file.read_text(encoding="utf-8")
+    assert "# Harness Report" not in (extracted_harness or "")
+    assert "## Meta" not in (extracted_harness or "")
+
 
 
 def test_operational_event_manager_lifecycle(tmp_path: Path):

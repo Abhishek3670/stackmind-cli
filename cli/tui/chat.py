@@ -1054,6 +1054,10 @@ def render_assistant_message(
     if cleaned:
         cleaned = format_contract_payload(cleaned)
 
+    # Suppress raw internal harness reports from assistant message bubble
+    if cleaned and (cleaned.strip().startswith("# Harness Report") or "## Meta\n```yaml" in cleaned):
+        cleaned = ""
+
     # Dynamic Region 3: Final assistant response (§18, §32) with operational telemetry dimming
     if cleaned:
         telemetry_lines: list[str] = []

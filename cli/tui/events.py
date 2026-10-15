@@ -446,6 +446,11 @@ def extract_assistant_response(
     from cli.tui.chat import format_contract_payload, strip_internal_reasoning
 
     def clean_response(value: str) -> str | None:
+        if not value:
+            return None
+        # Never leak raw harness audit reports or internal harness metadata into chat
+        if value.strip().startswith("# Harness Report") or "## Meta\n```yaml" in value:
+            return None
         clean = strip_internal_reasoning(value)
         if clean:
             clean = format_contract_payload(clean)
@@ -475,10 +480,8 @@ def extract_assistant_response(
                         _, _, body = content.partition("## Report")
                         report_body, _, _ = body.partition("## Meta")
                         clean = report_body.strip()
-                        if clean and clean != "Completed task via tools":
+                        if clean and clean != "Completed task via tools" and not clean.startswith("# Harness Report"):
                             return clean_response(clean)
-                    if content.strip() and content.strip() != "Completed task via tools":
-                        return clean_response(content)
                 except Exception:
                     pass
 
@@ -1012,7 +1015,7 @@ def recover_transcript_from_events(
                         _, _, body = content.partition("## Report")
                         report_body, _, _ = body.partition("## Meta")
                         clean = report_body.strip()
-                        if clean:
+                        if clean and clean != "Completed task via tools" and not clean.startswith("# Harness Report"):
                             msg_key = ("assistant", clean)
                             if msg_key not in state.seen_message_keys:
                                 state.seen_message_keys.add(msg_key)
