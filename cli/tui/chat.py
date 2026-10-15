@@ -545,9 +545,9 @@ def render_actions_group(
 
     lines: list[RenderableType] = []
 
-    if legacy_header:
+    failed_count = getattr(actions_obj, "failed_count", 0)
+    if legacy_header or failed_count > 0:
         arrow = "▾" if actions_obj.expanded else "▸"
-        failed_count = getattr(actions_obj, "failed_count", 0)
         suffix = getattr(actions_obj, "header_suffix", f"{getattr(actions_obj, 'count', len(getattr(actions_obj, 'actions', [])))}")
         suffix_style = "bold red" if failed_count > 0 else "dim white"
         hdr = Text()
@@ -630,6 +630,17 @@ def render_actions_group(
         is_failed = st in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}
         error_val = getattr(act, "error", None)
 
+        diff_val = getattr(act, "diff", None) or (
+            getattr(act, "code", None) if t_name in {"Edit", "Patch"} else None
+        )
+        has_diff = bool(diff_val and str(diff_val).strip())
+        is_completed = st in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}
+        auto_render_diff = (
+            has_diff
+            and is_completed
+            and (t_name in {"Edit", "Patch"} or bool(getattr(act, "diff", None)))
+        )
+
         if is_failed and error_val:
             from cli.tui.events import clean_error_message
             clean_err = clean_error_message(error_val)
@@ -642,14 +653,26 @@ def render_actions_group(
                 or getattr(act, "code", None)
                 or t_name in {"Read", "Bash", "Edit", "Write"}
             )
-            if has_collapsible and not actions_obj.expanded:
+            if has_collapsible and not actions_obj.expanded and not auto_render_diff:
                 line.append(" (ctrl+o to expand)", style="dim")
 
         lines.append(line)
 
-        # Only render preview if explicitly expanded!
-        if actions_obj.expanded:
-            prev = render_action_preview(act)
+        # Auto-display compact split diff block on Edit / File Modification Tools
+        if auto_render_diff:
+            from cli.tui.diff import render_split_diff
+            max_l = 100 if actions_obj.expanded else 16
+            target_f = arg or getattr(act, "target", "") or ""
+            diff_block = render_split_diff(
+                str(diff_val),
+                avail_width=avail_width,
+                max_lines=max_l,
+                file_path=target_f,
+                indent="    " if is_indented else "  ",
+            )
+            lines.append(diff_block)
+        elif actions_obj.expanded:
+            prev = render_action_preview(act, avail_width=avail_width)
             if prev:
                 lines.append(prev)
 
@@ -661,7 +684,7 @@ def render_actions_group(
 
 
 
-def render_action_preview(action: Any) -> RenderableType | None:
+def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType | None:
     """Render live or completed action preview: diff for edits, output for bash, code for writes."""
     if not action:
         return None
@@ -831,7 +854,7 @@ def render_action_preview_str(
     no_color: bool | None = None,
 ) -> str:
     """Render action preview as plain or ANSI formatted string using in-memory capture."""
-    elem = render_action_preview(action)
+    elem = render_action_preview(action, avail_width=width)
     if not elem:
         return ""
     console, use_ansi = _make_capture_console(
@@ -973,6 +996,7 @@ def render_assistant_message(
     thinking_expanded: bool = True,
     model: str | None = None,
     show_header: bool = True,
+    avail_width: int = 80,
 ) -> RenderableType:
     """Render an assistant message with '✦ StackMind' header (§15), dynamic turn regions (§18, §20, §24), left-aligned model attribution, and rich Markdown (§32)."""
     model_val = model
@@ -1014,7 +1038,7 @@ def render_assistant_message(
             actions_obj = actions
         if not getattr(actions_obj, "is_empty", False):
             elements.append(Text(""))
-            elements.append(render_actions_group(actions_obj))
+            elements.append(render_actions_group(actions_obj, avail_width=avail_width))
 
     # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24, §27)
     if thinking and thinking.strip():
@@ -1085,6 +1109,7 @@ def render_assistant_message_str(
             thinking=thinking,
             thinking_expanded=thinking_expanded,
             model=model,
+            avail_width=width,
         )
     )
     return console.export_text(styles=use_ansi).strip()
@@ -1217,6 +1242,7 @@ def render_chat_transcript(
                     model=getattr(msg, "model", None),
                     inline_diffs=inline_diffs,
                     show_header=show_hdr,
+                    avail_width=width or 80,
                 )
             )
         elif role == "system":

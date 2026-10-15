@@ -35,6 +35,13 @@ def canonical_blocker_text(block_msg: Any) -> str:
             msg = str(failure.get("canonical_message") or block_msg.get("error") or "")
             return f"{code} [{wo} rev {rev}] {msg}".strip()
         from cli.tui.events import clean_error_message
+        err_val = block_msg.get("error") or block_msg.get("reason") or block_msg.get("message")
+        if err_val:
+            import re
+            m = re.search(r"\[(.*?)\]", str(err_val))
+            if m:
+                err_val = m.group(1).strip()
+            return clean_error_message(err_val)
         return clean_error_message(block_msg)
     from cli.tui.events import clean_error_message
     return clean_error_message(block_msg)
