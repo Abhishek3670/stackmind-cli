@@ -1339,6 +1339,7 @@ class ProviderGateway:
         self.total_tool_calls: int = 0
         self.consecutive_failures: int = 0
         self.written_files: list[str] = []
+        self.required_deliverable: str | None = None
         self.read_counts: dict[str, int] = {}
         self._step_count: int = 0
         self._file_write_count: int = 0
@@ -1465,7 +1466,15 @@ class ProviderGateway:
 
         try:
             if name == "read_file":
-                target = args.get("path") or args.get("target") or args.get("filename") or ""
+                target = (
+                    args.get("path")
+                    or args.get("target")
+                    or args.get("filename")
+                    or args.get("file")
+                    or args.get("filepath")
+                    or args.get("file_path")
+                    or ""
+                )
                 if not target:
                     self.consecutive_failures += 1
                     res = "Error: 'read_file' missing required argument 'path'. Example: {\"path\": \"src/api/auth.py\"}"
@@ -1489,7 +1498,18 @@ class ProviderGateway:
                 return out
 
             if name == "write_file":
-                target = args.get("path") or args.get("target") or args.get("filename") or ""
+                target = (
+                    args.get("path")
+                    or args.get("target")
+                    or args.get("filename")
+                    or args.get("file")
+                    or args.get("filepath")
+                    or args.get("file_path")
+                    or args.get("destination")
+                    or args.get("target_path")
+                    or getattr(self, "required_deliverable", None)
+                    or ""
+                )
                 if not target:
                     self.consecutive_failures += 1
                     res = "Error: 'write_file' missing required argument 'path'. Example: {\"path\": \"src/api/auth.py\", \"content\": \"...\"}"
@@ -1500,7 +1520,21 @@ class ProviderGateway:
                         )
                     return res
 
-                if "content" not in args and "data" not in args and "text" not in args:
+                content = (
+                    args.get("content")
+                    if "content" in args
+                    else args.get("data", args.get("text", args.get("body", args.get("code", None))))
+                )
+                if content is None:
+                    candidates = [
+                        v for k, v in args.items()
+                        if k not in ("path", "target", "filename", "file", "filepath", "file_path", "destination", "target_path")
+                        and isinstance(v, str)
+                    ]
+                    if len(candidates) == 1:
+                        content = candidates[0]
+
+                if content is None:
                     self.consecutive_failures += 1
                     res = "Error: 'write_file' missing required argument 'content'. Example: {\"path\": \"src/api/auth.py\", \"content\": \"...\"}"
                     if self.consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_FAILURES:
@@ -1510,7 +1544,6 @@ class ProviderGateway:
                         )
                     return res
 
-                content = args.get("content", args.get("data", args.get("text", "")))
                 self.tool_gateway.write_file(target, content)
                 self.consecutive_failures = 0
                 if target not in self.written_files:
@@ -1935,6 +1968,8 @@ class ProviderGateway:
         active_tools = self.active_tools_list
 
         self.budget_status["steps"] = 0
+        if required_deliverable:
+            self.required_deliverable = required_deliverable
 
         budget_turns = self.contract.budget.get("max_turns") if (self.contract and hasattr(self.contract, "budget") and self.contract.budget) else None
         effective_max_turns = max_turns or budget_turns or DEFAULT_MAX_TURNS
