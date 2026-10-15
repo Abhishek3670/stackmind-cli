@@ -14,6 +14,7 @@ from validators.memory.contradiction import (
     ContradictionStatus,
     ContradictionStore,
 )
+from validators.memory.promotion import MemoryPromotionPolicy, MemoryApprovalReceipt
 from validators.memory.models import MemoryRecord, MemoryType, MemoryStatus, MemoryProvenance, MemoryEvidence
 from validators.knowledge.contract import AgentContract
 from validators.memory.store import MemoryStore
@@ -580,6 +581,12 @@ def test_contradiction_resolution_supersede():
             project_id="test-project",
         )
         store.save_record(superseding)
+
+        # Grant approval for all memories involved (both conflicting memories + superseding memory)
+        promo_policy = MemoryPromotionPolicy(project_path)
+        promo_policy.grant_approval(mem_a, "test-user", "Resolving contradiction")
+        promo_policy.grant_approval(mem_b, "test-user", "Resolving contradiction")
+        promo_policy.grant_approval(superseding, "test-user", "Superseding to resolve contradiction")
 
         # Resolve via supersession
         service = ContradictionResolutionService(project_path, memory_store=store)

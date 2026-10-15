@@ -348,25 +348,42 @@ class DecayAdjuster:
         finally:
             self._shadow_mode = was_shadow
 
-    def log_audit(self, diagnostics: DecayDiagnostics, query: str = "") -> None:
-        """Append decay diagnostics to daily audit log."""
+    def log_audit(self, diagnostics: DecayDiagnostics, query: str = "", correlation_id: str | None = None) -> None:
+        """Append decay diagnostics to daily audit log.
+
+        Args:
+            diagnostics: Decay diagnostics to log
+            query: Raw query string (NOT logged for privacy; only length and hash logged)
+            correlation_id: Optional correlation ID for traceability
+        """
+        import hashlib
         audit_file = self._audit_dir / f"decay_{datetime.now(timezone.utc).strftime('%Y%m%d')}.jsonl"
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16] if query else ""
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "query": query[:200] if query else "",
+            "query_len": len(query) if query else 0,
+            "query_hash": query_hash,
+            "correlation_id": correlation_id or "",
             "diagnostics": diagnostics.to_dict(),
         }
         with audit_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
-def get_decay_policy(profile: ExecutionProfile | str | None = None) -> DecayPolicy:
-    """Get effective decay policy for a profile (can be extended for config file support)."""
+def get_decay_policy(profile: ExecutionProfile | str | None = None, project_path: Path | str | None = None) -> DecayPolicy:
+    """Get effective decay policy for a profile (can be extended for config file support).
+
+    Args:
+        profile: Execution profile for policy lookup
+        project_path: Optional project path for config discovery. If not provided,
+                      uses the current working directory.
+    """
     resolved = ExecutionProfile.from_str(profile) if profile else ExecutionProfile.MEDIUM
     policy = DecayPolicy.default()
 
-    # Future: load from .sync/memory/config/decay.json if exists
-    config_path = Path.cwd() / ".sync" / "memory" / "config" / "decay.json"
+    # Determine config path from project_path or cwd
+    base_path = Path(project_path).resolve() if project_path else Path.cwd()
+    config_path = base_path / ".sync" / "memory" / "config" / "decay.json"
     if config_path.exists():
         try:
             with config_path.open("r", encoding="utf-8") as f:
