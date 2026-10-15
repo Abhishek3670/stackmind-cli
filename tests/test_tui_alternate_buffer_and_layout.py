@@ -218,6 +218,20 @@ def test_render_full_screen_workspace_composition():
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
+    # Landing frame: footer information stays always at bottom
+    landing_frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=24,
+    )
+    assert "StackMind Runtime" in landing_frame
+    assert "Type a message..." in landing_frame
+    assert "session: sess-001" in landing_frame
+    assert "online" in landing_frame
+
+    # Conversation frame: footer is shown with live metadata
+    state.add_message("user", "Hello")
     frame = render_full_screen_workspace(
         session=session,
         state=state,
@@ -225,13 +239,9 @@ def test_render_full_screen_workspace_composition():
         height=24,
         shortcuts="Ctrl+K commands | Ctrl+L clear",
     )
-
-    # Frame must contain top header
-    assert "stackmind" in frame
-    assert "codex" in frame
-    # Frame must contain runtime panel
+    assert "session: sess-001" in frame
+    assert "● online" in frame
     assert "StackMind Runtime" in frame
-    # Frame must contain composer box borders and shortcuts
     assert "Ctrl+K commands" in frame
     assert "Type a message..." in frame
 
@@ -332,6 +342,7 @@ def test_runtime_panel_reflects_state_mutations_reactively():
 def test_render_full_screen_workspace_without_composer():
     """Verify include_composer=False omits the bottom composer box (WO-055)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Hello")
     session = {"session_id": "sess-001", "agent": "codex"}
 
     frame_with = render_full_screen_workspace(
@@ -340,6 +351,7 @@ def test_render_full_screen_workspace_without_composer():
         width=120,
         height=24,
         include_composer=True,
+        shortcuts="Ctrl+K commands",
     )
     frame_without = render_full_screen_workspace(
         session=session,
@@ -391,6 +403,7 @@ def test_redraw_full_screen_without_composer_emits_newline_for_prompt_positionin
 def test_bottom_status_bar_relocation_in_full_screen_workspace():
     """Verify status bar is at the bottom below composer, row 0 starts with workspace (WO-007)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Hello")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
     frame_with = render_full_screen_workspace(
@@ -402,10 +415,9 @@ def test_bottom_status_bar_relocation_in_full_screen_workspace():
     )
     lines = frame_with.splitlines()
     # Row 0 must not be status bar
-    assert "stackmind" not in lines[0]
+    assert "sess-001" not in lines[0]
     # The last line must contain the status bar
-    assert "stackmind" in lines[-1]
-    assert "codex" in lines[-1]
+    assert "sess-001" in lines[-1]
     assert "online" in lines[-1]
 
     # Without composer: composer box is omitted, but status bar is retained (WO-015 AC-4)
@@ -417,12 +429,12 @@ def test_bottom_status_bar_relocation_in_full_screen_workspace():
         include_composer=False,
     )
     lines_wo = frame_without.splitlines()
-    assert "stackmind" not in lines_wo[0]
-    assert "stackmind" in lines_wo[-1]
+    assert "sess-001" not in lines_wo[0]
+    assert "sess-001" in lines_wo[-1]
 
 
 def test_prompt_composer_input_renders_status_bar_at_bottom(monkeypatch, capsys):
-    """Verify prompt_composer_input renders status bar below composer bottom border (WO-007)."""
+    """Verify prompt_composer_input renders status bar below composer bottom border during chat (WO-007)."""
     from cli.tui.app import prompt_composer_input
 
     monkeypatch.setattr("builtins.input", lambda prompt: "hello")
@@ -430,12 +442,12 @@ def test_prompt_composer_input_renders_status_bar_at_bottom(monkeypatch, capsys)
 
     session = {"session_id": "sess-abc", "agent": "gemini"}
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-abc")
+    state.add_message("user", "Hello")
     res = prompt_composer_input(width=80, session=session, state=state)
     assert res == "hello"
 
     captured = capsys.readouterr()
-    assert "stackmind" in captured.out
-    assert "gemini" in captured.out
+    assert "sess-abc" in captured.out
     assert "● online" in captured.out
 
 
@@ -527,6 +539,7 @@ def test_in_viewport_turn_streaming_clears_composer(monkeypatch):
 def test_composer_width_aligned_with_conversation_viewport():
     """Verify composer box width aligns with layout.conversation_width when runtime panel is visible (WO-008)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Hello")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
     layout_120 = compute_layout(120)
@@ -556,13 +569,14 @@ def test_composer_width_aligned_with_conversation_viewport():
 
     # Status bar aligns with conversation_width matching composer box (WO-018 AC-1)
     assert len(status_bar) == layout_120.conversation_width
-    assert "stackmind" in status_bar
+    assert "sess-001" in status_bar
     assert "● online" in status_bar
 
 
 def test_composer_width_spans_full_width_when_narrow():
     """Verify composer box spans full terminal width when runtime panel is hidden (WO-008)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Hello")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
     layout_80 = compute_layout(80)
@@ -594,6 +608,7 @@ def test_prompt_composer_input_uses_aligned_composer_width(monkeypatch, capsys):
 
     session = {"session_id": "sess-abc", "agent": "gemini"}
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-abc")
+    state.add_message("user", "Hello")
 
     # Calling with width=120 should automatically resolve comp_width=conversation_width and status bar=conversation_width
     res = prompt_composer_input(width=120, session=session, state=state)
@@ -604,7 +619,7 @@ def test_prompt_composer_input_uses_aligned_composer_width(monkeypatch, capsys):
     # Top border starts with ╭─ and bottom with ╰─
     top_borders = [l for l in lines if l.startswith("╭─")]
     bottom_borders = [l for l in lines if l.startswith("╰─")]
-    status_bars = [l for l in lines if "stackmind" in l]
+    status_bars = [l for l in lines if "online" in l]
 
     layout_120 = compute_layout(120)
     assert len(top_borders) >= 1
@@ -621,6 +636,7 @@ def test_prompt_composer_input_uses_aligned_composer_width(monkeypatch, capsys):
 def test_status_bar_and_composer_share_identical_right_edge():
     """Verify both composer box and status bar share the identical conversation_width boundary (WO-009, WO-018)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-001")
+    state.add_message("user", "Hello")
     session = {"session_id": "sess-001", "agent": "codex", "provider": "daemon"}
 
     layout_120 = compute_layout(120)
@@ -946,7 +962,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
     mock_editor.redraw_line.assert_called_once()
 
     # Test Page Down handler
@@ -958,7 +974,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
     mock_editor.redraw_line.assert_called_once()
 
     # Test Wheel Up handler
@@ -970,7 +986,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
     mock_editor.redraw_line.assert_called_once()
 
     # Test Wheel Down handler
@@ -982,7 +998,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is False
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
     mock_editor.redraw_line.assert_called_once()
 
     # Test Ctrl+L handler
@@ -994,7 +1010,7 @@ def test_interactive_delivery_loop_scroll_and_ctrl_l_preserve_layout(monkeypatch
     assert redraw_calls[0].get("include_composer") is True
     assert redraw_calls[0].get("composer_is_active") is True
     assert redraw_calls[0].get("clear") is True
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
     mock_editor.redraw_line.assert_called_once()
 
 
@@ -1050,8 +1066,8 @@ def test_tui_startup_in_alternate_buffer_renders_single_status_bar_and_composer(
     assert startup_redraw_call.get("include_composer") is True
     assert startup_redraw_call.get("composer_is_active") is True
 
-    # Cursor positioned at row height - 2 (24 - 2 = 22), col 5
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    # Cursor positioned at row height - 2 (24 - 2 = 22), col 5 above persistent footer
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
 
     # AC-2 & AC-4: prompt_composer_input called with full_screen=True
     assert captured_prompt_kwargs is not None
@@ -1093,6 +1109,7 @@ def test_prompt_composer_input_suppresses_redundant_borders_in_full_screen_mode(
     # When full_screen=False (scrollback mode), border echoes and status bar are emitted as expected
     stdout_writes.clear()
     echoed_lines.clear()
+    state.add_message("user", "Hello")
     result_legacy = prompt_composer_input(
         width=120,
         session=session,
@@ -1145,8 +1162,12 @@ def test_post_turn_settle_redraw_maintains_atomic_frame_and_cursor(monkeypatch, 
     mock_adapter.command.return_value = {"operation_id": "turn-1"}
     monkeypatch.setattr("cli.tui.app.StackMindTuiAdapter", lambda client: mock_adapter)
     monkeypatch.setattr("cli.tui.app.enter_alternate_screen", lambda: None)
-    monkeypatch.setattr("cli.tui.app.enable_mouse_reporting", lambda: None)
-    monkeypatch.setattr("cli.tui.app.dispatch_delivery_command", lambda *args, **kwargs: ({"session_id": "sess-post-turn"}, False))
+    def mock_dispatch(adapter, client, session, text, state, **kwargs):
+        state.add_message("user", text)
+        state.add_message("assistant", "done")
+        return ({"session_id": "sess-post-turn"}, False)
+
+    monkeypatch.setattr("cli.tui.app.dispatch_delivery_command", mock_dispatch)
 
     tui.callback(daemon_url="http://mock", agent="codex", workspace=tmp_path, demo=False, client_timeout=45.0)
 
@@ -1156,8 +1177,8 @@ def test_post_turn_settle_redraw_maintains_atomic_frame_and_cursor(monkeypatch, 
     assert post_turn.get("include_composer") is True
     assert post_turn.get("composer_is_active") is True
     assert post_turn.get("clear") is False
-    # Verify cursor positioned on input line (row 22, col 5)
-    assert any("\x1b[22;5H" in s for s in stdout_writes)
+    # Verify cursor positioned on input line (row 22, col 5) once conversation is active
+    assert any("\x1b[22;5H" in s for s in stdout_writes if isinstance(s, str))
 
 
 # ─── 15. WO-017: VIEWPORT HEIGHT BUDGET, FULL-WIDTH STATUS BAR, & COMPOSER INTEGRITY ───
@@ -1166,6 +1187,7 @@ def test_post_turn_settle_redraw_maintains_atomic_frame_and_cursor(monkeypatch, 
 def test_render_full_screen_workspace_exact_height_across_varied_terminal_sizes():
     """Verify render_full_screen_workspace produces strictly height lines across varied dimensions (WO-017 AC-1, AC-2, AC-5)."""
     state = AutonomousDeliveryState(project_name="demo-proj", session_id="sess-017")
+    state.add_message("user", "Hello")
     session = {"session_id": "sess-017", "agent": "gemini", "provider": "daemon"}
 
     for test_height in (24, 30, 40):
@@ -1193,7 +1215,18 @@ def test_render_full_screen_workspace_exact_height_across_varied_terminal_sizes(
             )
             composer_bottom = lines[-2]
             assert len(status_bar) == len(composer_bottom)
-            assert "stackmind" in status_bar
+            assert "sess-017" in status_bar
+            assert "online" in status_bar
+
+            # Verify landing frame also strictly preserves exact height
+            landing_frame = render_full_screen_workspace(
+                session=session,
+                state=AutonomousDeliveryState(project_name="demo-proj", session_id="sess-017"),
+                width=test_width,
+                height=test_height,
+                include_composer=True,
+            )
+            assert len(landing_frame.splitlines()) == test_height
 
             # (c) Composer top border, body, and bottom border intact and contiguous
             composer_top = lines[-4]

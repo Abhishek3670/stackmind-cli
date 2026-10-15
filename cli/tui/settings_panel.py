@@ -8,6 +8,7 @@ and agent role mappings into settings.json.
 from __future__ import annotations
 
 import getpass
+import io
 import os
 import shutil
 import sys
@@ -20,6 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from cli.tui.keyboard import Key, read_next_key
+from cli.tui.views import render_roles_panel
 
 from validators.kernel.settings import (
     DEFAULT_MODELS_BY_PROVIDER,
@@ -70,29 +72,17 @@ def render_settings_overview_str(
             prov.default_model or (prov.models[0] if prov.models else "(none)"),
         )
 
-    # Roles summary section
-    roles_table = Table(box=None, show_header=False, expand=True, padding=(0, 1))
-    roles_table.add_column("Role", style="bold #94a3b8", width=16)
-    roles_table.add_column("Binding", style="#e2e8f0")
-
-    for r_name in ["architecture", "backend", "frontend", "qa", "gitops"]:
-        r_cfg = settings.roles.get(r_name, {})
-        p = r_cfg.get("provider", "ollama")
-        m = r_cfg.get("model", "ornith-1.5-16k:latest")
-        display_name = "Q/A" if r_name.lower() in ("qa", "q/a") else r_name.title()
-        roles_table.add_row(f"• {display_name}", f"{p} -> {m}")
-
-    roles_idx = len(provider_keys) + 1
     content = Table.grid(expand=True)
     content.add_row(Text("Configured Providers & Endpoints:", style="bold #e2e8f0"))
     content.add_row(table)
-    content.add_row(Text(f"\n[{roles_idx}] Agent Role Assignments:", style="bold #e2e8f0"))
-    content.add_row(roles_table)
 
     prof_name = getattr(settings, "effective_profile", "medium").upper()
-    content.add_row(Text(f"\n[P] Execution Profile: [{prof_name}] (Low | Medium | High)", style="bold #38bdf8"))
+    gov_mode = getattr(settings, "govern_verbosity", "tree").upper()
+    content.add_row(Text(f"\nExecution Profile: [{prof_name}] (Low | Medium | High)", style="bold #38bdf8"))
+    content.add_row(Text(f"Governance Verbosity: [{gov_mode}] (Tree | Flat | Compact)  (Switch via :govern)", style="dim #a5b4fc"))
+    content.add_row(Text("Agent Role Bindings: Configure & rebind via :roles", style="dim #94a3b8"))
 
-    nav_hint = active_nav_hint or f"[1-{len(provider_keys)}] Provider | [{roles_idx}] Roles | [P] Profile | [S] Save | [Esc/Q] Close"
+    nav_hint = active_nav_hint or "[↑/↓] Navigate  [←/→] Toggle  [Enter] Configure  [Esc] Close"
     panel = Panel(
         content,
         title="[bold #60a5fa] Cloud Providers & Models Configuration (settings.json) [/]",
@@ -196,68 +186,89 @@ def render_stackmind_settings_str(
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
-    """Render StackMind system settings overview (Execution Profile, Roles, Policies, Governance)."""
+    """Render StackMind system settings overview in tabular layout without lines."""
     if settings is None:
         settings = load_settings()
 
     box_w = max(40, min(width - 2, 88))
-    content = Table.grid(expand=True, padding=(0, 0))
-
-    content.add_row(Text("StackMind System Configuration & Governance\n", style="bold white"))
+    table = Table(
+        box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        collapse_padding=True,
+        expand=True,
+        padding=(0, 1),
+    )
+    table.add_column("name", style="bold white", width=25, no_wrap=True)
+    table.add_column("value", width=18, no_wrap=True)
+    table.add_column("desc", style="dim #94a3b8", ratio=1, no_wrap=True)
 
     # 1. Execution Profile
     prof_val = getattr(settings, "effective_profile", "medium").upper()
     prof_color = "#38bdf8" if prof_val == "LOW" else ("#4ade80" if prof_val == "MEDIUM" else "#c084fc")
-    p_header = Text()
-    p_header.append("[1] Execution Profile: ", style="bold white")
-    p_header.append(f"[{prof_val}]", style=f"bold {prof_color}")
     if prof_val == "LOW":
-        p_desc = " (Fast: 0 optional skills, strict contracts & verification)"
+        prof_desc = "Fast: 0 optional skills, strict safety"
     elif prof_val == "MEDIUM":
-        p_desc = " (Balanced: 2 skills, 600 tok budget, progressive summaries)"
+        prof_desc = "Balanced: 2 skills, 600 tok budget"
     else:
-        p_desc = " (Deep: 5 skills, 1500 tok budget, extended verification)"
-    p_header.append(p_desc, style="dim #94a3b8")
-    content.add_row(p_header)
+        prof_desc = "Deep: 5 skills, 1500 tok budget"
+    table.add_row(
+        Text("Execution Profile", style="bold white"),
+        Text(f"[{prof_val}]", style=f"bold {prof_color}"),
+        Text(prof_desc, style="dim #94a3b8"),
+    )
 
-    # 2. Agent Role Assignments
-    content.add_row(Text("\n[2] Agent Role Bindings:", style="bold white"))
-    roles_table = Table(box=None, show_header=True, header_style="bold #38bdf8", expand=True, padding=(0, 1))
-    roles_table.add_column("Agent Role", style="bold white", width=18)
-    roles_table.add_column("Provider", style="#93c5fd", width=14)
-    roles_table.add_column("Assigned Model", style="#34d399")
-    roles_order = ["architecture", "backend", "frontend", "qa", "gitops"]
-    for r in roles_order:
-        r_cfg = settings.roles.get(r, {})
-        p = r_cfg.get("provider", "ollama")
-        m = r_cfg.get("model", "ornith-1.5-16k:latest")
-        display_name = "Q/A" if r.lower() in ("qa", "q/a") else r.title()
-        roles_table.add_row(display_name, p, m)
-    content.add_row(roles_table)
-
-    # 3. Skills Retrieval & Token Context Policy
-    content.add_row(Text("\n[3] Skills Retrieval & Token Policy:", style="bold white"))
-    if prof_val == "LOW":
-        sk_info = "  • Context: 0 optional skills / 0 token budget (direct deterministic execution)"
-    elif prof_val == "MEDIUM":
-        sk_info = "  • Context: Up to 2 relevant skills, 600-token budget (compact summaries first)"
+    # 1b. Governance Verbosity
+    gov_val = getattr(settings, "govern_verbosity", "tree").upper()
+    gov_color = "#38bdf8" if gov_val == "TREE" else ("#4ade80" if gov_val == "FLAT" else "#f59e0b")
+    if gov_val == "TREE":
+        gov_desc = "Hierarchical tree: Run harness with indented sub-actions"
+    elif gov_val == "FLAT":
+        gov_desc = "Linear stream: direct individual sub-actions"
     else:
-        sk_info = "  • Context: Up to 5 relevant skills, 1500-token budget (progressive deep runbooks)"
-    content.add_row(Text(sk_info, style="#34d399"))
+        gov_desc = "Compact: folded harness summary only"
+    table.add_row(
+        Text("Governance Verbosity", style="bold white"),
+        Text(f"[{gov_val}]", style=f"bold {gov_color}"),
+        Text(f"{gov_desc} (:govern)", style="dim #94a3b8"),
+    )
 
-    # 4. Turn Timeout & Governance
+    # 2. Client Turn Timeout
     to_val = getattr(settings, "client_timeout", 0)
-    to_str = f"{to_val}s" if to_val and to_val > 0 else "Disabled"
-    content.add_row(Text(f"\n[4] Client Turn Timeout: {to_str}", style="bold white"))
+    to_str = f"[{to_val}s]" if to_val and to_val > 0 else "[DISABLED]"
+    table.add_row(
+        Text("Client Turn Timeout", style="bold white"),
+        Text(to_str, style="bold #f59e0b" if to_val else "dim #94a3b8"),
+        Text("Governance response timeout threshold", style="dim #94a3b8"),
+    )
 
-    # 5. LLM Providers
+    # 3. Decision Engine
+    table.add_row(
+        Text("Decision Engine (Laya)", style="bold white"),
+        Text("[DETERMINISTIC]", style="dim #60a5fa"),
+        Text("Offline standby; contracts enforced", style="dim #94a3b8"),
+    )
+
+    # 4. LLM Providers & Models
     enabled_count = sum(1 for p in settings.providers.values() if p.enabled)
     total_count = len(settings.providers)
-    prov_line = Text()
-    prov_line.append("\n[5] LLM Cloud Providers & Models: ", style="bold white")
-    prov_line.append(f"[{enabled_count}/{total_count} ENABLED] ", style="bold #4ade80")
-    prov_line.append("— Configure Cloud Providers with :providers or :models", style="dim #94a3b8")
-    content.add_row(prov_line)
+    table.add_row(
+        Text("LLM Providers & Models", style="bold white"),
+        Text(f"[{enabled_count}/{total_count} ENABLED]", style="bold #4ade80"),
+        Text("Configure with :providers", style="dim #94a3b8"),
+    )
+
+    # 5. Agent Role Bindings
+    table.add_row(
+        Text("Agent Role Bindings", style="bold white"),
+        Text("[CONFIGURED]", style="#38bdf8"),
+        Text("Configure & rebind with :roles", style="dim #94a3b8"),
+    )
+
+    content = Table.grid(expand=True)
+    content.add_row(Text("StackMind System Settings & Governance\n", style="bold white"))
+    content.add_row(table)
 
     if status_msg:
         content.add_row(Text(f"\n>> {status_msg}", style="bold #f59e0b"))
@@ -265,18 +276,17 @@ def render_stackmind_settings_str(
     content.add_row(
         Text(
             "\nCommands:\n"
-            "  :settings              Open interactive StackMind settings panel\n"
-            "  :profile [low|med|hi]  Change execution profile\n"
-            "  :providers             Configure LLM providers, API keys & base URLs\n"
-            "  :roles                 Display and rebind agent roles",
+            "  :config      Open interactive StackMind configuration panel\n"
+            "  :providers   Configure LLM providers, API keys & base URLs\n"
+            "  :roles       Interactive Agent Roles & Execution Backend bindings",
             style="dim #64748b",
         )
     )
 
     panel = Panel(
         content,
-        title="[bold #60a5fa] StackMind System Settings (settings.json) [/]",
-        subtitle="[dim #94a3b8] [P] Profile | [2] Roles | [5] Providers | [Esc/Q] Close [/]",
+        title="[bold #60a5fa] StackMind System Settings & Configuration (:config) [/]",
+        subtitle="[dim #94a3b8] [↑/↓] Navigate  [←/→] Adjust  [Enter] Select  [Esc] Close [/]",
         border_style="#3b82f6",
         width=box_w,
         padding=(0, 1),
@@ -285,6 +295,9 @@ def render_stackmind_settings_str(
     console = Console(record=True, width=box_w, force_terminal=force_color, no_color=no_color)
     console.print(panel)
     return console.export_text().rstrip()
+
+
+render_config_str = render_stackmind_settings_str
 
 
 def run_interactive_settings_panel(
@@ -320,6 +333,17 @@ def run_interactive_settings_panel(
                 else:
                     return f"[ERROR] Invalid profile '{prof_val}'. Available: low, medium, high"
             return f"Current execution profile: {settings.effective_profile.upper()}"
+
+        if cmd in ("govern", "govern-verbosity", "verbosity"):
+            if len(parts) >= 2:
+                g_val = parts[1].lower()
+                if g_val in ("tree", "flat", "compact"):
+                    settings.govern_verbosity = g_val
+                    save_settings(settings, workspace)
+                    return f"[SUCCESS] Governance verbosity set to {g_val.upper()} in settings.json"
+                else:
+                    return f"[ERROR] Invalid verbosity '{g_val}'. Available: tree, flat, compact"
+            return f"Current governance verbosity: {getattr(settings, 'govern_verbosity', 'tree').upper()}"
 
         if cmd == "set" and len(parts) >= 4:
             p_name = parts[1].lower()
@@ -549,6 +573,9 @@ def run_interactive_settings_panel(
     return "[SUCCESS] Settings updated in settings.json"
 
 
+handle_system_settings_command = run_interactive_settings_panel
+
+
 def render_anchored_settings_panel_str(
     state: Any,
     width: int = 80,
@@ -576,123 +603,125 @@ def render_anchored_settings_panel_str(
 
     grid = Table.grid(expand=True, padding=(0, 0))
 
-    if view in ("settings", "stackmind"):
-        title = " StackMind System Settings & Governance (settings.json) "
+    if view in ("settings", "stackmind", "config"):
+        title = " StackMind System Settings & Configuration (:config) "
         subtitle = (
             f" >> {status_msg} "
             if status_msg
-            else " [↑/↓] Navigate  [←/→] Cycle/Toggle  [Enter] Select  [P] Profile  [S] Save  [Esc] Close "
+            else " [↑/↓] Navigate  [←/→] Adjust  [Enter] Select  [Esc] Close "
         )
 
-        # Row 0: Execution Profile
-        is_sel_prof = (sel == 0)
-        ptr_prof = "▸ " if is_sel_prof else "  "
-        prof_txt = Text(no_wrap=True)
-        prof_txt.append(ptr_prof, style="bold #38bdf8" if is_sel_prof else "dim")
+        # Top padding
+        grid.add_row(Text(" ", style="dim"))
+
+        table = Table(
+            box=None,
+            show_header=False,
+            show_edge=False,
+            pad_edge=False,
+            collapse_padding=True,
+            expand=True,
+            padding=(0, 1),
+        )
+        table.add_column("ptr", width=2, justify="left", no_wrap=True)
+        table.add_column("name", width=25, no_wrap=True)
+        table.add_column("value", width=18, no_wrap=True)
+        table.add_column("desc", ratio=1, no_wrap=True)
+
+        # Row 0: Execution Profile (merged with skills policy)
+        is_sel_0 = (sel == 0)
         prof_val = getattr(settings, "effective_profile", "medium").upper()
         prof_color = "#38bdf8" if prof_val == "LOW" else ("#4ade80" if prof_val == "MEDIUM" else "#c084fc")
-        prof_txt.append("[1] Execution Profile ", style="bold white" if is_sel_prof else "white")
-        prof_txt.append(f"[{prof_val}] ", style=f"bold {prof_color}")
         if prof_val == "LOW":
-            p_desc = "(Fast: 0 optional skills, strict safety)"
+            prof_desc = "Fast: 0 optional skills, strict safety"
         elif prof_val == "MEDIUM":
-            p_desc = "(Balanced: 2 skills, 600 tok budget)"
+            prof_desc = "Balanced: 2 skills, 600 tok budget"
         else:
-            p_desc = "(Deep: 5 skills, 1500 tok budget)"
-        prof_txt.append(p_desc, style="#93c5fd" if is_sel_prof else "dim #64748b")
-        grid.add_row(prof_txt)
+            prof_desc = "Deep: 5 skills, 1500 tok budget"
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_0 else Text(" ", style="dim"),
+            Text("Execution Profile", style="bold white" if is_sel_0 else "white"),
+            Text(f"[{prof_val}]", style=f"bold {prof_color}"),
+            Text(prof_desc, style="#93c5fd" if is_sel_0 else "dim #94a3b8"),
+        )
 
-        # Row 1: Agent Role Bindings
-        is_sel_roles = (sel == 1)
-        ptr_roles = "▸ " if is_sel_roles else "  "
-        roles_txt = Text(no_wrap=True)
-        roles_txt.append(ptr_roles, style="bold #38bdf8" if is_sel_roles else "dim")
-        roles_txt.append("[2] Agent Role Bindings ", style="bold white" if is_sel_roles else "white")
-        arch_p = settings.roles.get("architecture", {}).get("provider", "anthropic")
-        back_p = settings.roles.get("backend", {}).get("provider", "ollama")
-        front_p = settings.roles.get("frontend", {}).get("provider", "ollama")
-        qa_p = settings.roles.get("qa", {}).get("provider", "ollama")
-        roles_txt.append(f"(Arch: {arch_p} | Back: {back_p} | Front: {front_p} | QA: {qa_p})", style="#93c5fd" if is_sel_roles else "dim #64748b")
-        grid.add_row(roles_txt)
-
-        # Row 2: Skills Retrieval Policy
-        is_sel_skills = (sel == 2)
-        ptr_skills = "▸ " if is_sel_skills else "  "
-        skills_txt = Text(no_wrap=True)
-        skills_txt.append(ptr_skills, style="bold #38bdf8" if is_sel_skills else "dim")
-        skills_txt.append("[3] Skills Retrieval Policy ", style="bold white" if is_sel_skills else "white")
-        if prof_val == "LOW":
-            sk_desc = "[0 SKILLS / 0 TOK] (Mandatory runbooks only)"
-        elif prof_val == "MEDIUM":
-            sk_desc = "[2 SKILLS / 600 TOK] (Relevance-ranked, summaries first)"
-        else:
-            sk_desc = "[5 SKILLS / 1500 TOK] (Progressive deep instructions)"
-        skills_txt.append(sk_desc, style="#34d399" if is_sel_skills else "#10b981")
-        grid.add_row(skills_txt)
-
-        # Row 3: Client Turn Timeout
-        is_sel_timeout = (sel == 3)
-        ptr_timeout = "▸ " if is_sel_timeout else "  "
+        # Row 1: Client Turn Timeout
+        is_sel_1 = (sel == 1)
         to_val = getattr(state, "turn_timeout", None)
         if to_val is None:
             to_val = getattr(settings, "client_timeout", 0)
         to_str = f"[{to_val}s]" if to_val and to_val > 0 else "[DISABLED]"
-        to_txt = Text(no_wrap=True)
-        to_txt.append(ptr_timeout, style="bold #38bdf8" if is_sel_timeout else "dim")
-        to_txt.append("[4] Client Turn Timeout ", style="bold white" if is_sel_timeout else "white")
-        to_txt.append(f"{to_str} ", style="bold #f59e0b" if to_val else "dim #94a3b8")
-        to_txt.append("(←/→ cycle: 0s / 30s / 60s / 120s / 300s)", style="#93c5fd" if is_sel_timeout else "dim #64748b")
-        grid.add_row(to_txt)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_1 else Text(" ", style="dim"),
+            Text("Client Turn Timeout", style="bold white" if is_sel_1 else "white"),
+            Text(to_str, style="bold #f59e0b" if to_val else "dim #94a3b8"),
+            Text("Governance turn response timeout threshold", style="#93c5fd" if is_sel_1 else "dim #94a3b8"),
+        )
 
-        # Row 4: Decision Engine (Laya)
-        is_sel_laya = (sel == 4)
-        ptr_laya = "▸ " if is_sel_laya else "  "
-        laya_txt = Text(no_wrap=True)
-        laya_txt.append(ptr_laya, style="bold #38bdf8" if is_sel_laya else "dim")
-        laya_txt.append("[5] Decision Engine (Laya) ", style="bold white" if is_sel_laya else "white")
-        laya_txt.append("[DETERMINISTIC FALLBACK] ", style="bold #38bdf8" if is_sel_laya else "dim #60a5fa")
-        laya_txt.append("(Offline standby; contracts enforced)", style="dim #64748b")
-        grid.add_row(laya_txt)
+        # Row 2: Decision Engine (Laya)
+        is_sel_2 = (sel == 2)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_2 else Text(" ", style="dim"),
+            Text("Decision Engine (Laya)", style="bold white" if is_sel_2 else "white"),
+            Text("[DETERMINISTIC]", style="bold #38bdf8" if is_sel_2 else "dim #60a5fa"),
+            Text("Offline standby; contracts enforced", style="#93c5fd" if is_sel_2 else "dim #94a3b8"),
+        )
 
-        # Row 5: LLM Providers & Models
-        is_sel_prov = (sel == 5)
-        ptr_prov = "▸ " if is_sel_prov else "  "
-        prov_txt = Text(no_wrap=True)
-        prov_txt.append(ptr_prov, style="bold #38bdf8" if is_sel_prov else "dim")
+        # Row 3: LLM Providers & Models
+        is_sel_3 = (sel == 3)
         enabled_count = sum(1 for p in settings.providers.values() if p.enabled)
         total_count = len(settings.providers)
-        prov_txt.append("[6] LLM Providers & Models ", style="bold white" if is_sel_prov else "white")
-        prov_txt.append(f"[{enabled_count}/{total_count} ENABLED] ", style="bold #4ade80" if is_sel_prov else "dim #22c55e")
-        prov_txt.append("(Press Enter to open :providers)", style="#93c5fd" if is_sel_prov else "dim #64748b")
-        grid.add_row(prov_txt)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_3 else Text(" ", style="dim"),
+            Text("LLM Providers & Models", style="bold white" if is_sel_3 else "white"),
+            Text(f"[{enabled_count}/{total_count} ENABLED]", style="bold #4ade80" if is_sel_3 else "dim #22c55e"),
+            Text("Configure endpoints, API keys & models", style="#93c5fd" if is_sel_3 else "dim #94a3b8"),
+        )
 
-        # Row 6: Save & Exit
-        is_sel_save = (sel == 6)
-        ptr_save = "▸ " if is_sel_save else "  "
-        save_txt = Text(no_wrap=True)
-        save_txt.append(ptr_save, style="bold #38bdf8" if is_sel_save else "dim")
-        save_txt.append("[S] Save Settings to Disk & Apply to Runtime", style="bold #f59e0b" if is_sel_save else "dim #fbbf24")
-        grid.add_row(save_txt)
+        # Row 4: Agent Role Bindings
+        is_sel_4 = (sel == 4)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_4 else Text(" ", style="dim"),
+            Text("Agent Role Bindings", style="bold white" if is_sel_4 else "white"),
+            Text("[CONFIGURED]", style="bold #38bdf8" if is_sel_4 else "dim #60a5fa"),
+            Text("Configure agent contracts & role mappings", style="#93c5fd" if is_sel_4 else "dim #94a3b8"),
+        )
 
-        # Row 7: Hint
-        grid.add_row(Text("  Hint: Press [1-6], [P] Profile, [2] Roles, [6] Providers, [S] Save, [Esc] Close.", style="dim #64748b"))
+        # Row 5: Save Settings
+        is_sel_5 = (sel == 5)
+        table.add_row(
+            Text("▸", style="bold #38bdf8") if is_sel_5 else Text(" ", style="dim"),
+            Text("Save Settings to Disk", style="bold #f59e0b" if is_sel_5 else "white"),
+            Text("[SAVE & APPLY]", style="bold #f59e0b" if is_sel_5 else "dim #fbbf24"),
+            Text("Persist configuration to settings.json", style="#fde047" if is_sel_5 else "dim #94a3b8"),
+        )
 
-        # Row 8: Status message or empty line
+        grid.add_row(table)
+
+        # Row 7: Empty separator or status message
         if status_msg:
-            grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
+            grid.add_row(Text(f"  >> {status_msg}", style="bold #f59e0b", no_wrap=True))
         else:
             grid.add_row(Text(" ", style="dim"))
+
+        # Row 8: Shifted hint at bottom
+        hints_by_row = {
+            0: "Hint: Press [←/→] to cycle execution profile (Low / Medium / High).",
+            1: "Hint: Press [←/→] to adjust turn timeout (0s / 30s / 60s / 120s / 300s).",
+            2: "Hint: Laya decision engine runs offline in deterministic fallback mode.",
+            3: "Hint: Press [Enter] to open :providers (configure API keys & models).",
+            4: "Hint: Press [Enter] to open :roles (configure agent role bindings).",
+            5: "Hint: Press [Enter] to save settings to disk and apply changes.",
+        }
+        current_hint = hints_by_row.get(sel, "Hint: Use arrow keys to navigate. Press Enter to select or save.")
+        grid.add_row(Text(f"  {current_hint}", style="dim #94a3b8", no_wrap=True))
 
     elif view in ("main", "providers"):
         title = " Cloud Providers & Models Configuration (settings.json) "
         subtitle = (
             f" >> {status_msg} "
             if status_msg
-            else (
-                " [↑/↓] Navigate  [←/→] Toggle  [Enter] Configure  [7] Settings  [S] Save  [Esc] Close "
-                if view == "providers"
-                else " [↑/↓] Navigate  [←/→] Toggle/Cycle  [Enter] Configure  [P] Profile  [S] Save  [Esc] Close "
-            )
+            else " [↑/↓] Navigate  [←/→] Toggle  [Enter] Configure  [Esc] Close "
         )
 
         provider_keys = ["anthropic", "openai", "gemini", "ollama", "openrouter", "custom"]
@@ -709,7 +738,7 @@ def render_anchored_settings_panel_str(
             row_txt = Text(no_wrap=True)
             row_txt.append(ptr, style="bold #38bdf8" if is_sel else "dim")
             if prov:
-                row_txt.append(f"[{i + 1}] {prov.display_name:<16} ", style="bold white" if is_sel else "white")
+                row_txt.append(f"{prov.display_name:<18} ", style="bold white" if is_sel else "white")
                 if prov.enabled:
                     row_txt.append("[ENABLED]  ", style="bold #22c55e" if not is_sel else "bold #4ade80")
                 else:
@@ -719,7 +748,7 @@ def render_anchored_settings_panel_str(
                 model_str = prov.default_model or (prov.models[0] if prov.models else "(none)")
                 row_txt.append(f"{model_str}", style="#a7f3d0" if is_sel else "#34d399")
             else:
-                row_txt.append(f"[{i + 1}] (empty)", style="dim")
+                row_txt.append("(empty)", style="dim")
             grid.add_row(row_txt)
 
         if view == "providers":
@@ -728,7 +757,7 @@ def render_anchored_settings_panel_str(
             ptr_ret = "▸ " if is_sel_ret else "  "
             ret_txt = Text(no_wrap=True)
             ret_txt.append(ptr_ret, style="bold #38bdf8" if is_sel_ret else "dim")
-            ret_txt.append(f"[{num_prov + 1}] ◄ Return to StackMind Settings (:settings)", style="bold #60a5fa" if is_sel_ret else "#38bdf8")
+            ret_txt.append("◄ Return to StackMind Settings (:config)", style="bold #60a5fa" if is_sel_ret else "#38bdf8")
             grid.add_row(ret_txt)
 
             # Item num_prov + 1: Save & Exit
@@ -736,14 +765,14 @@ def render_anchored_settings_panel_str(
             ptr_save = "▸ " if is_sel_save else "  "
             save_txt = Text(no_wrap=True)
             save_txt.append(ptr_save, style="bold #38bdf8" if is_sel_save else "dim")
-            save_txt.append("[S] Save Settings to Disk & Apply to Runtime", style="bold #f59e0b" if is_sel_save else "dim #fbbf24")
+            save_txt.append("Save Settings to Disk & Apply to Runtime", style="bold #f59e0b" if is_sel_save else "dim #fbbf24")
             grid.add_row(save_txt)
 
             # Row 8: Hint or status
             if status_msg:
                 grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
             else:
-                grid.add_row(Text("  Hint: Press [1-6] Provider, [7] StackMind Settings, [S] Save, [Esc] Close.", style="dim #64748b"))
+                grid.add_row(Text("  Hint: Use arrow keys to navigate. Press Enter to configure provider.", style="dim #64748b"))
 
         else:
             # view == "main" (legacy fallback for tests)
@@ -831,7 +860,7 @@ def render_anchored_settings_panel_str(
             active_badge = "[ACTIVE] " if is_active else "         "
             row_txt = Text(no_wrap=True)
             row_txt.append(ptr, style="bold #38bdf8" if is_sel else "dim")
-            row_txt.append(f"[{i + 1}] {p_label:<8} ", style=f"bold {p_color}")
+            row_txt.append(f"{p_label:<10} ", style=f"bold {p_color}")
             row_txt.append(active_badge, style="bold green" if is_active else "dim")
             row_txt.append(f"— {p_summary}", style="bold white" if is_sel else "white")
             grid.add_row(row_txt)
@@ -845,11 +874,11 @@ def render_anchored_settings_panel_str(
         ptr_back = "▸ " if is_sel_back else "  "
         back_txt = Text(no_wrap=True)
         back_txt.append(ptr_back, style="bold #38bdf8" if is_sel_back else "dim")
-        back_label = "◄ Cancel (keep current profile)" if is_selector_mode else "◄ Return to Settings"
+        back_label = "◄ Cancel (keep current profile)" if is_selector_mode else "◄ Return to Configuration (:config)"
         back_txt.append(back_label, style="bold white" if is_sel_back else "dim white")
         grid.add_row(back_txt)
 
-        grid.add_row(Text("  Hint: Press Enter, [1-3], or [L/M/H] to apply profile.", style="dim #64748b"))
+        grid.add_row(Text("  Hint: Use arrow keys to select profile and press Enter to apply.", style="dim #64748b"))
         if status_msg:
             grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
         else:
@@ -861,7 +890,7 @@ def render_anchored_settings_panel_str(
         if not prov:
             prov = ProviderConfig(name=p_name, display_name=p_name.title())
         title = f" Configure Provider: {prov.display_name} "
-        subtitle = " [↑/↓] Navigate  [←/→] Cycle/Toggle  [Enter] Select  [Esc/B] Back "
+        subtitle = " [↑/↓] Navigate  [←/→] Toggle/Cycle  [Enter] Select  [Esc] Back "
 
         fields = [
             ("Status", "[ENABLED]" if prov.enabled else "[DISABLED]", "Press ←/→ to toggle"),
@@ -885,8 +914,8 @@ def render_anchored_settings_panel_str(
             grid.add_row(row_txt)
 
     elif view == "roles":
-        title = " Agent Role Assignments "
-        subtitle = " [↑/↓] Select Role  [←/→] Provider  [Enter/M] Model  [A] Custom Model  [Esc/B] Back "
+        title = " Agent Role Assignments (:roles) "
+        subtitle = " [↑/↓] Select Role  [←/→] Provider  [Enter] Model  [Esc] Close "
 
         roles_list = ["architecture", "backend", "frontend", "qa", "gitops"]
         for i, r in enumerate(roles_list):
@@ -902,24 +931,29 @@ def render_anchored_settings_panel_str(
             row_txt.append(f"{p_val:<12} ", style="bold #93c5fd" if is_sel else "#60a5fa")
             row_txt.append("-> ", style="dim")
             row_txt.append(f"{m_val:<22} ", style="#34d399")
-            row_txt.append("(←/→ Provider | Enter/M Model)", style="dim #64748b")
+            row_txt.append("(←/→ Provider | Enter Model)", style="dim #64748b")
             grid.add_row(row_txt)
 
-        # Back row (item 5)
+        # Save row (item 5)
         is_sel_5 = (sel == 5)
         ptr_5 = "▸ " if is_sel_5 else "  "
-        back_txt = Text(no_wrap=True)
-        back_txt.append(ptr_5, style="bold #38bdf8" if is_sel_5 else "dim")
-        back_txt.append("◄ Return to Settings", style="bold white" if is_sel_5 else "dim white")
-        grid.add_row(back_txt)
+        save_txt = Text(no_wrap=True)
+        save_txt.append(ptr_5, style="bold #38bdf8" if is_sel_5 else "dim")
+        save_txt.append("Save Role Bindings to Disk & Apply to Runtime", style="bold #f59e0b" if is_sel_5 else "dim #fbbf24")
+        grid.add_row(save_txt)
 
-        # Filler row to keep height stable
-        grid.add_row(Text("  Hint: Press Enter or M to cycle models, A to type custom model name.", style="dim #64748b"))
+        # Hint & status rows to keep height exactly 11 lines
+        grid.add_row(Text("  Navigation: [↑/↓] Select Role  [←/→] Cycle Provider  [Enter] Cycle Model", style="dim #64748b", no_wrap=True))
+        grid.add_row(Text("  Select Save row and press Enter to save to settings.json.", style="dim #64748b", no_wrap=True))
+        if status_msg:
+            grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
+        else:
+            grid.add_row(Text(" ", style="dim"))
 
-    # Status message or hint (only in subviews to keep main, providers, settings, and profile exactly 11 lines)
-    if status_msg and view not in ("main", "providers", "settings", "stackmind", "profile"):
+    # Status message or hint (only in subviews to keep main, providers, settings, roles, and profile exactly 11 lines)
+    if status_msg and view not in ("main", "providers", "settings", "stackmind", "config", "profile", "roles"):
         grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
-    elif view not in ("main", "providers", "settings", "stackmind", "profile"):
+    elif view not in ("main", "providers", "settings", "stackmind", "config", "profile", "roles"):
         grid.add_row(Text(" ", style="dim"))
 
     panel = Panel(
@@ -929,9 +963,11 @@ def render_anchored_settings_panel_str(
         border_style="#3b82f6",
         width=box_w,
         padding=(0, 1),
+        expand=True,
     )
 
-    console = Console(record=True, width=box_w)
+    sio = io.StringIO()
+    console = Console(file=sio, record=True, width=box_w)
     console.print(panel)
     raw = console.export_text()
     lines = [l.rstrip("\r") for l in raw.split("\n")]
@@ -1041,8 +1077,8 @@ def run_arrow_navigation_settings_loop(
         sel = getattr(state, "settings_selected_row", 0)
 
         # Max rows per view
-        if view in ("settings", "stackmind"):
-            max_rows = 7  # 0: Profile, 1: Roles, 2: Skills Policy, 3: Timeout, 4: Laya, 5: Providers, 6: Save
+        if view in ("settings", "stackmind", "config"):
+            max_rows = 6  # 0: Profile, 1: Timeout, 2: Laya, 3: Providers, 4: Roles, 5: Save
         elif view == "providers":
             max_rows = num_prov + 2  # 0..num_prov-1: Providers, num_prov: Return, num_prov+1: Save
         elif view == "main":
@@ -1070,8 +1106,8 @@ def run_arrow_navigation_settings_loop(
 
         if key in (Key.LEFT, Key.RIGHT):
             step = 1 if key == Key.RIGHT else -1
-            if view in ("settings", "stackmind"):
-                if sel in (0, 2):  # Execution Profile or Skills Context Policy
+            if view in ("settings", "stackmind", "config"):
+                if sel == 0:  # Execution Profile
                     curr_p = getattr(settings, "effective_profile", "medium").lower()
                     curr_idx = profile_keys.index(curr_p) if curr_p in profile_keys else 1
                     next_idx = (curr_idx + step) % len(profile_keys)
@@ -1080,7 +1116,7 @@ def run_arrow_navigation_settings_loop(
                     state.execution_profile = new_p
                     state.settings_status_msg = f"Execution profile set to {new_p.upper()}."
                     _redraw()
-                elif sel == 3:  # Client turn timeout cycle
+                elif sel == 1:  # Client turn timeout cycle
                     timeouts = [0, 30, 60, 120, 300]
                     curr_to = getattr(state, "turn_timeout", None)
                     if curr_to is None:
@@ -1149,30 +1185,25 @@ def run_arrow_navigation_settings_loop(
                     new_m = sanitize_model_name(new_m, new_p)
                     settings.roles[r_name] = {"provider": new_p, "model": new_m}
                     display_name = "Q/A" if r_name.lower() in ("qa", "q/a") else r_name.title()
+                    if hasattr(state, "roles") and display_name in state.roles:
+                        state.roles[display_name].backend = new_p
+                        state.roles[display_name].model = new_m
                     state.settings_status_msg = f"Bound '{display_name}' to {new_p} ({new_m})."
                     _redraw()
             continue
 
         if key in (Key.ENTER, Key.NEWLINE):
-            if view in ("settings", "stackmind"):
-                if sel == 0:  # Profile
-                    state.settings_current_view = "profile"
-                    cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                    state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                    state.settings_status_msg = ""
+            if view in ("settings", "stackmind", "config"):
+                if sel == 0:  # Profile: cycle next profile
+                    curr_p = getattr(settings, "effective_profile", "medium").lower()
+                    curr_idx = profile_keys.index(curr_p) if curr_p in profile_keys else 1
+                    next_idx = (curr_idx + 1) % len(profile_keys)
+                    new_p = profile_keys[next_idx]
+                    settings.execution_profile = new_p
+                    state.execution_profile = new_p
+                    state.settings_status_msg = f"Execution profile set to {new_p.upper()}."
                     _redraw()
-                elif sel == 1:  # Roles
-                    state.settings_current_view = "roles"
-                    state.settings_selected_row = 0
-                    state.settings_status_msg = ""
-                    _redraw()
-                elif sel == 2:  # Skills context policy
-                    state.settings_current_view = "profile"
-                    cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                    state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                    state.settings_status_msg = ""
-                    _redraw()
-                elif sel == 3:  # Client turn timeout cycle
+                elif sel == 1:  # Client turn timeout cycle
                     timeouts = [0, 30, 60, 120, 300]
                     curr_to = getattr(state, "turn_timeout", None)
                     if curr_to is None:
@@ -1184,15 +1215,20 @@ def run_arrow_navigation_settings_loop(
                     settings.client_timeout = new_to
                     state.settings_status_msg = f"Turn timeout set to {new_to}s." if new_to else "Turn timeout disabled."
                     _redraw()
-                elif sel == 4:  # Decision engine info
+                elif sel == 2:  # Decision engine info
                     state.settings_status_msg = "Laya decision engine in deterministic fallback mode."
                     _redraw()
-                elif sel == 5:  # Switch to LLM providers view
+                elif sel == 3:  # Switch to LLM providers view
                     state.settings_current_view = "providers"
                     state.settings_selected_row = 0
                     state.settings_status_msg = ""
                     _redraw()
-                elif sel == 6:  # Save & Exit
+                elif sel == 4:  # Switch to Roles view
+                    state.settings_current_view = "roles"
+                    state.settings_selected_row = 0
+                    state.settings_status_msg = ""
+                    _redraw()
+                elif sel == 5:  # Save & Exit
                     save_settings(settings, workspace)
                     if client and hasattr(client, "settings_update"):
                         try:
@@ -1209,8 +1245,8 @@ def run_arrow_navigation_settings_loop(
                     state.settings_status_msg = ""
                     _redraw()
                 elif sel == num_prov:  # ◄ Return to StackMind Settings
-                    state.settings_current_view = "settings"
-                    state.settings_selected_row = 5
+                    state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
+                    state.settings_selected_row = 3
                     state.settings_status_msg = ""
                     _redraw()
                 elif sel == num_prov + 1:  # Save & Exit
@@ -1350,15 +1386,33 @@ def run_arrow_navigation_settings_loop(
                         state.settings_status_msg = ""
                         _redraw()
             elif view == "roles":
-                if sel == len(role_keys):  # Back
-                    if initial_view in ("settings", "stackmind"):
-                        state.settings_current_view = "settings"
-                        state.settings_selected_row = 1
+                if sel == len(role_keys):  # Save & Exit (row 5)
+                    save_settings(settings, workspace)
+                    if client and hasattr(client, "settings_update"):
+                        try:
+                            client.settings_update(settings.to_dict())
+                        except Exception:
+                            pass
+                    for r_name in role_keys:
+                        r_cfg = settings.roles.get(r_name, {})
+                        d_name = "Q/A" if r_name.lower() in ("qa", "q/a") else r_name.title()
+                        if hasattr(state, "roles") and d_name in state.roles:
+                            state.roles[d_name].backend = r_cfg.get("provider", state.roles[d_name].backend)
+                            state.roles[d_name].model = r_cfg.get("model", state.roles[d_name].model)
+                    if initial_view == "roles":
+                        state.close_settings()
+                        _redraw()
+                        return "[SUCCESS] Agent role bindings saved to settings.json and applied to runtime."
+                    elif initial_view in ("settings", "stackmind", "config"):
+                        state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
+                        state.settings_selected_row = 4
+                        state.settings_status_msg = "Role bindings saved to settings.json."
+                        _redraw()
                     else:
                         state.settings_current_view = "main"
                         state.settings_selected_row = num_prov + 1
-                    state.settings_status_msg = ""
-                    _redraw()
+                        state.settings_status_msg = "Role bindings saved to settings.json."
+                        _redraw()
                 elif 0 <= sel < len(role_keys):
                     # Enter cycles through models of current provider
                     r_name = role_keys[sel]
@@ -1367,39 +1421,57 @@ def run_arrow_navigation_settings_loop(
                     m_val = r_cfg.get("model", "")
                     prov_obj = settings.providers.get(p_val)
                     m_list = prov_obj.models if prov_obj and prov_obj.models else []
+                    display_name = "Q/A" if r_name.lower() in ("qa", "q/a") else r_name.title()
                     if m_list:
                         curr_idx = m_list.index(m_val) if m_val in m_list else -1
                         next_idx = (curr_idx + 1) % len(m_list)
                         new_m = sanitize_model_name(m_list[next_idx], p_val)
                         settings.roles[r_name] = {"provider": p_val, "model": new_m}
-                        state.settings_status_msg = f"Role '{r_name.title()}' model set to '{new_m}'."
+                        if hasattr(state, "roles") and display_name in state.roles:
+                            state.roles[display_name].model = new_m
+                        state.settings_status_msg = f"Role '{display_name}' model set to '{new_m}'."
                     else:
-                        state.settings_status_msg = f"No catalog models for {p_val}. Press [A] to enter custom model."
+                        state.settings_status_msg = f"No catalog models for {p_val}."
                     _redraw()
             continue
 
-        if key in (Key.ESCAPE, "q", "Q"):
+        if key == Key.CTRL_C:
+            raise KeyboardInterrupt()
+
+        if key == Key.ESCAPE:
             if is_profile_selector_mode:
                 state.close_settings()
                 _redraw()
                 return "[INFO] Profile selection cancelled (no changes)."
-            elif view in ("settings", "stackmind"):
+            elif initial_view == "roles":
+                state.close_settings()
+                _redraw()
+                return "[INFO] Agent role bindings closed."
+            elif view in ("settings", "stackmind", "config"):
                 break
             elif view == "providers":
                 if initial_view == "providers":
                     break
                 else:
-                    state.settings_current_view = "settings"
-                    state.settings_selected_row = 5
+                    state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
+                    state.settings_selected_row = 3
+                    state.settings_status_msg = ""
+                    _redraw()
+            elif view == "roles":
+                if initial_view in ("settings", "stackmind", "config"):
+                    state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
+                    state.settings_selected_row = 4
+                    state.settings_status_msg = ""
+                    _redraw()
+                else:
+                    state.settings_current_view = "main"
+                    state.settings_selected_row = num_prov + 1
                     state.settings_status_msg = ""
                     _redraw()
             elif view != "main":
                 if view == "profile":
-                    state.settings_current_view = "settings" if initial_view in ("settings", "stackmind") else "main"
-                    state.settings_selected_row = 0 if initial_view in ("settings", "stackmind") else num_prov
-                elif view == "roles":
-                    state.settings_current_view = "settings" if initial_view in ("settings", "stackmind") else "main"
-                    state.settings_selected_row = 1 if initial_view in ("settings", "stackmind") else num_prov + 1
+                    state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "main"
+                    state.settings_selected_row = 0 if initial_view in ("settings", "stackmind", "config") else num_prov
                 elif view.startswith("provider:"):
                     p_name = view.split(":", 1)[1]
                     state.settings_current_view = "providers" if initial_view == "providers" else "main"
@@ -1409,234 +1481,6 @@ def run_arrow_navigation_settings_loop(
             else:
                 break
             continue
-
-        # Direct shortcuts
-        if key in ("s", "S"):
-            save_settings(settings, workspace)
-            if client and hasattr(client, "settings_update"):
-                try:
-                    client.settings_update(settings.to_dict())
-                except Exception:
-                    pass
-            state.settings_status_msg = "Settings saved to settings.json and applied to runtime."
-            _redraw()
-            continue
-
-        if view in ("settings", "stackmind"):
-            if key in ("p", "P", "1"):
-                state.settings_current_view = "profile"
-                cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                state.settings_status_msg = ""
-                _redraw()
-            elif key == "2":
-                state.settings_current_view = "roles"
-                state.settings_selected_row = 0
-                state.settings_status_msg = ""
-                _redraw()
-            elif key == "3":
-                state.settings_current_view = "profile"
-                cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                state.settings_status_msg = ""
-                _redraw()
-            elif key == "4":
-                timeouts = [0, 30, 60, 120, 300]
-                curr_to = getattr(state, "turn_timeout", None)
-                if curr_to is None:
-                    curr_to = getattr(settings, "client_timeout", 0)
-                curr_idx = timeouts.index(curr_to) if curr_to in timeouts else 0
-                next_idx = (curr_idx + 1) % len(timeouts)
-                new_to = timeouts[next_idx]
-                state.turn_timeout = new_to
-                settings.client_timeout = new_to
-                state.settings_status_msg = f"Turn timeout set to {new_to}s." if new_to else "Turn timeout disabled."
-                _redraw()
-            elif key == "5":
-                state.settings_status_msg = "Laya decision engine in deterministic fallback mode."
-                _redraw()
-            elif key == "6":
-                state.settings_current_view = "providers"
-                state.settings_selected_row = 0
-                state.settings_status_msg = ""
-                _redraw()
-        elif view == "providers":
-            if key.isdigit() and 1 <= int(key) <= num_prov:
-                idx = int(key) - 1
-                state.settings_current_view = f"provider:{provider_keys[idx]}"
-                state.settings_selected_row = 0
-                state.settings_status_msg = ""
-                _redraw()
-            elif key == str(num_prov + 1):  # Return to Settings
-                state.settings_current_view = "settings"
-                state.settings_selected_row = 5
-                state.settings_status_msg = ""
-                _redraw()
-            elif key in ("p", "P"):
-                state.settings_current_view = "settings"
-                state.settings_selected_row = 0
-                state.settings_status_msg = ""
-                _redraw()
-        elif view == "main":
-            if key in ("p", "P"):
-                state.settings_current_view = "profile"
-                cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                state.settings_status_msg = ""
-                _redraw()
-            elif key.isdigit() and 1 <= int(key) <= num_prov:
-                idx = int(key) - 1
-                state.settings_current_view = f"provider:{provider_keys[idx]}"
-                state.settings_selected_row = 0
-                state.settings_status_msg = ""
-                _redraw()
-            elif key == str(num_prov + 1):
-                state.settings_current_view = "profile"
-                cur_prof = getattr(settings, "effective_profile", "medium").lower()
-                state.settings_selected_row = profile_keys.index(cur_prof) if cur_prof in profile_keys else 1
-                state.settings_status_msg = ""
-                _redraw()
-            elif key == str(num_prov + 2):
-                state.settings_current_view = "roles"
-                state.settings_selected_row = 0
-                state.settings_status_msg = ""
-                _redraw()
-        elif view == "profile":
-            if key in ("b", "B"):
-                if is_profile_selector_mode:
-                    state.close_settings()
-                    _redraw()
-                    return "[INFO] Profile selection cancelled (no changes)."
-                else:
-                    if initial_view in ("settings", "stackmind"):
-                        state.settings_current_view = "settings"
-                        state.settings_selected_row = 0
-                    else:
-                        state.settings_current_view = "main"
-                        state.settings_selected_row = num_prov
-                    state.settings_status_msg = ""
-                    _redraw()
-            elif key in ("1", "2", "3"):
-                chosen_prof = profile_keys[int(key) - 1]
-                settings.execution_profile = chosen_prof
-                state.execution_profile = chosen_prof
-                save_settings(settings, workspace)
-                if client and hasattr(client, "settings_update"):
-                    try:
-                        client.settings_update(settings.to_dict())
-                    except Exception:
-                        pass
-                if is_profile_selector_mode:
-                    state.close_settings()
-                    _redraw()
-                    return (
-                        f"[SUCCESS] Execution profile updated to: {chosen_prof.upper()}\n"
-                        f"Profile saved to settings.json and applied to runtime."
-                    )
-                else:
-                    if initial_view in ("settings", "stackmind"):
-                        state.settings_current_view = "settings"
-                        state.settings_selected_row = 0
-                    else:
-                        state.settings_current_view = "main"
-                        state.settings_selected_row = num_prov
-                    state.settings_status_msg = f"Profile set to {chosen_prof.upper()} and saved."
-                    _redraw()
-            elif key.lower() in ("l", "m", "h"):
-                p_map = {"l": "low", "m": "medium", "h": "high"}
-                chosen_prof = p_map[key.lower()]
-                settings.execution_profile = chosen_prof
-                state.execution_profile = chosen_prof
-                save_settings(settings, workspace)
-                if client and hasattr(client, "settings_update"):
-                    try:
-                        client.settings_update(settings.to_dict())
-                    except Exception:
-                        pass
-                if is_profile_selector_mode:
-                    state.close_settings()
-                    _redraw()
-                    return (
-                        f"[SUCCESS] Execution profile updated to: {chosen_prof.upper()}\n"
-                        f"Profile saved to settings.json and applied to runtime."
-                    )
-                else:
-                    if initial_view in ("settings", "stackmind"):
-                        state.settings_current_view = "settings"
-                        state.settings_selected_row = 0
-                    else:
-                        state.settings_current_view = "main"
-                        state.settings_selected_row = num_prov
-                    state.settings_status_msg = f"Profile set to {chosen_prof.upper()} and saved."
-                    _redraw()
-        elif view.startswith("provider:"):
-            if key in ("b", "B"):
-                p_name = view.split(":", 1)[1]
-                if initial_view == "providers":
-                    state.settings_current_view = "providers"
-                else:
-                    state.settings_current_view = "main"
-                state.settings_selected_row = provider_keys.index(p_name) if p_name in provider_keys else 0
-                state.settings_status_msg = ""
-                _redraw()
-            elif key in ("t", "T"):
-                p_name = view.split(":", 1)[1]
-                prov = settings.providers.get(p_name)
-                if prov:
-                    state.settings_status_msg = f"Testing connection to {prov.display_name}..."
-                    _redraw()
-                    ok, msg, disc = test_provider_connection(prov, timeout=10.0)
-                    if disc:
-                        for dm in disc:
-                            clean_dm = sanitize_model_name(dm, prov.name)
-                            if clean_dm and clean_dm not in prov.models:
-                                prov.models.append(clean_dm)
-                    if ok and not prov.enabled:
-                        prov.enabled = True
-                    state.settings_status_msg = f"{'SUCCESS' if ok else 'FAILED'}: {msg}"
-                    _redraw()
-        elif view == "roles":
-            if key in ("b", "B"):
-                if initial_view in ("settings", "stackmind"):
-                    state.settings_current_view = "settings"
-                    state.settings_selected_row = 1
-                else:
-                    state.settings_current_view = "main"
-                    state.settings_selected_row = num_prov + 1
-                state.settings_status_msg = ""
-                _redraw()
-            elif key.isdigit() and 1 <= int(key) <= len(role_keys):
-                state.settings_selected_row = int(key) - 1
-                _redraw()
-            elif key in ("m", "M"):
-                if 0 <= sel < len(role_keys):
-                    r_name = role_keys[sel]
-                    r_cfg = settings.roles.get(r_name, {})
-                    p_val = r_cfg.get("provider", "ollama")
-                    m_val = r_cfg.get("model", "")
-                    prov_obj = settings.providers.get(p_val)
-                    m_list = prov_obj.models if prov_obj and prov_obj.models else []
-                    if m_list:
-                        curr_idx = m_list.index(m_val) if m_val in m_list else -1
-                        next_idx = (curr_idx + 1) % len(m_list)
-                        new_m = sanitize_model_name(m_list[next_idx], p_val)
-                        settings.roles[r_name] = {"provider": p_val, "model": new_m}
-                        state.settings_status_msg = f"Role '{r_name.title()}' model set to '{new_m}'."
-                    _redraw()
-            elif key in ("a", "A"):
-                if 0 <= sel < len(role_keys):
-                    r_name = role_keys[sel]
-                    r_cfg = settings.roles.get(r_name, {})
-                    p_val = r_cfg.get("provider", "ollama")
-                    prov_obj = settings.providers.get(p_val)
-                    val = _read_field_input(f"Enter model name for {r_name.title()} ({p_val}): ", key_stream)
-                    if val:
-                        clean_m = sanitize_model_name(val, p_val)
-                        if prov_obj and clean_m not in prov_obj.models:
-                            prov_obj.models.append(clean_m)
-                        settings.roles[r_name] = {"provider": p_val, "model": clean_m}
-                        state.settings_status_msg = f"Role '{r_name.title()}' set to '{clean_m}'."
-                    _redraw()
 
     # Save and clean up on exit
     save_settings(settings, workspace)
@@ -1649,7 +1493,7 @@ def run_arrow_navigation_settings_loop(
     _redraw()
     if is_profile_selector_mode:
         return f"[INFO] Profile selector closed. Active profile: {getattr(settings, 'effective_profile', 'medium').upper()}."
-    return "[SUCCESS] Settings closed and persisted"
+    return "[SUCCESS] Settings closed and persisted to settings.json"
 
 
 def render_profile_overview_str(
@@ -1713,9 +1557,9 @@ def render_profile_overview_str(
     content.add_row(
         Text(
             "Commands:\n"
-            "  :profile               Open interactive profile selection layout\n"
-            "  :profile low|medium|high Set profile directly\n"
-            "  :settings              Open full settings panel (Providers, Profiles, Roles)",
+            "  :config                Open interactive configuration panel\n"
+            "  :config profile low|medium|high Set profile directly\n"
+            "  :providers             Configure LLM providers and models",
             style="dim #64748b",
         )
     )
@@ -1759,7 +1603,7 @@ def run_interactive_profile_selector(
     )
 
 
-def run_interactive_stackmind_settings(
+def run_interactive_config_panel(
     session: Mapping[str, Any],
     state: Any,
     client: Any | None = None,
@@ -1769,7 +1613,7 @@ def run_interactive_stackmind_settings(
     width: int | None = None,
     stream: Any = None,
 ) -> str:
-    """Run interactive StackMind settings panel anchored below composer."""
+    """Run interactive StackMind configuration panel anchored below composer (:config)."""
     return run_arrow_navigation_settings_loop(
         session=session,
         state=state,
@@ -1779,8 +1623,11 @@ def run_interactive_stackmind_settings(
         workspace=workspace,
         width=width,
         stream=stream,
-        initial_view="settings",
+        initial_view="config",
     )
+
+
+run_interactive_stackmind_settings = run_interactive_config_panel
 
 
 def run_interactive_providers_panel(
@@ -1804,6 +1651,30 @@ def run_interactive_providers_panel(
         width=width,
         stream=stream,
         initial_view="providers",
+    )
+
+
+def run_interactive_roles_panel(
+    session: Mapping[str, Any],
+    state: Any,
+    client: Any | None = None,
+    live_manager: Any | None = None,
+    key_stream: Iterator[str] | None = None,
+    workspace: Path | None = None,
+    width: int | None = None,
+    stream: Any = None,
+) -> str:
+    """Run interactive Agent Roles & Execution Backend Bindings panel anchored below composer (:roles)."""
+    return run_arrow_navigation_settings_loop(
+        session=session,
+        state=state,
+        client=client,
+        live_manager=live_manager,
+        key_stream=key_stream,
+        workspace=workspace,
+        width=width,
+        stream=stream,
+        initial_view="roles",
     )
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import shutil
 import sys
 import time
 from typing import Any, Callable, Iterator, Optional
@@ -83,6 +84,7 @@ class Key:
     NEWLINE = "\n"
     CTRL_K = "\x0b"  # Command palette
     CTRL_L = "\x0c"  # Clear / redraw screen
+    CTRL_O = "\x0f"  # Toggle thinking block
     ESCAPE = "\x1b"
 
     UP = "<UP>"
@@ -96,6 +98,9 @@ class Key:
     PAGE_DOWN = "<PAGE_DOWN>"
     MOUSE_WHEEL_UP = "<WHEEL_UP>"
     MOUSE_WHEEL_DOWN = "<WHEEL_DOWN>"
+    PASTE_START = "<PASTE_START>"
+    PASTE_END = "<PASTE_END>"
+    SHIFT_ENTER = "<SHIFT_ENTER>"
 
 
 # SGR Extended Mouse Mode control sequences (WO-054)
@@ -132,7 +137,7 @@ def disable_mouse_reporting(stream: Any = None) -> None:
 
 
 class TerminalStateRestorer:
-    """Context manager to ensure terminal attributes and cursor are restored unconditionally."""
+    """Context manager to ensure terminal attributes, mouse reporting, and bracketed paste are restored unconditionally."""
 
     def __init__(self, fd: int = 0) -> None:
         self.fd = fd
@@ -147,6 +152,11 @@ class TerminalStateRestorer:
 
         if self.is_tty:
             enable_mouse_reporting(sys.stdout)
+            try:
+                sys.stdout.write("\x1b[?2004h")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
         if self.is_tty and os.name != "nt":
             try:
@@ -168,10 +178,10 @@ class TerminalStateRestorer:
             except Exception:
                 pass
 
-        # Unconditionally disable mouse reporting, restore cursor visibility, and reset ANSI attributes
+        # Unconditionally disable mouse reporting, disable bracketed paste, restore cursor visibility, and reset ANSI attributes
         disable_mouse_reporting(sys.stdout)
         try:
-            sys.stdout.write("\x1b[?25h\x1b[0m")
+            sys.stdout.write("\x1b[?2004l\x1b[?25h\x1b[0m")
             sys.stdout.flush()
         except Exception:
             pass
@@ -232,6 +242,16 @@ def _parse_escape_sequence(seq: str) -> str:
         return Key.PAGE_UP
     elif seq == "[6~":
         return Key.PAGE_DOWN
+
+    # Bracketed paste
+    elif seq == "[200~":
+        return Key.PASTE_START
+    elif seq == "[201~":
+        return Key.PASTE_END
+
+    # Shift+Enter / Alt+Enter
+    elif seq in ("[13;2u", "[27;2;13~", "OM"):
+        return Key.SHIFT_ENTER
 
     return f"<ESC_{seq}>"
 
@@ -508,6 +528,12 @@ class Win32ConsoleReader:
                     self._pending_keys.extend([Key.DELETE] * (key.wRepeatCount - 1))
                 return Key.DELETE
 
+            # Virtual key override for VK_RETURN when Shift is held
+            if vk == 0x0D and (key.dwControlKeyState & 0x0010):
+                if key.wRepeatCount > 1:
+                    self._pending_keys.extend([Key.SHIFT_ENTER] * (key.wRepeatCount - 1))
+                return Key.SHIFT_ENTER
+
             # 4. Standard character or control character
             if key.wRepeatCount > 1:
                 self._pending_keys.extend([char] * (key.wRepeatCount - 1))
@@ -708,6 +734,33 @@ def read_next_key(
     return res
 
 
+def has_pending_input() -> bool:
+    """Check if unread input events are immediately available in the console buffer."""
+    if os.name == "nt":
+        try:
+            if getattr(_win32_reader, "_pending_keys", None):
+                return True
+            import msvcrt
+            if msvcrt.kbhit():
+                return True
+            h = _win32_reader._get_input_handle()
+            if h and h not in (0, -1):
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                num_events = ctypes.c_uint32()
+                if kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
+                    return num_events.value > 0
+        except Exception:
+            pass
+    else:
+        try:
+            import select
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0)
+            return bool(r)
+        except Exception:
+            pass
+    return False
+
+
 DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":resume", "Resume active session", False),
     (":status", "Display current Session & Delivery View", False),
@@ -717,10 +770,9 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":goal", "Submit product goal to Architecture", True),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
-    (":roles", "Display Agent Roles & Backend bindings", False),
+    (":roles", "Interactive Agent Roles & Execution Backend bindings panel", False),
     (":rebind", "Rebind agent role to backend", True),
-    (":settings", "Configure StackMind execution profile, roles & system policies", False),
-    (":config", "Configure StackMind execution profile, roles & system policies", False),
+    (":config", "Configure StackMind execution profile, governance & system policies", False),
     (":providers", "Configure cloud & local LLM providers, API keys & base URLs", False),
     (":models", "Configure and list available provider models", False),
     (":tree", "Display Hierarchical Operation Tree", False),
@@ -734,6 +786,8 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":reconnect", "Reconnect to daemon & replay missed events", False),
     (":chat", "Display conversation transcript", False),
     (":actions", "Toggle/expand/collapse turn Actions group", False),
+    (":thinking", "Toggle thinking block expansion (Ctrl+O)", False),
+    (":govern", "Configure governance verbosity: tree | flat | compact", False),
     (":compact", "Compact older transcript turns", False),
     (":timeout", "Get or set client turn wait timeout", False),
     (":landing", "Display branded landing block", False),
@@ -742,11 +796,9 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":consume-skills", "Install/import procedural skills from file or directory", True),
     (":consume-skill", "Install/import procedural skill from file or directory", True),
     (":projects", "List registered projects and runtime home", False),
-    (":profile", "Get or set execution profile (low|medium|high)", True),
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
     (":exit", "Gracefully stop daemon and exit", False),
-    (":quit", "Gracefully stop daemon and exit", False),
 ]
 
 
@@ -778,7 +830,7 @@ def format_dropdown_lines(
             start_idx = selected_index - half
             end_idx = start_idx + max_visible
 
-    box_w = max(36, min(width - 2, 74))
+    box_w = max(20, width)
     inner_w = box_w - 4
 
     border_color = "\033[90m"
@@ -798,20 +850,31 @@ def format_dropdown_lines(
         top_line = f"{border_color}┌{top_mid}{'─' * rem_short}┐{reset}"
 
     lines = [top_line]
-    cmd_col_w = 14
+    visible_matches = matches[start_idx:end_idx]
+    max_cmd_len = max(len(m[0]) for m in visible_matches) if visible_matches else 14
+    if inner_w < 32:
+        cmd_col_w = min(16, max(8, inner_w // 2))
+    else:
+        cmd_col_w = max(16, max_cmd_len + 1)
 
     for i in range(start_idx, end_idx):
         cmd, desc, _ = matches[i]
         is_sel = (i == selected_index)
 
-        avail_desc_w = inner_w - cmd_col_w - 2
+        cmd_padded = cmd.ljust(cmd_col_w)
+        if len(cmd_padded) > max(8, inner_w - 4):
+            cmd_padded = cmd_padded[:max(8, inner_w - 4)]
+
+        avail_desc_w = max(0, inner_w - len(cmd_padded) - 2)
         if len(desc) > avail_desc_w:
-            desc_str = desc[:max(0, avail_desc_w - 3)] + "..."
+            if avail_desc_w >= 4:
+                desc_str = desc[:avail_desc_w - 3] + "..."
+            else:
+                desc_str = desc[:avail_desc_w]
         else:
             desc_str = desc
 
-        padding_w = max(0, inner_w - (2 + cmd_col_w + len(desc_str)))
-        cmd_padded = cmd.ljust(cmd_col_w)
+        padding_w = max(0, inner_w - (2 + len(cmd_padded) + len(desc_str)))
 
         if is_sel:
             marker = f"{cyan_bold}> {reset}"
@@ -846,6 +909,7 @@ class RawLineEditor:
         state: Optional[Any] = None,
         on_ctrl_k: Optional[Callable[[], None]] = None,
         on_ctrl_l: Optional[Callable[[], None]] = None,
+        on_ctrl_o: Optional[Callable[[], None]] = None,
         on_page_up: Optional[Callable[[], None]] = None,
         on_page_down: Optional[Callable[[], None]] = None,
         on_wheel_up: Optional[Callable[[], None]] = None,
@@ -856,6 +920,9 @@ class RawLineEditor:
         commands: Optional[list[tuple[str, str, bool]]] = None,
         on_clear_dropdown: Optional[Callable[[], Any]] = None,
         out: Any = sys.stdout,
+        bottom_border_renderer: Optional[Callable[[Optional[str]], str]] = None,
+        on_alert: Optional[Callable[[Optional[str]], None]] = None,
+        on_height_change: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
@@ -869,11 +936,13 @@ class RawLineEditor:
         self.state = state
         self.on_ctrl_k = on_ctrl_k
         self.on_ctrl_l = on_ctrl_l
+        self.on_ctrl_o = on_ctrl_o
         self.on_page_up = on_page_up
         self.on_page_down = on_page_down
         self.on_wheel_up = on_wheel_up
         self.on_wheel_down = on_wheel_down
         self.on_transition = on_transition
+        self.on_height_change = on_height_change
         self.width = width
         self.has_borders = "│" in self.prompt_prefix
         if right_border is not None:
@@ -891,12 +960,87 @@ class RawLineEditor:
         self._dropdown_dismissed: bool = False
         self.on_clear_dropdown = on_clear_dropdown
 
+        self._ctrl_c_timestamp: Optional[float] = None
+        self._ctrl_c_timeout: float = 3.0
+        self._confirmed_exit: bool = False
+        self.alert: Optional[str] = None
+        self.bottom_border_renderer = bottom_border_renderer
+        self.on_alert = on_alert
+
+        self.in_bracketed_paste: bool = False
+        self._last_was_cr: bool = False
+        self._last_line_count: int = max(1, "".join(self.buffer).count("\n") + 1)
+
         self._update_state()
         self._update_dropdown()
 
     @property
     def text(self) -> str:
         return "".join(self.buffer)
+
+    def _notify_height_change(self) -> None:
+        lines_count = max(1, "".join(self.buffer).count("\n") + 1)
+        if lines_count != self._last_line_count:
+            self._last_line_count = lines_count
+            if getattr(self, "on_height_change", None):
+                try:
+                    self.on_height_change(self)
+                except Exception:
+                    pass
+
+    def _get_line_and_col(self, cursor: int | None = None) -> tuple[int, int, list[str]]:
+        """Return (line_index, col_index, list_of_lines) for cursor in buffer."""
+        if cursor is None:
+            cursor = self.cursor
+        text = "".join(self.buffer)
+        lines = text.split("\n")
+        cur = 0
+        for l_idx, line in enumerate(lines):
+            line_len = len(line)
+            if cur <= cursor <= cur + line_len:
+                col = cursor - cur
+                return l_idx, col, lines
+            cur += line_len + 1
+        return max(0, len(lines) - 1), len(lines[-1]) if lines else 0, lines
+
+    @property
+    def current_line_and_col(self) -> tuple[int, int]:
+        l_idx, col, _ = self._get_line_and_col()
+        return l_idx, col
+
+    @property
+    def current_visible_line_index(self) -> int:
+        from cli.tui.layout import get_composer_line_limits
+
+        l_idx, _, lines = self._get_line_and_col()
+        total_lines = len(lines)
+        max_box_h, max_input_lines = get_composer_line_limits()
+        if total_lines > max_input_lines:
+            window_start = total_lines - max_input_lines
+            return max(0, l_idx - window_start)
+        return l_idx
+
+    def move_up(self) -> bool:
+        """Move cursor up one line within multiline buffer. Returns True if handled."""
+        l_idx, col, lines = self._get_line_and_col()
+        if l_idx > 0:
+            target_line = lines[l_idx - 1]
+            target_col = min(col, len(target_line))
+            new_cursor = sum(len(lines[i]) + 1 for i in range(l_idx - 1)) + target_col
+            self.cursor = new_cursor
+            return True
+        return False
+
+    def move_down(self) -> bool:
+        """Move cursor down one line within multiline buffer. Returns True if handled."""
+        l_idx, col, lines = self._get_line_and_col()
+        if l_idx < len(lines) - 1:
+            target_line = lines[l_idx + 1]
+            target_col = min(col, len(target_line))
+            new_cursor = sum(len(lines[i]) + 1 for i in range(l_idx + 1)) + target_col
+            self.cursor = new_cursor
+            return True
+        return False
 
     def _update_state(self) -> None:
         if self.state is not None and hasattr(self.state, "composer_buffer"):
@@ -962,25 +1106,31 @@ class RawLineEditor:
         self._update_dropdown()
         if was_empty and self.on_transition:
             self.on_transition(True)
+        if ch == "\n":
+            self._notify_height_change()
 
     def delete_backspace(self) -> None:
         if self.cursor > 0:
-            self.buffer.pop(self.cursor - 1)
+            removed = self.buffer.pop(self.cursor - 1)
             self.cursor -= 1
             self._update_state()
             self._dropdown_dismissed = False
             self._update_dropdown()
             if len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
+            if removed == "\n":
+                self._notify_height_change()
 
     def delete_forward(self) -> None:
         if self.cursor < len(self.buffer):
-            self.buffer.pop(self.cursor)
+            removed = self.buffer.pop(self.cursor)
             self._update_state()
             self._dropdown_dismissed = False
             self._update_dropdown()
             if len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
+            if removed == "\n":
+                self._notify_height_change()
 
     def move_left(self) -> None:
         if self.cursor > 0:
@@ -1014,6 +1164,7 @@ class RawLineEditor:
                 self.on_transition(True)
             elif not was_empty and len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
+            self._notify_height_change()
 
     def history_next(self) -> None:
         if not self.history:
@@ -1037,6 +1188,7 @@ class RawLineEditor:
             self.on_transition(True)
         elif not was_empty and len(self.buffer) == 0 and self.on_transition:
             self.on_transition(False)
+        self._notify_height_change()
 
     def handle_key(self, key: str) -> bool:
         """Process a single key. Returns True if Enter was pressed, False otherwise."""
@@ -1044,7 +1196,51 @@ class RawLineEditor:
             _log_debug_key(f"[handle_key] received key={repr(key)}")
 
         if key == Key.CTRL_C:
-            raise KeyboardInterrupt()
+            now = time.monotonic()
+            if self._ctrl_c_timestamp is not None and (now - self._ctrl_c_timestamp) <= self._ctrl_c_timeout:
+                self._ctrl_c_timestamp = None
+                self.alert = None
+                self._confirmed_exit = True
+                if self.state is not None and hasattr(self.state, "composer_alert"):
+                    self.state.composer_alert = None
+                if self.on_alert:
+                    try:
+                        self.on_alert(None)
+                    except Exception:
+                        pass
+                raise KeyboardInterrupt()
+            else:
+                self._ctrl_c_timestamp = now
+                self.alert = "press ctrl + C again"
+                self._confirmed_exit = False
+                if self.state is not None and hasattr(self.state, "composer_alert"):
+                    self.state.composer_alert = self.alert
+                if self.on_alert:
+                    try:
+                        self.on_alert(self.alert)
+                    except Exception:
+                        pass
+                return False
+
+        if self.alert is not None:
+            self.alert = None
+            self._ctrl_c_timestamp = None
+            self._confirmed_exit = False
+            if self.state is not None and hasattr(self.state, "composer_alert"):
+                self.state.composer_alert = None
+            if self.on_alert:
+                try:
+                    self.on_alert(None)
+                except Exception:
+                    pass
+            if self.bottom_border_renderer and self.has_borders:
+                try:
+                    border_str = self.bottom_border_renderer(None)
+                    target = getattr(self, "out", sys.stdout)
+                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+                    target.flush()
+                except Exception:
+                    pass
 
         if key == Key.CTRL_D:
             if not self.buffer:
@@ -1098,8 +1294,38 @@ class RawLineEditor:
                 self._erase_dropdown()
                 return False
 
+        if key == Key.PASTE_START:
+            self.in_bracketed_paste = True
+            return False
+
+        if key == Key.PASTE_END:
+            self.in_bracketed_paste = False
+            self._notify_height_change()
+            return False
+
+        if key == Key.SHIFT_ENTER:
+            self.insert_char("\n")
+            return False
+
         if key in (Key.ENTER, Key.NEWLINE):
+            if self.in_bracketed_paste or has_pending_input():
+                if key == "\r":
+                    self._last_was_cr = True
+                    self.insert_char("\n")
+                elif key == "\n":
+                    if self._last_was_cr:
+                        self._last_was_cr = False
+                        return False
+                    self._last_was_cr = False
+                    self.insert_char("\n")
+                else:
+                    self._last_was_cr = False
+                    self.insert_char("\n")
+                return False
+            self._last_was_cr = False
             return True
+
+        self._last_was_cr = False
 
         if key in (Key.BACKSPACE, Key.BACKSPACE_DEL):
             self.delete_backspace()
@@ -1126,10 +1352,20 @@ class RawLineEditor:
             return False
 
         if key == Key.UP:
+            if "\n" in self.buffer:
+                if self.move_up():
+                    self._update_state()
+                    self._update_dropdown()
+                    return False
             self.history_prev()
             return False
 
         if key == Key.DOWN:
+            if "\n" in self.buffer:
+                if self.move_down():
+                    self._update_state()
+                    self._update_dropdown()
+                    return False
             self.history_next()
             return False
 
@@ -1141,6 +1377,11 @@ class RawLineEditor:
         if key == Key.CTRL_L:
             if self.on_ctrl_l:
                 self.on_ctrl_l()
+            return False
+
+        if key == Key.CTRL_O:
+            if self.on_ctrl_o:
+                self.on_ctrl_o()
             return False
 
         if key == Key.PAGE_UP:
@@ -1180,6 +1421,24 @@ class RawLineEditor:
                 _log_debug_key(f"[handle_key] Filtered non-wheel mouse event: {key}")
             return False
 
+        if len(key) > 1 and not key.startswith(("<", "\x1b")):
+            for ch in key:
+                if ch == "\r":
+                    self._last_was_cr = True
+                    self.insert_char("\n")
+                elif ch == "\n":
+                    if self._last_was_cr:
+                        self._last_was_cr = False
+                        continue
+                    self._last_was_cr = False
+                    self.insert_char("\n")
+                else:
+                    self._last_was_cr = False
+                    if ch.isprintable() or ch == "\t":
+                        self.insert_char(ch)
+            self._notify_height_change()
+            return False
+
         # Printable characters (ASCII or Unicode)
         if len(key) == 1 and (key.isprintable() or key == "\t"):
             if DEBUG_KEYS_ENABLED:
@@ -1195,6 +1454,33 @@ class RawLineEditor:
         """Redraw current line with exact cursor placement and composer border preservation."""
         target = out if out is not None else getattr(self, "out", sys.stdout)
         buf_str = "".join(self.buffer)
+
+        if "\n" in buf_str:
+            l_idx, col, lines = self._get_line_and_col()
+            self.displayed_cursor = col
+            if getattr(self, "on_height_change", None):
+                try:
+                    self.on_height_change(self)
+                    return
+                except Exception:
+                    pass
+            cur_line_text = lines[l_idx]
+            prefix = self.prompt_prefix if l_idx == 0 else (
+                "\033[90m│\033[0m   " if "\033[" in self.prompt_prefix else "│   "
+            )
+            visible_prefix_len = len(_ANSI_STRIP_RE.sub("", prefix))
+            visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
+            inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
+            displayed = cur_line_text
+            self.displayed_cursor = col
+            spaces_count = max(0, inner_available - len(displayed))
+            line_out = f"\r{prefix}{displayed}{' ' * spaces_count}{self.right_border}"
+            target.write(line_out)
+            cursor_col = visible_prefix_len + col + 1
+            target.write(f"\x1b[{cursor_col}G")
+            target.flush()
+            return
+
         if not getattr(self, "has_borders", False):
             line_out = f"\r{self.prompt_prefix}{buf_str}\x1b[K"
             target.write(line_out)
@@ -1256,6 +1542,13 @@ class RawLineEditor:
         cursor_col = visible_prefix_len + displayed_cursor + 1
         target.write(f"\x1b[{cursor_col}G")
 
+        if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
+            try:
+                border_str = self.bottom_border_renderer(self.alert)
+                target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+            except Exception:
+                pass
+
         # Dropdown management
         prev_H = self._last_dropdown_lines_count
 
@@ -1307,6 +1600,7 @@ def raw_prompt_input(
     state: Optional[Any] = None,
     on_ctrl_k: Optional[Callable[[], None]] = None,
     on_ctrl_l: Optional[Callable[[], None]] = None,
+    on_ctrl_o: Optional[Callable[[], None]] = None,
     on_page_up: Optional[Callable[[], None]] = None,
     on_page_down: Optional[Callable[[], None]] = None,
     on_wheel_up: Optional[Callable[[], None]] = None,
@@ -1315,7 +1609,11 @@ def raw_prompt_input(
     commands: Optional[list[tuple[str, str, bool]]] = None,
     key_stream: Optional[Iterator[str]] = None,
     top_border_renderer: Optional[Callable[[bool], str]] = None,
+    bottom_border_renderer: Optional[Callable[[Optional[str]], str]] = None,
+    on_alert: Optional[Callable[[Optional[str]], None]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
+    on_height_change: Optional[Callable[[Any], None]] = None,
+    on_resize: Optional[Callable[..., None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -1380,6 +1678,15 @@ def raw_prompt_input(
                 sys.stdout.write(top_border_renderer(bool(editor.buffer)) + "\n")
         editor.redraw_line()
 
+    def wrapped_ctrl_o() -> None:
+        """Handle Ctrl+O — toggle thinking block, then restore prompt line."""
+        if on_ctrl_o:
+            try:
+                on_ctrl_o(editor)
+            except TypeError:
+                on_ctrl_o()
+        editor.redraw_line()
+
     def wrapped_page_up() -> None:
         """Handle Page Up — scroll conversation viewport up, then restore prompt line."""
         if on_page_up:
@@ -1429,6 +1736,7 @@ def raw_prompt_input(
         state=state,
         on_ctrl_k=wrapped_ctrl_k,
         on_ctrl_l=wrapped_ctrl_l,
+        on_ctrl_o=wrapped_ctrl_o,
         on_page_up=wrapped_page_up,
         on_page_down=wrapped_page_down,
         on_wheel_up=wrapped_wheel_up,
@@ -1437,34 +1745,93 @@ def raw_prompt_input(
         width=width,
         commands=commands,
         on_clear_dropdown=on_clear_dropdown,
+        bottom_border_renderer=bottom_border_renderer,
+        on_alert=on_alert,
+        on_height_change=on_height_change,
     )
 
-    with TerminalStateRestorer():
-        editor.redraw_line()
-        while True:
-            try:
-                k = read_next_key(key_stream=key_stream, timeout=0.08 if on_idle else None)
-                if k is None:
-                    if on_idle:
-                        try:
-                            on_idle(editor)
-                        except Exception:
-                            pass
-                    continue
-                done = editor.handle_key(k)
-                if done:
+    try:
+        with TerminalStateRestorer():
+            editor.redraw_line()
+            last_term_size = shutil.get_terminal_size(fallback=(width, 24))
+            while True:
+                try:
+                    read_timeout = 0.05 if key_stream is None else None
+                    k = read_next_key(key_stream=key_stream, timeout=read_timeout)
+
+                    term_size = shutil.get_terminal_size(fallback=(width, 24))
+                    if (term_size.columns, term_size.lines) != (last_term_size.columns, last_term_size.lines):
+                        last_term_size = term_size
+                        if on_resize is not None:
+                            try:
+                                on_resize(term_size.columns, term_size.lines, editor)
+                            except TypeError:
+                                try:
+                                    on_resize(term_size.columns, term_size.lines)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        else:
+                            editor.width = term_size.columns
+                            editor.redraw_line()
+
+                    if k is None:
+                        if editor.alert is not None and editor._ctrl_c_timestamp is not None:
+                            if (time.monotonic() - editor._ctrl_c_timestamp) > editor._ctrl_c_timeout:
+                                editor.alert = None
+                                editor._ctrl_c_timestamp = None
+                                if editor.state is not None and hasattr(editor.state, "composer_alert"):
+                                    editor.state.composer_alert = None
+                                if editor.on_alert:
+                                    try:
+                                        editor.on_alert(None)
+                                    except Exception:
+                                        pass
+                                editor.redraw_line()
+                        if on_idle:
+                            try:
+                                on_idle(editor)
+                            except Exception:
+                                pass
+                        continue
+                    done = editor.handle_key(k)
+                    if done:
+                        if editor._last_dropdown_lines_count > 0:
+                            editor._erase_dropdown()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        break
+                    editor.redraw_line()
+                except KeyboardInterrupt:
+                    if getattr(editor, "_confirmed_exit", False):
+                        if editor._last_dropdown_lines_count > 0:
+                            editor._erase_dropdown()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        raise
+                    try:
+                        editor.handle_key(Key.CTRL_C)
+                        editor.redraw_line()
+                        continue
+                    except KeyboardInterrupt:
+                        if editor._last_dropdown_lines_count > 0:
+                            editor._erase_dropdown()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        raise
+                except EOFError:
                     if editor._last_dropdown_lines_count > 0:
                         editor._erase_dropdown()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
-                    break
-                editor.redraw_line()
-            except (KeyboardInterrupt, EOFError):
-                if editor._last_dropdown_lines_count > 0:
-                    editor._erase_dropdown()
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                raise
+                    raise
+    finally:
+        if state is not None:
+            state.is_typing = False
+            state.composer_buffer = ""
+            if hasattr(state, "composer_alert"):
+                state.composer_alert = None
 
     result = editor.text
     if result.strip():
@@ -1472,8 +1839,36 @@ def raw_prompt_input(
         if history is not None and result not in history:
             history.append(result)
 
-    if state is not None:
-        state.is_typing = False
-        state.composer_buffer = ""
-
     return result
+
+
+def poll_scroll_key() -> str | None:
+    """Non-blocking poll for scroll keys (PgUp/PgDn/WheelUp/WheelDown).
+
+    Returns Key.PAGE_UP, Key.PAGE_DOWN, Key.MOUSE_WHEEL_UP, Key.MOUSE_WHEEL_DOWN,
+    or None if no scroll key is pending. Consumes non-scroll keys silently.
+    Used during SSE streaming to allow users to scroll the viewport.
+    """
+    SCROLL_KEYS = {Key.PAGE_UP, Key.PAGE_DOWN, Key.MOUSE_WHEEL_UP, Key.MOUSE_WHEEL_DOWN}
+    if os.name == "nt":
+        import msvcrt
+        if not msvcrt.kbhit():
+            return None
+        key = _read_raw_key_windows(timeout=0.02)
+        if key in SCROLL_KEYS:
+            return key
+        return None
+    else:
+        import select
+        fd = sys.stdin.fileno()
+        r, _, _ = select.select([fd], [], [], 0.0)
+        if not r:
+            return None
+        ch = os.read(fd, 1).decode("utf-8", errors="replace")
+        if ch == "\x1b":
+            seq = _read_escape_sequence_posix(fd)
+            if seq:
+                key = _parse_escape_sequence(seq)
+                if key in SCROLL_KEYS:
+                    return key
+        return None

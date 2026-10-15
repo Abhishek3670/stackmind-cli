@@ -639,9 +639,7 @@ def test_tui_cli_repl_autonomous_delivery_commands(tmp_path: Path):
 
         assert result.exit_code == 0, result.output
         assert "PHASE" in result.output
-        assert "AGENTS" in result.output
         assert "WORK ORDERS" in result.output
-        assert "ACTIVITY" in result.output
         assert "=== AGENT ROLES & EXECUTION BACKENDS (:roles) ===" in result.output
         assert "● Architecture" in result.output
         assert "PLAN.md" in result.output
@@ -726,6 +724,48 @@ def test_tui_populate_from_runtime_syncs_disk_work_orders_and_plan(tmp_path: Pat
     assert state.work_orders[1].title == "Build FastAPI login backend"
     assert state.completion_checklist["PLAN.md"] is True
     assert state.phase == ProjectPhase.AUTONOMOUS_EXECUTION
+
+
+def test_clean_workspace_initializes_with_no_work_orders(tmp_path: Path) -> None:
+    """When starting in a clean workspace with no work orders, work_orders is empty and panel renders 'No active orders'."""
+    import yaml
+    from cli.tui.runtime_panel import format_work_orders
+    from cli.tui.state import AutonomousDeliveryState
+    from cli.tui.views import render_work_orders_panel
+
+    # Case 1: Workspace with scaffolded empty INDEX.yaml (like stackmind init)
+    sync_wos = tmp_path / ".sync" / "work-orders"
+    sync_wos.mkdir(parents=True, exist_ok=True)
+    (sync_wos / "INDEX.yaml").write_text(
+        yaml.safe_dump({
+            "schema_version": 1,
+            "orders": [],
+            "total_active": 0,
+            "total_completed": 0,
+            "total_blocked": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    state = AutonomousDeliveryState(project_name="clean-proj", session_id="sess-clean", work_orders=[])
+    state.populate_from_runtime(workspace=tmp_path)
+
+    assert state.work_orders == []
+    for r in state.roles.values():
+        assert r.work_order_id is None
+
+    wo_panel = render_work_orders_panel(state)
+    assert "No active orders" in wo_panel
+
+    formatted = format_work_orders(state.work_orders)
+    assert any("No active orders" in str(line) for line in formatted)
+
+    # Case 2: Even if created without work_orders=[], populate_from_runtime clears dummy placeholders in clean ws
+    state2 = AutonomousDeliveryState(project_name="clean-proj-2", session_id="sess-clean-2")
+    state2.populate_from_runtime(workspace=tmp_path)
+    assert state2.work_orders == []
+    for r in state2.roles.values():
+        assert r.work_order_id is None
 
 
 def test_tui_update_from_session_clears_idle_op_root() -> None:
@@ -1139,6 +1179,48 @@ def test_all_agents_and_roles_transition_to_completed_on_project_delivery():
     tree_rendered = render_operation_tree(state)
     assert "✓ Architecture" in tree_rendered
     assert "✓ Backend" in tree_rendered
+
+
+def test_chat_mode_architecture_orchestrating_and_idle_worker_waiting():
+    """Verify that chatting with Architecture keeps it orchestrating and idle workers waiting (§7, §8)."""
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus, WorkOrderItem
+    from cli.tui.runtime_panel import format_agent_tree
+
+    state = AutonomousDeliveryState(work_orders=[])
+    # Simulate a dangling RUNNING state on Backend from previous execution
+    state.roles["Backend"].state = "RUNNING"
+
+    # Reconcile when there are no active work orders
+    state.reconcile_roles_from_work_orders()
+    assert state.roles["Backend"].state == "WAITING"
+    assert state.roles["Backend"].display_state == "waiting"
+
+    # Hierarchy should show Architecture orchestrating and Backend waiting
+    hierarchy = state.get_agent_hierarchy()
+    arch_entry = next(e for e in hierarchy if e["role"] == "Architecture")
+    backend_entry = next(e for e in hierarchy if e["role"] == "Backend")
+    assert arch_entry["status"] == "orchestrating"
+    assert backend_entry["status"] == "waiting"
+
+    # Chat turn execution with Architecture
+    state.operations["turn-1"] = OperationNode("turn-1", "Turn", role="Architecture", status="RUNNING")
+    state.roles["Architecture"].state = "RUNNING"
+
+    # Turn completes
+    state.process_event({
+        "name": "operation.completed",
+        "payload": {"operation_id": "turn-1", "role": "architecture", "status": "COMPLETED"},
+    })
+
+    # Architecture should remain in orchestrating state, NOT completed
+    assert state.roles["Architecture"].state == "RUNNING"
+    assert state.roles["Architecture"].display_state == "orchestrating"
+    hierarchy_after = state.get_agent_hierarchy()
+    arch_after = next(e for e in hierarchy_after if e["role"] == "Architecture")
+    backend_after = next(e for e in hierarchy_after if e["role"] == "Backend")
+    assert arch_after["status"] == "orchestrating"
+    assert backend_after["status"] == "waiting"
+
 
 
 

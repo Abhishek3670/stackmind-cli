@@ -123,6 +123,7 @@ class ContextBundle:
     text: str
     scope_filtered_count: int = 0
     skill_diagnostics: dict[str, Any] | None = None
+    memory_diagnostics: dict[str, Any] | None = None
     execution_profile: str = "medium"
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +136,7 @@ class ContextBundle:
             'scope_filtered_count': self.scope_filtered_count,
             'semantic': self.semantic,
             'skill_diagnostics': self.skill_diagnostics,
+            'memory_diagnostics': self.memory_diagnostics,
             'stale': self.stale,
             'text': self.text,
             'token_budget': self.token_budget,
@@ -728,6 +730,7 @@ class KnowledgeAPI:
         scope_skips: list[tuple[str, str]] = []
 
         skill_diag_dict: dict[str, Any] | None = None
+        memory_diag_dict: dict[str, Any] | None = None
         # 1. Retrieve matching verified active skills according to execution profile policy
         if include_skills and effective_policy.skills_enabled:
             try:
@@ -783,6 +786,41 @@ class KnowledgeAPI:
                 "skills_enabled": False,
             }
 
+        # 2. Retrieve matching verified active memories according to execution profile policy
+        memory_token_budget = max(200, token_budget // 4)  # Reserve 25% for memories
+        if include_skills and effective_policy.skills_enabled:
+            try:
+                from validators.memory.retriever import MemoryRetrievalBridge
+                memory_bridge = MemoryRetrievalBridge(self.project_path)
+                memory_text, memory_diag = memory_bridge.augment_context_bundle(
+                    query,
+                    contract=contract,
+                    policy=effective_policy,
+                    token_budget=memory_token_budget,
+                    explicit_memories=skills,  # Reuse skills parameter for explicit memories
+                )
+                if memory_text:
+                    memory_diag_dict = memory_diag.to_dict() if memory_diag else None
+                    # Add memory as a context entry
+                    memory_tokens = _estimate_tokens(memory_text)
+                    if estimated_tokens + memory_tokens <= token_budget:
+                        entries.append(
+                            ContextEntry(
+                                node_id="memory_bundle",
+                                rank=105,  # Just below skills
+                                confidence=0.8,  # Default confidence for memory bundle
+                                text=memory_text,
+                                reason="durable_memory",
+                                why_retrieved=("verified_durable_memory",),
+                                access_status="allowed",
+                            )
+                        )
+                        text_blocks.append(memory_text)
+                        estimated_tokens += memory_tokens
+            except Exception:
+                # Memory retrieval failures must fail open for standard graph context
+                pass
+
         for rank, result in sorted(
             ranked.values(),
             key=lambda item: (-item[0], item[1].path, item[1].qualified_name, item[1].node_id),
@@ -831,6 +869,7 @@ class KnowledgeAPI:
             text='\n\n'.join(text_blocks),
             scope_filtered_count=len(scope_skips),
             skill_diagnostics=skill_diag_dict,
+            memory_diagnostics=memory_diag_dict,
             execution_profile=effective_profile_str,
         )
 

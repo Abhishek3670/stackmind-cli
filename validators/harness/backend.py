@@ -843,7 +843,17 @@ def get_default_registry() -> BackendRegistry:
         discovered_models = discover_ollama_models(ollama_endpoint)
         best_model = pick_best_ollama_model(discovered_models)
         ollama_available = bool(discovered_models)
-        selected_model = best_model or "ornith-1.5-16k:latest"
+        # Check if settings.json defines a preferred default_model for ollama
+        ollama_configured_model = None
+        try:
+            from validators.kernel.settings import load_settings
+            app_settings = load_settings()
+            if "ollama" in app_settings.providers and app_settings.providers["ollama"].default_model:
+                ollama_configured_model = app_settings.providers["ollama"].default_model
+        except Exception:
+            pass
+
+        selected_model = ollama_configured_model or best_model or "ornith-1.5-16k:latest"
 
         reg.register(
             ModelExecutionBackend(

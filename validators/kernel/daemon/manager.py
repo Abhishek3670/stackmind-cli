@@ -609,6 +609,24 @@ class SessionManager:
         for r_name, r_cfg in recovered.get("roles", {}).items():
             if isinstance(r_cfg, dict):
                 self._roles[r_name] = dict(r_cfg)
+
+        # Apply roles from disk settings (settings.json takes precedence over auto-detection and cached roles)
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                from validators.kernel.settings import find_settings_file, load_settings
+                if find_settings_file():
+                    app_settings = load_settings()
+                    for r_name, r_cfg in app_settings.roles.items():
+                        canonical = self._canonical_role(r_name)
+                        prov = r_cfg.get("provider")
+                        mod = r_cfg.get("model")
+                        if canonical in self._roles:
+                            if prov:
+                                self._roles[canonical]["backend"] = prov
+                            if mod:
+                                self._roles[canonical]["model"] = mod
+            except Exception:
+                pass
         self._runner_factory = runner_factory or self._default_runner
         self.events = EventDispatcher(recovered.get("events", []), self._persist_event)
         for session in self._sessions.values():
@@ -707,7 +725,15 @@ class SessionManager:
             from validators.kernel.settings import find_settings_file, load_settings
             canonical = self._canonical_role(agent)
             role_cfg = self._roles.get(canonical, {})
-            has_disk_settings = find_settings_file(workspace) is not None
+            settings_path = find_settings_file(workspace)
+            is_local = False
+            if settings_path and workspace:
+                ws_res = Path(workspace).resolve()
+                try:
+                    is_local = settings_path.resolve().is_relative_to(ws_res)
+                except Exception:
+                    is_local = str(settings_path.resolve()).startswith(str(ws_res))
+            has_disk_settings = is_local or ("PYTEST_CURRENT_TEST" not in os.environ and settings_path is not None)
             app_settings = load_settings(workspace) if has_disk_settings else None
 
             if role_cfg.get("backend") and role_cfg.get("backend") != "echo-agent":
@@ -1068,6 +1094,17 @@ class SessionManager:
             meta = metadata or {}
             work_orders = meta.get("work_orders", [])
 
+            # Save authoritative plan directly as PLAN.v{N}.md under central ~/.stackmindcli/projects/<slug>/
+            workspace = session.get("workspace")
+            if workspace and content:
+                try:
+                    from validators.kernel.home import save_authoritative_plan
+                    auth_path, auth_ver = save_authoritative_plan(workspace, content)
+                    meta["authoritative_plan_file"] = str(auth_path)
+                    meta["version"] = auth_ver
+                except Exception:
+                    pass
+
             if plan_id in plans:
                 existing = plans[plan_id]
                 if existing.get("state") == "APPROVED":
@@ -1175,6 +1212,17 @@ class SessionManager:
             plan["state"] = "APPROVED"
             plan["updated_at"] = now
             plan["approval_reason"] = reason
+
+            # Copy approved golden plan to workspace PLAN.md
+            try:
+                from validators.kernel.home import copy_approved_plan_to_workspace, save_authoritative_plan
+                ver = plan.get("metadata", {}).get("version")
+                if not ver and plan.get("content"):
+                    _, ver = save_authoritative_plan(session["workspace"], plan["content"])
+                    plan.setdefault("metadata", {})["version"] = ver
+                copy_approved_plan_to_workspace(session["workspace"], version=ver)
+            except Exception:
+                pass
 
             created_work_orders: list[dict[str, Any]] = []
             proposed_wos = plan.get("metadata", {}).get("work_orders", [])

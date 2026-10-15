@@ -623,9 +623,9 @@ class TestProfileSettingsAndTUIInteraction:
         output_prof = render_anchored_settings_panel_str(state, width=80)
         lines_prof = output_prof.splitlines()
         assert len(lines_prof) == 11
-        assert "[1] LOW" in output_prof
-        assert "[2] MEDIUM" in output_prof
-        assert "[3] HIGH" in output_prof
+        assert "LOW" in output_prof
+        assert "MEDIUM" in output_prof
+        assert "HIGH" in output_prof
         assert "[ACTIVE]" in output_prof
         assert "0 optional skills" in output_prof
         assert "600-token budget" in output_prof
@@ -682,8 +682,9 @@ class TestProfileSettingsAndTUIInteraction:
         from cli.tui.settings_panel import run_arrow_navigation_settings_loop
 
         state = AutonomousDeliveryState()
-        # Press P to jump straight into profile view, press '1' to select LOW directly, then ESC to exit
-        key_sequence = ["p", "1", Key.ESCAPE]
+        # In :config (initial_view="settings"), row 0 is Execution Profile.
+        # Press LEFT to cycle from MEDIUM to LOW, then DOWN 5 times to Save row, then ENTER to apply.
+        key_sequence = [Key.LEFT, Key.DOWN, Key.DOWN, Key.DOWN, Key.DOWN, Key.DOWN, Key.ENTER, Key.ESCAPE]
         session = {"workspace": str(temp_workspace)}
 
         res = run_arrow_navigation_settings_loop(
@@ -691,6 +692,7 @@ class TestProfileSettingsAndTUIInteraction:
             state=state,
             workspace=temp_workspace,
             key_stream=iter(key_sequence),
+            initial_view="settings",
         )
 
         assert state.execution_profile == "low"
@@ -753,7 +755,7 @@ class TestProfileSettingsAndTUIInteraction:
         assert "[MEDIUM]" in output
         assert "[HIGH]" in output
         assert "[ACTIVE]" in output
-        assert ":profile" in output
+        assert ":config" in output
 
     def test_profile_command_integration(self, temp_workspace: Path):
         from cli.tui.state import AutonomousDeliveryState
@@ -764,20 +766,7 @@ class TestProfileSettingsAndTUIInteraction:
         client = MagicMock()
         adapter = MagicMock()
 
-        # 1. Direct argument usage: :profile low
-        session, should_exit = dispatch_delivery_command(
-            adapter,
-            client,
-            session,
-            ":profile low",
-            state,
-        )
-        assert state.execution_profile == "low"
-        assert load_settings(temp_workspace).effective_profile == "low"
-        last_msg = state.messages[-1]
-        assert "Execution profile updated to: LOW" in last_msg.content
-
-        # 2. Overview in non-TTY mode: :profile
+        # 1. :profile redirect notification
         session, should_exit = dispatch_delivery_command(
             adapter,
             client,
@@ -785,6 +774,20 @@ class TestProfileSettingsAndTUIInteraction:
             ":profile",
             state,
         )
+        assert should_exit is False
         last_msg = state.messages[-1]
-        assert "StackMind Execution Profiles" in last_msg.content
+        assert "':profile' has been merged into ':config'" in last_msg.content
+
+        # 2. Configure execution profile via :config profile low
+        session, should_exit = dispatch_delivery_command(
+            adapter,
+            client,
+            session,
+            ":config profile low",
+            state,
+        )
+        assert state.execution_profile == "low"
+        assert load_settings(temp_workspace).effective_profile == "low"
+        last_msg = state.messages[-1]
+        assert "[SUCCESS] Execution profile set to LOW" in last_msg.content
 

@@ -18,6 +18,7 @@ import click
 from rich.text import Text
 
 from cli.tui.chat import (
+    clear_transcript_cache,
     render_actions_group_str,
     render_assistant_message_str,
     render_assistant_stream_header,
@@ -30,6 +31,7 @@ from cli.tui.diff import (
 from cli.tui.events import (
     extract_assistant_response,
     extract_assistant_thinking,
+    extract_reasoning_delta,
     extract_text_delta,
     is_connection_error,
     recover_transcript_from_events,
@@ -249,10 +251,9 @@ def get_help_str() -> str:
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :reconnect        Reconnect to daemon and replay missed events\n"
-        "  :roles            Display Agent Roles & Execution Backend bindings\n"
+        "  :roles            Interactive Agent Roles & Execution Backend bindings panel\n"
         "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
-        "  :settings         StackMind system settings, execution profiles, roles & policies\n"
-        "  :config           Alias for :settings\n"
+        "  :config           StackMind system settings, execution profiles, governance & policies\n"
         "  :providers        Configure cloud and local LLM providers, API keys & endpoints\n"
         "  :models           Configure and list available provider models\n"
         "  :wo               Display Work Orders table and progress\n"
@@ -261,7 +262,6 @@ def get_help_str() -> str:
         "  :skills [name]    Display available procedural skills & verified runbooks\n"
         "  :consume-skills <p> Ingest and install procedural skills from file or directory\n"
         "  :projects         Display registered projects and centralized root (~/.stackmindcli)\n"
-        "  :profile [name]   Get or set execution profile (low | medium | high)\n"
         "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
@@ -274,18 +274,17 @@ def get_help_str() -> str:
         "  :resume           Resume active session\n"
         "  :chat             Display conversation transcript\n"
         "  :actions [cmd]    Toggle/expand/collapse turn Actions disclosure group\n"
+        "  :thinking [cmd]   Toggle/expand/collapse thinking blocks (Ctrl+O)\n"
+        "  :govern [mode]    Configure governance verbosity: tree | flat | compact\n"
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
         "  :help             Show this help menu\n"
-        "  :exit, :quit, q   Gracefully stop daemon and exit\n"
+        "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
         "Shortcuts:\n"
-        "  Ctrl+K            Open this help menu\n"
-        "  Ctrl+L            Redraw full screen\n"
-        "  PgUp / PgDn       Scroll conversation viewport\n"
-        "  Ctrl+C / Ctrl+D   Cancel turn or exit\n"
-        "  Esc               Cancel current prompt"
+        "  Ctrl+O            Toggle thinking block expansion\n"
+        "  Ctrl+C            Cancel active turn or abort"
     )
 
 
@@ -307,23 +306,24 @@ def _build_in_progress_turn_content(
     hdr = render_assistant_stream_header(model=model_name, width=layout_width)
     parts = [hdr]
 
-    # In-progress actions (expanded during active execution so tools are visible live)
+    # In-progress actions rendered as compact ● Tool(arg) lines (never expanded during streaming)
     turn_acts = getattr(state, "current_turn_actions", None)
     if turn_acts and not getattr(turn_acts, "is_empty", True):
-        turn_acts.expanded = True
         act_str = render_actions_group_str(turn_acts, width=layout_width)
         if act_str:
             parts.append(act_str)
 
-    # In-progress thinking - shows before and during answer streaming
-    # Thinking is NOT added to final message to avoid duplication
+    # In-progress thinking - shows live thinking stream before and during answer streaming
     thinking = getattr(state, "current_turn_thinking", None)
     if thinking and thinking.strip():
         clean_think = thinking.strip()
-        wrapped_thinking = _wrap_text_to_width(clean_think, layout_width)
-        parts.append(f"Thinking...\n{wrapped_thinking}")
+        from cli.tui.chat import render_thinking_block_str
+        is_exp = getattr(state, "live_thinking_expanded", True)
+        think_str = render_thinking_block_str(clean_think, expanded=is_exp, in_progress=True, width=layout_width)
+        if think_str:
+            parts.append(think_str)
 
-    # In-progress streamed response text or progress line
+    # In-progress streamed response text (Working... progress sits at composer text box)
     if streamed_chunks:
         curr_text = "".join(streamed_chunks)
         from cli.tui.chat import format_contract_payload
@@ -331,20 +331,6 @@ def _build_in_progress_turn_content(
         wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
         if wrapped_text:
             parts.append(wrapped_text)
-        else:
-            elapsed = time.time() - start_time
-            if max_wait > 0:
-                prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
-            else:
-                prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
-            parts.append(_wrap_text_to_width(prog_text, layout_width))
-    else:
-        elapsed = time.time() - start_time
-        if max_wait > 0:
-            prog_text = f"● Working... [{elapsed:.1f}s / {max_wait:.0f}s] ({latest_act_desc})"
-        else:
-            prog_text = f"● Working... [{elapsed:.1f}s] ({latest_act_desc})"
-        parts.append(_wrap_text_to_width(prog_text, layout_width))
 
     in_progress = "\n\n".join(parts)
     return f"{transcript}\n\n{in_progress}" if transcript else in_progress
@@ -381,6 +367,57 @@ def _stream_turn_execution(
 
     _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
     _diagnostics_start = time.monotonic()
+
+    def _format_token_usage_str(tokens: int) -> str:
+        if tokens < 1000:
+            return f"{tokens} tokens"
+        return f"{tokens / 1000:.1f}k tokens"
+
+    SYNC_WORKING_WORDS = [
+        "Infusing...",
+        "Synthesizing...",
+        "Harmonizing...",
+        "Calibrating...",
+        "Transmuting...",
+    ]
+
+    def _get_working_placeholder() -> str:
+        elapsed = time.time() - start_time
+        toks = (
+            getattr(state, "cumulative_turn_tokens", 0)
+            or AutonomousDeliveryState.estimate_tokens(
+                "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
+            )
+        )
+        is_sync_action = False
+        targets_to_check = [
+            getattr(state, "active_tool_target", ""),
+            getattr(state, "last_tool_target", ""),
+            getattr(state, "active_tool_name", ""),
+            latest_act_desc,
+        ]
+        turn_actions = getattr(state, "current_turn_actions", None)
+        if turn_actions and hasattr(turn_actions, "actions"):
+            for a in turn_actions.actions:
+                if getattr(a, "status", "").upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                    targets_to_check.extend([getattr(a, "target", ""), getattr(a, "description", ""), getattr(a, "tool_name", "")])
+                    for sa in getattr(a, "sub_actions", []):
+                        if getattr(sa, "status", "").upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                            targets_to_check.extend([getattr(sa, "target", ""), getattr(sa, "description", ""), getattr(sa, "tool_name", "")])
+
+        for t in targets_to_check:
+            if t and (".sync" in t or ".sync/" in t or ".sync\\" in t):
+                is_sync_action = True
+                break
+
+        sync_words = getattr(state, "sync_working_words", None) or SYNC_WORKING_WORDS
+        if getattr(state, "randomize_sync_verbs", False):
+            import random
+            verb = random.choice(sync_words)
+        else:
+            verb = getattr(state, "current_sync_verb", None) or sync_words[0]
+        prefix = verb if is_sync_action else "Working..."
+        return f"{prefix} [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
     _streaming_diagnostics = {
         "redraw_count": 0,
         "event_count": 0,
@@ -415,8 +452,39 @@ def _stream_turn_execution(
             resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
             if resized:
                 current_cols, current_lines = new_cols, new_lines
+                clear_transcript_cache()
                 if live_manager is not None and getattr(live_manager, "is_active", False):
                     live_manager.handle_resize(new_cols, new_lines)
+
+            # Poll for scroll keys (PgUp/PgDn/Wheel) so users can scroll during streaming
+            if is_tty:
+                from cli.tui.keyboard import poll_scroll_key, Key as _Key
+                _scroll_key = poll_scroll_key()
+                if _scroll_key is not None:
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    vp_h = compute_viewport_height(term_lines, state=state)
+                    if _scroll_key in (_Key.PAGE_UP, _Key.MOUSE_WHEEL_UP):
+                        step = max(1, vp_h // 2) if _scroll_key == _Key.PAGE_UP else 3
+                        state.scroll_conversation_up(step)
+                    elif _scroll_key in (_Key.PAGE_DOWN, _Key.MOUSE_WHEEL_DOWN):
+                        step = max(1, vp_h // 2) if _scroll_key == _Key.PAGE_DOWN else 3
+                        state.scroll_conversation_down(step)
+                    # Immediate redraw after scroll
+                    _s_layout = compute_layout(shutil.get_terminal_size().columns)
+                    _s_content = _build_in_progress_turn_content(
+                        state, model_name, streamed_chunks,
+                        latest_act_desc, start_time, max_wait,
+                        _s_layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session, state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=_get_working_placeholder(),
+                        conversation_content=_s_content,
+                        live_manager=live_manager,
+                    )
             try:
                 t_event_start = time.monotonic()
                 ev = next(stream_gen)
@@ -456,7 +524,7 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
                         conversation_content=tick_content,
                         live_manager=live_manager,
                     )
@@ -523,7 +591,8 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
                         conversation_content=tick_content,
                         live_manager=live_manager,
                     )
@@ -565,8 +634,42 @@ def _stream_turn_execution(
             if workspace:
                 state.sync_work_orders_from_disk(workspace)
 
-            # Check for incremental text delta (stream/token/chunk)
+            # Check for incremental text or reasoning delta (stream/token/chunk/thinking)
             delta = extract_text_delta(ev)
+            think_delta = extract_reasoning_delta(ev)
+            if think_delta:
+                if not streaming_active:
+                    streaming_active = True
+                    if model_name is None:
+                        if op_rec and isinstance(op_rec, dict):
+                            model_name = op_rec.get("model")
+                        elif session and isinstance(session, dict):
+                            model_name = session.get("model")
+                now_mono = time.monotonic()
+                if now_mono - last_redraw_time >= 0.1:
+                    layout = compute_layout(shutil.get_terminal_size().columns)
+                    full_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
+                        conversation_content=full_content,
+                        live_manager=live_manager,
+                    )
+                    last_redraw_time = now_mono
+
             if delta:
                 if not streaming_active:
                     streaming_active = True
@@ -600,7 +703,8 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
                         conversation_content=full_content,
                         live_manager=live_manager,
                     )
@@ -645,10 +749,15 @@ def _stream_turn_execution(
                     t_target = str(
                         t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
                     )
-                    latest_act_desc = f"{t_name} {t_target}".strip() if t_target else t_name
+                    t_role = str(ev_payload.get("role") or ev_payload.get("agent_id") or "")
+                    from cli.tui.events import format_action_description
+                    latest_act_desc = format_action_description(t_name, target=t_target, role=t_role)
 
+                is_tool_lifecycle = ev_name in {
+                    "event.toolCall", "tool.call", "event.toolResult", "tool.result"
+                } or ev_name.startswith(("tool_call.", "tool_result."))
                 now_mono = time.monotonic()
-                if is_tty and (now_mono - last_redraw_time >= 0.1):
+                if is_tty and (is_tool_lifecycle or now_mono - last_redraw_time >= 0.1):
                     layout = compute_layout(shutil.get_terminal_size().columns)
                     full_content = _build_in_progress_turn_content(
                         state,
@@ -665,7 +774,8 @@ def _stream_turn_execution(
                         clear=False,
                         include_composer=True,
                         composer_is_active=False,
-                        composer_placeholder=placeholder,
+                        composer_placeholder=_get_working_placeholder(),
+                        composer_content="",
                         conversation_content=full_content,
                         live_manager=live_manager,
                     )
@@ -677,9 +787,15 @@ def _stream_turn_execution(
                 response_events = {"operation.completed", "turn.completed"}
                 if ev_name in response_events:
                     resp = extract_assistant_response(ev_payload, workspace=workspace)
-                    thinking = extract_assistant_thinking(ev_payload, workspace=workspace)
+                    thinking = (
+                        extract_assistant_thinking(ev_payload, workspace=workspace)
+                        or getattr(state, "current_turn_thinking", None)
+                        or None
+                    )
                 if resp and not assistant_rendered and not streamed_chunks:
                     turn_acts = state.current_turn_actions
+                    if turn_acts:
+                        turn_acts.expanded = True
                     state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
                     if is_tty:
                         redraw_full_screen(
@@ -823,6 +939,8 @@ def _stream_turn_execution(
         from cli.tui.chat import format_contract_payload
         full_resp = format_contract_payload(full_resp)
         turn_acts = state.current_turn_actions
+        if turn_acts:
+            turn_acts.expanded = True
         thinking = getattr(state, "current_turn_thinking", None) or None
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
@@ -834,7 +952,8 @@ def _stream_turn_execution(
                 clear=False,
                 include_composer=True,
                 composer_is_active=False,
-                composer_placeholder=placeholder,
+                composer_placeholder="Type a message...",
+                composer_content="",
                 live_manager=live_manager,
             )
         else:
@@ -921,8 +1040,12 @@ def _stream_turn_execution(
                         resp = extract_assistant_response(
                             ev.get("payload", {}), workspace=workspace
                         )
-                        thinking = extract_assistant_thinking(
-                            ev.get("payload", {}), workspace=workspace
+                        thinking = (
+                            extract_assistant_thinking(
+                                ev.get("payload", {}), workspace=workspace
+                            )
+                            or getattr(state, "current_turn_thinking", None)
+                            or None
                         )
                     if resp and not assistant_rendered:
                         turn_acts = state.current_turn_actions
@@ -958,6 +1081,8 @@ def _stream_turn_execution(
                 or res.get("reasoning_content")
                 or op_rec.get("thinking")
                 or op_rec.get("thought")
+                or getattr(state, "current_turn_thinking", None)
+                or None
             )
             report_path_raw = res.get("report_path")
             if report_path_raw:
@@ -1003,7 +1128,7 @@ def _stream_turn_execution(
                 )
                 turn_acts = state.current_turn_actions
                 if turn_acts:
-                    turn_acts.expanded = True
+                    turn_acts.expanded = False
                 state.add_message(
                     "assistant",
                     f"Operation {op_status.lower() if op_status else 'failed'}: {err_msg}",
@@ -1158,8 +1283,10 @@ def dispatch_delivery_command(
         return session, True
 
     is_tty = False
+    is_interactive = False
     try:
         is_tty = sys.stdout.isatty()
+        is_interactive = is_tty and getattr(sys.stdin, "isatty", lambda: False)()
     except Exception:
         pass
 
@@ -1238,12 +1365,9 @@ def dispatch_delivery_command(
         if sid:
             output_parts.append(f"Session: {sid}")
         output_parts.append(get_status_str(session, state=state))
-        contract_data = session.get("contract") or (getattr(state, "contract", None) if state else None)
-        if contract_data:
-            output_parts.append(render_contract_hud_str(contract_data))
         if state is not None:
             from cli.tui.views import render_project_delivery_view
-            output_parts.append(render_project_delivery_view(state))
+            output_parts.append(render_project_delivery_view(state, include_runtime_items=False))
         output_str = "\n\n".join(output_parts)
 
         state.add_message("user", normalized)
@@ -1261,8 +1385,22 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized == ":roles":
-        # Query daemon role bindings if supported, and render detailed role panel
+    if (
+        normalized == ":roles"
+        or normalized.startswith(":roles ")
+        or normalized in {":role"}
+    ):
+        from cli.tui.settings_panel import (
+            render_roles_panel,
+            run_interactive_roles_panel,
+        )
+        from validators.kernel.settings import load_settings
+
+        ws = Path(session["workspace"]) if session.get("workspace") else None
+        subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+
+        # Query daemon role bindings if supported, and update state roles
         try:
             roles_data = client.list_roles()
             if roles_data and isinstance(roles_data, list):
@@ -1276,7 +1414,33 @@ def dispatch_delivery_command(
                         state.roles[normalized_key].model = rd.get("model")
         except Exception:
             pass
-        output_str = render_roles_panel(state, detailed=True)
+
+        # Also sync from disk settings if present
+        try:
+            from validators.kernel.settings import find_settings_file, load_settings
+            if find_settings_file(ws):
+                s = load_settings(ws)
+                for r_name, r_cfg in s.roles.items():
+                    r_title = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name.title()
+                    if r_title in state.roles:
+                        if r_cfg.get("provider"):
+                            state.roles[r_title].backend = r_cfg["provider"]
+                        if r_cfg.get("model"):
+                            state.roles[r_title].model = r_cfg["model"]
+        except Exception:
+            pass
+
+        if is_interactive and not subcmd:
+            output_str = run_interactive_roles_panel(
+                session=session,
+                state=state,
+                client=client,
+                live_manager=live_manager,
+                workspace=ws,
+                width=term_cols,
+            )
+        else:
+            output_str = render_roles_panel(state, detailed=True)
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -1338,10 +1502,11 @@ def dispatch_delivery_command(
         return session, False
 
     if (
-        normalized == ":settings"
-        or normalized.startswith(":settings ")
-        or normalized in {":config", ":setting"}
+        normalized == ":config"
         or normalized.startswith(":config ")
+        or normalized in {":settings", ":setting"}
+        or normalized.startswith(":settings ")
+        or normalized.startswith(":setting ")
     ):
         from cli.tui.settings_panel import (
             render_stackmind_settings_str,
@@ -1352,7 +1517,7 @@ def dispatch_delivery_command(
         ws = Path(session["workspace"]) if session.get("workspace") else None
         subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
         term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-        if is_tty and not subcmd:
+        if is_interactive and not subcmd:
             output_str = run_interactive_stackmind_settings(
                 session=session,
                 state=state,
@@ -1396,6 +1561,10 @@ def dispatch_delivery_command(
                     from cli.tui.settings_panel import render_settings_overview_str
 
                     output_str = render_settings_overview_str(settings_obj, width=term_cols)
+                elif scmd in ("roles", "role"):
+                    from cli.tui.settings_panel import render_roles_panel
+
+                    output_str = render_roles_panel(state, detailed=True)
                 else:
                     output_str = render_stackmind_settings_str(settings_obj, width=term_cols)
             else:
@@ -1435,7 +1604,7 @@ def dispatch_delivery_command(
         ws = Path(session["workspace"]) if session.get("workspace") else None
         subcmd = normalized.split(maxsplit=1)[1] if " " in normalized else None
         term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-        if is_tty and not subcmd:
+        if is_interactive and not subcmd:
             output_str = run_interactive_providers_panel(
                 session=session,
                 state=state,
@@ -1597,53 +1766,7 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":profile" or normalized.startswith(":profile "):
-        _, _, prof_arg = normalized.partition(" ")
-        clean_prof = prof_arg.strip().lower()
-        ws_path = session.get("workspace") if isinstance(session, dict) else None
-        from validators.kernel.settings import load_settings, save_settings
-        from validators.kernel.profile import ExecutionProfile, get_profile_policy
-        try:
-            settings_obj = load_settings(ws_path)
-        except Exception:
-            from validators.kernel.settings import StackMindSettings
-            settings_obj = StackMindSettings()
-
-        if clean_prof:
-            if clean_prof in ("low", "medium", "high"):
-                settings_obj.execution_profile = clean_prof
-                save_settings(settings_obj, ws_path)
-                state.execution_profile = clean_prof
-                if client and hasattr(client, "settings_update"):
-                    try:
-                        client.settings_update(settings_obj.to_dict())
-                    except Exception:
-                        pass
-                policy = get_profile_policy(clean_prof)
-                output_str = (
-                    f"Execution profile updated to: {clean_prof.upper()}\n"
-                    f"Policy details: skills_enabled={policy.skills_enabled}, "
-                    f"skill_limit={policy.skill_limit}, "
-                    f"token_budget={policy.skill_token_budget}, "
-                    f"verification_depth={policy.verification_depth.value}\n"
-                    f"Changes will take effect at the start of the next execution cycle."
-                )
-            else:
-                output_str = f"Invalid execution profile '{clean_prof}'. Supported values: low, medium, high."
-        else:
-            if is_tty:
-                from cli.tui.settings_panel import run_interactive_profile_selector
-                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-                output_str = run_interactive_profile_selector(
-                    session=session,
-                    state=state,
-                    client=client,
-                    live_manager=live_manager,
-                    workspace=Path(ws_path) if ws_path else None,
-                    width=term_cols,
-                )
-            else:
-                from cli.tui.settings_panel import render_profile_overview_str
-                output_str = render_profile_overview_str(settings_obj)
+        output_str = "':profile' has been merged into ':config'. Open ':config' to configure execution profile and skills policy."
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -1958,6 +2081,26 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
+    if normalized.startswith(":thinking"):
+        _, _, subcmd = normalized.partition(" ")
+        subcmd = subcmd.strip().lower()
+        if subcmd in {"expand", "open"}:
+            state.expand_thinking()
+        elif subcmd in {"collapse", "close"}:
+            state.collapse_thinking()
+        elif subcmd.isdigit():
+            state.toggle_thinking(index=int(subcmd))
+        else:
+            state.toggle_thinking()
+
+        status_str = "EXPANDED" if getattr(state, "thinking_expanded", False) else "COLLAPSED"
+        output_str = f"Thinking blocks: {status_str} (toggle with Ctrl+O or :thinking)"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
     if (
         normalized in {":click actions", ":mouse click actions", ":click"}
         or normalized.startswith("\x1b[<")
@@ -1969,6 +2112,44 @@ def dispatch_delivery_command(
             output_str = render_actions_group_str(target_group)
         else:
             output_str = "No actions to toggle."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":govern" or normalized.startswith(":govern "):
+        _, _, mode = normalized.partition(" ")
+        clean_mode = mode.strip().lower()
+        if clean_mode in {"tree", "flat", "compact"}:
+            state.govern_verbosity = clean_mode
+            if hasattr(state, "current_turn_actions") and state.current_turn_actions:
+                state.current_turn_actions.verbosity = clean_mode
+            if hasattr(state, "turn_actions"):
+                for group in state.turn_actions.values():
+                    group.verbosity = clean_mode
+            ws = Path(session["workspace"]) if session and session.get("workspace") else None
+            if not ws and getattr(state, "workspace_path", None):
+                ws = Path(state.workspace_path)
+            try:
+                from validators.kernel.settings import load_settings, save_settings
+                s = load_settings(ws)
+                s.govern_verbosity = clean_mode
+                save_settings(s, ws)
+            except Exception:
+                pass
+            output_str = f"✓ Governance verbosity set to '{clean_mode}'."
+        elif clean_mode == "":
+            curr = getattr(state, "govern_verbosity", "tree")
+            output_str = (
+                f"Current governance verbosity: {curr}\n"
+                "Usage: :govern [tree|flat|compact]\n"
+                "  tree    - Show 'Run harness' with indented sub-actions (default)\n"
+                "  flat    - Direct linear stream of individual sub-actions\n"
+                "  compact - High-level harness summary only"
+            )
+        else:
+            output_str = f"Unknown governance verbosity '{clean_mode}'. Choose: tree | flat | compact"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -2059,6 +2240,7 @@ def dispatch_delivery_command(
             include_composer=True,
             composer_is_active=False,
             composer_placeholder=placeholder,
+            composer_content="",
             live_manager=live_manager,
         )
     else:

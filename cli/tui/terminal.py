@@ -32,6 +32,7 @@ from cli.tui.keyboard import (
     raw_prompt_input,
 )
 from cli.tui.layout import (
+    compute_composer_cursor_row,
     compute_layout,
     format_responsive_path,
     render_full_screen_workspace,
@@ -126,22 +127,18 @@ def render_top_header_bar(
         return value
 
     right_items: list[str] = []
-    if width >= 90:
-        right_items.extend([f"session: {short_sid}", f"agent: {agent}", f"provider: {provider}"])
-    elif width >= 65:
-        right_items.extend([f"session: {short_sid}", f"agent: {agent}"])
-    elif width >= 45:
+    if width >= 45 and short_sid:
         right_items.append(f"session: {short_sid}")
 
-    if context_meter and width >= 80:
-        ctx = context_item(compact=width < 118)
+    if context_meter and width >= 65:
+        ctx = context_item(compact=width < 100)
         if ctx:
             right_items.append(ctx)
 
     def right_text(items: list[str]) -> str:
         return " | ".join(items + [status_item]) if items else status_item
 
-    left_prefix = "stackmind  |  dev  "
+    left_prefix = ""
     if workspace:
         p = Path(str(workspace))
         ws_display = str(p) if width >= 90 else f".../{p.name}"
@@ -169,22 +166,16 @@ def render_top_header_bar(
         ]
         ws_fit, right_plain = fit_left(candidates)
 
-    if len(left_prefix) + len(ws_fit) + len(right_plain) + 2 > width and width < 118:
-        candidates = [item for item in candidates if not item.startswith("provider: ")]
-        ws_fit, right_plain = fit_left(candidates)
-
     if len(left_prefix) + len(ws_fit) + len(right_plain) + 2 > width:
-        candidates = [item for item in candidates if not item.startswith("agent: ")]
+        candidates = [item for item in candidates if not item.startswith("session: ")]
         ws_fit, right_plain = fit_left(candidates)
 
-    left_plain = left_prefix + ws_fit
+    left_plain = ws_fit
     spaces_count = max(1, width - len(left_plain) - len(right_plain))
 
     res = Text(no_wrap=True, overflow="crop")
-    res.append("stackmind", style="bold #22c55e")
-    res.append("  |  ", style="dim #475569")
-    res.append("dev  ", style="dim white")
-    res.append(ws_fit, style="dim #64748b")
+    if ws_fit:
+        res.append(ws_fit, style="dim #64748b")
     res.append(" " * spaces_count)
 
     for item in candidates:
@@ -227,22 +218,41 @@ def render_top_header_bar_str(
 
 def render_composer_box(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+    shortcuts: str = "",
     width: int = 80,
     content: str | list[str] | None = None,
     is_active: bool = False,
     has_content: bool = False,
+    alert: str | None = None,
+    title: str | None = None,
+    height: int | None = None,
 ) -> Panel:
     """Render the rounded input composer box."""
-    inner_width = max(10, width - 4)
-    border_color = "#60a5fa" if is_active else "#475569"
+    from cli.tui.layout import get_composer_line_limits
 
-    shortcut_candidates = [
-        shortcuts,
-        "Ctrl+K commands | Ctrl+L clear",
-        "Ctrl+K | Ctrl+L | PgUp/PgDn",
-        "Ctrl+K | Ctrl+L",
-    ]
+    working_status: str | None = title
+    if not working_status and (
+        placeholder.startswith("Working...")
+        or placeholder.startswith("Generating response...")
+        or placeholder.startswith("Infusing...")
+        or "... [" in placeholder
+    ):
+        working_status = placeholder
+        placeholder = "Type a message..."
+
+    inner_width = max(10, width - 4)
+    border_color = "#f59e0b" if alert else ("#60a5fa" if is_active or working_status else "#475569")
+
+    shortcut_candidates = (
+        [
+            shortcuts,
+            "Ctrl+K commands | Ctrl+L clear",
+            "Ctrl+K | Ctrl+L | PgUp/PgDn",
+            "Ctrl+K | Ctrl+L",
+        ]
+        if shortcuts
+        else []
+    )
     seen = set()
     shortcut_candidates = [
         sc for sc in shortcut_candidates if sc and not (sc in seen or seen.add(sc))
@@ -280,14 +290,24 @@ def render_composer_box(
             body = line
     else:
         if isinstance(content, str):
-            lines = content.splitlines() or [""]
+            lines = content.split("\n") or [""]
         elif content:
             lines = list(content) or [""]
         else:
             lines = [""]
 
+        total_lines = len(lines)
+        max_box_h, max_input_lines = get_composer_line_limits(height)
+
+        if total_lines > max_input_lines:
+            visible_lines = lines[-max_input_lines:]
+            if not working_status:
+                working_status = f"[{total_lines} lines written]"
+        else:
+            visible_lines = lines
+
         rendered_lines: list[Text] = []
-        first_text = lines[0]
+        first_text = visible_lines[0]
 
         max_text_width = max(0, inner_width - 2)
 
@@ -316,27 +336,37 @@ def render_composer_box(
             line1.append(right_plain, style="dim #64748b")
         rendered_lines.append(line1)
 
-        for sub_line in lines[1:]:
+        for sub_line in visible_lines[1:]:
             if len(sub_line) > max_text_width:
                 sub_line = sub_line[: max(0, max_text_width - 3)] + "..."
-            line_n = Text()
+            line_n = Text(no_wrap=True)
             line_n.append("  ", style="dim #38bdf8")
             line_n.append(sub_line, style="white")
             rendered_lines.append(line_n)
 
         body = Group(*rendered_lines)
 
+    panel_title = None
+    if working_status:
+        panel_title = Text()
+        panel_title.append(" ")
+        panel_title.append(working_status, style="bold #38bdf8")
+        panel_title.append(" ")
+
     return Panel(
         body,
         box=box.ROUNDED,
         border_style=border_color,
+        title=panel_title,
+        title_align="left",
+        subtitle=f"[bold #f59e0b] {alert} [/]" if alert else None,
         padding=(0, 1),
     )
 
 
 def render_composer_box_str(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+    shortcuts: str = "",
     width: int = 80,
     content: str | list[str] | None = None,
     is_active: bool = False,
@@ -344,6 +374,9 @@ def render_composer_box_str(
     *,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    alert: str | None = None,
+    title: str | None = None,
+    height: int | None = None,
 ) -> str:
     """Render input composer box as plain or ANSI-styled string using in-memory capture."""
     console, use_ansi = _make_capture_console(
@@ -359,9 +392,13 @@ def render_composer_box_str(
             content=content,
             is_active=is_active,
             has_content=has_content,
+            alert=alert,
+            title=title,
+            height=height,
         )
     )
     return console.export_text(styles=use_ansi).rstrip()
+
 
 
 def _compute_cursor_col(editor: Any, default: int = 5) -> int:
@@ -395,11 +432,11 @@ def preserve_composer_buffer(state: Any | None, text: str) -> None:
 
 
 def enter_alternate_screen(stream: Any = None) -> None:
-    """Enter alternate screen buffer, clear screen, and home cursor (WO-053)."""
+    """Enter alternate screen buffer, clear screen, home cursor, and enable bracketed paste (WO-053)."""
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
-            target.write("\x1b[?1049h\x1b[2J\x1b[H")
+            target.write("\x1b[?1049h\x1b[2J\x1b[H\x1b[?2004h")
             target.flush()
     except Exception:
         pass
@@ -428,19 +465,19 @@ def disable_mouse_reporting(stream: Any = None) -> None:
 
 
 def exit_alternate_screen(stream: Any = None) -> None:
-    """Exit alternate screen buffer and disable mouse reporting (WO-053)."""
+    """Exit alternate screen buffer, disable bracketed paste, and disable mouse reporting (WO-053)."""
     disable_mouse_reporting(stream)
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
-            target.write("\x1b[?1049l")
+            target.write("\x1b[?2004l\x1b[?1049l")
             target.flush()
     except Exception:
         pass
 
 
 def restore_terminal_state(stream: Any = None) -> None:
-    """Restore terminal cursor, mouse modes, and attributes cleanly on exit."""
+    """Restore terminal cursor, mouse modes, bracketed paste, and attributes cleanly on exit."""
     try:
         Console().show_cursor(True)
     except Exception:
@@ -449,7 +486,7 @@ def restore_terminal_state(stream: Any = None) -> None:
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
-            target.write("\x1b[?1049l\x1b[?25h\x1b[0m")
+            target.write("\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m")
             target.flush()
     except Exception:
         pass
@@ -588,27 +625,45 @@ def redraw_full_screen(
 
 def render_composer_top_border(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+    shortcuts: str = "",
     width: int = 80,
     is_active: bool = False,
     has_content: bool = False,
     content: str | list[str] | None = None,
+    height: int | None = None,
 ) -> RenderableType:
     """Render top border of composer box with placeholder and shortcuts."""
+    from cli.tui.layout import get_composer_line_limits
+
     border_color = "#60a5fa" if is_active else "#475569"
     active_content = has_content or bool(content)
 
-    if active_content:
+    lines_count = 1
+    if content:
+        if isinstance(content, str):
+            lines_count = len(content.split("\n"))
+        elif isinstance(content, list):
+            lines_count = len(content)
+
+    max_box_h, max_input_lines = get_composer_line_limits(height)
+
+    if lines_count > max_input_lines:
+        label = f"[{lines_count} lines written]"
+    elif active_content:
         label = "[Active Input]" if placeholder == "Type a message..." else placeholder
     else:
         label = placeholder
 
-    shortcut_candidates = [
-        shortcuts,
-        "Ctrl+K commands | Ctrl+L clear",
-        "Ctrl+K | Ctrl+L | PgUp/PgDn",
-        "Ctrl+K | Ctrl+L",
-    ]
+    shortcut_candidates = (
+        [
+            shortcuts,
+            "Ctrl+K commands | Ctrl+L clear",
+            "Ctrl+K | Ctrl+L | PgUp/PgDn",
+            "Ctrl+K | Ctrl+L",
+        ]
+        if shortcuts
+        else []
+    )
     seen = set()
     shortcut_candidates = [
         sc for sc in shortcut_candidates if sc and not (sc in seen or seen.add(sc))
@@ -627,7 +682,7 @@ def render_composer_top_border(
             fill_count = width - fixed_len
             text = Text()
             text.append("╭─ ", style=border_color)
-            text.append(label, style="bold #38bdf8" if active_content else "dim #94a3b8")
+            text.append(label, style="bold #38bdf8" if (active_content or lines_count > max_input_lines) else "dim #94a3b8")
             text.append(" " + "─" * fill_count + " ", style=border_color)
             text.append(chosen_sc, style="dim #64748b")
             text.append(" ─╮", style=border_color)
@@ -638,7 +693,7 @@ def render_composer_top_border(
             fill_count = width - fixed_len_label_only
             text = Text()
             text.append("╭─ ", style=border_color)
-            text.append(label, style="bold #38bdf8" if active_content else "dim #94a3b8")
+            text.append(label, style="bold #38bdf8" if (active_content or lines_count > max_input_lines) else "dim #94a3b8")
             text.append(" " + "─" * fill_count + "─╮", style=border_color)
             return text
 
@@ -649,7 +704,7 @@ def render_composer_top_border(
             fill_count = width - fixed_len_trunc
             text = Text()
             text.append("╭─ ", style=border_color)
-            text.append(truncated_label, style="bold #38bdf8" if active_content else "dim #94a3b8")
+            text.append(truncated_label, style="bold #38bdf8" if (active_content or lines_count > max_input_lines) else "dim #94a3b8")
             text.append(" " + "─" * fill_count + "─╮", style=border_color)
             return text
     else:
@@ -670,15 +725,22 @@ def render_composer_top_border(
 
 def render_composer_top_border_str(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+    shortcuts: str = "",
     width: int = 80,
     is_active: bool = False,
     has_content: bool = False,
     content: str | list[str] | None = None,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
+    height: int | None = None,
 ) -> str:
     """Render top border of composer box as plain string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
     console.print(
         render_composer_top_border(
             placeholder=placeholder,
@@ -687,48 +749,82 @@ def render_composer_top_border_str(
             is_active=is_active,
             has_content=has_content,
             content=content,
+            height=height,
         )
     )
-    return console.export_text().rstrip()
+    return console.export_text(styles=use_ansi).rstrip()
 
 
-def render_composer_bottom_border(width: int = 80, is_active: bool = False) -> RenderableType:
-    """Render the bottom rounded border of the composer box."""
-    border_color = "#60a5fa" if is_active else "#475569"
+def render_composer_bottom_border(
+    width: int = 80,
+    is_active: bool = False,
+    alert: str | None = None,
+) -> RenderableType:
+    """Render the bottom rounded border of the composer box, optionally embedding an alert."""
+    border_color = "#f59e0b" if alert else ("#60a5fa" if is_active else "#475569")
     text = Text()
+    if alert:
+        alert_text = f" {alert} "
+        fixed_len = len("╰─") + len(alert_text) + len("─╯")
+        if width >= fixed_len + 2:
+            fill_count = max(0, width - fixed_len)
+            text.append("╰─", style=border_color)
+            text.append(alert_text, style="bold #f59e0b")
+            text.append("─" * fill_count + "─╯", style=border_color)
+            return text
+        elif width >= len(alert) + 4:
+            text.append("╰─", style=border_color)
+            text.append(f" {alert} ", style="bold #f59e0b")
+            text.append("─╯", style=border_color)
+            return text
     text.append("╰" + "─" * max(2, width - 2) + "╯", style=border_color)
     return text
 
 
-def render_composer_bottom_border_str(width: int = 80, is_active: bool = False) -> str:
+def render_composer_bottom_border_str(
+    width: int = 80,
+    is_active: bool = False,
+    alert: str | None = None,
+    *,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
+) -> str:
     """Render bottom border of composer box as plain string using in-memory capture."""
-    buf = io.StringIO()
-    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_composer_bottom_border(width=width, is_active=is_active))
-    return console.export_text().rstrip()
+    console, use_ansi = _make_capture_console(
+        width=width,
+        force_color=force_color,
+        no_color=no_color,
+    )
+    console.print(render_composer_bottom_border(width=width, is_active=is_active, alert=alert))
+    return console.export_text(styles=use_ansi).rstrip()
 
 
 def prompt_composer_input(
     placeholder: str = "Type a message...",
-    shortcuts: str = "Ctrl+K commands | Ctrl+L clear | PgUp/PgDn scroll",
+    shortcuts: str = "",
     width: int = 80,
     initial_text: str = "",
     multiline: bool = False,
     state: Any | None = None,
     on_ctrl_k: Callable[[], None] | None = None,
     on_ctrl_l: Callable[[], None] | None = None,
+    on_ctrl_o: Callable[[], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_wheel_up: Callable[[], None] | None = None,
     on_wheel_down: Callable[[], None] | None = None,
+    on_height_change: Optional[Callable[[Any], None]] = None,
     history: list[str] | None = None,
-    show_footer: bool = True,
+    show_footer: bool | None = None,
     live_manager: Any | None = None,
     session: Mapping[str, Any] | None = None,
     terminal_width: int | None = None,
     full_screen: bool = False,
     key_stream: Optional[Iterator[str]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
+    on_resize: Optional[Callable[..., None]] = None,
+    force_color: bool | None = None,
+    no_color: bool | None = None,
 ) -> str:
     """Prompt user for input inside styled composer box border."""
     term_width = terminal_width if terminal_width is not None else width
@@ -737,6 +833,9 @@ def prompt_composer_input(
         comp_width = width
     else:
         comp_width = layout.conversation_width if layout.show_runtime else term_width
+
+    if show_footer is None:
+        show_footer = True
 
     if state is not None:
         if not initial_text and getattr(state, "composer_buffer", ""):
@@ -769,10 +868,12 @@ def prompt_composer_input(
                     width=comp_width,
                     is_active=True,
                     has_content=bool(initial_text),
+                    force_color=force_color,
+                    no_color=no_color,
                 )
             )
             status_bar_line = ""
-            if session is not None:
+            if show_footer and session is not None:
                 status = (
                     getattr(state, "connection_status", "online") if state is not None else "online"
                 )
@@ -788,7 +889,12 @@ def prompt_composer_input(
                     session, width=comp_width, status=status, context_meter=context_meter
                 )
 
-            bottom_border = render_composer_bottom_border_str(width=comp_width, is_active=True)
+            bottom_border = render_composer_bottom_border_str(
+                width=comp_width,
+                is_active=True,
+                force_color=force_color,
+                no_color=no_color,
+            )
             if status_bar_line:
                 sys.stdout.write(f"\n{bottom_border}\n{status_bar_line}\x1b[2A\r")
             else:
@@ -808,12 +914,96 @@ def prompt_composer_input(
                         live_manager=live_manager,
                     )
                     term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                    sys.stdout.write(f"\x1b[{term_lines - 2};1H")
+                    c_row = compute_composer_cursor_row(term_lines, state=state)
+                    sys.stdout.write(f"\x1b[{c_row};1H")
                     sys.stdout.flush()
                     return True
                 except Exception:
                     pass
             return False
+
+        def _handle_alert(alert_text: str | None) -> None:
+            if state is not None and hasattr(state, "composer_alert"):
+                state.composer_alert = alert_text
+            if is_live_active:
+                try:
+                    live_manager.update(
+                        composer_content=getattr(state, "composer_buffer", ""),
+                        composer_is_active=True,
+                        shortcuts=shortcuts,
+                        include_composer=True,
+                    )
+                except Exception:
+                    pass
+
+        def _handle_prompt_resize(new_cols: int, new_lines: int, ed: Any = None) -> None:
+            nonlocal comp_width
+            try:
+                from cli.tui.chat import clear_transcript_cache
+                clear_transcript_cache()
+            except Exception:
+                pass
+
+            layout = compute_layout(new_cols)
+            comp_width = layout.conversation_width if layout.show_runtime else new_cols
+            if ed is not None:
+                ed.width = comp_width
+
+            if on_resize is not None:
+                try:
+                    on_resize(new_cols, new_lines, ed)
+                    return
+                except TypeError:
+                    try:
+                        on_resize(new_cols, new_lines)
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            if is_live_active:
+                try:
+                    live_manager.handle_resize(new_cols, new_lines)
+                except Exception:
+                    pass
+
+            if is_full_screen and session is not None and state is not None:
+                try:
+                    current_text = (
+                        "".join(ed.buffer)
+                        if (ed is not None and isinstance(getattr(ed, "buffer", None), list))
+                        else getattr(state, "composer_buffer", "")
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        width=new_cols,
+                        height=new_lines,
+                        clear=True,
+                        include_composer=True,
+                        composer_is_active=True,
+                        composer_content=current_text,
+                        live_manager=live_manager,
+                    )
+                    cursor_line = getattr(ed, "current_visible_line_index", None) if ed else None
+                    c_row = compute_composer_cursor_row(
+                        new_lines,
+                        state=state,
+                        composer_content=current_text,
+                        cursor_line=cursor_line,
+                    )
+                    c_col = _compute_cursor_col(ed) if ed else 5
+                    sys.stdout.write(f"\x1b[{c_row};{c_col}H")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+            if ed is not None and hasattr(ed, "redraw_line"):
+                try:
+                    ed.redraw_line()
+                except Exception:
+                    pass
 
         try:
             _raw_prompt_fn = getattr(
@@ -828,6 +1018,7 @@ def prompt_composer_input(
                 state=state,
                 on_ctrl_k=on_ctrl_k,
                 on_ctrl_l=on_ctrl_l,
+                on_ctrl_o=on_ctrl_o,
                 on_page_up=on_page_up,
                 on_page_down=on_page_down,
                 on_wheel_up=on_wheel_up,
@@ -840,13 +1031,27 @@ def prompt_composer_input(
                     width=comp_width,
                     is_active=True,
                     has_content=has_c,
+                    force_color=force_color,
+                    no_color=no_color,
                 ),
+                bottom_border_renderer=lambda alert: render_composer_bottom_border_str(
+                    width=comp_width,
+                    is_active=True,
+                    alert=alert,
+                    force_color=force_color,
+                    no_color=no_color,
+                ),
+                on_alert=_handle_alert,
                 on_idle=on_idle,
+                on_height_change=on_height_change,
+                on_resize=_handle_prompt_resize,
             )
         finally:
             if state is not None:
                 state.is_typing = False
                 state.composer_buffer = ""
+                if hasattr(state, "composer_alert"):
+                    state.composer_alert = None
 
         if is_live_active:
             live_manager.update(
@@ -857,9 +1062,10 @@ def prompt_composer_input(
             )
         elif not is_full_screen:
             click.echo(render_composer_bottom_border_str(width=comp_width, is_active=False))
-            if show_footer:
+            has_conv = bool(getattr(state, "messages", None))
+            if show_footer and has_conv:
                 click.echo(render_bottom_footer_bar_str(width=comp_width))
-            if session is not None:
+            if session is not None and show_footer:
                 status = (
                     getattr(state, "connection_status", "online") if state is not None else "online"
                 )
@@ -935,9 +1141,10 @@ def prompt_composer_input(
         )
     else:
         click.echo(render_composer_bottom_border_str(width=comp_width, is_active=False))
-        if show_footer:
+        has_conv = bool(getattr(state, "messages", None))
+        if show_footer and has_conv:
             click.echo(render_bottom_footer_bar_str(width=comp_width))
-        if session is not None:
+        if session is not None and has_conv:
             status = (
                 getattr(state, "connection_status", "online") if state is not None else "online"
             )

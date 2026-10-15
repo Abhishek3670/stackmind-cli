@@ -85,9 +85,13 @@ class AgentContract:
         # Load schema: check project override first, then package schema
         schema_path = None
         if project_path:
-            cand = project_path / "schemas" / "contract.schema.json"
+            cand = project_path / ".sync" / "schemas" / "contract.schema.json"
             if cand.exists():
                 schema_path = cand
+            else:
+                cand = project_path / "schemas" / "contract.schema.json"
+                if cand.exists():
+                    schema_path = cand
         if not schema_path:
             schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contract.schema.json"
         if not schema_path.exists():

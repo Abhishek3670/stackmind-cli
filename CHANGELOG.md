@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Automated skill consumer, store, and selector for dynamic runtime procedural knowledge injection.
   - Architectural skill selection and runbook audit tools.
 - **Central Home & Projects Workspace Management**:
-  - Multi-project registry management in `~/.stackmind/` via `cli/projects.py` and `validators/kernel/home.py`.
+  - Multi-project registry management in `~/.stackmindcli/` via `cli/projects.py` and `validators/kernel/home.py`.
 - **GitOps & Security Scan Autonomous Recovery**:
   - Authorized `run_security_scan` across root workspace directories without false contract denials.
   - Bounded GitOps recovery retries with structured feedback in `_advance_gitops`.

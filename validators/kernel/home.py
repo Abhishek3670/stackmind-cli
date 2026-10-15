@@ -7,21 +7,19 @@ Provides ~/.stackmindcli as the single authoritative root for:
 - Central daemon runtime & coordination (daemon/)
 - Central persistent sessions & transcripts (sessions/)
 - Shared scratch space, diff cache, and temporary sandboxes (tmp/)
-
-Handles seamless backward-compatibility and migration from legacy ~/.stackmind.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 STACKMIND_HOME_ENV = "STACKMIND_HOME"
-LEGACY_STACKMIND_DIR_NAME = ".stackmind"
 STACKMIND_CLI_DIR_NAME = ".stackmindcli"
 
 
@@ -29,8 +27,6 @@ def get_stackmind_home() -> Path:
     """Return the authoritative ~/.stackmindcli root directory.
 
     Respects STACKMIND_HOME environment variable if set.
-    Creates required root directories and performs one-time migration
-    from legacy ~/.stackmind if present.
     """
     override = os.environ.get(STACKMIND_HOME_ENV)
     if override:
@@ -41,34 +37,41 @@ def get_stackmind_home() -> Path:
     try:
         home_path.mkdir(parents=True, exist_ok=True)
         # Subdirectories
-        for subdir in ("skills/global", "skills/cache", "daemon", "sessions", "tmp"):
+        for subdir in ("skills/global", "skills/cache", "daemon", "sessions", "tmp", "projects"):
             (home_path / subdir).mkdir(parents=True, exist_ok=True)
-        # Legacy migration: ~/.stackmind/settings.json -> ~/.stackmindcli/settings.json
-        _migrate_legacy_settings_if_needed(home_path)
+        ensure_global_settings_file(home_path)
     except (PermissionError, OSError):
         pass
 
     return home_path
 
 
-def _migrate_legacy_settings_if_needed(target_home: Path) -> None:
-    """Migrate settings from legacy ~/.stackmind/ to target home if missing."""
-    target_settings = target_home / "settings.json"
-    if target_settings.is_file():
-        return
+def ensure_global_settings_file(target_home: Path | None = None) -> Path:
+    """Ensure settings.json and alias setting.json exist in ~/.stackmindcli with default values."""
+    cli_home = (target_home or get_stackmind_home()).resolve()
+    target_settings = cli_home / "settings.json"
 
-    legacy_home = Path.home() / LEGACY_STACKMIND_DIR_NAME
-    legacy_candidates = [
-        legacy_home / "settings.json",
-        legacy_home / "setting.json",
-    ]
-    for leg in legacy_candidates:
-        if leg.is_file():
-            try:
-                shutil.copy2(leg, target_settings)
-                break
-            except Exception:
-                pass
+    if not target_settings.is_file():
+        try:
+            from validators.kernel.settings import get_default_settings
+            default_text = get_default_settings().to_json(indent=2)
+        except Exception:
+            default_text = json.dumps({"execution_profile": "medium", "providers": {}, "roles": {}}, indent=2)
+        try:
+            cli_home.mkdir(parents=True, exist_ok=True)
+            target_settings.write_text(default_text, encoding="utf-8")
+        except Exception:
+            pass
+
+    # Ensure alias setting.json exists in ~/.stackmindcli
+    alias = cli_home / "setting.json"
+    if not alias.is_file() and target_settings.is_file():
+        try:
+            alias.write_text(target_settings.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+
+    return target_settings
 
 
 def get_global_settings_path() -> Path:
@@ -240,19 +243,145 @@ def list_registered_projects() -> list[dict[str, Any]]:
     )
 
 
+# ── Authoritative Project Storage & Plan Versioning (PLAN.v{N}.md) ───────────
+
+
+def get_project_slug(project_path: Path | str) -> str:
+    """Convert an arbitrary filesystem path into a deterministic filesystem-safe project slug.
+
+    Examples:
+        'W:\\Aatish\\Stuff\\clean_tui_test' -> 'W_Aatish_Stuff_clean_tui_test'
+        '/home/user/my_proj' -> 'home_user_my_proj'
+    """
+    resolved = Path(project_path).resolve()
+    raw = str(resolved).strip()
+    slug = re.sub(r"[:\\/]+", "_", raw)
+    slug = slug.strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    return slug or "default_project"
+
+
+def get_project_storage_dir(project_path: Path | str) -> Path:
+    """Return the authoritative storage directory for a project under ~/.stackmindcli/projects/<slug>."""
+    slug = get_project_slug(project_path)
+    proj_dir = get_stackmind_home() / "projects" / slug
+    try:
+        proj_dir.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError):
+        pass
+    return proj_dir
+
+
+def get_latest_plan_version(project_path: Path | str) -> int:
+    """Find the highest integer N in PLAN.v{N}.md under the project's central storage directory."""
+    proj_dir = get_project_storage_dir(project_path)
+    if not proj_dir.is_dir():
+        return 0
+    max_v = 0
+    for p_file in proj_dir.glob("PLAN.v*.md"):
+        m = re.match(r"^PLAN\.v(\d+)\.md$", p_file.name)
+        if m:
+            try:
+                v = int(m.group(1))
+                if v > max_v:
+                    max_v = v
+            except ValueError:
+                pass
+    return max_v
+
+
+def get_project_plan_path(project_path: Path | str, version: int | None = None) -> Path | None:
+    """Return path to PLAN.v{version}.md. If version is None, return path to latest version or None if none exist."""
+    proj_dir = get_project_storage_dir(project_path)
+    if version is not None:
+        p_path = proj_dir / f"PLAN.v{version}.md"
+        return p_path if p_path.is_file() else None
+    latest_v = get_latest_plan_version(project_path)
+    if latest_v == 0:
+        return None
+    p_path = proj_dir / f"PLAN.v{latest_v}.md"
+    return p_path if p_path.is_file() else None
+
+
+def list_project_plan_versions(project_path: Path | str) -> list[dict[str, Any]]:
+    """List all PLAN.v{N}.md versions for a project sorted in ascending version order."""
+    proj_dir = get_project_storage_dir(project_path)
+    if not proj_dir.is_dir():
+        return []
+    versions: list[dict[str, Any]] = []
+    for p_file in proj_dir.glob("PLAN.v*.md"):
+        m = re.match(r"^PLAN\.v(\d+)\.md$", p_file.name)
+        if m:
+            v_num = int(m.group(1))
+            versions.append({
+                "version": v_num,
+                "file_name": p_file.name,
+                "path": str(p_file),
+                "modified": p_file.stat().st_mtime if p_file.exists() else 0,
+            })
+    return sorted(versions, key=lambda x: x["version"])
+
+
+def save_authoritative_plan(
+    project_path: Path | str,
+    content: str,
+    version: int | None = None,
+) -> tuple[Path, int]:
+    """Save the authoritative StackMind plan directly as PLAN.v{N}.md under ~/.stackmindcli/projects/<slug>/.
+
+    If version is None, auto-increments to the next version number.
+    Returns:
+        (path_to_saved_plan, version_number)
+    """
+    proj_dir = get_project_storage_dir(project_path)
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    if version is None:
+        version = get_latest_plan_version(project_path) + 1
+
+    target_file = proj_dir / f"PLAN.v{version}.md"
+    target_file.write_text(content, encoding="utf-8")
+    return target_file, version
+
+
+def copy_approved_plan_to_workspace(
+    project_path: Path | str,
+    version: int | None = None,
+) -> Path | None:
+    """Copy the approved authoritative plan from ~/.stackmindcli/projects/<slug>/PLAN.v{N}.md to <workspace>/PLAN.md."""
+    src_file = get_project_plan_path(project_path, version=version)
+    if not src_file or not src_file.is_file():
+        return None
+
+    ws_root = Path(project_path).resolve()
+    dest_file = ws_root / "PLAN.md"
+    try:
+        shutil.copy2(src_file, dest_file)
+        return dest_file
+    except Exception:
+        return None
+
+
 __all__ = [
     "STACKMIND_CLI_DIR_NAME",
     "STACKMIND_HOME_ENV",
+    "copy_approved_plan_to_workspace",
     "get_daemon_home_dir",
     "get_global_settings_path",
     "get_global_skills_dir",
     "get_global_tmp_dir",
+    "get_latest_plan_version",
     "get_project_entry",
+    "get_project_plan_path",
+    "get_project_slug",
+    "get_project_storage_dir",
     "get_projects_registry_path",
     "get_sessions_home_dir",
     "get_stackmind_home",
+    "list_project_plan_versions",
     "list_registered_projects",
     "register_project",
+    "save_authoritative_plan",
     "touch_project",
     "unregister_project",
 ]

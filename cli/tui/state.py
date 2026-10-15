@@ -35,6 +35,13 @@ def canonical_blocker_text(block_msg: Any) -> str:
             msg = str(failure.get("canonical_message") or block_msg.get("error") or "")
             return f"{code} [{wo} rev {rev}] {msg}".strip()
         from cli.tui.events import clean_error_message
+        err_val = block_msg.get("error") or block_msg.get("reason") or block_msg.get("message")
+        if err_val:
+            import re
+            m = re.search(r"\[(.*?)\]", str(err_val))
+            if m:
+                err_val = m.group(1).strip()
+            return clean_error_message(err_val)
         return clean_error_message(block_msg)
     from cli.tui.events import clean_error_message
     return clean_error_message(block_msg)
@@ -129,6 +136,13 @@ class TurnAction:
     status: str = "RUNNING"  # RUNNING, COMPLETED, FAILED, CANCELLED
     duration_seconds: float | None = None
     error: str | None = None
+    tool_name: str | None = None
+    target: str | None = None
+    output: str | None = None
+    diff: str | None = None
+    code: str | None = None
+    parent_id: str | None = None
+    sub_actions: list[TurnAction] = field(default_factory=list)
 
     @property
     def symbol(self) -> str:
@@ -150,6 +164,72 @@ class ActionsGroup:
     expanded: bool = False
     active: bool = False
     turn_id: str | None = None
+    preview_label: str | None = None
+    preview_code: str | None = None
+    verbosity: str = "tree"  # "tree" | "flat" | "compact"
+
+    @property
+    def all_actions(self) -> list[TurnAction]:
+        """Flattened list of all top-level and nested sub-actions."""
+        res: list[TurnAction] = []
+        for a in self.actions:
+            res.append(a)
+            res.extend(a.sub_actions)
+        return res
+
+    @property
+    def failed_count(self) -> int:
+        return sum(1 for a in self.all_actions if a.status.upper() in {"FAILED", "FAILURE", "ERROR"})
+
+    @property
+    def latest_preview_action(self) -> TurnAction | None:
+        """Find the running action, or the most recent completed action with code/diff/output/error."""
+        all_acts = self.all_actions
+        for a in reversed(all_acts):
+            if a.status.upper() == "RUNNING":
+                return a
+        # 1. Prefer real agent tool actions with diff, output, code, or error over internal harness plumbing
+        for a in reversed(all_acts):
+            t_name = (a.tool_name or a.action_id or "").lower()
+            if "harness" in t_name:
+                continue
+            if (
+                (a.diff and a.diff.strip())
+                or (a.output and a.output.strip())
+                or (a.code and a.code.strip())
+                or (a.error and a.error.strip())
+            ):
+                return a
+        # 2. Check any other action with diff, code, or error
+        for a in reversed(all_acts):
+            if (a.diff and a.diff.strip()) or (a.code and a.code.strip()) or (a.error and a.error.strip()):
+                return a
+        # 3. Check any non-harness action
+        for a in reversed(all_acts):
+            t_name = (a.tool_name or a.action_id or "").lower()
+            if "harness" not in t_name:
+                return a
+        # 4. Fallback to completed action with output
+        for a in reversed(all_acts):
+            if a.output and a.output.strip():
+                return a
+        return all_acts[-1] if all_acts else None
+
+    def get_visible_actions(self, verbosity: str | None = None) -> list[tuple[TurnAction, int]]:
+        """Return list of (action, indent_level) according to verbosity mode."""
+        mode = (verbosity or self.verbosity or "tree").lower()
+        items: list[tuple[TurnAction, int]] = []
+        for a in self.actions:
+            if mode == "flat" and a.sub_actions:
+                for sa in a.sub_actions:
+                    items.append((sa, 0))
+            elif mode == "compact":
+                items.append((a, 0))
+            else:  # "tree"
+                items.append((a, 0))
+                for sa in a.sub_actions:
+                    items.append((sa, 1))
+        return items
 
     def add_or_update(
         self,
@@ -158,9 +238,16 @@ class ActionsGroup:
         status: str = "RUNNING",
         duration_seconds: float | None = None,
         error: str | None = None,
+        tool_name: str | None = None,
+        target: str | None = None,
+        code: str | None = None,
+        diff: str | None = None,
+        output: str | None = None,
+        parent_id: str | None = None,
     ) -> TurnAction:
         """Add new action or update existing invocation in-place (§21)."""
-        for a in self.actions:
+        # 1. Update if already exists in top-level or sub_actions
+        for a in self.all_actions:
             if a.action_id == action_id:
                 a.status = status
                 if description and (not a.description or a.description == a.action_id):
@@ -169,16 +256,51 @@ class ActionsGroup:
                     a.duration_seconds = duration_seconds
                 if error is not None:
                     a.error = error
+                if tool_name is not None:
+                    a.tool_name = tool_name
+                if target is not None:
+                    a.target = target
+                if code is not None:
+                    a.code = code
+                if diff is not None:
+                    a.diff = diff
+                if output is not None:
+                    a.output = output
                 return a
-        act = TurnAction(
+
+        # 2. Check if this is a sub-action under a parent
+        target_parent = None
+        if parent_id:
+            for a in self.actions:
+                if a.action_id == parent_id:
+                    target_parent = a
+                    break
+        elif tool_name and "harness" not in tool_name.lower():
+            for a in reversed(self.actions):
+                if a.status.upper() in {"RUNNING", "ACTIVE"} and (
+                    "harness" in (a.tool_name or "").lower() or "harness" in a.description.lower()
+                ):
+                    target_parent = a
+                    break
+
+        new_act = TurnAction(
             action_id=action_id,
             description=description or action_id,
             status=status,
             duration_seconds=duration_seconds,
             error=error,
+            tool_name=tool_name,
+            target=target,
+            code=code,
+            diff=diff,
+            output=output,
+            parent_id=target_parent.action_id if target_parent else parent_id,
         )
-        self.actions.append(act)
-        return act
+        if target_parent is not None:
+            target_parent.sub_actions.append(new_act)
+        else:
+            self.actions.append(new_act)
+        return new_act
 
     def complete_action(
         self,
@@ -187,55 +309,85 @@ class ActionsGroup:
         duration_seconds: float | None = None,
         error: str | None = None,
         tool_name: str | None = None,
+        output: str | None = None,
+        diff: str | None = None,
+        code: str | None = None,
     ) -> TurnAction | None:
         if status.upper() in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}:
             self.expanded = True
+        matched = None
         # 1. Match exact action_id if provided
         if action_id:
-            for a in self.actions:
+            for a in self.all_actions:
                 if a.action_id == action_id:
-                    a.status = status
-                    if duration_seconds is not None:
-                        a.duration_seconds = duration_seconds
-                    if error is not None:
-                        a.error = error
-                    return a
-        # 2. Match by tool_name in description or action_id
-        if tool_name:
+                    matched = a
+                    break
+
+        # 2. Match by tool_name in description or action_id (checking running sub-actions first)
+        if not matched and tool_name:
             norm_tool = tool_name.lower().replace("_", " ")
             for a in reversed(self.actions):
+                for sa in reversed(a.sub_actions):
+                    if sa.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                        desc_norm = sa.description.lower().replace("_", " ")
+                        if norm_tool in desc_norm or tool_name.lower() in sa.action_id.lower():
+                            matched = sa
+                            break
+                if matched:
+                    break
                 if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
                     desc_norm = a.description.lower().replace("_", " ")
                     if norm_tool in desc_norm or tool_name.lower() in a.action_id.lower():
-                        a.status = status
-                        if duration_seconds is not None:
-                            a.duration_seconds = duration_seconds
-                        if error is not None:
-                            a.error = error
-                        return a
-        # 3. Fallback: match most recent in-flight action
-        for a in reversed(self.actions):
-            if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
-                a.status = status
-                if duration_seconds is not None:
-                    a.duration_seconds = duration_seconds
-                if error is not None:
-                    a.error = error
-                return a
-        act = TurnAction(
-            action_id=action_id or f"act-{len(self.actions)+1}",
-            description=tool_name or action_id or "Action",
-            status=status,
-            duration_seconds=duration_seconds,
-            error=error,
-        )
-        self.actions.append(act)
-        return act
+                        matched = a
+                        break
+
+        # 3. Fallback: match most recent in-flight action (sub-action first)
+        if not matched:
+            for a in reversed(self.actions):
+                for sa in reversed(a.sub_actions):
+                    if sa.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                        matched = sa
+                        break
+                if matched:
+                    break
+                if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
+                    matched = a
+                    break
+
+        if not matched:
+            fallback_desc = tool_name or action_id or "Action"
+            if tool_name and "harness" in tool_name.lower():
+                from cli.tui.events import format_action_description
+                fallback_desc = format_action_description(tool_name)
+            matched = TurnAction(
+                action_id=action_id or f"act-{len(self.actions)+1}",
+                description=fallback_desc,
+                status=status,
+                duration_seconds=duration_seconds,
+                error=error,
+                tool_name=tool_name,
+            )
+            self.actions.append(matched)
+
+        matched.status = status
+        if tool_name and not getattr(matched, "tool_name", None):
+            matched.tool_name = tool_name
+        if duration_seconds is not None:
+            matched.duration_seconds = duration_seconds
+        if error is not None:
+            matched.error = error
+        if output is not None:
+            matched.output = output
+        if diff is not None:
+            matched.diff = diff
+        if code is not None:
+            matched.code = code
+        return matched
 
     def complete_all(self, status: str = "COMPLETED") -> None:
         """Complete all in-flight actions and mark group inactive."""
         self.active = False
-        for a in self.actions:
+        for a in self.all_actions:
             if a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"}:
                 a.status = status
 
@@ -262,31 +414,38 @@ class ActionsGroup:
 
     @property
     def has_running(self) -> bool:
-        return any(a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"} for a in self.actions)
+        return any(a.status.upper() in {"RUNNING", "IN_PROGRESS", "ACTIVE"} for a in self.all_actions)
 
     @property
     def count(self) -> int:
-        return len(self.actions)
+        vis = self.get_visible_actions()
+        return len(vis) if vis else len(self.actions)
 
     @property
     def completed_count(self) -> int:
-        return sum(1 for a in self.actions if a.status.upper() in {"COMPLETED", "SUCCESS", "DONE", "PASSED"})
+        vis = self.get_visible_actions()
+        items = [item[0] for item in vis] if vis else self.actions
+        return sum(1 for a in items if a.status.upper() in {"COMPLETED", "SUCCESS", "DONE", "PASSED"})
+
+    @property
+    def header_suffix(self) -> str:
+        """Summary suffix describing completed and failed action counts."""
+        failed = self.failed_count
+        count = self.count
+        if failed > 0:
+            if self.active or self.has_running:
+                return f"{count} ({failed} failed)"
+            if self.completed_count > 0:
+                return f"{self.completed_count} completed, {failed} failed"
+            return f"{failed} failed"
+        if self.active or self.has_running:
+            return f"{count}"
+        return f"{count} completed"
 
     def format_header_text(self) -> str:
         """Format the summary header line per §20 and §21."""
         arrow = "▾" if self.expanded else "▸"
-        count = len(self.actions)
-        failed_count = sum(1 for a in self.actions if a.status.upper() in {"FAILED", "FAILURE", "ERROR"})
-        if self.active or self.has_running:
-            suffix = f"{count}"
-        elif failed_count > 0:
-            if self.completed_count > 0:
-                suffix = f"{self.completed_count} completed, {failed_count} failed"
-            else:
-                suffix = f"{failed_count} failed"
-        else:
-            suffix = f"{count} completed"
-        return f"{arrow} Actions · {suffix}"
+        return f"{arrow} Actions · {self.header_suffix}"
 
 
 @dataclass
@@ -297,6 +456,7 @@ class ChatMessage:
     actions: ActionsGroup | None = None
     thinking: str | None = None
     turn_id: str | None = None
+    thinking_expanded: bool = False
 
 
 @dataclass
@@ -362,16 +522,6 @@ class AutonomousDeliveryState:
         self.error: str | None = None
         self.plan: dict[str, Any] = {}
         self.plan_revisions: list[PlanRevision] = []
-        if roles is not None:
-            self.roles = dict(roles)
-        else:
-            self.roles = {
-                "Architecture": RoleStatus("Architecture", backend="Claude", work_order_id="WO-001", state="RUNNING"),
-                "Backend": RoleStatus("Backend", backend="Codex", work_order_id="WO-002", state="WAITING"),
-                "Frontend": RoleStatus("Frontend", backend="AGY", work_order_id="WO-003", state="WAITING"),
-                "Q/A": RoleStatus("Q/A", backend="Ollama", work_order_id="WO-004", state="WAITING"),
-                "GitOps": RoleStatus("GitOps", backend="Ollama", work_order_id="WO-005", state="WAITING"),
-            }
         if work_orders is not None:
             self.work_orders = list(work_orders)
         elif roles is not None:
@@ -384,9 +534,19 @@ class AutonomousDeliveryState:
                 WorkOrderItem("WO-004", "Q/A Verification Suite", role="Q/A", priority="P0", status="WAITING"),
                 WorkOrderItem("WO-005", "GitOps Release & Hygiene", role="GitOps", priority="P0", status="WAITING"),
             ]
+        if roles is not None:
+            self.roles = dict(roles)
+        else:
+            self.roles = {
+                "Architecture": RoleStatus("Architecture", backend="Claude", work_order_id="WO-001" if self.work_orders else None, state="RUNNING" if self.work_orders else "WAITING"),
+                "Backend": RoleStatus("Backend", backend="Codex", work_order_id="WO-002" if self.work_orders else None, state="WAITING"),
+                "Frontend": RoleStatus("Frontend", backend="AGY", work_order_id="WO-003" if self.work_orders else None, state="WAITING"),
+                "Q/A": RoleStatus("Q/A", backend="Ollama", work_order_id="WO-004" if self.work_orders else None, state="WAITING"),
+                "GitOps": RoleStatus("GitOps", backend="Ollama", work_order_id="WO-005" if self.work_orders else None, state="WAITING"),
+            }
         if operations is not None:
             self.operations = dict(operations)
-        elif roles is not None:
+        elif roles is not None or not self.work_orders:
             self.operations = {}
         else:
             self.operations = {
@@ -397,6 +557,7 @@ class AutonomousDeliveryState:
             conversation_scroll if conversation_scroll is not None else ConversationScroll()
         )
         self.composer_buffer: str = ""
+        self.composer_alert: str | None = None
         self.is_typing: bool = False
         self.focus_target: str = "composer"
         self.activity_log: list[ActivityEntry] = []
@@ -424,8 +585,18 @@ class AutonomousDeliveryState:
         self.seen_sequences: set[int] = set()
         self.seen_message_keys: set[tuple[str, str]] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
-        self.current_turn_actions: ActionsGroup = ActionsGroup(active=False)
+        self.govern_verbosity: str = "tree"  # "tree" | "flat" | "compact"
+        self.current_turn_actions: ActionsGroup = ActionsGroup(active=False, verbosity=self.govern_verbosity)
         self.current_turn_thinking: str = ""
+        self.thinking_expanded: bool = True
+        self.live_thinking_expanded: bool = True
+        self.active_tool_name: str | None = None
+        self.active_tool_target: str | None = None
+        self.active_tool_code: str | None = None
+        self.last_tool_name: str | None = None
+        self.last_tool_target: str | None = None
+        self.last_tool_code: str | None = None
+        self.last_tool_status: str | None = None
         self.client_timeout: float = client_timeout
         self.context_window_tokens = max(1, context_window_tokens)
         self.compaction_threshold = min(max(compaction_threshold, 0.1), 1.0)
@@ -580,12 +751,29 @@ class AutonomousDeliveryState:
         if role == "assistant":
             from cli.tui.chat import format_contract_payload
             msg_content = format_contract_payload(msg_content)
+            for m in self.messages:
+                if m.role == "assistant" and getattr(m, "actions", None):
+                    m.actions.expanded = False
             if msg_actions is None and self.current_turn_actions and not self.current_turn_actions.is_empty:
                 msg_actions = self.current_turn_actions
-            if msg_actions is not None:
                 msg_actions.complete_all()
+                last_c = getattr(self, "last_tool_code", None) or getattr(self, "active_tool_code", None)
+                last_t = getattr(self, "last_tool_target", None) or getattr(self, "active_tool_target", None)
+                last_n = getattr(self, "last_tool_name", None) or getattr(self, "active_tool_name", None)
+                if last_c and last_n in {"write_file", "write", "edit_file", "edit", "create_file", "create"}:
+                    msg_actions.preview_label = f"✓ Wrote `{last_t}`" if last_t else "✓ Wrote code"
+                    msg_actions.preview_code = last_c
+                msg_actions.expanded = True
+            elif msg_actions is not None:
+                msg_actions.complete_all()
+            self.active_tool_name = None
+            self.active_tool_target = None
+            self.active_tool_code = None
+            self.last_tool_name = None
+            self.last_tool_target = None
+            self.last_tool_code = None
             if msg_actions is self.current_turn_actions:
-                self.current_turn_actions = ActionsGroup(active=False)
+                self.current_turn_actions = ActionsGroup(active=False, verbosity=self.govern_verbosity)
 
         msg = ChatMessage(
             role=role,
@@ -594,6 +782,7 @@ class AutonomousDeliveryState:
             actions=msg_actions,
             thinking=msg_thinking,
             turn_id=turn_id,
+            thinking_expanded=self.thinking_expanded,
         )
         self.messages.append(msg)
         if role == "user":
@@ -606,6 +795,40 @@ class AutonomousDeliveryState:
             self.conversation_scroll.total_lines = None
         self.maybe_compact_transcript()
         return msg
+
+    def toggle_thinking(self, index: int | None = None) -> bool:
+        """Toggle thinking block expansion globally or for a specific message."""
+        if index is not None and 0 <= index < len(self.messages):
+            self.messages[index].thinking_expanded = not getattr(self.messages[index], "thinking_expanded", False)
+            return self.messages[index].thinking_expanded
+        self.thinking_expanded = not self.thinking_expanded
+        self.live_thinking_expanded = self.thinking_expanded
+        for m in self.messages:
+            if getattr(m, "thinking", None):
+                m.thinking_expanded = self.thinking_expanded
+        return self.thinking_expanded
+
+    def expand_thinking(self, index: int | None = None) -> None:
+        """Expand thinking blocks globally or for a specific message."""
+        if index is not None and 0 <= index < len(self.messages):
+            self.messages[index].thinking_expanded = True
+            return
+        self.thinking_expanded = True
+        self.live_thinking_expanded = True
+        for m in self.messages:
+            if getattr(m, "thinking", None):
+                m.thinking_expanded = True
+
+    def collapse_thinking(self, index: int | None = None) -> None:
+        """Collapse thinking blocks globally or for a specific message."""
+        if index is not None and 0 <= index < len(self.messages):
+            self.messages[index].thinking_expanded = False
+            return
+        self.thinking_expanded = False
+        self.live_thinking_expanded = False
+        for m in self.messages:
+            if getattr(m, "thinking", None):
+                m.thinking_expanded = False
 
     def scroll_conversation_up(self, lines: int = 1) -> None:
         """Scroll conversation viewport upward, detaching from live-follow (§31)."""
@@ -626,16 +849,29 @@ class AutonomousDeliveryState:
         status: str = "RUNNING",
         duration_seconds: float | None = None,
         error: str | None = None,
+        tool_name: str | None = None,
+        target: str | None = None,
+        code: str | None = None,
+        diff: str | None = None,
+        output: str | None = None,
+        parent_id: str | None = None,
     ) -> TurnAction:
         """Record or update a turn action in-place (§21)."""
         if not self.current_turn_actions.active:
             self.current_turn_actions.active = True
+        self.current_turn_actions.verbosity = self.govern_verbosity
         action = self.current_turn_actions.add_or_update(
             action_id=action_id,
             description=description,
             status=status,
             duration_seconds=duration_seconds,
             error=error,
+            tool_name=tool_name,
+            target=target,
+            code=code,
+            diff=diff,
+            output=output,
+            parent_id=parent_id,
         )
         if self.messages and self.messages[-1].role == "assistant":
             if self.messages[-1].actions is None:
@@ -649,6 +885,9 @@ class AutonomousDeliveryState:
         duration_seconds: float | None = None,
         error: str | None = None,
         tool_name: str | None = None,
+        output: str | None = None,
+        diff: str | None = None,
+        code: str | None = None,
     ) -> TurnAction | None:
         """Complete a turn action in-place (§21)."""
         act = self.current_turn_actions.complete_action(
@@ -657,6 +896,9 @@ class AutonomousDeliveryState:
             duration_seconds=duration_seconds,
             error=error,
             tool_name=tool_name,
+            output=output,
+            diff=diff,
+            code=code,
         )
         if self.messages and self.messages[-1].role == "assistant":
             if self.messages[-1].actions is None:
@@ -938,7 +1180,22 @@ class AutonomousDeliveryState:
                 except Exception:
                     pass
 
+            default_titles = {
+                "Architecture & Orchestration",
+                "Backend API & Services",
+                "Frontend Client & Views",
+                "Q/A Verification Suite",
+                "GitOps Release & Hygiene",
+            }
+            is_dummy = bool(self.work_orders) and all(w.title in default_titles for w in self.work_orders)
+
             if not disk_statuses and not disk_orders:
+                if is_dummy:
+                    self.work_orders = []
+                    for r in self.roles.values():
+                        if r.work_order_id in {"WO-001", "WO-002", "WO-003", "WO-004", "WO-005"}:
+                            r.work_order_id = None
+                self.reconcile_roles_from_work_orders()
                 return
 
             # Compute effective statuses using dependencies and running operations
@@ -1039,9 +1296,15 @@ class AutonomousDeliveryState:
                 or (r_name.lower() in {"qa", "q/a"} and w.role.lower() in {"gemma", "qa", "q/a"})
                 or (r_name.lower() == "gitops" and w.role.lower() in {"local-llm", "gitops"})
             ]
-            if role_wos and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in role_wos):
+            if not self.work_orders and r_name.lower() not in running_roles:
+                if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                    r_obj.state = "WAITING"
+            elif role_wos and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in role_wos):
                 if r_name.lower() not in running_roles and r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
                     r_obj.state = "COMPLETED"
+            elif role_wos and not any(w.status.upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS"} for w in role_wos):
+                if r_name.lower() not in running_roles and r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                    r_obj.state = "WAITING"
 
     def get_agent_hierarchy(self) -> list[dict[str, Any]]:
         """Return the dynamic agent hierarchy without hard-coding the agent roster (§7, §8).
@@ -1078,7 +1341,11 @@ class AutonomousDeliveryState:
                 children_objs = []
 
             if root_obj:
-                if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE or root_obj.state.upper() in {"COMPLETED", "DONE", "VERIFIED"}:
+                if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE:
+                    r_stat = "completed"
+                elif self.work_orders and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in self.work_orders):
+                    r_stat = "completed"
+                elif root_obj.state.upper() in {"COMPLETED", "DONE", "VERIFIED"} and (self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE):
                     r_stat = "completed"
                 else:
                     r_stat = "orchestrating" if "arch" in root_obj.role.lower() else root_obj.display_state
@@ -1180,14 +1447,38 @@ class AutonomousDeliveryState:
                         normalized = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name
                         b_end = str(item.get("backend") or "Codex")
                         m_del = item.get("model")
+                        is_running_arch = (
+                            normalized.lower() == "architecture"
+                            and (bool(self.operations) or any(w.status == "RUNNING" for w in self.work_orders))
+                        )
                         new_roles[normalized] = RoleStatus(
                             role=normalized,
                             backend=b_end,
                             model=m_del,
-                            state="RUNNING" if normalized.lower() == "architecture" else "WAITING",
+                            state="RUNNING" if is_running_arch else "WAITING",
                         )
                     if new_roles:
                         self.roles = new_roles
+            except Exception:
+                pass
+
+            # Sync / enrich roles from settings on disk if available
+            try:
+                from validators.kernel.settings import find_settings_file, load_settings
+                ws = workspace or getattr(self, "workspace", None)
+                if find_settings_file(ws):
+                    s = load_settings(ws)
+                    if hasattr(s, "govern_verbosity") and s.govern_verbosity:
+                        self.govern_verbosity = s.govern_verbosity
+                        if hasattr(self, "current_turn_actions") and self.current_turn_actions:
+                            self.current_turn_actions.verbosity = self.govern_verbosity
+                    for r_name, r_cfg in s.roles.items():
+                        r_title = "Q/A" if r_name.upper() in {"QA", "Q/A"} else r_name.title()
+                        if r_title in self.roles:
+                            if r_cfg.get("provider"):
+                                self.roles[r_title].backend = r_cfg["provider"]
+                            if r_cfg.get("model"):
+                                self.roles[r_title].model = r_cfg["model"]
             except Exception:
                 pass
 
@@ -1241,6 +1532,20 @@ class AutonomousDeliveryState:
                             self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
             except Exception:
                 pass
+
+        default_titles = {
+            "Architecture & Orchestration",
+            "Backend API & Services",
+            "Frontend Client & Views",
+            "Q/A Verification Suite",
+            "GitOps Release & Hygiene",
+        }
+        if self.work_orders and all(w.title in default_titles for w in self.work_orders):
+            self.work_orders = []
+            for r in self.roles.values():
+                if r.work_order_id in {"WO-001", "WO-002", "WO-003", "WO-004", "WO-005"}:
+                    r.work_order_id = None
+        self.reconcile_roles_from_work_orders()
 
     def _infer_role_from_op(self, op_name: str) -> str:
         low = op_name.lower()
@@ -1375,6 +1680,10 @@ class AutonomousDeliveryState:
 
         elif name in {"operation.completed", "turn.completed"}:
             self.current_turn_actions.complete_all()
+            self.current_turn_actions.expanded = True
+            self.active_tool_name = None
+            self.active_tool_target = None
+            self.active_tool_code = None
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -1389,7 +1698,13 @@ class AutonomousDeliveryState:
                         op.status = "COMPLETED"
 
             if normalized_role in self.roles:
-                self.roles[normalized_role].state = "COMPLETED"
+                if normalized_role.lower() in {"architecture", "lead"}:
+                    if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE:
+                        self.roles[normalized_role].state = "COMPLETED"
+                    else:
+                        self.roles[normalized_role].state = "RUNNING"
+                else:
+                    self.roles[normalized_role].state = "COMPLETED"
             if wo_id:
                 for wo in self.work_orders:
                     if wo.id == wo_id:
@@ -1469,40 +1784,117 @@ class AutonomousDeliveryState:
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")
-            role = (payload.get("role") or "Backend").title()
-            target = payload.get("path") or payload.get("file") or payload.get("command") or payload.get("symbol") or ""
+            raw_role = payload.get("role") or payload.get("agent_id") or "Backend"
+            role = "QA" if str(raw_role).lower() == "qa" else str(raw_role).title()
+            target = (
+                payload.get("path")
+                or payload.get("file")
+                or payload.get("test_path")
+                or payload.get("test_name")
+                or payload.get("selector")
+                or payload.get("command")
+                or payload.get("target")
+                or payload.get("directory")
+                or payload.get("dir_path")
+                or payload.get("name")
+                or payload.get("symbol")
+                or ""
+            )
             self.add_activity(role, tool_name, str(target))
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.current_turn_actions.actions) + 1}")
-            from cli.tui.events import format_action_description
-            desc = format_action_description(tool_name, str(target))
-            self.current_turn_actions.expanded = True
-            self.record_turn_action(call_id, desc, status="RUNNING")
+            op_id = str(payload.get("operation_id") or "")
+            parent_id = op_id if (op_id and call_id != op_id) else None
+            from cli.tui.events import format_action_description, extract_tool_diff
+            desc = format_action_description(tool_name, str(target), role=role if role != "Agent" else "")
+            tool_code = None
+            tool_diff = None
+            if tool_name in {"write_file", "write", "create_file", "create"}:
+                tool_code = str(payload.get("content") or payload.get("code") or "")
+            elif tool_name in {"edit_file", "edit", "patch", "apply_patch"}:
+                tool_diff = extract_tool_diff(payload, payload)
+                if not tool_diff:
+                    tool_code = str(payload.get("content") or payload.get("code") or "")
+            self.record_turn_action(
+                call_id, desc, status="RUNNING",
+                tool_name=tool_name, target=str(target),
+                code=tool_code, diff=tool_diff,
+                parent_id=parent_id,
+            )
+            self.active_tool_name = tool_name
+            self.active_tool_target = str(target)
+            self.active_tool_code = tool_code
+            self.active_tool_diff = tool_diff
 
         elif name == "event.toolCall":
             tool_name = payload.get("tool_name", "tool")
-            role = (payload.get("role") or "Agent").title()
+            raw_role = payload.get("role") or payload.get("agent_id") or "Agent"
+            role = "QA" if str(raw_role).lower() == "qa" else str(raw_role).title()
             args_raw = payload.get("arguments")
             args = args_raw if isinstance(args_raw, Mapping) else {}
-            target = args.get("path") or args.get("file") or args.get("command") or args.get("target") or ""
+            target = (
+                args.get("path")
+                or args.get("file")
+                or args.get("test_path")
+                or args.get("test_name")
+                or args.get("selector")
+                or args.get("command")
+                or args.get("target")
+                or args.get("directory")
+                or args.get("dir_path")
+                or args.get("name")
+                or payload.get("target")
+                or ""
+            )
             self.add_activity(role, tool_name, str(target))
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.current_turn_actions.actions) + 1}")
-            from cli.tui.events import format_action_description
-            desc = format_action_description(tool_name, str(target))
-            self.current_turn_actions.expanded = True
-            self.record_turn_action(call_id, desc, status="RUNNING")
+            op_id = str(payload.get("operation_id") or "")
+            parent_id = op_id if (op_id and call_id != op_id) else None
+            from cli.tui.events import format_action_description, extract_tool_diff
+            desc = format_action_description(tool_name, str(target), role=role if role != "Agent" else "")
+            tool_code = None
+            tool_diff = None
+            if tool_name in {"write_file", "write", "create_file", "create"}:
+                tool_code = str(args.get("content") or args.get("code") or "")
+            elif tool_name in {"edit_file", "edit", "patch", "apply_patch"}:
+                tool_diff = extract_tool_diff(payload, args)
+                if not tool_diff:
+                    tool_code = str(args.get("content") or args.get("code") or "")
+            self.record_turn_action(
+                call_id, desc, status="RUNNING",
+                tool_name=tool_name, target=str(target),
+                code=tool_code, diff=tool_diff,
+                parent_id=parent_id,
+            )
+            self.active_tool_name = tool_name
+            self.active_tool_target = str(target)
+            self.active_tool_code = tool_code
+            self.active_tool_diff = tool_diff
 
-        elif name == "event.toolResult":
-            tool_name = payload.get("tool_name", "tool")
+        elif name in {"event.toolResult", "tool.result"} or name.startswith("tool_result."):
+            tool_name = payload.get("tool_name") or payload.get("tool") or "tool"
             role = (payload.get("role") or "Agent").title()
             status = payload.get("status", "completed")
-            from cli.tui.events import clean_error_message, normalize_status
+            from cli.tui.events import clean_error_message, normalize_status, extract_tool_output, extract_tool_diff
             norm_status = normalize_status(status)
             self.add_activity(role, f"{tool_name} ({norm_status.lower()})", "")
             call_id = str(payload.get("call_id") or payload.get("operation_id") or "")
             err = clean_error_message(payload.get("error")) if payload.get("error") else None
-            if norm_status in {"FAILED", "BLOCKED"}:
-                self.current_turn_actions.expanded = True
-            self.complete_turn_action(call_id, status=norm_status, error=err, tool_name=tool_name)
+            tool_output = extract_tool_output(payload)
+            tool_diff = extract_tool_diff(payload)
+            self.complete_turn_action(
+                call_id, status=norm_status, error=err,
+                tool_name=tool_name, output=tool_output, diff=tool_diff,
+            )
+            self.last_tool_name = self.active_tool_name or tool_name
+            self.last_tool_target = self.active_tool_target
+            self.last_tool_code = self.active_tool_code
+            self.last_tool_diff = tool_diff or getattr(self, "active_tool_diff", None)
+            self.last_tool_output = tool_output
+            self.last_tool_status = norm_status
+            self.active_tool_name = None
+            self.active_tool_target = None
+            self.active_tool_code = None
+            self.active_tool_diff = None
 
         elif name in {"cycle.telemetry", "harness.telemetry"}:
             telem = payload.get("telemetry") or payload

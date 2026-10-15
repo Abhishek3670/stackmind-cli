@@ -30,6 +30,7 @@ from typing import Any
 import click
 
 from cli.daemon import DEFAULT_DAEMON_PORT, clear_daemon_pid, daemon_health, write_daemon_pid
+from cli.tui.chat import clear_transcript_cache
 from cli.tui.commands import (
     _build_in_progress_turn_content,
     _compute_blocker,
@@ -47,6 +48,7 @@ from cli.tui.events import recover_transcript_from_events
 from cli.tui.keyboard import raw_prompt_input
 from cli.tui.landing import render_landing_block_str
 from cli.tui.layout import (
+    compute_composer_cursor_row,
     compute_layout,
     compute_viewport_height,
     render_workspace_layout_str,
@@ -344,7 +346,9 @@ def tui(
                 workspace=str(workspace.resolve()),
             )
         state = AutonomousDeliveryState(
-            project_name=workspace.resolve().name, session_id=session["session_id"]
+            project_name=workspace.resolve().name,
+            session_id=session["session_id"],
+            work_orders=[],
         )
         state.client_timeout = client_timeout
         state.update_from_session(session)
@@ -387,8 +391,9 @@ def tui(
                 session, state, clear=True, include_composer=True, composer_is_active=True
             )
             current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+            c_row = compute_composer_cursor_row(current_lines, state=state)
             # WO-022: fixed column — layout is flush at column 0 across all tiers.
-            sys.stdout.write(f"\x1b[{current_lines - 2};5H")
+            sys.stdout.write(f"\x1b[{c_row};5H")
             sys.stdout.flush()
         else:
             term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
@@ -433,8 +438,21 @@ def tui(
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
                 if resized:
                     current_cols, current_lines = new_cols, new_lines
+                    clear_transcript_cache()
                     if live_ws is not None and getattr(live_ws, "is_active", False):
                         live_ws.handle_resize(new_cols, new_lines)
+                    elif is_tty:
+                        redraw_full_screen(
+                            session,
+                            state,
+                            width=new_cols,
+                            height=new_lines,
+                            clear=True,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=getattr(state, "composer_buffer", ""),
+                            live_manager=live_ws,
+                        )
                 term_cols = current_cols
                 layout_info = compute_layout(term_cols)
                 conv_width = (
@@ -474,7 +492,14 @@ def tui(
                             live_manager=live_ws,
                         )
                         cursor_col = _compute_cursor_col(editor)
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
                     else:
                         click.echo(
@@ -501,7 +526,7 @@ def tui(
                                     state=state,
                                     scroll=state.scroll,
                                     conversation_scroll=state.conversation_scroll,
-                                    height=compute_viewport_height(term_lines),
+                                    height=compute_viewport_height(term_lines, state=state),
                                 )
                             )
                         else:
@@ -515,10 +540,45 @@ def tui(
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
+                def _handle_ctrl_o(editor: Any = None) -> None:
+                    """Toggle thinking block expansion."""
+                    state.toggle_thinking()
+                    if is_tty:
+                        current_text = (
+                            "".join(editor.buffer)
+                            if (
+                                editor is not None
+                                and isinstance(getattr(editor, "buffer", None), list)
+                            )
+                            else None
+                        )
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=False,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=current_text,
+                            live_manager=live_ws,
+                        )
+                        cursor_col = _compute_cursor_col(editor)
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
+
                 def _handle_page_up(editor: Any = None) -> None:
                     """Scroll conversation viewport up by half a page."""
                     term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_height = compute_viewport_height(term_lines)
+                    vp_height = compute_viewport_height(term_lines, state=state)
                     state.scroll_conversation_up(max(1, vp_height // 2))
                     if is_tty:
                         current_text = (
@@ -539,7 +599,14 @@ def tui(
                             live_manager=live_ws,
                         )
                         cursor_col = _compute_cursor_col(editor)
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -547,7 +614,7 @@ def tui(
                 def _handle_page_down(editor: Any = None) -> None:
                     """Scroll conversation viewport down by half a page."""
                     term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_height = compute_viewport_height(term_lines)
+                    vp_height = compute_viewport_height(term_lines, state=state)
                     state.scroll_conversation_down(max(1, vp_height // 2))
                     if is_tty:
                         current_text = (
@@ -568,7 +635,14 @@ def tui(
                             live_manager=live_ws,
                         )
                         cursor_col = _compute_cursor_col(editor)
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -596,7 +670,14 @@ def tui(
                             live_manager=live_ws,
                         )
                         cursor_col = _compute_cursor_col(editor)
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
@@ -624,13 +705,116 @@ def tui(
                             live_manager=live_ws,
                         )
                         cursor_col = _compute_cursor_col(editor)
-                        sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
+                def _handle_height_change(editor: Any = None) -> None:
+                    """Dynamically redraw full screen when composer content height changes."""
+                    if not is_tty:
+                        return
+                    current_text = (
+                        "".join(editor.buffer)
+                        if (
+                            editor is not None
+                            and isinstance(getattr(editor, "buffer", None), list)
+                        )
+                        else None
+                    )
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    redraw_full_screen(
+                        session,
+                        state,
+                        clear=False,
+                        include_composer=True,
+                        composer_is_active=True,
+                        composer_content=current_text,
+                        live_manager=live_ws,
+                    )
+                    cursor_col = _compute_cursor_col(editor)
+                    cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                    c_row = compute_composer_cursor_row(
+                        term_lines,
+                        state=state,
+                        composer_content=current_text,
+                        cursor_line=cursor_line,
+                    )
+                    sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                    sys.stdout.flush()
+
+                def _handle_resize(new_cols: int, new_lines: int, editor: Any = None) -> None:
+                    nonlocal current_cols, current_lines, term_cols, comp_width, layout_info
+                    current_cols, current_lines = new_cols, new_lines
+                    term_cols = new_cols
+                    layout_info = compute_layout(new_cols)
+                    conv_width = (
+                        layout_info.conversation_width if layout_info.show_runtime else new_cols
+                    )
+                    comp_width = conv_width if layout_info.show_runtime else new_cols
+
+                    clear_transcript_cache()
+                    if editor is not None:
+                        editor.width = comp_width
+
+                    if live_ws is not None and getattr(live_ws, "is_active", False):
+                        try:
+                            live_ws.handle_resize(new_cols, new_lines)
+                        except Exception:
+                            pass
+
+                    if is_tty:
+                        current_text = (
+                            "".join(editor.buffer)
+                            if (
+                                editor is not None
+                                and isinstance(getattr(editor, "buffer", None), list)
+                            )
+                            else getattr(state, "composer_buffer", "")
+                        )
+                        redraw_full_screen(
+                            session,
+                            state,
+                            width=new_cols,
+                            height=new_lines,
+                            clear=True,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=current_text,
+                            live_manager=live_ws,
+                        )
+                        cursor_col = _compute_cursor_col(editor) if editor else 5
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            new_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        try:
+                            editor.redraw_line()
+                        except Exception:
+                            pass
+
                 def _handle_idle(editor: Any = None) -> None:
-                    if not is_tty or client is None:
+                    if not is_tty:
+                        return
+                    term_size = shutil.get_terminal_size(fallback=(80, 24))
+                    if (term_size.columns, term_size.lines) != (current_cols, current_lines):
+                        _handle_resize(term_size.columns, term_size.lines, editor)
+                        return
+                    if client is None:
                         return
                     sid = session.get("session_id")
                     if not sid:
@@ -674,7 +858,14 @@ def tui(
                                 live_manager=live_ws,
                             )
                             cursor_col = _compute_cursor_col(editor)
-                            sys.stdout.write(f"\x1b[{term_lines - 2};{cursor_col}H")
+                            cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                            c_row = compute_composer_cursor_row(
+                                term_lines,
+                                state=state,
+                                composer_content=current_text,
+                                cursor_line=cursor_line,
+                            )
+                            sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                             sys.stdout.flush()
                             if editor is not None and hasattr(editor, "redraw_line"):
                                 editor.redraw_line()
@@ -688,12 +879,15 @@ def tui(
                     session=session,
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
+                    on_ctrl_o=_handle_ctrl_o,
                     on_page_up=_handle_page_up,
                     on_page_down=_handle_page_down,
                     on_wheel_up=_handle_wheel_up,
                     on_wheel_down=_handle_wheel_down,
+                    on_height_change=_handle_height_change,
                     on_idle=_handle_idle,
-                    show_footer=False if is_tty else not getattr(state, "has_conversation", False),
+                    on_resize=_handle_resize,
+                    show_footer=True,
                     live_manager=live_ws,
                     full_screen=is_tty,
                 )
@@ -730,7 +924,8 @@ def tui(
                     live_manager=live_ws,
                 )
                 current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                sys.stdout.write(f"\x1b[{current_lines - 2};5H")
+                c_row = compute_composer_cursor_row(current_lines, state=state)
+                sys.stdout.write(f"\x1b[{c_row};5H")
                 sys.stdout.flush()
     finally:
         disable_mouse_reporting()

@@ -387,3 +387,132 @@ def test_canonical_blocker_text_cleans_raw_errors():
     assert "Rate limit exceeded (HTTP 429)" in cleaned
     assert "{" not in cleaned
 
+
+def test_split_diff_side_by_side_alignment_and_padding():
+    """Verify unified diff with modified lines renders side-by-side with equal columns and paired line numbers."""
+    from rich.cells import cell_len
+    from cli.tui.diff import parse_unified_diff_to_split_rows, render_split_diff, render_split_diff_str
+
+    diff_sample = """--- a/src/components/App.tsx
++++ b/src/components/App.tsx
+@@ -82,3 +82,3 @@
+ context line 81
+-    tabIndex={3}
++    tabIndex={4}
+ context line 83
+"""
+    # 1. Parser verification
+    rows = parse_unified_diff_to_split_rows(diff_sample)
+    assert len(rows) == 3
+    # First row is context 82
+    assert rows[0].left.line_no == 82
+    assert rows[0].right.line_no == 82
+    assert rows[0].left.kind == "ctx"
+    # Second row is modified line (paired on exact same row)
+    assert rows[1].left.line_no == 83
+    assert rows[1].left.sign == "-"
+    assert rows[1].right.line_no == 83
+    assert rows[1].right.sign == "+"
+
+    # 2. Side-by-side rendering (width >= 90)
+    rendered = render_split_diff_str(diff_sample, avail_width=100)
+    assert "83 -" in rendered
+    assert "83 +" in rendered
+
+    # Modified line has both old line 83 - and new line 83 + on the exact same row
+    lines = rendered.splitlines()
+    mod_lines = [l for l in lines if "83 -" in l]
+    assert len(mod_lines) == 1
+    assert "83 +" in mod_lines[0]
+
+    # Strict padding: every line visible width must be <= avail_width
+    for l in lines:
+        assert cell_len(l) <= 100
+
+    # Rich renderable contract
+    rich_obj = render_split_diff(diff_sample, avail_width=100)
+    assert hasattr(rich_obj, "__rich__")
+    assert isinstance(rich_obj, str)
+
+
+def test_split_diff_narrow_fallback():
+    """Verify diff cleanly falls back to single-column mode without horizontal overflow when width < 90."""
+    from rich.cells import cell_len
+    from cli.tui.diff import render_split_diff_str
+
+    diff_sample = """--- a/src/components/App.tsx
++++ b/src/components/App.tsx
+@@ -82,3 +82,3 @@
+ context line 81
+-    tabIndex={3}
++    tabIndex={4}
+ context line 83
+"""
+    # Fallback mode for narrow terminals
+    rendered_narrow = render_split_diff_str(diff_sample, avail_width=75)
+    lines_narrow = rendered_narrow.splitlines()
+
+    # Deletions and additions are separate rows in single-column mode
+    assert any("83" in l and "-" in l for l in lines_narrow)
+    assert any("83" in l and "+" in l for l in lines_narrow)
+    del_row = [l for l in lines_narrow if "83" in l and "-" in l][0]
+    add_row = [l for l in lines_narrow if "83" in l and "+" in l][0]
+    assert del_row != add_row
+
+    # Every row strictly fits within avail_width
+    for l in lines_narrow:
+        assert cell_len(l) <= 75
+
+
+def test_edit_tool_renders_inline_split_diff_in_chat():
+    """Verify Edit tool actions render the split diff block in the chat stream and resize cleanly."""
+    from rich.cells import cell_len
+    from cli.tui.chat import render_actions_group_str, render_chat_transcript_str
+    from cli.tui.state import ActionsGroup, TurnAction
+
+    diff_sample = """--- a/src/components/App.tsx
++++ b/src/components/App.tsx
+@@ -82,3 +82,3 @@
+ context line 81
+-    tabIndex={3}
++    tabIndex={4}
+ context line 83
+"""
+    action = TurnAction(
+        action_id="act-edit-1",
+        description="Edit (src/components/App.tsx)",
+        tool_name="edit_file",
+        target="src/components/App.tsx",
+        status="COMPLETED",
+        diff=diff_sample,
+    )
+    group = ActionsGroup(actions=[action])
+
+    # 1. Wide view: side-by-side mode in actions group
+    rendered_wide = render_actions_group_str(group, width=100)
+    assert "● Edit(src/components/App.tsx)" in rendered_wide
+    assert "83 -" in rendered_wide
+    assert "83 +" in rendered_wide
+    for l in rendered_wide.splitlines():
+        assert cell_len(l) <= 100
+
+    # 2. Narrow view: single-column fallback
+    rendered_narrow = render_actions_group_str(group, width=70)
+    assert "● Edit(src/components/App.tsx)" in rendered_narrow
+    assert "83" in rendered_narrow
+    for l in rendered_narrow.splitlines():
+        assert cell_len(l) <= 70
+
+    # 3. Full transcript integration
+    msg = ChatMessage(
+        role="assistant",
+        content="Updated tab index.",
+        actions=group,
+    )
+    transcript_wide = render_chat_transcript_str([msg], width=110)
+    assert "● Edit(src/components/App.tsx)" in transcript_wide
+    assert "83 -" in transcript_wide
+    assert "83 +" in transcript_wide
+    for l in transcript_wide.splitlines():
+        assert cell_len(l) <= 110
+

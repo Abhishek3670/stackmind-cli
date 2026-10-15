@@ -58,7 +58,7 @@ def normalize_status(raw_status: str | None) -> str:
 
 
 def clean_error_message(err: Any) -> str:
-    """Extract a concise human-readable error string avoiding raw dicts or traces."""
+    """Extract a concise human-readable error string avoiding raw dicts or traces, stripping internal LLM prompts."""
     if not err:
         return ""
     if isinstance(err, Mapping):
@@ -70,7 +70,7 @@ def clean_error_message(err: Any) -> str:
                     return cleaned
         for val in err.values():
             if isinstance(val, str) and val.strip() and val.strip().lower() not in {"failed", "blocked", "error"}:
-                return val.strip()
+                return clean_error_message(val)
         return "Operation failed"
 
     msg = str(err).strip()
@@ -85,11 +85,44 @@ def clean_error_message(err: Any) -> str:
     if "Traceback (most recent call last):" in msg:
         lines = [line.strip() for line in msg.splitlines() if line.strip()]
         if lines:
-            return lines[-1]
+            msg = lines[-1]
+
+    # Strip LLM prompt instructions (e.g. CRITICAL: Do NOT retry...)
+    import re
+    if re.search(r"\bCRITICAL\s*:", msg, flags=re.IGNORECASE):
+        msg = re.split(r"\bCRITICAL\s*:", msg, flags=re.IGNORECASE)[0].strip()
+
+    # Normalize runtime policy / scope / contract permission denials
+    lower_msg = msg.lower()
+    if (
+        "denied by runtime policy" in lower_msg
+        or "target is explicitly denied" in lower_msg
+        or "outside assigned scope" in lower_msg
+        or ("permissionerror" in lower_msg and "denied" in lower_msg)
+    ):
+        return "Permission denied (outside assigned scope)"
+
+    # Strip verbose file lists from FileNotFoundError / ModuleNotFoundError
+    for cut_marker in ("Existing workspace files:", "Available workspace files:", "Available files:"):
+        if cut_marker in msg:
+            msg = msg[: msg.index(cut_marker)].rstrip(" .")
+            break
+
+    # Strip after first sentence boundary in *Error messages to avoid leaking implementation details
+    if re.match(r"^\w*Error:", msg):
+        sent_match = re.search(r"(?<=\.)\s", msg)
+        if sent_match:
+            msg = msg[: sent_match.start()].rstrip()
+
+    # Hard-cap inline error to 60 chars max
+    if len(msg) > 60:
+        msg = msg[:57] + "..."
+
     return msg
 
 
-def format_tool_name(tool_name: str) -> str:
+
+def format_tool_name(tool_name: str, role: str = "") -> str:
     """Clean up and format tool name for terminal presentation."""
     cleaned = (
         tool_name.replace("tool_call.", "")
@@ -99,6 +132,15 @@ def format_tool_name(tool_name: str) -> str:
         .strip()
     )
     lower = cleaned.lower()
+    if "graph" in lower:
+        return "Graphing"
+    if "harness" in lower:
+        if role:
+            cased = "QA" if role.lower() == "qa" else (role.title() if role.islower() else role)
+            return f"Agent ({cased})"
+        if "run_once" in tool_name.lower() or "run once" in lower or lower == "harness":
+            return "Agent"
+        return "Harnessing"
     if lower in {"read", "read file", "read_file"}:
         return "Read file"
     if lower in {"edit", "edit file", "edit_file"}:
@@ -109,12 +151,12 @@ def format_tool_name(tool_name: str) -> str:
         return "Create file"
     if lower in {"test", "run test", "run tests"}:
         return "Run tests"
-    if "harness" in lower:
-        return "Run harness"
+    if lower in {"exec command", "exec_command", "run command", "run_command", "bash", "sh", "command", "execute"}:
+        return "Execute"
     return cleaned.title()
 
 
-def format_action_description(tool_name: str, target: str = "") -> str:
+def format_action_description(tool_name: str, target: str = "", role: str = "") -> str:
     """Format an action description string for disclosure display per §19-§21."""
     cleaned_tool = (
         tool_name.replace("tool_call.", "")
@@ -122,24 +164,36 @@ def format_action_description(tool_name: str, target: str = "") -> str:
         .replace("event.", "")
         .strip()
     )
-    t = target.strip()
+    t = str(target).strip()
+    if t.startswith("(") and t.endswith(")"):
+        t = t[1:-1].strip()
     lower = cleaned_tool.lower()
-    if lower in {"read", "read_file", "read file"}:
-        return f"Read {t}".strip() if t else "Read file"
-    if lower in {"edit", "edit_file", "edit file"}:
-        return f"Edit {t}".strip() if t else "Edit file"
-    if lower in {"write", "write_file", "write file"}:
-        return f"Write {t}".strip() if t else "Write file"
-    if lower in {"create", "create_file", "create file"}:
-        return f"Create {t}".strip() if t else "Create file"
-    if lower in {"test", "run_tests", "run_test", "run tests"}:
-        return f"Run tests {t}".strip() if t else "Run tests"
+    if "graph" in lower:
+        return f"Graphing ({t})" if t else "Graphing"
     if "harness" in lower:
-        return f"Run harness {t}".strip() if t and t != "long_running_task" else "Run harness"
+        agent_name = (role or (t if t and t != "long_running_task" else "")).strip()
+        if agent_name:
+            cased = "QA" if agent_name.lower() == "qa" else (agent_name.title() if agent_name.islower() else agent_name)
+            return f"Agent ({cased})"
+        if "run_once" in tool_name.lower() or "run once" in lower or lower == "harness":
+            return "Agent"
+        return "Harnessing"
+    if lower in {"test", "run_tests", "run_test", "run tests"}:
+        return f"Test ({t})" if t else "Test"
+    if lower in {"read", "read_file", "read file", "view_file"}:
+        return f"Read ({t})" if t else "Read"
+    if lower in {"edit", "edit_file", "edit file", "patch"}:
+        return f"Edit ({t})" if t else "Edit"
+    if lower in {"write", "write_file", "write file", "create", "create_file", "create file"}:
+        return f"Write ({t})" if t else "Write"
+    if lower in {"exec_command", "run_command", "bash", "sh", "command", "execute"}:
+        return f"Execute ({t})" if t else "Execute"
+    if lower in {"list_dir", "list_directory", "ls"}:
+        return f"List ({t})" if t else "List"
     if "verify" in lower:
-        return f"Verify {t}".strip() if t else "Verify changes"
+        return f"Verify ({t})" if t else "Verify"
     base = cleaned_tool.replace("_", " ").title()
-    return f"{base} {t}".strip() if t else base
+    return f"{base} ({t})" if t else base
 
 
 @dataclass
@@ -269,6 +323,18 @@ def render_operational_event(event: Mapping[str, Any]) -> RenderableType | None:
         "contract.loaded",
         "operation.requested",
         "operation.authorized",
+        "reasoning.delta",
+        "token.delta",
+        "stream.delta",
+        "content.delta",
+        "message.delta",
+        "text.delta",
+        "turn.delta",
+        "assistant.delta",
+        "agent.thinking",
+        "turn.thinking",
+        "cycle.telemetry",
+        "harness.telemetry",
     }:
         return None
 
@@ -449,12 +515,19 @@ def extract_assistant_response(
 
         mods = result.get("modified_files")
         if isinstance(mods, list) and mods:
-            files_str = ", ".join(f"`{f}`" for f in mods)
-            if any("PLAN.md" in str(f) for f in mods):
+            user_mods = [f for f in mods if not str(f).startswith((".sync", ".sync/"))]
+            if user_mods:
+                files_str = ", ".join(f"`{f}`" for f in user_mods)
+                if any("PLAN.md" in str(f) for f in user_mods):
+                    return clean_response(
+                        f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                    )
+                return clean_response(f"Completed turn. Modified files: {files_str}.")
+            elif any("PLAN.md" in str(f) for f in mods):
                 return clean_response(
-                    f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                    "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
                 )
-            return clean_response(f"Completed turn. Modified files: {files_str}.")
+            return clean_response("Completed turn.")
 
         blockers = result.get("blockers")
         if isinstance(blockers, list) and blockers:
@@ -528,12 +601,87 @@ def extract_reasoning_delta(event: Mapping[str, Any] | Any) -> str | None:
     payload = event.get("payload")
     if not isinstance(payload, Mapping):
         payload = {}
-    if name == "reasoning.delta":
+    if name in {"reasoning.delta", "agent.thinking", "turn.thinking"}:
         for key in ("text", "reasoning", "thinking", "delta"):
             val = payload.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
     return None
+
+
+def extract_tool_output(payload: Mapping[str, Any] | Any) -> str | None:
+    """Extract terminal stdout, output, or execution error from toolResult payload."""
+    if not isinstance(payload, Mapping):
+        return None
+    res = payload.get("result")
+    if isinstance(res, str) and res.strip():
+        return res.strip()
+    if isinstance(res, Mapping):
+        for k in ("output", "stdout", "result", "response", "message", "text", "stderr"):
+            v = res.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        if "error" in res and res["error"]:
+            return str(res["error"]).strip()
+    for k in ("output", "stdout", "stderr", "error", "response"):
+        v = payload.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def extract_action_target(args: Mapping[str, Any] | None) -> str:
+    """Extract primary target path, command, or selector from tool arguments."""
+    if not isinstance(args, Mapping):
+        return ""
+    for k in ("path", "file", "test_path", "test_name", "selector", "command", "target", "directory", "dir_path", "name"):
+        v = args.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def extract_tool_diff(payload: Mapping[str, Any] | Any, args: Mapping[str, Any] | None = None) -> str | None:
+    """Extract unified diff text or synthetic diff summary from edit tool call or result."""
+    if isinstance(payload, Mapping):
+        res = payload.get("result")
+        if isinstance(res, str) and ("--- " in res or "@@" in res or res.startswith("diff ")):
+            return res.strip()
+        if isinstance(res, Mapping):
+            for k in ("diff", "patch", "unified_diff"):
+                v = res.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            summary = res.get("diffSummary")
+            if isinstance(summary, Mapping):
+                f = summary.get("file", "file")
+                adds = summary.get("additions", 0)
+                dels = summary.get("deletions", 0)
+                return f"--- a/{f}\n+++ b/{f}\n@@ -1,{dels} +1,{adds} @@\n- ({dels} deletions)\n+ ({adds} additions)"
+        for k in ("diff", "patch", "unified_diff"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+    if args and isinstance(args, Mapping):
+        for k in ("diff", "patch", "unified_diff"):
+            v = args.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        old_str = args.get("target_content") or args.get("old_str") or args.get("old_string") or args.get("find")
+        new_str = args.get("replacement") or args.get("replacement_content") or args.get("new_str") or args.get("new_string") or args.get("replace")
+        target_f = extract_action_target(args) or "file"
+        if old_str is not None or new_str is not None:
+            lines = [f"--- a/{target_f}", f"+++ b/{target_f}"]
+            if old_str:
+                for l in str(old_str).splitlines()[:6]:
+                    lines.append(f"- {l}")
+            if new_str:
+                for l in str(new_str).splitlines()[:6]:
+                    lines.append(f"+ {l}")
+            return "\n".join(lines)
+    return None
+
 
 
 
@@ -627,8 +775,8 @@ class OperationalEventManager:
         if name == "event.toolCall":
             call_id = str(payload.get("call_id") or payload.get("operation_id") or f"call-{len(self.tool_history)}")
             tool_name = str(payload.get("tool_name", "tool"))
-            args = payload.get("arguments", {})
-            target = str(args.get("path") or args.get("file") or args.get("command") or "")
+            args = payload.get("arguments", {}) if isinstance(payload.get("arguments"), Mapping) else {}
+            target = extract_action_target(args)
             start_t = time.time()
             self._tool_start_times[call_id] = start_t
             activity = ToolActivity(
@@ -641,8 +789,25 @@ class OperationalEventManager:
                 start_time=start_t,
             )
             self.active_tools[call_id] = activity
-            desc = format_action_description(tool_name, target)
-            self.current_actions.add_or_update(call_id, desc, status=ToolStatus.RUNNING)
+            role = str(payload.get("role") or payload.get("agent_id") or "").strip()
+            desc = format_action_description(tool_name, target, role=role)
+            tool_code = None
+            tool_diff = None
+            if tool_name in {"write_file", "write", "create_file", "create"}:
+                tool_code = str(args.get("content") or args.get("code") or "")
+            elif tool_name in {"edit_file", "edit", "patch", "apply_patch"}:
+                tool_diff = extract_tool_diff(payload, args)
+                if not tool_diff:
+                    tool_code = str(args.get("content") or args.get("code") or "")
+            self.current_actions.add_or_update(
+                call_id,
+                desc,
+                status=ToolStatus.RUNNING,
+                tool_name=tool_name,
+                target=target,
+                code=tool_code,
+                diff=tool_diff,
+            )
             return render_tool_activity(activity), None
 
         if name == "event.toolResult":
@@ -666,13 +831,16 @@ class OperationalEventManager:
                     error=clean_error_message(payload.get("error")) if payload.get("error") else None,
                 )
             self.tool_history.append(activity)
-            if status in {ToolStatus.FAILED, ToolStatus.BLOCKED}:
-                self.current_actions.expanded = True
+            tool_output = extract_tool_output(payload)
+            tool_diff = extract_tool_diff(payload)
             self.current_actions.complete_action(
                 call_id,
                 status=status,
                 duration_seconds=duration,
                 error=activity.error,
+                tool_name=activity.tool_name,
+                output=tool_output,
+                diff=tool_diff,
             )
 
             # Check if this toolResult yields an assistant response
@@ -864,6 +1032,8 @@ __all__ = [
     "clean_error_message",
     "extract_assistant_response",
     "extract_assistant_thinking",
+    "extract_tool_diff",
+    "extract_tool_output",
     "format_action_description",
     "format_tool_name",
     "is_connection_error",

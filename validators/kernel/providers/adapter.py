@@ -291,6 +291,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             finish_reason = first.get("finish_reason")
             delta = first.get("delta") or first.get("message") or {}
             delta_content = delta.get("content") or ""
+            delta_thinking = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or ""
             raw_tcs = delta.get("tool_calls") or []
             for tc in raw_tcs:
                 if not isinstance(tc, dict):
@@ -315,6 +316,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
 
         return StreamChunk(
             delta_content=delta_content,
+            delta_thinking=delta_thinking,
             delta_tool_calls=tuple(delta_tool_calls),
             finish_reason=finish_reason,
             usage=usage,

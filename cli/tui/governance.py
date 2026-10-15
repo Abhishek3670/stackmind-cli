@@ -47,9 +47,9 @@ def render_verification_matrix(
     }
 
     grid = Table.grid(expand=True, padding=(0, 1))
-    grid.add_column(ratio=2)
-    grid.add_column(ratio=3)
-    grid.add_column(justify="right", ratio=1)
+    grid.add_column(ratio=2, no_wrap=True, overflow="ellipsis")
+    grid.add_column(ratio=3, no_wrap=True, overflow="ellipsis")
+    grid.add_column(justify="right", ratio=1, no_wrap=True)
 
     all_pass = True
     for label, key, desc in VERIFICATION_DIMENSIONS:
@@ -289,7 +289,7 @@ def render_skills_panel(
 
     path = Path(project_path).resolve() if project_path else Path(".").resolve()
     store = SkillStore(path)
-    skills = store.list_skills()
+    skills = store.list_skills(include_global=False)
 
     if skill_filter:
         filt = skill_filter.strip().lower()
@@ -523,10 +523,10 @@ def render_projects_panel() -> Panel:
         return Panel(msg, title=title, title_align="left", box=box.ROUNDED, border_style="cyan", padding=(0, 1))
 
     table = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
-    table.add_column("Name", style="bold cyan")
-    table.add_column("Path", style="white")
-    table.add_column("Sync Runtime", style="green")
-    table.add_column("Last Accessed", style="dim")
+    table.add_column("Name", style="bold cyan", width=18, no_wrap=True, overflow="ellipsis")
+    table.add_column("Path", style="white", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("Sync Runtime", style="green", width=12, no_wrap=True)
+    table.add_column("Last Accessed", style="dim", width=18, no_wrap=True)
 
     for p in projects:
         sync_badge = "[+] .sync" if p.get("has_sync") else "no .sync"

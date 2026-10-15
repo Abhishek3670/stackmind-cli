@@ -8,16 +8,23 @@ from click.testing import CliRunner
 from cli.main import cli
 from validators.kernel.home import (
     STACKMIND_HOME_ENV,
+    copy_approved_plan_to_workspace,
     get_daemon_home_dir,
     get_global_settings_path,
     get_global_skills_dir,
     get_global_tmp_dir,
+    get_latest_plan_version,
     get_project_entry,
+    get_project_plan_path,
+    get_project_slug,
+    get_project_storage_dir,
     get_projects_registry_path,
     get_sessions_home_dir,
     get_stackmind_home,
+    list_project_plan_versions,
     list_registered_projects,
     register_project,
+    save_authoritative_plan,
     touch_project,
     unregister_project,
 )
@@ -46,37 +53,13 @@ def test_get_stackmind_home_creates_directories(monkeypatch, tmp_path: Path):
     assert get_sessions_home_dir() == home / "sessions"
 
 
-def test_legacy_settings_migration(monkeypatch, tmp_path: Path):
-    """Verify settings from legacy ~/.stackmind/ are copied to ~/.stackmindcli/."""
-    custom_home = tmp_path / ".stackmindcli"
-    fake_user_home = tmp_path / "user_home"
-    legacy_dir = fake_user_home / ".stackmind"
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    legacy_settings = legacy_dir / "settings.json"
-    legacy_settings.write_text('{"execution_profile": "high"}', encoding="utf-8")
-
-    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
-    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
-
-    home = get_stackmind_home()
-    target_settings = home / "settings.json"
-    assert target_settings.is_file()
-    assert json.loads(target_settings.read_text(encoding="utf-8")) == {"execution_profile": "high"}
-
-
-def test_find_settings_file_prioritizes_stackmindcli(monkeypatch, tmp_path: Path):
-    """Verify find_settings_file prefers ~/.stackmindcli/settings.json over legacy ~/.stackmind/."""
+def test_find_settings_file_global_fallback(monkeypatch, tmp_path: Path):
+    """Verify find_settings_file falls back to ~/.stackmindcli/settings.json when no workspace settings exist."""
     custom_home = tmp_path / ".stackmindcli"
     custom_home.mkdir(parents=True, exist_ok=True)
     cli_settings = custom_home / "settings.json"
     cli_settings.write_text('{"source": "stackmindcli"}', encoding="utf-8")
 
-    fake_user_home = tmp_path / "user_home"
-    legacy_dir = fake_user_home / ".stackmind"
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    (legacy_dir / "settings.json").write_text('{"source": "legacy"}', encoding="utf-8")
-
-    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
     monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
 
     # In an empty workspace without local settings
@@ -218,3 +201,116 @@ def test_cli_projects_commands(monkeypatch, tmp_path: Path):
     res_empty = runner.invoke(cli, ["projects", "list"])
     assert res_empty.exit_code == 0
     assert "No projects registered" in res_empty.output
+
+
+def test_auto_provision_global_settings_in_stackmindcli(monkeypatch, tmp_path: Path):
+    """Verify settings.json and setting.json are automatically provisioned in ~/.stackmindcli."""
+    custom_home = tmp_path / ".stackmindcli"
+    fake_user_home = tmp_path / "user_home"
+    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
+    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
+
+    # Before calling get_stackmind_home, directory has no settings
+    home = get_stackmind_home()
+
+    # Only ~/.stackmindcli has settings.json and setting.json
+    assert (home / "settings.json").is_file()
+    assert (home / "setting.json").is_file()
+    assert not (fake_user_home / ".stackmind").exists()
+
+    # Content is valid JSON
+    data = json.loads((home / "settings.json").read_text(encoding="utf-8"))
+    assert "providers" in data
+    assert "roles" in data
+
+
+def test_project_slug_generation():
+    """Verify deterministic filesystem-safe project slugging."""
+    slug_win = get_project_slug(r"W:\Aatish\Stuff\clean_tui_test")
+    assert slug_win == "W_Aatish_Stuff_clean_tui_test"
+
+    slug_posix = get_project_slug("/home/aatish/projects/my-app")
+    assert "home_aatish_projects_my-app" in slug_posix
+
+
+def test_authoritative_plan_versioning_and_divergence(monkeypatch, tmp_path: Path):
+    """Verify PLAN.v{N}.md versioning under ~/.stackmindcli/projects/<slug>/."""
+    custom_home = tmp_path / ".stackmindcli"
+    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
+
+    proj_dir = tmp_path / "my_project"
+    proj_dir.mkdir()
+
+    # 1. Initially no plan versions exist
+    assert get_latest_plan_version(proj_dir) == 0
+    assert get_project_plan_path(proj_dir) is None
+
+    # 2. Architect proposes first version (PLAN.v1.md)
+    p1_path, v1 = save_authoritative_plan(proj_dir, "# Plan V1: Initial Architecture")
+    assert v1 == 1
+    assert p1_path.name == "PLAN.v1.md"
+    assert p1_path.is_file()
+    assert get_latest_plan_version(proj_dir) == 1
+
+    # 3. Architect evolves / diverges plan to V2 (PLAN.v2.md)
+    p2_path, v2 = save_authoritative_plan(proj_dir, "# Plan V2: Refined Milestones")
+    assert v2 == 2
+    assert p2_path.name == "PLAN.v2.md"
+    assert get_latest_plan_version(proj_dir) == 2
+
+    # 4. List versions
+    versions = list_project_plan_versions(proj_dir)
+    assert len(versions) == 2
+    assert [v["version"] for v in versions] == [1, 2]
+
+    # 5. Retrieve specific vs latest version
+    assert get_project_plan_path(proj_dir, version=1) == p1_path
+    assert get_project_plan_path(proj_dir) == p2_path
+
+
+def test_copy_approved_plan_to_workspace(monkeypatch, tmp_path: Path):
+    """Verify approved PLAN.v{N}.md is copied to <workspace>/PLAN.md upon approval."""
+    custom_home = tmp_path / ".stackmindcli"
+    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
+
+    ws_dir = tmp_path / "workspace_app"
+    ws_dir.mkdir()
+
+    # Save v1 and v2
+    save_authoritative_plan(ws_dir, "# Plan V1 Content")
+    save_authoritative_plan(ws_dir, "# Plan V2 Content (Approved)")
+
+    # Copy latest (v2) to workspace
+    dest = copy_approved_plan_to_workspace(ws_dir)
+    assert dest == ws_dir / "PLAN.md"
+    assert dest.is_file()
+    assert dest.read_text(encoding="utf-8") == "# Plan V2 Content (Approved)"
+
+    # Copy specific older version (v1) to workspace
+    dest_v1 = copy_approved_plan_to_workspace(ws_dir, version=1)
+    assert dest_v1.read_text(encoding="utf-8") == "# Plan V1 Content"
+
+
+def test_init_seeds_plan_v1_and_schemas_in_sync(monkeypatch, tmp_path: Path):
+    """Verify stackmind init places schemas in .sync/schemas and seeds PLAN.v1.md."""
+    custom_home = tmp_path / ".stackmindcli"
+    monkeypatch.setenv(STACKMIND_HOME_ENV, str(custom_home))
+
+    target_proj = tmp_path / "init_project"
+    runner = CliRunner()
+    res = runner.invoke(cli, ["init", "--name", "TestApp", str(target_proj), "--no-git"])
+    assert res.exit_code == 0
+
+    # 1. Schemas must be in .sync/schemas and NOT in project root
+    assert (target_proj / ".sync" / "schemas").is_dir()
+    assert (target_proj / ".sync" / "schemas" / "contract.schema.json").is_file()
+    assert not (target_proj / "schemas").exists()
+
+    # 2. Staging PLAN.md exists in workspace root
+    assert (target_proj / "PLAN.md").is_file()
+
+    # 3. PLAN.v1.md seeded in ~/.stackmindcli/projects/<slug>/
+    slug = get_project_slug(target_proj)
+    storage_dir = custom_home / "projects" / slug
+    assert (storage_dir / "PLAN.v1.md").is_file()
+    assert "TestApp" in (storage_dir / "PLAN.v1.md").read_text(encoding="utf-8")

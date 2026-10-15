@@ -154,6 +154,7 @@ class StackMindSettings:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     roles: dict[str, dict[str, str]] = field(default_factory=dict)
     execution_profile: str = "medium"
+    govern_verbosity: str = "tree"
 
     @property
     def effective_profile(self) -> Any:
@@ -163,9 +164,13 @@ class StackMindSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "execution_profile": self.execution_profile,
+            "govern_verbosity": self.govern_verbosity,
             "providers": {k: v.to_dict() for k, v in self.providers.items()},
             "roles": self.roles,
         }
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> StackMindSettings:
@@ -177,6 +182,10 @@ class StackMindSettings:
         except ValueError:
             # Fallback gracefully to default for corrupted/invalid setting while logging
             profile_val = ExecutionProfile.MEDIUM.value
+
+        raw_verbosity = str(data.get("govern_verbosity") or "tree").lower().strip()
+        if raw_verbosity not in {"tree", "flat", "compact"}:
+            raw_verbosity = "tree"
 
         providers_data = data.get("providers") or {}
         providers: dict[str, ProviderConfig] = {}
@@ -208,7 +217,7 @@ class StackMindSettings:
                 mod = str(r_cfg.get("model", ""))
                 if mod:
                     r_cfg["model"] = sanitize_model_name(mod, prov)
-        return cls(providers=providers, roles=roles, execution_profile=profile_val)
+        return cls(providers=providers, roles=roles, execution_profile=profile_val, govern_verbosity=raw_verbosity)
 
 
 def get_default_settings() -> StackMindSettings:
@@ -316,9 +325,6 @@ def find_settings_file(workspace: Path | str | None = None) -> Path | None:
         ws / "setting.json",
         get_global_settings_path(),
         cli_home / "setting.json",
-        # Legacy fallback
-        Path.home() / ".stackmind" / "settings.json",
-        Path.home() / ".stackmind" / "setting.json",
     ]
     for p in candidate_paths:
         try:
@@ -385,7 +391,23 @@ def load_settings(workspace: Path | str | None = None) -> StackMindSettings:
 
 def save_settings(settings: StackMindSettings, workspace: Path | str | None = None) -> Path:
     """Save settings to disk in settings.json (and update any mirrored setting.json)."""
-    target = find_settings_file(workspace) or get_default_settings_path(workspace)
+    if workspace:
+        ws = Path(workspace).resolve()
+        target = None
+        for cand in [
+            ws / ".sync" / "settings.json",
+            ws / ".sync" / "setting.json",
+            ws / "settings.json",
+            ws / "setting.json",
+        ]:
+            if cand.is_file():
+                target = cand
+                break
+        if not target:
+            target = get_default_settings_path(workspace)
+    else:
+        target = find_settings_file(None) or get_default_settings_path(None)
+
     target.parent.mkdir(parents=True, exist_ok=True)
 
     data = settings.to_dict()
@@ -400,6 +422,14 @@ def save_settings(settings: StackMindSettings, workspace: Path | str | None = No
             root_json.write_text(text, encoding="utf-8")
         except Exception:
             pass
+
+    # Mirror setting.json alias in target directory
+    try:
+        alias = target.parent / "setting.json"
+        if alias != target:
+            alias.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
 
     return target
 

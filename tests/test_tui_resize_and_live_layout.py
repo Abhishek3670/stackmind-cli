@@ -445,3 +445,253 @@ def test_resize_preserves_conversation_scroll_without_geometry_drift():
     assert state.conversation_scroll.scroll_offset >= 0
 
 
+def test_dynamic_resize_120_70_140_cache_invalidation_and_panel_visibility():
+    """Verify resizing across 120x40 -> 70x20 -> 140x50 adapts panels, cache, and line budgets."""
+    from cli.tui.chat import _TRANSCRIPT_CACHE, clear_transcript_cache
+
+    state = AutonomousDeliveryState("demo", session_id="test-resize-120-70-140")
+    state.add_message("user", "Can you refactor the backend database layer?")
+    state.add_message("assistant", "Sure, starting architectural decomposition.")
+    session = {"session_id": "test-resize-120-70-140", "agent": "architect", "provider": "daemon"}
+
+    manager = LiveWorkspaceManager(session=session, state=state, width=120, height=40)
+
+    # 1. At 120x40 (width >= 100, show_runtime is True)
+    renderable_120 = manager.build_renderable(include_composer=True)
+    lines_120 = renderable_120.plain.splitlines()
+    assert len(lines_120) == 40
+    layout_120 = compute_layout(120)
+    assert layout_120.show_runtime is True
+    assert "StackMind Runtime" in renderable_120.plain
+    # Cache was populated
+    assert len(_TRANSCRIPT_CACHE) > 0
+
+    # 2. Resize to 70x20 (width < 95 -> narrow, show_runtime is False, side panel collapsed)
+    with patch("cli.tui.chat.clear_transcript_cache", wraps=clear_transcript_cache) as mock_clear:
+        manager.handle_resize(70, 20)
+        mock_clear.assert_called()
+
+    renderable_70 = manager.build_renderable(include_composer=True)
+    lines_70 = renderable_70.plain.splitlines()
+    assert len(lines_70) == 20
+    layout_70 = compute_layout(70)
+    assert layout_70.show_runtime is False
+    assert "StackMind Runtime" not in renderable_70.plain
+
+    # 3. Resize to 140x50 (wide breakpoint, runtime panel re-appears)
+    with patch("cli.tui.chat.clear_transcript_cache", wraps=clear_transcript_cache) as mock_clear_2:
+        manager.handle_resize(140, 50)
+        mock_clear_2.assert_called()
+
+    renderable_140 = manager.build_renderable(include_composer=True)
+    lines_140 = renderable_140.plain.splitlines()
+    assert len(lines_140) == 50
+    layout_140 = compute_layout(140)
+    assert layout_140.show_runtime is True
+    assert "StackMind Runtime" in renderable_140.plain
+
+
+def test_long_multiline_composer_and_tall_code_blocks_visual_line_sliced():
+    """Verify long multiline pastes and tall assistant code blocks do not overflow viewport."""
+    state = AutonomousDeliveryState("demo", session_id="test-tall-blocks")
+    tall_code = "```python\n" + "\n".join(f"def func_{i}():\n    return {i}" for i in range(40)) + "\n```"
+    state.add_message("assistant", f"Here is the implementation:\n{tall_code}")
+    session = {"session_id": "test-tall-blocks", "agent": "architect", "provider": "daemon"}
+
+    # Large multiline composer paste
+    large_paste = "\n".join(f"paste line {i} with lots of additional text content" for i in range(25))
+
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=100,
+        height=24,
+        composer_content=large_paste,
+        include_composer=True,
+    )
+    lines = frame.split("\n")
+    # Total lines strictly equal to height
+    assert len(lines) == 24
+    # Status bar preserved at the bottom
+    assert "test-tal" in lines[-1]
+    assert "online" in lines[-1]
+    # Composer box bottom border at lines[-2]
+    assert lines[-2][0] in ("╰", "└")
+
+
+def test_resize_during_idle_prompt_input_triggers_atomic_repaint(monkeypatch):
+    """Verify that resizing while idle at prompt triggers on_resize and atomic screen repaint."""
+    import os
+    import shutil
+    from cli.tui.app import prompt_composer_input
+    from cli.tui.keyboard import Key
+
+    state = AutonomousDeliveryState("demo-resize-idle", session_id="test-sess-resize")
+    session = {"session_id": "test-sess-resize", "agent": "architect", "provider": "daemon"}
+
+    # Mock terminal sizes: start at 80x24, then resize to 100x30
+    sizes = [os.terminal_size((80, 24)), os.terminal_size((100, 30))]
+    def mock_get_terminal_size(fallback=(80, 24)):
+        if sizes:
+            return sizes[0]
+        return os.terminal_size((100, 30))
+
+    monkeypatch.setattr(shutil, "get_terminal_size", mock_get_terminal_size)
+
+    # Key stream: first None (idle tick where resize occurs), then ENTER to complete
+    called_resize = []
+    def mock_on_resize(cols, lines, ed=None):
+        called_resize.append((cols, lines))
+
+    # Trigger resize after first check
+    key_steps = [None, Key.ENTER]
+    def mock_read_next_key(key_stream=None, timeout=None):
+        if sizes and len(sizes) > 1:
+            # Pop size to simulate resize event during poll tick
+            sizes.pop(0)
+        if key_steps:
+            return key_steps.pop(0)
+        return Key.ENTER
+
+    monkeypatch.setattr("cli.tui.keyboard.read_next_key", mock_read_next_key)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    stdout_writes = []
+    monkeypatch.setattr("sys.stdout.write", lambda s: stdout_writes.append(s))
+    monkeypatch.setattr("sys.stdout.flush", lambda: None)
+
+    val = prompt_composer_input(
+        width=80,
+        state=state,
+        session=session,
+        on_resize=mock_on_resize,
+        full_screen=True,
+    )
+
+    # on_resize was called with the new dimensions
+    assert len(called_resize) >= 1
+    assert called_resize[0] == (100, 30)
+
+
+def test_empty_conversation_landing_state_frame_strictly_fits_height():
+    """Verify landing block + composer + status bar strictly fits within height lines without trailing newline."""
+    state = AutonomousDeliveryState("demo-empty", session_id="test-landing-height")
+    session = {"session_id": "test-landing-height", "agent": "codex", "provider": "daemon"}
+
+    for h in (16, 20, 24, 30):
+        frame = render_full_screen_workspace(
+            session=session,
+            state=state,
+            width=100,
+            height=h,
+            include_composer=True,
+        )
+        # Must have NO trailing newline
+        assert not frame.endswith("\n")
+        lines = frame.split("\n")
+        # Exactly h lines (h - 1 newlines)
+        assert len(lines) == h, f"Expected {h} lines for height={h}, got {len(lines)}"
+        # Last line must be status bar
+        assert "test-lan" in lines[-1]
+        assert "online" in lines[-1]
+        # Composer bottom border must be line h - 2
+        assert lines[-2][0] in ("╰", "└")
+
+
+def test_filenotfounderror_workspace_file_list_stripped_and_capped():
+    """Verify FileNotFoundError strips workspace file lists and hard-caps to <= 60 chars."""
+    from cli.tui.events import clean_error_message
+
+    raw_err = (
+        "FileNotFoundError: File 'src/frontend.html' does not exist in workspace. "
+        "Existing workspace files: .gitignore, CHANGELOG.md, package.json, src/index.ts, "
+        "src/styles.css, tests/test_app.py, README.md, tsconfig.json"
+    )
+    cleaned = clean_error_message(raw_err)
+    # File list must be completely stripped
+    assert "Existing workspace files:" not in cleaned
+    assert ".gitignore" not in cleaned
+    assert "CHANGELOG.md" not in cleaned
+    assert "tsconfig.json" not in cleaned
+    # Must be <= 60 chars
+    assert len(cleaned) <= 60
+    assert "FileNotFoundError:" in cleaned
+
+
+def test_tool_execution_no_duplicate_ran_block_when_collapsed():
+    """Verify tool executions do NOT emit a duplicate ✓ Ran / │ block during in-progress turn."""
+    from cli.tui.app import _build_in_progress_turn_content
+    from cli.tui.state import AutonomousDeliveryState, TurnAction
+
+    state = AutonomousDeliveryState("test-tools", session_id="test-sess")
+    state.record_turn_action(
+        "act-1",
+        "Write src/backend.py",
+        status="COMPLETED",
+        tool_name="write_file",
+        target="src/backend.py",
+        code="import os\nprint('hello world')",
+    )
+
+    content = _build_in_progress_turn_content(
+        state,
+        model_name="test-model",
+        streamed_chunks=[],
+        latest_act_desc="Working...",
+        start_time=0.0,
+        max_wait=0.0,
+        layout_width=100,
+    )
+
+    # Must contain single flat tool call line
+    assert "● Write(src/backend.py)" in content
+    # Must NOT contain duplicate legacy block
+    assert "✓ Ran" not in content
+    assert "✓ Wrote" not in content
+    assert "  │ " not in content
+
+
+def test_page_up_page_down_keys_and_viewport_scrolling():
+    """Verify PgUp/PgDn key sequences update scroll_offset, shift viewport sliced lines, and poll_scroll_key works."""
+    from cli.tui.keyboard import Key, _parse_escape_sequence, poll_scroll_key
+    from cli.tui.layout import slice_conversation_viewport
+    from cli.tui.state import AutonomousDeliveryState
+
+    # 1. Verify ANSI key sequence decoding
+    assert _parse_escape_sequence("[5~") == Key.PAGE_UP
+    assert _parse_escape_sequence("[6~") == Key.PAGE_DOWN
+
+    # 2. Viewport slicing with scroll_offset shifts lines
+    lines = [f"Line {i:03d}" for i in range(50)]
+    full_content = "\n".join(lines)
+
+    state = AutonomousDeliveryState("test-scroll", session_id="test-sess")
+    vp_h = 10
+
+    # At bottom (scroll_offset = 0)
+    bottom_slice = slice_conversation_viewport(full_content, viewport_height=vp_h, scroll=state.conversation_scroll)
+    assert "Line 049" in bottom_slice
+    assert "Line 000" not in bottom_slice
+
+    # Scroll up by 10 lines
+    state.scroll_conversation_up(10)
+    assert state.conversation_scroll.scroll_offset == 10
+    scrolled_slice = slice_conversation_viewport(full_content, viewport_height=vp_h, scroll=state.conversation_scroll)
+    assert "Line 039" in scrolled_slice
+    assert "Line 049" not in scrolled_slice
+
+    # Scroll down by 5 lines
+    state.scroll_conversation_down(5)
+    assert state.conversation_scroll.scroll_offset == 5
+    part_slice = slice_conversation_viewport(full_content, viewport_height=vp_h, scroll=state.conversation_scroll)
+    assert "Line 044" in part_slice
+
+    # Scroll to bottom resets to follow_bottom
+    state.scroll_conversation_to_bottom()
+    assert state.conversation_scroll.scroll_offset == 0
+    assert state.conversation_scroll.follow_bottom is True
+
+
+
+

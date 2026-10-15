@@ -1839,6 +1839,12 @@ class ProviderGateway:
             if response.message and response.message.content:
                 from cli.tui.chat import extract_internal_reasoning
                 think_extracted = extract_internal_reasoning(response.message.content)
+                if not think_extracted and hasattr(response, "raw_payload") and isinstance(response.raw_payload, dict):
+                    raw_msg = response.raw_payload.get("message")
+                    if isinstance(raw_msg, dict):
+                        raw_think = raw_msg.get("thinking") or raw_msg.get("reasoning_content")
+                        if isinstance(raw_think, str) and raw_think.strip():
+                            think_extracted = raw_think.strip()
                 if think_extracted and self.on_thinking:
                     try:
                         self.on_thinking(think_extracted)
