@@ -395,6 +395,7 @@ from .skill import skill_group
 from .learn import learn_group
 from .daemon import daemon_group
 from .projects import projects_group
+from .memory import memory_group
 
 cli.add_command(graph)
 cli.add_command(harness)
@@ -404,6 +405,7 @@ cli.add_command(skill_group)
 cli.add_command(learn_group)
 cli.add_command(daemon_group)
 cli.add_command(projects_group)
+cli.add_command(memory_group)
 @click.command("tui")
 @click.option("--daemon-url", default=None, help="URL of an existing local daemon.")
 @click.option("--agent", "-a", default="claude", show_default=True)

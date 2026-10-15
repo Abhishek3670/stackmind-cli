@@ -51,6 +51,7 @@ KIND_PREFIXES = {
     "issue": "ISSUE",
     "experience": "EXP",
     "skill": "SKILL",
+    "memory": "MEM",
 }
 
 
