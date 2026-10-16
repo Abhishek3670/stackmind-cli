@@ -547,3 +547,244 @@ def test_edit_tool_renders_inline_split_diff_in_chat():
     for l in transcript_wide.splitlines():
         assert cell_len(l) <= 110
 
+
+def test_write_and_edit_tools_display_split_diff_in_chat_by_default():
+    """Verify that Write and Edit tool events display split diff in chat by default without Ctrl+O."""
+    import json
+    from cli.tui.chat import render_actions_group_str, render_chat_transcript_str
+    from cli.tui.state import ActionsGroup, ChatMessage, TurnAction
+
+    # 1. Write action with code
+    write_act = TurnAction(
+        action_id="act-write-1",
+        description="Write (src/config.py)",
+        tool_name="write_file",
+        target="src/config.py",
+        status="COMPLETED",
+        code="PORT = 8080\nDEBUG = True\n",
+    )
+    # 2. Edit action with diff
+    diff_text = """--- a/src/app.py
++++ b/src/app.py
+@@ -10,2 +10,3 @@
+ def start():
+-    run_server(port=3000)
++    config = load_config()
++    run_server(port=config.PORT)
+"""
+    edit_act = TurnAction(
+        action_id="act-edit-1",
+        description="Edit (src/app.py)",
+        tool_name="edit_file",
+        target="src/app.py",
+        status="COMPLETED",
+        diff=diff_text,
+    )
+
+    # Actions group is NOT expanded (expanded=False, the default!)
+    group = ActionsGroup(actions=[write_act, edit_act], expanded=False)
+    assert group.expanded is False
+
+    # Render actions group
+    rendered_group = render_actions_group_str(group, width=100)
+    # Both header lines have (+X) / (+X -Y) stats
+    assert "● Write(src/config.py) (+2)" in rendered_group
+    assert "● Edit(src/app.py) (+2 -1)" in rendered_group
+    # Both split diff blocks are rendered by default
+    assert "PORT = 8080" in rendered_group
+    assert "run_server(port=config.PORT)" in rendered_group
+
+    # Verify rendering inside complete transcript
+    msg = ChatMessage(
+        role="assistant",
+        content="Configured server startup.",
+        actions=group,
+    )
+    transcript = render_chat_transcript_str([msg], width=100)
+    assert "● Write(src/config.py) (+2)" in transcript
+    assert "● Edit(src/app.py) (+2 -1)" in transcript
+    assert "PORT = 8080" in transcript
+    assert "run_server(port=config.PORT)" in transcript
+
+
+def test_non_diff_tools_never_dump_raw_json_or_false_tests_passed():
+    """Verify non-diff tools never dump raw JSON or false '✓ Tests passed' when collapsed or expanded."""
+    import json
+    from cli.tui.chat import render_actions_group_str
+    from cli.tui.state import ActionsGroup, TurnAction
+
+    # 1. Test failure: exit_code=1 and success=false
+    test_json = json.dumps({
+        "success": False,
+        "exit_code": 1,
+        "failed": 1,
+        "passed": 2,
+        "stdout": "FAILED tests/test_login.py::test_auth - AssertionError\n2 passed, 1 failed in 0.42s",
+    })
+    test_act = TurnAction(
+        action_id="act-test",
+        description="Test (tests/test_qa.py)",
+        tool_name="run_tests",
+        target="tests/test_qa.py",
+        status="COMPLETED",
+        output=test_json,
+    )
+
+    # 2. Security scan with finding
+    scan_json = json.dumps({
+        "success": True,
+        "findings": [{
+            "id": "HARDCODED_SECRET_FALLBACK",
+            "severity": "CRITICAL",
+            "message": "Potential hardcoded credentials detected",
+            "file": "src/backend.py",
+            "line": 42,
+        }],
+    })
+    scan_act = TurnAction(
+        action_id="act-scan",
+        description="Run Security Scan (src/backend.py)",
+        tool_name="run_security_scan",
+        target="src/backend.py",
+        status="COMPLETED",
+        output=scan_json,
+    )
+
+    # 3. Graph tool
+    graph_act = TurnAction(
+        action_id="act-graph",
+        description="Graph",
+        tool_name="query_graph",
+        target="",
+        status="COMPLETED",
+        output=json.dumps({"nodes": 12, "edges": 18}),
+    )
+
+    # Collapsed view (default)
+    collapsed_group = ActionsGroup(actions=[test_act, scan_act, graph_act], expanded=False)
+    rendered_collapsed = render_actions_group_str(collapsed_group, width=90)
+
+    # Never print raw JSON dumps or false labels
+    assert "✓ Tests passed" not in rendered_collapsed
+    assert "✓ Ran" not in rendered_collapsed
+    assert "✓ Generating" not in rendered_collapsed
+    assert '{"success": false' not in rendered_collapsed
+    assert '{"nodes": 12' not in rendered_collapsed
+
+    # Check concise status summaries on the header line
+    assert "1 failed, 2 passed" in rendered_collapsed
+    assert "1 critical finding (HARDCODED_SECRET_FALLBACK)" in rendered_collapsed
+    assert "● Graph (ctrl+o to expand)" in rendered_collapsed
+
+    # Expanded view (Ctrl+O)
+    expanded_group = ActionsGroup(actions=[test_act, scan_act, graph_act], expanded=True)
+    rendered_expanded = render_actions_group_str(expanded_group, width=90)
+
+    # In expanded view: clean unescaped output is shown, still NO raw JSON dump
+    assert '{"success": false' not in rendered_expanded
+    assert "FAILED tests/test_login.py" in rendered_expanded
+    assert "HARDCODED_SECRET_FALLBACK: Potential hardcoded credentials" in rendered_expanded
+
+
+def test_split_diff_never_exceeds_avail_width_or_wraps_in_viewport():
+    """Verify long diff lines never overflow avail_width or cause right-column wrapping to column 0."""
+    from rich.cells import cell_len
+    from rich.text import Text
+    from cli.tui.diff import render_split_diff_str, parse_unified_diff_to_split_rows
+    from cli.tui.layout import slice_conversation_viewport
+    from cli.tui.state import ActionsGroup, TurnAction
+    from cli.tui.chat import render_actions_group_str
+
+    diff_sample = """--- a/PLAN.md
++++ b/PLAN.md
+@@ -1,6 +1,6 @@
+-# Project Plan for Complex Multi-Tier Enterprise Distributed Cloud Architecture With Automatic Failover
++# Project Plan for Complex Multi-Tier Enterprise Distributed Cloud Architecture With Ultra Resilient Edge Failover
+-Stack & Dependencies: TypeScript, React 19, Tailwind CSS v4, Fastify, Redis Cluster, Postgres with pgvector
++Stack & Dependencies: TypeScript, React 19, Tailwind CSS v4, Fastify, Redis Cluster, Postgres with pgvector, and WebSockets
+-  - [ ] Legacy item with very very long description that goes on and on and on and spans way past normal widths
++  - [ ] New item with very very long description that goes on and on and on and spans way past normal widths
+"""
+
+    # 1. Single-character marker stripping:
+    rows = parse_unified_diff_to_split_rows(diff_sample)
+    # The first deleted row's text must NOT have had an extra space stripped or doubled
+    assert rows[0].left.text == "# Project Plan for Complex Multi-Tier Enterprise Distributed Cloud Architecture With Automatic Failover"
+    assert rows[0].right.text == "# Project Plan for Complex Multi-Tier Enterprise Distributed Cloud Architecture With Ultra Resilient Edge Failover"
+
+    # 2. Side-by-side rendering at avail_width=100
+    rendered_diff = render_split_diff_str(diff_sample, avail_width=100, indent="  ")
+    diff_lines = [l for l in rendered_diff.splitlines() if l.strip()]
+
+    # Every rendered line cell_len must be strictly <= avail_width - 2
+    for line in diff_lines:
+        plain_line = Text.from_ansi(line).plain
+        assert cell_len(plain_line) <= 100 - 2, f"Line exceeded safety margin: {cell_len(plain_line)} > 98: {plain_line!r}"
+
+    # 3. Viewport slicing must NEVER produce a line that wraps to column 0
+    sliced = slice_conversation_viewport(rendered_diff, viewport_height=20, avail_width=100)
+    for s_line in sliced.splitlines():
+        plain = Text.from_ansi(s_line).plain
+        if not plain.strip():
+            continue
+        # Every diff row must start with the indent (2 spaces) and line number, never a wrapped fragment at col 0
+        assert plain.startswith("  "), f"Line wrapped onto column 0 in viewport: {plain!r}"
+
+    # 4. In actions group with Write(PLAN.md)
+    act = TurnAction(
+        action_id="act-write",
+        description="Write (PLAN.md)",
+        tool_name="write",
+        target="PLAN.md",
+        status="COMPLETED",
+        output="Successfully wrote characters to PLAN.md\n" + diff_sample,
+    )
+    group = ActionsGroup(actions=[act], expanded=False)
+    rendered_group = render_actions_group_str(group, width=100)
+    sliced_group = slice_conversation_viewport(rendered_group, viewport_height=20, avail_width=100)
+    for s_line in sliced_group.splitlines():
+        plain = Text.from_ansi(s_line).plain
+        if not plain.strip():
+            continue
+        # Either the tool header line "● Write(PLAN.md)" or an indented diff line "  "
+        assert plain.startswith("●") or plain.startswith("  ") or plain.startswith("    "), (
+            f"Actions diff line wrapped onto column 0: {plain!r}"
+        )
+
+
+def test_user_message_wrapped_lines_preserve_gutter():
+    """Verify long multi-line user messages keep the '│ ' cyan gutter bar on every wrapped visual line."""
+    from rich.text import Text
+    from cli.tui.chat import render_user_message_str, render_chat_transcript_str
+    from cli.tui.state import ChatMessage
+
+    long_prompt = (
+        "Recognizing that a single power outage could compromise sound systems, "
+        "catering equipment, climate control, and digital payment infrastructure simultaneously, "
+        "what contingency plans and technical safeguards should we establish?"
+    )
+
+    rendered_user = render_user_message_str(long_prompt, width=60)
+    user_lines = [l for l in rendered_user.splitlines() if l.strip()]
+
+    # First non-empty line is the header: "│ You"
+    assert "You" in Text.from_ansi(user_lines[0]).plain
+    assert Text.from_ansi(user_lines[0]).plain.startswith("│ ")
+
+    # Every subsequent line is a wrapped chunk of the message, and MUST start with "│ "
+    assert len(user_lines) > 2, "Long prompt should wrap across multiple visual lines at width 60"
+    for line in user_lines[1:]:
+        plain = Text.from_ansi(line).plain
+        assert plain.startswith("│ "), f"Continuation line lost gutter prefix: {plain!r}"
+
+    # Verify through chat transcript as well
+    messages = [ChatMessage(role="user", content=long_prompt)]
+    transcript = render_chat_transcript_str(messages, width=60)
+    t_lines = [l for l in transcript.splitlines() if l.strip()]
+    for line in t_lines:
+        plain = Text.from_ansi(line).plain
+        # Transcript adds 1-space padding: " │ ..."
+        assert plain.startswith(" │") or plain.startswith("│"), f"Transcript line missing gutter bar: {plain!r}"
+
+
+

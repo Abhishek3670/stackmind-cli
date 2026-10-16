@@ -127,6 +127,8 @@ def format_model_badge(
     - backend='Codex', model=None -> 'Codex'
     """
     b = str(backend).strip() if backend else ""
+    if b.lower() == "daemon":
+        b = ""
     m = str(model).strip() if model else ""
     q = str(quantization).strip() if quantization else ""
 

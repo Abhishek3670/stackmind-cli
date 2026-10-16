@@ -1799,15 +1799,19 @@ class ToolGateway:
         record = self._authorize(OperationType.WEB_SEARCH, f"web/search?q={query}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        self.boundary.journal.complete(record.request.operation_id, "completed")
-        return [{"title": f"Result for {query}", "snippet": f"Web reference for {query}", "url": "https://example.com"}]
+        from .web import perform_web_search
+        results = perform_web_search(query, limit=limit)
+        self.boundary.journal.complete(record.request.operation_id, f"{len(results)} results")
+        return results
 
     def web_fetch(self, url: str) -> str:
         record = self._authorize(OperationType.WEB_FETCH, url)
         if not record.authorized:
             raise PermissionError(record.reason)
+        from .web import perform_web_fetch
+        content = perform_web_fetch(url)
         self.boundary.journal.complete(record.request.operation_id, "fetched")
-        return f"# Content from {url}\n\nDocumentation page content."
+        return content
 
     def search_docs(self, query: str) -> list[dict[str, Any]]:
         record = self._authorize(OperationType.SEARCH_DOCS, f"docs?q={query}")

@@ -72,6 +72,7 @@ from .settings import (
     test_provider_connection,
 )
 from .tools import ToolGateway
+from .web import perform_web_fetch, perform_web_search
 from .tui import DaemonClient, StackMindTuiAdapter
 from .verification import SandboxCanaryVerifier
 from .workspace import ScratchWorkspace, WorkspaceEscapeError
@@ -142,6 +143,8 @@ __all__ = [
     "TaskDelegation",
     "ToolGateway",
     "WorkspaceEscapeError",
+    "perform_web_fetch",
+    "perform_web_search",
     "derive_verification_dimensions",
     "get_daemon_home_dir",
     "get_global_settings_path",

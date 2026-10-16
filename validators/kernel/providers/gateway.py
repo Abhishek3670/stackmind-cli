@@ -1141,7 +1141,7 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
 
 
-PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file")
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "web_search", "web_fetch")
 AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
@@ -1150,6 +1150,8 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "query_graph",
     "find_symbol",
     "find_references",
+    "web_search",
+    "web_fetch",
     "git_log",
     "git_diff",
     "run_command",
@@ -1544,10 +1546,35 @@ class ProviderGateway:
                         )
                     return res
 
+                old_content = ""
+                rel_target = target.replace("\\", "/").strip().lstrip("/")
+                try:
+                    if hasattr(self.tool_gateway, "workspace"):
+                        target_path = self.tool_gateway.workspace.path_for(target)
+                        if target_path.is_file():
+                            old_content = target_path.read_text(encoding="utf-8")
+                except Exception:
+                    old_content = ""
+
                 self.tool_gateway.write_file(target, content)
                 self.consecutive_failures = 0
                 if target not in self.written_files:
                     self.written_files.append(target)
+
+                # Generate standard unified diff for TUI and reviewers
+                import difflib
+                old_lines = old_content.splitlines(keepends=True) if old_content else []
+                new_lines = content.splitlines(keepends=True) if content else []
+                diff_lines = list(difflib.unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=f"a/{rel_target}",
+                    tofile=f"b/{rel_target}",
+                    n=3,
+                ))
+                diff_str = "".join(diff_lines)
+                if diff_str.strip():
+                    return f"Successfully wrote {len(content)} characters to {target}\n{diff_str}"
                 return f"Successfully wrote {len(content)} characters to {target}"
 
             if name == "run_command":
@@ -1604,10 +1631,11 @@ class ProviderGateway:
                     "analysis": {"find_callers", "find_callees", "impact_analysis", "dependency_analysis", "data_flow_analysis"},
                     "knowledge": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
                     "graph": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
+                    "web": {"web_search", "web_fetch"},
                     "linter": {"run_command"},
                     "linters": {"run_command"},
                     "diagnostics": {"inspect_environment", "inspect_logs", "inspect_version", "checkpoint"},
-                    "search": {"grep", "glob", "semantic_search", "search_docs"},
+                    "search": {"grep", "glob", "semantic_search", "search_docs", "web_search", "web_fetch"},
                     "browser": {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "inspect_screenshot"},
                     "process": {"process_start", "process_status", "process_output", "process_stop"},
                     "testing": {"run_tests", "run_lint", "run_typecheck", "run_security_scan", "verify_deliverable", "verify_tests"},
@@ -1635,7 +1663,7 @@ class ProviderGateway:
                 elif any(t in already_active for t in target_names):
                     return f"Tool(s) matching '{query}' are already active in your session."
                 else:
-                    return f"No permitted tools found matching '{query}'. Available categories: git, analysis, knowledge, search, linters."
+                    return f"No permitted tools found matching '{query}'. Available categories: web, git, analysis, knowledge, search, linters."
 
             if hasattr(self.tool_gateway, name):
                 method = getattr(self.tool_gateway, name)
@@ -1673,6 +1701,10 @@ class ProviderGateway:
                         kwargs[param_name] = args.get("cmd") or args.get("args")
                     elif param_name == "query" and any(k in args for k in ("q", "search", "prompt")):
                         kwargs[param_name] = args.get("q") or args.get("search") or args.get("prompt")
+                    elif param_name == "limit" and any(k in args for k in ("max_results", "count", "num_results", "num", "top_k")):
+                        kwargs[param_name] = args.get("max_results") or args.get("count") or args.get("num_results") or args.get("num") or args.get("top_k")
+                    elif param_name == "url" and any(k in args for k in ("link", "uri", "target", "path", "href")):
+                        kwargs[param_name] = args.get("link") or args.get("uri") or args.get("target") or args.get("path") or args.get("href")
                     elif param_name == "symbol" and any(k in args for k in ("name", "target")):
                         kwargs[param_name] = args.get("name") or args.get("target")
                     elif param_name == "instructions" and any(k in args for k in ("instruction", "prompt", "message", "task")):
@@ -1690,7 +1722,11 @@ class ProviderGateway:
 
                 result = method(**kwargs)
                 self.consecutive_failures = 0
-                if result is None:
+                if name == "apply_patch":
+                    p_content = kwargs.get("patch_content") or ""
+                    tgt = kwargs.get("target") or "file"
+                    out_str = f"Successfully applied patch to {tgt}\n{p_content}".strip()
+                elif result is None:
                     out_str = f"Successfully executed {name}"
                 elif isinstance(result, str):
                     out_str = result

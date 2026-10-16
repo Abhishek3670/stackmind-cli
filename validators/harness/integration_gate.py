@@ -391,8 +391,9 @@ class IntegrationGate:
         for entry in audit_entries:
             cmd_str, rc = self._extract_command_info(entry)
             tokens = self._parse_command_tokens(cmd_str)
-            if self._is_test_command(tokens) or entry.get("name") == "run_tests":
-                test_runs.append({"command": cmd_str, "tokens": tokens, "returncode": rc})
+            tool_name = entry.get("tool") or entry.get("name")
+            if self._is_test_command(tokens) or tool_name in ("run_tests", "pytest", "test"):
+                test_runs.append({"command": cmd_str or str(tool_name), "tokens": tokens, "returncode": rc})
 
         rel_test_paths = [p.relative_to(self.workspace).as_posix() for p in unique_test_files]
 
@@ -1080,20 +1081,21 @@ class IntegrationGate:
         """Extract command string and returncode from a command audit or tool call entry."""
         cmd = ""
         rc = 0
+        tool_name = entry.get("tool") or entry.get("name")
         if "command" in entry:
             cmd = str(entry["command"])
             rc = int(entry.get("returncode", entry.get("exit_code", 0)))
         elif "CommandLine" in entry:
             cmd = str(entry["CommandLine"])
             rc = int(entry.get("returncode", entry.get("exit_code", 0)))
-        elif entry.get("name") in ("run_command", "bash", "execute_command"):
+        elif tool_name in ("run_command", "bash", "execute_command"):
             args = entry.get("args") or entry.get("arguments") or {}
             if isinstance(args, dict):
                 cmd = str(args.get("CommandLine") or args.get("command") or "")
             res = entry.get("result") or {}
             if isinstance(res, dict):
                 rc = int(res.get("returncode", res.get("exit_code", 0)))
-        elif entry.get("name") in ("run_tests",):
+        elif tool_name in ("run_tests", "pytest", "test"):
             cmd = "run_tests"
             rc = 0 if entry.get("status") != "error" and not entry.get("failed") else 1
         return cmd, rc

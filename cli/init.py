@@ -325,19 +325,40 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                         except Exception:
                             pass
             idx_file = wos_dir / "INDEX.yaml"
-            if idx_file.is_file():
+            idx_data = None
+            if idx_file.is_file() and idx_file.stat().st_size > 0:
                 try:
-                    idx_data = yaml.safe_load(idx_file.read_text(encoding="utf-8"))
-                    if isinstance(idx_data, dict) and isinstance(idx_data.get("orders"), list):
-                        changed = False
-                        for o in idx_data["orders"]:
-                            if isinstance(o, dict) and str(o.get("status", "")).upper() == "FAILED":
-                                o["status"] = "BLOCKED"
-                                changed = True
-                        if changed:
-                            idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    loaded = yaml.safe_load(idx_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and isinstance(loaded.get("orders"), list):
+                        idx_data = loaded
                 except Exception:
-                    pass
+                    idx_data = None
+            if idx_data is None:
+                from datetime import datetime, timezone
+                now_iso = datetime.now(timezone.utc).isoformat()
+                idx_data = {
+                    "schema_version": 1,
+                    "last_updated": now_iso,
+                    "updated_by": "stackmind-init",
+                    "orders": [],
+                    "next_id": 1,
+                    "total_active": 0,
+                    "total_completed": 0,
+                    "total_blocked": 0,
+                }
+                tmp_idx = idx_file.with_name(f"{idx_file.name}.tmp.{int(time.time() * 1000)}")
+                tmp_idx.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                tmp_idx.replace(idx_file)
+            else:
+                changed = False
+                for o in idx_data["orders"]:
+                    if isinstance(o, dict) and str(o.get("status", "")).upper() == "FAILED":
+                        o["status"] = "BLOCKED"
+                        changed = True
+                if changed:
+                    tmp_idx = idx_file.with_name(f"{idx_file.name}.tmp.{int(time.time() * 1000)}")
+                    tmp_idx.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    tmp_idx.replace(idx_file)
 
         # 5. Mirror bundled schemas into .sync/schemas/ directory (not workspace root)
         sync_schemas_dir = sync_path / "schemas"

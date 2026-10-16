@@ -645,11 +645,20 @@ def extract_action_target(args: Mapping[str, Any] | None) -> str:
 
 
 def extract_tool_diff(payload: Mapping[str, Any] | Any, args: Mapping[str, Any] | None = None) -> str | None:
-    """Extract unified diff text or synthetic diff summary from edit tool call or result."""
+    """Extract unified diff text or synthetic diff summary from edit/write tool call or result."""
     if isinstance(payload, Mapping):
         res = payload.get("result")
-        if isinstance(res, str) and ("--- " in res or "@@" in res or res.startswith("diff ")):
-            return res.strip()
+        if isinstance(res, str):
+            if "@@" in res and ("--- " in res or "+++ " in res or "diff " in res):
+                lines = res.splitlines()
+                start_idx = 0
+                for idx, line in enumerate(lines):
+                    if line.startswith("--- ") or line.startswith("@@") or line.startswith("diff "):
+                        start_idx = idx
+                        break
+                return "\n".join(lines[start_idx:]).strip()
+            if "--- " in res or "@@" in res or res.startswith("diff "):
+                return res.strip()
         if isinstance(res, Mapping):
             for k in ("diff", "patch", "unified_diff"):
                 v = res.get(k)
@@ -667,21 +676,30 @@ def extract_tool_diff(payload: Mapping[str, Any] | Any, args: Mapping[str, Any] 
                 return v.strip()
 
     if args and isinstance(args, Mapping):
-        for k in ("diff", "patch", "unified_diff"):
+        for k in ("diff", "patch", "patch_content", "unified_diff"):
             v = args.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
         old_str = args.get("target_content") or args.get("old_str") or args.get("old_string") or args.get("find")
         new_str = args.get("replacement") or args.get("replacement_content") or args.get("new_str") or args.get("new_string") or args.get("replace")
         target_f = extract_action_target(args) or "file"
+        rel_target = target_f.replace("\\", "/").strip().lstrip("/")
         if old_str is not None or new_str is not None:
-            lines = [f"--- a/{target_f}", f"+++ b/{target_f}"]
+            lines = [f"--- a/{rel_target}", f"+++ b/{rel_target}"]
+            lines.append("@@ -1,6 +1,6 @@")
             if old_str:
                 for l in str(old_str).splitlines()[:6]:
                     lines.append(f"- {l}")
             if new_str:
                 for l in str(new_str).splitlines()[:6]:
                     lines.append(f"+ {l}")
+            return "\n".join(lines)
+        content = args.get("content") or args.get("code") or args.get("text")
+        if content and isinstance(content, str) and content.strip():
+            c_lines = content.splitlines()
+            lines = [f"--- a/{rel_target}", f"+++ b/{rel_target}", f"@@ -0,0 +1,{len(c_lines)} @@"]
+            for cl in c_lines:
+                lines.append(f"+{cl}")
             return "\n".join(lines)
     return None
 
@@ -807,6 +825,7 @@ class OperationalEventManager:
             tool_diff = None
             if tool_name in {"write_file", "write", "create_file", "create"}:
                 tool_code = str(args.get("content") or args.get("code") or "")
+                tool_diff = extract_tool_diff(payload, args)
             elif tool_name in {"edit_file", "edit", "patch", "apply_patch"}:
                 tool_diff = extract_tool_diff(payload, args)
                 if not tool_diff:
@@ -845,7 +864,13 @@ class OperationalEventManager:
                 )
             self.tool_history.append(activity)
             tool_output = extract_tool_output(payload)
-            tool_diff = extract_tool_diff(payload)
+            call_args = getattr(activity, "arguments", None) or payload.get("arguments") or {}
+            tool_diff = extract_tool_diff(payload, call_args)
+            if not tool_diff and getattr(activity, "code", None):
+                target_f = getattr(activity, "target", "") or "file"
+                rel_target = target_f.replace("\\", "/").strip().lstrip("/")
+                c_lines = str(activity.code).splitlines()
+                tool_diff = f"--- a/{rel_target}\n+++ b/{rel_target}\n@@ -0,0 +1,{len(c_lines)} @@\n" + "\n".join(f"+{l}" for l in c_lines)
             self.current_actions.complete_action(
                 call_id,
                 status=status,

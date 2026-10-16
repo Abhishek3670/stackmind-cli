@@ -470,8 +470,8 @@ def test_get_curated_tools_for_phase():
     for name in PLANNING_CORE_TOOL_NAMES:
         assert name in tool_names
     assert "request_tools" in tool_names
-    # Should be lean: 5 tools max (4 core + request_tools)
-    assert len(planning_tools) <= 5
+    # Should be lean: core planning tools + request_tools
+    assert len(planning_tools) <= len(PLANNING_CORE_TOOL_NAMES) + 1
 
     # Authoring phase for architect
     authoring_tools = get_curated_tools_for_phase("claude", phase="authoring")

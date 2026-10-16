@@ -1740,10 +1740,12 @@ class AutonomousDeliveryState:
             role_name = (payload.get("role") or self._infer_role_from_op(agent_id)).title()
             normalized_role = "Q/A" if role_name.upper() in {"QA", "Q/A"} else role_name
             existing_role = self.roles.get(normalized_role)
+            raw_backend = payload.get("backend") or payload.get("executionBackend")
+            if raw_backend and str(raw_backend).strip().lower() == "daemon":
+                raw_backend = None
             backend = (
-                payload.get("backend")
-                or payload.get("executionBackend")
-                or (existing_role.backend if existing_role and existing_role.backend else "Codex")
+                raw_backend
+                or (existing_role.backend if existing_role and existing_role.backend and existing_role.backend.lower() != "daemon" else "")
             )
             model = payload.get("model") or (existing_role.model if existing_role else None)
             quantization = payload.get("quantization") or getattr(existing_role, "quantization", None)
@@ -1796,7 +1798,7 @@ class AutonomousDeliveryState:
 
         elif name in {"operation.completed", "turn.completed"}:
             self.current_turn_actions.complete_all()
-            self.current_turn_actions.expanded = True
+            self.current_turn_actions.expanded = False
             self.active_tool_name = None
             self.active_tool_target = None
             self.active_tool_code = None

@@ -1954,8 +1954,21 @@ class SessionManager:
             self.events.publish("operation.authorized", session_id, operation_id=operation_id)
             self.events.publish("operation.started", session_id, operation_id=operation_id)
             if parent_operation_id is not None:
-                backend = (metadata or {}).get("backend") or (metadata or {}).get("provider") or session.get("provider") or "ollama"
-                model = (metadata or {}).get("model") or session.get("model")
+                canonical = self._canonical_role(effective_role)
+                role_cfg = self._roles.get(canonical, {})
+                role_backend = role_cfg.get("backend")
+                role_model = role_cfg.get("model")
+                sess_prov = session.get("provider")
+                if sess_prov and str(sess_prov).lower() == "daemon":
+                    sess_prov = None
+                backend = (
+                    (metadata or {}).get("backend")
+                    or (metadata or {}).get("provider")
+                    or (role_backend if role_backend and str(role_backend).lower() != "daemon" else None)
+                    or sess_prov
+                    or "ollama"
+                )
+                model = (metadata or {}).get("model") or role_model or session.get("model")
                 self.events.publish(
                     "event.agentSpawned",
                     session_id,

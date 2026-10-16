@@ -1810,7 +1810,7 @@ class AgentRunner:
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
                 "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
                 "You also select and assign appropriate procedural skills from the workspace skills library, indicating `(Skills: <skill_name>)` in milestone titles. "
-                "You operate in a governed environment where all file I/O and graph queries MUST be performed through provided tools (query_graph, read_file, write_file).\n"
+                "You operate in a governed environment where all file I/O, graph queries, and web research MUST be performed through provided tools (query_graph, read_file, write_file, web_search, web_fetch).\n"
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
                 "Only after receiving the graph research results should you call `write_file` to write PLAN.md.\n"
                 "SYSTEM INTEGRATION RULE: Plan end-to-end integration: if a milestone produces frontend assets (HTML/CSS/JS), "
@@ -3397,22 +3397,39 @@ class AgentRunner:
         sync_dir = base_dir / ".sync"
         active_dir = sync_dir / "work-orders" / "ACTIVE"
         index_file = sync_dir / "work-orders" / "INDEX.yaml"
-        if not active_dir.is_dir() or not index_file.is_file():
+        if not active_dir.is_dir() and not (sync_dir / "work-orders").is_dir():
             return
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
         try:
-            index_data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
-            if not isinstance(index_data, dict):
-                return
+            index_data: dict[str, Any] = {}
+            if index_file.is_file():
+                try:
+                    loaded = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        index_data = loaded
+                except Exception:
+                    index_data = {}
+            if not index_data:
+                index_data = {
+                    "schema_version": 1,
+                    "last_updated": now_iso,
+                    "updated_by": "stackmind-sync",
+                    "orders": [],
+                    "next_id": 1,
+                    "total_active": 0,
+                    "total_completed": 0,
+                    "total_blocked": 0,
+                }
+                updated_index = True
+            else:
+                updated_index = False
             index_data.setdefault("next_id", 1)
             orders = index_data.setdefault("orders", [])
             existing_orders = {
                 o.get("id"): o for o in orders if isinstance(o, dict) and "id" in o
             }
-            updated_index = False
             assigned_per_agent: dict[str, list[str]] = {}
-
-            from datetime import datetime, timezone
-            now_iso = datetime.now(timezone.utc).isoformat()
 
             completed_dir = sync_dir / "work-orders" / "COMPLETED"
             if completed_dir.is_dir():
@@ -3551,7 +3568,9 @@ class AgentRunner:
 
             if updated_index:
                 index_data["last_updated"] = now_iso
-                index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+                temp_idx = index_file.with_name(f"{index_file.name}.tmp.{int(time.time() * 1000)}")
+                temp_idx.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+                temp_idx.replace(index_file)
 
             # Also ensure work_orders totals and assigned_work_orders in TREE.yaml are updated
             tree_file = sync_dir / "runtime" / "TREE.yaml"
@@ -3587,7 +3606,9 @@ class AgentRunner:
                                             curr_assigned.append(w)
                                             updated_tree = True
                     if updated_tree:
-                        tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+                        temp_tree = tree_file.with_name(f"{tree_file.name}.tmp.{int(time.time() * 1000)}")
+                        temp_tree.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+                        temp_tree.replace(tree_file)
         except Exception:
             pass
 

@@ -5,9 +5,11 @@ from __future__ import annotations
 import datetime
 import hashlib
 import io
+import json
 import os
 import re
 import sys
+import textwrap
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console, Group, RenderableType
@@ -359,6 +361,7 @@ def render_user_message(
     *,
     accent: bool = True,
     show_timestamp: bool | None = None,
+    avail_width: int = 80,
 ) -> RenderableType:
     """Render a user message per §14 (visually quiet, 'You' header, unboxed, compact)."""
     if accent:
@@ -381,13 +384,27 @@ def render_user_message(
         top_elem = hdr
 
     lines: list[RenderableType] = [Text(""), top_elem]
-    for line in content.splitlines():
-        if accent:
-            msg_line = Text("│ ", style="bold #38bdf8")
-            msg_line.append(line, style="white on grey19")
-        else:
-            msg_line = Text(line, style="white")
-        lines.append(msg_line)
+    max_wrap_w = max(20, avail_width - 4)
+    for raw_line in content.splitlines():
+        if not raw_line:
+            if accent:
+                lines.append(Text("│ ", style="bold #38bdf8"))
+            else:
+                lines.append(Text(""))
+            continue
+        chunks = textwrap.wrap(
+            raw_line,
+            width=max_wrap_w,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or [raw_line]
+        for chunk in chunks:
+            if accent:
+                msg_line = Text("│ ", style="bold #38bdf8")
+                msg_line.append(chunk, style="white on grey19")
+            else:
+                msg_line = Text(chunk, style="white")
+            lines.append(msg_line)
     return Group(*lines)
 
 
@@ -413,6 +430,7 @@ def render_user_message_str(
             timestamp=timestamp,
             accent=accent,
             show_timestamp=show_timestamp,
+            avail_width=width,
         )
     )
     return console.export_text(styles=use_ansi).rstrip()
@@ -531,6 +549,204 @@ def normalize_action_call(act: Any) -> tuple[str, str]:
     return clean_t or desc or "Tool", target
 
 
+def is_internal_sync_action(act: Any = None, arg: str = "") -> bool:
+    """Return True if the action or argument represents internal StackMind synchronization plumbing."""
+    candidates = (
+        [arg, getattr(act, "target", None), getattr(act, "description", None), getattr(act, "tool_name", None), getattr(act, "action_id", None)]
+        if act is not None
+        else [arg]
+    )
+    for c in candidates:
+        if c:
+            s = str(c).replace("\\", "/")
+            if "/.sync" in s or s.startswith(".sync/") or s == ".sync" or "(.sync" in s:
+                return True
+    return False
+
+
+def compute_diff_stats(diff_text: str) -> tuple[int, int]:
+    """Count added and removed lines from unified diff text."""
+    if not diff_text:
+        return 0, 0
+    added = 0
+    removed = 0
+    for l in diff_text.splitlines():
+        if l.startswith("+++") or l.startswith("---") or l.startswith("@@"):
+            continue
+        if l.startswith("+"):
+            added += 1
+        elif l.startswith("-"):
+            removed += 1
+    return added, removed
+
+
+def parse_tool_output_info(act: Any, t_name: str) -> dict[str, Any]:
+    """Inspect tool output and metadata to determine success/failure and concise summary."""
+    output = getattr(act, "output", None)
+    error = getattr(act, "error", None)
+    st = str(getattr(act, "status", "")).upper()
+
+    parsed_json: dict[str, Any] | None = None
+    if isinstance(output, dict):
+        parsed_json = output
+    elif isinstance(output, str):
+        s = output.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                p = json.loads(s)
+                if isinstance(p, dict):
+                    parsed_json = p
+            except Exception:
+                pass
+
+    is_failed = st in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}
+    summary: str | None = None
+    dot_color = None
+
+    t_lower = t_name.lower()
+    is_test_tool = any(k in t_lower for k in ("test", "pytest", "verify"))
+    is_sec_tool = any(k in t_lower for k in ("security", "scan", "audit", "linter", "typecheck"))
+
+    if parsed_json:
+        if parsed_json.get("success") is False or (parsed_json.get("exit_code", 0) not in (0, None)):
+            is_failed = True
+        elif parsed_json.get("passed") is False:
+            is_failed = True
+
+        if is_test_tool:
+            failed = parsed_json.get("failed")
+            passed = parsed_json.get("passed")
+            errors = parsed_json.get("errors")
+            if failed is not None or passed is not None:
+                parts = []
+                if failed:
+                    parts.append(f"{failed} failed")
+                if errors:
+                    parts.append(f"{errors} errors")
+                if passed:
+                    parts.append(f"{passed} passed")
+                if parts:
+                    summary = " — " + ", ".join(parts)
+            elif is_failed:
+                ec = parsed_json.get("exit_code")
+                summary = f" — failed (exit code {ec})" if ec is not None else " — tests failed"
+            elif not is_failed and passed:
+                summary = f" — {passed} passed"
+        elif is_sec_tool:
+            findings = parsed_json.get("findings") or parsed_json.get("issues") or []
+            if isinstance(findings, list) and findings:
+                is_failed = True
+                crit = sum(1 for f in findings if isinstance(f, dict) and str(f.get("severity", "")).upper() in {"CRITICAL", "HIGH"})
+                first_code = findings[0].get("id") or findings[0].get("code") or findings[0].get("rule") if isinstance(findings[0], dict) else None
+                code_str = f" ({first_code})" if first_code else ""
+                if crit > 0:
+                    summary = f" — {len(findings)} critical finding{'s' if len(findings) > 1 else ''}{code_str}"
+                    dot_color = "red"
+                else:
+                    summary = f" — {len(findings)} finding{'s' if len(findings) > 1 else ''}{code_str}"
+                    dot_color = "yellow"
+            elif is_failed:
+                summary = " — scan failed"
+    elif isinstance(output, str) and output.strip():
+        m = re.search(r"(\d+)\s+failed(?:,\s*(\d+)\s+passed)?", output)
+        if m:
+            is_failed = True
+            f_cnt = m.group(1)
+            p_cnt = m.group(2)
+            summary = f" — {f_cnt} failed, {p_cnt} passed" if p_cnt else f" — {f_cnt} failed"
+        elif "FAILURES" in output or "=== ERRORS ===" in output:
+            is_failed = True
+            summary = " — tests failed"
+
+    if is_failed and not dot_color:
+        dot_color = "red"
+
+    return {
+        "is_failed": is_failed,
+        "summary": summary,
+        "dot_color": dot_color,
+        "parsed_json": parsed_json,
+    }
+
+
+def extract_clean_tool_text(act: Any, parsed_json: dict[str, Any] | None = None) -> str:
+    """Extract human-readable text from tool output, error, or parsed JSON."""
+    raw_output = getattr(act, "output", None)
+    raw_error = getattr(act, "error", None)
+
+    if parsed_json is None and isinstance(raw_output, dict):
+        parsed_json = raw_output
+    elif parsed_json is None and isinstance(raw_output, str):
+        s = raw_output.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                p = json.loads(s)
+                if isinstance(p, dict):
+                    parsed_json = p
+            except Exception:
+                pass
+
+    if parsed_json:
+        for k in ("stdout", "output", "stderr", "text", "content"):
+            val = parsed_json.get(k)
+            if val:
+                return str(val)
+        findings = parsed_json.get("findings")
+        if isinstance(findings, list) and findings:
+            f_lines = []
+            for f in findings:
+                if isinstance(f, dict):
+                    sev = f.get("severity", "FINDING").upper()
+                    f_id = f.get("id") or f.get("code") or ""
+                    msg = f.get("message") or f.get("desc") or ""
+                    loc = f.get("file", "")
+                    if f.get("line"):
+                        loc += f":{f['line']}"
+                    f_lines.append(f"[{sev}] {f_id}: {msg} ({loc})" if loc else f"[{sev}] {f_id}: {msg}")
+                else:
+                    f_lines.append(str(f))
+            return "\n".join(f_lines)
+        failures = parsed_json.get("failures")
+        if isinstance(failures, list) and failures:
+            return "\n".join(str(f) for f in failures)
+        if parsed_json.get("error"):
+            return str(parsed_json["error"])
+
+    if raw_error:
+        from cli.tui.events import clean_error_message
+        return clean_error_message(raw_error)
+    if isinstance(raw_output, str):
+        return raw_output
+    return ""
+
+
+def format_expanded_tool_output(
+    act: Any,
+    parsed_json: dict[str, Any] | None = None,
+    indent: str = "  ",
+    max_lines: int = 25,
+) -> RenderableType | None:
+    """Format clean multiline output for expanded tools, unescaping newlines and extracting stdout/stderr."""
+    clean_text = extract_clean_tool_text(act, parsed_json=parsed_json)
+    if not clean_text or not clean_text.strip():
+        return None
+
+    if "\\n" in clean_text and "\n" not in clean_text:
+        clean_text = clean_text.replace("\\n", "\n").replace("\\t", "    ")
+
+    lines: list[RenderableType] = []
+    text_lines = clean_text.strip().splitlines()
+    preview = text_lines[:max_lines]
+    for tl in preview:
+        t = Text(f"{indent}│ ")
+        t.append(tl, style="dim #cbd5e1")
+        lines.append(t)
+    if len(text_lines) > max_lines:
+        lines.append(Text(f"{indent}│ ... (+{len(text_lines) - max_lines} more lines)", style="dim #64748b"))
+
+    return Group(*lines) if lines else None
+
+
 def render_actions_group(
     group: Any,
     *,
@@ -573,6 +789,8 @@ def render_actions_group(
     collapsed: list[tuple[Any, int, str, str, str, int]] = []
     for act, indent_lvl in vis_items:
         t_name, arg = normalize_action_call(act)
+        if t_name != "Agent" and is_internal_sync_action(act, arg):
+            continue
         st = str(getattr(act, "status", "")).upper()
         if (
             collapsed
@@ -602,8 +820,14 @@ def render_actions_group(
         is_indented = indent_lvl > 0
         indent_prefix = "  " if is_indented else ""
 
+        info = parse_tool_output_info(act, t_name)
+        if info["is_failed"]:
+            st = "FAILED"
+
         # Status dot
-        if st in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}:
+        if info.get("dot_color"):
+            dot_color = info["dot_color"]
+        elif st in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}:
             dot_color = "green"
         elif st in {"RUNNING", "ACTIVE", "IN_PROGRESS"}:
             dot_color = "yellow"
@@ -631,26 +855,59 @@ def render_actions_group(
         if count > 1:
             line.append(f" (×{count})", style="dim")
 
-        is_failed = st in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}
+        is_failed = st in {"FAILED", "FAILURE", "ERROR", "BLOCKED"} or info["is_failed"]
         error_val = getattr(act, "error", None)
 
         diff_val = getattr(act, "diff", None) or (
             getattr(act, "code", None) if t_name in {"Edit", "Patch"} else None
         )
+        if not diff_val and getattr(act, "output", None):
+            out_s = str(act.output)
+            if "@@" in out_s:
+                idx = out_s.find("--- a/")
+                if idx == -1:
+                    idx = out_s.find("@@")
+                if idx != -1:
+                    diff_val = out_s[idx:].strip()
+
+        if not diff_val and getattr(act, "code", None) and t_name in {"Write", "Create"}:
+            c_lines = str(act.code).splitlines()
+            rel_tgt = (arg or getattr(act, "target", "") or "file").replace("\\", "/").strip().lstrip("/")
+            diff_val = f"--- a/{rel_tgt}\n+++ b/{rel_tgt}\n@@ -0,0 +1,{len(c_lines)} @@\n" + "\n".join(f"+{l}" for l in c_lines)
+
         has_diff = bool(diff_val and str(diff_val).strip())
         is_completed = st in {"COMPLETED", "SUCCESS", "DONE", "PASSED"}
         auto_render_diff = (
             has_diff
             and is_completed
-            and (t_name in {"Edit", "Patch"} or bool(getattr(act, "diff", None)))
+            and (t_name in {"Edit", "Patch", "Write", "Create"} or bool(getattr(act, "diff", None)))
         )
 
-        if is_failed and error_val:
-            from cli.tui.events import clean_error_message
-            clean_err = clean_error_message(error_val)
-            if clean_err:
-                line.append(f" — {clean_err}", style="red")
+        if has_diff and auto_render_diff:
+            added, removed = compute_diff_stats(str(diff_val))
+            if added > 0 and removed > 0:
+                stats_str = f"(+{added} -{removed})"
+            elif added > 0:
+                stats_str = f"(+{added})"
+            elif removed > 0:
+                stats_str = f"(-{removed})"
+            else:
+                stats_str = ""
+            if stats_str:
+                line.append(f" {stats_str}", style="dim")
+
+        if is_failed:
+            if info.get("summary"):
+                s_color = info.get("dot_color") or "red"
+                line.append(info["summary"], style=s_color)
+            elif error_val:
+                from cli.tui.events import clean_error_message
+                clean_err = clean_error_message(error_val)
+                if clean_err:
+                    line.append(f" — {clean_err}", style="red")
         else:
+            if info.get("summary"):
+                line.append(info["summary"], style="green")
             has_collapsible = bool(
                 getattr(act, "output", None)
                 or getattr(act, "diff", None)
@@ -662,7 +919,7 @@ def render_actions_group(
 
         lines.append(line)
 
-        # Auto-display compact split diff block on Edit / File Modification Tools
+        # Auto-display compact split diff block on Edit / Write / File Modification Tools
         if auto_render_diff:
             from cli.tui.diff import render_split_diff
             max_l = 100 if actions_obj.expanded else 16
@@ -675,11 +932,15 @@ def render_actions_group(
                 indent="    " if is_indented else "  ",
             )
             lines.append(diff_block)
-        elif actions_obj.expanded and not is_failed:
-            if t_name not in {"Agent", "Read", "List", "Graph", "Verify", "Run Security Scan"} and "harness" not in t_name.lower():
-                prev = render_action_preview(act, avail_width=avail_width)
-                if prev:
-                    lines.append(prev)
+        elif actions_obj.expanded:
+            if t_name not in {"Agent"}:
+                exp_block = format_expanded_tool_output(
+                    act,
+                    parsed_json=info.get("parsed_json"),
+                    indent="    " if is_indented else "  ",
+                )
+                if exp_block:
+                    lines.append(exp_block)
 
     if not lines:
         return Text("")
@@ -691,14 +952,20 @@ def render_actions_group(
 
 def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType | None:
     """Render live or completed action preview: diff for edits, output for bash, code for writes."""
-    if not action:
+    if not action or is_internal_sync_action(action):
         return None
     t_name = str(getattr(action, "tool_name", "") or "").lower()
     target = getattr(action, "target", "") or ""
+    if is_internal_sync_action(action, target):
+        return None
     status = str(getattr(action, "status", "")).upper()
     is_running = status == "RUNNING"
     is_failed = status in {"FAILED", "FAILURE", "ERROR"}
     desc = str(getattr(action, "description", "") or "")
+
+    info = parse_tool_output_info(action, t_name)
+    if info["is_failed"]:
+        is_failed = True
 
     diff = getattr(action, "diff", None)
     output = getattr(action, "output", None)
@@ -707,7 +974,7 @@ def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType 
 
     # Suppress duplicate Agent preview headers
     if desc.startswith("Agent") or "harness" in t_name:
-        if not (output or error or diff or code):
+        if not is_running and not (output or error or diff or code):
             return None
 
     # 1. Edit action -> Diff
@@ -783,10 +1050,11 @@ def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType 
                 lbl = Text("✓ Ran ", style="bold green").append(f"`{target}`", style="white")
 
         lines = [lbl]
-        body_text = output or error or ""
         if is_failed and error:
             from cli.tui.events import clean_error_message
             body_text = clean_error_message(error)
+        else:
+            body_text = extract_clean_tool_text(action, parsed_json=info.get("parsed_json")) or body_text
         if body_text.strip():
             if "\\n" in body_text and "\n" not in body_text:
                 body_text = body_text.replace("\\n", "\n").replace("\\t", "    ")
@@ -1239,6 +1507,7 @@ def render_chat_transcript(
                     timestamp=msg.timestamp if show_timestamps else None,
                     accent=accent,
                     show_timestamp=show_timestamps,
+                    avail_width=width or 80,
                 )
             )
         elif role == "assistant":
@@ -1345,7 +1614,12 @@ def render_chat_transcript_str(
 __all__ = [
     "_make_capture_console",
     "extract_internal_reasoning",
+    "compute_diff_stats",
+    "parse_tool_output_info",
+    "extract_clean_tool_text",
+    "format_expanded_tool_output",
     "is_stray_command_bar",
+    "is_internal_sync_action",
     "render_action_preview",
     "render_action_preview_str",
     "render_actions_group",

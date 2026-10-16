@@ -55,7 +55,8 @@ def extract_candidate_paths(text: str) -> list[str]:
             continue
         if any(clean.endswith(ext) for ext in (
             ".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md",
-            ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite", ".go", ".rs", ".vue", ".svelte"
+            ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite", ".go", ".rs", ".vue", ".svelte",
+            ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot"
         )):
             if not clean.startswith(".sync") and not clean.startswith(".git") and clean not in ("PLAN.md", ".env"):
                 candidate_paths.append(clean)
@@ -179,12 +180,14 @@ def extract_deliverable_spec(
             elif is_svelte:
                 target_path = "src/App.svelte"
             else:
-                if "landing" in combined_lower:
-                    target_path = "src/landing.html"
+                if any(kw in combined_lower for kw in ("style", "css", "theme", "stylesheet", "design system")):
+                    target_path = "css/style.css"
+                elif any(kw in combined_lower for kw in ("script", "javascript", "interactivity")):
+                    target_path = "js/main.js"
                 elif any(kw in combined_lower for kw in ("login", "auth")):
                     target_path = "src/login.html"
                 else:
-                    target_path = "src/frontend.html"
+                    target_path = "index.html"
 
         return {
             "type": "code",
@@ -470,9 +473,14 @@ def derive_implementation_estimate(
         else:
             expected.append(f"tests/test_{stem}.py")
 
+    is_scaffold_task = any(kw in f"{title} {description}".lower() for kw in (
+        "scaffold", "scaffolding", "setup", "asset setup", "structure", "init", "bootstrap"
+    ))
+    max_files = max(len(expected), 6) if is_scaffold_task else max(len(expected), len(expected) + 1)
+
     return {
         "expected_files": expected,
-        "max_files_touched": len(expected),
+        "max_files_touched": max_files,
         "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
     }
 
@@ -506,6 +514,11 @@ def build_child_contract(
         for cp in candidate_paths:
             if cp and isinstance(cp, str) and not cp.startswith(".git") and not cp.startswith(".sync") and cp != ".env":
                 allow_rules.append({"module": cp})
+                clean_cp = cp.replace("\\", "/").strip().lstrip("/")
+                if "/" in clean_cp:
+                    top_dir = clean_cp.split("/")[0]
+                    if top_dir not in (".git", ".sync", ".env"):
+                        allow_rules.append({"module": f"{top_dir}/**"})
 
     # Common repository root documentation and config files allowed across roles:
     allow_rules.extend([
@@ -563,6 +576,13 @@ def build_child_contract(
             {"module": "templates/**"},
             {"module": "views/**"},
             {"module": "components/**"},
+            {"module": "assets/**"},
+            {"module": "css/**"},
+            {"module": "js/**"},
+            {"module": "styles/**"},
+            {"module": "images/**"},
+            {"module": "img/**"},
+            {"module": "fonts/**"},
             {"module": "index.html"},
             {"module": "package.json"},
             {"module": "*.html"},
@@ -571,6 +591,13 @@ def build_child_contract(
             {"module": "*.tsx"},
             {"module": "*.jsx"},
             {"module": "*.css"},
+            {"module": "*.svg"},
+            {"module": "*.png"},
+            {"module": "*.jpg"},
+            {"module": "*.jpeg"},
+            {"module": "*.webp"},
+            {"module": "*.gif"},
+            {"module": "*.ico"},
         ])
     elif role_norm in ("qa", "gemma"):
         allow_rules.extend([

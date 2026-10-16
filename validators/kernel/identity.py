@@ -270,6 +270,8 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
             OperationType.RUN_SECURITY_SCAN.value,
             OperationType.SUBMIT_FOR_REVIEW.value,
             OperationType.ASK_USER.value,
+            OperationType.WEB_SEARCH.value,
+            OperationType.WEB_FETCH.value,
             OperationType.GIT_STAGE.value,
             OperationType.GIT_RESTORE.value,
             OperationType.GIT_CREATE_BRANCH.value,

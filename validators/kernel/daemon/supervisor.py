@@ -2498,7 +2498,9 @@ class LifecycleSupervisor:
                             "assigned_agents": ["claude"],
                         })
                     idx_data["next_id"] = max(idx_data.get("next_id", 1), int(review_wo_id.replace("WO-", "")) + 1)
-                    idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    temp_idx = idx_file.with_name(f"{idx_file.name}.tmp.{int(time.time() * 1000)}")
+                    temp_idx.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    temp_idx.replace(idx_file)
         except Exception:
             pass
 
@@ -4970,7 +4972,9 @@ def archive_completed_work_orders(
                 1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
             )
             index_data["last_updated"] = now_iso
-            index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+            temp_idx = index_file.with_name(f"{index_file.name}.tmp.{int(time.time() * 1000)}")
+            temp_idx.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+            temp_idx.replace(index_file)
         except Exception:
             pass
 
