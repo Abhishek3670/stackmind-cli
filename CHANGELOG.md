@@ -5,6 +5,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.9.0] - 2026-10-17
+
+### Added
+- **Multi-Engine Image Search & Media Asset Extraction**:
+  - `IMAGE_SEARCH = "image_search"` registered in `OperationType` and permitted across `claude`, `codex`, and `gemini` agent roles in `validators/kernel/identity.py`.
+  - DuckDuckGo Images API integration (`search_duckduckgo_images`) with automated session `vqd` token acquisition and query parsing.
+  - Wikimedia Commons image search (`search_wikimedia_images`) querying Wikimedia Action APIs for public domain and Creative Commons media assets with author and license attribution metadata.
+  - SerpAPI Google Images mode (`engine="google_images"`, `tbm="isch"`) in `search_serpapi`.
+  - Integrated `perform_image_search` and `perform_web_search(media_type="images")` routing queries to DuckDuckGo, Wikimedia, or SerpAPI based on provider configuration.
+  - HTML media asset extraction in `perform_web_fetch` (`_HTMLToTextExtractor`): parses `<img>` tags (`src`, `srcset`, `alt`, `title`), resolves relative paths to absolute URLs using page `base_url`, and synthesizes a dedicated `## Discovered Images & Media Assets:` reference block.
+  - `ToolGateway.image_search` and `ToolGateway.web_fetch(extract_images=True)` exposed with tool call routing in `ProviderGateway`.
+- **Deliverable Quality Assurance & Media Integrity Gate**:
+  - HTML media asset integrity verification in `DeliverableVerifier` (`_check_html_media_assets`).
+  - Strict detection of broken media syntax: flags empty or missing `src`, placeholder strings, search and gallery landing pages incorrectly used as raw image URLs (e.g. Unsplash photo search URLs), and missing local relative assets.
+  - Non-blocking remote image reachability probe (HTTP HEAD requests) detecting 404s, 403s, and non-image HTML responses.
+  - Integrated deliverable verification directly into `ToolGateway.verify_deliverable` to ensure agent-produced deliverables conform to QA integrity standards before finalization.
+  - Comprehensive unit test coverage across web search, image extraction, and deliverable QA gates (`test_tools_web_research.py`, `test_deliverable_verifier.py`, `test_tools_qa_verification.py`).
+
 ## [3.8.0] - 2026-10-13
 
 ### Added
