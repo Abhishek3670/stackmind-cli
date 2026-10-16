@@ -53,6 +53,7 @@ from cli.tui.landing import (
 )
 from cli.tui.layout import (
     compute_layout,
+    compute_viewport_height,
     render_runtime_panel_str,
 )
 from cli.tui.state import (
@@ -417,7 +418,10 @@ def _stream_turn_execution(
         else:
             verb = getattr(state, "current_sync_verb", None) or sync_words[0]
         prefix = verb if is_sync_action else "Working..."
-        return f"{prefix} [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
+        res = f"{prefix} [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
+        if state is not None:
+            state.active_working_status = res
+        return res
     _streaming_diagnostics = {
         "redraw_count": 0,
         "event_count": 0,
@@ -750,6 +754,15 @@ def _stream_turn_execution(
                         t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
                     )
                     t_role = str(ev_payload.get("role") or ev_payload.get("agent_id") or "")
+                    if not t_role and state is not None:
+                        op_id = ev_payload.get("operation_id")
+                        if op_id and hasattr(state, "operations") and op_id in state.operations:
+                            t_role = state.operations[op_id].role
+                        if not t_role and hasattr(state, "operations"):
+                            for op in state.operations.values():
+                                if getattr(op, "status", "") == "RUNNING":
+                                    t_role = getattr(op, "role", "")
+                                    break
                     from cli.tui.events import format_action_description
                     latest_act_desc = format_action_description(t_name, target=t_target, role=t_role)
 
@@ -804,6 +817,7 @@ def _stream_turn_execution(
                             clear=False,
                             include_composer=True,
                             composer_is_active=False,
+                            composer_placeholder=_get_working_placeholder(),
                             live_manager=live_manager,
                         )
                     else:

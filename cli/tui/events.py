@@ -792,7 +792,16 @@ class OperationalEventManager:
                 start_time=start_t,
             )
             self.active_tools[call_id] = activity
-            role = str(payload.get("role") or payload.get("agent_id") or "").strip()
+            role = str(payload.get("role") or payload.get("agent_id") or payload.get("agent") or "").strip()
+            if not role and state is not None:
+                op_id = payload.get("operation_id")
+                if op_id and hasattr(state, "operations") and op_id in state.operations:
+                    role = getattr(state.operations[op_id], "role", "")
+                if not role and hasattr(state, "operations"):
+                    for op in state.operations.values():
+                        if getattr(op, "status", "") == "RUNNING":
+                            role = getattr(op, "role", "")
+                            break
             desc = format_action_description(tool_name, target, role=role)
             tool_code = None
             tool_diff = None
@@ -810,6 +819,7 @@ class OperationalEventManager:
                 target=target,
                 code=tool_code,
                 diff=tool_diff,
+                role=role,
             )
             return render_tool_activity(activity), None
 

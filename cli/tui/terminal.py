@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import signal
 import sys
@@ -360,7 +361,7 @@ def render_composer_box(
             panel_title.append(" " + "─" * gap + " ", style=border_color)
             panel_title.append(retry_status, style="dim #94a3b8")
             title_align = "left"
-        elif width >= len(working_status) + len(retry_status) + 6:
+        elif width >= len(working_status) + len(retry_status) + 4:
             panel_title = Text.assemble(
                 working_status,
                 style="bold #38bdf8",
@@ -369,8 +370,44 @@ def render_composer_box(
             panel_title.append(retry_status, style="dim #94a3b8")
             title_align = "left"
         else:
-            panel_title = Text(retry_status, style="dim #94a3b8")
-            title_align = "right"
+            compact_retry = retry_status
+            m = re.search(r"\((\d+/\d+)\s+Attempt(?:\s*\.\s*(\d+/\d+)\s+Retry)?\)", retry_status, re.IGNORECASE)
+            if m:
+                if m.group(2) and m.group(2) != "0/10":
+                    compact_retry = f"({m.group(1)} . {m.group(2)})"
+                else:
+                    compact_retry = f"({m.group(1)})"
+            gap_compact = width - 5 - len(working_status) - len(compact_retry) - 2
+            if gap_compact >= 1:
+                panel_title = Text.assemble(
+                    working_status,
+                    style="bold #38bdf8",
+                )
+                panel_title.append(" " + "─" * max(1, gap_compact) + " ", style=border_color)
+                panel_title.append(compact_retry, style="dim #94a3b8")
+                title_align = "left"
+            elif width >= len(working_status) + len(compact_retry) + 3:
+                panel_title = Text.assemble(
+                    working_status,
+                    style="bold #38bdf8",
+                )
+                panel_title.append(" ", style=border_color)
+                panel_title.append(compact_retry, style="dim #94a3b8")
+                title_align = "left"
+            elif width >= len(working_status) + 4:
+                panel_title = Text()
+                panel_title.append(" ")
+                panel_title.append(working_status, style="bold #38bdf8")
+                panel_title.append(" ")
+                title_align = "left"
+            else:
+                max_w = max(10, width - 6)
+                trunc_w = working_status[: max_w - 3] + "..." if len(working_status) > max_w else working_status
+                panel_title = Text()
+                panel_title.append(" ")
+                panel_title.append(trunc_w, style="bold #38bdf8")
+                panel_title.append(" ")
+                title_align = "left"
     elif working_status:
         panel_title = Text()
         panel_title.append(" ")

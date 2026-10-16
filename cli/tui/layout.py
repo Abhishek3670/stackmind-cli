@@ -957,8 +957,15 @@ def render_full_screen_workspace(
 
     # 5. Dynamic bottom composer box placed above bottom status bar / settings panel
     comp_width = layout.conversation_width if layout.show_runtime else width
+    effective_placeholder = composer_placeholder
+    if (
+        (effective_placeholder in {None, "", "Type a message..."})
+        and state is not None
+        and getattr(state, "active_working_status", None)
+    ):
+        effective_placeholder = state.active_working_status
     composer_str = render_composer_box_str(
-        placeholder=composer_placeholder,
+        placeholder=effective_placeholder,
         shortcuts=shortcuts,
         width=comp_width,
         content=composer_content,

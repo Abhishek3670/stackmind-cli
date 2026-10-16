@@ -434,6 +434,10 @@ def normalize_action_call(act: Any) -> tuple[str, str]:
             target = desc[desc.index("(") + 1 : -1].strip()
         elif not target and desc.startswith("Agent "):
             target = desc[6:].strip()
+        if not target and getattr(act, "role", None):
+            target = str(act.role).strip()
+        if not target:
+            target = "Worker"
         cased = "QA" if target.lower() == "qa" else (target.title() if target.islower() else target)
         return name, cased
 

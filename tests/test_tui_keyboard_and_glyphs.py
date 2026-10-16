@@ -1401,6 +1401,71 @@ def test_layout_workspace_and_process_event_retry_display():
     assert "(10/10 Attempt . 1/10 Retry)" in rendered
 
 
+def test_composer_box_preserves_working_status_when_retry_status_present_in_narrow_width():
+    """Verify Working... status is NEVER dropped even when retry_status is present and width is tight."""
+    from cli.tui.terminal import render_composer_box_str
+
+    working = "Working... [12.4s] (1.2k tokens)"
+    retry = "(2/10 Attempt . 0/10 Retry)"
+
+    # At 80 columns: both visible
+    out_80 = render_composer_box_str(width=80, title=working, retry_status=retry)
+    top_80 = out_80.splitlines()[0]
+    assert "Working... [12.4s]" in top_80
+    assert "2/10" in top_80
+
+    # At 55 columns (narrow split panel): working is preserved, retry is compacted or dropped
+    out_55 = render_composer_box_str(width=55, title=working, retry_status=retry)
+    top_55 = out_55.splitlines()[0]
+    assert "Working... [12.4s]" in top_55
+
+    # At 40 columns (very narrow): working is preserved (truncated if needed)
+    out_40 = render_composer_box_str(width=40, title=working, retry_status=retry)
+    top_40 = out_40.splitlines()[0]
+    assert "Working..." in top_40
+
+
+def test_agent_spawned_preserves_configured_model_and_backend():
+    """Verify event.agentSpawned does not wipe out configured provider/model with [Codex]."""
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus
+
+    state = AutonomousDeliveryState()
+    state.roles["Backend"] = RoleStatus("Backend", backend="ollama", model="gemma4:31b-cloud")
+
+    # Ingest agentSpawned without backend
+    state.process_event({
+        "name": "event.agentSpawned",
+        "payload": {
+            "role": "Backend",
+            "agent_id": "agent-backend-1",
+            "work_order_id": "WO-002",
+        },
+    })
+
+    assert state.roles["Backend"].backend == "ollama"
+    assert state.roles["Backend"].model == "gemma4:31b-cloud"
+
+
+def test_agent_action_renders_role_badge_never_bare_agent():
+    """Verify TurnAction for agent resolves role and renders badge, never bare ● Agent."""
+    from cli.tui.chat import render_actions_group_str
+    from cli.tui.state import ActionsGroup, TurnAction
+
+    # 1. Action with explicit role
+    act1 = TurnAction("h1", "Agent", status="RUNNING", tool_name="harness.run_once", role="Backend")
+    group1 = ActionsGroup(actions=[act1])
+    out1 = render_actions_group_str(group1, width=80)
+    assert "● Agent(Backend)" in out1 or "● Agent (Backend)" in out1
+
+    # 2. Action without explicit role falls back to Worker
+    act2 = TurnAction("h2", "Agent", status="RUNNING", tool_name="harness.run_once")
+    group2 = ActionsGroup(actions=[act2])
+    out2 = render_actions_group_str(group2, width=80)
+    assert "● Agent(Worker)" in out2 or "● Agent (Worker)" in out2
+    assert "● Agent (ctrl+o to expand)" not in out2
+
+
+
 
 
 
