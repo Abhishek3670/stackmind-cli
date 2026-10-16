@@ -325,8 +325,121 @@ def test_skill_retrieval_with_contract_scope_and_universal_skills(tmp_path: Path
     injected_names = [r.skill.name for r in results]
     assert "ponytail" in injected_names, f"ponytail was not injected! Exclusions: {diag.exclusions}"
 
-    # Verify db-wizard was excluded due to contract_scope_denied
     excluded_reasons = {ex["skill_id"]: ex["reason"] for ex in diag.exclusions}
     assert excluded_reasons.get(skill_db.skill_id) == "contract_scope_denied"
+
+
+def test_laya_decides_skills_for_clarity_and_implementation(tmp_path: Path):
+    """Verify Laya decision engine autonomously assigns asd-ste100 and ponytail based on task intent."""
+    from validators.routing.laya_adapter import LayaDecisionAdapter, LayaMode
+
+    store = SkillStore(tmp_path)
+    ste_skill = _make_test_skill(
+        name="asd-ste100",
+        description="Simplified Technical English for unambiguous agent instructions and prompts.",
+    )
+    store.save_version(ste_skill)
+
+    ponytail_skill = _make_test_skill(
+        name="ponytail",
+        description="Write the simplest, minimal code possible.",
+    )
+    store.save_version(ponytail_skill)
+
+    adapter = LayaDecisionAdapter(mode=LayaMode.ACTIVE)
+
+    # 1. Task needing clear instructions/prompts -> Laya decides asd-ste100
+    clarity_task = select_skills_for_task(
+        title="Clarify instructions and prompt specification for downstream agents",
+        description="Remove ambiguity and write controlled plain language rules",
+        role="architect",
+        deliverable_path="docs/SPEC.md",
+        project_path=tmp_path,
+        laya_adapter=adapter,
+    )
+    assert "asd-ste100" in clarity_task
+
+    # 2. Task implementing feature code -> Laya decides ponytail
+    impl_task = select_skills_for_task(
+        title="Implement user authentication API",
+        description="Write JWT verification logic",
+        role="backend",
+        deliverable_path="src/auth.py",
+        project_path=tmp_path,
+        laya_adapter=adapter,
+    )
+    assert "ponytail" in impl_task
+
+    # 3. QA task with inter-agent coordination -> Laya selects asd-ste100
+    qa_task = select_skills_for_task(
+        title="QA Coordination and verification review",
+        description="Coordinate verification handoff and write review report",
+        role="qa",
+        deliverable_path="tests/test_report.md",
+        project_path=tmp_path,
+        laya_adapter=adapter,
+    )
+    assert "asd-ste100" in qa_task
+
+
+def test_laya_decides_skills_for_arbitrary_new_skills(tmp_path: Path):
+    """Verify Laya autonomously evaluates and selects newly added, custom procedural skills."""
+    from validators.routing.laya_adapter import LayaDecisionAdapter, LayaMode
+
+    store = SkillStore(tmp_path)
+
+    # 1. New custom skill: biome-formatter
+    biome_skill = _make_test_skill(
+        name="biome-formatter",
+        description="Fast code formatting and linting for web projects.",
+    )
+    store.save_version(biome_skill)
+
+    # 2. New custom skill: prisma-migrate
+    prisma_skill = _make_test_skill(
+        name="prisma-migrate",
+        description="Database schema migration and ORM model updates.",
+        applicability=SkillApplicability(target_modules=("db/migrations/**", "prisma/**")),
+    )
+    store.save_version(prisma_skill)
+
+    adapter = LayaDecisionAdapter(mode=LayaMode.ACTIVE)
+
+    # Case A: Task mentioning tool and formatting intent -> selects biome-formatter
+    task_biome = select_skills_for_task(
+        title="Run biome to clean codebase",
+        description="Fix lint errors across source files",
+        role="backend",
+        deliverable_path="src/index.ts",
+        project_path=tmp_path,
+        laya_adapter=adapter,
+    )
+    assert "biome-formatter" in task_biome
+    assert "prisma-migrate" not in task_biome
+
+    # Case B: Task targeting database migration -> selects prisma-migrate
+    task_prisma = select_skills_for_task(
+        title="Apply database schema updates",
+        description="Run migration for user table",
+        role="backend",
+        deliverable_path="db/migrations/001_create_users.sql",
+        project_path=tmp_path,
+        laya_adapter=adapter,
+    )
+    assert "prisma-migrate" in task_prisma
+    assert "biome-formatter" not in task_prisma
+
+    # Case C: Unrelated task (e.g. documentation) -> selects neither
+    task_doc = select_skills_for_task(
+        title="Write release notes",
+        description="Document version 1.0 features in markdown",
+        role="architect",
+        deliverable_path="docs/release.md",
+        project_path=tmp_path,
+        laya_adapter=adapter,
+    )
+    assert "biome-formatter" not in task_doc
+    assert "prisma-migrate" not in task_doc
+
 
 

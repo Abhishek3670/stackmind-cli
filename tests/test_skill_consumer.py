@@ -451,3 +451,68 @@ pytest
     assert retrieved.name == "remote-ci-cd"
     assert "Continuous integration" in retrieved.description
 
+
+def test_parse_skill_with_semver_version():
+    """Verify that skills with semver strings (e.g. '0.4.0' or 'v2') parse cleanly without ValueError."""
+    semver_content = """---
+name: asd-ste100
+description: "ASD-STE100 Simplified Technical English"
+version: 0.4.0
+risk_tier: low
+---
+# Simplified Technical English
+1. Write in active voice
+2. Limit instructions to one sentence
+"""
+    rec = parse_skill_markdown(semver_content)
+    assert rec.name == "asd-ste100"
+    assert rec.version == 1
+    assert len(rec.steps) == 2
+
+    # String version in JSON manifest
+    json_manifest = {
+        "name": "semver_json_skill",
+        "version": "2.1.0",
+        "description": "Semver in JSON",
+        "steps": ["Step 1", "Step 2"],
+    }
+    rec_json = parse_skill_json(json_manifest)
+    assert rec_json.name == "semver_json_skill"
+    assert rec_json.version == 2
+    assert len(rec_json.steps) == 2
+
+
+def test_consume_skills_github_clone_fallback_to_raw(isolated_home, monkeypatch):
+    """Verify that if git clone fails, fetch_skills_from_url falls back to downloading raw SKILL.md."""
+    import subprocess
+    from unittest.mock import MagicMock
+    from validators.skill.consumer import fetch_skills_from_url
+
+    raw_skill_content = """---
+name: asd-ste100
+description: Simplified Technical English
+version: 0.4.0
+---
+# Simplified Technical English
+1. Active voice
+"""
+    class FakeRawResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return raw_skill_content.encode("utf-8")
+
+    # Force git clone to raise CalledProcessError
+    def fake_subprocess_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["git", "clone"], stderr="Network unreachable")
+
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr("urllib.request.urlopen", MagicMock(return_value=FakeRawResponse()))
+
+    skills = fetch_skills_from_url("https://github.com/danyuchn/asd-ste100-skill")
+    assert len(skills) == 1
+    assert skills[0].name == "asd-ste100"
+    assert skills[0].version == 1
+
