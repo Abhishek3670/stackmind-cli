@@ -26,12 +26,15 @@ from validators.kernel.providers.gateway import (
     get_curated_tools_for_phase,
 )
 from validators.kernel.web import (
+    perform_image_search,
     perform_web_fetch,
     perform_web_search,
     search_brave,
+    search_duckduckgo_images,
     search_duckduckgo_lite,
     search_serpapi,
     search_tavily,
+    search_wikimedia_images,
 )
 
 
@@ -283,3 +286,123 @@ def test_planning_phase_and_request_tools_web_integration(tmp_path: Path):
     with patch("validators.kernel.web.perform_web_search", return_value=[{"title": "Ok", "url": "u", "snippet": "s"}]) as mock_search:
         provider_gateway.execute_tool_call("web_search", {"q": "search term", "max_results": 7})
         mock_search.assert_called_once_with("search term", limit=7)
+
+
+def test_perform_web_fetch_extracts_images():
+    sample_html = """
+    <!DOCTYPE html>
+    <html>
+      <head><title>Crochet Gallery</title></head>
+      <body>
+        <h1>Handmade Bags</h1>
+        <p>Explore our seasonal collection.</p>
+        <img src="https://images.unsplash.com/photo-1584992236310-6edddc08acff?auto=format&fit=crop&w=800" alt="Crochet bag" />
+        <img src="/assets/local-bag.jpg" alt="Local Bag" />
+        <img src="https://example.com/pixel.gif?tracking=1" alt="tracking" />
+      </body>
+    </html>
+    """
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = sample_html.encode("utf-8")
+    mock_resp.headers.get_content_type.return_value = "text/html"
+    mock_resp.headers.get_content_charset.return_value = "utf-8"
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        text = perform_web_fetch("https://crochet-example.com/gallery")
+
+    assert "## Discovered Images & Media Assets:" in text
+    assert "https://images.unsplash.com/photo-1584992236310-6edddc08acff" in text
+    # Relative URL is resolved using base_url:
+    assert "https://crochet-example.com/assets/local-bag.jpg" in text
+    # Tracking pixel is filtered out:
+    assert "pixel.gif" not in text
+
+
+def test_search_duckduckgo_images():
+    vqd_html = """
+    <html><head><script>vqd='4-1234567890';</script></head><body>Search page</body></html>
+    """
+    json_payload = {
+        "results": [
+            {
+                "title": "Crochet Handbag Pattern",
+                "image": "https://example.com/crochet-bag.jpg",
+                "thumbnail": "https://tse1.mm.bing.net/th?id=123",
+                "url": "https://example.com/patterns",
+                "width": 1200,
+                "height": 800,
+            }
+        ]
+    }
+
+    mock_resp1 = MagicMock()
+    mock_resp1.read.return_value = vqd_html.encode("utf-8")
+    mock_resp1.__enter__.return_value = mock_resp1
+
+    mock_resp2 = MagicMock()
+    mock_resp2.read.return_value = json.dumps(json_payload).encode("utf-8")
+    mock_resp2.__enter__.return_value = mock_resp2
+
+    with patch("urllib.request.urlopen", side_effect=[mock_resp1, mock_resp2]):
+        results = search_duckduckgo_images("crochet handbag", limit=1)
+
+    assert len(results) == 1
+    assert results[0]["title"] == "Crochet Handbag Pattern"
+    assert results[0]["url"] == "https://example.com/crochet-bag.jpg"
+    assert results[0]["media_type"] == "image"
+
+
+def test_search_wikimedia_images():
+    wikimedia_payload = {
+        "query": {
+            "pages": {
+                "123": {
+                    "title": "File:Crochet sample texture.jpg",
+                    "imageinfo": [
+                        {
+                            "url": "https://upload.wikimedia.org/wikipedia/commons/sample.jpg",
+                            "thumburl": "https://upload.wikimedia.org/wikipedia/commons/thumb/sample.jpg",
+                            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Crochet_sample_texture.jpg",
+                            "width": 1024,
+                            "height": 768,
+                            "mime": "image/jpeg",
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(wikimedia_payload).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        results = search_wikimedia_images("crochet", limit=1)
+
+    assert len(results) == 1
+    assert results[0]["title"] == "Crochet sample texture.jpg"
+    assert results[0]["url"] == "https://upload.wikimedia.org/wikipedia/commons/sample.jpg"
+    assert results[0]["media_type"] == "image"
+
+
+def test_tool_gateway_image_search(tmp_path: Path):
+    gateway, journal = _setup_gateway(tmp_path, "gemini")
+
+    mock_images = [{
+        "title": "Handmade Bag",
+        "url": "https://example.com/bag.jpg",
+        "thumbnail_url": "https://example.com/thumb.jpg",
+        "source_url": "https://example.com",
+        "media_type": "image",
+    }]
+
+    with patch("validators.kernel.web.perform_image_search", return_value=mock_images) as mock_img_search:
+        results = gateway.image_search("crochet bag", limit=2)
+
+    assert results == mock_images
+    mock_img_search.assert_called_once_with("crochet bag", limit=2)
+    assert len(journal.records) == 1
+    assert journal.records[0].request.operation_type.value == "image_search"
+

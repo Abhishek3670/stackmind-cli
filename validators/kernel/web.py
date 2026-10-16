@@ -28,11 +28,13 @@ DEFAULT_TIMEOUT_SECONDS = 12
 
 
 class _HTMLToTextExtractor(HTMLParser):
-    """Clean HTML parser that strips scripts/styles and extracts readable text."""
+    """Clean HTML parser that strips scripts/styles and extracts readable text and media."""
 
-    def __init__(self) -> None:
+    def __init__(self, base_url: str = "") -> None:
         super().__init__()
+        self.base_url = base_url
         self.result: list[str] = []
+        self.images: list[dict[str, str]] = []
         self.skip_tags = {"script", "style", "noscript", "svg", "iframe"}
         self.current_skip = 0
         self.in_title = False
@@ -46,6 +48,24 @@ class _HTMLToTextExtractor(HTMLParser):
             self.in_title = True
         elif tag_lower in ("p", "div", "article", "section", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "li", "br"):
             self.result.append("\n")
+        elif tag_lower == "img":
+            attrs_dict = {k.lower(): (v or "") for k, v in attrs if k}
+            src = attrs_dict.get("src") or attrs_dict.get("data-src") or ""
+            srcset = attrs_dict.get("srcset") or ""
+            if not src and srcset:
+                parts = srcset.split(",")
+                if parts:
+                    src = parts[0].strip().split()[0]
+            alt = attrs_dict.get("alt", "").strip()
+            title = attrs_dict.get("title", "").strip()
+            if src and not src.startswith("data:image/svg"):
+                full_src = urllib.parse.urljoin(self.base_url, src) if self.base_url else src
+                lower_src = full_src.lower()
+                if not any(k in lower_src for k in ("tracking", "pixel", "analytics", "beacon", "1x1")):
+                    self.images.append({
+                        "src": full_src,
+                        "alt": alt or title or "Image",
+                    })
 
     def handle_endtag(self, tag: str) -> None:
         tag_lower = tag.lower()
@@ -163,14 +183,26 @@ def search_tavily(query: str, api_key: str, limit: int = 5, timeout: int = DEFAU
     return results
 
 
-def search_serpapi(query: str, api_key: str, limit: int = 5, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[dict[str, Any]]:
-    """Search via SerpAPI."""
-    params = urllib.parse.urlencode({
+def search_serpapi(
+    query: str,
+    api_key: str,
+    limit: int = 5,
+    media_type: str = "all",
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Search via SerpAPI (supports general and images engines)."""
+    params_dict = {
         "q": query,
         "api_key": api_key,
         "num": limit,
-        "engine": "google",
-    })
+    }
+    if media_type in ("images", "image"):
+        params_dict["engine"] = "google_images"
+        params_dict["tbm"] = "isch"
+    else:
+        params_dict["engine"] = "google"
+
+    params = urllib.parse.urlencode(params_dict)
     url = f"https://serpapi.com/search.json?{params}"
 
     req = urllib.request.Request(
@@ -182,12 +214,23 @@ def search_serpapi(query: str, api_key: str, limit: int = 5, timeout: int = DEFA
         data = json.loads(resp.read().decode("utf-8"))
 
     results: list[dict[str, Any]] = []
-    for item in data.get("organic_results", [])[:limit]:
-        results.append({
-            "title": str(item.get("title", "")),
-            "url": str(item.get("link", "")),
-            "snippet": str(item.get("snippet", "")),
-        })
+    if media_type in ("images", "image"):
+        for item in data.get("images_results", [])[:limit]:
+            results.append({
+                "title": str(item.get("title", "")),
+                "url": str(item.get("original", item.get("thumbnail", ""))),
+                "thumbnail_url": str(item.get("thumbnail", "")),
+                "source_url": str(item.get("link", "")),
+                "snippet": str(item.get("source", "")),
+                "media_type": "image",
+            })
+    else:
+        for item in data.get("organic_results", [])[:limit]:
+            results.append({
+                "title": str(item.get("title", "")),
+                "url": str(item.get("link", "")),
+                "snippet": str(item.get("snippet", "")),
+            })
     return results
 
 
@@ -222,14 +265,175 @@ def search_brave(query: str, api_key: str, limit: int = 5, timeout: int = DEFAUL
     return results
 
 
-def perform_web_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
+def search_duckduckgo_images(
+    query: str,
+    limit: int = 5,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Search DuckDuckGo Images for direct, live image assets (zero-configuration)."""
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+
+    # 1. Acquire vqd token from main search endpoint
+    params = urllib.parse.urlencode({"q": clean_query, "iax": "images", "ia": "images"})
+    req = urllib.request.Request(
+        f"https://duckduckgo.com/?{params}",
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    m = (
+        re.search(r'vqd=([\"\']?)([\d\-]+)\1', html)
+        or re.search(r'vqd:\s*([\"\']?)([\d\-]+)\1', html)
+        or re.search(r'vqd=([\d\-]+)', html)
+    )
+    if not m:
+        return []
+
+    vqd = m.group(2) if len(m.groups()) >= 2 and m.group(2) else m.group(1)
+
+    # 2. Query DuckDuckGo image JSON API
+    i_params = urllib.parse.urlencode({
+        "l": "us-en",
+        "o": "json",
+        "q": clean_query,
+        "vqd": vqd,
+        "f": ",,,",
+        "p": "1",
+    })
+    i_req = urllib.request.Request(
+        f"https://duckduckgo.com/i.js?{i_params}",
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": "https://duckduckgo.com/",
+        },
+    )
+
+    with urllib.request.urlopen(i_req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+    results: list[dict[str, Any]] = []
+    for item in data.get("results", [])[:limit]:
+        img_url = item.get("image") or item.get("thumbnail") or ""
+        if img_url:
+            results.append({
+                "title": unescape(str(item.get("title", "")).strip()),
+                "url": img_url,
+                "thumbnail_url": item.get("thumbnail", ""),
+                "source_url": item.get("url", ""),
+                "snippet": f"Dimensions: {item.get('width', 0)}x{item.get('height', 0)} | Source: {item.get('url', '')}",
+                "media_type": "image",
+            })
+    return results
+
+
+def search_wikimedia_images(
+    query: str,
+    limit: int = 5,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Search Wikimedia Commons for free, public domain or Creative Commons image assets."""
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+
+    params = urllib.parse.urlencode({
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": f"{clean_query} filetype:bitmap",
+        "gsrlimit": max(1, min(limit, 20)),
+        "prop": "imageinfo",
+        "iiprop": "url|mime|size",
+        "format": "json",
+    })
+    url = f"https://commons.wikimedia.org/w/api.php?{params}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StackMind/1.0"},
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+    pages = data.get("query", {}).get("pages", {})
+    results: list[dict[str, Any]] = []
+    for page in pages.values():
+        title = page.get("title", "").replace("File:", "").strip()
+        info_list = page.get("imageinfo", [])
+        if info_list:
+            info = info_list[0]
+            img_url = info.get("url", "")
+            if img_url:
+                results.append({
+                    "title": title,
+                    "url": img_url,
+                    "thumbnail_url": info.get("thumburl", img_url),
+                    "source_url": info.get("descriptionurl", img_url),
+                    "snippet": f"{title} ({info.get('width', 0)}x{info.get('height', 0)}, {info.get('mime', 'image')})",
+                    "media_type": "image",
+                })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def perform_web_search(
+    query: str,
+    limit: int = 5,
+    media_type: str = "all",
+) -> list[dict[str, Any]]:
     """Execute live web search across configured or default search providers."""
     clean_query = str(query or "").strip()
     if not clean_query:
         return []
 
     effective_limit = max(1, min(limit or 5, 20))
+    norm_media = str(media_type or "all").lower().strip()
 
+    # Image Search Mode
+    if norm_media in ("images", "image"):
+        # 1. SerpAPI if configured
+        serpapi_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+        if serpapi_key:
+            try:
+                results = search_serpapi(clean_query, serpapi_key, limit=effective_limit, media_type="images")
+                if results:
+                    return results
+            except Exception:
+                pass
+
+        # 2. DuckDuckGo Images
+        try:
+            results = search_duckduckgo_images(clean_query, limit=effective_limit)
+            if results:
+                return results
+        except Exception:
+            pass
+
+        # 3. Wikimedia Commons fallback
+        try:
+            results = search_wikimedia_images(clean_query, limit=effective_limit)
+            if results:
+                return results
+        except Exception:
+            pass
+
+        return [{
+            "title": "Image Search Unavailable",
+            "url": "",
+            "snippet": f"No image assets found for '{clean_query}'. Check network connectivity or query terms.",
+            "media_type": "image",
+        }]
+
+    # General Web Search Mode
     # 1. Check for configured search API keys
     tavily_key = os.environ.get("TAVILY_API_KEY", "").strip()
     if tavily_key:
@@ -241,7 +445,7 @@ def perform_web_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
     serpapi_key = os.environ.get("SERPAPI_API_KEY", "").strip()
     if serpapi_key:
         try:
-            return search_serpapi(clean_query, serpapi_key, limit=effective_limit)
+            return search_serpapi(clean_query, serpapi_key, limit=effective_limit, media_type="all")
         except Exception:
             pass
 
@@ -267,8 +471,13 @@ def perform_web_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
     return []
 
 
-def perform_web_fetch(url: str, max_chars: int = 12_000) -> str:
-    """Fetch and extract readable text/documentation from a web URL."""
+def perform_image_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Search for real, accessible web image assets and photos with direct image URLs."""
+    return perform_web_search(query, limit=limit, media_type="images")
+
+
+def perform_web_fetch(url: str, max_chars: int = 12_000, extract_images: bool = True) -> str:
+    """Fetch and extract readable text/documentation and discovered media from a web URL."""
     clean_url = str(url or "").strip()
     if not clean_url:
         return "Error: URL is required"
@@ -293,7 +502,7 @@ def perform_web_fetch(url: str, max_chars: int = 12_000) -> str:
         if "html" not in content_type:
             return text[:max_chars]
 
-        extractor = _HTMLToTextExtractor()
+        extractor = _HTMLToTextExtractor(base_url=clean_url)
         extractor.feed(text)
         raw_content = "".join(extractor.result)
 
@@ -313,6 +522,20 @@ def perform_web_fetch(url: str, max_chars: int = 12_000) -> str:
         title_header = f"# {extractor.title.strip()}\nSource: {clean_url}\n\n" if extractor.title else f"Source: {clean_url}\n\n"
         body = "\n".join(clean_lines).strip()
         full_result = title_header + body
+
+        if extract_images and extractor.images:
+            seen_src: set[str] = set()
+            unique_imgs = []
+            for img in extractor.images:
+                if img["src"] not in seen_src:
+                    seen_src.add(img["src"])
+                    unique_imgs.append(img)
+            if unique_imgs:
+                media_lines = ["\n\n## Discovered Images & Media Assets:"]
+                for img in unique_imgs[:15]:
+                    media_lines.append(f"- ![{img['alt']}]({img['src']})")
+                full_result += "\n".join(media_lines)
+
         return full_result[:max_chars]
 
     except urllib.error.HTTPError as exc:

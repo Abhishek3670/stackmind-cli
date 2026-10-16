@@ -1295,21 +1295,32 @@ class ToolGateway:
 
             missing = []
             found = []
+            content_issues = []
+            from validators.harness.deliverable_verifier import DeliverableVerifier
+            verifier = DeliverableVerifier()
+
             for d in deliverables:
                 path_str = d.get("path") or d.get("file") or d.get("target") if isinstance(d, dict) else str(d)
                 if path_str:
                     file_path = self.workspace.path_for(path_str)
                     if file_path.exists() and (file_path.is_dir() or file_path.stat().st_size > 0):
                         found.append(path_str)
+                        if file_path.is_file():
+                            v_res = verifier.verify(file_path)
+                            if not v_res.passed:
+                                for c in v_res.checks:
+                                    if not c.passed and c.severity == "error":
+                                        content_issues.append(f"{path_str}: {c.message}")
                     else:
                         missing.append(path_str)
 
-            passed = len(missing) == 0
+            passed = len(missing) == 0 and len(content_issues) == 0
             out = {
                 "wo_id": clean_id,
                 "passed": passed,
                 "deliverables_found": found,
                 "deliverables_missing": missing,
+                "content_issues": content_issues,
             }
         except Exception as e:
             out = {
@@ -1795,21 +1806,33 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, f"Dispatched to {agent_name}")
         return {"dispatched": True, "path": str(dispatch_path.relative_to(self.workspace.root))}
 
-    def web_search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def web_search(self, query: str, limit: int = 5, media_type: str | None = None) -> list[dict[str, Any]]:
         record = self._authorize(OperationType.WEB_SEARCH, f"web/search?q={query}")
         if not record.authorized:
             raise PermissionError(record.reason)
         from .web import perform_web_search
-        results = perform_web_search(query, limit=limit)
+        kwargs: dict[str, Any] = {"limit": limit}
+        if media_type is not None:
+            kwargs["media_type"] = media_type
+        results = perform_web_search(query, **kwargs)
         self.boundary.journal.complete(record.request.operation_id, f"{len(results)} results")
         return results
 
-    def web_fetch(self, url: str) -> str:
+    def image_search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        record = self._authorize(OperationType.IMAGE_SEARCH, f"web/images?q={query}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        from .web import perform_image_search
+        results = perform_image_search(query, limit=limit)
+        self.boundary.journal.complete(record.request.operation_id, f"{len(results)} images")
+        return results
+
+    def web_fetch(self, url: str, extract_images: bool = True) -> str:
         record = self._authorize(OperationType.WEB_FETCH, url)
         if not record.authorized:
             raise PermissionError(record.reason)
         from .web import perform_web_fetch
-        content = perform_web_fetch(url)
+        content = perform_web_fetch(url, extract_images=extract_images)
         self.boundary.journal.complete(record.request.operation_id, "fetched")
         return content
 

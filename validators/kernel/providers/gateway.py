@@ -894,11 +894,24 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ),
     ToolDefinition(
         name="web_search",
-        description="Perform a web search for documentation and API references.",
+        description="Perform a web search for documentation, media assets, and API references. Use media_type='images' to search for image assets.",
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
+                "limit": {"type": "integer", "description": "Max results", "default": 5},
+                "media_type": {"type": "string", "enum": ["all", "images"], "description": "Search media type ('all' or 'images')", "default": "all"},
+            },
+            "required": ["query"],
+        },
+    ),
+    ToolDefinition(
+        name="image_search",
+        description="Search for real, accessible web image assets, photos, logos, and graphics with direct image URLs.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Image search query (e.g. 'crochet handmade bag')"},
                 "limit": {"type": "integer", "description": "Max results", "default": 5},
             },
             "required": ["query"],
@@ -906,11 +919,12 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ),
     ToolDefinition(
         name="web_fetch",
-        description="Fetch static content from a documentation URL.",
+        description="Fetch static content and media assets from a documentation or web URL.",
         parameters={
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "URL to fetch"},
+                "extract_images": {"type": "boolean", "description": "Whether to extract discovered image URLs from the page", "default": True},
             },
             "required": ["url"],
         },
@@ -1141,7 +1155,7 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
 
 
-PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "web_search", "web_fetch")
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "web_search", "image_search", "web_fetch")
 AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
@@ -1151,6 +1165,7 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "find_symbol",
     "find_references",
     "web_search",
+    "image_search",
     "web_fetch",
     "git_log",
     "git_diff",
@@ -1631,11 +1646,13 @@ class ProviderGateway:
                     "analysis": {"find_callers", "find_callees", "impact_analysis", "dependency_analysis", "data_flow_analysis"},
                     "knowledge": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
                     "graph": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
-                    "web": {"web_search", "web_fetch"},
+                    "web": {"web_search", "web_fetch", "image_search"},
+                    "image": {"image_search", "web_search", "web_fetch"},
+                    "images": {"image_search", "web_search", "web_fetch"},
                     "linter": {"run_command"},
                     "linters": {"run_command"},
                     "diagnostics": {"inspect_environment", "inspect_logs", "inspect_version", "checkpoint"},
-                    "search": {"grep", "glob", "semantic_search", "search_docs", "web_search", "web_fetch"},
+                    "search": {"grep", "glob", "semantic_search", "search_docs", "web_search", "image_search", "web_fetch"},
                     "browser": {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "inspect_screenshot"},
                     "process": {"process_start", "process_status", "process_output", "process_stop"},
                     "testing": {"run_tests", "run_lint", "run_typecheck", "run_security_scan", "verify_deliverable", "verify_tests"},
@@ -1663,7 +1680,7 @@ class ProviderGateway:
                 elif any(t in already_active for t in target_names):
                     return f"Tool(s) matching '{query}' are already active in your session."
                 else:
-                    return f"No permitted tools found matching '{query}'. Available categories: web, git, analysis, knowledge, search, linters."
+                    return f"No permitted tools found matching '{query}'. Available categories: web, image, git, analysis, knowledge, search, linters."
 
             if hasattr(self.tool_gateway, name):
                 method = getattr(self.tool_gateway, name)
@@ -1703,6 +1720,10 @@ class ProviderGateway:
                         kwargs[param_name] = args.get("q") or args.get("search") or args.get("prompt")
                     elif param_name == "limit" and any(k in args for k in ("max_results", "count", "num_results", "num", "top_k")):
                         kwargs[param_name] = args.get("max_results") or args.get("count") or args.get("num_results") or args.get("num") or args.get("top_k")
+                    elif param_name == "media_type" and any(k in args for k in ("type", "media", "search_type")):
+                        kwargs[param_name] = args.get("type") or args.get("media") or args.get("search_type")
+                    elif param_name == "extract_images" and any(k in args for k in ("images", "include_images")):
+                        kwargs[param_name] = args.get("images") if "images" in args else args.get("include_images")
                     elif param_name == "url" and any(k in args for k in ("link", "uri", "target", "path", "href")):
                         kwargs[param_name] = args.get("link") or args.get("uri") or args.get("target") or args.get("path") or args.get("href")
                     elif param_name == "symbol" and any(k in args for k in ("name", "target")):

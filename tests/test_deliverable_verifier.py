@@ -274,3 +274,151 @@ class TestMultipleDeliverables:
         results = verifier.verify_multiple(deliverables)
 
         assert len(results) == 2
+
+
+class TestHtmlMediaAssetVerification:
+    """Tests for HTML media asset verification in DeliverableVerifier."""
+
+    def test_html_with_broken_local_image_fails(self, tmp_path):
+        """Referencing a non-existent local image should fail verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Product</h1>
+<img src="assets/non_existent_bag.jpg" alt="Handmade bag">
+</body></html>""")
+
+        result = verifier.verify(html_file)
+        assert not result.passed
+        assert any("Referenced local media file does not exist" in c.message for c in result.checks)
+
+    def test_html_with_existing_local_image_passes(self, tmp_path):
+        """Referencing an existing local image file should pass verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        img_dir = tmp_path / "assets"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        (img_dir / "bag.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Product</h1>
+<img src="assets/bag.jpg" alt="Handmade bag">
+</body></html>""")
+
+        result = verifier.verify(html_file)
+        assert result.passed
+
+    def test_html_with_search_url_as_image_fails(self, tmp_path):
+        """Using a search page or gallery URL as an img src should fail verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Gallery</h1>
+<img src="https://unsplash.com/s/photos/crochet-bag" alt="Search page mistakenly in img src">
+</body></html>""")
+
+        result = verifier.verify(html_file)
+        assert not result.passed
+        assert any("Unsplash search gallery page used as image source" in c.message for c in result.checks)
+
+    def test_html_with_empty_or_placeholder_src_fails(self, tmp_path):
+        """Empty or placeholder src should fail verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Hero</h1>
+<img src="#" alt="placeholder">
+</body></html>""")
+
+        result = verifier.verify(html_file)
+        assert not result.passed
+        assert any("placeholder media src" in c.message.lower() for c in result.checks)
+
+    def test_html_with_valid_remote_image_passes(self, tmp_path):
+        """Valid remote CDN image URL should pass verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Hero</h1>
+<img src="https://images.unsplash.com/photo-1584992236310-6edddc08acff?auto=format&fit=crop&w=800" alt="Crochet bag">
+</body></html>""")
+
+        result = verifier.verify(html_file)
+        assert result.passed
+        assert any("Verified 1 media/image asset references" in c.message for c in result.checks)
+
+    def test_html_with_data_uri_image_passes(self, tmp_path):
+        """Valid data URI image should pass verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Icon</h1>
+<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" alt="Pixel">
+</body></html>""")
+
+        result = verifier.verify(html_file)
+        assert result.passed
+
+    def test_html_with_remote_404_image_fails(self, tmp_path):
+        """Remote image returning 404 Not Found should fail verification."""
+        from unittest.mock import patch
+        import urllib.error
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Hero</h1>
+<img src="https://images.unsplash.com/photo-hallucinated-fake-id" alt="Fake photo">
+</body></html>""")
+
+        err = urllib.error.HTTPError("https://images.unsplash.com/photo-hallucinated-fake-id", 404, "Not Found", {}, None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            result = verifier.verify(html_file)
+
+        assert not result.passed
+        assert any("Remote media asset does not exist (HTTP 404 Not Found)" in c.message for c in result.checks)
+
+    def test_html_with_remote_html_document_image_fails(self, tmp_path):
+        """Remote image URL returning an HTML page instead of an image should fail verification."""
+        from unittest.mock import patch, MagicMock
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        html_file = tmp_path / "index.html"
+        html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Hero</h1>
+<img src="https://example.com/not-an-image" alt="Not an image">
+</body></html>""")
+
+        mock_resp = MagicMock()
+        mock_resp.headers.get_content_type.return_value = "text/html"
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = verifier.verify(html_file)
+
+        assert not result.passed
+        assert any("Remote URL returned HTML document instead of an image asset" in c.message for c in result.checks)
+
+

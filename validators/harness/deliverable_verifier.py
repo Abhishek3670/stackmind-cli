@@ -14,8 +14,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 import yaml
@@ -342,10 +346,8 @@ class DeliverableVerifier:
                     severity="error",
                 ))
 
-        # HTML token parsing check (basic token/element parsing via stdlib HTMLParser; not full HTML conformance)
+        # HTML token parsing check and media asset verification
         if ext == ".html":
-            from html.parser import HTMLParser
-
             class WellFormednessParser(HTMLParser):
                 pass
 
@@ -366,11 +368,218 @@ class DeliverableVerifier:
                     severity="error",
                 ))
 
+            # Validate media assets (images, videos, pictures, sources)
+            checks.extend(self._check_html_media_assets(path, content))
+
         if ext not in (".json", ".yaml", ".yml", ".py", ".html"):
             checks.append(VerificationCheck(
                 name="format_syntax",
                 passed=True,
                 message=f"Format-specific syntax validation not implemented for '{ext}' (skipped)",
+                severity="info",
+            ))
+
+        return checks
+
+    def _check_html_media_assets(self, path: Path, content: str) -> list[VerificationCheck]:
+        """Verify image and media assets in HTML deliverables for broken, placeholder, or invalid URLs."""
+        checks: list[VerificationCheck] = []
+
+        class MediaTagExtractor(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.media_elements: list[dict[str, Any]] = []
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                tag_lower = tag.lower()
+                attrs_dict = {k.lower(): (v or "") for k, v in attrs if k}
+                if tag_lower in ("img", "source", "video", "audio", "embed"):
+                    self.media_elements.append({
+                        "tag": tag_lower,
+                        "src": attrs_dict.get("src", "").strip(),
+                        "srcset": attrs_dict.get("srcset", "").strip(),
+                        "alt": attrs_dict.get("alt", "").strip(),
+                        "line": self.getpos()[0],
+                    })
+
+        extractor = MediaTagExtractor()
+        try:
+            extractor.feed(content)
+        except Exception:
+            return checks
+
+        if not extractor.media_elements:
+            return checks
+
+        # Webpage search/gallery domains and routes that are NOT image assets
+        INVALID_PAGE_PATTERNS = [
+            (r"(?i)unsplash\.com/s/photos/", "Unsplash search gallery page used as image source"),
+            (r"(?i)unsplash\.com/photos/[^/]+$", "Unsplash photo landing page used as image source (requires direct image CDN URL)"),
+            (r"(?i)google\.[a-z]+/search", "Google search results page used as image source"),
+            (r"(?i)duckduckgo\.com/\?q=", "DuckDuckGo search results page used as image source"),
+            (r"(?i)pexels\.com/search/", "Pexels search gallery page used as image source"),
+            (r"(?i)shutterstock\.com/search/", "Shutterstock search page used as image source"),
+            (r"(?i)wikipedia\.org/wiki/", "Wikipedia article page used as image source"),
+            (r"(?i)\.html?([?#].*)?$", "HTML webpage URL used as image source"),
+        ]
+
+        # Obvious placeholder values
+        PLACEHOLDER_SRC_VALUES = {
+            "#",
+            "undefined",
+            "null",
+            "none",
+            "todo",
+            "placeholder.png",
+            "placeholder.jpg",
+            "image.png",
+            "example.com/image.png",
+        }
+
+        html_dir = path.parent if path and isinstance(path, Path) else Path(".")
+
+        total_checked = 0
+        failed_count = 0
+
+        for elem in extractor.media_elements:
+            tag = elem["tag"]
+            src = elem["src"]
+            srcset = elem["srcset"]
+            line = elem["line"]
+
+            # If img has neither src nor srcset
+            if tag == "img" and not src and not srcset:
+                checks.append(VerificationCheck(
+                    name="html_media_assets",
+                    passed=False,
+                    message=f"Line {line}: <img> tag missing required 'src' attribute",
+                    severity="error",
+                ))
+                failed_count += 1
+                continue
+
+            sources_to_test = [src] if src else []
+            if srcset:
+                for candidate in srcset.split(","):
+                    c_url = candidate.strip().split()[0] if candidate.strip() else ""
+                    if c_url:
+                        sources_to_test.append(c_url)
+
+            for s in sources_to_test:
+                total_checked += 1
+                lower_s = s.lower().strip()
+
+                if not lower_s or lower_s in PLACEHOLDER_SRC_VALUES:
+                    checks.append(VerificationCheck(
+                        name="html_media_assets",
+                        passed=False,
+                        message=f"Line {line}: Empty or placeholder media src '{s}' in <{tag}> tag",
+                        severity="error",
+                    ))
+                    failed_count += 1
+                    continue
+
+                # Check if search/gallery webpage URL was used
+                matched_page_pattern = False
+                for pattern, msg in INVALID_PAGE_PATTERNS:
+                    if re.search(pattern, s):
+                        checks.append(VerificationCheck(
+                            name="html_media_assets",
+                            passed=False,
+                            message=f"Line {line}: {msg} in <{tag}>: '{s}'",
+                            severity="error",
+                        ))
+                        failed_count += 1
+                        matched_page_pattern = True
+                        break
+
+                if matched_page_pattern:
+                    continue
+
+                # Check data URIs
+                if lower_s.startswith("data:"):
+                    if not lower_s.startswith(("data:image/", "data:video/", "data:audio/")):
+                        checks.append(VerificationCheck(
+                            name="html_media_assets",
+                            passed=False,
+                            message=f"Line {line}: Invalid data URI scheme in <{tag}>: '{s[:40]}...'",
+                            severity="error",
+                        ))
+                        failed_count += 1
+                    continue
+
+                # Check HTTP / HTTPS URLs
+                if lower_s.startswith(("http://", "https://", "//")):
+                    try:
+                        norm_url = f"https:{s}" if s.startswith("//") else s
+                        parsed = urllib.parse.urlparse(norm_url)
+                        if not parsed.netloc:
+                            checks.append(VerificationCheck(
+                                name="html_media_assets",
+                                passed=False,
+                                message=f"Line {line}: Malformed remote media URL '{s}' in <{tag}>",
+                                severity="error",
+                            ))
+                            failed_count += 1
+                            continue
+
+                        # Probe reachability if online (gracefully skips if offline/sandboxed/timeout)
+                        try:
+                            head_req = urllib.request.Request(
+                                norm_url,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                                method="HEAD",
+                            )
+                            with urllib.request.urlopen(head_req, timeout=2.0) as resp:
+                                content_type = str(resp.headers.get_content_type() or "").lower()
+                                if content_type and "html" in content_type:
+                                    checks.append(VerificationCheck(
+                                        name="html_media_assets",
+                                        passed=False,
+                                        message=f"Line {line}: Remote URL returned HTML document instead of an image asset (Content-Type: {content_type}): '{s}'",
+                                        severity="error",
+                                    ))
+                                    failed_count += 1
+                        except urllib.error.HTTPError as exc:
+                            if exc.code in (404, 410, 400):
+                                checks.append(VerificationCheck(
+                                    name="html_media_assets",
+                                    passed=False,
+                                    message=f"Line {line}: Remote media asset does not exist (HTTP {exc.code} {exc.reason}): '{s}'",
+                                    severity="error",
+                                ))
+                                failed_count += 1
+                        except Exception:
+                            # Offline / sandbox network isolation / timeout: do not fail offline builds
+                            pass
+
+                    except Exception as e:
+                        checks.append(VerificationCheck(
+                            name="html_media_assets",
+                            passed=False,
+                            message=f"Line {line}: Invalid media URL format '{s}': {e}",
+                            severity="error",
+                        ))
+                        failed_count += 1
+                    continue
+
+                # Local relative path: check that file exists on disk
+                local_file_str = s.split("?")[0].split("#")[0]
+                local_path = (html_dir / local_file_str).resolve()
+                if not local_path.is_file():
+                    checks.append(VerificationCheck(
+                        name="html_media_assets",
+                        passed=False,
+                        message=f"Line {line}: Referenced local media file does not exist on disk: '{s}' in <{tag}>",
+                        severity="error",
+                    ))
+                    failed_count += 1
+
+        if failed_count == 0 and total_checked > 0:
+            checks.append(VerificationCheck(
+                name="html_media_assets",
+                passed=True,
+                message=f"Verified {total_checked} media/image asset references (all valid)",
                 severity="info",
             ))
 

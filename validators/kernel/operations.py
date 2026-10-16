@@ -91,6 +91,7 @@ class OperationType(str, Enum):
 
     # Web Research
     WEB_SEARCH = "web_search"
+    IMAGE_SEARCH = "image_search"
     WEB_FETCH = "web_fetch"
     SEARCH_DOCS = "search_docs"
 
