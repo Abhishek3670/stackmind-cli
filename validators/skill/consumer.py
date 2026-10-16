@@ -45,6 +45,23 @@ def slugify_skill_name(raw: str) -> str:
     return slug
 
 
+def _parse_version_int(raw: Any) -> int:
+    """Safely parse version to positive int, handling semver ('0.4.0' -> 1) or 'v2'."""
+    if isinstance(raw, int):
+        return max(1, raw)
+    if isinstance(raw, float):
+        return max(1, int(raw))
+    raw_str = str(raw).strip()
+    m = re.search(r"\d+", raw_str)
+    if m:
+        try:
+            val = int(m.group(0))
+            return max(1, val)
+        except ValueError:
+            pass
+    return 1
+
+
 def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     """Parse YAML frontmatter delimited by `---` from markdown content."""
     stripped = content.strip()
@@ -268,9 +285,7 @@ def parse_skill_markdown(content: str, filename_or_path: str | Path | None = Non
     desc = str(desc).strip()
 
     # 3. Resolve version & risk tier
-    version = int(frontmatter.get("version", 1))
-    if version < 1:
-        version = 1
+    version = _parse_version_int(frontmatter.get("version", 1))
 
     risk_raw = str(frontmatter.get("risk_tier") or frontmatter.get("risk") or "low").lower()
     try:
@@ -355,7 +370,7 @@ def parse_skill_json(content: str | dict[str, Any], filename_or_path: str | Path
     if "procedure" in data and "skill_id" in data and "status" in data:
         # Standardize name slug
         data["name"] = slugify_skill_name(data["name"])
-        data["skill_id"] = SkillRecord.mint_id(data["name"], int(data.get("version", 1)))
+        data["skill_id"] = SkillRecord.mint_id(data["name"], _parse_version_int(data.get("version", 1)))
         return SkillRecord.from_dict(data)
 
     # Simplified format
@@ -364,7 +379,7 @@ def parse_skill_json(content: str | dict[str, Any], filename_or_path: str | Path
         raw_name = Path(filename_or_path).stem
     name = slugify_skill_name(str(raw_name or "unnamed_skill"))
 
-    version = int(data.get("version", 1))
+    version = _parse_version_int(data.get("version", 1))
     risk_raw = str(data.get("risk_tier", "low")).lower()
     try:
         risk_tier = RiskTier(risk_raw)
@@ -616,11 +631,25 @@ def fetch_skills_from_url(url: str) -> list[SkillRecord]:
                 timeout=60,
                 check=True,
             )
-        except subprocess.CalledProcessError as err:
-            err_msg = (err.stderr or err.stdout or str(err)).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError) as err:
+            # Fallback for GitHub repositories: attempt direct raw fetch of SKILL.md across common branches
+            if "github.com" in netloc:
+                match_repo = re.match(r"^/([^/]+)/([^/]+?)(?:\.git)?/?$", path)
+                if match_repo:
+                    owner, repo = match_repo.groups()
+                    for branch in ("master", "main"):
+                        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/SKILL.md"
+                        try:
+                            req = urllib.request.Request(raw_url, headers={"User-Agent": "stackmind-cli"})
+                            with urllib.request.urlopen(req, timeout=15) as resp:
+                                text = resp.read().decode("utf-8")
+                                return [parse_skill_markdown(text, filename_or_path="SKILL.md")]
+                        except Exception:
+                            continue
+            err_msg = (getattr(err, "stderr", None) or getattr(err, "stdout", None) or str(err)).strip()
+            if isinstance(err, FileNotFoundError):
+                raise RuntimeError(f"'git' command not found. Please install git or use a raw file URL directly.") from err
             raise RuntimeError(f"Failed to clone git repository '{clone_url}': {err_msg}") from err
-        except FileNotFoundError as err:
-            raise RuntimeError("'git' command not found. Please install git or use a raw file URL directly.") from err
 
         scan_target = tmp_path / subpath if subpath else tmp_path
         if not scan_target.exists():

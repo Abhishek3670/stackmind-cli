@@ -168,6 +168,8 @@ def setup_executing_state(tmp_path: Path, wo_id: str = "WO-001") -> tuple[MockSe
     state = supervisor.start_run("run-recovery", "Scaffold app", tmp_path, "sess-001")
     state.phase = Phase.EXECUTING
     state.worker_wo_ids = [wo_id]
+    state.max_retries = 2
+    state.max_attempts = 1
     write_ready_artifact_set(tmp_path, [(wo_id, "codex", "backend", "code", "src/app.py")])
     return mock_mgr, supervisor, state
 
@@ -1173,6 +1175,8 @@ class TestQaTestAuthoringLoop:
         state = supervisor.start_run("run-qa", "Build app", tmp_path, "sess-001")
         state.phase = Phase.EXECUTING
         state.worker_wo_ids = ["WO-005"]
+        state.max_retries = 2
+        state.max_attempts = 1
         write_wo(tmp_path, make_wo("WO-005", agent="gemma", deliv_path="tests/test_app.py"))
         contract = make_contract("WO-005", agent="gemma", extra_allow=["tests/test_app.py"])
         contract["identity"] = {"role": "qa", "reports_to": "claude"}

@@ -120,10 +120,12 @@ class RunState:
     failed_wo_ids: list[str] = field(default_factory=list)
     blocked_wo_ids: list[str] = field(default_factory=list)
     retry_counts: dict[str, int] = field(default_factory=dict)
+    attempt_counts: dict[str, int] = field(default_factory=dict)
     contention_count: int = 0
     integration_operation_id: str | None = None
     integration_wo_id: str | None = None
     integration_blockers: list[str] = field(default_factory=list)
+    integration_evidence: dict[str, Any] = field(default_factory=dict)
     batch_operation_id: str | None = None
     gitops_wo_id: str | None = None
     gitops_operation_id: str | None = None
@@ -132,7 +134,8 @@ class RunState:
     updated_at: str = ""
     release_commit_sha: str | None = None
     transitions: list[dict[str, str]] = field(default_factory=list)
-    max_retries: int = 2
+    max_retries: int = 10
+    max_attempts: int = 10
     ignored_operation_ids: list[str] = field(default_factory=list)
     dependency_escalation_op_id: str | None = None
     dependency_escalation_wo_id: str | None = None
@@ -183,10 +186,12 @@ class RunState:
             "failed_wo_ids": list(self.failed_wo_ids),
             "blocked_wo_ids": list(self.blocked_wo_ids),
             "retry_counts": dict(self.retry_counts),
+            "attempt_counts": dict(self.attempt_counts),
             "contention_count": self.contention_count,
             "integration_operation_id": self.integration_operation_id,
             "integration_wo_id": self.integration_wo_id,
             "integration_blockers": list(self.integration_blockers),
+            "integration_evidence": dict(self.integration_evidence),
             "batch_operation_id": self.batch_operation_id,
             "gitops_wo_id": self.gitops_wo_id,
             "gitops_operation_id": self.gitops_operation_id,
@@ -196,6 +201,7 @@ class RunState:
             "updated_at": self.updated_at,
             "transitions": list(self.transitions),
             "max_retries": self.max_retries,
+            "max_attempts": self.max_attempts,
             "ignored_operation_ids": list(self.ignored_operation_ids),
             "dependency_escalation_op_id": self.dependency_escalation_op_id,
             "dependency_escalation_wo_id": self.dependency_escalation_wo_id,
@@ -240,10 +246,12 @@ class RunState:
             failed_wo_ids=data.get("failed_wo_ids", []),
             blocked_wo_ids=data.get("blocked_wo_ids", []),
             retry_counts=data.get("retry_counts", {}),
+            attempt_counts=data.get("attempt_counts", {}),
             contention_count=data.get("contention_count", 0),
             integration_operation_id=data.get("integration_operation_id"),
             integration_wo_id=data.get("integration_wo_id"),
             integration_blockers=data.get("integration_blockers", []),
+            integration_evidence=dict(data.get("integration_evidence", {}) or {}),
             batch_operation_id=data.get("batch_operation_id"),
             gitops_wo_id=data.get("gitops_wo_id"),
             gitops_operation_id=data.get("gitops_operation_id"),
@@ -252,7 +260,8 @@ class RunState:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             transitions=data.get("transitions", []),
-            max_retries=data.get("max_retries", 2),
+            max_retries=data.get("max_retries", 10),
+            max_attempts=data.get("max_attempts", 10),
             ignored_operation_ids=list(data.get("ignored_operation_ids", [])),
             dependency_escalation_op_id=data.get("dependency_escalation_op_id"),
             dependency_escalation_wo_id=data.get("dependency_escalation_wo_id"),
@@ -1276,10 +1285,18 @@ class LifecycleSupervisor:
                     all_done = False
                 continue
 
-            # Verify declared deliverable exists on disk (S3)
-            if not self._check_deliverable_exists(wo_id, ws):
+            # Verify declared deliverable exists and is valid on disk (S3)
+            deliv_passed, deliv_err, deliv_evidence = self._verify_work_order_deliverables(wo_id, ws)
+            if not deliv_passed:
+                if deliv_evidence:
+                    state.worker_blockers[wo_id] = {
+                        "failure_code": "DELIVERABLE_VERIFICATION_FAILED",
+                        "work_order_id": wo_id,
+                        "canonical_message": deliv_err,
+                        "evidence": deliv_evidence,
+                    }
                 def _missing_prompt(n: int, agent: str) -> str:
-                    prompt = f"Retry work order {wo_id}: declared deliverable was not found on disk (attempt {n})"
+                    prompt = f"Retry work order {wo_id}: {deliv_err} (attempt {n})"
                     if agent == "gemma":
                         deliv_path = self._get_wo_deliverable_path(wo_id, ws) or "the declared test suite"
                         prompt += (
@@ -1340,6 +1357,7 @@ class LifecycleSupervisor:
             if wo_id not in state.completed_wo_ids:
                 state.completed_wo_ids.append(wo_id)
                 self._mark_wo_status_on_disk(ws, wo_id, "COMPLETED")
+            state.worker_blockers.pop(wo_id, None)
 
         # Check for fatal failures among worker WOs
         non_gitops_failed = [
@@ -2025,35 +2043,52 @@ class LifecycleSupervisor:
     def _retry_worker(
         self, state: RunState, ws: Path, wo_id: str, make_prompt: Callable[[int, str], str],
     ) -> bool:
-        """Bounded worker retry. True when a retry was attempted (budget left).
+        """Bounded worker retry: two-tier attempt and retry mechanism.
 
-        Budget exhaustion or a failed dispatch marks the work order failed.
+        Attempts count up to max_attempts (default 10). When attempts are exhausted,
+        it counts as 1 retry (1/10 Retry) and resets attempts for the next retry round.
+        Exhaustion of both attempts and retries marks the work order failed.
         """
+        attempts = state.attempt_counts.get(wo_id, 0) + 1
         retries = state.retry_counts.get(wo_id, 0)
+
         if retries >= state.max_retries:
             state.failed_wo_ids.append(wo_id)
             return False
+
+        if attempts > state.max_attempts:
+            retries += 1
+            state.retry_counts[wo_id] = retries
+            attempts = 1
+            if retries >= state.max_retries:
+                state.failed_wo_ids.append(wo_id)
+                return False
+        elif attempts == state.max_attempts and retries == 0:
+            retries = 1
+            state.retry_counts[wo_id] = retries
+
+        state.attempt_counts[wo_id] = attempts
+
         agent = self._agent_for_wo(wo_id, ws)
         try:
             self.manager.start_turn(
                 state.session_id,
-                make_prompt(retries + 2, agent),
+                make_prompt(attempts + 1, agent),
                 role=self._role_for_agent(agent),
                 agent_id=agent,
                 work_order_id=wo_id,
                 parent_operation_id=state.batch_operation_id,
+                attempt=attempts,
+                max_attempts=state.max_attempts,
+                retry=retries,
+                max_retries=state.max_retries,
             )
-            # Budget is consumed only after a successful dispatch — a
-            # contention failure never consumes a turn that never ran.
-            state.retry_counts[wo_id] = retries + 1
         except OperationContentionError:
-            # Parallel sibling turns share the session: roll the retry budget
-            # back and let advance() wait for the session to free — the retry
-            # is re-attempted without consuming budget on a turn that never ran.
-            state.retry_counts[wo_id] = retries
+            state.attempt_counts[wo_id] = max(0, attempts - 1)
             raise
         except Exception:
             state.failed_wo_ids.append(wo_id)
+            return False
         return True
 
     def _close_batch_operation(self, state: RunState, status: str) -> None:
@@ -2096,33 +2131,83 @@ class LifecycleSupervisor:
             op_result = op.get("result", {})
             result_status = str(op_result.get("status", "")).lower()
 
-            if status == "BLOCKED" or result_status == "blocked":
-                # A valid blocked review routes its blockers — with the
-                # Architect's prescribed fixes when provided — back to the
-                # implementation and QA workers for bounded rework; the review
-                # re-runs after they complete. Terminal BLOCKED only when the
+            if status == "FAILED":
+                state.error = f"Integration review failed: {op.get('result', {}).get('error', 'unknown')}"
+                self._transition(state, Phase.FAILED)
+                return AdvanceResult.FAILED
+
+            # Evaluate deterministic integration gate
+            from validators.harness.integration_gate import IntegrationGate
+            gate = IntegrationGate(ws)
+            session_ops = []
+            if hasattr(self.manager, "list_operations"):
+                try:
+                    session_ops = self.manager.list_operations(state.session_id)
+                except Exception:
+                    session_ops = []
+            ignored_ops = set(getattr(state, "ignored_operation_ids", []) or [])
+            valid_session_ops = [
+                o for o in session_ops
+                if isinstance(o, dict)
+                and str(o.get("operation_id", "")) not in ignored_ops
+            ]
+            extra_telemetry = [
+                o.get("result", {})
+                for o in valid_session_ops
+                if isinstance(o.get("result"), dict)
+            ]
+            gate_decision = gate.evaluate(state=state, integration_op=op, extra_telemetry=extra_telemetry)
+            state.integration_evidence = gate_decision.to_dict()
+
+            llm_blocked = (status == "BLOCKED" or result_status == "blocked")
+            deterministic_blocked = not gate_decision.passed
+
+            if llm_blocked or deterministic_blocked:
+                # A valid blocked review or deterministic failure routes its blockers — with the
+                # prescribed fixes when provided — back to the implementation and QA workers for
+                # bounded rework; the review re-runs after they complete. Terminal BLOCKED only when the
                 # rework rounds are exhausted.
                 blockers: list[str] = []
                 remediations: dict[str, str] = {}
                 detail_paths: list[str] = []
-                for item in op_result.get("blocker_details") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    finding = str(item.get("finding", "")).strip()
-                    if not finding:
-                        continue
-                    if finding not in blockers:
-                        blockers.append(finding)
-                    remediation = str(item.get("remediation", "")).strip()
-                    if remediation:
-                        remediations[finding] = remediation
-                    if item.get("path"):
-                        detail_paths.append(str(item["path"]))
-                for raw in op_result.get("blockers") or []:
-                    if str(raw) not in blockers:
-                        blockers.append(str(raw))
-                if not blockers and op_result.get("reason"):
-                    blockers = [op_result["reason"]]
+
+                if llm_blocked:
+                    # When the Architect review explicitly reports blockers, use its specific findings
+                    for item in op_result.get("blocker_details") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        finding = str(item.get("finding", "")).strip()
+                        if not finding:
+                            continue
+                        if finding not in blockers:
+                            blockers.append(finding)
+                        remediation = str(item.get("remediation", "")).strip()
+                        if remediation:
+                            remediations[finding] = remediation
+                        if item.get("path"):
+                            detail_paths.append(str(item["path"]))
+
+                    for raw in op_result.get("blockers") or []:
+                        if str(raw) not in blockers:
+                            blockers.append(str(raw))
+                    if not blockers and op_result.get("reason"):
+                        blockers = [op_result["reason"]]
+                else:
+                    # When the review claimed completion but deterministic checks failed,
+                    # enforce deterministic blockers (anti-fabrication, test/build/route failures)
+                    for item in gate_decision.blocker_details:
+                        finding = str(item.get("finding", "")).strip()
+                        if finding and finding not in blockers:
+                            blockers.append(finding)
+                        remediation = str(item.get("remediation", "")).strip()
+                        if remediation:
+                            remediations[finding] = remediation
+                        if item.get("path"):
+                            detail_paths.append(str(item["path"]))
+
+                    for issue in gate_decision.issues:
+                        if str(issue) not in blockers:
+                            blockers.append(str(issue))
                 state.integration_blockers = list(blockers)
                 err_msg = (
                     "; ".join(blockers)
@@ -2166,6 +2251,11 @@ class LifecycleSupervisor:
                         except Exception:
                             parent_op_id = None
                     for wo_id in reworkable:
+                        target_op = self._find_latest_wo_operation(state, wo_id)
+                        if target_op and target_op.get("operation_id"):
+                            target_op_id = str(target_op["operation_id"])
+                            if target_op_id not in state.ignored_operation_ids:
+                                state.ignored_operation_ids.append(target_op_id)
                         self._unarchive_work_order(ws, wo_id)
                         if wo_id not in state.worker_wo_ids:
                             state.worker_wo_ids.append(wo_id)
@@ -2207,12 +2297,8 @@ class LifecycleSupervisor:
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
 
-            if status == "FAILED":
-                state.error = f"Integration review failed: {op.get('result', {}).get('error', 'unknown')}"
-                self._transition(state, Phase.FAILED)
-                return AdvanceResult.FAILED
-
-            # Integration review completed cleanly
+            # Both deterministic checks and review completed cleanly
+            state.integration_blockers = []
             self._transition(state, Phase.PRODUCT_READY)
             return AdvanceResult.TRANSITIONED
 
@@ -2412,7 +2498,9 @@ class LifecycleSupervisor:
                             "assigned_agents": ["claude"],
                         })
                     idx_data["next_id"] = max(idx_data.get("next_id", 1), int(review_wo_id.replace("WO-", "")) + 1)
-                    idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    temp_idx = idx_file.with_name(f"{idx_file.name}.tmp.{int(time.time() * 1000)}")
+                    temp_idx.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    temp_idx.replace(idx_file)
         except Exception:
             pass
 
@@ -4583,32 +4671,32 @@ class LifecycleSupervisor:
             pass
         return None
 
-    def _check_deliverable_exists(self, wo_id: str, ws: Path) -> bool:
-        """Check if declared deliverable for a work order actually exists on disk."""
+    def _verify_work_order_deliverables(
+        self, wo_id: str, ws: Path
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Deterministically verify all declared deliverables for a work order on disk."""
         wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if not wo_file.is_file():
             wo_file = ws / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
         if not wo_file.is_file():
-            return True
+            return True, "", {}
         try:
             data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                return True
-            deliv = data.get("deliverable")
-            if isinstance(deliv, dict) and deliv.get("path"):
-                target = ws / str(deliv["path"])
-                if target.exists():
-                    return True
-                # A declared-path deliverable must exist on disk — inbox
-                # sign-off notices no longer substitute for it (D024 shift-left:
-                # QA suites are real files the gate can verify).
-                return False
-            # Deliverables without a declared path (sign-off style) and work
-            # orders without a deliverable section are verified downstream.
-            return True
-        except Exception:
-            return True
-        return True
+                return True, "", {}
+            from validators.harness.deliverable_verifier import verify_work_order_deliverables
+            passed, errors, evidence = verify_work_order_deliverables(ws, data)
+            if not passed:
+                err_msg = "; ".join(errors) if errors else "declared deliverable was not found or failed verification on disk"
+                return False, err_msg, evidence
+            return True, "", evidence
+        except Exception as e:
+            return False, f"Deliverable verification error: {e}", {"error": str(e)}
+
+    def _check_deliverable_exists(self, wo_id: str, ws: Path) -> bool:
+        """Check if declared deliverable for a work order actually exists on disk."""
+        passed, _, _ = self._verify_work_order_deliverables(wo_id, ws)
+        return passed
 
     def _get_qa_feedback(self, wo_id: str, ws: Path) -> str:
         """Extract QA review feedback text from verdict file if present."""
@@ -4884,7 +4972,9 @@ def archive_completed_work_orders(
                 1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
             )
             index_data["last_updated"] = now_iso
-            index_file.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+            temp_idx = index_file.with_name(f"{index_file.name}.tmp.{int(time.time() * 1000)}")
+            temp_idx.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+            temp_idx.replace(index_file)
         except Exception:
             pass
 

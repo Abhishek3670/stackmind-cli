@@ -871,6 +871,62 @@ def validate_authoring_readiness(
     if cycle:
         _issue(issues, "DEPENDENCY_CYCLE", "dependency", f"Work order dependency graph contains a cycle: {' -> '.join(cycle)}", artifact_path=", ".join(cycle))
 
+    # ── 7. Overlapping file ownership between parallel work orders ─────
+    deps_map: dict[str, set[str]] = {
+        wo_id: {str(d).strip() for d in (data.get("dependencies") or []) if str(d).strip() in wo_files}
+        if isinstance(data.get("dependencies"), list) else set()
+        for wo_id, (_rel, data) in wo_files.items()
+    }
+
+    def _is_descendant(target: str, source: str) -> bool:
+        visited = set()
+        queue = list(deps_map.get(source, set()))
+        while queue:
+            curr = queue.pop(0)
+            if curr == target:
+                return True
+            if curr not in visited:
+                visited.add(curr)
+                queue.extend(deps_map.get(curr, set()))
+        return False
+
+    file_to_wos: dict[str, list[tuple[str, str]]] = {}
+    for wo_id, (rel, data) in sorted(wo_files.items()):
+        deliv = data.get("deliverable")
+        if isinstance(deliv, dict) and deliv.get("path"):
+            norm = str(deliv["path"]).replace("\\", "/").strip().lstrip("/")
+            file_to_wos.setdefault(norm, []).append((wo_id, rel))
+        for extra in data.get("deliverables") or []:
+            if isinstance(extra, dict) and extra.get("path"):
+                norm = str(extra["path"]).replace("\\", "/").strip().lstrip("/")
+                file_to_wos.setdefault(norm, []).append((wo_id, rel))
+            elif isinstance(extra, str) and extra.strip():
+                norm = extra.replace("\\", "/").strip().lstrip("/")
+                file_to_wos.setdefault(norm, []).append((wo_id, rel))
+
+    for file_path, claiming in sorted(file_to_wos.items()):
+        if len(claiming) > 1:
+            for i in range(len(claiming)):
+                for j in range(i + 1, len(claiming)):
+                    wo_a, rel_a = claiming[i]
+                    wo_b, rel_b = claiming[j]
+                    if not (_is_descendant(wo_b, wo_a) or _is_descendant(wo_a, wo_b)):
+                        _issue(
+                            issues,
+                            "OVERLAPPING_FILE_OWNERSHIP",
+                            "coverage",
+                            f"Overlapping file ownership: parallel work orders '{wo_a}' and '{wo_b}' "
+                            f"claim the same deliverable '{file_path}' without dependency ordering",
+                            why="Parallel work orders claiming the same file cause write contention and overwrites.",
+                            actual_state=f"work orders '{wo_a}' and '{wo_b}' both claim '{file_path}' in parallel",
+                            expected_state="disjoint file ownership between parallel work orders or sequential dependency ordering",
+                            required_action=f"Add a dependency between '{wo_a}' and '{wo_b}', or assign distinct deliverable paths",
+                            canonical_rule="work_order.ownership",
+                            affected_artifacts=(rel_a, rel_b),
+                            work_order_id=wo_a,
+                            artifact_path=rel_a,
+                        )
+
     return AuthoringReadinessResult(
         ready=not issues,
         plan_id=plan_id,

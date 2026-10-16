@@ -139,3 +139,37 @@ def test_skill_verification_and_release_metadata(tmp_path):
     (tmp_path / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
     meta = gemma_gw.validate_release_metadata()
     assert meta["valid"] is True
+
+
+def test_verify_deliverable_catches_broken_media_assets(tmp_path):
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    wo_file = wo_dir / "WO-020.yaml"
+    wo_data = {
+        "id": "WO-020",
+        "type": "FEATURE",
+        "title": "Landing Page",
+        "status": "PENDING",
+        "priority": "P1",
+        "assigned_agents": ["gemini"],
+        "dependencies": [],
+        "deliverables": [
+            {"path": "index.html", "type": "code"},
+        ],
+    }
+    wo_file.write_text(yaml.dump(wo_data), encoding="utf-8")
+
+    # Deliverable with a broken search URL used as img src
+    html_file = tmp_path / "index.html"
+    html_file.write_text("""<!DOCTYPE html>
+<html><body>
+<h1>Shop</h1>
+<img src="https://unsplash.com/s/photos/crochet" alt="broken search URL">
+</body></html>""", encoding="utf-8")
+
+    gateway, _ = _setup_gateway(tmp_path, "gemma")
+    res = gateway.verify_deliverable("WO-020")
+    assert res["passed"] is False
+    assert len(res["content_issues"]) > 0
+    assert any("Unsplash search gallery page" in issue for issue in res["content_issues"])
+

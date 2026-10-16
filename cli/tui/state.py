@@ -73,6 +73,7 @@ class RoleStatus:
     role: str
     backend: str = "Codex"
     model: str | None = None
+    quantization: str | None = None
     work_order_id: str | None = None
     state: str = "WAITING"  # WAITING, RUNNING, COMPLETED, CANCELLED, FAILED
     agent_id: str | None = None
@@ -142,6 +143,7 @@ class TurnAction:
     diff: str | None = None
     code: str | None = None
     parent_id: str | None = None
+    role: str | None = None
     sub_actions: list[TurnAction] = field(default_factory=list)
 
     @property
@@ -244,6 +246,7 @@ class ActionsGroup:
         diff: str | None = None,
         output: str | None = None,
         parent_id: str | None = None,
+        role: str | None = None,
     ) -> TurnAction:
         """Add new action or update existing invocation in-place (§21)."""
         # 1. Update if already exists in top-level or sub_actions
@@ -266,6 +269,8 @@ class ActionsGroup:
                     a.diff = diff
                 if output is not None:
                     a.output = output
+                if role is not None:
+                    a.role = role
                 return a
 
         # 2. Check if this is a sub-action under a parent
@@ -295,6 +300,7 @@ class ActionsGroup:
             diff=diff,
             output=output,
             parent_id=target_parent.action_id if target_parent else parent_id,
+            role=role,
         )
         if target_parent is not None:
             target_parent.sub_actions.append(new_act)
@@ -312,6 +318,8 @@ class ActionsGroup:
         output: str | None = None,
         diff: str | None = None,
         code: str | None = None,
+        role: str | None = None,
+        target: str | None = None,
     ) -> TurnAction | None:
         if status.upper() in {"FAILED", "FAILURE", "ERROR", "BLOCKED"}:
             self.expanded = True
@@ -358,7 +366,7 @@ class ActionsGroup:
             fallback_desc = tool_name or action_id or "Action"
             if tool_name and "harness" in tool_name.lower():
                 from cli.tui.events import format_action_description
-                fallback_desc = format_action_description(tool_name)
+                fallback_desc = format_action_description(tool_name, target=target, role=role)
             matched = TurnAction(
                 action_id=action_id or f"act-{len(self.actions)+1}",
                 description=fallback_desc,
@@ -366,10 +374,16 @@ class ActionsGroup:
                 duration_seconds=duration_seconds,
                 error=error,
                 tool_name=tool_name,
+                target=target,
+                role=role,
             )
             self.actions.append(matched)
 
         matched.status = status
+        if role and not getattr(matched, "role", None):
+            matched.role = role
+        if target and not getattr(matched, "target", None):
+            matched.target = target
         if tool_name and not getattr(matched, "tool_name", None):
             matched.tool_name = tool_name
         if duration_seconds is not None:
@@ -614,6 +628,74 @@ class AutonomousDeliveryState:
         self.execution_profile: str = "medium"
         self.cycle_telemetry: list[dict[str, Any]] = []
         self.last_telemetry: dict[str, Any] | None = None
+        self.attempt_count: int = 0
+        self.max_attempts: int = 10
+        self.retry_count: int = 0
+        self.max_retries: int = 10
+        self.retry_status: str | None = None
+        self.active_working_status: str | None = None
+
+    @property
+    def retry_status_display(self) -> str | None:
+        """Formatted retry/attempt status for top-right border display (§retry)."""
+        if self.retry_status is not None:
+            return self.retry_status
+        if self.attempt_count > 0 or self.retry_count > 0:
+            return f"({self.attempt_count}/{self.max_attempts} Attempt . {self.retry_count}/{self.max_retries} Retry)"
+        return None
+
+    def record_attempt(
+        self,
+        attempt: int | None = None,
+        retry: int | None = None,
+        max_attempts: int | None = None,
+        max_retries: int | None = None,
+        status: str | None = None,
+    ) -> str:
+        """Record an attempt/retry update according to two-tier retry mechanism."""
+        if max_attempts is not None:
+            try:
+                self.max_attempts = max(1, int(max_attempts))
+            except (ValueError, TypeError):
+                pass
+        if max_retries is not None:
+            try:
+                self.max_retries = max(1, int(max_retries))
+            except (ValueError, TypeError):
+                pass
+
+        if status is not None:
+            self.retry_status = str(status)
+            return self.retry_status
+
+        if attempt is not None:
+            try:
+                self.attempt_count = int(attempt)
+            except (ValueError, TypeError):
+                self.attempt_count += 1
+        else:
+            if self.attempt_count >= self.max_attempts:
+                self.attempt_count = 1
+            else:
+                self.attempt_count += 1
+
+        if retry is not None:
+            try:
+                self.retry_count = int(retry)
+            except (ValueError, TypeError):
+                pass
+        else:
+            # When attempts are exhausted, count as 1/10 retry
+            if self.attempt_count == self.max_attempts:
+                self.retry_count += 1
+
+        return self.retry_status_display or ""
+
+    def reset_attempts_and_retries(self) -> None:
+        """Reset attempt and retry counters for a fresh session or completed task."""
+        self.attempt_count = 0
+        self.retry_count = 0
+        self.retry_status = None
 
     def open_settings(self, settings_obj: Any | None = None, initial_view: str = "main") -> None:
         """Open the interactive settings panel anchored below the composer."""
@@ -763,7 +845,7 @@ class AutonomousDeliveryState:
                 if last_c and last_n in {"write_file", "write", "edit_file", "edit", "create_file", "create"}:
                     msg_actions.preview_label = f"✓ Wrote `{last_t}`" if last_t else "✓ Wrote code"
                     msg_actions.preview_code = last_c
-                msg_actions.expanded = True
+                msg_actions.expanded = False
             elif msg_actions is not None:
                 msg_actions.complete_all()
             self.active_tool_name = None
@@ -1577,6 +1659,31 @@ class AutonomousDeliveryState:
         payload_raw = event.get("payload")
         payload: Mapping[str, Any] = payload_raw if isinstance(payload_raw, Mapping) else {}
 
+        # Two-tier attempt and retry tracking (§retry)
+        if any(k in payload for k in ("attempt", "retry", "max_attempts", "max_retries", "retry_status")):
+            self.record_attempt(
+                attempt=payload.get("attempt"),
+                retry=payload.get("retry"),
+                max_attempts=payload.get("max_attempts"),
+                max_retries=payload.get("max_retries"),
+                status=payload.get("retry_status"),
+            )
+        elif payload.get("prompt"):
+            prompt_text = str(payload.get("prompt"))
+            import re
+            m = re.search(r"\((\d+)/(\d+)\s+Attempt\s+\.\s+(\d+)/(\d+)\s+Retry\)", prompt_text, re.IGNORECASE)
+            if m:
+                self.record_attempt(
+                    attempt=int(m.group(1)),
+                    max_attempts=int(m.group(2)),
+                    retry=int(m.group(3)),
+                    max_retries=int(m.group(4)),
+                )
+            else:
+                m_att = re.search(r"\(attempt\s+(\d+)\)", prompt_text, re.IGNORECASE)
+                if m_att:
+                    self.record_attempt(attempt=int(m_att.group(1)))
+
         if name == "plan.proposed":
             self.phase = ProjectPhase.AWAITING_APPROVAL
             plan_id = payload.get("plan_id", "PLAN-001")
@@ -1631,16 +1738,27 @@ class AutonomousDeliveryState:
         elif name in {"event.agentSpawned", "agent.spawned"}:
             agent_id = payload.get("agent_id") or payload.get("agentId") or "agent-sub"
             role_name = (payload.get("role") or self._infer_role_from_op(agent_id)).title()
-            backend = payload.get("backend") or payload.get("executionBackend") or "Codex"
+            normalized_role = "Q/A" if role_name.upper() in {"QA", "Q/A"} else role_name
+            existing_role = self.roles.get(normalized_role)
+            raw_backend = payload.get("backend") or payload.get("executionBackend")
+            if raw_backend and str(raw_backend).strip().lower() == "daemon":
+                raw_backend = None
+            backend = (
+                raw_backend
+                or (existing_role.backend if existing_role and existing_role.backend and existing_role.backend.lower() != "daemon" else "")
+            )
+            model = payload.get("model") or (existing_role.model if existing_role else None)
+            quantization = payload.get("quantization") or getattr(existing_role, "quantization", None)
             wo_id = payload.get("work_order_id") or payload.get("workOrderId")
             parent_id = payload.get("parent_operation_id") or payload.get("parentOperationId") or "op-root"
             op_id = payload.get("operation_id") or payload.get("operationId") or f"op-{agent_id}"
 
             # Update roles
-            normalized_role = "Q/A" if role_name.upper() in {"QA", "Q/A"} else role_name
             self.roles[normalized_role] = RoleStatus(
                 normalized_role,
                 backend=backend,
+                model=model,
+                quantization=quantization,
                 work_order_id=wo_id,
                 state="RUNNING",
                 agent_id=agent_id,
@@ -1680,10 +1798,11 @@ class AutonomousDeliveryState:
 
         elif name in {"operation.completed", "turn.completed"}:
             self.current_turn_actions.complete_all()
-            self.current_turn_actions.expanded = True
+            self.current_turn_actions.expanded = False
             self.active_tool_name = None
             self.active_tool_target = None
             self.active_tool_code = None
+            self.active_working_status = None
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role

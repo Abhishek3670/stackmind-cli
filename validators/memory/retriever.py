@@ -382,7 +382,7 @@ class MemoryRetriever:
 
         # Step 5: Apply memory decay as a retrieval-time signal (Stage 7)
         # Decay is a multiplicative factor on baseline relevance scores
-        decay_policy = get_decay_policy(active_policy.profile)
+        decay_policy = get_decay_policy(active_policy.profile, self.project_path)
         decay_adjuster = DecayAdjuster(self.project_path, decay_policy)
 
         # Check if shadow mode is enabled via environment/config

@@ -244,10 +244,11 @@ def render_stackmind_settings_str(
     )
 
     # 3. Decision Engine
+    laya_m = getattr(settings, "laya_mode", "active").upper()
     table.add_row(
         Text("Decision Engine (Laya)", style="bold white"),
-        Text("[DETERMINISTIC]", style="dim #60a5fa"),
-        Text("Offline standby; contracts enforced", style="dim #94a3b8"),
+        Text(f"[{laya_m}]", style="bold #38bdf8" if laya_m == "ACTIVE" else "dim #60a5fa"),
+        Text("Autonomous skill routing & decision engine", style="dim #94a3b8"),
     )
 
     # 4. LLM Providers & Models
@@ -660,11 +661,12 @@ def render_anchored_settings_panel_str(
 
         # Row 2: Decision Engine (Laya)
         is_sel_2 = (sel == 2)
+        laya_m = getattr(settings, "laya_mode", "active").upper()
         table.add_row(
             Text("▸", style="bold #38bdf8") if is_sel_2 else Text(" ", style="dim"),
             Text("Decision Engine (Laya)", style="bold white" if is_sel_2 else "white"),
-            Text("[DETERMINISTIC]", style="bold #38bdf8" if is_sel_2 else "dim #60a5fa"),
-            Text("Offline standby; contracts enforced", style="#93c5fd" if is_sel_2 else "dim #94a3b8"),
+            Text(f"[{laya_m}]", style="bold #38bdf8" if is_sel_2 else "dim #60a5fa"),
+            Text("Autonomous skill routing & decision engine", style="#93c5fd" if is_sel_2 else "dim #94a3b8"),
         )
 
         # Row 3: LLM Providers & Models
@@ -708,7 +710,7 @@ def render_anchored_settings_panel_str(
         hints_by_row = {
             0: "Hint: Press [←/→] to cycle execution profile (Low / Medium / High).",
             1: "Hint: Press [←/→] to adjust turn timeout (0s / 30s / 60s / 120s / 300s).",
-            2: "Hint: Laya decision engine runs offline in deterministic fallback mode.",
+            2: "Hint: Press [Enter] or [←/→] to cycle Laya mode (ACTIVE / SHADOW / DISABLED).",
             3: "Hint: Press [Enter] to open :providers (configure API keys & models).",
             4: "Hint: Press [Enter] to open :roles (configure agent role bindings).",
             5: "Hint: Press [Enter] to save settings to disk and apply changes.",
@@ -1128,6 +1130,15 @@ def run_arrow_navigation_settings_loop(
                     settings.client_timeout = new_to
                     state.settings_status_msg = f"Turn timeout set to {new_to}s." if new_to else "Turn timeout disabled."
                     _redraw()
+                elif sel == 2:  # Decision engine mode cycle
+                    modes = ["active", "shadow", "disabled"]
+                    curr_m = getattr(settings, "laya_mode", "active").lower()
+                    curr_idx = modes.index(curr_m) if curr_m in modes else 0
+                    next_idx = (curr_idx + step) % len(modes)
+                    new_m = modes[next_idx]
+                    settings.laya_mode = new_m
+                    state.settings_status_msg = f"Laya decision engine set to [{new_m.upper()}] mode."
+                    _redraw()
             elif view == "providers":
                 if 0 <= sel < num_prov:
                     p_name = provider_keys[sel]
@@ -1215,8 +1226,14 @@ def run_arrow_navigation_settings_loop(
                     settings.client_timeout = new_to
                     state.settings_status_msg = f"Turn timeout set to {new_to}s." if new_to else "Turn timeout disabled."
                     _redraw()
-                elif sel == 2:  # Decision engine info
-                    state.settings_status_msg = "Laya decision engine in deterministic fallback mode."
+                elif sel == 2:  # Decision engine mode toggle
+                    modes = ["active", "shadow", "disabled"]
+                    curr_m = getattr(settings, "laya_mode", "active").lower()
+                    curr_idx = modes.index(curr_m) if curr_m in modes else 0
+                    next_idx = (curr_idx + 1) % len(modes)
+                    new_m = modes[next_idx]
+                    settings.laya_mode = new_m
+                    state.settings_status_msg = f"Laya decision engine set to [{new_m.upper()}] mode."
                     _redraw()
                 elif sel == 3:  # Switch to LLM providers view
                     state.settings_current_view = "providers"

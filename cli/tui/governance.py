@@ -282,6 +282,7 @@ def render_plan_panel_str(state: AutonomousDeliveryState, width: int = 80) -> st
 def render_skills_panel(
     project_path: Path | str | None = None,
     skill_filter: str | None = None,
+    include_global: bool = True,
 ) -> Panel:
     """Render procedural skills overview or specific skill runbook."""
     from validators.skill.store import SkillStore
@@ -289,7 +290,7 @@ def render_skills_panel(
 
     path = Path(project_path).resolve() if project_path else Path(".").resolve()
     store = SkillStore(path)
-    skills = store.list_skills(include_global=False)
+    skills = store.list_skills(include_global=include_global)
 
     if skill_filter:
         filt = skill_filter.strip().lower()
@@ -297,7 +298,10 @@ def render_skills_panel(
         if len(matched) == 1:
             skill = matched[0]
             lines: list[RenderableType] = []
-            lines.append(Text(f"Name: {skill.name} (v{skill.version})", style="bold white"))
+            slug = skill.name.strip().lower()
+            is_local = (store.active_dir / f"{slug}.json").is_file()
+            scope_badge = "[local]" if is_local else "[global]"
+            lines.append(Text(f"Name: {skill.name} (v{skill.version})  {scope_badge}", style="bold white"))
             lines.append(
                 Text(
                     f"ID: {skill.skill_id}  |  Status: {skill.status.value.upper()}  |  Risk: {skill.risk_tier.value.upper()}  |  Confidence: {skill.metrics.confidence_score:.2f}",
@@ -338,10 +342,12 @@ def render_skills_panel(
 
     if not skills:
         msg = Text()
-        msg.append("\nNo procedural skills found in .sync/skills/.\n", style="yellow")
+        msg.append("\nNo procedural skills found in .sync/skills/ or global library (~/.stackmindcli/skills/global/).\n", style="yellow")
         msg.append("StackMind learns procedural skills from verified execution trajectories.\n", style="dim")
         msg.append("To discover and distill skills, run:\n", style="dim")
         msg.append("  stackmind learn mine --min-support 2\n", style="bold white")
+        msg.append("To consume external procedural skills, run:\n", style="dim")
+        msg.append("  :consume-skills <path_or_url> [--local]\n", style="bold white")
         return Panel(
             msg,
             title=title,
@@ -360,6 +366,7 @@ def render_skills_panel(
     table.add_column("Conf", justify="right")
     table.add_column("Modules", style="dim")
 
+    n_local = 0
     for s in skills:
         status_style = (
             "green"
@@ -374,6 +381,9 @@ def render_skills_panel(
         mods = ", ".join(s.applicability.target_modules[:2])
         if len(s.applicability.target_modules) > 2:
             mods += "..."
+        slug = s.name.strip().lower()
+        if (store.active_dir / f"{slug}.json").is_file():
+            n_local += 1
         table.add_row(
             s.skill_id,
             s.name,
@@ -384,7 +394,9 @@ def render_skills_panel(
             mods or "*",
         )
 
-    summary = Text(f"\nTotal: {len(skills)} skill(s). Type ':skill <name>' for detailed steps.", style="dim")
+    n_global = len(skills) - n_local
+    scope_info = f" ({n_local} local, {n_global} global)" if n_global > 0 else ""
+    summary = Text(f"\nTotal: {len(skills)} skill(s){scope_info}. Type ':skill <name>' for detailed steps.", style="dim")
     return Panel(
         Group(table, summary),
         title=title,
@@ -399,11 +411,12 @@ def render_skills_panel_str(
     project_path: Path | str | None = None,
     skill_filter: str | None = None,
     width: int = 80,
+    include_global: bool = True,
 ) -> str:
     """Render procedural skills panel as plain string using in-memory capture."""
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_skills_panel(project_path, skill_filter))
+    console.print(render_skills_panel(project_path, skill_filter, include_global=include_global))
     return console.export_text().rstrip()
 
 

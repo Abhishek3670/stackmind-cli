@@ -894,11 +894,24 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ),
     ToolDefinition(
         name="web_search",
-        description="Perform a web search for documentation and API references.",
+        description="Perform a web search for documentation, media assets, and API references. Use media_type='images' to search for image assets.",
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
+                "limit": {"type": "integer", "description": "Max results", "default": 5},
+                "media_type": {"type": "string", "enum": ["all", "images"], "description": "Search media type ('all' or 'images')", "default": "all"},
+            },
+            "required": ["query"],
+        },
+    ),
+    ToolDefinition(
+        name="image_search",
+        description="Search for real, accessible web image assets, photos, logos, and graphics with direct image URLs.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Image search query (e.g. 'crochet handmade bag')"},
                 "limit": {"type": "integer", "description": "Max results", "default": 5},
             },
             "required": ["query"],
@@ -906,11 +919,12 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ),
     ToolDefinition(
         name="web_fetch",
-        description="Fetch static content from a documentation URL.",
+        description="Fetch static content and media assets from a documentation or web URL.",
         parameters={
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "URL to fetch"},
+                "extract_images": {"type": "boolean", "description": "Whether to extract discovered image URLs from the page", "default": True},
             },
             "required": ["url"],
         },
@@ -1141,7 +1155,7 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
 
 
-PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file")
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "web_search", "image_search", "web_fetch")
 AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
@@ -1150,6 +1164,9 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "query_graph",
     "find_symbol",
     "find_references",
+    "web_search",
+    "image_search",
+    "web_fetch",
     "git_log",
     "git_diff",
     "run_command",
@@ -1339,6 +1356,7 @@ class ProviderGateway:
         self.total_tool_calls: int = 0
         self.consecutive_failures: int = 0
         self.written_files: list[str] = []
+        self.required_deliverable: str | None = None
         self.read_counts: dict[str, int] = {}
         self._step_count: int = 0
         self._file_write_count: int = 0
@@ -1465,7 +1483,15 @@ class ProviderGateway:
 
         try:
             if name == "read_file":
-                target = args.get("path") or args.get("target") or args.get("filename") or ""
+                target = (
+                    args.get("path")
+                    or args.get("target")
+                    or args.get("filename")
+                    or args.get("file")
+                    or args.get("filepath")
+                    or args.get("file_path")
+                    or ""
+                )
                 if not target:
                     self.consecutive_failures += 1
                     res = "Error: 'read_file' missing required argument 'path'. Example: {\"path\": \"src/api/auth.py\"}"
@@ -1489,7 +1515,18 @@ class ProviderGateway:
                 return out
 
             if name == "write_file":
-                target = args.get("path") or args.get("target") or args.get("filename") or ""
+                target = (
+                    args.get("path")
+                    or args.get("target")
+                    or args.get("filename")
+                    or args.get("file")
+                    or args.get("filepath")
+                    or args.get("file_path")
+                    or args.get("destination")
+                    or args.get("target_path")
+                    or getattr(self, "required_deliverable", None)
+                    or ""
+                )
                 if not target:
                     self.consecutive_failures += 1
                     res = "Error: 'write_file' missing required argument 'path'. Example: {\"path\": \"src/api/auth.py\", \"content\": \"...\"}"
@@ -1500,7 +1537,21 @@ class ProviderGateway:
                         )
                     return res
 
-                if "content" not in args and "data" not in args and "text" not in args:
+                content = (
+                    args.get("content")
+                    if "content" in args
+                    else args.get("data", args.get("text", args.get("body", args.get("code", None))))
+                )
+                if content is None:
+                    candidates = [
+                        v for k, v in args.items()
+                        if k not in ("path", "target", "filename", "file", "filepath", "file_path", "destination", "target_path")
+                        and isinstance(v, str)
+                    ]
+                    if len(candidates) == 1:
+                        content = candidates[0]
+
+                if content is None:
                     self.consecutive_failures += 1
                     res = "Error: 'write_file' missing required argument 'content'. Example: {\"path\": \"src/api/auth.py\", \"content\": \"...\"}"
                     if self.consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_FAILURES:
@@ -1510,11 +1561,35 @@ class ProviderGateway:
                         )
                     return res
 
-                content = args.get("content", args.get("data", args.get("text", "")))
+                old_content = ""
+                rel_target = target.replace("\\", "/").strip().lstrip("/")
+                try:
+                    if hasattr(self.tool_gateway, "workspace"):
+                        target_path = self.tool_gateway.workspace.path_for(target)
+                        if target_path.is_file():
+                            old_content = target_path.read_text(encoding="utf-8")
+                except Exception:
+                    old_content = ""
+
                 self.tool_gateway.write_file(target, content)
                 self.consecutive_failures = 0
                 if target not in self.written_files:
                     self.written_files.append(target)
+
+                # Generate standard unified diff for TUI and reviewers
+                import difflib
+                old_lines = old_content.splitlines(keepends=True) if old_content else []
+                new_lines = content.splitlines(keepends=True) if content else []
+                diff_lines = list(difflib.unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=f"a/{rel_target}",
+                    tofile=f"b/{rel_target}",
+                    n=3,
+                ))
+                diff_str = "".join(diff_lines)
+                if diff_str.strip():
+                    return f"Successfully wrote {len(content)} characters to {target}\n{diff_str}"
                 return f"Successfully wrote {len(content)} characters to {target}"
 
             if name == "run_command":
@@ -1571,10 +1646,13 @@ class ProviderGateway:
                     "analysis": {"find_callers", "find_callees", "impact_analysis", "dependency_analysis", "data_flow_analysis"},
                     "knowledge": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
                     "graph": {"query_graph", "find_symbol", "find_references", "knowledge_stats", "semantic_search"},
+                    "web": {"web_search", "web_fetch", "image_search"},
+                    "image": {"image_search", "web_search", "web_fetch"},
+                    "images": {"image_search", "web_search", "web_fetch"},
                     "linter": {"run_command"},
                     "linters": {"run_command"},
                     "diagnostics": {"inspect_environment", "inspect_logs", "inspect_version", "checkpoint"},
-                    "search": {"grep", "glob", "semantic_search", "search_docs"},
+                    "search": {"grep", "glob", "semantic_search", "search_docs", "web_search", "image_search", "web_fetch"},
                     "browser": {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "inspect_screenshot"},
                     "process": {"process_start", "process_status", "process_output", "process_stop"},
                     "testing": {"run_tests", "run_lint", "run_typecheck", "run_security_scan", "verify_deliverable", "verify_tests"},
@@ -1602,7 +1680,7 @@ class ProviderGateway:
                 elif any(t in already_active for t in target_names):
                     return f"Tool(s) matching '{query}' are already active in your session."
                 else:
-                    return f"No permitted tools found matching '{query}'. Available categories: git, analysis, knowledge, search, linters."
+                    return f"No permitted tools found matching '{query}'. Available categories: web, image, git, analysis, knowledge, search, linters."
 
             if hasattr(self.tool_gateway, name):
                 method = getattr(self.tool_gateway, name)
@@ -1640,6 +1718,14 @@ class ProviderGateway:
                         kwargs[param_name] = args.get("cmd") or args.get("args")
                     elif param_name == "query" and any(k in args for k in ("q", "search", "prompt")):
                         kwargs[param_name] = args.get("q") or args.get("search") or args.get("prompt")
+                    elif param_name == "limit" and any(k in args for k in ("max_results", "count", "num_results", "num", "top_k")):
+                        kwargs[param_name] = args.get("max_results") or args.get("count") or args.get("num_results") or args.get("num") or args.get("top_k")
+                    elif param_name == "media_type" and any(k in args for k in ("type", "media", "search_type")):
+                        kwargs[param_name] = args.get("type") or args.get("media") or args.get("search_type")
+                    elif param_name == "extract_images" and any(k in args for k in ("images", "include_images")):
+                        kwargs[param_name] = args.get("images") if "images" in args else args.get("include_images")
+                    elif param_name == "url" and any(k in args for k in ("link", "uri", "target", "path", "href")):
+                        kwargs[param_name] = args.get("link") or args.get("uri") or args.get("target") or args.get("path") or args.get("href")
                     elif param_name == "symbol" and any(k in args for k in ("name", "target")):
                         kwargs[param_name] = args.get("name") or args.get("target")
                     elif param_name == "instructions" and any(k in args for k in ("instruction", "prompt", "message", "task")):
@@ -1657,7 +1743,11 @@ class ProviderGateway:
 
                 result = method(**kwargs)
                 self.consecutive_failures = 0
-                if result is None:
+                if name == "apply_patch":
+                    p_content = kwargs.get("patch_content") or ""
+                    tgt = kwargs.get("target") or "file"
+                    out_str = f"Successfully applied patch to {tgt}\n{p_content}".strip()
+                elif result is None:
                     out_str = f"Successfully executed {name}"
                 elif isinstance(result, str):
                     out_str = result
@@ -1935,6 +2025,8 @@ class ProviderGateway:
         active_tools = self.active_tools_list
 
         self.budget_status["steps"] = 0
+        if required_deliverable:
+            self.required_deliverable = required_deliverable
 
         budget_turns = self.contract.budget.get("max_turns") if (self.contract and hasattr(self.contract, "budget") and self.contract.budget) else None
         effective_max_turns = max_turns or budget_turns or DEFAULT_MAX_TURNS

@@ -144,12 +144,26 @@ class D024Gate:
         else:
             alt_stem = stem
 
+        deliv_ext = deliv_p.suffix.lower()
+        is_js_or_ts = deliv_ext in (".js", ".jsx", ".ts", ".tsx", ".mjs")
+        is_go = deliv_ext == ".go"
+        is_rust = deliv_ext == ".rs"
+
         tests_dir = project_path / "tests"
         if not tests_dir.is_dir():
-            root_test = project_path / f"test_{stem}.py"
-            if root_test.is_file() and root_test.stat().st_size > 0:
-                return root_test
-            if stem in ("__init__", "main", "index", "app") or deliv_p.suffix.lower() in (
+            root_candidates = [
+                project_path / f"test_{stem}.py",
+                project_path / f"{stem}.test.js",
+                project_path / f"{stem}.test.ts",
+                project_path / f"test_{stem}.js",
+                project_path / f"{stem}_test.go",
+                project_path / f"{stem}_test.rs",
+            ]
+            for rc in root_candidates:
+                if rc.is_file() and rc.stat().st_size > 0:
+                    return rc
+
+            if stem in ("__init__", "main", "index", "app") or deliv_ext in (
                 ".html", ".htm", ".css", ".svg"
             ):
                 for cand_name in (
@@ -161,11 +175,18 @@ class D024Gate:
                     "test_app.py",
                     "test_main.py",
                     "test_server.py",
+                    "test_e2e.test.js",
+                    "test_integration.test.js",
+                    "test_api.test.js",
+                    "test_server.test.js",
                 ):
                     root_cand = project_path / cand_name
                     if root_cand.is_file() and root_cand.stat().st_size > 0:
                         return root_cand
                 for tf in sorted(project_path.glob("test_*.py")):
+                    if tf.is_file() and tf.stat().st_size > 0:
+                        return tf
+                for tf in sorted(project_path.glob("*.test.js")):
                     if tf.is_file() and tf.stat().st_size > 0:
                         return tf
             return None
@@ -174,6 +195,15 @@ class D024Gate:
             tests_dir / f"test_{stem}.py",
             tests_dir / f"{stem}_test.py",
             tests_dir / f"test_{alt_stem}.py",
+            tests_dir / f"test_{stem}.test.js",
+            tests_dir / f"{stem}.test.js",
+            tests_dir / f"{stem}.test.ts",
+            tests_dir / f"{stem}.spec.js",
+            tests_dir / f"{stem}.spec.ts",
+            tests_dir / f"test_{stem}.js",
+            tests_dir / f"test_{alt_stem}.test.js",
+            tests_dir / f"{stem}_test.go",
+            tests_dir / f"{stem}_test.rs",
         ]
         parts = [p for p in deliv_p.parts[:-1] if p not in ("src", "lib", "app")]
         if parts:
@@ -181,25 +211,40 @@ class D024Gate:
             direct_candidates.extend([
                 sub_dir / f"test_{stem}.py",
                 sub_dir / f"{stem}_test.py",
+                sub_dir / f"test_{stem}.test.js",
+                sub_dir / f"{stem}.test.js",
+                sub_dir / f"{stem}.test.ts",
+                sub_dir / f"{stem}.spec.js",
+                sub_dir / f"{stem}_test.go",
+                sub_dir / f"{stem}_test.rs",
             ])
 
         for candidate in direct_candidates:
             if candidate.is_file() and candidate.stat().st_size > 0:
                 return candidate
 
-        for pattern in (f"test_*{stem}*.py", f"*{stem}*_test.py", f"test_*{alt_stem}*.py"):
+        patterns = [
+            f"test_*{stem}*.py", f"*{stem}*_test.py", f"test_*{alt_stem}*.py",
+            f"*{stem}*.test.js", f"*{stem}*.test.ts", f"*{stem}*.spec.js", f"*{stem}*.spec.ts",
+            f"test_*{stem}*.js", f"test_*{stem}*.ts", f"*{stem}*_test.go", f"*{stem}*_test.rs",
+        ]
+        for pattern in patterns:
             for match in tests_dir.rglob(pattern):
                 if match.is_file() and match.stat().st_size > 0:
                     return match
 
-        for test_file in tests_dir.rglob("test_*.py"):
-            if test_file.is_file() and test_file.stat().st_size > 0:
-                try:
-                    content = test_file.read_text(encoding="utf-8", errors="ignore")
-                    if stem in content or alt_stem in content:
-                        return test_file
-                except Exception:
-                    continue
+        for test_file in tests_dir.rglob("*"):
+            if not test_file.is_file() or test_file.stat().st_size == 0:
+                continue
+            tf_name = test_file.name.lower()
+            if not (tf_name.endswith((".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs")) and ("test" in tf_name or "spec" in tf_name)):
+                continue
+            try:
+                content = test_file.read_text(encoding="utf-8", errors="ignore")
+                if stem in content or alt_stem in content:
+                    return test_file
+            except Exception:
+                continue
 
         # Fallback for entrypoint stems and frontend/markup deliverables:
         # Per authoring readiness convention, entrypoint stems ("app", "main", "index", "__init__")
@@ -217,6 +262,10 @@ class D024Gate:
                 "test_app.py",
                 "test_main.py",
                 "test_server.py",
+                "test_e2e.test.js",
+                "test_integration.test.js",
+                "test_api.test.js",
+                "test_server.test.js",
             )
             for cand_name in common_suites:
                 for match in tests_dir.rglob(cand_name):
@@ -227,6 +276,12 @@ class D024Gate:
                 if test_file.is_file() and test_file.stat().st_size > 0:
                     return test_file
             for test_file in sorted(tests_dir.rglob("*_test.py")):
+                if test_file.is_file() and test_file.stat().st_size > 0:
+                    return test_file
+            for test_file in sorted(tests_dir.rglob("*.test.js")):
+                if test_file.is_file() and test_file.stat().st_size > 0:
+                    return test_file
+            for test_file in sorted(tests_dir.rglob("*.test.ts")):
                 if test_file.is_file() and test_file.stat().st_size > 0:
                     return test_file
 
@@ -617,7 +672,33 @@ class D024Gate:
                             )
                             self.log_decision(project_path, decision)
                             return decision
-                        if deliv_file.is_file() and deliv_file.stat().st_size == 0:
+                        if deliv_file.is_dir():
+                            decision = D024GateDecision(
+                                passed=False,
+                                work_order_id=work_order_id,
+                                target_work_orders=target_wos,
+                                verdict_status="INCOMPLETE",
+                                deliverable_checked=True,
+                                deliverable_exists=False,
+                                deliverable_path=deliv_path_str,
+                                reason=f"Deliverable for {target_wo} is a directory, expected regular file: {deliv_path_str}",
+                            )
+                            self.log_decision(project_path, decision)
+                            return decision
+                        if not deliv_file.is_file():
+                            decision = D024GateDecision(
+                                passed=False,
+                                work_order_id=work_order_id,
+                                target_work_orders=target_wos,
+                                verdict_status="INCOMPLETE",
+                                deliverable_checked=True,
+                                deliverable_exists=False,
+                                deliverable_path=deliv_path_str,
+                                reason=f"Deliverable for {target_wo} is not a regular file: {deliv_path_str}",
+                            )
+                            self.log_decision(project_path, decision)
+                            return decision
+                        if deliv_file.stat().st_size == 0:
                             decision = D024GateDecision(
                                 passed=False,
                                 work_order_id=work_order_id,
@@ -630,6 +711,22 @@ class D024Gate:
                             )
                             self.log_decision(project_path, decision)
                             return decision
+                        try:
+                            if not deliv_file.read_text(encoding="utf-8", errors="replace").strip():
+                                decision = D024GateDecision(
+                                    passed=False,
+                                    work_order_id=work_order_id,
+                                    target_work_orders=target_wos,
+                                    verdict_status="INCOMPLETE",
+                                    deliverable_checked=True,
+                                    deliverable_exists=False,
+                                    deliverable_path=deliv_path_str,
+                                    reason=f"Deliverable for {target_wo} contains only whitespace: {deliv_path_str}",
+                                )
+                                self.log_decision(project_path, decision)
+                                return decision
+                        except Exception:
+                            pass
 
                         # Quality & Security validations on existing deliverable
                         if deliv_file.is_file():

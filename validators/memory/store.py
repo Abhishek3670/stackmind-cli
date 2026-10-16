@@ -851,15 +851,17 @@ class MemoryCompiler:
             return False
 
     def promote_candidate(self, memory_id: str, *, reason: str = "Validated by compiler", actor: str = "compiler") -> MemoryRecord | None:
-        """Promote a candidate memory to ACTIVE status using centralized promotion policy."""
+        """Promote a candidate memory to ACTIVE status using centralized promotion service."""
         record = self.memory_store.load_record(memory_id)
         if not record or record.status != MemoryStatus.CANDIDATE:
             return None
 
-        # Use centralized promotion policy
-        policy = MemoryPromotionPolicy(self.project_path)
-        promoted, result = policy.enforce_promotion(
-            record,
+        # Use centralized promotion service (authoritative entry point)
+        from validators.memory.promotion import MemoryPromotionService
+        service = MemoryPromotionService(self.project_path)
+        promoted, result = service.promote(
+            memory_id,
+            reason=reason,
             actor=actor,
             is_human=False,
             dry_run=False,

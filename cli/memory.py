@@ -266,7 +266,7 @@ def memory_promote(memory_id, project, reason, actor, dry_run):
         memory_id,
         reason=reason,
         actor=actor,
-        is_human=True,
+        is_human=False,
     )
     if promoted:
         click.echo(f"Promoted {memory_id} to ACTIVE")
@@ -566,7 +566,7 @@ def memory_contradiction_detect(memory_id, project, fmt):
 def memory_decay_config(project, function, half_life, decay_floor, enabled, show):
     """Configure or display memory decay policy."""
     project_path = Path(project).resolve()
-    policy = get_decay_policy()
+    policy = get_decay_policy(project_path=project_path)
 
     if function is not None or half_life is not None or decay_floor is not None or enabled is not None:
         # Build updated policy

@@ -155,6 +155,8 @@ class StackMindSettings:
     roles: dict[str, dict[str, str]] = field(default_factory=dict)
     execution_profile: str = "medium"
     govern_verbosity: str = "tree"
+    laya_mode: str = "active"
+    client_timeout: int = 0
 
     @property
     def effective_profile(self) -> Any:
@@ -163,8 +165,10 @@ class StackMindSettings:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "client_timeout": self.client_timeout,
             "execution_profile": self.execution_profile,
             "govern_verbosity": self.govern_verbosity,
+            "laya_mode": self.laya_mode,
             "providers": {k: v.to_dict() for k, v in self.providers.items()},
             "roles": self.roles,
         }
@@ -217,7 +221,18 @@ class StackMindSettings:
                 mod = str(r_cfg.get("model", ""))
                 if mod:
                     r_cfg["model"] = sanitize_model_name(mod, prov)
-        return cls(providers=providers, roles=roles, execution_profile=profile_val, govern_verbosity=raw_verbosity)
+        laya_mode = str(data.get("laya_mode") or "active").lower().strip()
+        if laya_mode not in {"active", "shadow", "disabled"}:
+            laya_mode = "active"
+        client_to = int(data.get("client_timeout", 0) or 0)
+        return cls(
+            providers=providers,
+            roles=roles,
+            execution_profile=profile_val,
+            govern_verbosity=raw_verbosity,
+            laya_mode=laya_mode,
+            client_timeout=client_to,
+        )
 
 
 def get_default_settings() -> StackMindSettings:

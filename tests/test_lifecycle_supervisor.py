@@ -452,6 +452,7 @@ def test_supervisor_qa_needs_changes_retry_loop(tmp_path: Path) -> None:
     state.phase = Phase.EXECUTING
     state.worker_wo_ids = ["WO-001"]
     state.max_retries = 1
+    state.max_attempts = 1
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
@@ -866,6 +867,7 @@ def test_s3_advance_checks_real_deliverable_on_disk_before_completion(tmp_path: 
         session_id="sess-s3",
         phase=Phase.EXECUTING,
         worker_wo_ids=["WO-001"],
+        max_attempts=1,
     )
 
     op = mock_mgr.start_turn("sess-s3", "Execute WO-001", work_order_id="WO-001", role="backend")
@@ -1017,6 +1019,7 @@ def test_s7_qa_needs_changes_retries_with_feedback_until_max_retries_then_fails(
         phase=Phase.EXECUTING,
         worker_wo_ids=["WO-002"],
         max_retries=1,
+        max_attempts=1,
     )
 
     op1 = mock_mgr.start_turn("sess-s7", "Execute WO-002", work_order_id="WO-002", role="backend")

@@ -470,8 +470,8 @@ def test_get_curated_tools_for_phase():
     for name in PLANNING_CORE_TOOL_NAMES:
         assert name in tool_names
     assert "request_tools" in tool_names
-    # Should be lean: 5 tools max (4 core + request_tools)
-    assert len(planning_tools) <= 5
+    # Should be lean: core planning tools + request_tools
+    assert len(planning_tools) <= len(PLANNING_CORE_TOOL_NAMES) + 1
 
     # Authoring phase for architect
     authoring_tools = get_curated_tools_for_phase("claude", phase="authoring")
@@ -766,6 +766,48 @@ def test_null_tool_calls_resilience():
     ollama_stream_adapter = OllamaAdapter(transport=lambda p, s, t: ollama_stream_payload)
     ollama_chunks = list(ollama_stream_adapter.stream([Message.user("Hi")]))
     assert "".join(c.delta_content for c in ollama_chunks) == "Hello there!"
+
+
+def test_gateway_write_file_parameter_resilience_and_deliverable_fallback(tmp_path: Path):
+    """Verify that write_file and read_file tolerate parameter aliases and fallback to required_deliverable."""
+    from validators.kernel.providers.gateway import ProviderGateway
+    from validators.kernel.providers.models import ToolCallRequest
+
+    # Set up mock tool gateway
+    written = {}
+
+    class MockToolGateway:
+        def read_file(self, target: str) -> str:
+            if target in written:
+                return written[target]
+            return f"content of {target}"
+
+        def write_file(self, target: str, content: str) -> None:
+            written[target] = content
+
+    mock_tg = MockToolGateway()
+    from validators.kernel.providers.adapter import OllamaAdapter
+    mock_adapter = OllamaAdapter(transport=lambda p, s, t: {})
+    gw = ProviderGateway(mock_adapter, mock_tg)
+    gw.required_deliverable = "index.html"
+
+    # 1. write_file with only content -> falls back to required_deliverable
+    call1 = ToolCallRequest(id="c1", name="write_file", arguments={"content": "<h1>Hello</h1>"})
+    res1 = gw.execute_tool_call(call1)
+    assert "Successfully wrote" in res1
+    assert written["index.html"] == "<h1>Hello</h1>"
+
+    # 2. write_file with alias 'file' and 'data'
+    call2 = ToolCallRequest(id="c2", name="write_file", arguments={"file": "style.css", "data": "body { margin: 0; }"})
+    res2 = gw.execute_tool_call(call2)
+    assert "Successfully wrote" in res2
+    assert written["style.css"] == "body { margin: 0; }"
+
+    # 3. read_file with alias 'filepath'
+    call3 = ToolCallRequest(id="c3", name="read_file", arguments={"filepath": "style.css"})
+    res3 = gw.execute_tool_call(call3)
+    assert "body { margin: 0; }" in res3
+
 
 
 

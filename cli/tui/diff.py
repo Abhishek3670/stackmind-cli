@@ -60,7 +60,7 @@ def truncate_cell(text: str, max_w: int) -> str:
         return ""
     if cell_len(text) <= max_w:
         return text
-    target_w = max_w - 1
+    target_w = max_w - cell_len("…")
     if target_w <= 0:
         return "…"[:max_w]
     truncated = ""
@@ -71,7 +71,11 @@ def truncate_cell(text: str, max_w: int) -> str:
             break
         truncated += ch
         curr_w += ch_w
-    return truncated + "…"
+    res = truncated + "…"
+    while cell_len(res) > max_w and len(truncated) > 0:
+        truncated = truncated[:-1]
+        res = truncated + "…"
+    return res
 
 
 def highlight_code_line(text: str, base_style: str = "#d1d5db", bg_style: str = "") -> Text:
@@ -150,21 +154,14 @@ def parse_unified_diff_to_split_rows(diff_text: str) -> list[SplitRow]:
             if old_no is None:
                 old_no = 1
                 new_no = 1
-            # Strip synthetic single space from extract_tool_diff if present (avoid stripping code indent)
-            if raw_line.startswith("- ") and not raw_line.startswith("-  "):
-                code = raw_line[2:]
-            else:
-                code = raw_line[1:]
+            code = raw_line[1:]
             removed_block.append(DiffCell(line_no=old_no, sign="-", text=code, kind="del"))
             old_no += 1
         elif raw_line.startswith("+"):
             if new_no is None:
                 old_no = 1
                 new_no = 1
-            if raw_line.startswith("+ ") and not raw_line.startswith("+  "):
-                code = raw_line[2:]
-            else:
-                code = raw_line[1:]
+            code = raw_line[1:]
             added_block.append(DiffCell(line_no=new_no, sign="+", text=code, kind="add"))
             new_no += 1
         else:
@@ -211,62 +208,45 @@ def render_split_diff(
         return SplitDiffText(msg, Text(msg, style="dim italic"))
 
     indent_len = cell_len(indent)
-    usable_w = max(20, avail_width - indent_len)
+    effective_w = avail_width - indent_len - 4
     rich_lines: list[Text] = []
 
-    if avail_width >= 90 and usable_w >= 80:
+    if avail_width >= 90 and effective_w >= 80:
         # Side-by-Side Mode (avail_width >= 90)
-        col_w = (usable_w - 2) // 2
+        col_w = effective_w // 2
         code_w = max(6, col_w - 6)
 
+        def _format_diff_col(cell: DiffCell) -> Text:
+            if cell.kind == "none" or (cell.line_no is None and not cell.text):
+                return Text(" " * col_w)
+            num_str = f"{cell.line_no:>3}" if cell.line_no is not None else "   "
+            trunc = truncate_cell(cell.text, code_w)
+            code = trunc + (" " * max(0, code_w - cell_len(trunc)))
+            t = Text()
+            if cell.kind == "del":
+                t.append(f"{num_str} ", style="#9ca3af on #3b1d26")
+                t.append("- ", style="bold #f87171 on #3b1d26")
+                t.append_text(highlight_code_line(code, base_style="#fca5a5", bg_style="on #3b1d26"))
+            elif cell.kind == "add":
+                t.append(f"{num_str} ", style="#9ca3af on #16332e")
+                t.append("+ ", style="bold #34d399 on #16332e")
+                t.append_text(highlight_code_line(code, base_style="#a7f3d0", bg_style="on #16332e"))
+            else:
+                t.append(f"{num_str}   ", style="#6b7280")
+                t.append_text(highlight_code_line(code, base_style="#d1d5db"))
+            return t
+
         for row in split_rows:
-            # Left column (Deletions / Old context / Filler)
-            left = row.left
-            l_num_str = f"{left.line_no:>3}" if left.line_no is not None else "   "
-            l_gutter = f"{l_num_str} {left.sign} "
-            l_trunc = truncate_cell(left.text, code_w)
-            l_pad = max(0, col_w - cell_len(l_gutter) - cell_len(l_trunc))
-            l_code = l_trunc + (" " * l_pad)
-
-            l_text = Text()
-            if left.kind == "del":
-                l_text.append(f"{l_num_str} ", style="#9ca3af on #3b1d26")
-                l_text.append("- ", style="bold #f87171 on #3b1d26")
-                l_text.append_text(highlight_code_line(l_code, base_style="#fca5a5", bg_style="on #3b1d26"))
-            elif left.kind == "ctx":
-                l_text.append(f"{l_num_str}   ", style="#6b7280")
-                l_text.append_text(highlight_code_line(l_code, base_style="#d1d5db"))
-            else:  # empty filler
-                l_text.append(" " * col_w)
-
-            # Right column (Additions / New context / Filler)
-            right = row.right
-            r_num_str = f"{right.line_no:>3}" if right.line_no is not None else "   "
-            r_gutter = f"{r_num_str} {right.sign} "
-            r_trunc = truncate_cell(right.text, code_w)
-            r_pad = max(0, col_w - cell_len(r_gutter) - cell_len(r_trunc))
-            r_code = r_trunc + (" " * r_pad)
-
-            r_text = Text()
-            if right.kind == "add":
-                r_text.append(f"{r_num_str} ", style="#9ca3af on #16332e")
-                r_text.append("+ ", style="bold #34d399 on #16332e")
-                r_text.append_text(highlight_code_line(r_code, base_style="#a7f3d0", bg_style="on #16332e"))
-            elif right.kind == "ctx":
-                r_text.append(f"{r_num_str}   ", style="#6b7280")
-                r_text.append_text(highlight_code_line(r_code, base_style="#d1d5db"))
-            else:  # empty filler
-                r_text.append(" " * col_w)
-
             row_line = Text(indent) if indent else Text()
-            row_line.append_text(l_text)
+            row_line.append_text(_format_diff_col(row.left))
             row_line.append("  ")  # 2-space column divider
-            row_line.append_text(r_text)
+            row_line.append_text(_format_diff_col(row.right))
             rich_lines.append(row_line)
 
     else:
         # Responsive Single-Column Fallback (< 90)
         gutter_w = 10
+        usable_w = max(20, avail_width - indent_len - 4)
         code_w = max(10, usable_w - gutter_w)
 
         for row in split_rows:
@@ -276,7 +256,7 @@ def render_split_diff(
                 new_str = f"{right.line_no:>3}" if right.line_no is not None else "   "
                 gutter = f"{old_str} {new_str}   "
                 trunc = truncate_cell(left.text, code_w)
-                pad = max(0, usable_w - gutter_w - cell_len(trunc))
+                pad = max(0, code_w - cell_len(trunc))
                 code = trunc + (" " * pad)
                 lt = Text(indent) if indent else Text()
                 lt.append(gutter, style="#6b7280")
@@ -287,7 +267,7 @@ def render_split_diff(
                 old_str = f"{left.line_no:>3}" if left.line_no is not None else "   "
                 gutter_num = f"{old_str}     "
                 trunc = truncate_cell(left.text, code_w)
-                pad = max(0, usable_w - gutter_w - cell_len(trunc))
+                pad = max(0, code_w - cell_len(trunc))
                 code = trunc + (" " * pad)
                 lt = Text(indent) if indent else Text()
                 lt.append(gutter_num, style="#9ca3af on #3b1d26")
@@ -299,7 +279,7 @@ def render_split_diff(
                 new_str = f"{right.line_no:>3}" if right.line_no is not None else "   "
                 gutter_num = f"    {new_str} "
                 trunc = truncate_cell(right.text, code_w)
-                pad = max(0, usable_w - gutter_w - cell_len(trunc))
+                pad = max(0, code_w - cell_len(trunc))
                 code = trunc + (" " * pad)
                 lt = Text(indent) if indent else Text()
                 lt.append(gutter_num, style="#9ca3af on #16332e")
@@ -312,7 +292,7 @@ def render_split_diff(
                 old_str = f"{left.line_no:>3}" if left.line_no is not None else "   "
                 gutter_del = f"{old_str}     "
                 trunc_del = truncate_cell(left.text, code_w)
-                pad_del = max(0, usable_w - gutter_w - cell_len(trunc_del))
+                pad_del = max(0, code_w - cell_len(trunc_del))
                 code_del = trunc_del + (" " * pad_del)
                 ldel = Text(indent) if indent else Text()
                 ldel.append(gutter_del, style="#9ca3af on #3b1d26")
@@ -323,7 +303,7 @@ def render_split_diff(
                 new_str = f"{right.line_no:>3}" if right.line_no is not None else "   "
                 gutter_add = f"    {new_str} "
                 trunc_add = truncate_cell(right.text, code_w)
-                pad_add = max(0, usable_w - gutter_w - cell_len(trunc_add))
+                pad_add = max(0, code_w - cell_len(trunc_add))
                 code_add = trunc_add + (" " * pad_add)
                 ladd = Text(indent) if indent else Text()
                 ladd.append(gutter_add, style="#9ca3af on #16332e")

@@ -495,12 +495,12 @@ class MemoryPromotionPolicy:
         # 12. Approval check (type-specific)
         policy = self.TYPE_POLICIES.get(record.memory_type, {})
         if policy.get("approval_required", False):
-            approval = self.get_approval(record.memory_id)
-            if not approval and not is_human:
+            ok, reasons = self._check_approval_receipt(record)
+            if not ok:
                 return PromotionEligibilityResult(
                     decision=PromotionDecision.REQUIRES_REVIEW,
-                    reason_code="approval_required",
-                    message=f"Memory type {record.memory_type.value} requires approval before promotion",
+                    reason_code=reasons[0],
+                    message=f"Memory type {record.memory_type.value} requires valid approval receipt before promotion",
                     requires_approval=True,
                     approval_type="human_or_lead",
                 )
@@ -532,8 +532,10 @@ class MemoryPromotionPolicy:
         result = self.evaluate_promotion(record, actor=actor, is_human=is_human, dry_run=dry_run)
 
         if result.decision == PromotionDecision.REQUIRES_REVIEW and result.requires_approval:
-            if not is_human:
-                raise ApprovalRequiredError(result.message)
+            # At mutation time, require actual approval receipt (not just is_human flag)
+            ok, reasons = self._check_approval_receipt(record)
+            if not ok:
+                raise ApprovalRequiredError(f"Approval receipt required: {reasons[0]}")
 
         if result.decision not in {PromotionDecision.ELIGIBLE, PromotionDecision.ALREADY_ACTIVE}:
             return None, result

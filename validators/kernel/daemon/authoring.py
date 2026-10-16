@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from validators.harness.authoring_gate import AuthoringGate
-from validators.harness.plan import parse_plan, PlanStructure
+from validators.harness.plan import parse_plan, PlanStructure, TechStack, PlanValidationError, parse_tech_stack, PlanMilestone
 from validators.skill.selector import select_skills_for_task
 
 
@@ -30,7 +30,7 @@ def _is_test_path(path: str) -> bool:
     if parts[0] in ("tests", "test"):
         return True
     stem = Path(norm).stem.lower()
-    return stem.startswith("test_") or stem.endswith("_test")
+    return stem.startswith("test_") or stem.endswith(("_test", ".test", ".spec"))
 
 
 def _slugify(title: str, max_len: int = 48) -> str:
@@ -41,39 +41,153 @@ def _slugify(title: str, max_len: int = 48) -> str:
     return words or "qa_suite"
 
 
-def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) -> dict[str, str]:
-    """Extract deliverable type, path, and description from milestone and tasks."""
-    combined_text = f"{milestone_title}\n" + "\n".join(tasks)
-    
-    # 1. Search for explicitly mentioned file paths in tasks
-    # Patterns: requirements.txt, src/backend.py, src/frontend.html, src/landing.html, etc.
-    file_pattern = r"(?:`|\"|'|\s|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?:`|\"|'|\s|$)"
-    matches = re.findall(file_pattern, combined_text)
+def extract_candidate_paths(text: str) -> list[str]:
+    """Extract candidate file paths from text, ignoring VCS and internal system files."""
+    if not text:
+        return []
+    file_pattern = r"(?:[`\"'\s(\[{<]|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?=[`\"'\s)\]}>,;:]|$)"
+    matches = re.findall(file_pattern, text)
     candidate_paths: list[str] = []
+    seen = set()
     for m in matches:
         clean = m.strip().strip("`\"'.,()")
-        if clean.endswith((".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite")):
-            if not clean.startswith(".sync") and not clean.startswith(".git") and clean != "PLAN.md":
+        if clean in seen:
+            continue
+        if any(clean.endswith(ext) for ext in (
+            ".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md",
+            ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite", ".go", ".rs", ".vue", ".svelte",
+            ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot"
+        )):
+            if not clean.startswith(".sync") and not clean.startswith(".git") and clean not in ("PLAN.md", ".env"):
                 candidate_paths.append(clean)
+                seen.add(clean)
+
+    # Check for dependency manifests mentioned by name without explicit quotes
+    text_lower = text.lower()
+    for mf in ("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod"):
+        if mf in text_lower and mf not in seen:
+            candidate_paths.append(mf)
+            seen.add(mf)
+
+    return candidate_paths
+
+
+def extract_deliverable_spec(
+    milestone_title: str,
+    tasks: list[str],
+    role: str,
+    stack: TechStack | None = None,
+    project_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Extract deliverable type, path, and description from milestone and tasks, respecting tech stack precedence."""
+    if stack and stack.is_ambiguous:
+        return {
+            "type": "blocked",
+            "path": None,
+            "description": f"Blocked by stack ambiguity: {stack.ambiguity_reason}",
+            "error": f"Stack ambiguity: {stack.ambiguity_reason}",
+        }
+
+    combined_text = f"{milestone_title}\n" + "\n".join(tasks)
+    combined_lower = combined_text.lower()
+
+    # 1. Search for explicitly mentioned file paths in tasks
+    candidate_paths = extract_candidate_paths(combined_text)
 
     role_norm = role.lower().strip()
-    
-    # Role-based extraction with candidate path matching
+
+    # Precedence 1: Explicit Scaffolding / Dependency Manifest
+    is_scaffold_task = any(kw in combined_lower for kw in (
+        "scaffolding", "dependency setup", "dependencies setup", "setup dependencies",
+        "install dependencies", "initialize dependencies", "configure dependencies",
+        "package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod"
+    ))
+    manifest_candidates = [
+        p for p in candidate_paths
+        if p in ("package.json", "requirements.txt", "pyproject.toml", "Cargo.toml", "go.mod")
+        or p.endswith(("/package.json", "/requirements.txt", "/pyproject.toml", "/Cargo.toml", "/go.mod"))
+    ]
+
+    if (is_scaffold_task or manifest_candidates) and role_norm in ("backend", "codex", "gitops", "local-llm"):
+        if manifest_candidates:
+            return {
+                "type": "config",
+                "path": manifest_candidates[0],
+                "description": f"Project dependency manifest declaring required packages for {milestone_title}",
+            }
+        if stack and stack.dependency_manifest:
+            return {
+                "type": "config",
+                "path": stack.dependency_manifest,
+                "description": f"Project dependency manifest declaring required packages for {milestone_title}",
+            }
+        if project_path:
+            pp = Path(project_path).resolve()
+            if (pp / "package.json").is_file():
+                return {"type": "config", "path": "package.json", "description": f"Project dependency manifest for {milestone_title}"}
+            if (pp / "requirements.txt").is_file():
+                return {"type": "config", "path": "requirements.txt", "description": f"Project dependency manifest for {milestone_title}"}
+            if (pp / "pyproject.toml").is_file():
+                return {"type": "config", "path": "pyproject.toml", "description": f"Project dependency manifest for {milestone_title}"}
+
+        # Check stack language for scaffolding fallback
+        is_node_scaffold = (
+            (stack and stack.backend_language in ("javascript", "typescript"))
+            or (stack and stack.backend_framework in ("express", "nest"))
+            or any(kw in combined_lower for kw in ("node", "express", "npm", "javascript"))
+        )
+        if is_node_scaffold:
+            return {
+                "type": "config",
+                "path": "package.json",
+                "description": f"Project dependency manifest declaring required packages for {milestone_title}",
+            }
+        return {
+            "type": "config",
+            "path": "requirements.txt",
+            "description": f"Project dependency manifest declaring required packages for {milestone_title}",
+        }
+
+    # Role-based extraction:
+    # ── Frontend (Gemini) ──
     if role_norm in ("gemini", "frontend"):
         target_path = next(
-            (p for p in candidate_paths if any(p.endswith(ext) for ext in (".html", ".jsx", ".tsx", ".js", ".ts", ".css"))),
+            (p for p in candidate_paths if any(p.endswith(ext) for ext in (".html", ".jsx", ".tsx", ".vue", ".svelte", ".js", ".ts", ".css")) and not _is_test_path(p)),
             None,
         )
         if not target_path:
-            target_path = next(
-                (p for p in candidate_paths if not p.endswith((".py", ".txt", ".md"))),
-                None,
-            )
-        if not target_path:
-            if "landing" in combined_text.lower():
-                target_path = "src/landing.html"
+            # Check tech stack
+            is_react = (stack and stack.frontend_framework == "react") or ("react" in combined_lower)
+            is_vue = (stack and stack.frontend_framework == "vue") or ("vue" in combined_lower)
+            is_svelte = (stack and stack.frontend_framework == "svelte") or ("svelte" in combined_lower)
+
+            if is_react:
+                if "landing" in combined_lower:
+                    target_path = "src/components/Landing.jsx"
+                elif any(kw in combined_lower for kw in ("theme", "design system", "design")):
+                    target_path = "src/theme.js"
+                elif any(kw in combined_lower for kw in ("login", "auth", "register")):
+                    target_path = "src/components/Login.jsx"
+                elif "dashboard" in combined_lower:
+                    target_path = "src/components/Dashboard.jsx"
+                else:
+                    target_path = "src/App.jsx"
+            elif is_vue:
+                if "landing" in combined_lower:
+                    target_path = "src/components/Landing.vue"
+                else:
+                    target_path = "src/App.vue"
+            elif is_svelte:
+                target_path = "src/App.svelte"
             else:
-                target_path = "src/frontend.html"
+                if any(kw in combined_lower for kw in ("style", "css", "theme", "stylesheet", "design system")):
+                    target_path = "css/style.css"
+                elif any(kw in combined_lower for kw in ("script", "javascript", "interactivity")):
+                    target_path = "js/main.js"
+                elif any(kw in combined_lower for kw in ("login", "auth")):
+                    target_path = "src/login.html"
+                else:
+                    target_path = "index.html"
 
         return {
             "type": "code",
@@ -81,21 +195,29 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
             "description": f"Frontend interface and UI components for {milestone_title}",
         }
 
+    # ── QA (Gemma) ──
     if role_norm in ("gemma", "qa"):
-        # QA work orders deliver an executable test suite the QA worker authors
-        # and runs end-to-end — never a bare sign-off document (D024 requires a
-        # companion test file for every code deliverable at GitOps time).
         test_path = next((p for p in candidate_paths if _is_test_path(p)), None)
         if not test_path:
-            test_path = f"tests/test_{_slugify(milestone_title)}.py"
+            is_js_qa = (
+                (stack and stack.backend_language in ("javascript", "typescript"))
+                or (stack and stack.frontend_framework in ("react", "vue", "svelte"))
+                or any(kw in combined_lower for kw in ("jest", "mocha", "vitest", "playwright", "cypress"))
+            )
+            if is_js_qa:
+                test_path = f"tests/test_{_slugify(milestone_title)}.test.js"
+            elif stack and stack.backend_language == "go":
+                test_path = f"tests/{_slugify(milestone_title)}_test.go"
+            else:
+                test_path = f"tests/test_{_slugify(milestone_title)}.py"
+
         return {
             "type": "code",
             "path": test_path,
-            "description": (
-                f"Executable end-to-end test suite and QA sign-off for {milestone_title}"
-            ),
+            "description": f"Executable end-to-end test suite and QA sign-off for {milestone_title}",
         }
 
+    # ── GitOps (Local-LLM) ──
     if role_norm in ("local-llm", "gitops"):
         target_path = next(
             (p for p in candidate_paths if p in ("VERSION.md", "CHANGELOG.md", "package.json")),
@@ -107,22 +229,62 @@ def extract_deliverable_spec(milestone_title: str, tasks: list[str], role: str) 
             "description": f"Release metadata and version bump for {milestone_title}",
         }
 
-    # Default: Codex / Backend
-    # Only treat as requirements.txt if explicitly mentioned and no code files are targeted
-    has_req = any(p == "requirements.txt" or p.endswith("requirements.txt") for p in candidate_paths) or any(
-        kw in combined_text.lower() for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")
+    # ── Backend (Codex) ──
+    # 1. Explicit code paths in candidate_paths take precedence
+    code_path = next(
+        (p for p in candidate_paths if any(p.endswith(ext) for ext in (".py", ".js", ".ts", ".mjs", ".go", ".rs")) and not _is_test_path(p)),
+        None,
     )
-    code_path = next((p for p in candidate_paths if p.endswith(".py") and not "test" in p), None)
-    if not code_path:
-        code_path = next((p for p in candidate_paths if p.endswith(".py")), None)
-    if has_req and not code_path:
+    if code_path:
         return {
-            "type": "config",
-            "path": "requirements.txt",
-            "description": "Project dependency manifest declaring required packages",
+            "type": "code",
+            "path": code_path,
+            "description": f"Backend API and logic implementation for {milestone_title}",
         }
 
-    target_path = code_path or "src/backend.py"
+    # 2. Derive path based on approved technology stack precedence
+    is_node = (
+        (stack and stack.backend_language in ("javascript", "typescript"))
+        or (stack and stack.backend_framework in ("express", "nest"))
+        or any(kw in combined_lower for kw in ("node", "express", "npm", "javascript"))
+    )
+    is_python = (
+        (stack and stack.backend_language == "python")
+        or (stack and stack.backend_framework in ("flask", "fastapi", "django"))
+        or any(kw in combined_lower for kw in ("python", "flask", "fastapi", "django", "pytest"))
+    )
+    is_go = (stack and stack.backend_language == "go") or any(kw in combined_lower for kw in ("go", "golang"))
+    is_rust = (stack and stack.backend_language == "rust") or any(kw in combined_lower for kw in ("rust", "cargo"))
+
+    # Check project structure on disk if stack was not explicit
+    if not (is_node or is_python or is_go or is_rust) and project_path:
+        pp = Path(project_path).resolve()
+        if (pp / "package.json").is_file():
+            is_node = True
+        elif (pp / "requirements.txt").is_file() or (pp / "pyproject.toml").is_file():
+            is_python = True
+        elif (pp / "Cargo.toml").is_file():
+            is_rust = True
+        elif (pp / "go.mod").is_file():
+            is_go = True
+
+    if is_node:
+        is_ts = (stack and stack.backend_language == "typescript") or ("typescript" in combined_lower)
+        ext = ".ts" if is_ts else ".js"
+        if any(kw in combined_lower for kw in ("auth", "login", "user")):
+            target_path = f"src/routes/auth{ext}"
+        elif "api" in combined_lower or "server" in combined_lower:
+            target_path = f"src/server{ext}"
+        else:
+            target_path = f"src/server{ext}"
+    elif is_go:
+        target_path = "main.go"
+    elif is_rust:
+        target_path = "src/main.rs"
+    else:
+        # Default Python backend convention
+        target_path = "src/backend.py"
+
     return {
         "type": "code",
         "path": target_path,
@@ -206,7 +368,7 @@ def determine_assigned_agent(
         return "gemma", "qa"
 
     # Scaffolding / dependencies specifically for backend
-    if any(kw in combined for kw in ("requirements.txt", "dependency manifest", "dependencies manifest", "setup dependencies")):
+    if any(kw in combined for kw in ("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod", "dependency manifest", "dependencies manifest", "setup dependencies", "scaffold", "scaffolding")):
         return "codex", "backend"
 
     return "codex", "backend"
@@ -223,6 +385,7 @@ def build_child_work_order(
     implementation_estimate: dict[str, Any] | None = None,
     milestone_id: str | None = None,
     skills: list[str] | None = None,
+    deliverables: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Work Order record."""
     now = _now()
@@ -252,6 +415,8 @@ def build_child_work_order(
         record["implementation_estimate"] = dict(implementation_estimate)
     if skills:
         record["skills"] = list(skills)
+    if deliverables:
+        record["deliverables"] = list(deliverables)
     return record
 
 
@@ -261,6 +426,7 @@ def derive_implementation_estimate(
     deliverable_path: str | None,
     candidate_paths: list[str] | None = None,
     deliverable_type: str | None = None,
+    stack: TechStack | None = None,
 ) -> dict[str, Any] | None:
     """Derive an explicit implementation estimate from the task's expected file set.
 
@@ -270,8 +436,8 @@ def derive_implementation_estimate(
     of receiving an unbounded budget.
 
     Every code deliverable also plans its D024 companion test
-    (``tests/test_<stem>.py``) so test authoring is part of the work order's
-    declared footprint instead of being discovered missing at GitOps time.
+    (``tests/test_<stem>.py`` or language equivalent) so test authoring is part of the
+    work order's declared footprint instead of being discovered missing at GitOps time.
     """
     expected: list[str] = []
     if deliverable_path:
@@ -284,7 +450,7 @@ def derive_implementation_estimate(
         return None
 
     deliv_norm = (deliverable_path or "").replace("\\", "/").strip().lstrip("/")
-    code_exts = (".py", ".ts", ".js", ".go", ".rs", ".dart")
+    code_exts = (".py", ".ts", ".js", ".jsx", ".tsx", ".mjs", ".go", ".rs", ".dart")
     is_code_deliverable = (
         str(deliverable_type or "").lower() == "code"
         or (bool(deliv_norm) and deliv_norm.endswith(code_exts))
@@ -296,11 +462,25 @@ def derive_implementation_estimate(
         and not any(_is_test_path(f) for f in expected)
     ):
         stem = Path(deliv_norm).stem
-        expected.append(f"tests/test_{stem}.py")
+        ext = Path(deliv_norm).suffix.lower()
+        if ext in (".js", ".jsx", ".ts", ".tsx", ".mjs") or (stack and stack.backend_language in ("javascript", "typescript")):
+            test_ext = ".test.ts" if (ext in (".ts", ".tsx") or (stack and stack.backend_language == "typescript")) else ".test.js"
+            expected.append(f"tests/test_{stem}{test_ext}")
+        elif ext == ".go" or (stack and stack.backend_language == "go"):
+            expected.append(f"tests/{stem}_test.go")
+        elif ext == ".rs" or (stack and stack.backend_language == "rust"):
+            expected.append(f"tests/test_{stem}.rs")
+        else:
+            expected.append(f"tests/test_{stem}.py")
+
+    is_scaffold_task = any(kw in f"{title} {description}".lower() for kw in (
+        "scaffold", "scaffolding", "setup", "asset setup", "structure", "init", "bootstrap"
+    ))
+    max_files = max(len(expected), 6) if is_scaffold_task else max(len(expected), len(expected) + 1)
 
     return {
         "expected_files": expected,
-        "max_files_touched": len(expected),
+        "max_files_touched": max_files,
         "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
     }
 
@@ -334,6 +514,11 @@ def build_child_contract(
         for cp in candidate_paths:
             if cp and isinstance(cp, str) and not cp.startswith(".git") and not cp.startswith(".sync") and cp != ".env":
                 allow_rules.append({"module": cp})
+                clean_cp = cp.replace("\\", "/").strip().lstrip("/")
+                if "/" in clean_cp:
+                    top_dir = clean_cp.split("/")[0]
+                    if top_dir not in (".git", ".sync", ".env"):
+                        allow_rules.append({"module": f"{top_dir}/**"})
 
     # Common repository root documentation and config files allowed across roles:
     allow_rules.extend([
@@ -391,6 +576,13 @@ def build_child_contract(
             {"module": "templates/**"},
             {"module": "views/**"},
             {"module": "components/**"},
+            {"module": "assets/**"},
+            {"module": "css/**"},
+            {"module": "js/**"},
+            {"module": "styles/**"},
+            {"module": "images/**"},
+            {"module": "img/**"},
+            {"module": "fonts/**"},
             {"module": "index.html"},
             {"module": "package.json"},
             {"module": "*.html"},
@@ -399,6 +591,13 @@ def build_child_contract(
             {"module": "*.tsx"},
             {"module": "*.jsx"},
             {"module": "*.css"},
+            {"module": "*.svg"},
+            {"module": "*.png"},
+            {"module": "*.jpg"},
+            {"module": "*.jpeg"},
+            {"module": "*.webp"},
+            {"module": "*.gif"},
+            {"module": "*.ico"},
         ])
     elif role_norm in ("qa", "gemma"):
         allow_rules.extend([
@@ -412,6 +611,28 @@ def build_child_contract(
             {"module": "*.db"},
             {"module": "*.sqlite"},
             {"module": "pytest.ini"},
+            # QA must also inspect and audit frontend deliverables and assets
+            {"module": "index.html"},
+            {"module": "css/**"},
+            {"module": "styles/**"},
+            {"module": "js/**"},
+            {"module": "assets/**"},
+            {"module": "images/**"},
+            {"module": "img/**"},
+            {"module": "fonts/**"},
+            {"module": "*.html"},
+            {"module": "*.css"},
+            {"module": "*.js"},
+            {"module": "*.jsx"},
+            {"module": "*.tsx"},
+            {"module": "*.ts"},
+            {"module": "*.svg"},
+            {"module": "*.png"},
+            {"module": "*.jpg"},
+            {"module": "*.jpeg"},
+            {"module": "*.webp"},
+            {"module": "*.gif"},
+            {"module": "*.ico"},
         ])
     elif role_norm in ("gitops", "local-llm"):
         allow_rules.extend([
@@ -499,6 +720,201 @@ def build_child_contract(
     return ret
 
 
+def extract_declared_deliverable_paths(wo_data: dict[str, Any]) -> set[str]:
+    """Extract normalized paths of all declared deliverables from a work order."""
+    paths: set[str] = set()
+    deliv = wo_data.get("deliverable")
+    if isinstance(deliv, dict) and deliv.get("path"):
+        paths.add(str(deliv["path"]).replace("\\", "/").strip().lstrip("/"))
+    for extra in wo_data.get("deliverables") or []:
+        if isinstance(extra, dict) and extra.get("path"):
+            paths.add(str(extra["path"]).replace("\\", "/").strip().lstrip("/"))
+        elif isinstance(extra, str) and extra.strip():
+            paths.add(extra.replace("\\", "/").strip().lstrip("/"))
+    return paths
+
+
+def validate_work_orders_ownership(wos: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+    """Validate that parallel work orders do not claim conflicting file ownership.
+
+    Returns:
+        (is_valid, list of error messages)
+    """
+    errors: list[str] = []
+
+    deps_map: dict[str, set[str]] = {}
+    for wo in wos:
+        wo_id = str(wo.get("id") or "")
+        deps = set()
+        for d in wo.get("dependencies") or []:
+            if d and str(d).strip():
+                deps.add(str(d).strip())
+        deps_map[wo_id] = deps
+
+    def _is_descendant(target: str, source: str) -> bool:
+        visited = set()
+        queue = list(deps_map.get(source, set()))
+        while queue:
+            curr = queue.pop(0)
+            if curr == target:
+                return True
+            if curr not in visited:
+                visited.add(curr)
+                queue.extend(deps_map.get(curr, set()))
+        return False
+
+    def are_serialized(wo_a: str, wo_b: str) -> bool:
+        return _is_descendant(wo_b, wo_a) or _is_descendant(wo_a, wo_b)
+
+    file_to_wos: dict[str, list[str]] = {}
+    for wo in wos:
+        wo_id = str(wo.get("id") or "")
+        paths = extract_declared_deliverable_paths(wo)
+        for p in paths:
+            file_to_wos.setdefault(p, []).append(wo_id)
+
+    for file_path, claiming_wos in sorted(file_to_wos.items()):
+        if len(claiming_wos) > 1:
+            for i in range(len(claiming_wos)):
+                for j in range(i + 1, len(claiming_wos)):
+                    wo_a = claiming_wos[i]
+                    wo_b = claiming_wos[j]
+                    if not are_serialized(wo_a, wo_b):
+                        errors.append(
+                            f"Overlapping file ownership detected for '{file_path}': "
+                            f"work orders '{wo_a}' and '{wo_b}' claim the same deliverable concurrently "
+                            f"without dependency ordering"
+                        )
+
+    return len(errors) == 0, errors
+
+
+def decompose_milestone(
+    m: PlanMilestone,
+    start_idx: int,
+    stack: TechStack | None = None,
+    project_path: Path | str | None = None,
+    prev_wo_id: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Decompose a milestone into one or more validated child work orders.
+
+    If the milestone contains multiple subtasks that declare distinct non-test
+    deliverable files (e.g., landing.html, app.js, style.css), decompose them
+    into sequential child work orders linked by explicit dependencies and sharing
+    the milestone_id.
+
+    If the milestone is cohesive or subtasks target the same deliverable/companion
+    tests, generate a single work order covering all declared files.
+
+    Returns:
+        (list of work order dictionaries, last_wo_id)
+    """
+    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
+
+    # Analyze tasks for distinct non-test deliverables
+    task_deliverables: list[tuple[str, str, dict[str, Any]]] = []
+    if len(m.tasks) > 1:
+        for t in m.tasks:
+            t_clean = t.strip()
+            if not t_clean:
+                continue
+            cands = extract_candidate_paths(t_clean)
+            non_test_cands = [p for p in cands if not _is_test_path(p)]
+            if non_test_cands:
+                t_deliv = extract_deliverable_spec(t_clean, [t_clean], role, stack=stack, project_path=project_path)
+                if t_deliv.get("path") and not _is_test_path(str(t_deliv.get("path"))):
+                    task_deliverables.append((t_clean, t_clean, t_deliv))
+
+    distinct_paths = [td[2]["path"] for td in task_deliverables if td[2].get("path")]
+    should_decompose = len(task_deliverables) > 1 and len(set(distinct_paths)) == len(task_deliverables)
+
+    wos: list[dict[str, Any]] = []
+    current_prev = prev_wo_id
+
+    if should_decompose:
+        for offset, (t_text, t_title, t_deliv) in enumerate(task_deliverables):
+            wo_idx = start_idx + offset
+            wo_id = f"WO-{wo_idx:03d}"
+            deps = [current_prev] if current_prev else []
+            clean_title = re.sub(r"^Task\s+[0-9]+(?:\.[0-9]+)?\s*:\s*", "", t_title, flags=re.IGNORECASE).strip()
+            clean_title = re.sub(r"^-\s*\[[ xX]\]\s*", "", clean_title).strip()
+            wo_title = f"{m.title}: {clean_title}" if len(clean_title) < 50 else clean_title[:80]
+
+            wo = build_child_work_order(
+                wo_id=wo_id,
+                title=wo_title,
+                description=t_text,
+                assigned_agents=[agent],
+                dependencies=deps,
+                priority="P0" if wo_idx == 1 else "P1",
+                deliverable=t_deliv,
+                milestone_id=m.id,
+                skills=m.skills if m.skills else None,
+            )
+            wos.append(wo)
+            current_prev = wo_id
+        return wos, current_prev
+    else:
+        wo_id = f"WO-{start_idx:03d}"
+        deps = [current_prev] if current_prev else []
+        deliv = extract_deliverable_spec(m.title, m.tasks, role, stack=stack, project_path=project_path)
+
+        all_cands = extract_candidate_paths(f"{m.title}\n" + "\n".join(m.tasks))
+        non_test_cands = [p for p in all_cands if not _is_test_path(p)]
+
+        deliverables_list: list[dict[str, Any]] | None = None
+        if len(non_test_cands) > 1:
+            deliverables_list = []
+            for p in non_test_cands:
+                p_type = "config" if p in ("package.json", "requirements.txt", "pyproject.toml") else "code"
+                deliverables_list.append({
+                    "type": p_type,
+                    "path": p,
+                    "description": f"Deliverable {p} for {m.title}",
+                })
+
+        wo = build_child_work_order(
+            wo_id=wo_id,
+            title=m.title,
+            description="\n".join(m.tasks) if m.tasks else m.title,
+            assigned_agents=[agent],
+            dependencies=deps,
+            priority="P0" if start_idx == 1 else "P1",
+            deliverable=deliv,
+            milestone_id=m.id,
+            skills=m.skills if m.skills else None,
+            deliverables=deliverables_list,
+        )
+        wos.append(wo)
+        return wos, wo_id
+
+
+def decompose_plan_milestones(
+    milestones: list[PlanMilestone],
+    start_idx: int,
+    stack: TechStack | None = None,
+    project_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Decompose parsed plan milestones into child work order dictionaries."""
+    all_wos: list[dict[str, Any]] = []
+    current_idx = start_idx
+    prev_wo_id: str | None = None
+
+    for m in milestones:
+        child_wos, last_id = decompose_milestone(
+            m,
+            start_idx=current_idx,
+            stack=stack,
+            project_path=project_path,
+            prev_wo_id=prev_wo_id,
+        )
+        all_wos.extend(child_wos)
+        current_idx += len(child_wos)
+        prev_wo_id = last_id
+
+    return all_wos
+
+
 def get_next_work_order_int(workspace: Path | str) -> int:
     """Find the next monotonically increasing integer ID for work orders.
 
@@ -565,8 +981,35 @@ def synthesize_child_work_orders(
     gate = AuthoringGate(project_root=ws)
     start_idx = get_next_work_order_int(ws)
 
-    # 1. Extract plan structure and proposed work orders
+    # 1. Extract plan structure, technology stack, and proposed work orders
     proposed_wos: list[dict[str, Any]] = []
+
+    tech_stack: TechStack | None = None
+    plan_raw_text = ""
+    if isinstance(plan, dict):
+        plan_raw_text = plan.get("content") or ""
+    elif isinstance(plan, str):
+        plan_raw_text = plan
+
+    if not plan_raw_text:
+        plan_file = ws / "PLAN.md"
+        if plan_file.is_file():
+            try:
+                plan_raw_text = plan_file.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+    if plan_raw_text:
+        try:
+            parsed_plan = parse_plan(plan_raw_text, project_path=ws)
+            tech_stack = parsed_plan.tech_stack
+        except Exception:
+            pass
+    elif ws:
+        tech_stack = parse_tech_stack("", project_path=ws)
+
+    if tech_stack and tech_stack.is_ambiguous:
+        raise PlanValidationError(f"Cannot synthesize child work orders from ambiguous technology stack: {tech_stack.ambiguity_reason}")
 
     if isinstance(plan, dict):
         # Check if pre-parsed work orders exist in plan metadata
@@ -576,75 +1019,18 @@ def synthesize_child_work_orders(
         elif plan.get("created_work_orders"):
             proposed_wos = list(plan["created_work_orders"])
         elif plan.get("content"):
-            try:
-                parsed = parse_plan(plan["content"])
-                for offset, m in enumerate(parsed.milestones):
-                    idx = start_idx + offset
-                    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
-                    deliv = extract_deliverable_spec(m.title, m.tasks, role)
-                    wo_id = f"WO-{idx:03d}"
-                    deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
-                    wo = build_child_work_order(
-                        wo_id=wo_id,
-                        title=m.title,
-                        description="\n".join(m.tasks) if m.tasks else m.title,
-                        assigned_agents=[agent],
-                        dependencies=deps,
-                        priority="P0" if offset == 0 else "P1",
-                        deliverable=deliv,
-                        skills=m.skills if m.skills else None,
-                    )
-                    proposed_wos.append(wo)
-            except Exception:
-                pass
+            parsed = parse_plan(plan["content"], project_path=ws)
+            proposed_wos = decompose_plan_milestones(parsed.milestones, start_idx, stack=tech_stack, project_path=ws)
     elif isinstance(plan, str):
-        try:
-            parsed = parse_plan(plan)
-            for offset, m in enumerate(parsed.milestones):
-                idx = start_idx + offset
-                agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
-                deliv = extract_deliverable_spec(m.title, m.tasks, role)
-                wo_id = f"WO-{idx:03d}"
-                deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
-                wo = build_child_work_order(
-                    wo_id=wo_id,
-                    title=m.title,
-                    description="\n".join(m.tasks) if m.tasks else m.title,
-                    assigned_agents=[agent],
-                    dependencies=deps,
-                    priority="P0" if offset == 0 else "P1",
-                    deliverable=deliv,
-                    skills=m.skills if m.skills else None,
-                )
-                proposed_wos.append(wo)
-        except Exception:
-            pass
+        parsed = parse_plan(plan, project_path=ws)
+        proposed_wos = decompose_plan_milestones(parsed.milestones, start_idx, stack=tech_stack, project_path=ws)
 
     # Fallback to reading PLAN.md directly if still empty
     if not proposed_wos:
         plan_file = ws / "PLAN.md"
         if plan_file.is_file():
-            try:
-                parsed = parse_plan(plan_file.read_text(encoding="utf-8"))
-                for offset, m in enumerate(parsed.milestones):
-                    idx = start_idx + offset
-                    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
-                    deliv = extract_deliverable_spec(m.title, m.tasks, role)
-                    wo_id = f"WO-{idx:03d}"
-                    deps = [f"WO-{idx-1:03d}"] if offset > 0 else []
-                    wo = build_child_work_order(
-                        wo_id=wo_id,
-                        title=m.title,
-                        description="\n".join(m.tasks) if m.tasks else m.title,
-                        assigned_agents=[agent],
-                        dependencies=deps,
-                        priority="P0" if offset == 0 else "P1",
-                        deliverable=deliv,
-                        skills=m.skills if m.skills else None,
-                    )
-                    proposed_wos.append(wo)
-            except Exception:
-                pass
+            parsed = parse_plan(plan_file.read_text(encoding="utf-8"), project_path=ws)
+            proposed_wos = decompose_plan_milestones(parsed.milestones, start_idx, stack=tech_stack, project_path=ws)
 
     if not proposed_wos:
         raise ValueError("Cannot synthesize child work orders: no milestones or tasks could be parsed from plan")
@@ -669,7 +1055,12 @@ def synthesize_child_work_orders(
             new_deps = [id_map.get(d, d) for d in w.get("dependencies", [])]
             w_copy["dependencies"] = new_deps
             renumbered_wos.append(w_copy)
-        proposed_wos = renumbered_wos
+    # Anti-collision and parallel deliverable ownership check
+    valid_ownership, ownership_errors = validate_work_orders_ownership(proposed_wos)
+    if not valid_ownership:
+        raise PlanValidationError(
+            f"Cannot synthesize child work orders due to ownership conflict: {'; '.join(ownership_errors)}"
+        )
 
     created_records: list[dict[str, Any]] = []
 
@@ -713,28 +1104,44 @@ def synthesize_child_work_orders(
 
         # Ensure deliverable has explicit path matching role
         if not deliv.get("path") or (primary_agent == "gemini" and str(deliv.get("path")).endswith(".txt")):
-            deliv = extract_deliverable_spec(title, [desc], role)
+            deliv = extract_deliverable_spec(title, [desc], role, stack=tech_stack, project_path=ws)
+
+        if deliv.get("type") == "blocked":
+            raise PlanValidationError(
+                f"Cannot synthesize work order {wo_id}: {deliv.get('error') or deliv.get('description')}"
+            )
 
         # Extract candidate paths from title and description
         combined_task_text = f"{title}\n{desc}"
-        cand_matches = re.findall(
-            r"(?:`|\"|'|\s|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?:`|\"|'|\s|$)",
-            combined_task_text,
-        )
-        task_candidates: list[str] = []
-        for cm in cand_matches:
-            c_clean = cm.strip().strip("`\"'.,()")
-            if any(c_clean.endswith(ext) for ext in (".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md", ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite")):
-                if not c_clean.startswith(".sync") and not c_clean.startswith(".git") and c_clean not in ("PLAN.md", ".env"):
-                    task_candidates.append(c_clean)
+        task_candidates = extract_candidate_paths(combined_task_text)
+
+        # Ensure declared deliverable paths are in task_candidates
+        if deliv.get("path"):
+            deliv_p = str(deliv["path"]).replace("\\", "/").strip().lstrip("/")
+            if deliv_p and deliv_p not in task_candidates:
+                task_candidates.append(deliv_p)
+        for extra in wo.get("deliverables") or []:
+            if isinstance(extra, dict) and extra.get("path"):
+                ep = str(extra["path"]).replace("\\", "/").strip().lstrip("/")
+                if ep and ep not in task_candidates:
+                    task_candidates.append(ep)
+            elif isinstance(extra, str) and extra.strip():
+                ep = extra.replace("\\", "/").strip().lstrip("/")
+                if ep and ep not in task_candidates:
+                    task_candidates.append(ep)
 
         # Plan-derived file budget: the contract covers exactly the files the
         # task is expected to create/modify (including its D024 companion test)
         # instead of a fixed limit.
-        implementation_estimate = derive_implementation_estimate(
-            title, desc, deliv.get("path"), task_candidates,
-            deliverable_type=deliv.get("type"),
-        )
+        implementation_estimate = wo.get("implementation_estimate")
+        if not implementation_estimate:
+            implementation_estimate = derive_implementation_estimate(
+                title, desc, deliv.get("path"), task_candidates,
+                deliverable_type=deliv.get("type"),
+                stack=tech_stack,
+            )
+        else:
+            implementation_estimate = dict(implementation_estimate)
         if primary_agent in ("local-llm", "gitops") and implementation_estimate:
             # The release flow always writes the release documentation pair.
             for rel in ("VERSION.md", "CHANGELOG.md"):
@@ -780,6 +1187,7 @@ def synthesize_child_work_orders(
             implementation_estimate=implementation_estimate,
             milestone_id=wo.get("milestone_id"),
             skills=resolved_skills if resolved_skills else None,
+            deliverables=wo.get("deliverables"),
         )
 
         # Provenance marker: bootstrap-synthesized artifacts are scaffolding an
@@ -824,7 +1232,7 @@ def synthesize_child_work_orders(
     for rec in created_records:
         rec_id = rec["id"]
         if rec_id not in existing_order_ids:
-            index_data.setdefault("orders", []).append({
+            order_entry: dict[str, Any] = {
                 "id": rec_id,
                 "type": rec["type"],
                 "title": rec["title"],
@@ -836,7 +1244,10 @@ def synthesize_child_work_orders(
                 "created": rec["created"],
                 "updated": rec["updated"],
                 "file": f"work-orders/ACTIVE/{rec_id}.yaml",
-            })
+            }
+            if rec.get("deliverables"):
+                order_entry["deliverables"] = rec["deliverables"]
+            index_data.setdefault("orders", []).append(order_entry)
             existing_order_ids.add(rec_id)
 
     max_id_num = 0

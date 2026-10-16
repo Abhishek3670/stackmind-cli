@@ -781,6 +781,41 @@ class ContradictionResolutionService:
                 return False
         return True
 
+    def _check_approval_receipt(self, memory_id: str, memory_type: str) -> tuple[bool, list[str]]:
+        """Validate that an approval receipt exists and matches the memory."""
+        from validators.memory.promotion import MemoryPromotionPolicy
+        policy = MemoryPromotionPolicy(self.project_path)
+        approval = policy.get_approval(memory_id)
+        if not approval:
+            return False, ["no_approval_receipt"]
+
+        # Verify receipt matches this memory
+        if approval.memory_id != memory_id:
+            return False, ["approval_memory_id_mismatch"]
+        if approval.memory_type != memory_type:
+            return False, ["approval_memory_type_mismatch"]
+
+        return True, []
+
+    def _require_approval_for_resolution(self, resolution: ContradictionStatus, finding: ContradictionFinding, actor: str) -> tuple[bool, list[str]]:
+        """Check if resolution requires approval and validate it."""
+        # RESOLVED_SUPERSEDED and RESOLVED_REJECTED mutate memory state - require approval
+        # RESOLVED_NOT_CONTRADICTION and RESOLVED_BOTH_VALID are read-only decisions
+        if resolution in {ContradictionStatus.RESOLVED_SUPERSEDED, ContradictionStatus.RESOLVED_REJECTED}:
+            # Check approval for both memories involved
+            record_a = self.memory_store.load_record(finding.memory_id_a)
+            record_b = self.memory_store.load_record(finding.memory_id_b)
+
+            if record_a:
+                ok, reasons = self._check_approval_receipt(record_a.memory_id, record_a.memory_type.value)
+                if not ok:
+                    return False, [f"Memory {record_a.memory_id}: {reasons[0]}"]
+            if record_b:
+                ok, reasons = self._check_approval_receipt(record_b.memory_id, record_b.memory_type.value)
+                if not ok:
+                    return False, [f"Memory {record_b.memory_id}: {reasons[0]}"]
+        return True, []
+
     def resolve_finding(
         self,
         finding_id: str,
@@ -819,6 +854,11 @@ class ContradictionResolutionService:
         }
         if resolution not in valid_resolutions:
             raise ValueError(f"Invalid resolution status: {resolution.value}")
+
+        # Validate approval receipt for mutating resolutions
+        ok, reasons = self._require_approval_for_resolution(resolution, finding, actor)
+        if not ok:
+            raise ValueError(f"Approval required for resolution: {reasons[0]}")
 
         # Update finding
         resolved_finding = ContradictionFinding(
@@ -873,6 +913,11 @@ class ContradictionResolutionService:
         # Superseding must be authorized
         if not self._check_contract_scope(superseding_memory):
             raise ValueError("Superseding memory outside contract scope")
+
+        # Validate approval for superseding memory
+        ok, reasons = self._check_approval_receipt(superseding_memory.memory_id, superseding_memory.memory_type.value)
+        if not ok:
+            raise ValueError(f"Approval required for superseding memory: {reasons[0]}")
 
         # Use compiler to supersede
         from validators.memory.store import MemoryCompiler

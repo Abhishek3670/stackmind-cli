@@ -53,6 +53,7 @@ from cli.tui.landing import (
 )
 from cli.tui.layout import (
     compute_layout,
+    compute_viewport_height,
     render_runtime_panel_str,
 )
 from cli.tui.state import (
@@ -77,6 +78,25 @@ def redraw_full_screen(*args: Any, **kwargs: Any) -> Any:
     if fn is not None and fn is not redraw_full_screen and fn is not _terminal_redraw_full_screen:
         return fn(*args, **kwargs)
     return _terminal_redraw_full_screen(*args, **kwargs)
+
+
+def format_duration_human(seconds: float) -> str:
+    """Format duration from seconds to human readable units transitioning from sec to min to hr.
+
+    Examples:
+    - < 60s: '14.2s', '1.2s'
+    - 60s <= d < 3600s: '33m 17s', '36m 22s'
+    - d >= 3600s: '1h 2m 5s'
+    """
+    sec = max(0.0, float(seconds))
+    if sec < 60.0:
+        return f"{sec:.1f}s"
+    total_seconds = int(sec)
+    minutes, rem_seconds = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {rem_seconds}s"
+    hours, rem_minutes = divmod(minutes, 60)
+    return f"{hours}h {rem_minutes}m {rem_seconds}s"
 
 
 from cli.tui.views import (
@@ -417,7 +437,10 @@ def _stream_turn_execution(
         else:
             verb = getattr(state, "current_sync_verb", None) or sync_words[0]
         prefix = verb if is_sync_action else "Working..."
-        return f"{prefix} [{elapsed:.1f}s] ({_format_token_usage_str(toks)})"
+        res = f"{prefix} [{format_duration_human(elapsed)}] ({_format_token_usage_str(toks)})"
+        if state is not None:
+            state.active_working_status = res
+        return res
     _streaming_diagnostics = {
         "redraw_count": 0,
         "event_count": 0,
@@ -750,6 +773,15 @@ def _stream_turn_execution(
                         t_args.get("path") or t_args.get("command") or t_args.get("file") or ""
                     )
                     t_role = str(ev_payload.get("role") or ev_payload.get("agent_id") or "")
+                    if not t_role and state is not None:
+                        op_id = ev_payload.get("operation_id")
+                        if op_id and hasattr(state, "operations") and op_id in state.operations:
+                            t_role = state.operations[op_id].role
+                        if not t_role and hasattr(state, "operations"):
+                            for op in state.operations.values():
+                                if getattr(op, "status", "") == "RUNNING":
+                                    t_role = getattr(op, "role", "")
+                                    break
                     from cli.tui.events import format_action_description
                     latest_act_desc = format_action_description(t_name, target=t_target, role=t_role)
 
@@ -795,7 +827,7 @@ def _stream_turn_execution(
                 if resp and not assistant_rendered and not streamed_chunks:
                     turn_acts = state.current_turn_actions
                     if turn_acts:
-                        turn_acts.expanded = True
+                        turn_acts.expanded = False
                     state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
                     if is_tty:
                         redraw_full_screen(
@@ -804,6 +836,7 @@ def _stream_turn_execution(
                             clear=False,
                             include_composer=True,
                             composer_is_active=False,
+                            composer_placeholder=_get_working_placeholder(),
                             live_manager=live_manager,
                         )
                     else:
@@ -940,7 +973,7 @@ def _stream_turn_execution(
         full_resp = format_contract_payload(full_resp)
         turn_acts = state.current_turn_actions
         if turn_acts:
-            turn_acts.expanded = True
+            turn_acts.expanded = False
         thinking = getattr(state, "current_turn_thinking", None) or None
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
@@ -1192,7 +1225,7 @@ def _stream_turn_execution(
                 )
                 turn_acts = state.current_turn_actions
                 if turn_acts:
-                    turn_acts.expanded = True
+                    turn_acts.expanded = False
                 state.add_message(
                     "assistant", f"Operation {op_status.lower()}: {err_msg}", actions=turn_acts
                 )
