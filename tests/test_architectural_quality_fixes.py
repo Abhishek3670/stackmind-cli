@@ -153,3 +153,21 @@ def test_sync_index_recovers_empty_index_yaml_atomically(tmp_path: Path):
     order_ids = [o["id"] for o in loaded["orders"]]
     assert "WO-000" in order_ids
     assert "WO-001" in order_ids
+
+
+def test_build_child_contract_includes_frontend_scope_for_qa():
+    """Verify QA (gemma) contracts allow reading/auditing frontend deliverables and assets."""
+    contract = build_child_contract(
+        wo_id="WO-005",
+        agent_id="gemma",
+        role="qa",
+        deliverable_path="tests/test_qa_final_delivery.py",
+    )
+    allowed_modules = {rule["module"] for rule in contract["scope"]["allow"]}
+    assert "tests/test_qa_final_delivery.py" in allowed_modules
+    assert "tests/**" in allowed_modules
+    assert "index.html" in allowed_modules
+    assert "css/**" in allowed_modules
+    assert "*.css" in allowed_modules
+    assert "*.svg" in allowed_modules
+

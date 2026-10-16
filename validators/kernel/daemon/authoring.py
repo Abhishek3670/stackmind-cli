@@ -611,6 +611,28 @@ def build_child_contract(
             {"module": "*.db"},
             {"module": "*.sqlite"},
             {"module": "pytest.ini"},
+            # QA must also inspect and audit frontend deliverables and assets
+            {"module": "index.html"},
+            {"module": "css/**"},
+            {"module": "styles/**"},
+            {"module": "js/**"},
+            {"module": "assets/**"},
+            {"module": "images/**"},
+            {"module": "img/**"},
+            {"module": "fonts/**"},
+            {"module": "*.html"},
+            {"module": "*.css"},
+            {"module": "*.js"},
+            {"module": "*.jsx"},
+            {"module": "*.tsx"},
+            {"module": "*.ts"},
+            {"module": "*.svg"},
+            {"module": "*.png"},
+            {"module": "*.jpg"},
+            {"module": "*.jpeg"},
+            {"module": "*.webp"},
+            {"module": "*.gif"},
+            {"module": "*.ico"},
         ])
     elif role_norm in ("gitops", "local-llm"):
         allow_rules.extend([
