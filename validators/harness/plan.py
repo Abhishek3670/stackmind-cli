@@ -171,6 +171,28 @@ CONTRACT_SCHEMA_TEMPLATE = (
 
 
 @dataclass
+class TechStack:
+    backend_language: str | None = None   # "javascript", "typescript", "python", "go", "rust"
+    backend_framework: str | None = None  # "express", "flask", "fastapi", "django", "nest"
+    frontend_framework: str | None = None # "react", "vue", "angular", "svelte", "html"
+    database: str | None = None           # "postgresql", "mysql", "sqlite", "mongodb"
+    dependency_manifest: str | None = None # "package.json", "requirements.txt", "pyproject.toml", "Cargo.toml", "go.mod"
+    is_ambiguous: bool = False
+    ambiguity_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "backend_language": self.backend_language,
+            "backend_framework": self.backend_framework,
+            "frontend_framework": self.frontend_framework,
+            "database": self.database,
+            "dependency_manifest": self.dependency_manifest,
+            "is_ambiguous": self.is_ambiguous,
+            "ambiguity_reason": self.ambiguity_reason,
+        }
+
+
+@dataclass
 class PlanMilestone:
     id: str
     title: str
@@ -197,14 +219,18 @@ class PlanStructure:
     architecture_overview: str
     milestones: list[PlanMilestone] = field(default_factory=list)
     raw_content: str = ""
+    tech_stack: TechStack | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "project_name": self.project_name,
             "title": self.title,
             "architecture_overview": self.architecture_overview,
             "milestones": [m.to_dict() for m in self.milestones],
         }
+        if self.tech_stack:
+            data["tech_stack"] = self.tech_stack.to_dict()
+        return data
 
     @property
     def milestone_ids(self) -> list[str]:
@@ -254,7 +280,171 @@ def validate_plan_structure(content: str) -> tuple[bool, list[str]]:
     return len(errors) == 0, errors
 
 
-def parse_plan(content: str) -> PlanStructure:
+def parse_tech_stack(content: str, project_path: Path | str | None = None) -> TechStack:
+    """Parse technology stack, frameworks, and manifests from PLAN.md and existing project config."""
+    # 1. Search for architecture/tech stack sections
+    arch_match = re.search(
+        r"^##\s+.*(?:Architecture|Technical Design|Core Technologies|Stack)[^\n]*\n(.*?)(?=^##|\Z)",
+        content,
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    arch_text = arch_match.group(1).strip() if arch_match else ""
+    full_text = f"{arch_text}\n{content}"
+
+    # Extract explicit key-value fields if present
+    backend_val = ""
+    frontend_val = ""
+    db_val = ""
+
+    b_match = re.search(r"(?:^|\n)\s*[-*]?\s*\**backend(?:\s+stack)?\**\s*:\s*([^\n]+)", full_text, re.IGNORECASE)
+    if b_match:
+        backend_val = b_match.group(1).strip()
+
+    f_match = re.search(r"(?:^|\n)\s*[-*]?\s*\**frontend(?:\s+stack)?\**\s*:\s*([^\n]+)", full_text, re.IGNORECASE)
+    if f_match:
+        frontend_val = f_match.group(1).strip()
+
+    d_match = re.search(r"(?:^|\n)\s*[-*]?\s*\**database\**\s*:\s*([^\n]+)", full_text, re.IGNORECASE)
+    if d_match:
+        db_val = d_match.group(1).strip()
+
+    search_scope = arch_text or content
+
+    # Check for explicit ambiguity/conflict in backend_val
+    if backend_val:
+        b_lower = backend_val.lower()
+        b_node = bool(re.search(r"\b(node(?:\.js)?|express(?:\.js)?|javascript)\b", b_lower))
+        b_py = bool(re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", b_lower))
+        b_go = bool(re.search(r"\b(go|golang)\b", b_lower))
+        b_rust = bool(re.search(r"\b(rust)\b", b_lower))
+
+        competing = [k for k, v in [("node", b_node), ("python", b_py), ("go", b_go), ("rust", b_rust)] if v]
+        if len(competing) > 1:
+            return TechStack(
+                is_ambiguous=True,
+                ambiguity_reason=f"Conflicting backend technologies explicitly declared: {', '.join(competing)}",
+            )
+
+    backend_lang = None
+    backend_fw = None
+    manifest = None
+
+    if backend_val:
+        b_lower = backend_val.lower()
+        if re.search(r"\b(node(?:\.js)?|express(?:\.js)?|javascript)\b", b_lower):
+            backend_lang = "typescript" if re.search(r"\btypescript\b", b_lower) else "javascript"
+            if re.search(r"\bexpress(?:\.js)?\b", b_lower):
+                backend_fw = "express"
+            elif re.search(r"\bnest(?:\.js)?\b", b_lower):
+                backend_fw = "nest"
+            manifest = "package.json"
+        elif re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", b_lower):
+            backend_lang = "python"
+            if re.search(r"\bflask\b", b_lower):
+                backend_fw = "flask"
+            elif re.search(r"\bfastapi\b", b_lower):
+                backend_fw = "fastapi"
+            elif re.search(r"\bdjango\b", b_lower):
+                backend_fw = "django"
+            manifest = "requirements.txt"
+        elif re.search(r"\b(go|golang)\b", b_lower):
+            backend_lang = "go"
+            manifest = "go.mod"
+        elif re.search(r"\brust\b", b_lower):
+            backend_lang = "rust"
+            manifest = "Cargo.toml"
+
+    # If backend not determined from explicit line, check project on disk
+    if not backend_lang and project_path:
+        pp = Path(project_path).resolve()
+        if (pp / "package.json").is_file():
+            backend_lang = "javascript"
+            manifest = "package.json"
+        elif (pp / "requirements.txt").is_file() or (pp / "pyproject.toml").is_file():
+            backend_lang = "python"
+            manifest = "requirements.txt" if (pp / "requirements.txt").is_file() else "pyproject.toml"
+        elif (pp / "Cargo.toml").is_file():
+            backend_lang = "rust"
+            manifest = "Cargo.toml"
+        elif (pp / "go.mod").is_file():
+            backend_lang = "go"
+            manifest = "go.mod"
+
+    # If still not determined, check architecture overview
+    if not backend_lang:
+        scope_lower = search_scope.lower()
+        has_node = bool(re.search(r"\b(node(?:\.js)?|express(?:\.js)?)\b", scope_lower))
+        has_python = bool(re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", scope_lower))
+        has_go = bool(re.search(r"\b(golang|go\.mod)\b", scope_lower))
+        has_rust = bool(re.search(r"\b(rust|cargo\.toml)\b", scope_lower))
+
+        active = [k for k, v in [("node", has_node), ("python", has_python), ("go", has_go), ("rust", has_rust)] if v]
+        if len(active) == 1:
+            cand = active[0]
+            if cand == "node":
+                backend_lang = "typescript" if re.search(r"\btypescript\b", scope_lower) else "javascript"
+                if re.search(r"\bexpress(?:\.js)?\b", scope_lower):
+                    backend_fw = "express"
+                manifest = "package.json"
+            elif cand == "python":
+                backend_lang = "python"
+                if re.search(r"\bflask\b", scope_lower):
+                    backend_fw = "flask"
+                elif re.search(r"\bfastapi\b", scope_lower):
+                    backend_fw = "fastapi"
+                elif re.search(r"\bdjango\b", scope_lower):
+                    backend_fw = "django"
+                manifest = "requirements.txt"
+            elif cand == "go":
+                backend_lang = "go"
+                manifest = "go.mod"
+            elif cand == "rust":
+                backend_lang = "rust"
+                manifest = "Cargo.toml"
+        elif len(active) > 1:
+            arch_b_node = bool(re.search(r"\b(node(?:\.js)?|express(?:\.js)?)\b", arch_text.lower()))
+            arch_b_py = bool(re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", arch_text.lower()))
+            if arch_b_node and arch_b_py:
+                return TechStack(
+                    is_ambiguous=True,
+                    ambiguity_reason="Contradictory backend stack specified: both Node.js and Python referenced in architecture section",
+                )
+
+    # Detect frontend framework
+    target_frontend_text = f"{frontend_val} {search_scope}".lower()
+    frontend_fw = None
+    if re.search(r"\breact(?:\.js)?\b", target_frontend_text):
+        frontend_fw = "react"
+    elif re.search(r"\bvue(?:\.js)?\b", target_frontend_text):
+        frontend_fw = "vue"
+    elif re.search(r"\bsvelte\b", target_frontend_text):
+        frontend_fw = "svelte"
+    elif re.search(r"\bhtml\b", target_frontend_text):
+        frontend_fw = "html"
+
+    # Database
+    database = None
+    target_db_text = f"{db_val} {search_scope}".lower()
+    if re.search(r"\bpostgres(?:ql)?\b", target_db_text):
+        database = "postgresql"
+    elif re.search(r"\bsqlite\b", target_db_text):
+        database = "sqlite"
+    elif re.search(r"\bmongo(?:db)?\b", target_db_text):
+        database = "mongodb"
+    elif re.search(r"\bmysql\b", target_db_text):
+        database = "mysql"
+
+    return TechStack(
+        backend_language=backend_lang,
+        backend_framework=backend_fw,
+        frontend_framework=frontend_fw,
+        database=database,
+        dependency_manifest=manifest,
+        is_ambiguous=False,
+    )
+
+
+def parse_plan(content: str, project_path: Path | str | None = None) -> PlanStructure:
     """Parse PLAN.md into structured data usable downstream by Architect and TUI."""
     content = content.replace("\r\n", "\n")
     is_valid, errors = validate_plan_structure(content)
@@ -337,12 +527,15 @@ def parse_plan(content: str) -> PlanStructure:
                 task_text = re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str).group(1).strip()
                 current_milestone.tasks.append(task_text)
 
+    tech_stack = parse_tech_stack(content, project_path=project_path)
+
     return PlanStructure(
         project_name=project_name,
         title=title,
         architecture_overview=architecture_overview,
         milestones=milestones,
         raw_content=content,
+        tech_stack=tech_stack,
     )
 
 

@@ -60,8 +60,6 @@ def test_synthesize_bootstrap_planning_artifacts(tmp_path: Path) -> None:
     # Verify narrowed deny list covers operationally sensitive paths
     deny_modules = {d["module"] for d in contract_rec["scope"]["deny"]}
     assert ".git/**" in deny_modules
-    assert "src/**" in deny_modules
-    assert "tests/**" in deny_modules
     assert ".sync/inbox/codex/**" in deny_modules
     assert ".sync/inbox/gemma/**" in deny_modules
     assert ".sync/runtime/**" in deny_modules

@@ -82,6 +82,7 @@ class HarnessTask:
     is_authoring: bool = False
     work_order_type: str | None = None
     deliverable_type: str | None = None
+    deliverable_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -421,6 +422,7 @@ class AgentRunner:
                         is_authoring=True,
                         work_order_type=task.work_order_type,
                         deliverable_type=task.deliverable_type,
+                        deliverable_paths=(),
                     )
             if task is None:
                 return HarnessRunResult(
@@ -445,6 +447,7 @@ class AgentRunner:
                         is_authoring=task.is_authoring,
                         work_order_type=task.work_order_type,
                         deliverable_type=task.deliverable_type,
+                        deliverable_paths=task.deliverable_paths,
                     )
 
             # 1. Post-task discovery.
@@ -1018,6 +1021,7 @@ class AgentRunner:
                         has_staged_writes=(task.kind == 'inbox'),
                         tool_runtime=tool_runtime,
                     )
+                    stage_inputs['verification_evidence'] = getattr(self, '_last_verification_evidence', {})
                     # Audit trail (Phase 5): persist every declared command and
                     # its outcome — the ORIGINAL string the model asked to run,
                     # never internal shim argv — so the gate verdict and the
@@ -1040,6 +1044,8 @@ class AgentRunner:
                             'commands_audit': stage_inputs.get('commands_audit', []),
                             'blocker_details': stage_inputs.get('blocker_details', []),
                         }
+                        if 'verification_evidence' in stage_inputs:
+                            meta_dict['verification_evidence'] = stage_inputs['verification_evidence']
                         if not dimensions.scope_verified:
                             # Scope evidence: make every scope-gate block
                             # diagnosable without re-running the turn.
@@ -1053,14 +1059,21 @@ class AgentRunner:
                                 f" (declared {evidence['declared']}; "
                                 f"observed {evidence['observed']})"
                             )
-                        if not dimensions.outcome_verified and task.work_order_id and task.deliverable_path and not getattr(task, 'is_authoring', False):
-                            norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
-                            stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
-                            stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
-                            if norm_del not in stg_added and norm_del not in stg_mod:
-                                diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
-                                reason_msg += f" ({diag})"
-                                meta_dict['blocker'] = diag
+                        if not dimensions.outcome_verified and task.work_order_id and not getattr(task, 'is_authoring', False):
+                            meta_dict['failure'] = {
+                                'failure_code': 'OUTCOME_NOT_VERIFIED',
+                                'work_order_id': task.work_order_id,
+                                'canonical_message': reason_msg,
+                                'verification_evidence': stage_inputs.get('verification_evidence'),
+                            }
+                            if task.deliverable_path:
+                                norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
+                                stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
+                                stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
+                                if norm_del not in stg_added and norm_del not in stg_mod:
+                                    diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
+                                    reason_msg += f" ({diag})"
+                                    meta_dict['blocker'] = diag
                         return HarnessRunResult(
                             status='blocked',
                             persisted=False,
@@ -1164,6 +1177,18 @@ class AgentRunner:
                 if path.exists():
                     payload = self._read_yaml(path)
                     deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
+                    deliv_paths = []
+                    if isinstance(deliverable, dict) and deliverable.get('path'):
+                        deliv_paths.append(str(deliverable['path']))
+                    elif isinstance(deliverable, str) and deliverable.strip():
+                        deliv_paths.append(deliverable.strip())
+                    for extra in (payload.get('deliverables') or []) if isinstance(payload, dict) else []:
+                        if isinstance(extra, dict) and extra.get('path'):
+                            deliv_paths.append(str(extra['path']))
+                        elif isinstance(extra, str) and extra.strip():
+                            deliv_paths.append(extra.strip())
+                    norm_deliv_tuple = tuple(dict.fromkeys(Path(p).as_posix().lstrip('/') for p in deliv_paths if p.strip()))
+                    deliv_path = norm_deliv_tuple[0] if norm_deliv_tuple else (deliverable.get('path') if isinstance(deliverable, dict) else None)
                     return HarnessTask(
                         kind='work_order',
                         identifier=work_order_id,
@@ -1172,9 +1197,10 @@ class AgentRunner:
                         body=str(payload.get('description', '')),
                         query=str(payload.get('title', work_order_id)),
                         work_order_id=work_order_id,
-                        deliverable_path=deliverable.get('path') if isinstance(deliverable, dict) else None,
+                        deliverable_path=deliv_path,
                         work_order_type=str(payload.get('type')) if isinstance(payload, dict) and payload.get('type') else None,
                         deliverable_type=str(deliverable.get('type')) if isinstance(deliverable, dict) and deliverable.get('type') else None,
+                        deliverable_paths=norm_deliv_tuple,
                     )
 
         inbox_dir = self.sync_path / 'inbox' / self.agent
@@ -1222,6 +1248,18 @@ class AgentRunner:
                 continue
             payload = self._read_yaml(path)
             deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
+            deliv_paths = []
+            if isinstance(deliverable, dict) and deliverable.get('path'):
+                deliv_paths.append(str(deliverable['path']))
+            elif isinstance(deliverable, str) and deliverable.strip():
+                deliv_paths.append(deliverable.strip())
+            for extra in (payload.get('deliverables') or []) if isinstance(payload, dict) else []:
+                if isinstance(extra, dict) and extra.get('path'):
+                    deliv_paths.append(str(extra['path']))
+                elif isinstance(extra, str) and extra.strip():
+                    deliv_paths.append(extra.strip())
+            norm_deliv_tuple = tuple(dict.fromkeys(Path(p).as_posix().lstrip('/') for p in deliv_paths if p.strip()))
+            deliv_path = norm_deliv_tuple[0] if norm_deliv_tuple else (deliverable.get('path') if isinstance(deliverable, dict) else None)
             return HarnessTask(
                 kind='work_order',
                 identifier=wo_id,
@@ -1230,9 +1268,10 @@ class AgentRunner:
                 body=str(payload.get('description', '')),
                 query=str(payload.get('title', wo_id)),
                 work_order_id=wo_id,
-                deliverable_path=deliverable.get('path') if isinstance(deliverable, dict) else None,
+                deliverable_path=deliv_path,
                 work_order_type=str(payload.get('type')) if isinstance(payload, dict) and payload.get('type') else None,
                 deliverable_type=str(deliverable.get('type')) if isinstance(deliverable, dict) and deliverable.get('type') else None,
+                deliverable_paths=norm_deliv_tuple,
             )
         return None
 
@@ -2584,6 +2623,7 @@ class AgentRunner:
             'commands_audit': stage_inputs.get('commands_audit', []),
             'tool_calls_audit': stage_inputs.get('tool_calls_audit', []),
             'blocker_details': stage_inputs.get('blocker_details', []),
+            'verification_evidence': stage_inputs.get('verification_evidence', {}),
             'declaration_matches': stage_inputs.get('declaration_matches', True),
             'experience_id': exp_rec.experience_id if exp_rec else None,
             'knowledge_git_commit': context.git_commit,
@@ -2713,6 +2753,8 @@ class AgentRunner:
         """
         from validators.harness.contract_gate import verify_post_execution
         from validators.harness.snapshot import VerificationDimensions
+
+        self._last_verification_evidence = {}
 
         # Include tool-written files in changed files for scope verification
         tool_written_files = []
@@ -3033,50 +3075,68 @@ class AgentRunner:
                     or any(r.returncode == 0 for r in command_results)
                 )
             )
-        elif task.work_order_id and task.deliverable_path:
-            # Check both scratch (staged) and project root for the deliverable
-            staged_deliverable = staged_root / task.deliverable_path
-            project_deliverable = self.project_path / task.deliverable_path
-            deliverable_exists = staged_deliverable.exists() or project_deliverable.exists()
-            if tool_runtime is not None:
-                outcome_verified = (
-                    decision.status == 'completed'
-                    and not decision.blockers
-                    and (deliverable_touched or deliverable_exists or (authored_artifacts and deliverable_exists))
-                )
+        elif task.work_order_id:
+            # Discover work order deliverable metadata
+            wo_data: dict[str, Any] = {}
+            for sub in ("ACTIVE", "COMPLETED"):
+                wo_file = self.sync_path / "work-orders" / sub / f"{task.work_order_id}.yaml"
+                if wo_file.is_file():
+                    try:
+                        wo_data = self._read_yaml(wo_file) or {}
+                    except Exception:
+                        pass
+                    break
+
+            if not wo_data:
+                if getattr(task, 'deliverable_paths', ()):
+                    wo_data = {"deliverables": [{"path": p} for p in task.deliverable_paths]}
+                elif task.deliverable_path:
+                    wo_data = {"deliverable": {"path": task.deliverable_path, "type": task.deliverable_type or "code"}}
+
+            from validators.harness.deliverable_verifier import verify_work_order_deliverables
+            deliv_passed, deliv_errors, deliv_evidence = verify_work_order_deliverables(
+                self.project_path, wo_data, staged_root=staged_root
+            )
+            self._last_verification_evidence = deliv_evidence
+
+            has_declared_files = bool(deliv_evidence.get("declared_paths"))
+            if has_declared_files:
+                if not deliv_passed:
+                    outcome_verified = False
+                    for err in deliv_errors:
+                        staged_errors.append(f"Deliverable verification failed: {err}")
+                else:
+                    outcome_verified = (
+                        decision.status == 'completed'
+                        and not decision.blockers
+                    )
             else:
+                is_non_code_task = (
+                    getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
+                    or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
+                )
+                has_tool_activity = bool(
+                    tool_runtime
+                    and getattr(tool_runtime, 'gateway', None)
+                    and (
+                        getattr(getattr(tool_runtime.gateway, 'boundary', None), 'journal', None)
+                        or getattr(tool_runtime.gateway, '_todo_list', None)
+                    )
+                )
+                has_report = bool(
+                    (decision.summary and decision.summary.strip())
+                    or (decision.report_markdown and decision.report_markdown.strip())
+                )
                 outcome_verified = (
                     decision.status == 'completed'
                     and not decision.blockers
-                    and (deliverable_touched or deliverable_exists or bool(changed_files) or has_staged_writes)
+                    and (
+                        bool(task_changed_files)
+                        or bool(changed_files)
+                        or any(r.returncode == 0 for r in command_results)
+                        or (is_non_code_task and (has_report or has_tool_activity))
+                    )
                 )
-        elif task.work_order_id and not task.deliverable_path:
-            is_non_code_task = (
-                getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
-                or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
-            )
-            has_tool_activity = bool(
-                tool_runtime
-                and getattr(tool_runtime, 'gateway', None)
-                and (
-                    getattr(getattr(tool_runtime.gateway, 'boundary', None), 'journal', None)
-                    or getattr(tool_runtime.gateway, '_todo_list', None)
-                )
-            )
-            has_report = bool(
-                (decision.summary and decision.summary.strip())
-                or (decision.report_markdown and decision.report_markdown.strip())
-            )
-            outcome_verified = (
-                decision.status == 'completed'
-                and not decision.blockers
-                and (
-                    bool(task_changed_files)
-                    or bool(changed_files)
-                    or any(r.returncode == 0 for r in command_results)
-                    or (is_non_code_task and (has_report or has_tool_activity))
-                )
-            )
         else:
             outcome_verified = (
                 decision.status == 'completed'

@@ -1954,6 +1954,8 @@ class SessionManager:
             self.events.publish("operation.authorized", session_id, operation_id=operation_id)
             self.events.publish("operation.started", session_id, operation_id=operation_id)
             if parent_operation_id is not None:
+                backend = (metadata or {}).get("backend") or (metadata or {}).get("provider") or session.get("provider") or "ollama"
+                model = (metadata or {}).get("model") or session.get("model")
                 self.events.publish(
                     "event.agentSpawned",
                     session_id,
@@ -1962,6 +1964,8 @@ class SessionManager:
                     operation_id=operation_id,
                     parent_operation_id=parent_operation_id,
                     work_order_id=work_order_id,
+                    backend=backend,
+                    model=model,
                 )
             self._save()
             return cancel, operation_id
@@ -2576,6 +2580,8 @@ class SessionManager:
                 result_data["tool_calls_audit"] = res_meta.get("tool_calls_audit") or []
             if "scope_evidence" in res_meta:
                 result_data["scope_evidence"] = res_meta.get("scope_evidence")
+            if "verification_evidence" in res_meta:
+                result_data["verification_evidence"] = res_meta.get("verification_evidence")
             if res_meta.get("blocker_details"):
                 result_data["blocker_details"] = res_meta.get("blocker_details")
             if "execution_profile" in res_meta:
@@ -2608,7 +2614,7 @@ class SessionManager:
                         plan_content = plan_file.read_text(encoding="utf-8")
                         is_valid, _ = validate_plan_structure(plan_content)
                         if is_valid:
-                            parsed_plan = parse_plan(plan_content)
+                            parsed_plan = parse_plan(plan_content, project_path=ws_path)
                             from .authoring import get_next_work_order_int, determine_assigned_agent, extract_deliverable_spec
                             start_idx = get_next_work_order_int(ws_path)
                             proposed_wos = []
@@ -2616,7 +2622,7 @@ class SessionManager:
                                 idx = start_idx + offset
                                 wo_id = f"WO-{idx:03d}"
                                 agent_id, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
-                                deliv = extract_deliverable_spec(m.title, m.tasks, role)
+                                deliv = extract_deliverable_spec(m.title, m.tasks, role, stack=parsed_plan.tech_stack, project_path=ws_path)
                                 proposed_wos.append({
                                     "id": wo_id,
                                     "title": m.title,

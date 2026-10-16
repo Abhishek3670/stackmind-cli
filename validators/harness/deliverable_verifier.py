@@ -93,18 +93,57 @@ class DeliverableVerifier:
     # File types that can be checked
     CHECKABLE_EXTENSIONS = {".py", ".ts", ".js", ".json", ".yaml", ".yml", ".html", ".css", ".md"}
 
-    def verify(self, path: Path, acceptance_criteria: list[str] | None = None) -> VerificationResult:
+    def verify(
+        self,
+        path: Path,
+        acceptance_criteria: list[str] | None = None,
+        root: Path | None = None,
+    ) -> VerificationResult:
         """
         Verify a single deliverable.
 
         Args:
             path: Path to the deliverable
             acceptance_criteria: Optional list of criteria to verify against
+            root: Optional root directory to enforce containment
 
         Returns:
             VerificationResult with check outcomes and evidence
         """
         result = VerificationResult(path=str(path), checked=False, passed=False)
+
+        if root is not None:
+            try:
+                root_res = root.resolve()
+                path_res = path.resolve()
+                if not path_res.is_relative_to(root_res):
+                    result.checked = True
+                    result.checks.append(VerificationCheck(
+                        name="path_containment",
+                        passed=False,
+                        message=f"Deliverable path escapes permitted root ({root}): {path}",
+                        severity="error",
+                    ))
+                    result.evidence = {
+                        "path": str(path),
+                        "content_hash": None,
+                        "size_bytes": 0,
+                        "line_count": 0,
+                        "checks_run": 1,
+                        "checks_passed": 0,
+                        "checks_failed": 1,
+                        "failures": [f"Deliverable path escapes permitted root ({root}): {path}"],
+                    }
+                    return result
+            except Exception as e:
+                result.checked = True
+                result.checks.append(VerificationCheck(
+                    name="path_containment",
+                    passed=False,
+                    message=f"Path containment resolution error: {e}",
+                    severity="error",
+                ))
+                return result
 
         if not path.exists():
             result.checked = True
@@ -115,6 +154,33 @@ class DeliverableVerifier:
                 severity="error",
             ))
             return result
+
+        if path.is_dir():
+            result.checked = True
+            result.checks.append(VerificationCheck(
+                name="file_type",
+                passed=False,
+                message=f"Deliverable is a directory, expected regular file: {path}",
+                severity="error",
+            ))
+            return result
+
+        if not path.is_file():
+            result.checked = True
+            result.checks.append(VerificationCheck(
+                name="file_type",
+                passed=False,
+                message=f"Deliverable is not a regular file: {path}",
+                severity="error",
+            ))
+            return result
+
+        result.checks.append(VerificationCheck(
+            name="file_type",
+            passed=True,
+            message="Deliverable is a regular file",
+            severity="info",
+        ))
 
         # Compute content hash for freshness tracking
         try:
@@ -153,9 +219,14 @@ class DeliverableVerifier:
 
         # Build evidence
         result.evidence = {
+            "path": str(path),
             "content_hash": result.content_hash,
             "size_bytes": len(text_content),
             "line_count": len(text_content.splitlines()),
+            "checks_run": len(result.checks),
+            "checks_passed": sum(1 for c in result.checks if c.passed),
+            "checks_failed": sum(1 for c in result.checks if not c.passed),
+            "failures": [c.message for c in result.checks if not c.passed and c.severity == "error"],
         }
 
         return result
@@ -171,6 +242,13 @@ class DeliverableVerifier:
                 message="File is empty or contains only whitespace",
                 severity="error",
             ))
+        else:
+            checks.append(VerificationCheck(
+                name="non_empty",
+                passed=True,
+                message="File has non-empty content",
+                severity="info",
+            ))
 
         return checks
 
@@ -183,15 +261,25 @@ class DeliverableVerifier:
             return checks
 
         # Check for placeholder patterns
+        matched = False
         for pattern in self.PLACEHOLDER_PATTERNS:
             if re.search(pattern, content, re.IGNORECASE):
                 checks.append(VerificationCheck(
                     name="placeholder_detection",
                     passed=False,
-                    message=f"Unresolved placeholder detected in deliverable",
+                    message="Unresolved placeholder detected in deliverable",
                     severity="error",
                 ))
+                matched = True
                 break
+
+        if not matched:
+            checks.append(VerificationCheck(
+                name="placeholder_detection",
+                passed=True,
+                message="No unresolved placeholders detected",
+                severity="info",
+            ))
 
         return checks
 
@@ -204,7 +292,13 @@ class DeliverableVerifier:
         if ext == ".json":
             try:
                 json.loads(content)
-            except json.JSONDecodeError as e:
+                checks.append(VerificationCheck(
+                    name="json_syntax",
+                    passed=True,
+                    message="Valid JSON syntax",
+                    severity="info",
+                ))
+            except (json.JSONDecodeError, ValueError) as e:
                 checks.append(VerificationCheck(
                     name="json_syntax",
                     passed=False,
@@ -216,6 +310,12 @@ class DeliverableVerifier:
         if ext in (".yaml", ".yml"):
             try:
                 yaml.safe_load(content)
+                checks.append(VerificationCheck(
+                    name="yaml_syntax",
+                    passed=True,
+                    message="Valid YAML syntax",
+                    severity="info",
+                ))
             except yaml.YAMLError as e:
                 checks.append(VerificationCheck(
                     name="yaml_syntax",
@@ -228,6 +328,12 @@ class DeliverableVerifier:
         if ext == ".py":
             try:
                 compile(content, str(path), "exec")
+                checks.append(VerificationCheck(
+                    name="python_syntax",
+                    passed=True,
+                    message="Valid Python syntax",
+                    severity="info",
+                ))
             except SyntaxError as e:
                 checks.append(VerificationCheck(
                     name="python_syntax",
@@ -235,6 +341,38 @@ class DeliverableVerifier:
                     message=f"Python syntax error: {e}",
                     severity="error",
                 ))
+
+        # HTML token parsing check (basic token/element parsing via stdlib HTMLParser; not full HTML conformance)
+        if ext == ".html":
+            from html.parser import HTMLParser
+
+            class WellFormednessParser(HTMLParser):
+                pass
+
+            try:
+                parser = WellFormednessParser()
+                parser.feed(content)
+                checks.append(VerificationCheck(
+                    name="html_syntax",
+                    passed=True,
+                    message="HTML basic token/element parsing succeeded (not full specification conformance)",
+                    severity="info",
+                ))
+            except Exception as e:
+                checks.append(VerificationCheck(
+                    name="html_syntax",
+                    passed=False,
+                    message=f"HTML parsing error: {e}",
+                    severity="error",
+                ))
+
+        if ext not in (".json", ".yaml", ".yml", ".py", ".html"):
+            checks.append(VerificationCheck(
+                name="format_syntax",
+                passed=True,
+                message=f"Format-specific syntax validation not implemented for '{ext}' (skipped)",
+                severity="info",
+            ))
 
         return checks
 
@@ -309,8 +447,185 @@ class DeliverableVerifier:
         return results
 
 
+def check_deliverable_path_containment(raw_path: str, root: Path) -> tuple[bool, str, str]:
+    r"""Check if a declared deliverable path is safely contained within root.
+
+    Rejects:
+    - Empty or whitespace paths
+    - Absolute POSIX paths (e.g. /etc/passwd)
+    - Windows drive paths (e.g. C:/foo, d:\bar)
+    - UNC paths (e.g. //server/share, \\server\share)
+    - Directory traversal components ('..' parts)
+    - Paths or symlinks that resolve outside root
+
+    Returns:
+        (is_safe, error_message, cleaned_relative_path)
+    """
+    p = str(raw_path).strip()
+    if not p:
+        return False, "Deliverable path is empty or whitespace-only", ""
+
+    # Check for UNC path (//server/share or \\server\share)
+    if p.startswith("//") or p.startswith(r"\\") or p.startswith(r"\\\\"):
+        return False, f"UNC path is not allowed: {raw_path}", ""
+
+    # Check for Windows drive letter path (C:... or c:...) cross-platform
+    if re.match(r"^[a-zA-Z]:", p):
+        return False, f"Windows drive path is not allowed: {raw_path}", ""
+
+    # Check for absolute path (leading slash on POSIX or Windows)
+    if p.startswith("/") or p.startswith("\\"):
+        return False, f"Absolute path is not allowed: {raw_path}", ""
+
+    # Host-level absolute check
+    if Path(p).is_absolute():
+        return False, f"Absolute path is not allowed: {raw_path}", ""
+
+    # Normalize Windows separators
+    norm = p.replace("\\", "/")
+    parts = norm.split("/")
+
+    # Check for traversal components
+    if any(part == ".." for part in parts):
+        return False, f"Directory traversal ('..') is not allowed: {raw_path}", ""
+
+    # Filter empty parts or single dots
+    filtered_parts = [part for part in parts if part and part != "."]
+    if not filtered_parts:
+        return False, f"Path does not point to a deliverable file: {raw_path}", ""
+
+    cleaned_rel = "/".join(filtered_parts)
+
+    # Check resolved containment against root
+    try:
+        root_resolved = root.resolve()
+        candidate = root / cleaned_rel
+        candidate_resolved = candidate.resolve()
+        if not candidate_resolved.is_relative_to(root_resolved):
+            return False, f"Deliverable path escapes root directory ({root}): {raw_path}", ""
+    except Exception as exc:
+        return False, f"Path resolution failed for '{raw_path}': {exc}", ""
+
+    return True, "", cleaned_rel
+
+
+def verify_work_order_deliverables(
+    project_path: Path,
+    wo_data: dict[str, Any],
+    staged_root: Path | None = None,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Verify all declared deliverables of a work order deterministically.
+
+    Args:
+        project_path: Project root directory
+        wo_data: Work order dictionary (with 'deliverable' and/or 'deliverables')
+        staged_root: Optional staged root directory (for turns in runner)
+
+    Returns:
+        (all_passed, list of critical error messages, inspectable evidence dictionary)
+    """
+    declared_paths: list[str] = []
+    deliv = wo_data.get("deliverable")
+    if isinstance(deliv, dict) and deliv.get("path"):
+        declared_paths.append(str(deliv["path"]))
+    elif isinstance(deliv, str) and deliv.strip():
+        declared_paths.append(deliv.strip())
+
+    for extra in wo_data.get("deliverables") or []:
+        if isinstance(extra, dict) and extra.get("path"):
+            declared_paths.append(str(extra["path"]))
+        elif isinstance(extra, str) and extra.strip():
+            declared_paths.append(extra.strip())
+
+    if not declared_paths:
+        # Non-file work order (e.g. pure sign-off, doc/research without file path)
+        return True, [], {
+            "verified": True,
+            "declared_paths": [],
+            "deliverables_count": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "critical_errors": [],
+            "results": [],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    effective_root = staged_root if staged_root is not None else project_path
+
+    verifier = DeliverableVerifier()
+    results: list[dict[str, Any]] = []
+    critical_errors: list[str] = []
+    all_passed = True
+    seen: set[str] = set()
+    checked_paths: list[str] = []
+
+    for raw_path in declared_paths:
+        raw_str = str(raw_path).strip()
+        if not raw_str:
+            continue
+
+        is_safe, containment_err, cleaned_rel = check_deliverable_path_containment(raw_str, effective_root)
+        if not is_safe:
+            all_passed = False
+            checked_paths.append(raw_str)
+            res = VerificationResult(path=raw_str, checked=True, passed=False)
+            res.checks.append(VerificationCheck(
+                name="path_containment",
+                passed=False,
+                message=containment_err,
+                severity="error",
+            ))
+            res.evidence = {
+                "path": raw_str,
+                "content_hash": None,
+                "size_bytes": 0,
+                "line_count": 0,
+                "checks_run": 1,
+                "checks_passed": 0,
+                "checks_failed": 1,
+                "failures": [containment_err],
+            }
+            res_dict = res.to_dict()
+            res_dict["relative_path"] = raw_str
+            results.append(res_dict)
+            critical_errors.append(f"{raw_str}: {containment_err}")
+            continue
+
+        if cleaned_rel in seen:
+            continue
+        seen.add(cleaned_rel)
+        checked_paths.append(cleaned_rel)
+
+        target_path = effective_root / cleaned_rel
+        res = verifier.verify(target_path, root=effective_root)
+        res_dict = res.to_dict()
+        res_dict["relative_path"] = cleaned_rel
+        results.append(res_dict)
+
+        if not res.passed:
+            all_passed = False
+            for c in res.checks:
+                if not c.passed and c.severity == "error":
+                    critical_errors.append(f"{cleaned_rel}: {c.message}")
+
+    evidence = {
+        "verified": all_passed,
+        "declared_paths": checked_paths,
+        "deliverables_count": len(checked_paths),
+        "passed_count": sum(1 for r in results if r.get("passed")),
+        "failed_count": sum(1 for r in results if not r.get("passed")),
+        "critical_errors": critical_errors,
+        "results": results,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return all_passed, critical_errors, evidence
+
+
 __all__ = [
     "VerificationCheck",
     "VerificationResult",
     "DeliverableVerifier",
+    "check_deliverable_path_containment",
+    "verify_work_order_deliverables",
 ]
