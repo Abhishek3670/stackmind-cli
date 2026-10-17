@@ -57,7 +57,8 @@ def test_command_dialog_height_and_rendering():
     panel = render_command_dialog(state, width=80, height=24)
     assert isinstance(panel, Panel)
     panel_str = render_command_dialog_str(state, width=80, height=24, no_color=True)
-    assert ":resume" in panel_str
+    assert "Resume" in panel_str
+    assert "⚙" not in panel_str
     assert "Session RUNNING" in panel_str
     assert "Supervisor run resumed" in panel_str
 
@@ -126,14 +127,15 @@ def test_dialog_positioned_just_above_composer_in_workspace():
         no_color=True,
     )
 
-    # The command dialog must be present in the full-screen frame
-    assert ":status" in frame
+    # The command dialog must be present in the full-screen frame with friendly name and no gear icon
+    assert "Status" in frame
+    assert "⚙" not in frame
     assert "Session: sess-test" in frame
     # The composer box placeholder must also be present
     assert "Type a message..." in frame
 
     # Verify vertical ordering: Command dialog appears before (above) composer box
-    idx_dialog = frame.find("⚙ :status")
+    idx_dialog = frame.find("Status")
     idx_composer = frame.find("Type a message...")
     assert idx_dialog != -1
     assert idx_composer != -1
@@ -172,3 +174,49 @@ def test_normal_prompt_submission_closes_command_dialog():
     # User enters regular message (not starting with :)
     state.add_message("user", "Please implement the API")
     assert state.command_dialog_open is False
+
+
+def test_escape_key_closes_dialog_and_triggers_full_redraw():
+    from cli.tui.keyboard import Key, LineEditor
+
+    state = AutonomousDeliveryState(session_id="sess-1")
+    state.show_command_dialog(":status", "Session online")
+    assert state.command_dialog_open is True
+
+    redraw_calls = []
+
+    def mock_height_change(editor, clear=False):
+        redraw_calls.append(("height_change", clear))
+
+    def mock_clear_dropdown():
+        redraw_calls.append(("clear_dropdown", True))
+
+    editor = LineEditor(
+        state=state,
+        on_height_change=mock_height_change,
+        on_clear_dropdown=mock_clear_dropdown,
+    )
+
+    # Pressing ESCAPE must close the dialog and trigger a full screen redraw with clear=True
+    editor.handle_key(Key.ESCAPE)
+    assert state.command_dialog_open is False
+    assert state.command_dialog_output == ""
+    assert ("height_change", True) in redraw_calls
+
+
+def test_page_up_and_down_scrolls_dialog():
+    from cli.tui.keyboard import Key, LineEditor
+
+    state = AutonomousDeliveryState(session_id="sess-1")
+    state.show_command_dialog(
+        ":help", "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10"
+    )
+    assert state.command_dialog_scroll == 0
+
+    editor = LineEditor(state=state)
+    editor.handle_key(Key.PAGE_DOWN)
+    assert state.command_dialog_scroll == 5
+
+    editor.handle_key(Key.PAGE_UP)
+    assert state.command_dialog_scroll == 0
+

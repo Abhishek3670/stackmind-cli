@@ -1060,6 +1060,26 @@ class RawLineEditor:
                 except Exception:
                     pass
 
+    def _force_full_redraw(self, clear: bool = True) -> None:
+        """Trigger a clean full-screen redraw when dialogs or panels close."""
+        if getattr(self, "on_height_change", None):
+            try:
+                self.on_height_change(self, clear=clear)
+                return
+            except TypeError:
+                try:
+                    self.on_height_change(self)
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if getattr(self, "on_clear_dropdown", None):
+            try:
+                self.on_clear_dropdown()
+            except Exception:
+                pass
+
     def _get_line_and_col(self, cursor: int | None = None) -> tuple[int, int, list[str]]:
         """Return (line_index, col_index, list_of_lines) for cursor in buffer."""
         if cursor is None:
@@ -1354,6 +1374,9 @@ class RawLineEditor:
                 self._dropdown_dismissed = True
                 self.dropdown_active = False
                 self._erase_dropdown()
+                if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                    self.state.close_command_dialog()
+                    self._force_full_redraw(clear=True)
                 return False
             if key == Key.RIGHT and self.cursor == len(self.buffer):
                 cmd, desc, req_args = self.dropdown_matches[self.dropdown_index]
@@ -1382,13 +1405,13 @@ class RawLineEditor:
         if key == Key.ESCAPE:
             if self.state is not None and getattr(self.state, "command_dialog_open", False):
                 self.state.close_command_dialog()
-                self._notify_height_change()
+                self._force_full_redraw(clear=True)
                 return False
 
         if key in (Key.ENTER, Key.NEWLINE):
             if not self.buffer and not self.in_bracketed_paste and self.state is not None and getattr(self.state, "command_dialog_open", False):
                 self.state.close_command_dialog()
-                self._notify_height_change()
+                self._force_full_redraw(clear=True)
                 return False
             if self.in_bracketed_paste or has_pending_input():
 
@@ -1468,6 +1491,10 @@ class RawLineEditor:
             return False
 
         if key == Key.PAGE_UP:
+            if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.scroll_command_dialog_up(5)
+                self._force_full_redraw(clear=False)
+                return False
             if DEBUG_KEYS_ENABLED:
                 _log_debug_key(f"[handle_key] MATCHED Key.PAGE_UP (has on_page_up={self.on_page_up is not None})")
             if self.on_page_up:
@@ -1475,6 +1502,10 @@ class RawLineEditor:
             return False
 
         if key == Key.PAGE_DOWN:
+            if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.scroll_command_dialog_down(5)
+                self._force_full_redraw(clear=False)
+                return False
             if DEBUG_KEYS_ENABLED:
                 _log_debug_key(f"[handle_key] MATCHED Key.PAGE_DOWN (has on_page_down={self.on_page_down is not None})")
             if self.on_page_down:
@@ -1692,6 +1723,9 @@ class RawLineEditor:
                 self._erase_dropdown(target)
 
         target.flush()
+
+
+LineEditor = RawLineEditor
 
 
 def raw_prompt_input(

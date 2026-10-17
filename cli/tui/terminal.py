@@ -993,7 +993,7 @@ def prompt_composer_input(
                     redraw_full_screen(
                         session,
                         state,
-                        clear=False,
+                        clear=True,
                         include_composer=True,
                         composer_is_active=True,
                         composer_content=getattr(state, "composer_buffer", ""),

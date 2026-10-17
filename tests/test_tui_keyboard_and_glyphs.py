@@ -1132,7 +1132,16 @@ def test_dropdown_height_shrink_clears_excess_top_lines():
     import re
 
     out = io.StringIO()
-    editor = RawLineEditor(width=80, out=out)
+    test_commands = [
+        (":plan", "desc", False),
+        (":pause", "desc", False),
+        (":providers", "desc", False),
+        (":projects", "desc", False),
+        (":status", "desc", False),
+        (":resume", "desc", False),
+        (":wo", "desc", False),
+    ]
+    editor = RawLineEditor(width=80, out=out, commands=test_commands)
 
     # 1. Type ':' (many matches -> max_visible 6 items -> 8 total lines)
     editor.handle_key(":")

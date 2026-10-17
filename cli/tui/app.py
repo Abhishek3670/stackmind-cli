@@ -724,7 +724,7 @@ def tui(
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
-                def _handle_height_change(editor: Any = None) -> None:
+                def _handle_height_change(editor: Any = None, clear: bool = False) -> None:
                     """Dynamically redraw full screen when composer content height changes."""
                     if not is_tty:
                         return
@@ -740,7 +740,7 @@ def tui(
                     redraw_full_screen(
                         session,
                         state,
-                        clear=False,
+                        clear=clear,
                         include_composer=True,
                         composer_is_active=True,
                         composer_content=current_text,

@@ -747,7 +747,7 @@ class AutonomousDeliveryState:
         self.command_dialog_command = command
         self.command_dialog_output = output
         self.command_dialog_scroll = 0
-        self.command_dialog_title = title or f"Command: {command}"
+        self.command_dialog_title = title or ""
 
     def close_command_dialog(self) -> None:
         """Close system command dialog and restore normal conversation viewport."""

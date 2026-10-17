@@ -18,6 +18,73 @@ from rich.text import Text
 from cli.tui.chat import _make_capture_console, should_render_ansi
 
 
+COMMAND_NAMES: dict[str, str] = {
+    ":status": "Status",
+    ":resume": "Resume",
+    ":plan": "Plan",
+    ":pause": "Pause",
+    ":wo": "Work Orders",
+    ":work-orders": "Work Orders",
+    ":tasks": "Work Orders",
+    ":goal": "Product Goal",
+    ":approve": "Approve",
+    ":reject": "Reject",
+    ":roles": "Agent Roles",
+    ":rebind": "Rebind Role",
+    ":config": "Configuration",
+    ":provider": "LLM Providers",
+    ":providers": "LLM Providers",
+    ":tree": "Operation Tree",
+    ":agents": "Agent Tree",
+    ":completion": "Project Completion",
+    ":cancel": "Cancel",
+    ":contract": "Contract Boundary",
+    ":diff": "Unified Diff",
+    ":matrix": "Verification Matrix",
+    ":events": "Event Stream",
+    ":reconnect": "Reconnect",
+    ":chat": "Conversation",
+    ":actions": "Actions History",
+    ":thinking": "Thinking Process",
+    ":govern": "Governance",
+    ":compact": "Compact Context",
+    ":timeout": "Turn Timeout",
+    ":landing": "Project Landing",
+    ":skills": "Procedural Skills",
+    ":skill": "Procedural Skill",
+    ":consume-skills": "Import Skills",
+    ":consume-skill": "Import Skill",
+    ":copy": "Clipboard Copy",
+    ":yank": "Clipboard Copy",
+    ":clipboard": "Clipboard Copy",
+    ":projects": "Projects",
+    ":help": "Help",
+    ":debugkeys": "Debug Keys",
+    ":exit": "Exit",
+    ":quit": "Exit",
+}
+
+
+def get_command_friendly_name(cmd: str | None) -> str:
+    """Derive human-friendly display name from command string, without gear icon or raw colon."""
+    if not cmd:
+        return "Command Output"
+    raw = cmd.strip()
+    if not raw:
+        return "Command Output"
+    parts = raw.split(maxsplit=1)
+    base_cmd = parts[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+
+    friendly_base = COMMAND_NAMES.get(
+        base_cmd,
+        base_cmd.lstrip(":").replace("-", " ").replace("_", " ").title() or "Command Output",
+    )
+    if args:
+        return f"{friendly_base} ({args})"
+    return friendly_base
+
+
 def compute_command_dialog_height(state: Any | None, height: int | None = None) -> int:
     """Calculate the height (in terminal lines) of the command dialog box.
 
@@ -67,10 +134,18 @@ def render_command_dialog(
         visible_lines = lines
         scroll_indicator = "[Esc close]"
 
+    custom_title = getattr(state, "command_dialog_title", None)
+    if (
+        custom_title
+        and not custom_title.startswith("Command: :")
+        and not custom_title.startswith("Command: ")
+    ):
+        title_str = custom_title
+    else:
+        title_str = get_command_friendly_name(cmd)
+
     title_text = Text()
-    title_text.append(" ⚙ ", style="bold #38bdf8")
-    title_text.append(cmd, style="bold #f8fafc")
-    title_text.append(" ", style="default")
+    title_text.append(f" {title_str} ", style="bold #f8fafc")
 
     subtitle_text = Text(f" {scroll_indicator} ", style="dim #94a3b8")
 
