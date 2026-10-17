@@ -440,9 +440,10 @@ def synthesize_bootstrap_planning(
         )
 
     # 4. Write artifacts to disk
+    from validators.kernel.io import durable_write_text
     wo_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{actual_wo_id}.yaml"
     wo_path.parent.mkdir(parents=True, exist_ok=True)
-    wo_path.write_text(wo_yaml, encoding="utf-8")
+    durable_write_text(wo_path, wo_yaml)
 
     # Invariant: work order must not exist in multiple state directories
     for stale_dir in ("COMPLETED", "BLOCKED"):
@@ -455,7 +456,7 @@ def synthesize_bootstrap_planning(
 
     contract_path = ws / ".sync" / "contracts" / f"{actual_wo_id}.yaml"
     contract_path.parent.mkdir(parents=True, exist_ok=True)
-    contract_path.write_text(contract_yaml, encoding="utf-8")
+    durable_write_text(contract_path, contract_yaml)
 
     # 5. Update .sync/work-orders/INDEX.yaml
     index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
@@ -501,7 +502,8 @@ def synthesize_bootstrap_planning(
         1 for o in index_data["orders"] if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
     )
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+    from validators.kernel.io import durable_write_yaml
+    durable_write_yaml(index_path, index_data)
 
     # 6. Update .sync/runtime/TREE.yaml
     tree_path = ws / ".sync" / "runtime" / "TREE.yaml"
@@ -529,7 +531,7 @@ def synthesize_bootstrap_planning(
     if actual_wo_id not in assigned_list:
         assigned_list.append(actual_wo_id)
     tree_path.parent.mkdir(parents=True, exist_ok=True)
-    tree_path.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+    durable_write_yaml(tree_path, tree_data)
 
     return wo_record, contract_record
 
@@ -649,6 +651,20 @@ class SessionManager:
                 session["state"] = "WAITING"
                 session["updated_at"] = _now()
                 self.events.publish("session.recovered", session["session_id"], state="WAITING")
+            # Clear orphaned active_operation from prior daemon process
+            active_op = session.get("active_operation")
+            if active_op:
+                for r in session.get("journal", []):
+                    if r.get("operation_id") == active_op and r.get("status") not in _OPERATION_TERMINAL:
+                        r["status"] = "CANCELLED"
+                        r.setdefault("transitions", []).append({
+                            "status": "CANCELLED",
+                            "at": _now(),
+                            "reason": "Recovered across daemon restart",
+                        })
+                        r["completed_at"] = _now()
+                        break
+                session["active_operation"] = None
             records = {
                 r["operation_id"]: r
                 for r in session.get("journal", [])
@@ -750,16 +766,24 @@ class SessionManager:
             has_disk_settings = is_local or ("PYTEST_CURRENT_TEST" not in os.environ and settings_path is not None)
             app_settings = load_settings(workspace) if has_disk_settings else None
 
-            if role_cfg.get("backend") and role_cfg.get("backend") != "echo-agent":
+            role_settings = app_settings.roles.get(canonical, {}) if app_settings else {}
+            configured_provider = role_settings.get("provider")
+            configured_model = role_settings.get("model")
+
+            if configured_provider:
+                backend_id = configured_provider
+                model_name = configured_model or role_cfg.get("model")
+            elif role_cfg.get("backend") and role_cfg.get("backend") != "echo-agent":
                 backend_id = role_cfg["backend"]
                 model_name = role_cfg.get("model")
-            elif app_settings:
-                role_settings = app_settings.roles.get(canonical, {})
-                backend_id = role_settings.get("provider") or role_cfg.get("backend", "echo-agent")
-                model_name = role_settings.get("model") or role_cfg.get("model")
             else:
-                backend_id = role_cfg.get("backend", "echo-agent")
+                backend_id = "echo-agent"
                 model_name = role_cfg.get("model")
+
+            if canonical in self._roles:
+                self._roles[canonical]["backend"] = backend_id
+                if model_name:
+                    self._roles[canonical]["model"] = model_name
 
             registry = get_default_registry()
             backend = registry.get(backend_id) if backend_id in registry else None
@@ -805,7 +829,7 @@ class SessionManager:
                 m = model_name or (prov_cfg.default_model if prov_cfg else None) or getattr(backend, "model", default_m) or default_m
                 m = sanitize_model_name(m, backend_id)
                 t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
-                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
+                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, provider_name=backend_id, default_timeout=float(t_val) if t_val else None)
 
             elif backend_id in ("gemini", "google"):
                 from validators.kernel.providers.adapter import GeminiAdapter
@@ -1891,9 +1915,34 @@ class SessionManager:
                     contract_scope = parent_record.get("contract_scope")
                 _verify_contract_scope_narrowing(parent_record.get("contract_scope"), contract_scope)
             else:
-                if session.get("active_operation"):
-                    from .supervisor import OperationContentionError
-                    raise OperationContentionError("session already has an active operation")
+                active_op_id = session.get("active_operation")
+                if active_op_id:
+                    is_thread_alive = (
+                        active_op_id in self._turn_threads
+                        and self._turn_threads[active_op_id].is_alive()
+                    )
+                    active_rec = None
+                    for r in session.get("journal", []):
+                        if r.get("operation_id") == active_op_id:
+                            active_rec = r
+                            break
+
+                    if (
+                        active_rec is None
+                        or active_rec.get("status") in _OPERATION_TERMINAL
+                        or not is_thread_alive
+                    ):
+                        if active_rec and active_rec.get("status") not in _OPERATION_TERMINAL:
+                            self.complete_operation(
+                                session_id,
+                                active_op_id,
+                                {"reason": "Orphaned operation cleaned up on new turn"},
+                                status="CANCELLED" if active_rec.get("status") == "CANCEL_REQUESTED" else "FAILED",
+                            )
+                        session["active_operation"] = None
+                    else:
+                        from .supervisor import OperationContentionError
+                        raise OperationContentionError("session already has an active operation")
 
             operation_id = str(uuid4())
             cancel = Event()
@@ -2030,7 +2079,16 @@ class SessionManager:
         """Request cooperative cancellation without changing the session lifecycle."""
         with self._lock:
             session, record = self._operation(operation_id)
+            is_thread_alive = (
+                operation_id in self._turn_threads
+                and self._turn_threads[operation_id].is_alive()
+            )
+            already_cancel_requested = record["status"] == "CANCEL_REQUESTED"
             if record["status"] not in _OPERATION_TERMINAL:
+                if not is_thread_alive or already_cancel_requested:
+                    return self.complete_operation(
+                        session["session_id"], operation_id, status="CANCELLED"
+                    )
                 self._transition(record, "CANCEL_REQUESTED")
                 cancel = self._active.get(operation_id)
                 if cancel:
@@ -2198,6 +2256,7 @@ class SessionManager:
                 work_order_id=op_wo,
                 operation=op_name,
                 error=op_err,
+                result=record.get("result"),
             )
             self._save()
             self._operation_event.set()
@@ -2211,6 +2270,12 @@ class SessionManager:
             operation_id = session.get("active_operation")
             if operation_id:
                 self.cancel_operation(operation_id)
+                try:
+                    _, record = self._operation(operation_id)
+                    if record.get("status") in _OPERATION_TERMINAL:
+                        session["active_operation"] = None
+                except KeyError:
+                    session["active_operation"] = None
                 return self._view(session)
             return self._set_state(session_id, "CANCELLED", "session.cancelled")
 
@@ -2509,6 +2574,14 @@ class SessionManager:
             )
             runner.on_thinking = lambda think_text: self.events.publish(
                 "reasoning.delta", session_id, text=think_text, operation_id=operation_id,
+                role=op_role, agent_id=agent,
+            )
+            runner.on_usage = lambda usage: self.events.publish(
+                "token.usage", session_id,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                completion_tokens=getattr(usage, "completion_tokens", 0),
+                total_tokens=getattr(usage, "total_tokens", 0),
+                operation_id=operation_id,
                 role=op_role, agent_id=agent,
             )
             with self._lock:

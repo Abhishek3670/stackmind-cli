@@ -271,16 +271,18 @@ def get_help_str() -> str:
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :reconnect        Reconnect to daemon and replay missed events\n"
-        "  :roles            Interactive Agent Roles & Execution Backend bindings panel\n"
-        "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
+        "  :roles            Interactive Agent Roles & Execution Backend bindings panel (preferred)\n"
+        "  :rebind [r] [b]   [DEPRECATED] Rebind agent role to backend (use :roles instead)\n"
         "  :config           StackMind system settings, execution profiles, governance & policies\n"
-        "  :providers        Configure cloud and local LLM providers, API keys & endpoints\n"
-        "  :models           Configure and list available provider models\n"
+        "  :provider         Configure cloud and local LLM providers, API keys & endpoints (alias: :providers)\n"
+        "  :providers        Alias for :provider\n"
         "  :wo               Display Work Orders table and progress\n"
         "  :tree, :agents    Display Hierarchical Operation Tree\n"
         "  :plan             Display Plan Approval surface and revision history\n"
         "  :skills [name]    Display available procedural skills & verified runbooks\n"
         "  :consume-skills <p> Ingest and install procedural skills from file or directory\n"
+        "  :attach <p>       Upload and ingest documents (.pdf, .docx, .md), images, or archives (.zip)\n"
+        "  :attachments      List all ingested workspace attachments and grounding assets\n"
         "  :projects         Display registered projects and centralized root (~/.stackmindcli)\n"
         "  :goal <request>   Submit product goal to Architecture (claude)\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
@@ -299,12 +301,14 @@ def get_help_str() -> str:
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
+        "  :copy [all]       Copy latest assistant response (or 'all' for full transcript) to clipboard\n"
         "  :help             Show this help menu\n"
         "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
         "Shortcuts:\n"
         "  Ctrl+O            Toggle thinking block expansion\n"
-        "  Ctrl+C            Cancel active turn or abort"
+        "  Ctrl+C            Cancel active turn or abort\n"
+        "  Ctrl+V            Paste clipboard content into input composer"
     )
 
 
@@ -403,12 +407,11 @@ def _stream_turn_execution(
 
     def _get_working_placeholder() -> str:
         elapsed = time.time() - start_time
-        toks = (
-            getattr(state, "cumulative_turn_tokens", 0)
-            or AutonomousDeliveryState.estimate_tokens(
-                "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
-            )
+        in_progress_tokens = AutonomousDeliveryState.estimate_tokens(
+            "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
         )
+        cumulative = getattr(state, "cumulative_turn_tokens", 0)
+        toks = cumulative + in_progress_tokens if cumulative > 0 else in_progress_tokens
         is_sync_action = False
         targets_to_check = [
             getattr(state, "active_tool_target", ""),
@@ -1331,6 +1334,49 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
+    if normalized.startswith(":copy") or normalized.startswith(":yank") or normalized == ":clipboard":
+        from cli.tui.clipboard import set_clipboard_text
+
+        parts = normalized.split()
+        mode = parts[1].lower() if len(parts) > 1 else "last"
+        text_to_copy = ""
+        if mode in ("all", "full", "transcript"):
+            lines = []
+            for msg in getattr(state, "messages", []):
+                sender = str(getattr(msg, "role", getattr(msg, "sender", "message"))).upper()
+                content = str(getattr(msg, "content", getattr(msg, "text", ""))).strip()
+                if content:
+                    lines.append(f"[{sender}]:\n{content}\n")
+            text_to_copy = "\n".join(lines)
+            desc = "entire conversation transcript"
+        else:
+            for msg in reversed(getattr(state, "messages", [])):
+                role = getattr(msg, "role", getattr(msg, "sender", ""))
+                if role not in ("user",):
+                    text_to_copy = str(getattr(msg, "content", getattr(msg, "text", ""))).strip()
+                    if text_to_copy:
+                        break
+            if not text_to_copy and getattr(state, "messages", []):
+                last = state.messages[-1]
+                text_to_copy = str(getattr(last, "content", getattr(last, "text", ""))).strip()
+            desc = "latest response"
+
+        if text_to_copy:
+            ok = set_clipboard_text(text_to_copy)
+            msg_str = (
+                f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard."
+                if ok
+                else "[ERROR] Failed to write to system clipboard."
+            )
+        else:
+            msg_str = "[CLIPBOARD] No messages available to copy."
+
+        state.add_message("user", normalized)
+        state.add_message("system", msg_str)
+        if not is_tty:
+            click.echo(msg_str)
+        return session, False
+
     if normalized == ":debugkeys":
         from cli.tui.keyboard import DEBUG_KEYS_ENABLED, DEBUG_LOG_FILE, set_debug_keys
 
@@ -1519,14 +1565,24 @@ def dispatch_delivery_command(
                         "model": m_to_save,
                     }
                 save_settings(s, ws)
-                output_str = f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'" + (
-                    f" (model: {model_arg})" if model_arg else ""
+                output_str = (
+                    "[DEPRECATED] ':rebind' is deprecated and scheduled for removal. "
+                    "Use ':roles' to assign providers to agent roles, or ':provider' for provider configuration.\n"
+                    f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'"
+                    + (f" (model: {model_arg})" if model_arg else "")
                 )
             except Exception as err:
-                output_str = f"[ERROR] Failed to rebind role '{role_arg}': {err}"
+                output_str = (
+                    "[DEPRECATED] ':rebind' is deprecated. Please use ':roles' instead.\n"
+                    f"[ERROR] Failed to rebind role '{role_arg}': {err}\n"
+                    f"Hint: Syntax is ':rebind <role> <backend> [model]' (e.g., ':rebind {role_arg} custom <model>'). "
+                    "Ensure no turn is currently active before rebinding."
+                )
         else:
             output_str = (
-                "Usage: :rebind <role> <backend> [model]  (e.g., :rebind gitops ollama llama3)"
+                "[DEPRECATED] ':rebind' is deprecated and scheduled for removal. "
+                "Use ':roles' to configure agent backends interactively, or ':provider' for provider credentials.\n"
+                "Usage: :rebind <role> <backend> [model]  (e.g., :rebind architecture custom <model>)"
             )
         state.add_message("user", normalized)
         state.add_message("system", output_str)
@@ -1622,9 +1678,10 @@ def dispatch_delivery_command(
         return session, False
 
     if (
-        normalized == ":providers"
+        normalized in {":provider", ":providers"}
+        or normalized.startswith(":provider ")
         or normalized.startswith(":providers ")
-        or normalized in {":models", ":provider"}
+        or normalized == ":models"
         or normalized.startswith(":models ")
     ):
         from cli.tui.settings_panel import (
@@ -1657,6 +1714,8 @@ def dispatch_delivery_command(
             else:
                 settings_obj = load_settings(ws)
                 output_str = render_settings_overview_str(settings_obj, width=term_cols)
+        if normalized == ":models" or normalized.startswith(":models "):
+            output_str = f"[INFO] ':models' is unified into ':provider'. Configure endpoints and models via ':provider', or assign role backends via ':roles'.\n\n{output_str}"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -1783,6 +1842,84 @@ def dispatch_delivery_command(
                     output_str = render_consumed_skills_summary_str(records, is_global, dest_desc)
                 except Exception as exc:
                     output_str = f"[Error consuming skills] {exc}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized == ":attach"
+        or normalized.startswith(":attach ")
+        or normalized == ":upload"
+        or normalized.startswith(":upload ")
+    ):
+        from validators.ingest import AttachmentStore
+        from cli.tui.attachments_panel import render_attachment_ingested_str
+
+        _, _, raw_arg = normalized.partition(" ")
+        clean_path = raw_arg.strip()
+        if (clean_path.startswith('"') and clean_path.endswith('"')) or (
+            clean_path.startswith("'") and clean_path.endswith("'")
+        ):
+            clean_path = clean_path[1:-1].strip()
+
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        store = AttachmentStore(ws_path or ".")
+
+        if not clean_path:
+            output_str = (
+                "Usage: :attach <file_or_archive_path> (or :upload <path>)\n"
+                "Supported formats:\n"
+                "  • Documents: .pdf, .docx, .md, .txt, .csv, .html\n"
+                "  • Images: .png, .jpg, .jpeg, .webp, .svg\n"
+                "  • Archives: .zip, .tar.gz (extracted safely with Zip-Slip protection)\n"
+                "Attachments are indexed into .sync/attachments/ and grounded into multi-agent turns."
+            )
+        else:
+            try:
+                record = store.ingest(clean_path)
+                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                output_str = render_attachment_ingested_str(record, width=term_cols)
+            except Exception as exc:
+                output_str = f"[Error ingesting attachment] {exc}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized in {":attachments", ":files"}:
+        from validators.ingest import AttachmentStore
+        from cli.tui.attachments_panel import render_attachments_list_str
+
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        store = AttachmentStore(ws_path or ".")
+        records = store.list_attachments()
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        output_str = render_attachments_list_str(records, width=term_cols)
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":attachment ") or normalized.startswith(":file "):
+        from validators.ingest import AttachmentStore
+        from cli.tui.attachments_panel import render_attachment_detail_str
+
+        _, _, target_id = normalized.partition(" ")
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        store = AttachmentStore(ws_path or ".")
+        record = store.get_attachment(target_id.strip())
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        if record:
+            output_str = render_attachment_detail_str(record, width=term_cols)
+        else:
+            output_str = f"Attachment '{target_id.strip()}' not found. Use :attachments to view all files."
 
         state.add_message("user", normalized)
         state.add_message("system", output_str)

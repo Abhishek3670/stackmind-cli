@@ -386,7 +386,7 @@ def tui(
         if is_tty:
             _ensure_utf8()
             enter_alternate_screen()
-            enable_mouse_reporting()
+            disable_mouse_reporting()
             redraw_full_screen(
                 session, state, clear=True, include_composer=True, composer_is_active=True
             )
@@ -872,6 +872,86 @@ def tui(
                     except Exception:
                         pass
 
+                def _handle_mouse_click(col: int, row: int, button: int, editor: Any = None) -> None:
+                    """Handle mouse clicks: clicking on the scrollbar track or dragging to scroll."""
+                    if button not in (0, 1, 32):
+                        return
+                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
+                    term_cols, term_lines = term_size.columns, term_size.lines
+                    layout = compute_layout(
+                        term_cols,
+                        term_lines,
+                        show_runtime=getattr(state, "runtime_panel_visible", False),
+                    )
+
+                    scrollbar_col = layout.conversation_width
+                    header_h = 1
+
+                    if scrollbar_col - 2 <= col <= scrollbar_col + 2:
+                        active_scroll = state.conversation_scroll
+                        tot_l = getattr(active_scroll, "total_lines", None)
+                        vp_h = getattr(active_scroll, "viewport_height", None) or max(1, term_lines - 6)
+                        cur_off = getattr(active_scroll, "scroll_offset", 0)
+
+                        if vp_h and tot_l and tot_l > vp_h:
+                            thumb_size = max(1, int(round(vp_h * (vp_h / tot_l))))
+                            thumb_size = min(thumb_size, vp_h)
+                            max_off = tot_l - vp_h
+                            start_idx = max_off - cur_off
+                            thumb_top = int(round((start_idx / max_off) * (vp_h - thumb_size)))
+                            click_r = max(0, min(vp_h - 1, row - header_h))
+
+                            if button == 32:
+                                # Continuous drag tracking: thumb position follows cursor directly
+                                travel_height = max(1, vp_h - thumb_size)
+                                thumb_pos = max(0, min(click_r, travel_height))
+                                ratio = thumb_pos / travel_height
+                                target_start = int(round(ratio * max_off))
+                                target_off = max(0, min(max_off, max_off - target_start))
+                                state.set_conversation_scroll_offset(target_off)
+                            elif click_r < thumb_top:
+                                state.scroll_conversation_up(max(1, vp_h // 2))
+                            elif click_r > thumb_top + thumb_size:
+                                state.scroll_conversation_down(max(1, vp_h // 2))
+                            else:
+                                travel_height = max(1, vp_h - thumb_size)
+                                thumb_pos = max(0, min(click_r, travel_height))
+                                ratio = thumb_pos / travel_height
+                                target_start = int(round(ratio * max_off))
+                                target_off = max(0, min(max_off, max_off - target_start))
+                                state.set_conversation_scroll_offset(target_off)
+
+                            if is_tty:
+                                current_text = (
+                                    "".join(editor.buffer)
+                                    if (
+                                        editor is not None
+                                        and isinstance(getattr(editor, "buffer", None), list)
+                                    )
+                                    else None
+                                )
+                                redraw_full_screen(
+                                    session,
+                                    state,
+                                    clear=False,
+                                    include_composer=True,
+                                    composer_is_active=True,
+                                    composer_content=current_text,
+                                    live_manager=live_ws,
+                                )
+                                cursor_col = _compute_cursor_col(editor)
+                                cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                                c_row = compute_composer_cursor_row(
+                                    term_lines,
+                                    state=state,
+                                    composer_content=current_text,
+                                    cursor_line=cursor_line,
+                                )
+                                sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                                sys.stdout.flush()
+                            if editor is not None and hasattr(editor, "redraw_line"):
+                                editor.redraw_line()
+
                 text = prompt_composer_input(
                     width=comp_width,
                     terminal_width=term_cols,
@@ -884,6 +964,7 @@ def tui(
                     on_page_down=_handle_page_down,
                     on_wheel_up=_handle_wheel_up,
                     on_wheel_down=_handle_wheel_down,
+                    on_mouse_click=_handle_mouse_click,
                     on_height_change=_handle_height_change,
                     on_idle=_handle_idle,
                     on_resize=_handle_resize,

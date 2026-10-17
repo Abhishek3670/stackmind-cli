@@ -211,7 +211,7 @@ class ColumnLayout:
         return 1 if self.show_runtime else 0
 
 
-def compute_layout(width: int) -> ColumnLayout:
+def compute_layout(width: int, *args: Any, **kwargs: Any) -> ColumnLayout:
     """Compute the multi-tier responsive layout for a given terminal width (WO-019).
 
     Supports 5 breakpoint tiers:

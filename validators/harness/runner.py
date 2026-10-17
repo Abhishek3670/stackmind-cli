@@ -305,6 +305,7 @@ class AgentRunner:
         on_tool_call: Callable[[str, dict[str, Any], str], None] | None = None,
         on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        on_usage: Callable[[Any], None] | None = None,
         execution_profile: Any | None = None,
     ) -> None:
         self.project_path = project_path.resolve()
@@ -312,6 +313,7 @@ class AgentRunner:
         self.agent = agent
         self.backend = backend
         self.provider_adapter = provider_adapter
+        self.on_usage = on_usage
 
         # Canonical execution profile & policy resolution
         from validators.kernel.profile import ExecutionProfile, get_profile_policy
@@ -1704,6 +1706,7 @@ class AgentRunner:
             on_tool_result=getattr(self, 'on_tool_result', None),
             on_thinking=getattr(self, 'on_thinking', None),
             on_token=getattr(self, 'on_token', None),
+            on_usage=getattr(self, 'on_usage', None),
         )
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
@@ -3639,11 +3642,34 @@ class AgentRunner:
 
             target = base_path / op.path
             target.parent.mkdir(parents=True, exist_ok=True)
+            from validators.kernel.io import durable_write_text
             if op.append and target.exists():
                 existing = target.read_text(encoding='utf-8')
-                target.write_text(existing + op.content, encoding='utf-8', newline='\n')
+                durable_write_text(target, existing + op.content, encoding='utf-8', newline='\n')
             else:
-                target.write_text(op.content, encoding='utf-8', newline='\n')
+                durable_write_text(target, op.content, encoding='utf-8', newline='\n')
+
+    def _resolve_fallback_release_target(self) -> str:
+        """Resolve a non-empty release target for completion notices (GEMINI-04)."""
+        try:
+            version_file = self.project_path / "VERSION"
+            if version_file.is_file():
+                v = version_file.read_text(encoding="utf-8").strip()
+                if v:
+                    return f"v{v.lstrip('v')}"
+        except Exception:
+            pass
+        try:
+            tree_file = self.sync_path / "runtime" / "TREE.yaml"
+            if tree_file.is_file():
+                import yaml
+                data = yaml.safe_load(tree_file.read_text(encoding="utf-8")) or {}
+                rel = data.get("release")
+                if rel:
+                    return f"v{str(rel).strip().lstrip('v')}"
+        except Exception:
+            pass
+        return "v0.1.0"
 
     def _render_review_request(
         self,
@@ -3672,12 +3698,15 @@ class AgentRunner:
         rationale_block = ""
         if decision.report_markdown and decision.report_markdown.strip() != decision.summary.strip():
             rationale_block = f"\nRationale & Details:\n{decision.report_markdown.strip()}\n"
+        release_tgt = decision.release_target
+        if not release_tgt or str(release_tgt).strip().lower() in ("none", "null", "tbd", "unassigned", ""):
+            release_tgt = self._resolve_fallback_release_target()
         return (
             f"# Completion Notice: {task.work_order_id}\n\n"
             f"from: {self.agent}\n"
             f"to: claude\n"
             f"date: \"{now.isoformat()}\"\n"
-            f"release_target: {decision.release_target}\n\n"
+            f"release_target: {release_tgt}\n\n"
             f"WO ID: {task.work_order_id}\n"
             f"Status: {decision.status}\n\n"
             f"Summary:\n{decision.summary}\n"

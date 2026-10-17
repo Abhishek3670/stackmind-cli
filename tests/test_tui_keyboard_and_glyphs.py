@@ -586,17 +586,19 @@ def test_raw_prompt_input_mouse_wheel():
 
 def test_terminal_state_restorer_disables_mouse():
     """Verify TerminalStateRestorer exits with mouse reporting disabled."""
+    from cli.tui.keyboard import DISABLE_MOUSE_REPORTING_SEQ
+
     buf = io.StringIO()
     with patch("sys.stdout", buf):
         with TerminalStateRestorer():
             pass
-    assert "\x1b[?1006l\x1b[?1000l" in buf.getvalue()
+    assert DISABLE_MOUSE_REPORTING_SEQ in buf.getvalue()
 
 
 # ─── 9. WIN32 DIRECT INPUT RECORD READER TESTS (PHASE 1) ────────────────────
 
 
-def _make_key_record(char: str = "\x00", vk: int = 0, down: bool = True, repeat: int = 1):
+def _make_key_record(char: str = "\x00", vk: int = 0, down: bool = True, repeat: int = 1, ctrl_state: int = 0):
     from cli.tui.keyboard import INPUT_RECORD
     rec = INPUT_RECORD()
     rec.EventType = 0x0001
@@ -605,7 +607,7 @@ def _make_key_record(char: str = "\x00", vk: int = 0, down: bool = True, repeat:
     rec.Event.KeyEvent.wVirtualKeyCode = vk
     rec.Event.KeyEvent.wVirtualScanCode = 0
     rec.Event.KeyEvent.UnicodeChar = char
-    rec.Event.KeyEvent.dwControlKeyState = 0
+    rec.Event.KeyEvent.dwControlKeyState = ctrl_state
     return rec
 
 
@@ -622,7 +624,7 @@ def _make_mouse_record(event_flags: int = 0, button_state: int = 0, x: int = 0, 
 
 
 def test_win32_reader_mouse_wheel():
-    """Verify Win32ConsoleReader parses MOUSE_WHEELED records into MOUSE_WHEEL_UP/DOWN."""
+    """Verify Win32ConsoleReader parses MOUSE_WHEELED records into MOUSE_WHEEL_UP/DOWN and motion into drags."""
     from cli.tui.keyboard import Key, Win32ConsoleReader
 
     reader = Win32ConsoleReader(handle=1)
@@ -641,9 +643,13 @@ def test_win32_reader_mouse_wheel():
     assert parsed_click == "<MOUSE_1_10_5>"
     assert parsed_click.startswith("<MOUSE_")
 
+    # Left drag event (event_flags = 0x0001 MOUSE_MOVED, button_state = 0x0001) -> reports btn=32
+    drag_rec = _make_mouse_record(event_flags=0x0001, button_state=0x0001, x=10, y=5)
+    assert reader.parse_input_record(drag_rec) == "<MOUSE_32_10_5>"
+
 
 def test_win32_reader_keyboard_events():
-    """Verify Win32ConsoleReader parses standard key down, control keys, and ignores key up."""
+    """Verify Win32ConsoleReader parses standard key down, control keys (including Ctrl+O), and ignores key up."""
     from cli.tui.keyboard import Key, Win32ConsoleReader
 
     reader = Win32ConsoleReader(handle=1)
@@ -654,7 +660,16 @@ def test_win32_reader_keyboard_events():
     # Key up (bKeyDown=False) must be ignored (returns None)
     assert reader.parse_input_record(_make_key_record(char="a", vk=0x41, down=False)) is None
 
-    # Control keys
+    # Control keys with null UnicodeChar (common in ConHost / Windows Terminal)
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x4F, ctrl_state=0x0008)) == Key.CTRL_O
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x4B, ctrl_state=0x0008)) == Key.CTRL_K
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x4C, ctrl_state=0x0008)) == Key.CTRL_L
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x43, ctrl_state=0x0008)) == Key.CTRL_C
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x44, ctrl_state=0x0008)) == Key.CTRL_D
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x56, ctrl_state=0x0008)) == Key.CTRL_V
+
+    # Control keys with letter or ASCII char
+    assert reader.parse_input_record(_make_key_record(char="o", vk=0x4F, ctrl_state=0x0004)) == Key.CTRL_O
     assert reader.parse_input_record(_make_key_record(char=Key.CTRL_C, vk=0x43, down=True)) == Key.CTRL_C
     assert reader.parse_input_record(_make_key_record(char=Key.CTRL_K, vk=0x4B, down=True)) == Key.CTRL_K
     assert reader.parse_input_record(_make_key_record(char=Key.CTRL_L, vk=0x4C, down=True)) == Key.CTRL_L

@@ -4254,10 +4254,8 @@ class LifecycleSupervisor:
             elif clear_error:
                 data.pop("error", None)
                 data.pop("blocked_reason", None)
-            wo_file.write_text(
-                yaml.dump(data, default_flow_style=False, allow_unicode=True),
-                encoding="utf-8",
-            )
+            from validators.kernel.io import durable_write_yaml
+            durable_write_yaml(wo_file, data, default_flow_style=False)
             # Also keep INDEX.yaml synchronized if present
             index_file = ws / ".sync" / "work-orders" / "INDEX.yaml"
             if index_file.is_file():
@@ -4279,7 +4277,7 @@ class LifecycleSupervisor:
                         1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
                     )
                     idx_data["last_updated"] = data["updated"]
-                    index_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                    durable_write_yaml(index_file, idx_data)
                     tree_file = ws / ".sync" / "runtime" / "TREE.yaml"
                     if tree_file.is_file():
                         try:
@@ -4288,7 +4286,7 @@ class LifecycleSupervisor:
                                 tree_data["work_orders"]["total_active"] = idx_data.get("total_active", 0)
                                 tree_data["work_orders"]["total_completed"] = idx_data.get("total_completed", 0)
                                 tree_data["work_orders"]["total_blocked"] = idx_data.get("total_blocked", 0)
-                                tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+                                durable_write_yaml(tree_file, tree_data)
                         except Exception:
                             pass
                 except Exception:
@@ -4936,7 +4934,8 @@ def archive_completed_work_orders(
         wo_data["status"] = "COMPLETED"
         wo_data["updated"] = now_iso
         target_file = completed_dir / wo_file.name
-        target_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+        from validators.kernel.io import durable_write_yaml
+        durable_write_yaml(target_file, wo_data)
         try:
             wo_file.unlink()
         except OSError:
@@ -4972,9 +4971,7 @@ def archive_completed_work_orders(
                 1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
             )
             index_data["last_updated"] = now_iso
-            temp_idx = index_file.with_name(f"{index_file.name}.tmp.{int(time.time() * 1000)}")
-            temp_idx.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
-            temp_idx.replace(index_file)
+            durable_write_yaml(index_file, index_data)
         except Exception:
             pass
 
@@ -4997,7 +4994,7 @@ def archive_completed_work_orders(
                                 w for w in assigned if w not in archived_set
                             ]
             tree_data["last_updated"] = now_iso
-            tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+            durable_write_yaml(tree_file, tree_data)
         except Exception:
             pass
 

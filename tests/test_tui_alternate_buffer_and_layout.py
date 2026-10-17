@@ -73,30 +73,38 @@ def test_enter_alternate_screen_emits_expected_sequences():
 
 def test_enable_and_disable_mouse_reporting():
     """Verify enable_mouse_reporting and disable_mouse_reporting emit correct SGR control sequences."""
+    from cli.tui.keyboard import DISABLE_MOUSE_REPORTING_SEQ, ENABLE_MOUSE_REPORTING_SEQ
+
     buf = io.StringIO()
     enable_mouse_reporting(stream=buf)
-    assert "\x1b[?1000h\x1b[?1006h" in buf.getvalue()
+    assert ENABLE_MOUSE_REPORTING_SEQ == ""
+    assert buf.getvalue() == ""
 
     buf2 = io.StringIO()
     disable_mouse_reporting(stream=buf2)
-    assert "\x1b[?1006l\x1b[?1000l" in buf2.getvalue()
+    assert DISABLE_MOUSE_REPORTING_SEQ in buf2.getvalue()
+
 
 
 def test_exit_alternate_screen_emits_expected_sequence():
     """Verify exit_alternate_screen writes mouse disable and primary buffer restore sequence."""
+    from cli.tui.keyboard import DISABLE_MOUSE_REPORTING_SEQ
+
     buf = io.StringIO()
     exit_alternate_screen(stream=buf)
     out = buf.getvalue()
-    assert "\x1b[?1006l\x1b[?1000l" in out
+    assert DISABLE_MOUSE_REPORTING_SEQ in out
     assert "\x1b[?1049l" in out
 
 
 def test_restore_terminal_state_emits_alternate_exit_and_cursor_reset():
     """Verify restore_terminal_state disables mouse reporting, exits alternate screen, shows cursor, and resets attributes."""
+    from cli.tui.keyboard import DISABLE_MOUSE_REPORTING_SEQ
+
     buf = io.StringIO()
     restore_terminal_state(stream=buf)
     out = buf.getvalue()
-    assert "\x1b[?1006l\x1b[?1000l" in out
+    assert DISABLE_MOUSE_REPORTING_SEQ in out
     assert "\x1b[?1049l" in out
     assert "\x1b[?25h" in out
     assert "\x1b[0m" in out

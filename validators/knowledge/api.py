@@ -821,6 +821,33 @@ class KnowledgeAPI:
                 # Memory retrieval failures must fail open for standard graph context
                 pass
 
+        # 3. Retrieve verified user attachments & grounding context if present
+        try:
+            from validators.ingest import AttachmentStore
+            attachment_store = AttachmentStore(self.project_path)
+            attachment_grounding = attachment_store.build_grounding_context(
+                query=query,
+                token_budget=max(200, token_budget // 3),
+            )
+            if attachment_grounding:
+                att_tokens = _estimate_tokens(attachment_grounding)
+                if estimated_tokens + att_tokens <= token_budget:
+                    entries.append(
+                        ContextEntry(
+                            node_id="attachments.grounding",
+                            rank=105,
+                            confidence=1.0,
+                            text=attachment_grounding,
+                            reason="attachment_grounding",
+                            why_retrieved=("verified_user_attachments",),
+                            access_status="allowed",
+                        )
+                    )
+                    text_blocks.append(attachment_grounding)
+                    estimated_tokens += att_tokens
+        except Exception:
+            pass
+
         for rank, result in sorted(
             ranked.values(),
             key=lambda item: (-item[0], item[1].path, item[1].qualified_name, item[1].node_id),

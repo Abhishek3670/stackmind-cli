@@ -101,17 +101,21 @@ class Key:
     PASTE_START = "<PASTE_START>"
     PASTE_END = "<PASTE_END>"
     SHIFT_ENTER = "<SHIFT_ENTER>"
+    CTRL_V = "\x16"  # Paste from clipboard (ASCII SYN / ord 22)
+    SHIFT_INSERT = "<SHIFT_INSERT>"
 
 
 # SGR Extended Mouse Mode control sequences (WO-054)
-ENABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000h\x1b[?1006h"
-DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1000l"
+# Left empty by default so terminal emulator retains direct native mouse text selection & copy.
+ENABLE_MOUSE_REPORTING_SEQ = ""
+DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 
 
 def enable_mouse_reporting(stream: Any = None) -> None:
     """Enable terminal SGR mouse reporting (WO-054).
 
-    Emits \x1b[?1000h\x1b[?1006h (normal tracking + SGR extended coordinates).
+    When ENABLE_MOUSE_REPORTING_SEQ is empty (default), this is a no-op so that
+    native terminal mouse text selection and copying work directly without Shift.
     """
     target = stream or sys.stdout
     try:
@@ -125,7 +129,7 @@ def enable_mouse_reporting(stream: Any = None) -> None:
 def disable_mouse_reporting(stream: Any = None) -> None:
     """Disable terminal SGR mouse reporting (WO-054).
 
-    Emits \x1b[?1006l\x1b[?1000l.
+    Emits \x1b[?1006l\x1b[?1002l\x1b[?1000l.
     """
     target = stream or sys.stdout
     try:
@@ -139,8 +143,9 @@ def disable_mouse_reporting(stream: Any = None) -> None:
 class TerminalStateRestorer:
     """Context manager to ensure terminal attributes, mouse reporting, and bracketed paste are restored unconditionally."""
 
-    def __init__(self, fd: int = 0) -> None:
+    def __init__(self, fd: int = 0, state: Any = None) -> None:
         self.fd = fd
+        self.state = state
         self.old_termios = None
         self.is_tty = False
 
@@ -151,7 +156,11 @@ class TerminalStateRestorer:
             self.is_tty = False
 
         if self.is_tty:
-            enable_mouse_reporting(sys.stdout)
+            mouse_enabled = getattr(self.state, "mouse_reporting_enabled", False) if self.state is not None else False
+            if mouse_enabled:
+                enable_mouse_reporting(sys.stdout)
+            else:
+                disable_mouse_reporting(sys.stdout)
             try:
                 sys.stdout.write("\x1b[?2004h")
                 sys.stdout.flush()
@@ -361,6 +370,8 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
             res = _parse_escape_sequence(seq)
         else:
             res = Key.ESCAPE
+    elif ch == Key.CTRL_V:
+        res = Key.CTRL_V
     else:
         if msvcrt.kbhit():
             debug_parts.append("kbhit=True")
@@ -458,8 +469,14 @@ class Win32ConsoleReader:
                     return Key.MOUSE_WHEEL_UP
                 elif delta < 0:
                     return Key.MOUSE_WHEEL_DOWN
-            # Non-wheel mouse events (clicks, motion) -> filtered by handle_key
-            btn = mouse.dwButtonState
+            # Filter out mouse motion with no buttons pressed to avoid event queue spam
+            if (mouse.dwEventFlags & 0x0001) and mouse.dwButtonState == 0:
+                return None
+            # If left mouse button is held while moving (MOUSE_MOVED), report as drag (btn=32)
+            if (mouse.dwEventFlags & 0x0001) and (mouse.dwButtonState & 0x0001):
+                btn = 32
+            else:
+                btn = mouse.dwButtonState
             return f"<MOUSE_{btn}_{mouse.dwMousePosition.X}_{mouse.dwMousePosition.Y}>"
 
         # Key Events (EventType == 0x0001)
@@ -502,7 +519,33 @@ class Win32ConsoleReader:
             # Discard stale high surrogate if followed by a regular char
             self._surrogate_high = None
 
-            # 2. Virtual Keys without Unicode representation (UnicodeChar == '\x00')
+            # 2. Control Key Combinations (Ctrl+O, Ctrl+K, Ctrl+L, Ctrl+C, Ctrl+D, Ctrl+V)
+            # Handle control keys regardless of whether UnicodeChar is null ('\x00') or letter
+            is_ctrl = bool(key.dwControlKeyState & (0x0004 | 0x0008))
+            is_shift = bool(key.dwControlKeyState & 0x0010)
+
+            if is_ctrl:
+                ctrl_vk_map = {
+                    0x4F: Key.CTRL_O,  # VK_O -> '\x0f' (Toggle thinking)
+                    0x4B: Key.CTRL_K,  # VK_K -> '\x0b' (Command palette)
+                    0x4C: Key.CTRL_L,  # VK_L -> '\x0c' (Clear screen)
+                    0x43: Key.CTRL_C,  # VK_C -> '\x03' (Cancel / exit)
+                    0x44: Key.CTRL_D,  # VK_D -> '\x04' (EOF / exit)
+                    0x56: Key.CTRL_V,  # VK_V -> '\x16' (Paste clipboard)
+                }
+                res = ctrl_vk_map.get(vk)
+                if res:
+                    if key.wRepeatCount > 1:
+                        self._pending_keys.extend([res] * (key.wRepeatCount - 1))
+                    return res
+
+            # Virtual key override for Ctrl+V / Shift+Insert (paste from clipboard)
+            if (vk == 0x2D and is_shift) or char == Key.CTRL_V:
+                if key.wRepeatCount > 1:
+                    self._pending_keys.extend([Key.CTRL_V] * (key.wRepeatCount - 1))
+                return Key.CTRL_V
+
+            # 3. Virtual Keys without Unicode representation (UnicodeChar == '\x00')
             if char == "\x00":
                 vk_map = {
                     0x21: Key.PAGE_UP,      # VK_PRIOR
@@ -522,19 +565,19 @@ class Win32ConsoleReader:
                     return res
                 return None
 
-            # 3. Virtual key override for VK_DELETE if it arrived with a char code like '\x7f' or '\x00'
+            # 4. Virtual key override for VK_DELETE if it arrived with a char code like '\x7f' or '\x00'
             if vk == 0x2E:
                 if key.wRepeatCount > 1:
                     self._pending_keys.extend([Key.DELETE] * (key.wRepeatCount - 1))
                 return Key.DELETE
 
             # Virtual key override for VK_RETURN when Shift is held
-            if vk == 0x0D and (key.dwControlKeyState & 0x0010):
+            if vk == 0x0D and is_shift:
                 if key.wRepeatCount > 1:
                     self._pending_keys.extend([Key.SHIFT_ENTER] * (key.wRepeatCount - 1))
                 return Key.SHIFT_ENTER
 
-            # 4. Standard character or control character
+            # 5. Standard character or control character
             if key.wRepeatCount > 1:
                 self._pending_keys.extend([char] * (key.wRepeatCount - 1))
             return char
@@ -771,10 +814,10 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
     (":roles", "Interactive Agent Roles & Execution Backend bindings panel", False),
-    (":rebind", "Rebind agent role to backend", True),
+    (":rebind", "Rebind agent role to backend (use :roles)", True),
     (":config", "Configure StackMind execution profile, governance & system policies", False),
-    (":providers", "Configure cloud & local LLM providers, API keys & base URLs", False),
-    (":models", "Configure and list available provider models", False),
+    (":provider", "Configure cloud & local LLM providers, API keys & base URLs", False),
+    (":providers", "Alias for :provider", False),
     (":tree", "Display Hierarchical Operation Tree", False),
     (":agents", "Display Hierarchical Agent Tree", False),
     (":completion", "Display Project Complete checklist", False),
@@ -795,6 +838,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":skill", "Display available procedural skills & runbooks", False),
     (":consume-skills", "Install/import procedural skills from file or directory", True),
     (":consume-skill", "Install/import procedural skill from file or directory", True),
+    (":copy", "Copy latest response (or :copy all for transcript) to clipboard", False),
     (":projects", "List registered projects and runtime home", False),
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
@@ -923,6 +967,7 @@ class RawLineEditor:
         bottom_border_renderer: Optional[Callable[[Optional[str]], str]] = None,
         on_alert: Optional[Callable[[Optional[str]], None]] = None,
         on_height_change: Optional[Callable[[Any], None]] = None,
+        on_mouse_click: Optional[Callable[[int, int, int], None]] = None,
     ) -> None:
         self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
@@ -941,6 +986,7 @@ class RawLineEditor:
         self.on_page_down = on_page_down
         self.on_wheel_up = on_wheel_up
         self.on_wheel_down = on_wheel_down
+        self.on_mouse_click = on_mouse_click
         self.on_transition = on_transition
         self.on_height_change = on_height_change
         self.width = width
@@ -973,6 +1019,32 @@ class RawLineEditor:
 
         self._update_state()
         self._update_dropdown()
+
+    def paste_from_clipboard(self) -> bool:
+        """Paste text from system clipboard directly into the composer buffer."""
+        from cli.tui.clipboard import get_clipboard_text
+
+        text = get_clipboard_text()
+        if not text:
+            return False
+
+        for ch in text:
+            if ch == "\r":
+                self._last_was_cr = True
+                self.insert_char("\n")
+            elif ch == "\n":
+                if self._last_was_cr:
+                    self._last_was_cr = False
+                    continue
+                self._last_was_cr = False
+                self.insert_char("\n")
+            else:
+                self._last_was_cr = False
+                if ch.isprintable() or ch == "\t":
+                    self.insert_char(ch)
+        self._notify_height_change()
+        self._update_state()
+        return True
 
     @property
     def text(self) -> str:
@@ -1416,9 +1488,29 @@ class RawLineEditor:
                 self.on_page_down()
             return False
 
+        if key == Key.CTRL_V:
+            self.paste_from_clipboard()
+            return False
+
         if key.startswith("<MOUSE_"):
+            parts = key.strip("<>").split("_")
+            if len(parts) >= 4:
+                try:
+                    btn = int(parts[1])
+                    col = int(parts[2])
+                    row = int(parts[3])
+                    action = parts[4] if len(parts) > 4 else "M"
+                    if action not in ("m",):
+                        # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
+                        if btn == 2 or (btn & 0x0002 != 0):
+                            self.paste_from_clipboard()
+                            return False
+                        if self.on_mouse_click:
+                            self.on_mouse_click(col, row, btn)
+                except Exception:
+                    pass
             if DEBUG_KEYS_ENABLED:
-                _log_debug_key(f"[handle_key] Filtered non-wheel mouse event: {key}")
+                _log_debug_key(f"[handle_key] Handled or filtered mouse event: {key}")
             return False
 
         if len(key) > 1 and not key.startswith(("<", "\x1b")):
@@ -1614,6 +1706,7 @@ def raw_prompt_input(
     on_idle: Optional[Callable[[Any], None]] = None,
     on_height_change: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
+    on_mouse_click: Optional[Callable[..., None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -1729,6 +1822,14 @@ def raw_prompt_input(
             except TypeError:
                 on_page_down()
 
+    def wrapped_mouse_click(col: int, row: int, button: int) -> None:
+        """Handle mouse clicks on layout elements like the vertical scrollbar."""
+        if on_mouse_click:
+            try:
+                on_mouse_click(col, row, button, editor)
+            except TypeError:
+                on_mouse_click(col, row, button)
+
     editor = RawLineEditor(
         prompt_prefix=prompt_prefix,
         initial_text=initial_text,
@@ -1741,6 +1842,7 @@ def raw_prompt_input(
         on_page_down=wrapped_page_down,
         on_wheel_up=wrapped_wheel_up,
         on_wheel_down=wrapped_wheel_down,
+        on_mouse_click=wrapped_mouse_click,
         on_transition=handle_transition,
         width=width,
         commands=commands,
@@ -1751,7 +1853,7 @@ def raw_prompt_input(
     )
 
     try:
-        with TerminalStateRestorer():
+        with TerminalStateRestorer(state=state):
             editor.redraw_line()
             last_term_size = shutil.get_terminal_size(fallback=(width, 24))
             while True:

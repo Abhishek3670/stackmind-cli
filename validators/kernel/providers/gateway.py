@@ -1329,6 +1329,7 @@ class ProviderGateway:
         on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
         on_token: Callable[[str], None] | None = None,
+        on_usage: Callable[[TokenUsage], None] | None = None,
     ) -> None:
         self.adapter = adapter
         self.tool_gateway = tool_gateway
@@ -1338,6 +1339,7 @@ class ProviderGateway:
         self.on_tool_result = on_tool_result
         self.on_thinking = on_thinking
         self.on_token = on_token
+        self.on_usage = on_usage
         active_tools = list(tools)
         if self.contract and hasattr(tool_gateway, "boundary") and hasattr(tool_gateway.boundary, "evaluator"):
             evaluator = tool_gateway.boundary.evaluator
@@ -1950,6 +1952,11 @@ class ProviderGateway:
         self._record_and_check_budget(response.usage)
         self.budget_status["tokens_used"] = self.total_usage.total_tokens
         self.budget_status["tool_calls_used"] = self.total_tool_calls
+        if self.on_usage:
+            try:
+                self.on_usage(self.total_usage)
+            except Exception:
+                pass
 
         messages.append(response.message)
 

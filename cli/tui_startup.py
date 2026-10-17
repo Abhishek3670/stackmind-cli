@@ -218,15 +218,24 @@ def prepare_project(workspace: Path, *, yes: bool, interactive: bool) -> None:
 
 
 def _safe_generated_repair(issue: Any) -> bool:
-    """Allow only additive directory/.gitkeep repair paths from validate --fix."""
+    """Allow additive, recoverable, and clean repair paths from validate --fix."""
     if not issue.auto_fixable:
         return False
-    message = issue.message
+    message = getattr(issue, "message", "")
+    path_str = str(getattr(issue, "path", ""))
     return (
         "without .gitkeep" in message
         or ("Missing: .sync/inbox/" in message and "_read" in message)
         or "Missing: .sync/outbox/" in message
         or "Missing directory: .sync/" in message
+        or "Missing: .sync/PROTOCOL_DIGEST" in message
+        or "Missing: .sync/RUNTIME_VERSION" in message
+        or "RUNTIME_VERSION" in path_str
+        or "auto-reconstructible from INDEX.yaml" in message
+        or "Completion notice" in message
+        or "CORRUPTED" in message
+        or "Canonical drift:" in message
+        or "Untracked path in .sync repo:" in message
     )
 
 

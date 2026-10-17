@@ -504,6 +504,19 @@ class ConversationScroll:
         self.follow_bottom = True
         self.has_new_activity = False
 
+    def set_scroll_offset(self, offset: int) -> None:
+        """Set absolute scroll offset directly (e.g. from scrollbar drag or positioning)."""
+        max_limit = self.max_offset if (self.max_offset is not None and self.max_offset > 0) else None
+        if max_limit is not None:
+            self.scroll_offset = max(0, min(offset, max_limit))
+        else:
+            self.scroll_offset = max(0, offset)
+        if self.scroll_offset == 0:
+            self.follow_bottom = True
+            self.has_new_activity = False
+        else:
+            self.follow_bottom = False
+
     def notify_activity(self) -> None:
         """Notify that new conversation content arrived outside current viewport."""
         if not self.follow_bottom and self.scroll_offset > 0:
@@ -618,6 +631,14 @@ class AutonomousDeliveryState:
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
         self.cumulative_turn_tokens: int = 0
+        self._legacy_prompt_tokens: int = 0
+        self._legacy_completion_tokens: int = 0
+        self._legacy_cumulative_turn_tokens: int = 0
+        self._unattached_prompt_tokens: int = 0
+        self._unattached_completion_tokens: int = 0
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
+        self.operation_tokens: dict[str, dict[str, int]] = {}
         self.compaction_count: int = 0
         self.settings_panel_open: bool = False
         self.settings_selected_row: int = 0
@@ -718,10 +739,105 @@ class AutonomousDeliveryState:
         """Return a fast, dependency-free token estimate suitable for local models."""
         return max(0, math.ceil(len(text or "") / 4))
 
+    def _recompute_token_totals(self) -> None:
+        op_p = sum(op.get("prompt", 0) for op in self.operation_tokens.values())
+        op_c = sum(op.get("completion", 0) for op in self.operation_tokens.values())
+        total_p = op_p + self._unattached_prompt_tokens
+        total_c = op_c + self._unattached_completion_tokens
+        self.prompt_tokens = max(total_p, self._legacy_prompt_tokens)
+        self.completion_tokens = max(total_c, self._legacy_completion_tokens)
+        self.cumulative_turn_tokens = max(total_p + total_c, self._legacy_cumulative_turn_tokens)
+
+    def record_operation_tokens(
+        self,
+        op_id: str | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        """Record provider-measured tokens for an operation to avoid double-counting across retries."""
+        if prompt_tokens > 0:
+            self.last_prompt_tokens = prompt_tokens
+        if completion_tokens > 0:
+            self.last_completion_tokens = completion_tokens
+        if op_id:
+            curr = self.operation_tokens.get(op_id, {"prompt": 0, "completion": 0, "total": 0})
+            new_p = max(curr["prompt"], prompt_tokens)
+            new_c = max(curr["completion"], completion_tokens)
+            self.operation_tokens[op_id] = {
+                "prompt": new_p,
+                "completion": new_c,
+                "total": new_p + new_c,
+            }
+        else:
+            self._unattached_prompt_tokens = max(self._unattached_prompt_tokens, prompt_tokens)
+            self._unattached_completion_tokens = max(self._unattached_completion_tokens, completion_tokens)
+        self._recompute_token_totals()
+
+    def record_token_usage(
+        self,
+        prompt: str = "",
+        completion: str = "",
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+    ) -> None:
+        """Accumulate per-session prompt/completion estimates for observability."""
+        p_count = prompt_tokens if prompt_tokens is not None else self.estimate_tokens(prompt)
+        c_count = completion_tokens if completion_tokens is not None else self.estimate_tokens(completion)
+        self._legacy_prompt_tokens += p_count
+        self._legacy_completion_tokens += c_count
+        self._legacy_cumulative_turn_tokens += p_count + c_count
+        self._recompute_token_totals()
+
+    def estimate_transcript_tokens(self) -> int:
+        """Return estimated tokens across all retained messages, thinking, and actions."""
+        total = 0
+        for message in self.messages:
+            total += self.estimate_tokens(message.content)
+            if message.thinking:
+                total += self.estimate_tokens(message.thinking)
+            if message.actions:
+                for a in message.actions.all_actions:
+                    if a.description:
+                        total += self.estimate_tokens(a.description)
+                    if a.target:
+                        total += self.estimate_tokens(a.target)
+                    if a.diff:
+                        total += self.estimate_tokens(a.diff)
+                    if a.code:
+                        total += self.estimate_tokens(a.code)
+                    if a.output:
+                        total += self.estimate_tokens(a.output)
+                    if a.error:
+                        total += self.estimate_tokens(a.error)
+        if getattr(self, "current_turn_thinking", None):
+            total += self.estimate_tokens(self.current_turn_thinking)
+        turn_actions = getattr(self, "current_turn_actions", None)
+        if turn_actions and hasattr(turn_actions, "all_actions"):
+            for a in turn_actions.all_actions:
+                if a.description:
+                    total += self.estimate_tokens(a.description)
+                if a.target:
+                    total += self.estimate_tokens(a.target)
+                if a.diff:
+                    total += self.estimate_tokens(a.diff)
+                if a.code:
+                    total += self.estimate_tokens(a.code)
+                if a.output:
+                    total += self.estimate_tokens(a.output)
+                if a.error:
+                    total += self.estimate_tokens(a.error)
+        return total
+
     @property
     def context_tokens(self) -> int:
-        """Estimated tokens currently retained in the model-facing transcript."""
-        return sum(self.estimate_tokens(message.content) for message in self.messages)
+        """Estimated tokens currently retained in or evaluated by the active model context."""
+        transcript_est = self.estimate_transcript_tokens()
+        active_prompt = getattr(self, "last_prompt_tokens", 0) or 0
+        active_in_progress = self.estimate_tokens(getattr(self, "current_turn_thinking", ""))
+        if hasattr(self, "last_completion_tokens") and self.last_completion_tokens:
+            active_in_progress = max(active_in_progress, self.last_completion_tokens)
+        model_context = active_prompt + active_in_progress if active_prompt > 0 else 0
+        return max(transcript_est, model_context)
 
     @property
     def context_utilization(self) -> float:
@@ -743,14 +859,6 @@ class AutonomousDeliveryState:
     def set_context_window(self, tokens: int) -> None:
         """Set a detected model context capacity, retaining a safe positive value."""
         self.context_window_tokens = max(1, int(tokens))
-
-    def record_token_usage(self, prompt: str = "", completion: str = "") -> None:
-        """Accumulate per-session prompt/completion estimates for observability."""
-        prompt_count = self.estimate_tokens(prompt)
-        completion_count = self.estimate_tokens(completion)
-        self.prompt_tokens += prompt_count
-        self.completion_tokens += completion_count
-        self.cumulative_turn_tokens += prompt_count + completion_count
 
     def compact_transcript(self, keep_recent: int | None = None) -> bool:
         """Replace older transcript turns with a concise local continuity summary."""
@@ -923,6 +1031,10 @@ class AutonomousDeliveryState:
     def scroll_conversation_to_bottom(self) -> None:
         """Jump conversation viewport to bottom and resume live-following (§31)."""
         self.conversation_scroll.scroll_to_bottom()
+
+    def set_conversation_scroll_offset(self, offset: int) -> None:
+        """Set absolute conversation viewport scroll offset directly."""
+        self.conversation_scroll.set_scroll_offset(offset)
 
     def record_turn_action(
         self,
@@ -1151,6 +1263,18 @@ class AutonomousDeliveryState:
         ws_session = session.get("workspace")
         if ws_session:
             self.sync_work_orders_from_disk(ws_session)
+        journal = session.get("journal")
+        if isinstance(journal, list):
+            for rec in journal:
+                if isinstance(rec, Mapping):
+                    op_id = rec.get("operation_id")
+                    result = rec.get("result")
+                    if isinstance(result, Mapping):
+                        telem = result.get("telemetry")
+                        if isinstance(telem, Mapping):
+                            p_tok = int(telem.get("prompt_tokens", 0) or 0)
+                            c_tok = int(telem.get("completion_tokens", 0) or 0)
+                            self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
         self.reconcile_roles_from_work_orders()
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
@@ -1841,6 +1965,13 @@ class AutonomousDeliveryState:
                 self.completion_checklist["README.md"] = True
                 self.completion_checklist["Git"] = True
 
+            result = payload.get("result")
+            if isinstance(result, Mapping):
+                telem = result.get("telemetry")
+                if isinstance(telem, Mapping):
+                    p_tok = int(telem.get("prompt_tokens", 0) or 0)
+                    c_tok = int(telem.get("completion_tokens", 0) or 0)
+                    self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
             self.add_activity(normalized_role, "completed", op_name or (wo_id or ""))
             self.reconcile_roles_from_work_orders()
 
@@ -2023,6 +2154,16 @@ class AutonomousDeliveryState:
                 prof = telem.get("execution_profile") or payload.get("execution_profile")
                 if prof:
                     self.execution_profile = str(prof)
+                op_id = event.get("operation_id") or payload.get("operation_id")
+                p_tok = int(telem.get("prompt_tokens", 0) or 0)
+                c_tok = int(telem.get("completion_tokens", 0) or 0)
+                self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
+
+        elif name in {"token.usage", "usage.delta"}:
+            op_id = event.get("operation_id") or payload.get("operation_id")
+            p_tok = int(payload.get("prompt_tokens", 0) or 0)
+            c_tok = int(payload.get("completion_tokens", 0) or 0)
+            self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
 
         elif name in {"agent.thinking", "turn.thinking", "reasoning.delta"}:
             raw_think = payload.get("text") or payload.get("thinking") or payload.get("thought") or payload.get("reasoning") or payload.get("delta") or ""

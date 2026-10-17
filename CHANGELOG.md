@@ -5,6 +5,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TUI Mouse Access, Scrollbar Navigation & Native Clipboard Integration**:
+  - Native zero-dependency cross-platform clipboard utility (`cli/tui/clipboard.py`) leveraging Win32 `ctypes` (`OpenClipboard`, `GetClipboardData`, `SetClipboardData`), macOS `pbcopy`/`pbpaste`, and Linux `wl-clipboard`/`xclip`/`xsel`.
+  - Full keyboard clipboard paste support via `Ctrl+V` (`\x16` or VK `0x56`) and `Shift+Insert` in `RawLineEditor`.
+  - Right-click mouse paste: right-clicking anywhere in the input line or terminal viewport immediately pastes OS clipboard text into the active composer.
+  - Interactive mouse scrollbar navigation: clicking on the conversation viewport's scrollbar track jumps or smoothly pages up/down, keeping multiline conversations easily navigable without leaving the mouse.
+  - Multi-line clipboard paste: preserves CRLF / LF line endings cleanly into composer buffer.
+  - System clipboard commands (`:copy`, `:yank`, `:clipboard`, `:copy all`): copies latest assistant response or full conversation transcript to the OS clipboard with character confirmation.
+- **Multi-Modal Document, Image & Archive Ingestion Engine (Pillar 4)**:
+  - New `validators/ingest` subsystem (`models.py`, `parsers.py`, `store.py`) enabling attachment ingestion and prompt grounding across documents, images, and archives.
+  - Zero-dependency document extraction: parses Word `.docx` documents (paragraphs, headings, Markdown tables via stdlib `xml.etree.ElementTree` and `zipfile`), PDFs (stream object text extraction), CSVs (Markdown tables), and multi-encoding plain text / Markdown.
+  - Image asset inspection: extracts width, height, aspect ratio, color mode, and SHA-256 for `.png`, `.jpg`, `.jpeg`, `.webp`, `.svg`, and produces structured grounding metadata.
+  - Secure archive extraction: decompresses `.zip`, `.tar.gz`, `.tgz` with strict Zip Slip path traversal protection (rejecting `..` and escaped target paths) and maximum uncompressed byte bounds.
+  - Workspace attachment persistence: manages raw immutable files under `.sync/attachments/raw/`, extracted markdown under `.sync/attachments/extracted/`, and registry index in `manifest.json`.
+  - Context grounding injection: automatically injects verified user attachments into KnowledgeAPI `assemble_context` for both Architecture (`WO-000`) planning and Worker execution.
+  - TUI commands: `:attach <path>` / `:upload <path>` (ingest and index), `:attachments` / `:files` (list tracked assets), and `:attachment <id>` (view details/preview).
+  - CLI commands: `stackmind attach <path> [--workspace PATH] [--tag TAG]` and `stackmind attachments`.
+  - Full test coverage with 7 automated unit tests in `tests/test_ingest_attachments.py`.
+
+### Fixed
+- **Win32 `Ctrl+O` Thinking Toggle and Control Key Parsing**:
+  - Resolved an issue in `cli/tui/keyboard.py` where Windows console / Windows Terminal sends `UnicodeChar == '\x00'` when `Ctrl` is held, causing `Win32ConsoleReader.parse_input_record` to drop `Ctrl+O` (`vk=0x4F`), `Ctrl+K` (`vk=0x4B`), and `Ctrl+L` (`vk=0x4C`).
+  - Added dedicated `is_ctrl` virtual key code resolution for `Ctrl+O`, `Ctrl+K`, `Ctrl+L`, `Ctrl+C`, `Ctrl+D`, and `Ctrl+V`.
+- **Smooth Mouse Scrollbar Dragging**:
+  - Updated terminal mouse reporting sequences to enable SGR Mode 1002 (`\x1b[?1000h\x1b[?1002h\x1b[?1006h`), enabling continuous button-motion tracking during mouse drags.
+  - Added support for button code `32` (left drag) in `_handle_mouse_click`, mapping the thumb's proportional position directly across the scrollbar travel height to smoothly drag the conversation viewport.
+- **Native Mouse Text Selection & Clipboard Copy**:
+  - Direct native click-and-drag text selection is enabled by default without requiring `Shift`, leaving terminal mouse management to the native console / terminal emulator.
+  - Removed `:mouse` command and removed the temporary "Hold Shift+Drag to select & copy text (or run :copy)" tooltip hint for an uncluttered terminal experience.
+  - Retained `:copy` (for latest assistant response) and `:copy all` (for full conversation transcript) for instant zero-dependency OS clipboard copying.
+  - Updated `:help` menu and shortcuts documentation to cleanly reflect `Ctrl+O`, `Ctrl+C`, `Ctrl+V`, and `:copy [all]`.
+- **Provider vs. Role Single-Responsibility Separation & Mismatch Fix**:
+  - Enforced strict separation of concerns between `:provider` and `:roles`:
+    - **`:provider`** (with alias `:providers`) is the ONLY surface for configuring provider definitions (endpoints, base URLs, API keys, status enabled/disabled, default models, and connection health checks). Purged duplicate role menus and role prompts from the provider configuration surface.
+    - **`:roles`** (with alias `:role`) is the ONLY surface for assigning providers and models to agent roles (`Architecture`, `Backend`, `Frontend`, `Q/A`, `GitOps`).
+    - Unified `:models` into `:provider` and removed duplicate `:models` command from autocompletion and help.
+    - Updated `:rebind` deprecation notices to cleanly distinguish `:roles` for role assignments from `:provider` for provider definitions.
+  - Fixed role persistence and daemon synchronization:
+    - Resolved an issue where pressing `[Esc]` in `:roles` exited without persisting role changes to `settings.json` or syncing with the daemon.
+    - Added immediate auto-persistence to disk and real-time daemon synchronization (`client.settings_update`) whenever role providers or models are cycled, updating both the `AGENTS` sidebar and runtime state in real-time.
+    - Updated `SessionManager._default_runner` in `validators/kernel/daemon/manager.py` to prioritize workspace role assignments from `settings.json` over in-memory defaults, eliminating provider/role mismatches where turns were routed to stale providers.
+- **Provider View Navigation Cleanup**:
+  - Removed confusing `◄ Return to StackMind Settings (:config)` row from the `:provider` view in `cli/tui/settings_panel.py`.
+  - `:provider` now cleanly presents only provider definitions and the direct `Save Settings to Disk & Apply to Runtime` action, while `[Esc]` cleanly exits and saves (or returns to `:config` if the user originally navigated from `:config`).
+
+### Deprecated
+- **TUI `:rebind` Colon Command**:
+  - The `:rebind <role> <backend> [model]` colon command is formally deprecated and scheduled for removal in a future major release.
+  - Interactive role binding is now fully consolidated under `:roles` (for visual role assignment across providers and models) and `:provider` (for endpoint and credential management).
+  - Executing `:rebind` now surfaces structured `[DEPRECATED]` notices and redirection guidance, helping users avoid positional syntax errors and active-turn rebinding lock conflicts.
+
 ## [3.9.0] - 2026-10-17
 
 ### Added

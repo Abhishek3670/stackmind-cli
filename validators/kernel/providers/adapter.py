@@ -97,7 +97,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             "messages": [m.to_dict() for m in messages],
             "stream": stream,
         }
-        if stream:
+        if stream and ("api.openai.com" in self.base_url or self.provider_name == "openai"):
             payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
@@ -160,6 +160,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         headers = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
+            "User-Agent": "StackMind-CLI/3.3",
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -269,9 +270,19 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                 if line == "data: [DONE]":
                     break
                 if line.startswith("data: "):
-                    raw_json = line[6:]
+                    raw_json = line[6:].strip()
                     try:
                         chunk_data = json.loads(raw_json)
+                        yield self._parse_stream_dict(chunk_data)
+                    except json.JSONDecodeError:
+                        continue
+                elif line.startswith("{") and line.endswith("}"):
+                    try:
+                        chunk_data = json.loads(line)
+                        if "error" in chunk_data and isinstance(chunk_data["error"], (dict, str)):
+                            err_info = chunk_data["error"]
+                            err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
+                            raise ProviderError(f"Proxy error: {err_msg}", provider=self.provider_name)
                         yield self._parse_stream_dict(chunk_data)
                     except json.JSONDecodeError:
                         continue
@@ -284,6 +295,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         choices = data.get("choices") or []
         finish_reason = None
         delta_content = ""
+        delta_thinking = ""
         delta_tool_calls: list[ToolCallRequest] = []
 
         if choices:
@@ -291,7 +303,13 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             finish_reason = first.get("finish_reason")
             delta = first.get("delta") or first.get("message") or {}
             delta_content = delta.get("content") or ""
-            delta_thinking = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or ""
+            delta_thinking = (
+                delta.get("reasoning_content")
+                or delta.get("reasoning")
+                or delta.get("thinking")
+                or data.get("reasoning_summary")
+                or ""
+            )
             raw_tcs = delta.get("tool_calls") or []
             for tc in raw_tcs:
                 if not isinstance(tc, dict):
