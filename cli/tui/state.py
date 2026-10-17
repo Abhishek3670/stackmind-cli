@@ -471,6 +471,7 @@ class ChatMessage:
     thinking: str | None = None
     turn_id: str | None = None
     thinking_expanded: bool = False
+    is_command: bool = False
 
 
 @dataclass
@@ -655,6 +656,12 @@ class AutonomousDeliveryState:
         self.max_retries: int = 10
         self.retry_status: str | None = None
         self.active_working_status: str | None = None
+        self.command_dialog_open: bool = False
+        self.command_dialog_command: str = ""
+        self.command_dialog_output: str = ""
+        self.command_dialog_scroll: int = 0
+        self.command_dialog_title: str = ""
+        self._last_command_str: str | None = None
 
     @property
     def retry_status_display(self) -> str | None:
@@ -733,6 +740,41 @@ class AutonomousDeliveryState:
         self.settings_selected_row = 0
         self.settings_current_view = "main"
         self.settings_status_msg = ""
+
+    def show_command_dialog(self, command: str, output: str, title: str | None = None) -> None:
+        """Open system command dialog just above the composer text area."""
+        self.command_dialog_open = True
+        self.command_dialog_command = command
+        self.command_dialog_output = output
+        self.command_dialog_scroll = 0
+        self.command_dialog_title = title or f"Command: {command}"
+
+    def close_command_dialog(self) -> None:
+        """Close system command dialog and restore normal conversation viewport."""
+        self.command_dialog_open = False
+        self.command_dialog_command = ""
+        self.command_dialog_output = ""
+        self.command_dialog_scroll = 0
+        self.command_dialog_title = ""
+
+    def scroll_command_dialog_up(self, lines: int = 1) -> None:
+        """Scroll command dialog content upward."""
+        if self.command_dialog_scroll > 0:
+            self.command_dialog_scroll = max(0, self.command_dialog_scroll - lines)
+
+    def scroll_command_dialog_down(self, lines: int = 1, max_lines: int = 1000) -> None:
+        """Scroll command dialog content downward."""
+        self.command_dialog_scroll = min(max_lines, self.command_dialog_scroll + lines)
+
+    def record_command_output(self, command: str, output: str, title: str | None = None) -> None:
+        """Record command execution and display output in dialog above text area without cluttering chat."""
+        self.add_message("user", command, is_command=True)
+        msg = self.add_message("system", output, is_command=True)
+        try:
+            setattr(msg, "_is_command_output", True)
+        except Exception:
+            pass
+        self.show_command_dialog(command, output, title=title)
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -911,9 +953,22 @@ class AutonomousDeliveryState:
         actions: ActionsGroup | None = None,
         thinking: str | None = None,
         turn_id: str | None = None,
+        is_command: bool = False,
     ) -> ChatMessage:
         clean = content.strip()
+        if not is_command and role == "user" and clean.startswith(":"):
+            is_command = True
+            self._last_command_str = clean
+        elif role == "user":
+            self._last_command_str = None
+            self.close_command_dialog()
+        elif role == "system" and getattr(self, "_last_command_str", None):
+            is_command = True
+            cmd_name = self._last_command_str
+            self._last_command_str = None
+            self.show_command_dialog(cmd_name, content)
         key = (role, clean)
+
         if deduplicate and key in self.seen_message_keys:
             for m in self.messages:
                 if m.role == role and m.content.strip() == clean:
@@ -973,8 +1028,10 @@ class AutonomousDeliveryState:
             thinking=msg_thinking,
             turn_id=turn_id,
             thinking_expanded=self.thinking_expanded,
+            is_command=is_command,
         )
         self.messages.append(msg)
+
         if role == "user":
             self.record_token_usage(prompt=msg_content)
         elif role == "assistant":

@@ -1498,6 +1498,10 @@ def render_chat_transcript(
     for msg in messages:
         if is_stray_command_bar(msg.content):
             continue
+        if getattr(msg, "is_command", False) or getattr(msg, "_is_command_output", False):
+            continue
+        if msg.role.lower() == "user" and msg.content.strip().startswith(":"):
+            continue
         role = msg.role.lower()
         if role == "user":
             assistant_header_shown = False

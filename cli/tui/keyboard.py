@@ -1379,8 +1379,19 @@ class RawLineEditor:
             self.insert_char("\n")
             return False
 
+        if key == Key.ESCAPE:
+            if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.close_command_dialog()
+                self._notify_height_change()
+                return False
+
         if key in (Key.ENTER, Key.NEWLINE):
+            if not self.buffer and not self.in_bracketed_paste and self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.close_command_dialog()
+                self._notify_height_change()
+                return False
             if self.in_bracketed_paste or has_pending_input():
+
                 if key == "\r":
                     self._last_was_cr = True
                     self.insert_char("\n")

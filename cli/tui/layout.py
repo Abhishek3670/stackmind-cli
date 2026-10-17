@@ -129,7 +129,11 @@ def compute_viewport_height(
     chrome = comp_h + (STATUS_BAR_HEIGHT if show_footer else 0)
     if state is not None and getattr(state, "settings_panel_open", False):
         chrome += SETTINGS_PANEL_HEIGHT
+    if state is not None and getattr(state, "command_dialog_open", False):
+        from cli.tui.command_dialog import compute_command_dialog_height
+        chrome += compute_command_dialog_height(state, height=lines)
     return max(MIN_VIEWPORT_HEIGHT, lines - chrome)
+
 
 
 def compute_composer_cursor_row(
@@ -940,11 +944,26 @@ def render_full_screen_workspace(
             state, width=settings_width, height=SETTINGS_PANEL_HEIGHT
         )
 
+    # 4b. System command dialog anchored just above the text area
+    dialog_open = getattr(state, "command_dialog_open", False) if state is not None else False
+    dialog_str = ""
+    if dialog_open:
+        from cli.tui.command_dialog import render_command_dialog_str
+
+        dialog_width = layout.conversation_width if layout.show_runtime else width
+        dialog_str = render_command_dialog_str(
+            state, width=dialog_width, height=height, force_color=force_color, no_color=no_color
+        )
+
     if not include_composer:
+        blocks = [workspace_str]
+        if dialog_str:
+            blocks.append(dialog_str)
         if settings_open and settings_panel_str:
-            res = f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{settings_panel_str}"
-        else:
-            res = f"{workspace_str}\n{status_bar_str}" if status_bar_str else workspace_str
+            blocks.append(settings_panel_str)
+        if status_bar_str:
+            blocks.append(status_bar_str)
+        res = "\n".join(blocks)
         all_lines = res.split("\n")
         if height is not None:
             comp_h = compute_composer_height(composer_content, height=height, state=state)
@@ -978,10 +997,16 @@ def render_full_screen_workspace(
         retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
     )
 
+    blocks = [workspace_str]
+    if dialog_str:
+        blocks.append(dialog_str)
+    blocks.append(composer_str)
     if settings_open and settings_panel_str:
-        res = f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}\n{settings_panel_str}"
-    else:
-        res = f"{workspace_str}\n{composer_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}"
+        blocks.append(settings_panel_str)
+    if status_bar_str:
+        blocks.append(status_bar_str)
+    res = "\n".join(blocks)
+
 
     all_lines = res.split("\n")
     if height is not None:

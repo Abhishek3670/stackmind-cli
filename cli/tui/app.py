@@ -576,10 +576,13 @@ def tui(
                         editor.redraw_line()
 
                 def _handle_page_up(editor: Any = None) -> None:
-                    """Scroll conversation viewport up by half a page."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_height = compute_viewport_height(term_lines, state=state)
-                    state.scroll_conversation_up(max(1, vp_height // 2))
+                    """Scroll conversation viewport or command dialog up by half a page."""
+                    if state is not None and getattr(state, "command_dialog_open", False):
+                        state.scroll_command_dialog_up(4)
+                    else:
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        vp_height = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_up(max(1, vp_height // 2))
                     if is_tty:
                         current_text = (
                             "".join(editor.buffer)
@@ -601,7 +604,7 @@ def tui(
                         cursor_col = _compute_cursor_col(editor)
                         cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
                         c_row = compute_composer_cursor_row(
-                            term_lines,
+                            term_lines if "term_lines" in locals() else shutil.get_terminal_size(fallback=(80, current_lines)).lines,
                             state=state,
                             composer_content=current_text,
                             cursor_line=cursor_line,
@@ -612,10 +615,14 @@ def tui(
                         editor.redraw_line()
 
                 def _handle_page_down(editor: Any = None) -> None:
-                    """Scroll conversation viewport down by half a page."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_height = compute_viewport_height(term_lines, state=state)
-                    state.scroll_conversation_down(max(1, vp_height // 2))
+                    """Scroll conversation viewport or command dialog down by half a page."""
+                    if state is not None and getattr(state, "command_dialog_open", False):
+                        state.scroll_command_dialog_down(4)
+                    else:
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        vp_height = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_down(max(1, vp_height // 2))
+
                     if is_tty:
                         current_text = (
                             "".join(editor.buffer)
