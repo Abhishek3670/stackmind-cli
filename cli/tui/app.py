@@ -405,7 +405,7 @@ def tui(
                 )
             )
 
-            layout = compute_layout(term_cols)
+            layout = compute_layout(term_cols, state=state)
             if layout.show_runtime:
                 landing_str = render_landing_block_str(
                     session=session,
@@ -454,7 +454,7 @@ def tui(
                             live_manager=live_ws,
                         )
                 term_cols = current_cols
-                layout_info = compute_layout(term_cols)
+                layout_info = compute_layout(term_cols, state=state)
                 conv_width = (
                     layout_info.conversation_width if layout_info.show_runtime else term_cols
                 )
@@ -512,7 +512,7 @@ def tui(
                                 ),
                             )
                         )
-                        l_layout = compute_layout(term_cols)
+                        l_layout = compute_layout(term_cols, state=state)
                         if l_layout.show_runtime:
                             l_str = render_landing_block_str(
                                 session=session,
@@ -541,8 +541,13 @@ def tui(
                         editor.redraw_line()
 
                 def _handle_ctrl_o(editor: Any = None) -> None:
-                    """Toggle thinking block expansion."""
-                    state.toggle_thinking()
+                    """Toggle thinking block and actions disclosure expansion (§22)."""
+                    if hasattr(state, "toggle_disclosures"):
+                        state.toggle_disclosures()
+                    else:
+                        state.toggle_thinking()
+                        state.toggle_actions()
+                    clear_transcript_cache()
                     if is_tty:
                         current_text = (
                             "".join(editor.buffer)
@@ -557,6 +562,47 @@ def tui(
                             session,
                             state,
                             clear=False,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=current_text,
+                            live_manager=live_ws,
+                        )
+                        cursor_col = _compute_cursor_col(editor)
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
+
+                def _handle_ctrl_b(editor: Any = None) -> None:
+                    """Toggle runtime sidebar visibility (full-width conversation toggle)."""
+                    nonlocal comp_width, layout_info
+                    state.toggle_runtime_panel()
+                    layout_info = compute_layout(term_cols, state=state)
+                    comp_width = layout_info.conversation_width if layout_info.show_runtime else term_cols
+                    if editor is not None:
+                        editor.width = comp_width
+                    if is_tty:
+                        current_text = (
+                            "".join(editor.buffer)
+                            if (
+                                editor is not None
+                                and isinstance(getattr(editor, "buffer", None), list)
+                            )
+                            else None
+                        )
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        clear_transcript_cache()
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=True,
                             include_composer=True,
                             composer_is_active=True,
                             composer_content=current_text,
@@ -761,7 +807,7 @@ def tui(
                     nonlocal current_cols, current_lines, term_cols, comp_width, layout_info
                     current_cols, current_lines = new_cols, new_lines
                     term_cols = new_cols
-                    layout_info = compute_layout(new_cols)
+                    layout_info = compute_layout(new_cols, state=state)
                     conv_width = (
                         layout_info.conversation_width if layout_info.show_runtime else new_cols
                     )
@@ -959,7 +1005,18 @@ def tui(
                             if editor is not None and hasattr(editor, "redraw_line"):
                                 editor.redraw_line()
 
+                is_awaiting_plan = (
+                    getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+                    or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+                )
+                comp_placeholder = (
+                    "Plan ready: type :approve or 'continue' to execute..."
+                    if is_awaiting_plan
+                    else "Type a message..."
+                )
+
                 text = prompt_composer_input(
+                    placeholder=comp_placeholder,
                     width=comp_width,
                     terminal_width=term_cols,
                     state=state,
@@ -967,6 +1024,7 @@ def tui(
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
                     on_ctrl_o=_handle_ctrl_o,
+                    on_ctrl_b=_handle_ctrl_b,
                     on_page_up=_handle_page_up,
                     on_page_down=_handle_page_down,
                     on_wheel_up=_handle_wheel_up,

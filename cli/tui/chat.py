@@ -51,13 +51,15 @@ def _compute_transcript_hash(messages: list[ChatMessage]) -> str:
         msg_content = getattr(msg, "content", "")
         msg_role = getattr(msg, "role", "")
         msg_actions = str(getattr(msg, "actions", None))
+        msg_actions_expanded = str(getattr(getattr(msg, "actions", None), "expanded", False))
         msg_thinking = getattr(msg, "thinking", None) or ""
+        msg_thinking_expanded = str(getattr(msg, "thinking_expanded", False))
         msg_model = getattr(msg, "model", None) or ""
 
         # Hash individual message to handle long content efficiently
         msg_hash = hashlib.md5(
-            "{}|{}|{}|{}|{}".format(
-                msg_role, msg_content, msg_actions, msg_thinking, msg_model
+            "{}|{}|{}|{}|{}|{}|{}".format(
+                msg_role, msg_content, msg_actions, msg_actions_expanded, msg_thinking, msg_thinking_expanded, msg_model
             ).encode("utf-8")
         ).hexdigest()
         key_parts.append(msg_hash)
@@ -909,20 +911,25 @@ def render_actions_group(
             if info.get("summary"):
                 line.append(info["summary"], style="green")
             has_collapsible = bool(
-                getattr(act, "output", None)
-                or getattr(act, "diff", None)
-                or getattr(act, "code", None)
-                or t_name in {"Read", "Bash", "Edit", "Write"}
+                t_name != "Agent"
+                and (
+                    getattr(act, "output", None)
+                    or getattr(act, "diff", None)
+                    or getattr(act, "code", None)
+                    or t_name in {"Read", "Bash", "Edit", "Write"}
+                )
             )
             if has_collapsible and not actions_obj.expanded and not auto_render_diff:
                 line.append(" (ctrl+o to expand)", style="dim")
+            elif has_collapsible and actions_obj.expanded and not auto_render_diff:
+                line.append(" (ctrl+o to collapse)", style="dim")
 
         lines.append(line)
 
         # Auto-display compact split diff block on Edit / Write / File Modification Tools
         if auto_render_diff:
             from cli.tui.diff import render_split_diff
-            max_l = 100 if actions_obj.expanded else 16
+            max_l = 500 if actions_obj.expanded else 16
             target_f = arg or getattr(act, "target", "") or ""
             diff_block = render_split_diff(
                 str(diff_val),
@@ -930,6 +937,7 @@ def render_actions_group(
                 max_lines=max_l,
                 file_path=target_f,
                 indent="    " if is_indented else "  ",
+                expanded=actions_obj.expanded,
             )
             lines.append(diff_block)
         elif actions_obj.expanded:

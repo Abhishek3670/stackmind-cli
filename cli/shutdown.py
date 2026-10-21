@@ -193,6 +193,9 @@ def update_tree_status(sync_path: Path, agent: str) -> bool:
     if agent not in data["agents"]:
         return False
     
+    data.setdefault("schema_version", 1)
+    data.setdefault("tree_version", 1)
+    data.setdefault("release", "3.1.0")
     data["agents"][agent]["status"] = "idle"
     data["agents"][agent]["last_task"] = "Session ended via shutdown"
     data["agents"][agent]["blockers"] = []

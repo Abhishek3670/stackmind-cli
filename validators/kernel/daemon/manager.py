@@ -203,6 +203,88 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             encoding="utf-8",
         )
 
+    # Scaffold default agent contracts for protocol citizens
+    agent_contract_file = sync_dir / "agents" / f"{agent}.contract.yaml"
+    if not agent_contract_file.exists():
+        agent_contract_file.parent.mkdir(parents=True, exist_ok=True)
+        if agent in ("gemini", "frontend"):
+            default_allow = [
+                {"module": "*.html"},
+                {"module": "*.css"},
+                {"module": "*.js"},
+                {"module": "*.jsx"},
+                {"module": "*.tsx"},
+                {"module": "index.html"},
+                {"module": "assets/**"},
+                {"module": "static/**"},
+                {"module": "public/**"},
+                {"module": "templates/**"},
+                {"module": "src/**"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "frontend"
+        elif agent in ("codex", "backend"):
+            default_allow = [
+                {"module": "src/**"},
+                {"module": "server/**"},
+                {"module": "api/**"},
+                {"module": "backend/**"},
+                {"module": "lib/**"},
+                {"module": "*.py"},
+                {"module": "*.js"},
+                {"module": "*.ts"},
+                {"module": "*.json"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "backend"
+        elif agent in ("gemma", "qa"):
+            default_allow = [
+                {"module": "tests/**"},
+                {"module": "*.test.*"},
+                {"module": "*.spec.*"},
+                {"module": ".sync/qa/**"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "qa"
+        elif agent in ("local-llm", "gitops"):
+            default_allow = [
+                {"module": "VERSION*"},
+                {"module": "CHANGELOG*"},
+                {"module": "package.json"},
+                {"module": "pyproject.toml"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "gitops"
+        else:
+            default_allow = [{"module": "workspace/**"}]
+            default_role = "worker"
+
+        if agent != "claude":
+            agent_contract_file.write_text(yaml.safe_dump({
+                "schema_version": 1,
+                "agent_id": agent,
+                "work_order": "WO-000",
+                "identity": {
+                    "role": default_role,
+                    "reports_to": "claude",
+                },
+                "scope": {
+                    "allow": default_allow,
+                    "deny": [
+                        {"module": ".git/**"},
+                        {"module": ".sync/runtime/**"},
+                        {"module": ".sync/agents/**"},
+                        {"module": ".env"},
+                        {"module": "__pycache__/**"},
+                    ],
+                    "write": "read-write",
+                },
+                "budget": {
+                    "max_files_touched": 20,
+                    "max_tokens": 50000,
+                },
+            }, sort_keys=False), encoding="utf-8")
+
     if agent == "claude":
         claude_contract = sync_dir / "agents" / "claude.contract.yaml"
         default_claude_allow = [
@@ -1682,7 +1764,7 @@ class SessionManager:
         try:
             from validators.harness.authoring_compiler import compile_authoring_artifacts
             from validators.harness.authoring_readiness import load_plan_milestones
-            compile_authoring_artifacts(ws, load_plan_milestones(ws))
+            compile_authoring_artifacts(ws, load_plan_milestones(ws), planning_wo_id=state.planning_wo_id)
         except Exception:
             pass
 
@@ -1785,16 +1867,18 @@ class SessionManager:
                         self.supervisor.__class__ = reloaded_mod.LifecycleSupervisor
                 except Exception:
                     pass
-            if "validators.harness.runner" in sys.modules:
-                try:
-                    importlib.reload(sys.modules["validators.harness.runner"])
-                except Exception:
-                    pass
-            if "validators.harness.d024_gate" in sys.modules:
-                try:
-                    importlib.reload(sys.modules["validators.harness.d024_gate"])
-                except Exception:
-                    pass
+            for mod_name in (
+                "validators.harness.authoring_compiler",
+                "validators.harness.authoring_readiness",
+                "validators.harness.integration_gate",
+                "validators.harness.runner",
+                "validators.harness.d024_gate",
+            ):
+                if mod_name in sys.modules:
+                    try:
+                        importlib.reload(sys.modules[mod_name])
+                    except Exception:
+                        pass
 
             session = self._sessions.get(session_id)
             if not session:
@@ -2597,6 +2681,29 @@ class SessionManager:
                     pass
             wo_id_param = op_rec.get("work_order_id")
             is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
+            session_history: list[dict[str, str]] = []
+            client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
+            if isinstance(client_hist, list) and client_hist:
+                for h in client_hist:
+                    if isinstance(h, dict) and "role" in h and "content" in h:
+                        h_content = str(h["content"]).strip()
+                        if h_content:
+                            session_history.append({"role": str(h["role"]).lower(), "content": h_content})
+            else:
+                with self._lock:
+                    for r in session.get("journal", []):
+                        if r.get("operation_id") == operation_id:
+                            continue
+                        if r.get("operation") == "turn" and not r.get("work_order_id") and not (r.get("metadata") or {}).get("is_authoring"):
+                            u_p = (r.get("metadata") or {}).get("prompt") or r.get("prompt")
+                            res = r.get("result") or {}
+                            a_r = res.get("summary") or res.get("report_markdown")
+                            if u_p and a_r and isinstance(a_r, str) and a_r.strip():
+                                session_history.append({"role": "user", "content": str(u_p).strip()})
+                                session_history.append({"role": "assistant", "content": str(a_r).strip()})
+
+            if len(session_history) > 12:
+                session_history = session_history[-12:]
             try:
                 result = runner.run_once(
                     cancel_event=cancel_event,
@@ -2604,6 +2711,7 @@ class SessionManager:
                     prompt=prompt,
                     work_order_id=wo_id_param,
                     is_authoring=is_authoring_param,
+                    session_history=session_history,
                 )
             except TypeError:
                 try:
@@ -2694,7 +2802,9 @@ class SessionManager:
                 is_goal_turn = bool(op_rec.get("metadata", {}).get("is_goal"))
                 is_authoring_turn = bool(op_rec.get("metadata", {}).get("is_authoring"))
                 plan_file = ws_path / "PLAN.md"
-                if is_goal_turn and not is_authoring_turn and plan_file.is_file():
+                mod_files = [str(f).replace("\\", "/").strip().lstrip("/") for f in (res_meta.get("modified_files") or [])]
+                plan_written_this_turn = any(f.endswith("PLAN.md") for f in mod_files)
+                if (is_goal_turn or plan_written_this_turn) and not is_authoring_turn and plan_file.is_file():
                     try:
                         from validators.harness.plan import validate_plan_structure, parse_plan
                         plan_content = plan_file.read_text(encoding="utf-8")
@@ -2770,6 +2880,58 @@ class SessionManager:
                     result=result_data, role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data)
+
+                # Autonomous Multi-Agent Dispatch from Architect (Hybrid Pattern)
+                triggered_goal = res_meta.get("triggered_goal") or res_payload.get("triggered_goal")
+                if triggered_goal and isinstance(triggered_goal, dict) and triggered_goal.get("goal"):
+                    goal_text = str(triggered_goal["goal"]).strip()
+                    if goal_text:
+                        self.events.publish(
+                            "goal.auto_triggered",
+                            session_id,
+                            goal=goal_text,
+                            parent_operation_id=operation_id,
+                            triggered_by=agent,
+                        )
+                        try:
+                            self.start_turn(session_id, f":goal {goal_text}", is_goal=True)
+                        except Exception as e:
+                            self.events.publish("error", session_id, message=f"Failed to auto-trigger goal: {e}")
+
+                delegated_tasks = res_meta.get("delegated_tasks") or res_payload.get("delegated_tasks") or []
+                if isinstance(delegated_tasks, dict):
+                    delegated_tasks = [delegated_tasks]
+                for d_task in delegated_tasks:
+                    if isinstance(d_task, dict) and d_task.get("agent") and d_task.get("instructions"):
+                        target_agent = str(d_task["agent"]).lower().strip()
+                        target_role = str(d_task.get("role") or self._canonical_role(target_agent))
+                        target_instr = str(d_task["instructions"]).strip()
+                        target_files = d_task.get("target_files") or []
+                        self.events.publish(
+                            "task.auto_delegated",
+                            session_id,
+                            agent_id=target_agent,
+                            role=target_role,
+                            instructions=target_instr,
+                            target_files=target_files,
+                            parent_operation_id=operation_id,
+                        )
+                        files_str = "\n".join(f"- {f}" for f in target_files) if target_files else ""
+                        worker_prompt = (
+                            f"{target_instr}\n\nTarget files:\n{files_str}\n\nNote: When authoring files, invoke write_file with path and content."
+                            if files_str
+                            else target_instr
+                        )
+                        try:
+                            self.start_turn(
+                                session_id,
+                                worker_prompt,
+                                role=target_role,
+                                agent_id=target_agent,
+                                delegated_from=operation_id,
+                            )
+                        except Exception as e:
+                            self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")
             elif res_status == "blocked":
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "blocked", operation_id=operation_id,

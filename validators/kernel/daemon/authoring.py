@@ -493,6 +493,8 @@ def build_child_contract(
     candidate_paths: list[str] | None = None,
     max_files_touched: int | None = None,
     skills: list[str] | None = None,
+    title: str | None = None,
+    description: str | None = None,
 ) -> dict[str, Any]:
     """Construct a schema-conforming Contract record bound strictly to the assigned scope.
 
@@ -519,6 +521,18 @@ def build_child_contract(
                     top_dir = clean_cp.split("/")[0]
                     if top_dir not in (".git", ".sync", ".env"):
                         allow_rules.append({"module": f"{top_dir}/**"})
+
+    # Authorize command execution for QA/testing and build/install/setup tasks
+    needs_commands = (
+        role_norm in ("qa", "gemma")
+        or any(s in ("test", "build", "diagnosing-bugs", "exec", "pr") for s in (skills or []))
+        or any(
+            kw in f"{title or ''} {description or ''} {wo_id}".lower()
+            for kw in ("build", "test", "install", "setup", "dependency", "dependencies", "compile", "exec", "npm", "pip", "pytest", "vite")
+        )
+    )
+    if needs_commands:
+        allow_rules.append({"module": "workspace/command"})
 
     # Common repository root documentation and config files allowed across roles:
     allow_rules.extend([
@@ -1174,6 +1188,8 @@ def synthesize_child_work_orders(
                 implementation_estimate["max_files_touched"] if implementation_estimate else None
             ),
             skills=resolved_skills if resolved_skills else None,
+            title=title,
+            description=desc,
         )
 
         wo_rec = build_child_work_order(
@@ -1391,23 +1407,23 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                         pass
 
                 # Update TREE.yaml
-                tree_path = ws / ".sync" / "runtime" / "TREE.yaml"
-                if tree_path.is_file():
-                    try:
-                        tree_data = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
-                        if isinstance(tree_data, dict) and "agents" in tree_data:
-                            agents_map = tree_data["agents"]
-                            if primary_agent in agents_map:
-                                p_orders = agents_map[primary_agent].get("assigned_work_orders", [])
-                                if wo_id in p_orders:
-                                    p_orders.remove(wo_id)
-                            t_info = agents_map.setdefault(target_agent, {"assigned_work_orders": [], "status": "idle", "session_count": 0})
-                            t_orders = t_info.setdefault("assigned_work_orders", [])
-                            if wo_id not in t_orders:
-                                t_orders.append(wo_id)
-                            tree_path.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
-                    except Exception:
-                        pass
+                try:
+                    from cli.init import ensure_canonical_tree
+                    from validators.kernel.io import durable_write_yaml
+                    tree_data = ensure_canonical_tree(ws)
+                    if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                        agents_map = tree_data["agents"]
+                        if primary_agent in agents_map:
+                            p_orders = agents_map[primary_agent].get("assigned_work_orders", [])
+                            if wo_id in p_orders:
+                                p_orders.remove(wo_id)
+                        t_info = agents_map.setdefault(target_agent, {"assigned_work_orders": [], "status": "idle", "session_count": 0})
+                        t_orders = t_info.setdefault("assigned_work_orders", [])
+                        if wo_id not in t_orders:
+                            t_orders.append(wo_id)
+                        durable_write_yaml(ws / ".sync" / "runtime" / "TREE.yaml", tree_data)
+                except Exception:
+                    pass
 
                 reconciled_ids.append(wo_id)
         except Exception:

@@ -96,6 +96,7 @@ class LLMRequest:
     retrieval: RetrievalBatch
     on_token: Callable[[str], None] | None = None
     cancellation: Event | None = None
+    session_history: Sequence[dict[str, str]] | None = None
 
     @property
     def evidence_text(self) -> str:
@@ -387,6 +388,7 @@ class AgentRunner:
         prompt: str | None = None,
         work_order_id: str | None = None,
         is_authoring: bool = False,
+        session_history: Sequence[dict[str, str]] | None = None,
     ) -> HarnessRunResult:
         """Run one task, cooperatively stopping at operation lifecycle boundaries."""
         if cancel_event is not None:
@@ -398,6 +400,8 @@ class AgentRunner:
             self._ensure_protocol_citizenship(tree_data)
             if prompt and not work_order_id and not is_authoring:
                 adhoc_file = self.sync_path / 'inbox' / self.agent / 'adhoc.md'
+                m_tf = re.search(r"Target files?:\s*\n?\s*[-*]?\s*([a-zA-Z0-9_./\\-]+)", prompt)
+                deliv_path = m_tf.group(1).strip() if m_tf else None
                 task = HarnessTask(
                     kind='adhoc',
                     identifier=operation_id or 'adhoc',
@@ -407,7 +411,8 @@ class AgentRunner:
                     query=prompt.strip() or 'User Prompt',
                     is_authoring=False,
                     work_order_type=None,
-                    deliverable_type=None,
+                    deliverable_type='code' if deliv_path else None,
+                    deliverable_path=deliv_path,
                 )
             else:
                 task = self.discover_next_task(tree_data, work_order_id=work_order_id)
@@ -565,12 +570,13 @@ class AgentRunner:
 
             request = LLMRequest(
                 agent=self.agent,
-                session_count=int(tree_data['agents'][self.agent].get('session_count', 0)),
+                session_count=int(tree_data.get('agents', {}).get(self.agent, {}).get('session_count', 0)),
                 task=task,
                 context=context,
                 retrieval=retrieval,
                 on_token=self.on_token,
                 cancellation=cancellation,
+                session_history=session_history,
             )
 
             llm_started = time.monotonic()
@@ -677,7 +683,7 @@ class AgentRunner:
                         if raw_thinking:
                             meta['thinking'] = raw_thinking
                         if hasattr(completion, 'meta') and isinstance(completion.meta, dict):
-                            for k in ('tool_calls_audit', 'commands_audit', 'backend_id', 'model'):
+                            for k in ('tool_calls_audit', 'commands_audit', 'backend_id', 'model', 'triggered_goal', 'delegated_tasks'):
                                 if k in completion.meta:
                                     meta[k] = completion.meta[k]
                         return HarnessRunResult(
@@ -1287,14 +1293,17 @@ class AgentRunner:
         if 'agents' not in tree_data or not isinstance(tree_data.get('agents'), dict):
             tree_data['agents'] = {}
         if self.agent not in tree_data['agents']:
-            tree_data['agents'][self.agent] = {
-                'session_count': 0,
-                'status': 'idle',
-                'assigned_work_orders': [],
-            }
-            tree_file = self.sync_path / 'runtime' / 'TREE.yaml'
-            tree_file.parent.mkdir(parents=True, exist_ok=True)
-            tree_file.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding='utf-8')
+            from cli.init import ensure_canonical_tree
+            tree_data = ensure_canonical_tree(self.project_path)
+            if self.agent not in tree_data['agents']:
+                tree_data['agents'][self.agent] = {
+                    'session_count': 0,
+                    'status': 'idle',
+                    'assigned_work_orders': [],
+                }
+                from validators.kernel.io import durable_write_yaml
+                durable_write_yaml(self.sync_path / 'runtime' / 'TREE.yaml', tree_data)
+        self._tree_cache = tree_data
 
         if not boot_file.exists():
             boot_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1322,25 +1331,12 @@ class AgentRunner:
 
     def _load_tree(self) -> dict[str, Any]:
         tree_file = self.sync_path / 'runtime' / 'TREE.yaml'
+        from cli.init import ensure_canonical_tree
         if not tree_file.exists():
-            tree_file.parent.mkdir(parents=True, exist_ok=True)
-            initial_tree: dict[str, Any] = {
-                'schema_version': 1,
-                'tree_version': 1,
-                'release': '3.1.0',
-                'agents': {
-                    self.agent: {
-                        'session_count': 0,
-                        'status': 'IDLE',
-                        'assigned_work_orders': [],
-                    }
-                },
-            }
-            tree_file.write_text(yaml.safe_dump(initial_tree, sort_keys=False), encoding='utf-8')
-            self._tree_cache = initial_tree
+            self._tree_cache = ensure_canonical_tree(self.project_path)
             return self._tree_cache
         if self._tree_cache is None:
-            self._tree_cache = self._read_yaml(tree_file)
+            self._tree_cache = ensure_canonical_tree(self.project_path)
         return self._tree_cache
 
     def _read_text(self, path: Path) -> str:
@@ -1600,6 +1596,58 @@ class AgentRunner:
 
         return payload if isinstance(payload, dict) else None
 
+    def _build_adhoc_system_message(self) -> str:
+        if self.agent == 'claude':
+            return (
+                "You are Claude, the Lead Architect in this project workspace (powered by StackMind CLI).\n"
+                "Your role in this interactive conversational phase is to consult with the operator, understand their vision and requirements, explore their needs, and co-design the project architecture before initiating autonomous development.\n\n"
+                "CONVERSATIONAL ARCHITECT GUIDELINES:\n"
+                "1. Understand Before Prescribing: Chat normally and consultatively. Listen carefully and ask clarifying questions where helpful to uncover the user's business domain, target audience, core user workflows, and constraints (e.g. local development vs. cloud hosting, minimal lightweight solution vs. comprehensive framework).\n"
+                "2. Co-Design Iteratively: Do NOT dump massive generic boilerplate or rigid milestone tables on the very first message. Converse naturally across turns, maintain full continuity with earlier messages, and iteratively refine the architecture with the user.\n"
+                "3. Autonomous Multi-Agent Dispatch (MANDATORY INVARIANT):\n"
+                "   You are Claude, the Lead Architect. Under StackMind governance rules, you govern and design, but you NEVER write application source code directly (HTML, CSS, JS, Python in the workspace). Never call write_file on project source files (which is strictly forbidden and will be denied outside assigned scope).\n"
+                "   Instead, whenever the operator requests code changes, features, or visual tweaks, dispatch your specialist team autonomously using your tools:\n"
+                "   - For focused UI tweaks, animations, CSS effects, styling, or isolated file modifications: Call `delegate_task(target_agent='frontend'|'backend', instructions='...', target_files=['...'])`. The delegated specialist worker (e.g. Frontend/Gemini) will be immediately spawned with authorized write access to those target files.\n"
+                "   - For broad features, full milestones, or multi-component additions: Call `trigger_goal(goal='...', rationale='...')`. This will autonomously initiate the full supervisor run (PLAN.md -> child work orders -> worker execution -> QA verification).\n"
+                "   - You may also advise the operator that they can run `:goal <description>` manually if they prefer.\n"
+                "4. Strict Project Grounding: You are designing the user's software for this workspace. Never deflect to building, packaging, or deploying StackMind CLI itself unless the user explicitly tells you that the project being built IS StackMind CLI. Never assume or claim procedural skills (such as 'ponytail', 'audit', etc.) are active unless the user explicitly requested them or they are installed in the workspace.\n"
+                "5. Output Style: Deliver conversational, clear Markdown prose directly to the user. Do not output raw JSON decision schemas in chat mode unless explicitly requested.\n"
+                "6. Strict Prohibition on Fabricated Background Monitoring (MANDATORY INVARIANT):\n"
+                "   You CANNOT monitor, loop, or wait in the background. Once your response turn finishes, the system immediately returns to IDLE waiting for user input.\n"
+                "   NEVER tell the user 'the engine has taken over', 'I am monitoring the supervisor in the background', or 'you don't need to do anything else' unless you actually executed `trigger_goal` or `delegate_task` during this turn!\n"
+                "   If you created or modified PLAN.md, or if a plan is proposed, you MUST explicitly tell the user: 'I have prepared/updated the plan in PLAN.md. Please type `:approve` (or simply 'continue') to start autonomous multi-agent execution, or let me know if you would like adjustments.'"
+            )
+        else:
+            return (
+                f"You are StackMind's {self.agent.title()} agent, paired with the operator in this project workspace. "
+                "Respond conversationally, helpfully, and directly to the operator's message. "
+                "Maintain context across chat turns. "
+                "Do NOT format your response as a JSON decision schema unless explicitly asked."
+            )
+
+    def _build_adhoc_messages(
+        self,
+        system_msg: str,
+        user_content: str,
+        history: Sequence[dict[str, str]] | None,
+    ) -> list[Any]:
+        from validators.kernel.providers.models import Message
+        messages = [Message.system(system_msg)]
+        if history:
+            for turn in history[-12:]:
+                role = str(turn.get("role", "")).lower().strip()
+                content = str(turn.get("content", "")).strip()
+                if not content:
+                    continue
+                if len(content) > 2000:
+                    content = content[:2000] + "..."
+                if role in ("user", "human"):
+                    messages.append(Message.user(content))
+                elif role in ("assistant", "agent", "model"):
+                    messages.append(Message.assistant(content))
+        messages.append(Message.user(user_content))
+        return messages
+
     def _complete_request(
         self, request: LLMRequest, tool_runtime: GovernedToolRuntime | None,
     ) -> CompletionRecord:
@@ -1613,9 +1661,16 @@ class AgentRunner:
                 )
             ):
                 from validators.kernel.providers.models import Message
-                task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
-                prompt_text = f"{task_text}Context:\n{getattr(request.context, 'text', '')}"
-                messages = [Message.user(prompt_text)]
+                if request.task.kind == 'adhoc':
+                    system_msg = self._build_adhoc_system_message()
+                    user_content = (request.task.body or request.task.title).strip()
+                    if getattr(request.context, "text", None) and request.context.text.strip():
+                        user_content = f"{user_content}\n\nContext:\n{request.context.text.strip()}"
+                    messages = self._build_adhoc_messages(system_msg, user_content, request.session_history)
+                else:
+                    task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
+                    prompt_text = f"{task_text}Context:\n{getattr(request.context, 'text', '')}"
+                    messages = [Message.user(prompt_text)]
                 response = self.provider_adapter.complete(
                     messages,
                     cancellation_token=request.cancellation,
@@ -1773,40 +1828,10 @@ class AgentRunner:
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
             )
         elif request.task.kind == 'adhoc':
-            if is_architecture:
-                system_msg = (
-                    "You are Claude, the Lead Architect for StackMind CLI, paired with the operator in this project workspace. "
-                    "You handle General Q&A, chat, code explanation, architecture planning, and ad-hoc workspace assistance. "
-                    "Respond conversationally, helpfully, and directly to the operator's message with architectural depth and precision.\n\n"
-                    "ARCHITECTURAL CAPABILITIES & INSTRUCTIONS:\n"
-                    "1. When the operator asks for a plan, design, or feature specification (e.g. login page, auth flow, API, database schema):\n"
-                    "   - Provide a complete, production-grade architectural blueprint: technology stack choices, component decomposition, data/control flow, and file layout.\n"
-                    "   - Detail security best practices (e.g. password hashing with Argon2/bcrypt, secure session/JWT with HttpOnly cookies, CSRF tokens, rate limiting, and input sanitization).\n"
-                    "   - Outline the concrete implementation milestones with assigned specialist agent roles:\n"
-                    "     * Backend (Codex): APIs, data models, auth logic, and core services\n"
-                    "     * Frontend (Gemini): UI markup, responsive styles, client validation, and UX states\n"
-                    "     * QA (Gemma): Automated test suites, security scans, and behavioral assertions\n"
-                    "     * GitOps (Local-LLM): Semantic versioning, changelog, and release packaging\n"
-                    "   - Proactive guidance: Explicitly inform the operator that to build, launch, and test this plan autonomously across the workspace, they can execute:\n"
-                    "     `:goal <description>` in the prompt bar.\n"
-                    "2. Workspace Investigation: You have access to tools (read_file, list_directory, query_graph, find_symbol, find_references, write_file, run_command) if needed to inspect or examine the codebase. If you execute tools, synthesize your findings directly into your answer so the operator sees the context.\n"
-                    "3. Conversational Feedback: For greetings, general questions, explanations, or code reviews, answer directly in clean Markdown without making unnecessary tool calls.\n"
-                    "4. Output Format: Never output raw JSON decision schemas unless explicitly requested. Always deliver well-structured Markdown prose."
-                )
-            else:
-                agent_title = self.agent.title()
-                system_msg = (
-                    f"You are StackMind's {agent_title} agent, paired with the operator in this project workspace. "
-                    "Respond conversationally, helpfully, and directly to the operator's message. "
-                    "You have access to tools (e.g. read_file, list_directory, query_graph, write_file) if you need "
-                    "to inspect or edit workspace files to answer or fulfill the request. If no tools are needed "
-                    "(such as for greetings, general explanations, answering questions, or conversational feedback), "
-                    "answer directly in plain text without making unnecessary tool calls. "
-                    "Do NOT format your response as a JSON decision schema unless explicitly asked."
-                )
+            system_msg = self._build_adhoc_system_message()
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = raw_context
-            task_text = f"User Message:\n{request.task.body or request.task.title}\n\n"
+            task_text = (request.task.body or request.task.title).strip()
         elif is_architecture:
             system_msg = (
                 "You are Claude, the Senior Architect for StackMind CLI. "
@@ -1895,13 +1920,16 @@ class AgentRunner:
         user_content = task_text
         if request.task.kind != 'adhoc':
             user_content = f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
-        elif getattr(request.context, "text", None):
-            user_content = f'{task_text}Context:\n{request.context.text}'
+        elif getattr(request.context, "text", None) and request.context.text.strip():
+            user_content = f'{task_text}\n\nContext:\n{request.context.text.strip()}'
 
-        messages = [
-            Message.system(system_msg),
-            Message.user(user_content),
-        ]
+        if request.task.kind == 'adhoc':
+            messages = self._build_adhoc_messages(system_msg, user_content, request.session_history)
+        else:
+            messages = [
+                Message.system(system_msg),
+                Message.user(user_content),
+            ]
         from validators.kernel.providers.errors import (
             ConsecutiveToolFailureError,
             NoProgressLoopError,
@@ -2247,6 +2275,11 @@ class AgentRunner:
             completion_meta['guard_trip'] = guard_trip
             completion_meta['decision_source'] = decision_source
         completion_meta['tool_calls_audit'] = tool_calls_audit
+        if tool_runtime is not None and hasattr(tool_runtime, "gateway"):
+            if getattr(tool_runtime.gateway, "triggered_goal", None):
+                completion_meta['triggered_goal'] = tool_runtime.gateway.triggered_goal
+            if getattr(tool_runtime.gateway, "delegated_tasks", None):
+                completion_meta['delegated_tasks'] = tool_runtime.gateway.delegated_tasks
 
         return CompletionRecord(
             provider=getattr(self.provider_adapter, 'provider_name', self.backend_id),
@@ -2401,9 +2434,13 @@ class AgentRunner:
             events_write = self._build_events_write(stage_inputs, 0, 0)
             self._apply_ops(staged_root, [report_write, events_write])
             self._sync_index_and_tree_yaml(staged_root)
-            from cli.init import ensure_workspace_protocol_scaffolding
+            from cli.init import ensure_workspace_protocol_scaffolding, ensure_canonical_tree
             ensure_workspace_protocol_scaffolding(staged_root)
+            ensure_canonical_tree(staged_root)
             validation = validate_runtime(staged_root)
+            if any("runtime/TREE.yaml" in e.message for e in validation.errors):
+                ensure_canonical_tree(staged_root)
+                validation = validate_runtime(staged_root)
         return [issue.message for issue in validation.errors]
 
     def _apply_non_report_writes(
@@ -3577,41 +3614,39 @@ class AgentRunner:
 
             # Also ensure work_orders totals and assigned_work_orders in TREE.yaml are updated
             tree_file = sync_dir / "runtime" / "TREE.yaml"
-            if tree_file.is_file():
-                tree_data = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
-                if isinstance(tree_data, dict):
-                    updated_tree = False
-                    if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
-                        for k in ("total_active", "total_completed", "total_blocked"):
-                            if tree_data["work_orders"].get(k) != index_data.get(k, 0):
-                                tree_data["work_orders"][k] = index_data.get(k, 0)
+            from cli.init import ensure_canonical_tree
+            tree_data = ensure_canonical_tree(base_dir)
+            updated_tree = False
+            if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+                for k in ("total_active", "total_completed", "total_blocked"):
+                    if tree_data["work_orders"].get(k) != index_data.get(k, 0):
+                        tree_data["work_orders"][k] = index_data.get(k, 0)
+                        updated_tree = True
+            if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                completed_set = {
+                    o.get("id") for o in orders
+                    if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+                }
+                for ag_name, ag_entry in tree_data["agents"].items():
+                    if isinstance(ag_entry, dict) and "assigned_work_orders" in ag_entry:
+                        curr = ag_entry["assigned_work_orders"]
+                        if isinstance(curr, list):
+                            filtered = [w for w in curr if w not in completed_set]
+                            if filtered != curr:
+                                ag_entry["assigned_work_orders"] = filtered
                                 updated_tree = True
-                    if "agents" in tree_data and isinstance(tree_data["agents"], dict):
-                        completed_set = {
-                            o.get("id") for o in orders
-                            if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
-                        }
-                        for ag_name, ag_entry in tree_data["agents"].items():
-                            if isinstance(ag_entry, dict) and "assigned_work_orders" in ag_entry:
-                                curr = ag_entry["assigned_work_orders"]
-                                if isinstance(curr, list):
-                                    filtered = [w for w in curr if w not in completed_set]
-                                    if filtered != curr:
-                                        ag_entry["assigned_work_orders"] = filtered
-                                        updated_tree = True
-                        for ag_name, wo_ids in assigned_per_agent.items():
-                            if ag_name in tree_data["agents"]:
-                                ag_entry = tree_data["agents"][ag_name]
-                                if isinstance(ag_entry, dict):
-                                    curr_assigned = ag_entry.setdefault("assigned_work_orders", [])
-                                    for w in wo_ids:
-                                        if w not in curr_assigned:
-                                            curr_assigned.append(w)
-                                            updated_tree = True
-                    if updated_tree:
-                        temp_tree = tree_file.with_name(f"{tree_file.name}.tmp.{int(time.time() * 1000)}")
-                        temp_tree.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
-                        temp_tree.replace(tree_file)
+                for ag_name, wo_ids in assigned_per_agent.items():
+                    if ag_name in tree_data["agents"]:
+                        ag_entry = tree_data["agents"][ag_name]
+                        if isinstance(ag_entry, dict):
+                            curr_assigned = ag_entry.setdefault("assigned_work_orders", [])
+                            for w in wo_ids:
+                                if w not in curr_assigned:
+                                    curr_assigned.append(w)
+                                    updated_tree = True
+            if updated_tree:
+                from validators.kernel.io import durable_write_yaml
+                durable_write_yaml(tree_file, tree_data)
         except Exception:
             pass
 

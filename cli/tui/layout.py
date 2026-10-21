@@ -84,6 +84,7 @@ def compute_composer_height(
     content: str | list[str] | None = None,
     height: int | None = None,
     state: Any | None = None,
+    width: int | None = None,
 ) -> int:
     """Calculate dynamic composer box height (including borders) based on content lines.
 
@@ -92,10 +93,12 @@ def compute_composer_height(
     if content is None and state is not None and getattr(state, "composer_buffer", ""):
         content = state.composer_buffer
 
-    if isinstance(content, str):
-        lines_count = len(content.split("\n")) if content else 1
-    elif content:
-        lines_count = len(content)
+    if content:
+        w = width if width is not None else 80
+        wrap_width = max(10, w - 6)
+        from cli.tui.keyboard import wrap_composer_text
+
+        lines_count = len(wrap_composer_text(content, wrap_width))
     else:
         lines_count = 1
 
@@ -110,6 +113,7 @@ def compute_viewport_height(
     show_footer: bool = True,
     composer_content: str | list[str] | None = None,
     composer_height: int | None = None,
+    width: int | None = None,
 ) -> int:
     """Calculate the conversation/workspace viewport height for a given terminal height.
 
@@ -122,7 +126,7 @@ def compute_viewport_height(
     if composer_height is not None:
         comp_h = composer_height
     elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
-        comp_h = compute_composer_height(composer_content, height=lines, state=state)
+        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=width)
     else:
         comp_h = COMPOSER_BOX_HEIGHT
 
@@ -144,6 +148,7 @@ def compute_composer_cursor_row(
     composer_content: str | list[str] | None = None,
     cursor_line: int | None = None,
     composer_height: int | None = None,
+    width: int | None = None,
 ) -> int:
     """Calculate the 1-based ANSI terminal row for the composer input cursor.
 
@@ -160,7 +165,7 @@ def compute_composer_cursor_row(
     if composer_height is not None:
         comp_h = composer_height
     elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
-        comp_h = compute_composer_height(composer_content, height=lines, state=state)
+        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=width)
     else:
         comp_h = COMPOSER_BOX_HEIGHT
 
@@ -225,6 +230,22 @@ def compute_layout(width: int, *args: Any, **kwargs: Any) -> ColumnLayout:
     - WIDE (140-179 cols): 2-column proportional flex with runtime capped at 38 cols.
     - VERY_WIDE (>=180 cols): Full-stretch 2-column split, flush at column 0 (WO-022).
     """
+    show_runtime_kw = kwargs.get("show_runtime")
+    state_kw = kwargs.get("state")
+    if (
+        show_runtime_kw is False
+        or (state_kw is not None and getattr(state_kw, "runtime_panel_visible", True) is False)
+    ):
+        return ColumnLayout(
+            total_width=width,
+            conversation_width=width,
+            runtime_width=0,
+            show_runtime=False,
+            tier=LayoutTier.NARROW if width >= NARROW_BREAKPOINT else LayoutTier.VERY_NARROW,
+            left_margin=0,
+            right_margin=0,
+            show_runtime_badge=False,
+        )
     if width < VERY_NARROW_BREAKPOINT:
         return ColumnLayout(
             total_width=width,
@@ -692,7 +713,7 @@ def render_workspace_layout(
     - If show_runtime is True (NORMAL, WIDE, VERY_WIDE modes), returns a Table grid
       with [conversation] [divider] [runtime] — all flush at column 0 (WO-022).
     """
-    layout = compute_layout(width)
+    layout = compute_layout(width, state=state)
 
     active_scroll = conversation_scroll
     if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
@@ -778,7 +799,7 @@ def render_workspace_layout_str(
     """Render the full workspace layout as plain or ANSI-styled text."""
     if conversation_content is not None:
         conversation_text = conversation_content
-    layout = compute_layout(width)
+    layout = compute_layout(width, state=state)
     has_runtime_data = (
         (state is not None)
         or bool(agents)
@@ -875,7 +896,7 @@ def render_full_screen_workspace(
     )
     from cli.tui.chat import render_chat_transcript_str
 
-    layout = compute_layout(width)
+    layout = compute_layout(width, state=state)
     status = getattr(state, "connection_status", "online")
     context_meter = (
         (getattr(state, "context_meter_text", None), getattr(state, "context_warning_level", None))

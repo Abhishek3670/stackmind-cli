@@ -284,7 +284,9 @@ def get_help_str() -> str:
         "  :attach <p>       Upload and ingest documents (.pdf, .docx, .md), images, or archives (.zip)\n"
         "  :attachments      List all ingested workspace attachments and grounding assets\n"
         "  :projects         Display registered projects and centralized root (~/.stackmindcli)\n"
-        "  :goal <request>   Submit product goal to Architecture (claude)\n"
+        "  :goal <request>   Submit product goal to Architecture (claude) or adopt suggested goal\n"
+        "  :adopt            Adopt suggested goal proposed by Architecture\n"
+        "  :panel, :side     Toggle runtime sidebar visibility (Ctrl+B) for full-width conversation\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
         "  :completion       Display Project Complete handover checklist\n"
@@ -301,11 +303,13 @@ def get_help_str() -> str:
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
-        "  :copy [all]       Copy latest assistant response (or 'all' for full transcript) to clipboard\n"
+        "  :copy [goal|all]  Copy latest assistant response, suggested goal, or transcript to clipboard\n"
         "  :help             Show this help menu\n"
         "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
         "Shortcuts:\n"
+        "  Ctrl+B            Toggle runtime sidebar (collapse for 100% full-width view)\n"
+        "  Tab / Ctrl+G      Auto-fill Architect's suggested goal into input box\n"
         "  Ctrl+O            Toggle thinking block expansion\n"
         "  Ctrl+C            Cancel active turn or abort\n"
         "  Ctrl+V            Paste clipboard content into input composer"
@@ -981,6 +985,15 @@ def _stream_turn_execution(
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
         streamed_chunks = []
+        is_awaiting_plan = (
+            getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+            or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+        )
+        post_placeholder = (
+            "Plan ready: type :approve or 'continue' to execute..."
+            if is_awaiting_plan
+            else "Type a message..."
+        )
         if is_tty:
             redraw_full_screen(
                 session,
@@ -988,7 +1001,7 @@ def _stream_turn_execution(
                 clear=False,
                 include_composer=True,
                 composer_is_active=False,
-                composer_placeholder="Type a message...",
+                composer_placeholder=post_placeholder,
                 composer_content="",
                 live_manager=live_manager,
             )
@@ -1340,7 +1353,18 @@ def dispatch_delivery_command(
         parts = normalized.split()
         mode = parts[1].lower() if len(parts) > 1 else "last"
         text_to_copy = ""
-        if mode in ("all", "full", "transcript"):
+        if mode in ("goal", "plan"):
+            suggested = (
+                state.get_latest_suggested_goal()
+                if hasattr(state, "get_latest_suggested_goal")
+                else None
+            )
+            if suggested:
+                text_to_copy = f":goal {suggested}"
+                desc = "suggested :goal command"
+            else:
+                desc = "suggested goal"
+        elif mode in ("all", "full", "transcript"):
             lines = []
             for msg in getattr(state, "messages", []):
                 sender = str(getattr(msg, "role", getattr(msg, "sender", "message"))).upper()
@@ -1369,13 +1393,78 @@ def dispatch_delivery_command(
                 else "[ERROR] Failed to write to system clipboard."
             )
         else:
-            msg_str = "[CLIPBOARD] No messages available to copy."
+            msg_str = (
+                "[CLIPBOARD] No suggested goal found from the Architect to copy."
+                if mode in ("goal", "plan")
+                else "[CLIPBOARD] No messages available to copy."
+            )
 
         state.add_message("user", normalized)
         state.add_message("system", msg_str)
         if not is_tty:
             click.echo(msg_str)
         return session, False
+
+    if normalized in (":panel", ":sidebar", ":side", ":toggle panel", ":panel toggle"):
+        is_now_visible = state.toggle_runtime_panel() if hasattr(state, "toggle_runtime_panel") else True
+        status_text = (
+            "[SIDEBAR] Runtime panel restored (2-column split layout)."
+            if is_now_visible
+            else "[SIDEBAR] Runtime panel collapsed (100% full-width conversation layout). Press Ctrl+B to toggle."
+        )
+        state.add_message("user", normalized)
+        state.add_message("system", status_text)
+        if not is_tty:
+            click.echo(status_text)
+        return session, False
+
+    # Auto-approve pending plan if operator intuitively enters 'continue', 'proceed', or ':adopt'
+    is_awaiting_plan = (
+        getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+        or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+    )
+    if is_awaiting_plan and normalized.lower() in {
+        "continue", ":continue", "proceed", ":proceed", "go ahead", ":go", ":adopt", ":accept"
+    }:
+        return dispatch_delivery_command(
+            adapter,
+            client,
+            session,
+            ":approve Approved by operator",
+            state,
+            client_timeout=effective_timeout,
+            live_manager=live_manager,
+        )
+
+    if normalized in (":adopt", ":accept", ":run goal"):
+        goal = state.get_latest_suggested_goal() if hasattr(state, "get_latest_suggested_goal") else None
+        if not goal:
+            if is_awaiting_plan:
+                return dispatch_delivery_command(
+                    adapter,
+                    client,
+                    session,
+                    ":approve Approved by operator",
+                    state,
+                    client_timeout=effective_timeout,
+                    live_manager=live_manager,
+                )
+            msg = "[GOAL] No suggested goal found from the Architect to adopt."
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        state.add_message("system", f"[AUTO-ADOPT] Adopting Architect's suggested goal: :goal {goal}")
+        return dispatch_delivery_command(
+            adapter,
+            client,
+            session,
+            f":goal {goal}",
+            state,
+            client_timeout=effective_timeout,
+            live_manager=live_manager,
+        )
 
     if normalized == ":debugkeys":
         from cli.tui.keyboard import DEBUG_KEYS_ENABLED, DEBUG_LOG_FILE, set_debug_keys
@@ -2367,12 +2456,21 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":goal" or (normalized.startswith(":goal ") and not normalized[6:].strip()):
-        output_str = "Usage: :goal <product goal or feature request>"
-        state.add_message("user", normalized)
-        state.add_message("system", output_str)
-        if not is_tty:
-            click.echo(output_str)
-        return session, False
+        suggested = (
+            state.get_latest_suggested_goal()
+            if hasattr(state, "get_latest_suggested_goal")
+            else None
+        )
+        if suggested:
+            normalized = f":goal {suggested}"
+            state.add_message("system", f"[AUTO-ADOPT] Using Architect's suggested goal: :goal {suggested}")
+        else:
+            output_str = "Usage: :goal <product goal or feature request>"
+            state.add_message("user", normalized)
+            state.add_message("system", output_str)
+            if not is_tty:
+                click.echo(output_str)
+            return session, False
 
     if (
         normalized.startswith(":")
@@ -2418,7 +2516,17 @@ def dispatch_delivery_command(
     op_id = "turn"
 
     try:
-        result = adapter.command(normalized, session_id=session["session_id"])
+        turn_kwargs: dict[str, Any] = {}
+        if not is_goal and hasattr(state, "messages") and state.messages:
+            c_hist: list[dict[str, str]] = []
+            for msg in state.messages:
+                m_role = getattr(msg, "role", getattr(msg, "sender", None))
+                m_content = getattr(msg, "content", getattr(msg, "text", None))
+                if m_role in ("user", "assistant") and m_content and isinstance(m_content, str) and m_content.strip():
+                    c_hist.append({"role": m_role, "content": m_content.strip()})
+            if c_hist:
+                turn_kwargs["chat_history"] = c_hist[-12:]
+        result = adapter.command(normalized, session_id=session["session_id"], **turn_kwargs)
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         if is_goal:
             state.add_activity("User", "submitted goal to Architecture", op_id)

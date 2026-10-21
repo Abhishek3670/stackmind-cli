@@ -853,10 +853,10 @@ def test_win32_reader_default_and_opt_in_flag():
 # ─── 8. RESPONSIVE INPUT FIELD & VIEWPORT SCROLLING TESTS ───────────────────
 
 
-def test_raw_line_editor_horizontal_viewport_scrolling():
-    """Verify RawLineEditor shifts viewport when text exceeds inner width."""
+def test_raw_line_editor_text_wrapping_no_ellipsis():
+    """Verify RawLineEditor wraps lines without '...' ellipsis when text exceeds inner width."""
     # prompt_prefix "│ > " (4 chars visible), right_border " │" (2 chars visible)
-    # width=20 -> inner_available = 20 - 4 - 2 = 14
+    # width=20 -> wrap_width = 14
     editor = RawLineEditor(
         prompt_prefix="│ > ",
         width=20,
@@ -882,31 +882,33 @@ def test_raw_line_editor_horizontal_viewport_scrolling():
     out = io.StringIO()
     editor.redraw_line(out=out)
     output = out.getvalue()
-    # Should display "..." prefix since start > 0
-    assert "..." in output
-    # Total line inside borders must not overflow width 20
-    # visible_prefix(4) + displayed(14) + visible_right(2) = 20
-    assert editor.displayed_cursor <= 14
-    assert _compute_cursor_col(editor) == 4 + editor.displayed_cursor + 1
+    # Text must wrap across visual lines instead of displaying "..."
+    assert "..." not in output
+    v_lines, _, c_line, c_col = editor._get_visual_lines()
+    assert len(v_lines) == 3
+    assert v_lines[0] == "short text "
+    assert v_lines[1] == "that is very "
+    assert v_lines[2] == "long"
+    assert c_line == 2
 
-    # 3. Press HOME key: moves cursor to 0, start becomes 0
+    # 3. Press HOME key: moves cursor to 0, start of first visual line
     editor.handle_key(Key.HOME)
     out = io.StringIO()
     editor.redraw_line(out=out)
     output = out.getvalue()
-    # Start is 0, so should show beginning of text with trailing ellipsis
     assert editor.cursor == 0
     assert editor.displayed_cursor == 0
-    assert "short" in output
-    assert output.endswith("... │\x1b[5G") or "short" in output
+    assert "..." not in output
+    assert "short text " in output
 
-    # 4. Press END key: moves cursor back to end
+    # 4. Press END key: moves cursor back to end of buffer
     editor.handle_key(Key.END)
     out = io.StringIO()
     editor.redraw_line(out=out)
     output = out.getvalue()
     assert editor.cursor == len(editor.buffer)
-    assert "..." in output
+    assert "..." not in output
+    assert "long" in output
 
 
 def test_raw_line_editor_narrow_width_graceful_clamping():

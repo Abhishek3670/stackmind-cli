@@ -245,6 +245,7 @@ def _append_schema_errors(file_rel: str, data: dict, schema: dict, result: Valid
             severity=Severity.ERROR,
             message=f"{file_rel}: {json_path} — {error.message}",
             path=file_rel,
+            auto_fixable=(file_rel in ("RUNTIME_VERSION", "runtime/TREE.yaml")),
         ))
 
 
@@ -362,7 +363,7 @@ def validate_structure(project_path: Path, sync_path: Path, agents: list[str], r
 
     for f in required_files:
         if not (sync_path / f).exists():
-            can_fix = f in {"PROTOCOL_DIGEST.md", "PROTOCOL_DIGEST.hash", "RUNTIME_VERSION"}
+            can_fix = f in {"PROTOCOL_DIGEST.md", "PROTOCOL_DIGEST.hash", "RUNTIME_VERSION", "runtime/TREE.yaml"}
             result.issues.append(Issue(
                 layer="Structure",
                 severity=Severity.ERROR,
@@ -1530,7 +1531,7 @@ def auto_fix(sync_path: Path, issues: list[Issue]) -> int:
             (dir_path / ".gitkeep").write_text("", encoding="utf-8")
             fixed += 1
 
-        elif "Missing: .sync/PROTOCOL_DIGEST" in issue.message or "Missing: .sync/RUNTIME_VERSION" in issue.message or "RUNTIME_VERSION" in issue.path:
+        elif "Missing: .sync/PROTOCOL_DIGEST" in issue.message or "Missing: .sync/RUNTIME_VERSION" in issue.message or "RUNTIME_VERSION" in issue.path or "Missing: .sync/runtime/TREE.yaml" in issue.message or ("TREE.yaml" in issue.path and issue.layer == "Schema"):
             try:
                 from cli.init import ensure_workspace_protocol_scaffolding
                 ensure_workspace_protocol_scaffolding(sync_path.parent)

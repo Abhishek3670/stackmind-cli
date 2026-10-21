@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -37,7 +38,6 @@ def canonical_blocker_text(block_msg: Any) -> str:
         from cli.tui.events import clean_error_message
         err_val = block_msg.get("error") or block_msg.get("reason") or block_msg.get("message")
         if err_val:
-            import re
             m = re.search(r"\[(.*?)\]", str(err_val))
             if m:
                 err_val = m.group(1).strip()
@@ -547,6 +547,7 @@ class AutonomousDeliveryState:
         self.project_name = project_name
         self.session_id = session_id
         self.phase: ProjectPhase = ProjectPhase.INITIALIZING
+        self.mouse_reporting_enabled: bool = True
         self.error: str | None = None
         self.plan: dict[str, Any] = {}
         self.plan_revisions: list[PlanRevision] = []
@@ -612,12 +613,14 @@ class AutonomousDeliveryState:
         self.last_sequence: int = 0
         self.seen_sequences: set[int] = set()
         self.seen_message_keys: set[tuple[str, str]] = set()
+        self.seen_harness_reports: set[str] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
         self.govern_verbosity: str = "tree"  # "tree" | "flat" | "compact"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False, verbosity=self.govern_verbosity)
         self.current_turn_thinking: str = ""
         self.thinking_expanded: bool = True
         self.live_thinking_expanded: bool = True
+        self.actions_expanded: bool = False
         self.active_tool_name: str | None = None
         self.active_tool_target: str | None = None
         self.active_tool_code: str | None = None
@@ -662,6 +665,30 @@ class AutonomousDeliveryState:
         self.command_dialog_scroll: int = 0
         self.command_dialog_title: str = ""
         self._last_command_str: str | None = None
+        self.runtime_panel_visible: bool = True
+
+    def toggle_runtime_panel(self) -> bool:
+        """Toggle visibility of the persistent runtime sidebar panel (Ctrl+B)."""
+        self.runtime_panel_visible = not self.runtime_panel_visible
+        return self.runtime_panel_visible
+
+    def get_latest_suggested_goal(self) -> str | None:
+        """Extract the most recently proposed :goal command from assistant messages."""
+
+        for msg in reversed(self.messages):
+            role = getattr(msg, "role", getattr(msg, "sender", ""))
+            if role == "assistant":
+                content = getattr(msg, "content", "")
+                if not content:
+                    continue
+                # Match :goal followed by description (handles backticks, leading symbols, or newlines)
+                m = re.search(r"(?:^|[^\w/]):goal\s+([^\n`\r]+)", content, re.MULTILINE)
+                if m:
+                    goal_text = m.group(1).strip()
+                    goal_text = goal_text.rstrip("`'\"").lstrip("`'\"").strip()
+                    if goal_text:
+                        return goal_text
+        return None
 
     @property
     def retry_status_display(self) -> str | None:
@@ -922,7 +949,8 @@ class AutonomousDeliveryState:
         )
         summary_message = ChatMessage(role="system", content=summary, timestamp=self.now_str())
         self.messages = [summary_message, *retained]
-        self.seen_message_keys = {(message.role, message.content.strip()) for message in self.messages}
+        # Preserve all historical seen_message_keys so compacted turns are never re-added as duplicates
+        self.seen_message_keys.add((summary_message.role, summary_message.content.strip()))
         self.compaction_count += 1
         self.conversation_scroll.notify_activity()
         self.conversation_scroll.max_offset = None
@@ -1019,6 +1047,9 @@ class AutonomousDeliveryState:
             self.last_tool_code = None
             if msg_actions is self.current_turn_actions:
                 self.current_turn_actions = ActionsGroup(active=False, verbosity=self.govern_verbosity)
+
+        if msg_actions and getattr(self, "actions_expanded", False):
+            msg_actions.expanded = self.actions_expanded
 
         msg = ChatMessage(
             role=role,
@@ -1171,10 +1202,15 @@ class AutonomousDeliveryState:
             asst_msgs = [m for m in self.messages if m.role == "assistant" and m.actions]
             if 0 <= turn_index < len(asst_msgs):
                 return asst_msgs[turn_index].actions.toggle()  # type: ignore[union-attr]
-        group = self.get_latest_actions_group()
-        if group:
-            return group.toggle()
-        return False
+        latest = self.get_latest_actions_group()
+        new_expanded = not (latest.expanded if latest else getattr(self, "actions_expanded", False))
+        self.actions_expanded = new_expanded
+        if self.current_turn_actions:
+            self.current_turn_actions.expanded = new_expanded
+        for m in self.messages:
+            if m.actions:
+                m.actions.expanded = new_expanded
+        return new_expanded
 
     def expand_actions(self, turn_index: int | None = None) -> None:
         """Expand actions disclosure via keyboard (§22)."""
@@ -1183,9 +1219,12 @@ class AutonomousDeliveryState:
             if 0 <= turn_index < len(asst_msgs):
                 asst_msgs[turn_index].actions.expand()  # type: ignore[union-attr]
                 return
-        group = self.get_latest_actions_group()
-        if group:
-            group.expand()
+        self.actions_expanded = True
+        if self.current_turn_actions:
+            self.current_turn_actions.expand()
+        for m in self.messages:
+            if m.actions:
+                m.actions.expand()
 
     def collapse_actions(self, turn_index: int | None = None) -> None:
         """Collapse actions disclosure via keyboard (§22)."""
@@ -1194,9 +1233,52 @@ class AutonomousDeliveryState:
             if 0 <= turn_index < len(asst_msgs):
                 asst_msgs[turn_index].actions.collapse()  # type: ignore[union-attr]
                 return
-        group = self.get_latest_actions_group()
-        if group:
-            group.collapse()
+        self.actions_expanded = False
+        if self.current_turn_actions:
+            self.current_turn_actions.collapse()
+        for m in self.messages:
+            if m.actions:
+                m.actions.collapse()
+
+    def toggle_disclosures(self) -> bool:
+        """Toggle all collapsible disclosures (thinking + actions) harmoniously (§22)."""
+        has_actions = any(m.actions and not m.actions.is_empty for m in self.messages) or (
+            self.current_turn_actions and not self.current_turn_actions.is_empty
+        )
+        has_thinking = any(getattr(m, "thinking", None) for m in self.messages) or bool(self.current_turn_thinking)
+
+        actions_collapsed = False
+        if has_actions:
+            latest_act = self.get_latest_actions_group()
+            if latest_act and not latest_act.expanded:
+                actions_collapsed = True
+            elif not getattr(self, "actions_expanded", False):
+                actions_collapsed = True
+
+        thinking_collapsed = False
+        if has_thinking:
+            if not getattr(self, "thinking_expanded", True):
+                thinking_collapsed = True
+            elif any(getattr(m, "thinking", None) and not getattr(m, "thinking_expanded", False) for m in self.messages):
+                thinking_collapsed = True
+
+        if has_actions and not has_thinking:
+            return self.toggle_actions()
+        elif has_thinking and not has_actions:
+            return self.toggle_thinking()
+        elif has_actions and has_thinking:
+            target_expand = actions_collapsed or thinking_collapsed
+            if target_expand:
+                self.expand_thinking()
+                self.expand_actions()
+                return True
+            else:
+                self.collapse_thinking()
+                self.collapse_actions()
+                return False
+        else:
+            self.toggle_thinking()
+            return self.toggle_actions()
 
     def handle_mouse_click(
         self,
@@ -1880,6 +1962,12 @@ class AutonomousDeliveryState:
                 )
             )
             self.add_activity("Architecture", f"proposed plan {plan_id}")
+            wos = payload.get("metadata", {}).get("work_orders") or []
+            wo_count_str = f" with {len(wos)} work orders" if wos else ""
+            self.add_message(
+                "system",
+                f"[PLAN READY] Plan '{plan_id}' proposed{wo_count_str}. Type :approve (or 'continue') to authorize autonomous multi-agent execution, or :reject [feedback].",
+            )
 
         elif name == "plan.approved":
             self.phase = ProjectPhase.AUTONOMOUS_EXECUTION

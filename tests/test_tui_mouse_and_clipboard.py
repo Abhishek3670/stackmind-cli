@@ -166,3 +166,159 @@ def test_scrollbar_drag_scroll_calculation():
     assert 0 < state.conversation_scroll.scroll_offset < max_off
 
 
+def test_copy_slash_command_copies_suggested_goal():
+    """Verify :copy goal extracts Architect's suggested :goal command to clipboard."""
+    state = AutonomousDeliveryState(session_id="test-session")
+    state.add_message("user", "Hello")
+    state.add_message(
+        "assistant",
+        "Send this command to set our goal:\n"
+        ":goal Build a cozy, rustic static landing page for a crochet artist using React and Tailwind.\n"
+        "Let me know once ready!",
+    )
+
+    mock_adapter = MagicMock()
+    mock_client = MagicMock()
+
+    with patch("cli.tui.clipboard.set_clipboard_text", return_value=True) as mock_set:
+        session, should_exit = dispatch_delivery_command(
+            mock_adapter,
+            mock_client,
+            {"session_id": "test-session"},
+            ":copy goal",
+            state,
+        )
+
+        assert should_exit is False
+        expected_goal = ":goal Build a cozy, rustic static landing page for a crochet artist using React and Tailwind."
+        mock_set.assert_called_once_with(expected_goal)
+        last_msg = state.messages[-1]
+        assert "Copied" in last_msg.content
+        assert "suggested :goal" in last_msg.content
+
+
+def test_adopt_slash_command_executes_suggested_goal():
+    """Verify :adopt automatically adopts and routes the Architect's suggested goal."""
+    state = AutonomousDeliveryState(session_id="test-session")
+    state.add_message(
+        "assistant",
+        "To start the build, run:\n`:goal Build a cozy landing page with React and Tailwind`",
+    )
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-submit-1"}
+    mock_adapter.stream.return_value = iter([])
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED"}
+
+    session, should_exit = dispatch_delivery_command(
+        mock_adapter,
+        mock_client,
+        {"session_id": "test-session"},
+        ":adopt",
+        state,
+        client_timeout=0.1,
+    )
+
+    assert any("[AUTO-ADOPT]" in m.content for m in state.messages)
+    assert any(":goal Build a cozy landing page with React and Tailwind" in m.content for m in state.messages)
+
+
+def test_goal_command_auto_adopts_when_no_args():
+    """Verify :goal with no arguments auto-adopts the Architect's suggested goal."""
+    state = AutonomousDeliveryState(session_id="test-session")
+    state.add_message(
+        "assistant",
+        "Please confirm goal:\n:goal Build a rustic website with Tailwind\nReady?",
+    )
+
+    mock_adapter = MagicMock()
+    mock_adapter.command.return_value = {"operation_id": "op-submit-2"}
+    mock_adapter.stream.return_value = iter([])
+
+    mock_client = MagicMock()
+    mock_client.operation_get.return_value = {"status": "COMPLETED"}
+
+    session, should_exit = dispatch_delivery_command(
+        mock_adapter,
+        mock_client,
+        {"session_id": "test-session"},
+        ":goal",
+        state,
+        client_timeout=0.1,
+    )
+
+    # Check that it adopted the goal and recorded it
+    assert any("[AUTO-ADOPT]" in m.content for m in state.messages)
+    assert any(":goal Build a rustic website with Tailwind" in m.content for m in state.messages)
+
+
+def test_toggle_runtime_panel_layout():
+    """Verify toggling runtime panel collapses and restores 100% full-width layout."""
+    from cli.tui.layout import compute_layout
+
+    state = AutonomousDeliveryState(session_id="test-session")
+    assert state.runtime_panel_visible is True
+
+    # Default wide layout: 2 columns
+    layout_default = compute_layout(120, state=state)
+    assert layout_default.show_runtime is True
+    assert layout_default.conversation_width < 120
+
+    # Toggle sidebar off (Ctrl+B)
+    state.toggle_runtime_panel()
+    assert state.runtime_panel_visible is False
+
+    # Layout is now 100% full-width, zero right panel
+    layout_collapsed = compute_layout(120, state=state)
+    assert layout_collapsed.show_runtime is False
+    assert layout_collapsed.conversation_width == 120
+    assert layout_collapsed.runtime_width == 0
+
+    # Toggle sidebar back on
+    state.toggle_runtime_panel()
+    assert state.runtime_panel_visible is True
+    layout_restored = compute_layout(120, state=state)
+    assert layout_restored.show_runtime is True
+
+
+def test_tab_and_ctrl_g_auto_fill_suggested_goal_in_editor():
+    """Verify Tab and Ctrl+G in RawLineEditor automatically populate suggested goal."""
+    state = AutonomousDeliveryState(session_id="test-session")
+    state.add_message(
+        "assistant",
+        "Run this command:\n:goal Build a cozy crochet portfolio with React\nThanks!",
+    )
+
+    # 1. Pressing Tab in empty editor
+    editor = RawLineEditor(state=state)
+    assert editor.text == ""
+    editor.handle_key(Key.TAB)
+    assert editor.text == ":goal Build a cozy crochet portfolio with React"
+
+    # 2. Pressing Ctrl+G
+    editor2 = RawLineEditor(state=state)
+    editor2.handle_key(Key.CTRL_G)
+    assert editor2.text == ":goal Build a cozy crochet portfolio with React"
+
+    # 3. Pressing Tab when buffer starts with :goal
+    editor3 = RawLineEditor(state=state, initial_text=":goal ")
+    editor3.handle_key(Key.TAB)
+    assert editor3.text == ":goal Build a cozy crochet portfolio with React"
+
+
+def test_ctrl_b_toggles_runtime_panel_in_editor():
+    """Verify Ctrl+B in RawLineEditor toggles runtime sidebar visibility."""
+    state = AutonomousDeliveryState(session_id="test-session")
+    assert state.runtime_panel_visible is True
+
+    editor = RawLineEditor(state=state)
+    editor.handle_key(Key.CTRL_B)
+    assert state.runtime_panel_visible is False
+
+    editor.handle_key(Key.CTRL_B)
+    assert state.runtime_panel_visible is True
+
+
+

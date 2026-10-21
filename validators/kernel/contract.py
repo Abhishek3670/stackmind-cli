@@ -141,6 +141,7 @@ class ContractEvaluator:
     }
 
     _PROTOCOL_TARGET_PREFIXES = (
+        "workspace/command",
         "workspace/process",
         "workspace/verdicts",
         "workspace/inbox",

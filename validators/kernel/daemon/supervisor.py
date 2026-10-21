@@ -390,6 +390,10 @@ class LifecycleSupervisor:
             profile_val = load_settings(Path(workspace)).execution_profile
         except Exception:
             profile_val = "medium"
+        try:
+            archive_blocked_work_orders(Path(workspace))
+        except Exception:
+            pass
         state = RunState(
             run_id=run_id,
             product_goal=product_goal,
@@ -770,16 +774,12 @@ class LifecycleSupervisor:
                 return self._advance_authoring(state)
 
         ws = Path(state.workspace)
-        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
-        active_ids = sorted([f.stem for f in active_dir.glob("*.yaml")]) if active_dir.is_dir() else []
-        if not active_ids:
-            try:
-                from .authoring import get_next_work_order_int
-                start_wo_idx = get_next_work_order_int(ws)
-                active_ids = [f"WO-{start_wo_idx:03d}"]
-            except Exception:
-                active_ids = ["WO-001"]
-        example_wo = active_ids[0] if active_ids else "WO-001"
+        try:
+            from .authoring import get_next_work_order_int
+            start_wo_idx = get_next_work_order_int(ws)
+            example_wo = f"WO-{start_wo_idx:03d}"
+        except Exception:
+            example_wo = "WO-001"
 
         # Supervisor directly dispatches Turn 2 (Authoring child WOs and Contracts)
         authoring_prompt = (
@@ -1684,6 +1684,17 @@ class LifecycleSupervisor:
                         (
                             f"Retry work order {wo_id}: previous attempt failed or halted ({err_msg})."
                             f"{evidence_lines} "
+                            + (
+                                " CRITICAL FIX: Remote image URLs returned 404. Do NOT guess Unsplash/external URLs; use inline SVGs, CSS placeholder containers, or local assets."
+                                if ("Remote media asset does not exist" in str(err_msg) or "404 Not Found" in str(err_msg))
+                                else ""
+                            )
+                            + (
+                                " CRITICAL FIX: Remove prohibited 'stackmind' references from product files (README, CHANGELOG)."
+                                if "Clean delivery gate failed" in str(err_msg)
+                                else ""
+                            )
+                            + " "
                             f"You MUST resolve any reported issues, invoke write_file to author the deliverable{target_str} "
                             "at EXACTLY that path — no renamed or extra-nested folders — and "
                             "declare in modified_files ONLY files you actually wrote with "
@@ -2192,6 +2203,29 @@ class LifecycleSupervisor:
                             blockers.append(str(raw))
                     if not blockers and op_result.get("reason"):
                         blockers = [op_result["reason"]]
+
+                    # Waive unfulfillable build execution blockers when dependencies are not installed
+                    # in workspace and deterministic gate skipped build execution:
+                    build_chk = next((c for c in gate_decision.checks if c.name == "build_execution"), None)
+                    if build_chk and build_chk.status == "skipped" and build_chk.passed:
+                        def _is_unfulfillable_build_blocker(b_text: str) -> bool:
+                            b_lower = b_text.lower()
+                            return (
+                                "build execution" in b_lower
+                                or "record of build" in b_lower
+                                or "vite build" in b_lower
+                                or "npm run build" in b_lower
+                                or "no build execution" in b_lower
+                            )
+                        filtered_blockers = [b for b in blockers if not _is_unfulfillable_build_blocker(b)]
+                        if len(filtered_blockers) < len(blockers):
+                            blockers = filtered_blockers
+                            detail_paths = [p for p in detail_paths if not (p == "package.json" and not blockers)]
+
+                    if not blockers:
+                        state.integration_blockers = []
+                        self._transition(state, Phase.PRODUCT_READY)
+                        return AdvanceResult.TRANSITIONED
                 else:
                     # When the review claimed completion but deterministic checks failed,
                     # enforce deterministic blockers (anti-fabrication, test/build/route failures)
@@ -2551,7 +2585,8 @@ class LifecycleSupervisor:
             "1. Read PLAN.md for the original product requirements.\n"
             f"2. Read each declared deliverable file to verify completeness and correctness:\n{deliv_lines}\n"
             "3. Inspect developer completion notices in `.sync/inbox/claude/` to understand implementation rationales and design decisions.\n"
-            "4. Verify that all components integrate properly and test coverage is satisfactory.\n\n"
+            "4. Verify that all components integrate properly and test coverage is satisfactory.\n"
+            "5. Build Verification: If package.json or Makefile defines a build command AND dependencies are installed (e.g. node_modules exists, build was run), verify that build execution succeeded without errors. If dependencies are not installed or workers do not have shell command permissions in their contracts, verify code correctness and imports statically and approve with a note, rather than blocking delivery.\n\n"
             "OUTPUT FORMAT INSTRUCTIONS:\n"
             "Your output must be a single JSON object with these exact fields:\n"
             "If review passes:\n"
@@ -3071,7 +3106,7 @@ class LifecycleSupervisor:
         # Deterministic preflight/normalization pass (SYSTEM-NORMALIZABLE
         # fixes are applied in place; ARCHITECT-DECISION-REQUIRED findings
         # short-circuit into a targeted repair turn).
-        compile_result = compile_authoring_artifacts(ws, plan_milestones)
+        compile_result = compile_authoring_artifacts(ws, plan_milestones, planning_wo_id=state.planning_wo_id)
         if compile_result.decision_required:
             result = AuthoringReadinessResult(
                 ready=False,
@@ -4279,16 +4314,16 @@ class LifecycleSupervisor:
                     idx_data["last_updated"] = data["updated"]
                     durable_write_yaml(index_file, idx_data)
                     tree_file = ws / ".sync" / "runtime" / "TREE.yaml"
-                    if tree_file.is_file():
-                        try:
-                            tree_data = yaml.safe_load(tree_file.read_text(encoding="utf-8")) or {}
-                            if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
-                                tree_data["work_orders"]["total_active"] = idx_data.get("total_active", 0)
-                                tree_data["work_orders"]["total_completed"] = idx_data.get("total_completed", 0)
-                                tree_data["work_orders"]["total_blocked"] = idx_data.get("total_blocked", 0)
-                                durable_write_yaml(tree_file, tree_data)
-                        except Exception:
-                            pass
+                    try:
+                        from cli.init import ensure_canonical_tree
+                        tree_data = ensure_canonical_tree(ws)
+                        if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+                            tree_data["work_orders"]["total_active"] = idx_data.get("total_active", 0)
+                            tree_data["work_orders"]["total_completed"] = idx_data.get("total_completed", 0)
+                            tree_data["work_orders"]["total_blocked"] = idx_data.get("total_blocked", 0)
+                            durable_write_yaml(tree_file, tree_data)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             return True
@@ -4402,6 +4437,10 @@ class LifecycleSupervisor:
         if not active_dir.is_dir():
             return
         wo_ids: list[str] = []
+        p_idx = None
+        if state.planning_wo_id:
+            from validators.harness.authoring_readiness import _parse_wo_index
+            p_idx = _parse_wo_index(state.planning_wo_id)
         for wo_file in sorted(active_dir.glob("*.yaml")):
             wo_id = wo_file.stem
             if wo_id in (state.planning_wo_id, "WO-000"):
@@ -4409,8 +4448,13 @@ class LifecycleSupervisor:
             try:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    if str(data.get("status", "")).upper() == "COMPLETED":
+                    st = str(data.get("status", "")).upper()
+                    if st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
                         continue
+                    if p_idx is not None:
+                        from validators.harness.authoring_readiness import _parse_wo_index
+                        if (_parse_wo_index(wo_id) or 0) <= p_idx:
+                            continue
                     assigned = data.get("assigned_agents", [])
                     if isinstance(assigned, list):
                         assigned_norm = [str(a).lower().strip() for a in assigned]
@@ -4759,12 +4803,24 @@ class LifecycleSupervisor:
         active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
         if not active_dir.is_dir():
             return None
+        p_idx = None
+        if state.planning_wo_id:
+            from validators.harness.authoring_readiness import _parse_wo_index
+            p_idx = _parse_wo_index(state.planning_wo_id)
         for wo_file in sorted(active_dir.glob("*.yaml")):
             wo_id = wo_file.stem
             if wo_id in (state.planning_wo_id, "WO-000"):
                 continue
             try:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    st = str(data.get("status", "")).upper()
+                    if st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                        continue
+                    if p_idx is not None:
+                        from validators.harness.authoring_readiness import _parse_wo_index
+                        if (_parse_wo_index(wo_id) or 0) <= p_idx:
+                            continue
                 if isinstance(data, dict):
                     assigned = data.get("assigned_agents", [])
                     is_gitops = False
@@ -4976,27 +5032,142 @@ def archive_completed_work_orders(
             pass
 
     # Update TREE.yaml
-    if tree_file.is_file():
+    try:
+        from cli.init import ensure_canonical_tree
+        tree_data = ensure_canonical_tree(ws)
+        if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+            if index_file.is_file():
+                tree_data["work_orders"]["total_active"] = index_data.get("total_active", 0)
+                tree_data["work_orders"]["total_completed"] = index_data.get("total_completed", 0)
+                tree_data["work_orders"]["total_blocked"] = index_data.get("total_blocked", 0)
+        if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+            archived_set = set(archived)
+            for _agent_name, agent_info in tree_data["agents"].items():
+                if isinstance(agent_info, dict) and "assigned_work_orders" in agent_info:
+                    assigned = agent_info["assigned_work_orders"]
+                    if isinstance(assigned, list):
+                        agent_info["assigned_work_orders"] = [
+                            w for w in assigned if w not in archived_set
+                        ]
+        tree_data["last_updated"] = now_iso
+        durable_write_yaml(tree_file, tree_data)
+    except Exception:
+        pass
+
+    try:
+        from validators.harness.runner import HarnessRunner
+        HarnessRunner._sync_index_and_tree_yaml(ws)
+    except Exception:
+        pass
+
+    return archived
+
+
+def archive_blocked_work_orders(
+    workspace: Path | str,
+    blocked_wo_ids: list[str] | None = None,
+) -> list[str]:
+    """Archive blocked/failed/terminal work orders from ACTIVE to BLOCKED and update INDEX.yaml/TREE.yaml.
+
+    Returns the list of work order IDs that were successfully archived.
+    """
+    ws = Path(workspace).resolve()
+    sync_dir = ws / ".sync"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    blocked_dir = sync_dir / "work-orders" / "BLOCKED"
+    index_file = sync_dir / "work-orders" / "INDEX.yaml"
+    tree_file = sync_dir / "runtime" / "TREE.yaml"
+
+    if not active_dir.is_dir():
+        return []
+
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    target_ids = set(blocked_wo_ids or [])
+
+    archived: list[str] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for wo_file in sorted(active_dir.glob("*.yaml")):
+        wo_id = wo_file.stem
         try:
-            tree_data = yaml.safe_load(tree_file.read_text(encoding="utf-8")) or {}
-            if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
-                if index_file.is_file():
-                    tree_data["work_orders"]["total_active"] = index_data.get("total_active", 0)
-                    tree_data["work_orders"]["total_completed"] = index_data.get("total_completed", 0)
-                    tree_data["work_orders"]["total_blocked"] = index_data.get("total_blocked", 0)
-            if "agents" in tree_data and isinstance(tree_data["agents"], dict):
-                archived_set = set(archived)
-                for _agent_name, agent_info in tree_data["agents"].items():
-                    if isinstance(agent_info, dict) and "assigned_work_orders" in agent_info:
-                        assigned = agent_info["assigned_work_orders"]
-                        if isinstance(assigned, list):
-                            agent_info["assigned_work_orders"] = [
-                                w for w in assigned if w not in archived_set
-                            ]
-            tree_data["last_updated"] = now_iso
-            durable_write_yaml(tree_file, tree_data)
+            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            wo_data = {}
+
+        st = str(wo_data.get("status", "")).upper()
+        is_blocked = (
+            wo_id in target_ids
+            or st in ("BLOCKED", "FAILED", "CANCELLED")
+        )
+        if not is_blocked:
+            continue
+
+        if not wo_data.get("status") or str(wo_data.get("status", "")).upper() == "ACTIVE":
+            wo_data["status"] = "BLOCKED"
+        wo_data["updated"] = now_iso
+        target_file = blocked_dir / wo_file.name
+        from validators.kernel.io import durable_write_yaml
+        durable_write_yaml(target_file, wo_data)
+        try:
+            wo_file.unlink()
+        except OSError:
+            pass
+        archived.append(wo_id)
+
+    for target_id in target_ids:
+        if (blocked_dir / f"{target_id}.yaml").is_file() and target_id not in archived:
+            archived.append(target_id)
+
+    if not archived:
+        return []
+
+    # Update INDEX.yaml
+    index_data: dict[str, Any] = {}
+    if index_file.is_file():
+        try:
+            index_data = yaml.safe_load(index_file.read_text(encoding="utf-8")) or {}
+            orders = index_data.get("orders", [])
+            for o in orders:
+                if isinstance(o, dict) and o.get("id") in archived:
+                    o["status"] = "BLOCKED"
+                    o["file"] = f"work-orders/BLOCKED/{o.get('id')}.yaml"
+                    o["updated"] = now_iso
+            index_data["total_active"] = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+            )
+            index_data["total_completed"] = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+            )
+            index_data["total_blocked"] = sum(
+                1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
+            )
+            index_data["last_updated"] = now_iso
+            durable_write_yaml(index_file, index_data)
         except Exception:
             pass
+
+    # Update TREE.yaml
+    try:
+        from cli.init import ensure_canonical_tree
+        tree_data = ensure_canonical_tree(ws)
+        if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+            if index_file.is_file():
+                tree_data["work_orders"]["total_active"] = index_data.get("total_active", 0)
+                tree_data["work_orders"]["total_completed"] = index_data.get("total_completed", 0)
+                tree_data["work_orders"]["total_blocked"] = index_data.get("total_blocked", 0)
+        if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+            archived_set = set(archived)
+            for _agent_name, agent_info in tree_data["agents"].items():
+                if isinstance(agent_info, dict) and "assigned_work_orders" in agent_info:
+                    assigned = agent_info["assigned_work_orders"]
+                    if isinstance(assigned, list):
+                        agent_info["assigned_work_orders"] = [
+                            w for w in assigned if w not in archived_set
+                        ]
+        tree_data["last_updated"] = now_iso
+        durable_write_yaml(tree_file, tree_data)
+    except Exception:
+        pass
 
     try:
         from validators.harness.runner import HarnessRunner
@@ -5013,6 +5184,7 @@ __all__ = [
     "Phase",
     "RunState",
     "archive_completed_work_orders",
+    "archive_blocked_work_orders",
     "create_gitops_commit",
     "format_release_commit_message",
 ]

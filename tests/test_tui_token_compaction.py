@@ -176,3 +176,39 @@ def test_process_event_telemetry_and_token_usage() -> None:
     assert state.last_prompt_tokens == 2_500
     assert state.cumulative_turn_tokens == 2_900
 
+
+def test_compaction_does_not_resurrect_outbox_reports(tmp_path) -> None:
+    """Verify compaction preserves seen_message_keys and does not re-add old outbox reports."""
+    from cli.tui.events import recover_transcript_from_events
+
+    outbox_dir = tmp_path / ".sync" / "outbox" / "claude"
+    outbox_dir.mkdir(parents=True)
+    report_file = outbox_dir / "harness-turn1.md"
+    report_file.write_text(
+        "# Harness Report: 123\n\n## Report\nOriginal Greeting: I am your Lead Architect.",
+        encoding="utf-8",
+    )
+
+    state = AutonomousDeliveryState(session_id="test-s1")
+    # Initial recovery loads report
+    recovered = recover_transcript_from_events([], state, workspace=tmp_path)
+    assert len(recovered) == 1
+    assert "Original Greeting" in recovered[0].content
+    assert len(state.messages) == 1
+
+    # Add more turns
+    for i in range(10):
+        state.add_message("user", f"user message {i}")
+        state.add_message("assistant", f"assistant message {i}")
+
+    # Compact transcript
+    state.compact_transcript(keep_recent=4)
+    assert len(state.messages) == 5
+
+    # Subsequent poll must NOT re-add the compacted Greeting report
+    recovered2 = recover_transcript_from_events([], state, workspace=tmp_path)
+    assert len(recovered2) == 0
+    assert len(state.messages) == 5
+    assert not any("Original Greeting" in m.content for m in state.messages[1:])
+
+

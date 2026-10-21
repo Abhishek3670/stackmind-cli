@@ -192,6 +192,11 @@ def format_action_description(tool_name: str, target: str = "", role: str = "") 
         return f"List ({t})" if t else "List"
     if "verify" in lower:
         return f"Verify ({t})" if t else "Verify"
+    if lower in {"trigger_goal", "trigger goal"}:
+        g = t if len(t) <= 30 else t[:27] + "..."
+        return f"Trigger Goal ({g})" if g else "Trigger Goal"
+    if lower in {"delegate_task", "delegate task"}:
+        return f"Delegate ({t})" if t else "Delegate"
     base = cleaned_tool.replace("_", " ").title()
     return f"{base} ({t})" if t else base
 
@@ -637,7 +642,7 @@ def extract_action_target(args: Mapping[str, Any] | None) -> str:
     """Extract primary target path, command, or selector from tool arguments."""
     if not isinstance(args, Mapping):
         return ""
-    for k in ("path", "file", "test_path", "test_name", "selector", "command", "target", "directory", "dir_path", "name"):
+    for k in ("path", "file", "test_path", "test_name", "selector", "command", "target", "directory", "dir_path", "name", "goal", "target_agent", "agent"):
         v = args.get(k)
         if v:
             return str(v)
@@ -1024,6 +1029,18 @@ def recover_transcript_from_events(
 
         # 2. Recover assistant response from toolResult, completed, or report
         elif name in {"event.toolResult", "operation.completed", "turn.completed"}:
+            res = payload.get("result") if isinstance(payload.get("result"), Mapping) else {}
+            rpt_raw = res.get("report_path")
+            if rpt_raw:
+                try:
+                    rp = Path(rpt_raw)
+                    if not rp.is_absolute() and workspace:
+                        rp = workspace / rp
+                    if hasattr(state, "seen_harness_reports"):
+                        state.seen_harness_reports.add(str(rp.resolve()))
+                except Exception:
+                    pass
+
             resp = extract_assistant_response(payload, workspace=workspace)
             thinking = extract_assistant_thinking(payload, workspace=workspace)
             if resp and isinstance(resp, str) and resp.strip():
@@ -1039,6 +1056,12 @@ def recover_transcript_from_events(
         outbox_dir = workspace / ".sync" / "outbox"
         if outbox_dir.exists():
             for rpt in sorted(outbox_dir.glob("**/harness-*.md")):
+                rpt_key = str(rpt.resolve())
+                if hasattr(state, "seen_harness_reports"):
+                    if rpt_key in state.seen_harness_reports:
+                        continue
+                    state.seen_harness_reports.add(rpt_key)
+
                 try:
                     content = rpt.read_text(encoding="utf-8")
                     thinking = None

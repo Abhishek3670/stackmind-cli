@@ -31,6 +31,7 @@ from cli.tui.keyboard import (
     DISABLE_MOUSE_REPORTING_SEQ,
     ENABLE_MOUSE_REPORTING_SEQ,
     raw_prompt_input,
+    wrap_composer_text,
 )
 from cli.tui.layout import (
     compute_composer_cursor_row,
@@ -291,12 +292,8 @@ def render_composer_box(
                 line.append(right_plain, style="dim #64748b")
             body = line
     else:
-        if isinstance(content, str):
-            lines = content.split("\n") or [""]
-        elif content:
-            lines = list(content) or [""]
-        else:
-            lines = [""]
+        wrap_width = max(10, inner_width - 2)
+        lines = wrap_composer_text(content, wrap_width)
 
         total_lines = len(lines)
         max_box_h, max_input_lines = get_composer_line_limits(height)
@@ -311,8 +308,6 @@ def render_composer_box(
         rendered_lines: list[Text] = []
         first_text = visible_lines[0]
 
-        max_text_width = max(0, inner_width - 2)
-
         left_plain = f"> {first_text}"
         available_shortcuts_width = inner_width - len(left_plain) - 2
         right_plain = ""
@@ -320,11 +315,6 @@ def render_composer_box(
             if available_shortcuts_width >= len(sc):
                 right_plain = sc
                 break
-
-        if len(first_text) > max_text_width:
-            first_text = first_text[: max(0, max_text_width - 3)] + "..."
-            left_plain = f"> {first_text}"
-            right_plain = ""
 
         spaces_count = (
             max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
@@ -339,8 +329,6 @@ def render_composer_box(
         rendered_lines.append(line1)
 
         for sub_line in visible_lines[1:]:
-            if len(sub_line) > max_text_width:
-                sub_line = sub_line[: max(0, max_text_width - 3)] + "..."
             line_n = Text(no_wrap=True)
             line_n.append("  ", style="dim #38bdf8")
             line_n.append(sub_line, style="white")
@@ -472,6 +460,14 @@ def _compute_cursor_col(editor: Any, default: int = 5) -> int:
     """Compute the visible cursor column for the composer prompt line."""
     if editor is None:
         return default
+    if hasattr(editor, "current_line_and_col"):
+        try:
+            _, col = editor.current_line_and_col
+            prefix = getattr(editor, "prompt_prefix", None)
+            v_prefix_len = len(_ANSI_STRIP_RE.sub("", prefix)) if isinstance(prefix, str) else 4
+            return v_prefix_len + col + 1
+        except Exception:
+            pass
     cursor = getattr(editor, "displayed_cursor", None)
     if not isinstance(cursor, int):
         cursor = getattr(editor, "cursor", None)
@@ -708,10 +704,8 @@ def render_composer_top_border(
 
     lines_count = 1
     if content:
-        if isinstance(content, str):
-            lines_count = len(content.split("\n"))
-        elif isinstance(content, list):
-            lines_count = len(content)
+        wrap_width = max(10, width - 6)
+        lines_count = len(wrap_composer_text(content, wrap_width))
 
     max_box_h, max_input_lines = get_composer_line_limits(height)
 
@@ -893,6 +887,8 @@ def prompt_composer_input(
     on_ctrl_k: Callable[[], None] | None = None,
     on_ctrl_l: Callable[[], None] | None = None,
     on_ctrl_o: Callable[[], None] | None = None,
+    on_ctrl_b: Callable[[], None] | None = None,
+    on_ctrl_g: Callable[[], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_wheel_up: Callable[[], None] | None = None,
@@ -913,7 +909,7 @@ def prompt_composer_input(
 ) -> str:
     """Prompt user for input inside styled composer box border."""
     term_width = terminal_width if terminal_width is not None else width
-    layout = compute_layout(term_width)
+    layout = compute_layout(term_width, state=state)
     if width != term_width:
         comp_width = width
     else:
@@ -1105,6 +1101,8 @@ def prompt_composer_input(
                 on_ctrl_k=on_ctrl_k,
                 on_ctrl_l=on_ctrl_l,
                 on_ctrl_o=on_ctrl_o,
+                on_ctrl_b=on_ctrl_b,
+                on_ctrl_g=on_ctrl_g,
                 on_page_up=on_page_up,
                 on_page_down=on_page_down,
                 on_wheel_up=on_wheel_up,

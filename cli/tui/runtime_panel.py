@@ -349,6 +349,19 @@ def format_current_operation(
                     short_err = short_err[:max_len - 1] + "…"
                 res_lines.append(Text(f"    {short_err}", style="dim #ef4444"))
             return res_lines
+
+        if state is not None:
+            phase = getattr(state, "phase", None)
+            phase_val = phase.value if hasattr(phase, "value") else str(phase or "")
+            plan_obj = getattr(state, "plan", None) or {}
+            plan_state = str(plan_obj.get("state", "")).upper()
+            if phase_val in ("AWAITING_APPROVAL", "PLAN_PROPOSED") or plan_state == "AWAITING_APPROVAL":
+                plan_id = plan_obj.get("plan_id") or plan_obj.get("id") or "PLAN"
+                return [
+                    Text(f"  ◐ Plan Ready ({plan_id})", style="bold #f59e0b"),
+                    Text("    Run :approve to execute", style="dim #fbbf24"),
+                ]
+
         return [Text("  ○ Idle", style="dim #475569")]
 
     if isinstance(current_operation, Mapping):

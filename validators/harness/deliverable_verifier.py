@@ -545,7 +545,7 @@ class DeliverableVerifier:
                                 checks.append(VerificationCheck(
                                     name="html_media_assets",
                                     passed=False,
-                                    message=f"Line {line}: Remote media asset does not exist (HTTP {exc.code} {exc.reason}): '{s}'",
+                                    message=f"Line {line}: Remote media asset does not exist (HTTP {exc.code} {exc.reason}): '{s}'. Do not use guessed remote URLs; use local placeholders, inline SVGs, or styled CSS cards.",
                                     severity="error",
                                 ))
                                 failed_count += 1

@@ -191,6 +191,7 @@ def render_split_diff(
     max_lines: int = 18,
     file_path: str = "",
     indent: str = "",
+    expanded: bool = False,
 ) -> SplitDiffText:
     """Render a side-by-side or single-column diff with full-width background highlights.
 
@@ -317,9 +318,14 @@ def render_split_diff(
         displayed = rich_lines[:max_lines]
         more_count = total_lines - max_lines
         hint_prefix = f"{indent}  " if indent else "  "
-        hint = Text(f"{hint_prefix}... (+{more_count} more diff lines, ctrl+o to expand)", style="dim italic #9ca3af")
+        hint_suffix = "ctrl+o to collapse" if expanded else "ctrl+o to expand"
+        hint = Text(f"{hint_prefix}... (+{more_count} more diff lines, {hint_suffix})", style="dim italic #9ca3af")
         displayed.append(hint)
         rich_lines = displayed
+    elif expanded and total_lines > 16:
+        hint_prefix = f"{indent}  " if indent else "  "
+        hint = Text(f"{hint_prefix}... (ctrl+o to collapse)", style="dim italic #9ca3af")
+        rich_lines.append(hint)
 
     plain_str = "\n".join(rl.plain for rl in rich_lines)
     return SplitDiffText(plain_str, Group(*rich_lines))
@@ -331,6 +337,7 @@ def render_split_diff_str(
     max_lines: int = 18,
     file_path: str = "",
     indent: str = "",
+    expanded: bool = False,
 ) -> str:
     """Render side-by-side or single-column diff as a string."""
     res = render_split_diff(
@@ -339,6 +346,7 @@ def render_split_diff_str(
         max_lines=max_lines,
         file_path=file_path,
         indent=indent,
+        expanded=expanded,
     )
     return str(res)
 
