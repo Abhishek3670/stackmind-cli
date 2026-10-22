@@ -700,7 +700,8 @@ def test_render_providers_panel_view():
     assert "Cloud Providers & Models Configuration" in rendered
     assert "Anthropic" in rendered
     assert "OpenAI" in rendered
-    assert "Return to StackMind Settings" in rendered
+    assert "Save Settings to Disk & Apply to Runtime" in rendered
+    assert "Return to StackMind Settings" not in rendered
 
 
 def test_navigation_between_settings_and_providers(tmp_path: Path):
@@ -714,21 +715,14 @@ def test_navigation_between_settings_and_providers(tmp_path: Path):
     # Sequence starting in "settings":
     # 1. DOWN x 3 -> select row 3: LLM Providers & Models
     # 2. ENTER -> opens "providers" view
-    # 3. DOWN x 6 -> select row 6: Return to StackMind Settings
-    # 4. ENTER -> returns to "settings" view
-    # 5. ESCAPE -> save & exit
+    # 3. ESCAPE -> returns to "settings" view
+    # 4. ESCAPE -> save & exit
     key_seq = [
         Key.DOWN,
         Key.DOWN,
         Key.DOWN,
         Key.ENTER,
-        Key.DOWN,
-        Key.DOWN,
-        Key.DOWN,
-        Key.DOWN,
-        Key.DOWN,
-        Key.DOWN,
-        Key.ENTER,
+        Key.ESCAPE,
         Key.ESCAPE,
     ]
 
@@ -740,6 +734,32 @@ def test_navigation_between_settings_and_providers(tmp_path: Path):
         key_stream=iter(key_seq),
         workspace=tmp_path,
         initial_view="settings",
+    )
+    assert "[SUCCESS]" in result
+    assert state.settings_panel_open is False
+
+
+def test_providers_view_save_and_exit_directly(tmp_path: Path):
+    from cli.tui.keyboard import Key
+    from cli.tui.settings_panel import run_arrow_navigation_settings_loop
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="s1")
+    session = {"session_id": "s1", "workspace": str(tmp_path)}
+
+    # Starting directly in "providers" view (:provider):
+    # 6 providers: DOWN x 6 -> select row 6: Save Settings to Disk & Apply to Runtime
+    # ENTER -> saves & closes
+    key_seq = [Key.DOWN] * 6 + [Key.ENTER]
+
+    mock_client = MagicMock()
+    result = run_arrow_navigation_settings_loop(
+        session=session,
+        state=state,
+        client=mock_client,
+        key_stream=iter(key_seq),
+        workspace=tmp_path,
+        initial_view="providers",
     )
     assert "[SUCCESS]" in result
     assert state.settings_panel_open is False
@@ -863,6 +883,49 @@ def test_interactive_roles_panel_loop(tmp_path: Path):
     assert reloaded.roles["architecture"]["provider"] == "openrouter"
     # Verify runtime state was updated
     assert state.roles["Architecture"].backend == "openrouter"
+
+
+def test_rebind_command_deprecation(tmp_path: Path):
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.commands import get_help_str
+    from cli.tui.state import AutonomousDeliveryState
+
+    # 1. Verify get_help_str marks :rebind as [DEPRECATED]
+    help_text = get_help_str()
+    assert ":rebind" in help_text
+    assert "[DEPRECATED]" in help_text
+    assert ":roles" in help_text
+
+    state = AutonomousDeliveryState(session_id="s_dep")
+    session = {"session_id": "s_dep", "workspace": str(tmp_path)}
+    mock_adapter = MagicMock()
+    mock_client = MagicMock()
+
+    # 2. Rebind with missing arguments (e.g. ":rebind" or ":rebind custom") emits deprecation notice
+    dispatch_delivery_command(
+        adapter=mock_adapter,
+        client=mock_client,
+        session=session,
+        text=":rebind custom",
+        state=state,
+    )
+    last_msg = state.messages[-1].content
+    assert "[DEPRECATED]" in last_msg
+    assert ":roles" in last_msg
+
+    # 3. Successful rebind emits deprecation warning alongside success
+    dispatch_delivery_command(
+        adapter=mock_adapter,
+        client=mock_client,
+        session=session,
+        text=":rebind backend custom my-model",
+        state=state,
+    )
+    succ_msg = state.messages[-1].content
+    assert "[DEPRECATED]" in succ_msg
+    assert "[SUCCESS]" in succ_msg
+    assert "Rebound role 'backend' to backend 'custom'" in succ_msg
+
 
 
 

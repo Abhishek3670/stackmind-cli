@@ -452,6 +452,48 @@ def tui(ctx, daemon_url, agent, workspace, session_id, demo, client_timeout, yes
                 clear_daemon_pid(workspace, expected_pid=os.getpid())
 
 
+@cli.command("attach")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option(
+    "--workspace",
+    "-w",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("."),
+    help="Workspace directory",
+)
+@click.option("--tag", "-t", multiple=True, help="Optional tags for the attachment")
+def attach_cmd(file_path: str, workspace: Path, tag: tuple[str, ...]):
+    """Ingest a document, image, or archive into .sync/attachments/."""
+    from validators.ingest import AttachmentStore
+    from cli.tui.attachments_panel import render_attachment_ingested_str
+
+    store = AttachmentStore(workspace)
+    try:
+        rec = store.ingest(file_path, tags=list(tag))
+        click.echo(render_attachment_ingested_str(rec))
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+
+@cli.command("attachments")
+@click.option(
+    "--workspace",
+    "-w",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("."),
+    help="Workspace directory",
+)
+def attachments_cmd(workspace: Path):
+    """List all workspace attachments and grounding assets."""
+    from validators.ingest import AttachmentStore
+    from cli.tui.attachments_panel import render_attachments_list_str
+
+    store = AttachmentStore(workspace)
+    records = store.list_attachments()
+    click.echo(render_attachments_list_str(records))
+
+
 cli.add_command(tui)
 
 if __name__ == "__main__":

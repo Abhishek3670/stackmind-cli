@@ -37,7 +37,7 @@ from validators.kernel.settings import (
 def render_settings_overview_str(
     settings: StackMindSettings,
     width: int = 80,
-    active_nav_hint: str = "[1-5] Configure Provider | [6] Assign Roles | [S] Save | [Esc/Q] Close",
+    active_nav_hint: str = "[1-5] Configure Provider | [S] Save | [Esc/Q] Close",
 ) -> str:
     """Render the main cloud providers configuration overview box."""
     box_w = max(40, min(width - 2, 88))
@@ -80,12 +80,12 @@ def render_settings_overview_str(
     gov_mode = getattr(settings, "govern_verbosity", "tree").upper()
     content.add_row(Text(f"\nExecution Profile: [{prof_name}] (Low | Medium | High)", style="bold #38bdf8"))
     content.add_row(Text(f"Governance Verbosity: [{gov_mode}] (Tree | Flat | Compact)  (Switch via :govern)", style="dim #a5b4fc"))
-    content.add_row(Text("Agent Role Bindings: Configure & rebind via :roles", style="dim #94a3b8"))
+    content.add_row(Text("Note: To assign which provider each agent role uses, use ':roles'", style="dim #94a3b8"))
 
     nav_hint = active_nav_hint or "[↑/↓] Navigate  [←/→] Toggle  [Enter] Configure  [Esc] Close"
     panel = Panel(
         content,
-        title="[bold #60a5fa] Cloud Providers & Models Configuration (settings.json) [/]",
+        title="[bold #60a5fa] Cloud Providers & Models Configuration (:provider) [/]",
         subtitle=f"[dim #94a3b8] {nav_hint} [/]",
         border_style="#3b82f6",
         width=box_w,
@@ -432,7 +432,7 @@ def run_interactive_settings_panel(
                 out.write(f"\x1b[1;33m>> {status_msg}\x1b[0m\n")
                 status_msg = ""
             roles_idx = len(provider_keys) + 1
-            out.write(f"\x1b[1;36mSelect Option [1-{len(provider_keys)} Provider, {roles_idx} Roles, S Save, Q/Esc Exit]: \x1b[0m")
+            out.write(f"\x1b[1;36mSelect Option [1-{len(provider_keys)} Provider, S Save, Q/Esc Exit]: \x1b[0m")
             out.flush()
 
             try:
@@ -446,8 +446,8 @@ def run_interactive_settings_panel(
             if choice.isdigit() and 1 <= int(choice) <= len(provider_keys):
                 idx = int(choice) - 1
                 current_view = f"provider:{provider_keys[idx]}"
-            elif choice == str(roles_idx):
-                current_view = "roles"
+            elif choice.lower() in ("roles", "role") or choice == str(roles_idx):
+                status_msg = "Agent role assignments are managed via ':roles'. Exit and run ':roles' to assign providers to roles."
             elif choice.lower() in ("p", "profile"):
                 curr = getattr(settings, "effective_profile", "medium").lower()
                 nxt = {"low": "medium", "medium": "high", "high": "low"}.get(curr, "medium")
@@ -719,7 +719,7 @@ def render_anchored_settings_panel_str(
         grid.add_row(Text(f"  {current_hint}", style="dim #94a3b8", no_wrap=True))
 
     elif view in ("main", "providers"):
-        title = " Cloud Providers & Models Configuration (settings.json) "
+        title = " Cloud Providers & Models Configuration (:provider) "
         subtitle = (
             f" >> {status_msg} "
             if status_msg
@@ -754,27 +754,22 @@ def render_anchored_settings_panel_str(
             grid.add_row(row_txt)
 
         if view == "providers":
-            # Item num_prov: Return to StackMind Settings
-            is_sel_ret = (sel == num_prov)
-            ptr_ret = "▸ " if is_sel_ret else "  "
-            ret_txt = Text(no_wrap=True)
-            ret_txt.append(ptr_ret, style="bold #38bdf8" if is_sel_ret else "dim")
-            ret_txt.append("◄ Return to StackMind Settings (:config)", style="bold #60a5fa" if is_sel_ret else "#38bdf8")
-            grid.add_row(ret_txt)
-
-            # Item num_prov + 1: Save & Exit
-            is_sel_save = (sel == num_prov + 1)
+            # Item num_prov: Save & Exit
+            is_sel_save = (sel == num_prov)
             ptr_save = "▸ " if is_sel_save else "  "
             save_txt = Text(no_wrap=True)
             save_txt.append(ptr_save, style="bold #38bdf8" if is_sel_save else "dim")
             save_txt.append("Save Settings to Disk & Apply to Runtime", style="bold #f59e0b" if is_sel_save else "dim #fbbf24")
             grid.add_row(save_txt)
 
-            # Row 8: Hint or status
+            # Row 8: Status message or empty line
             if status_msg:
                 grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
             else:
-                grid.add_row(Text("  Hint: Use arrow keys to navigate. Press Enter to configure provider.", style="dim #64748b"))
+                grid.add_row(Text(" ", style="dim"))
+
+            # Row 9: Navigation hint
+            grid.add_row(Text("  Hint: Use arrow keys to navigate. Press Enter to configure provider. (Use :roles for roles).", style="dim #64748b"))
 
         else:
             # view == "main" (legacy fallback for tests)
@@ -917,7 +912,7 @@ def render_anchored_settings_panel_str(
 
     elif view == "roles":
         title = " Agent Role Assignments (:roles) "
-        subtitle = " [↑/↓] Select Role  [←/→] Provider  [Enter] Model  [Esc] Close "
+        subtitle = " [↑/↓] Select Role  [←/→] Provider  [Enter] Model  [Esc] Save & Close "
 
         roles_list = ["architecture", "backend", "frontend", "qa", "gitops"]
         for i, r in enumerate(roles_list):
@@ -946,7 +941,7 @@ def render_anchored_settings_panel_str(
 
         # Hint & status rows to keep height exactly 11 lines
         grid.add_row(Text("  Navigation: [↑/↓] Select Role  [←/→] Cycle Provider  [Enter] Cycle Model", style="dim #64748b", no_wrap=True))
-        grid.add_row(Text("  Select Save row and press Enter to save to settings.json.", style="dim #64748b", no_wrap=True))
+        grid.add_row(Text("  Tip: Use [←/→] to change role provider. To configure endpoints, use ':provider'.", style="dim #64748b", no_wrap=True))
         if status_msg:
             grid.add_row(Text(f" >> {status_msg}", style="bold #f59e0b", no_wrap=True))
         else:
@@ -1082,7 +1077,7 @@ def run_arrow_navigation_settings_loop(
         if view in ("settings", "stackmind", "config"):
             max_rows = 6  # 0: Profile, 1: Timeout, 2: Laya, 3: Providers, 4: Roles, 5: Save
         elif view == "providers":
-            max_rows = num_prov + 2  # 0..num_prov-1: Providers, num_prov: Return, num_prov+1: Save
+            max_rows = num_prov + 1  # 0..num_prov-1: Providers, num_prov: Save Settings & Exit
         elif view == "main":
             max_rows = num_prov + 3  # providers (num_prov), profile (1), roles (1), save (1)
         elif view == "profile":
@@ -1200,6 +1195,12 @@ def run_arrow_navigation_settings_loop(
                         state.roles[display_name].backend = new_p
                         state.roles[display_name].model = new_m
                     state.settings_status_msg = f"Bound '{display_name}' to {new_p} ({new_m})."
+                    save_settings(settings, workspace)
+                    if client and hasattr(client, "settings_update"):
+                        try:
+                            client.settings_update(settings.to_dict())
+                        except Exception:
+                            pass
                     _redraw()
             continue
 
@@ -1261,12 +1262,7 @@ def run_arrow_navigation_settings_loop(
                     state.settings_selected_row = 0
                     state.settings_status_msg = ""
                     _redraw()
-                elif sel == num_prov:  # ◄ Return to StackMind Settings
-                    state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
-                    state.settings_selected_row = 3
-                    state.settings_status_msg = ""
-                    _redraw()
-                elif sel == num_prov + 1:  # Save & Exit
+                elif sel == num_prov:  # Save & Exit
                     save_settings(settings, workspace)
                     if client and hasattr(client, "settings_update"):
                         try:
@@ -1446,7 +1442,15 @@ def run_arrow_navigation_settings_loop(
                         settings.roles[r_name] = {"provider": p_val, "model": new_m}
                         if hasattr(state, "roles") and display_name in state.roles:
                             state.roles[display_name].model = new_m
-                        state.settings_status_msg = f"Role '{display_name}' model set to '{new_m}'."
+                        state.settings_status_msg = (
+                            f"Role '{display_name}' model set to '{new_m}' under {p_val}. (Tip: Use ←/→ to change provider)"
+                        )
+                        save_settings(settings, workspace)
+                        if client and hasattr(client, "settings_update"):
+                            try:
+                                client.settings_update(settings.to_dict())
+                            except Exception:
+                                pass
                     else:
                         state.settings_status_msg = f"No catalog models for {p_val}."
                     _redraw()
@@ -1461,9 +1465,21 @@ def run_arrow_navigation_settings_loop(
                 _redraw()
                 return "[INFO] Profile selection cancelled (no changes)."
             elif initial_view == "roles":
+                save_settings(settings, workspace)
+                if client and hasattr(client, "settings_update"):
+                    try:
+                        client.settings_update(settings.to_dict())
+                    except Exception:
+                        pass
+                for r_name in role_keys:
+                    r_cfg = settings.roles.get(r_name, {})
+                    d_name = "Q/A" if r_name.lower() in ("qa", "q/a") else r_name.title()
+                    if hasattr(state, "roles") and d_name in state.roles:
+                        state.roles[d_name].backend = r_cfg.get("provider", state.roles[d_name].backend)
+                        state.roles[d_name].model = r_cfg.get("model", state.roles[d_name].model)
                 state.close_settings()
                 _redraw()
-                return "[INFO] Agent role bindings closed."
+                return "[SUCCESS] Agent role bindings saved to settings.json and applied to runtime."
             elif view in ("settings", "stackmind", "config"):
                 break
             elif view == "providers":
@@ -1475,15 +1491,21 @@ def run_arrow_navigation_settings_loop(
                     state.settings_status_msg = ""
                     _redraw()
             elif view == "roles":
+                save_settings(settings, workspace)
+                if client and hasattr(client, "settings_update"):
+                    try:
+                        client.settings_update(settings.to_dict())
+                    except Exception:
+                        pass
                 if initial_view in ("settings", "stackmind", "config"):
                     state.settings_current_view = "config" if initial_view in ("settings", "stackmind", "config") else "settings"
                     state.settings_selected_row = 4
-                    state.settings_status_msg = ""
+                    state.settings_status_msg = "Role bindings saved to settings.json."
                     _redraw()
                 else:
                     state.settings_current_view = "main"
                     state.settings_selected_row = num_prov + 1
-                    state.settings_status_msg = ""
+                    state.settings_status_msg = "Role bindings saved to settings.json."
                     _redraw()
             elif view != "main":
                 if view == "profile":

@@ -84,6 +84,7 @@ def compute_composer_height(
     content: str | list[str] | None = None,
     height: int | None = None,
     state: Any | None = None,
+    width: int | None = None,
 ) -> int:
     """Calculate dynamic composer box height (including borders) based on content lines.
 
@@ -92,10 +93,12 @@ def compute_composer_height(
     if content is None and state is not None and getattr(state, "composer_buffer", ""):
         content = state.composer_buffer
 
-    if isinstance(content, str):
-        lines_count = len(content.split("\n")) if content else 1
-    elif content:
-        lines_count = len(content)
+    if content:
+        w = width if width is not None else 80
+        wrap_width = max(10, w - 6)
+        from cli.tui.keyboard import wrap_composer_text
+
+        lines_count = len(wrap_composer_text(content, wrap_width))
     else:
         lines_count = 1
 
@@ -110,6 +113,7 @@ def compute_viewport_height(
     show_footer: bool = True,
     composer_content: str | list[str] | None = None,
     composer_height: int | None = None,
+    width: int | None = None,
 ) -> int:
     """Calculate the conversation/workspace viewport height for a given terminal height.
 
@@ -122,14 +126,18 @@ def compute_viewport_height(
     if composer_height is not None:
         comp_h = composer_height
     elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
-        comp_h = compute_composer_height(composer_content, height=lines, state=state)
+        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=width)
     else:
         comp_h = COMPOSER_BOX_HEIGHT
 
     chrome = comp_h + (STATUS_BAR_HEIGHT if show_footer else 0)
     if state is not None and getattr(state, "settings_panel_open", False):
         chrome += SETTINGS_PANEL_HEIGHT
+    if state is not None and getattr(state, "command_dialog_open", False):
+        from cli.tui.command_dialog import compute_command_dialog_height
+        chrome += compute_command_dialog_height(state, height=lines)
     return max(MIN_VIEWPORT_HEIGHT, lines - chrome)
+
 
 
 def compute_composer_cursor_row(
@@ -140,6 +148,7 @@ def compute_composer_cursor_row(
     composer_content: str | list[str] | None = None,
     cursor_line: int | None = None,
     composer_height: int | None = None,
+    width: int | None = None,
 ) -> int:
     """Calculate the 1-based ANSI terminal row for the composer input cursor.
 
@@ -156,7 +165,7 @@ def compute_composer_cursor_row(
     if composer_height is not None:
         comp_h = composer_height
     elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
-        comp_h = compute_composer_height(composer_content, height=lines, state=state)
+        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=width)
     else:
         comp_h = COMPOSER_BOX_HEIGHT
 
@@ -211,7 +220,7 @@ class ColumnLayout:
         return 1 if self.show_runtime else 0
 
 
-def compute_layout(width: int) -> ColumnLayout:
+def compute_layout(width: int, *args: Any, **kwargs: Any) -> ColumnLayout:
     """Compute the multi-tier responsive layout for a given terminal width (WO-019).
 
     Supports 5 breakpoint tiers:
@@ -221,6 +230,22 @@ def compute_layout(width: int) -> ColumnLayout:
     - WIDE (140-179 cols): 2-column proportional flex with runtime capped at 38 cols.
     - VERY_WIDE (>=180 cols): Full-stretch 2-column split, flush at column 0 (WO-022).
     """
+    show_runtime_kw = kwargs.get("show_runtime")
+    state_kw = kwargs.get("state")
+    if (
+        show_runtime_kw is False
+        or (state_kw is not None and getattr(state_kw, "runtime_panel_visible", True) is False)
+    ):
+        return ColumnLayout(
+            total_width=width,
+            conversation_width=width,
+            runtime_width=0,
+            show_runtime=False,
+            tier=LayoutTier.NARROW if width >= NARROW_BREAKPOINT else LayoutTier.VERY_NARROW,
+            left_margin=0,
+            right_margin=0,
+            show_runtime_badge=False,
+        )
     if width < VERY_NARROW_BREAKPOINT:
         return ColumnLayout(
             total_width=width,
@@ -599,9 +624,6 @@ def slice_conversation_viewport(
             if not raw_line:
                 visual_lines.append("")
                 continue
-            if len(raw_line) <= avail_width and "\x1b[" not in raw_line:
-                visual_lines.append(raw_line)
-                continue
             t = Text.from_ansi(raw_line) if "\x1b[" in raw_line else Text(raw_line)
             if t.cell_len <= avail_width:
                 visual_lines.append(raw_line)
@@ -688,7 +710,7 @@ def render_workspace_layout(
     - If show_runtime is True (NORMAL, WIDE, VERY_WIDE modes), returns a Table grid
       with [conversation] [divider] [runtime] — all flush at column 0 (WO-022).
     """
-    layout = compute_layout(width)
+    layout = compute_layout(width, state=state)
 
     active_scroll = conversation_scroll
     if active_scroll is None and state is not None and hasattr(state, "conversation_scroll"):
@@ -750,7 +772,8 @@ def render_workspace_layout(
         )
         divider_char = Text("\n").join(s_rows)
     else:
-        divider_char = Text("│", style="dim #334155")
+        d_count = max(1, vp_h or 1)
+        divider_char = Text("\n").join([Text("│", style="dim #334155") for _ in range(d_count)])
 
     grid.add_row(conv_column, divider_char, runtime)
     return grid
@@ -774,7 +797,7 @@ def render_workspace_layout_str(
     """Render the full workspace layout as plain or ANSI-styled text."""
     if conversation_content is not None:
         conversation_text = conversation_content
-    layout = compute_layout(width)
+    layout = compute_layout(width, state=state)
     has_runtime_data = (
         (state is not None)
         or bool(agents)
@@ -871,7 +894,7 @@ def render_full_screen_workspace(
     )
     from cli.tui.chat import render_chat_transcript_str
 
-    layout = compute_layout(width)
+    layout = compute_layout(width, state=state)
     status = getattr(state, "connection_status", "online")
     context_meter = (
         (getattr(state, "context_meter_text", None), getattr(state, "context_warning_level", None))
@@ -896,8 +919,16 @@ def render_full_screen_workspace(
     )
 
     # 2. Viewport height (reserved 1 line for bottom status bar, dynamic composer box height, and settings panel if open)
+    # Use the same width as the composer so multi-line input wraps identically
+    # in the height calculation and in the rendered box. A mismatch here makes
+    # the composer jump vertically between frames and leaves ghost borders.
+    comp_width = layout.conversation_width if layout.show_runtime else width
     viewport_height = compute_viewport_height(
-        height, state=state, show_footer=True, composer_content=composer_content
+        height,
+        state=state,
+        show_footer=True,
+        composer_content=composer_content,
+        width=comp_width,
     )
 
     # 3. Conversation content
@@ -940,11 +971,26 @@ def render_full_screen_workspace(
             state, width=settings_width, height=SETTINGS_PANEL_HEIGHT
         )
 
+    # 4b. System command dialog anchored just above the text area
+    dialog_open = getattr(state, "command_dialog_open", False) if state is not None else False
+    dialog_str = ""
+    if dialog_open:
+        from cli.tui.command_dialog import render_command_dialog_str
+
+        dialog_width = layout.conversation_width if layout.show_runtime else width
+        dialog_str = render_command_dialog_str(
+            state, width=dialog_width, height=height, force_color=force_color, no_color=no_color
+        )
+
     if not include_composer:
+        blocks = [workspace_str]
+        if dialog_str:
+            blocks.append(dialog_str)
         if settings_open and settings_panel_str:
-            res = f"{workspace_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{settings_panel_str}"
-        else:
-            res = f"{workspace_str}\n{status_bar_str}" if status_bar_str else workspace_str
+            blocks.append(settings_panel_str)
+        if status_bar_str:
+            blocks.append(status_bar_str)
+        res = "\n".join(blocks)
         all_lines = res.split("\n")
         if height is not None:
             comp_h = compute_composer_height(composer_content, height=height, state=state)
@@ -956,7 +1002,6 @@ def render_full_screen_workspace(
         return "\n".join(all_lines)
 
     # 5. Dynamic bottom composer box placed above bottom status bar / settings panel
-    comp_width = layout.conversation_width if layout.show_runtime else width
     effective_placeholder = composer_placeholder
     if (
         (effective_placeholder in {None, "", "Type a message..."})
@@ -978,10 +1023,16 @@ def render_full_screen_workspace(
         retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
     )
 
+    blocks = [workspace_str]
+    if dialog_str:
+        blocks.append(dialog_str)
+    blocks.append(composer_str)
     if settings_open and settings_panel_str:
-        res = f"{workspace_str}\n{composer_str}\n{settings_panel_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}\n{settings_panel_str}"
-    else:
-        res = f"{workspace_str}\n{composer_str}\n{status_bar_str}" if status_bar_str else f"{workspace_str}\n{composer_str}"
+        blocks.append(settings_panel_str)
+    if status_bar_str:
+        blocks.append(status_bar_str)
+    res = "\n".join(blocks)
+
 
     all_lines = res.split("\n")
     if height is not None:

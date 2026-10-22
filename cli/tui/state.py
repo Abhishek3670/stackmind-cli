@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -37,7 +38,6 @@ def canonical_blocker_text(block_msg: Any) -> str:
         from cli.tui.events import clean_error_message
         err_val = block_msg.get("error") or block_msg.get("reason") or block_msg.get("message")
         if err_val:
-            import re
             m = re.search(r"\[(.*?)\]", str(err_val))
             if m:
                 err_val = m.group(1).strip()
@@ -471,6 +471,7 @@ class ChatMessage:
     thinking: str | None = None
     turn_id: str | None = None
     thinking_expanded: bool = False
+    is_command: bool = False
 
 
 @dataclass
@@ -504,6 +505,19 @@ class ConversationScroll:
         self.follow_bottom = True
         self.has_new_activity = False
 
+    def set_scroll_offset(self, offset: int) -> None:
+        """Set absolute scroll offset directly (e.g. from scrollbar drag or positioning)."""
+        max_limit = self.max_offset if (self.max_offset is not None and self.max_offset > 0) else None
+        if max_limit is not None:
+            self.scroll_offset = max(0, min(offset, max_limit))
+        else:
+            self.scroll_offset = max(0, offset)
+        if self.scroll_offset == 0:
+            self.follow_bottom = True
+            self.has_new_activity = False
+        else:
+            self.follow_bottom = False
+
     def notify_activity(self) -> None:
         """Notify that new conversation content arrived outside current viewport."""
         if not self.follow_bottom and self.scroll_offset > 0:
@@ -533,6 +547,7 @@ class AutonomousDeliveryState:
         self.project_name = project_name
         self.session_id = session_id
         self.phase: ProjectPhase = ProjectPhase.INITIALIZING
+        self.mouse_reporting_enabled: bool = True
         self.error: str | None = None
         self.plan: dict[str, Any] = {}
         self.plan_revisions: list[PlanRevision] = []
@@ -598,12 +613,14 @@ class AutonomousDeliveryState:
         self.last_sequence: int = 0
         self.seen_sequences: set[int] = set()
         self.seen_message_keys: set[tuple[str, str]] = set()
+        self.seen_harness_reports: set[str] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
         self.govern_verbosity: str = "tree"  # "tree" | "flat" | "compact"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False, verbosity=self.govern_verbosity)
         self.current_turn_thinking: str = ""
         self.thinking_expanded: bool = True
         self.live_thinking_expanded: bool = True
+        self.actions_expanded: bool = False
         self.active_tool_name: str | None = None
         self.active_tool_target: str | None = None
         self.active_tool_code: str | None = None
@@ -618,6 +635,14 @@ class AutonomousDeliveryState:
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
         self.cumulative_turn_tokens: int = 0
+        self._legacy_prompt_tokens: int = 0
+        self._legacy_completion_tokens: int = 0
+        self._legacy_cumulative_turn_tokens: int = 0
+        self._unattached_prompt_tokens: int = 0
+        self._unattached_completion_tokens: int = 0
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
+        self.operation_tokens: dict[str, dict[str, int]] = {}
         self.compaction_count: int = 0
         self.settings_panel_open: bool = False
         self.settings_selected_row: int = 0
@@ -634,6 +659,36 @@ class AutonomousDeliveryState:
         self.max_retries: int = 10
         self.retry_status: str | None = None
         self.active_working_status: str | None = None
+        self.command_dialog_open: bool = False
+        self.command_dialog_command: str = ""
+        self.command_dialog_output: str = ""
+        self.command_dialog_scroll: int = 0
+        self.command_dialog_title: str = ""
+        self._last_command_str: str | None = None
+        self.runtime_panel_visible: bool = True
+
+    def toggle_runtime_panel(self) -> bool:
+        """Toggle visibility of the persistent runtime sidebar panel (Ctrl+B)."""
+        self.runtime_panel_visible = not self.runtime_panel_visible
+        return self.runtime_panel_visible
+
+    def get_latest_suggested_goal(self) -> str | None:
+        """Extract the most recently proposed :goal command from assistant messages."""
+
+        for msg in reversed(self.messages):
+            role = getattr(msg, "role", getattr(msg, "sender", ""))
+            if role == "assistant":
+                content = getattr(msg, "content", "")
+                if not content:
+                    continue
+                # Match :goal followed by description (handles backticks, leading symbols, or newlines)
+                m = re.search(r"(?:^|[^\w/]):goal\s+([^\n`\r]+)", content, re.MULTILINE)
+                if m:
+                    goal_text = m.group(1).strip()
+                    goal_text = goal_text.rstrip("`'\"").lstrip("`'\"").strip()
+                    if goal_text:
+                        return goal_text
+        return None
 
     @property
     def retry_status_display(self) -> str | None:
@@ -713,15 +768,145 @@ class AutonomousDeliveryState:
         self.settings_current_view = "main"
         self.settings_status_msg = ""
 
+    def show_command_dialog(self, command: str, output: str, title: str | None = None) -> None:
+        """Open system command dialog just above the composer text area."""
+        self.command_dialog_open = True
+        self.command_dialog_command = command
+        self.command_dialog_output = output
+        self.command_dialog_scroll = 0
+        self.command_dialog_title = title or ""
+
+    def close_command_dialog(self) -> None:
+        """Close system command dialog and restore normal conversation viewport."""
+        self.command_dialog_open = False
+        self.command_dialog_command = ""
+        self.command_dialog_output = ""
+        self.command_dialog_scroll = 0
+        self.command_dialog_title = ""
+
+    def scroll_command_dialog_up(self, lines: int = 1) -> None:
+        """Scroll command dialog content upward."""
+        if self.command_dialog_scroll > 0:
+            self.command_dialog_scroll = max(0, self.command_dialog_scroll - lines)
+
+    def scroll_command_dialog_down(self, lines: int = 1, max_lines: int = 1000) -> None:
+        """Scroll command dialog content downward."""
+        self.command_dialog_scroll = min(max_lines, self.command_dialog_scroll + lines)
+
+    def record_command_output(self, command: str, output: str, title: str | None = None) -> None:
+        """Record command execution and display output in dialog above text area without cluttering chat."""
+        self.add_message("user", command, is_command=True)
+        msg = self.add_message("system", output, is_command=True)
+        try:
+            setattr(msg, "_is_command_output", True)
+        except Exception:
+            pass
+        self.show_command_dialog(command, output, title=title)
+
     @staticmethod
     def estimate_tokens(text: str) -> int:
         """Return a fast, dependency-free token estimate suitable for local models."""
         return max(0, math.ceil(len(text or "") / 4))
 
+    def _recompute_token_totals(self) -> None:
+        op_p = sum(op.get("prompt", 0) for op in self.operation_tokens.values())
+        op_c = sum(op.get("completion", 0) for op in self.operation_tokens.values())
+        total_p = op_p + self._unattached_prompt_tokens
+        total_c = op_c + self._unattached_completion_tokens
+        self.prompt_tokens = max(total_p, self._legacy_prompt_tokens)
+        self.completion_tokens = max(total_c, self._legacy_completion_tokens)
+        self.cumulative_turn_tokens = max(total_p + total_c, self._legacy_cumulative_turn_tokens)
+
+    def record_operation_tokens(
+        self,
+        op_id: str | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        """Record provider-measured tokens for an operation to avoid double-counting across retries."""
+        if prompt_tokens > 0:
+            self.last_prompt_tokens = prompt_tokens
+        if completion_tokens > 0:
+            self.last_completion_tokens = completion_tokens
+        if op_id:
+            curr = self.operation_tokens.get(op_id, {"prompt": 0, "completion": 0, "total": 0})
+            new_p = max(curr["prompt"], prompt_tokens)
+            new_c = max(curr["completion"], completion_tokens)
+            self.operation_tokens[op_id] = {
+                "prompt": new_p,
+                "completion": new_c,
+                "total": new_p + new_c,
+            }
+        else:
+            self._unattached_prompt_tokens = max(self._unattached_prompt_tokens, prompt_tokens)
+            self._unattached_completion_tokens = max(self._unattached_completion_tokens, completion_tokens)
+        self._recompute_token_totals()
+
+    def record_token_usage(
+        self,
+        prompt: str = "",
+        completion: str = "",
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+    ) -> None:
+        """Accumulate per-session prompt/completion estimates for observability."""
+        p_count = prompt_tokens if prompt_tokens is not None else self.estimate_tokens(prompt)
+        c_count = completion_tokens if completion_tokens is not None else self.estimate_tokens(completion)
+        self._legacy_prompt_tokens += p_count
+        self._legacy_completion_tokens += c_count
+        self._legacy_cumulative_turn_tokens += p_count + c_count
+        self._recompute_token_totals()
+
+    def estimate_transcript_tokens(self) -> int:
+        """Return estimated tokens across all retained messages, thinking, and actions."""
+        total = 0
+        for message in self.messages:
+            total += self.estimate_tokens(message.content)
+            if message.thinking:
+                total += self.estimate_tokens(message.thinking)
+            if message.actions:
+                for a in message.actions.all_actions:
+                    if a.description:
+                        total += self.estimate_tokens(a.description)
+                    if a.target:
+                        total += self.estimate_tokens(a.target)
+                    if a.diff:
+                        total += self.estimate_tokens(a.diff)
+                    if a.code:
+                        total += self.estimate_tokens(a.code)
+                    if a.output:
+                        total += self.estimate_tokens(a.output)
+                    if a.error:
+                        total += self.estimate_tokens(a.error)
+        if getattr(self, "current_turn_thinking", None):
+            total += self.estimate_tokens(self.current_turn_thinking)
+        turn_actions = getattr(self, "current_turn_actions", None)
+        if turn_actions and hasattr(turn_actions, "all_actions"):
+            for a in turn_actions.all_actions:
+                if a.description:
+                    total += self.estimate_tokens(a.description)
+                if a.target:
+                    total += self.estimate_tokens(a.target)
+                if a.diff:
+                    total += self.estimate_tokens(a.diff)
+                if a.code:
+                    total += self.estimate_tokens(a.code)
+                if a.output:
+                    total += self.estimate_tokens(a.output)
+                if a.error:
+                    total += self.estimate_tokens(a.error)
+        return total
+
     @property
     def context_tokens(self) -> int:
-        """Estimated tokens currently retained in the model-facing transcript."""
-        return sum(self.estimate_tokens(message.content) for message in self.messages)
+        """Estimated tokens currently retained in or evaluated by the active model context."""
+        transcript_est = self.estimate_transcript_tokens()
+        active_prompt = getattr(self, "last_prompt_tokens", 0) or 0
+        active_in_progress = self.estimate_tokens(getattr(self, "current_turn_thinking", ""))
+        if hasattr(self, "last_completion_tokens") and self.last_completion_tokens:
+            active_in_progress = max(active_in_progress, self.last_completion_tokens)
+        model_context = active_prompt + active_in_progress if active_prompt > 0 else 0
+        return max(transcript_est, model_context)
 
     @property
     def context_utilization(self) -> float:
@@ -744,14 +929,6 @@ class AutonomousDeliveryState:
         """Set a detected model context capacity, retaining a safe positive value."""
         self.context_window_tokens = max(1, int(tokens))
 
-    def record_token_usage(self, prompt: str = "", completion: str = "") -> None:
-        """Accumulate per-session prompt/completion estimates for observability."""
-        prompt_count = self.estimate_tokens(prompt)
-        completion_count = self.estimate_tokens(completion)
-        self.prompt_tokens += prompt_count
-        self.completion_tokens += completion_count
-        self.cumulative_turn_tokens += prompt_count + completion_count
-
     def compact_transcript(self, keep_recent: int | None = None) -> bool:
         """Replace older transcript turns with a concise local continuity summary."""
         keep = self.compaction_keep_recent if keep_recent is None else max(1, keep_recent)
@@ -772,7 +949,8 @@ class AutonomousDeliveryState:
         )
         summary_message = ChatMessage(role="system", content=summary, timestamp=self.now_str())
         self.messages = [summary_message, *retained]
-        self.seen_message_keys = {(message.role, message.content.strip()) for message in self.messages}
+        # Preserve all historical seen_message_keys so compacted turns are never re-added as duplicates
+        self.seen_message_keys.add((summary_message.role, summary_message.content.strip()))
         self.compaction_count += 1
         self.conversation_scroll.notify_activity()
         self.conversation_scroll.max_offset = None
@@ -803,9 +981,22 @@ class AutonomousDeliveryState:
         actions: ActionsGroup | None = None,
         thinking: str | None = None,
         turn_id: str | None = None,
+        is_command: bool = False,
     ) -> ChatMessage:
         clean = content.strip()
+        if not is_command and role == "user" and clean.startswith(":"):
+            is_command = True
+            self._last_command_str = clean
+        elif role == "user":
+            self._last_command_str = None
+            self.close_command_dialog()
+        elif role == "system" and getattr(self, "_last_command_str", None):
+            is_command = True
+            cmd_name = self._last_command_str
+            self._last_command_str = None
+            self.show_command_dialog(cmd_name, content)
         key = (role, clean)
+
         if deduplicate and key in self.seen_message_keys:
             for m in self.messages:
                 if m.role == role and m.content.strip() == clean:
@@ -857,6 +1048,9 @@ class AutonomousDeliveryState:
             if msg_actions is self.current_turn_actions:
                 self.current_turn_actions = ActionsGroup(active=False, verbosity=self.govern_verbosity)
 
+        if msg_actions and getattr(self, "actions_expanded", False):
+            msg_actions.expanded = self.actions_expanded
+
         msg = ChatMessage(
             role=role,
             content=msg_content,
@@ -865,8 +1059,10 @@ class AutonomousDeliveryState:
             thinking=msg_thinking,
             turn_id=turn_id,
             thinking_expanded=self.thinking_expanded,
+            is_command=is_command,
         )
         self.messages.append(msg)
+
         if role == "user":
             self.record_token_usage(prompt=msg_content)
         elif role == "assistant":
@@ -923,6 +1119,10 @@ class AutonomousDeliveryState:
     def scroll_conversation_to_bottom(self) -> None:
         """Jump conversation viewport to bottom and resume live-following (§31)."""
         self.conversation_scroll.scroll_to_bottom()
+
+    def set_conversation_scroll_offset(self, offset: int) -> None:
+        """Set absolute conversation viewport scroll offset directly."""
+        self.conversation_scroll.set_scroll_offset(offset)
 
     def record_turn_action(
         self,
@@ -1002,10 +1202,15 @@ class AutonomousDeliveryState:
             asst_msgs = [m for m in self.messages if m.role == "assistant" and m.actions]
             if 0 <= turn_index < len(asst_msgs):
                 return asst_msgs[turn_index].actions.toggle()  # type: ignore[union-attr]
-        group = self.get_latest_actions_group()
-        if group:
-            return group.toggle()
-        return False
+        latest = self.get_latest_actions_group()
+        new_expanded = not (latest.expanded if latest else getattr(self, "actions_expanded", False))
+        self.actions_expanded = new_expanded
+        if self.current_turn_actions:
+            self.current_turn_actions.expanded = new_expanded
+        for m in self.messages:
+            if m.actions:
+                m.actions.expanded = new_expanded
+        return new_expanded
 
     def expand_actions(self, turn_index: int | None = None) -> None:
         """Expand actions disclosure via keyboard (§22)."""
@@ -1014,9 +1219,12 @@ class AutonomousDeliveryState:
             if 0 <= turn_index < len(asst_msgs):
                 asst_msgs[turn_index].actions.expand()  # type: ignore[union-attr]
                 return
-        group = self.get_latest_actions_group()
-        if group:
-            group.expand()
+        self.actions_expanded = True
+        if self.current_turn_actions:
+            self.current_turn_actions.expand()
+        for m in self.messages:
+            if m.actions:
+                m.actions.expand()
 
     def collapse_actions(self, turn_index: int | None = None) -> None:
         """Collapse actions disclosure via keyboard (§22)."""
@@ -1025,9 +1233,52 @@ class AutonomousDeliveryState:
             if 0 <= turn_index < len(asst_msgs):
                 asst_msgs[turn_index].actions.collapse()  # type: ignore[union-attr]
                 return
-        group = self.get_latest_actions_group()
-        if group:
-            group.collapse()
+        self.actions_expanded = False
+        if self.current_turn_actions:
+            self.current_turn_actions.collapse()
+        for m in self.messages:
+            if m.actions:
+                m.actions.collapse()
+
+    def toggle_disclosures(self) -> bool:
+        """Toggle all collapsible disclosures (thinking + actions) harmoniously (§22)."""
+        has_actions = any(m.actions and not m.actions.is_empty for m in self.messages) or (
+            self.current_turn_actions and not self.current_turn_actions.is_empty
+        )
+        has_thinking = any(getattr(m, "thinking", None) for m in self.messages) or bool(self.current_turn_thinking)
+
+        actions_collapsed = False
+        if has_actions:
+            latest_act = self.get_latest_actions_group()
+            if latest_act and not latest_act.expanded:
+                actions_collapsed = True
+            elif not getattr(self, "actions_expanded", False):
+                actions_collapsed = True
+
+        thinking_collapsed = False
+        if has_thinking:
+            if not getattr(self, "thinking_expanded", True):
+                thinking_collapsed = True
+            elif any(getattr(m, "thinking", None) and not getattr(m, "thinking_expanded", False) for m in self.messages):
+                thinking_collapsed = True
+
+        if has_actions and not has_thinking:
+            return self.toggle_actions()
+        elif has_thinking and not has_actions:
+            return self.toggle_thinking()
+        elif has_actions and has_thinking:
+            target_expand = actions_collapsed or thinking_collapsed
+            if target_expand:
+                self.expand_thinking()
+                self.expand_actions()
+                return True
+            else:
+                self.collapse_thinking()
+                self.collapse_actions()
+                return False
+        else:
+            self.toggle_thinking()
+            return self.toggle_actions()
 
     def handle_mouse_click(
         self,
@@ -1151,6 +1402,18 @@ class AutonomousDeliveryState:
         ws_session = session.get("workspace")
         if ws_session:
             self.sync_work_orders_from_disk(ws_session)
+        journal = session.get("journal")
+        if isinstance(journal, list):
+            for rec in journal:
+                if isinstance(rec, Mapping):
+                    op_id = rec.get("operation_id")
+                    result = rec.get("result")
+                    if isinstance(result, Mapping):
+                        telem = result.get("telemetry")
+                        if isinstance(telem, Mapping):
+                            p_tok = int(telem.get("prompt_tokens", 0) or 0)
+                            c_tok = int(telem.get("completion_tokens", 0) or 0)
+                            self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
         self.reconcile_roles_from_work_orders()
 
     def sync_work_orders(self, wo_records: list[dict[str, Any]]) -> None:
@@ -1699,6 +1962,12 @@ class AutonomousDeliveryState:
                 )
             )
             self.add_activity("Architecture", f"proposed plan {plan_id}")
+            wos = payload.get("metadata", {}).get("work_orders") or []
+            wo_count_str = f" with {len(wos)} work orders" if wos else ""
+            self.add_message(
+                "system",
+                f"[PLAN READY] Plan '{plan_id}' proposed{wo_count_str}. Type :approve (or 'continue') to authorize autonomous multi-agent execution, or :reject [feedback].",
+            )
 
         elif name == "plan.approved":
             self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
@@ -1841,10 +2110,18 @@ class AutonomousDeliveryState:
                 self.completion_checklist["README.md"] = True
                 self.completion_checklist["Git"] = True
 
+            result = payload.get("result")
+            if isinstance(result, Mapping):
+                telem = result.get("telemetry")
+                if isinstance(telem, Mapping):
+                    p_tok = int(telem.get("prompt_tokens", 0) or 0)
+                    c_tok = int(telem.get("completion_tokens", 0) or 0)
+                    self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
             self.add_activity(normalized_role, "completed", op_name or (wo_id or ""))
             self.reconcile_roles_from_work_orders()
 
         elif name in {"operation.cancelled", "agent.cancelled", "turn.cancelled", "session.cancelled"}:
+            self.active_working_status = None
             role = (payload.get("role") or "Agent").title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             op_id = payload.get("operation_id")
@@ -1866,6 +2143,7 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, "cancelled", payload.get("reason", ""))
 
         elif name in {"operation.failed", "turn.failed"}:
+            self.active_working_status = None
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -1883,6 +2161,7 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, "failed", str(err_msg))
 
         elif name in {"operation.blocked", "turn.blocked"}:
+            self.active_working_status = None
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -2023,6 +2302,16 @@ class AutonomousDeliveryState:
                 prof = telem.get("execution_profile") or payload.get("execution_profile")
                 if prof:
                     self.execution_profile = str(prof)
+                op_id = event.get("operation_id") or payload.get("operation_id")
+                p_tok = int(telem.get("prompt_tokens", 0) or 0)
+                c_tok = int(telem.get("completion_tokens", 0) or 0)
+                self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
+
+        elif name in {"token.usage", "usage.delta"}:
+            op_id = event.get("operation_id") or payload.get("operation_id")
+            p_tok = int(payload.get("prompt_tokens", 0) or 0)
+            c_tok = int(payload.get("completion_tokens", 0) or 0)
+            self.record_operation_tokens(op_id, prompt_tokens=p_tok, completion_tokens=c_tok)
 
         elif name in {"agent.thinking", "turn.thinking", "reasoning.delta"}:
             raw_think = payload.get("text") or payload.get("thinking") or payload.get("thought") or payload.get("reasoning") or payload.get("delta") or ""

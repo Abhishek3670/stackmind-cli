@@ -586,17 +586,19 @@ def test_raw_prompt_input_mouse_wheel():
 
 def test_terminal_state_restorer_disables_mouse():
     """Verify TerminalStateRestorer exits with mouse reporting disabled."""
+    from cli.tui.keyboard import DISABLE_MOUSE_REPORTING_SEQ
+
     buf = io.StringIO()
     with patch("sys.stdout", buf):
         with TerminalStateRestorer():
             pass
-    assert "\x1b[?1006l\x1b[?1000l" in buf.getvalue()
+    assert DISABLE_MOUSE_REPORTING_SEQ in buf.getvalue()
 
 
 # ─── 9. WIN32 DIRECT INPUT RECORD READER TESTS (PHASE 1) ────────────────────
 
 
-def _make_key_record(char: str = "\x00", vk: int = 0, down: bool = True, repeat: int = 1):
+def _make_key_record(char: str = "\x00", vk: int = 0, down: bool = True, repeat: int = 1, ctrl_state: int = 0):
     from cli.tui.keyboard import INPUT_RECORD
     rec = INPUT_RECORD()
     rec.EventType = 0x0001
@@ -605,7 +607,7 @@ def _make_key_record(char: str = "\x00", vk: int = 0, down: bool = True, repeat:
     rec.Event.KeyEvent.wVirtualKeyCode = vk
     rec.Event.KeyEvent.wVirtualScanCode = 0
     rec.Event.KeyEvent.UnicodeChar = char
-    rec.Event.KeyEvent.dwControlKeyState = 0
+    rec.Event.KeyEvent.dwControlKeyState = ctrl_state
     return rec
 
 
@@ -622,7 +624,7 @@ def _make_mouse_record(event_flags: int = 0, button_state: int = 0, x: int = 0, 
 
 
 def test_win32_reader_mouse_wheel():
-    """Verify Win32ConsoleReader parses MOUSE_WHEELED records into MOUSE_WHEEL_UP/DOWN."""
+    """Verify Win32ConsoleReader parses MOUSE_WHEELED records into MOUSE_WHEEL_UP/DOWN and motion into drags."""
     from cli.tui.keyboard import Key, Win32ConsoleReader
 
     reader = Win32ConsoleReader(handle=1)
@@ -641,9 +643,13 @@ def test_win32_reader_mouse_wheel():
     assert parsed_click == "<MOUSE_1_10_5>"
     assert parsed_click.startswith("<MOUSE_")
 
+    # Left drag event (event_flags = 0x0001 MOUSE_MOVED, button_state = 0x0001) -> reports btn=32
+    drag_rec = _make_mouse_record(event_flags=0x0001, button_state=0x0001, x=10, y=5)
+    assert reader.parse_input_record(drag_rec) == "<MOUSE_32_10_5>"
+
 
 def test_win32_reader_keyboard_events():
-    """Verify Win32ConsoleReader parses standard key down, control keys, and ignores key up."""
+    """Verify Win32ConsoleReader parses standard key down, control keys (including Ctrl+O), and ignores key up."""
     from cli.tui.keyboard import Key, Win32ConsoleReader
 
     reader = Win32ConsoleReader(handle=1)
@@ -654,7 +660,16 @@ def test_win32_reader_keyboard_events():
     # Key up (bKeyDown=False) must be ignored (returns None)
     assert reader.parse_input_record(_make_key_record(char="a", vk=0x41, down=False)) is None
 
-    # Control keys
+    # Control keys with null UnicodeChar (common in ConHost / Windows Terminal)
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x4F, ctrl_state=0x0008)) == Key.CTRL_O
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x4B, ctrl_state=0x0008)) == Key.CTRL_K
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x4C, ctrl_state=0x0008)) == Key.CTRL_L
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x43, ctrl_state=0x0008)) == Key.CTRL_C
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x44, ctrl_state=0x0008)) == Key.CTRL_D
+    assert reader.parse_input_record(_make_key_record(char="\x00", vk=0x56, ctrl_state=0x0008)) == Key.CTRL_V
+
+    # Control keys with letter or ASCII char
+    assert reader.parse_input_record(_make_key_record(char="o", vk=0x4F, ctrl_state=0x0004)) == Key.CTRL_O
     assert reader.parse_input_record(_make_key_record(char=Key.CTRL_C, vk=0x43, down=True)) == Key.CTRL_C
     assert reader.parse_input_record(_make_key_record(char=Key.CTRL_K, vk=0x4B, down=True)) == Key.CTRL_K
     assert reader.parse_input_record(_make_key_record(char=Key.CTRL_L, vk=0x4C, down=True)) == Key.CTRL_L
@@ -838,10 +853,10 @@ def test_win32_reader_default_and_opt_in_flag():
 # ─── 8. RESPONSIVE INPUT FIELD & VIEWPORT SCROLLING TESTS ───────────────────
 
 
-def test_raw_line_editor_horizontal_viewport_scrolling():
-    """Verify RawLineEditor shifts viewport when text exceeds inner width."""
+def test_raw_line_editor_text_wrapping_no_ellipsis():
+    """Verify RawLineEditor wraps lines without '...' ellipsis when text exceeds inner width."""
     # prompt_prefix "│ > " (4 chars visible), right_border " │" (2 chars visible)
-    # width=20 -> inner_available = 20 - 4 - 2 = 14
+    # width=20 -> wrap_width = 14
     editor = RawLineEditor(
         prompt_prefix="│ > ",
         width=20,
@@ -867,31 +882,33 @@ def test_raw_line_editor_horizontal_viewport_scrolling():
     out = io.StringIO()
     editor.redraw_line(out=out)
     output = out.getvalue()
-    # Should display "..." prefix since start > 0
-    assert "..." in output
-    # Total line inside borders must not overflow width 20
-    # visible_prefix(4) + displayed(14) + visible_right(2) = 20
-    assert editor.displayed_cursor <= 14
-    assert _compute_cursor_col(editor) == 4 + editor.displayed_cursor + 1
+    # Text must wrap across visual lines instead of displaying "..."
+    assert "..." not in output
+    v_lines, _, c_line, c_col = editor._get_visual_lines()
+    assert len(v_lines) == 3
+    assert v_lines[0] == "short text "
+    assert v_lines[1] == "that is very "
+    assert v_lines[2] == "long"
+    assert c_line == 2
 
-    # 3. Press HOME key: moves cursor to 0, start becomes 0
+    # 3. Press HOME key: moves cursor to 0, start of first visual line
     editor.handle_key(Key.HOME)
     out = io.StringIO()
     editor.redraw_line(out=out)
     output = out.getvalue()
-    # Start is 0, so should show beginning of text with trailing ellipsis
     assert editor.cursor == 0
     assert editor.displayed_cursor == 0
-    assert "short" in output
-    assert output.endswith("... │\x1b[5G") or "short" in output
+    assert "..." not in output
+    assert "short text " in output
 
-    # 4. Press END key: moves cursor back to end
+    # 4. Press END key: moves cursor back to end of buffer
     editor.handle_key(Key.END)
     out = io.StringIO()
     editor.redraw_line(out=out)
     output = out.getvalue()
     assert editor.cursor == len(editor.buffer)
-    assert "..." in output
+    assert "..." not in output
+    assert "long" in output
 
 
 def test_raw_line_editor_narrow_width_graceful_clamping():
@@ -1117,7 +1134,16 @@ def test_dropdown_height_shrink_clears_excess_top_lines():
     import re
 
     out = io.StringIO()
-    editor = RawLineEditor(width=80, out=out)
+    test_commands = [
+        (":plan", "desc", False),
+        (":pause", "desc", False),
+        (":providers", "desc", False),
+        (":projects", "desc", False),
+        (":status", "desc", False),
+        (":resume", "desc", False),
+        (":wo", "desc", False),
+    ]
+    editor = RawLineEditor(width=80, out=out, commands=test_commands)
 
     # 1. Type ':' (many matches -> max_visible 6 items -> 8 total lines)
     editor.handle_key(":")

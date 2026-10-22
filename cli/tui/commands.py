@@ -271,18 +271,22 @@ def get_help_str() -> str:
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :reconnect        Reconnect to daemon and replay missed events\n"
-        "  :roles            Interactive Agent Roles & Execution Backend bindings panel\n"
-        "  :rebind <r> <b>   Rebind agent role to backend (e.g., :rebind gitops ollama llama3)\n"
+        "  :roles            Interactive Agent Roles & Execution Backend bindings panel (preferred)\n"
+        "  :rebind [r] [b]   [DEPRECATED] Rebind agent role to backend (use :roles instead)\n"
         "  :config           StackMind system settings, execution profiles, governance & policies\n"
-        "  :providers        Configure cloud and local LLM providers, API keys & endpoints\n"
-        "  :models           Configure and list available provider models\n"
+        "  :provider         Configure cloud and local LLM providers, API keys & endpoints (alias: :providers)\n"
+        "  :providers        Alias for :provider\n"
         "  :wo               Display Work Orders table and progress\n"
         "  :tree, :agents    Display Hierarchical Operation Tree\n"
         "  :plan             Display Plan Approval surface and revision history\n"
         "  :skills [name]    Display available procedural skills & verified runbooks\n"
         "  :consume-skills <p> Ingest and install procedural skills from file or directory\n"
+        "  :attach <p>       Upload and ingest documents (.pdf, .docx, .md), images, or archives (.zip)\n"
+        "  :attachments      List all ingested workspace attachments and grounding assets\n"
         "  :projects         Display registered projects and centralized root (~/.stackmindcli)\n"
-        "  :goal <request>   Submit product goal to Architecture (claude)\n"
+        "  :goal <request>   Submit product goal to Architecture (claude) or adopt suggested goal\n"
+        "  :adopt            Adopt suggested goal proposed by Architecture\n"
+        "  :panel, :side     Toggle runtime sidebar visibility (Ctrl+B) for full-width conversation\n"
         "  :approve [reason] Submit Plan approval or HITL approval\n"
         "  :reject [reason]  Submit Plan rejection feedback or HITL rejection\n"
         "  :completion       Display Project Complete handover checklist\n"
@@ -299,12 +303,16 @@ def get_help_str() -> str:
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
+        "  :copy [goal|all]  Copy latest assistant response, suggested goal, or transcript to clipboard\n"
         "  :help             Show this help menu\n"
         "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
         "Shortcuts:\n"
+        "  Ctrl+B            Toggle runtime sidebar (collapse for 100% full-width view)\n"
+        "  Tab / Ctrl+G      Auto-fill Architect's suggested goal into input box\n"
         "  Ctrl+O            Toggle thinking block expansion\n"
-        "  Ctrl+C            Cancel active turn or abort"
+        "  Ctrl+C            Cancel active turn or abort\n"
+        "  Ctrl+V            Paste clipboard content into input composer"
     )
 
 
@@ -381,9 +389,17 @@ def _stream_turn_execution(
     last_progress_time = start_time
     last_poll_time = start_time
     last_redraw_time: float = -1.0
+    last_domain_event_time = start_time
     latest_act_desc = initial_activity_desc
     op_rec: dict[str, Any] | None = None
     op_status: str | None = None
+
+    # A new turn starts with a clean attempt/retry display. Stale counters from
+    # the previous turn otherwise bleed into this turn's composer border.
+    state.reset_attempts_and_retries()
+
+    _TERMINAL_OP_STATUS = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
+    _RUNNING_OP_STATUS = {"RUNNING", "ACTIVE", "IN_PROGRESS", "PENDING"}
 
     _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
     _diagnostics_start = time.monotonic()
@@ -403,12 +419,11 @@ def _stream_turn_execution(
 
     def _get_working_placeholder() -> str:
         elapsed = time.time() - start_time
-        toks = (
-            getattr(state, "cumulative_turn_tokens", 0)
-            or AutonomousDeliveryState.estimate_tokens(
-                "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
-            )
+        in_progress_tokens = AutonomousDeliveryState.estimate_tokens(
+            "".join(streamed_chunks) + getattr(state, "current_turn_thinking", "")
         )
+        cumulative = getattr(state, "cumulative_turn_tokens", 0)
+        toks = cumulative + in_progress_tokens if cumulative > 0 else in_progress_tokens
         is_sync_action = False
         targets_to_check = [
             getattr(state, "active_tool_target", ""),
@@ -463,6 +478,47 @@ def _stream_turn_execution(
     install_resize_handler()
     init_term = shutil.get_terminal_size(fallback=(80, 24))
     current_cols, current_lines = init_term.columns, init_term.lines
+
+    def _daemon_has_running_work() -> bool:
+        """True when the daemon still reports an operation in flight for this session."""
+        for op in getattr(state, "operations", {}).values():
+            if str(getattr(op, "status", "")).upper() in _RUNNING_OP_STATUS:
+                return True
+        return False
+
+    def _reconcile_with_daemon(now: float) -> bool:
+        """Refresh daemon state and detect a turn that finished without a terminal event.
+
+        The daemon can complete a turn while the client is between SSE events
+        (or when the terminal event is missed entirely). The TUI used to wait
+        forever in that case, leaving a frozen "Working..." frame on screen
+        even though the daemon had nothing left to do.
+        """
+        nonlocal op_rec, op_status
+        sid = session.get("session_id")
+        if sid and hasattr(client, "get_session"):
+            try:
+                fresh_sess = client.get_session(sid)
+                if isinstance(fresh_sess, Mapping):
+                    state.update_from_session(fresh_sess)
+            except Exception:
+                pass
+        if op_id and op_id != "turn" and hasattr(client, "operation_get"):
+            try:
+                record = client.operation_get(op_id)
+                if isinstance(record, dict):
+                    op_rec = record
+                    op_status = record.get("status")
+                    if str(op_status).upper() in _TERMINAL_OP_STATUS:
+                        return True
+            except Exception:
+                pass
+        # No terminal event, no operation in flight, and the answer already
+        # arrived: the daemon is done with this turn.
+        if (streamed_chunks or assistant_rendered) and not _daemon_has_running_work():
+            if now - last_domain_event_time >= 3.0:
+                return True
+        return False
 
     try:
         stream_gen = adapter.stream(
@@ -555,27 +611,9 @@ def _stream_turn_execution(
 
                 if now - last_poll_time >= 0.5:
                     last_poll_time = now
-                    try:
-                        sid = session.get("session_id")
-                        if sid and hasattr(client, "get_session"):
-                            fresh_sess = client.get_session(sid)
-                            if isinstance(fresh_sess, Mapping):
-                                state.update_from_session(fresh_sess)
-                    except Exception:
-                        pass
-                    try:
-                        op_rec = (
-                            client.operation_get(op_id)
-                            if hasattr(client, "operation_get") and op_id and op_id != "turn"
-                            else None
-                        )
-                        if op_rec and isinstance(op_rec, dict):
-                            op_status = op_rec.get("status")
-                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                completed = True
-                                break
-                    except Exception:
-                        pass
+                    if _reconcile_with_daemon(now):
+                        completed = True
+                        break
                 time.sleep(0.05)
                 stream_gen = adapter.stream(
                     session["session_id"],
@@ -594,7 +632,11 @@ def _stream_turn_execution(
             if isinstance(ev, dict) and (
                 ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"
             ):
-                if not streaming_active and (now - last_progress_time >= 2.0):
+                # Keep repainting even after the model stopped streaming. The
+                # previous gate (not streaming_active) froze the composer on the
+                # last painted frame, so a turn that was still running looked
+                # dead: the timer stopped and the frame never changed again.
+                if now - last_progress_time >= 2.0:
                     render_start = time.monotonic()
                     layout = compute_layout(shutil.get_terminal_size().columns)
                     tick_content = _build_in_progress_turn_content(
@@ -629,19 +671,9 @@ def _stream_turn_execution(
 
                 if now - last_poll_time >= 1.5:
                     last_poll_time = now
-                    try:
-                        op_rec = (
-                            client.operation_get(op_id)
-                            if hasattr(client, "operation_get") and op_id and op_id != "turn"
-                            else None
-                        )
-                        if op_rec and isinstance(op_rec, dict):
-                            op_status = op_rec.get("status")
-                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                completed = True
-                                break
-                    except Exception:
-                        pass
+                    if _reconcile_with_daemon(now):
+                        completed = True
+                        break
                 continue
 
             # 2. Process concrete domain event
@@ -650,6 +682,7 @@ def _stream_turn_execution(
             sequence = ev.get("sequence")
             if isinstance(sequence, int) and sequence <= state.last_sequence:
                 continue
+            last_domain_event_time = now
             state.process_event(ev)
             ev_name = str(ev.get("name", ""))
             ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
@@ -774,9 +807,18 @@ def _stream_turn_execution(
                     )
                     t_role = str(ev_payload.get("role") or ev_payload.get("agent_id") or "")
                     if not t_role and state is not None:
-                        op_id = ev_payload.get("operation_id")
-                        if op_id and hasattr(state, "operations") and op_id in state.operations:
-                            t_role = state.operations[op_id].role
+                        # NOTE: never assign to op_id here. op_id tracks the turn
+                        # being streamed; overwriting it with the tool's
+                        # operation id made the TUI poll and match the wrong
+                        # operation, so the turn never reached its terminal
+                        # event and the "Working..." status stuck forever.
+                        tool_op_id = ev_payload.get("operation_id")
+                        if (
+                            tool_op_id
+                            and hasattr(state, "operations")
+                            and tool_op_id in state.operations
+                        ):
+                            t_role = state.operations[tool_op_id].role
                         if not t_role and hasattr(state, "operations"):
                             for op in state.operations.values():
                                 if getattr(op, "status", "") == "RUNNING":
@@ -939,6 +981,7 @@ def _stream_turn_execution(
         if streaming_active and not is_tty:
             click.echo("")
 
+        state.active_working_status = None
         cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
         turn_acts = state.current_turn_actions
         state.add_message("assistant", cancel_msg, actions=turn_acts)
@@ -966,6 +1009,12 @@ def _stream_turn_execution(
         restore_composer_focus(state)
         return session, False
 
+    # The turn is over (completed, failed, blocked, or timed out). Drop the
+    # transient timer and retry counters before the final frame so they cannot
+    # linger in the composer or be painted into the next idle frame.
+    state.active_working_status = None
+    state.reset_attempts_and_retries()
+
     # Finalize streaming if active
     if streamed_chunks and not assistant_rendered:
         full_resp = "".join(streamed_chunks).strip()
@@ -978,18 +1027,7 @@ def _stream_turn_execution(
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
         streamed_chunks = []
-        if is_tty:
-            redraw_full_screen(
-                session,
-                state,
-                clear=False,
-                include_composer=True,
-                composer_is_active=False,
-                composer_placeholder="Type a message...",
-                composer_content="",
-                live_manager=live_manager,
-            )
-        else:
+        if not is_tty:
             click.echo(
                 render_assistant_message_str(
                     full_resp, actions=turn_acts, thinking=thinking
@@ -1282,6 +1320,32 @@ def _stream_turn_execution(
 
     if hasattr(state, "current_turn_actions") and state.current_turn_actions:
         state.current_turn_actions.complete_all()
+
+    # Always repaint the final frame. When the turn completed via a full
+    # response event (assistant_rendered is already True) there are no
+    # streamed_chunks left to trigger a redraw, and the last frame painted
+    # during streaming still carries "Working..." and the attempt counters.
+    if is_tty:
+        is_awaiting_plan = (
+            getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+            or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+        )
+        post_placeholder = (
+            "Plan ready: type :approve or 'continue' to execute..."
+            if is_awaiting_plan
+            else "Type a message..."
+        )
+        redraw_full_screen(
+            session,
+            state,
+            clear=False,
+            include_composer=True,
+            composer_is_active=False,
+            composer_placeholder=post_placeholder,
+            composer_content="",
+            live_manager=live_manager,
+        )
+
     if live_manager is not None and not getattr(live_manager, "is_active", False):
         live_manager.start(include_composer=False)
     restore_composer_focus(state)
@@ -1330,6 +1394,125 @@ def dispatch_delivery_command(
         if not is_tty:
             click.echo(output_str)
         return session, False
+
+    if normalized.startswith(":copy") or normalized.startswith(":yank") or normalized == ":clipboard":
+        from cli.tui.clipboard import set_clipboard_text
+
+        parts = normalized.split()
+        mode = parts[1].lower() if len(parts) > 1 else "last"
+        text_to_copy = ""
+        if mode in ("goal", "plan"):
+            suggested = (
+                state.get_latest_suggested_goal()
+                if hasattr(state, "get_latest_suggested_goal")
+                else None
+            )
+            if suggested:
+                text_to_copy = f":goal {suggested}"
+                desc = "suggested :goal command"
+            else:
+                desc = "suggested goal"
+        elif mode in ("all", "full", "transcript"):
+            lines = []
+            for msg in getattr(state, "messages", []):
+                sender = str(getattr(msg, "role", getattr(msg, "sender", "message"))).upper()
+                content = str(getattr(msg, "content", getattr(msg, "text", ""))).strip()
+                if content:
+                    lines.append(f"[{sender}]:\n{content}\n")
+            text_to_copy = "\n".join(lines)
+            desc = "entire conversation transcript"
+        else:
+            for msg in reversed(getattr(state, "messages", [])):
+                role = getattr(msg, "role", getattr(msg, "sender", ""))
+                if role not in ("user",):
+                    text_to_copy = str(getattr(msg, "content", getattr(msg, "text", ""))).strip()
+                    if text_to_copy:
+                        break
+            if not text_to_copy and getattr(state, "messages", []):
+                last = state.messages[-1]
+                text_to_copy = str(getattr(last, "content", getattr(last, "text", ""))).strip()
+            desc = "latest response"
+
+        if text_to_copy:
+            ok = set_clipboard_text(text_to_copy)
+            msg_str = (
+                f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard."
+                if ok
+                else "[ERROR] Failed to write to system clipboard."
+            )
+        else:
+            msg_str = (
+                "[CLIPBOARD] No suggested goal found from the Architect to copy."
+                if mode in ("goal", "plan")
+                else "[CLIPBOARD] No messages available to copy."
+            )
+
+        state.add_message("user", normalized)
+        state.add_message("system", msg_str)
+        if not is_tty:
+            click.echo(msg_str)
+        return session, False
+
+    if normalized in (":panel", ":sidebar", ":side", ":toggle panel", ":panel toggle"):
+        is_now_visible = state.toggle_runtime_panel() if hasattr(state, "toggle_runtime_panel") else True
+        status_text = (
+            "[SIDEBAR] Runtime panel restored (2-column split layout)."
+            if is_now_visible
+            else "[SIDEBAR] Runtime panel collapsed (100% full-width conversation layout). Press Ctrl+B to toggle."
+        )
+        state.add_message("user", normalized)
+        state.add_message("system", status_text)
+        if not is_tty:
+            click.echo(status_text)
+        return session, False
+
+    # Auto-approve pending plan if operator intuitively enters 'continue', 'proceed', or ':adopt'
+    is_awaiting_plan = (
+        getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+        or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+    )
+    if is_awaiting_plan and normalized.lower() in {
+        "continue", ":continue", "proceed", ":proceed", "go ahead", ":go", ":adopt", ":accept"
+    }:
+        return dispatch_delivery_command(
+            adapter,
+            client,
+            session,
+            ":approve Approved by operator",
+            state,
+            client_timeout=effective_timeout,
+            live_manager=live_manager,
+        )
+
+    if normalized in (":adopt", ":accept", ":run goal"):
+        goal = state.get_latest_suggested_goal() if hasattr(state, "get_latest_suggested_goal") else None
+        if not goal:
+            if is_awaiting_plan:
+                return dispatch_delivery_command(
+                    adapter,
+                    client,
+                    session,
+                    ":approve Approved by operator",
+                    state,
+                    client_timeout=effective_timeout,
+                    live_manager=live_manager,
+                )
+            msg = "[GOAL] No suggested goal found from the Architect to adopt."
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        state.add_message("system", f"[AUTO-ADOPT] Adopting Architect's suggested goal: :goal {goal}")
+        return dispatch_delivery_command(
+            adapter,
+            client,
+            session,
+            f":goal {goal}",
+            state,
+            client_timeout=effective_timeout,
+            live_manager=live_manager,
+        )
 
     if normalized == ":debugkeys":
         from cli.tui.keyboard import DEBUG_KEYS_ENABLED, DEBUG_LOG_FILE, set_debug_keys
@@ -1519,14 +1702,24 @@ def dispatch_delivery_command(
                         "model": m_to_save,
                     }
                 save_settings(s, ws)
-                output_str = f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'" + (
-                    f" (model: {model_arg})" if model_arg else ""
+                output_str = (
+                    "[DEPRECATED] ':rebind' is deprecated and scheduled for removal. "
+                    "Use ':roles' to assign providers to agent roles, or ':provider' for provider configuration.\n"
+                    f"[SUCCESS] Rebound role '{role_arg}' to backend '{backend_arg}'"
+                    + (f" (model: {model_arg})" if model_arg else "")
                 )
             except Exception as err:
-                output_str = f"[ERROR] Failed to rebind role '{role_arg}': {err}"
+                output_str = (
+                    "[DEPRECATED] ':rebind' is deprecated. Please use ':roles' instead.\n"
+                    f"[ERROR] Failed to rebind role '{role_arg}': {err}\n"
+                    f"Hint: Syntax is ':rebind <role> <backend> [model]' (e.g., ':rebind {role_arg} custom <model>'). "
+                    "Ensure no turn is currently active before rebinding."
+                )
         else:
             output_str = (
-                "Usage: :rebind <role> <backend> [model]  (e.g., :rebind gitops ollama llama3)"
+                "[DEPRECATED] ':rebind' is deprecated and scheduled for removal. "
+                "Use ':roles' to configure agent backends interactively, or ':provider' for provider credentials.\n"
+                "Usage: :rebind <role> <backend> [model]  (e.g., :rebind architecture custom <model>)"
             )
         state.add_message("user", normalized)
         state.add_message("system", output_str)
@@ -1622,9 +1815,10 @@ def dispatch_delivery_command(
         return session, False
 
     if (
-        normalized == ":providers"
+        normalized in {":provider", ":providers"}
+        or normalized.startswith(":provider ")
         or normalized.startswith(":providers ")
-        or normalized in {":models", ":provider"}
+        or normalized == ":models"
         or normalized.startswith(":models ")
     ):
         from cli.tui.settings_panel import (
@@ -1657,6 +1851,8 @@ def dispatch_delivery_command(
             else:
                 settings_obj = load_settings(ws)
                 output_str = render_settings_overview_str(settings_obj, width=term_cols)
+        if normalized == ":models" or normalized.startswith(":models "):
+            output_str = f"[INFO] ':models' is unified into ':provider'. Configure endpoints and models via ':provider', or assign role backends via ':roles'.\n\n{output_str}"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -1783,6 +1979,84 @@ def dispatch_delivery_command(
                     output_str = render_consumed_skills_summary_str(records, is_global, dest_desc)
                 except Exception as exc:
                     output_str = f"[Error consuming skills] {exc}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized == ":attach"
+        or normalized.startswith(":attach ")
+        or normalized == ":upload"
+        or normalized.startswith(":upload ")
+    ):
+        from validators.ingest import AttachmentStore
+        from cli.tui.attachments_panel import render_attachment_ingested_str
+
+        _, _, raw_arg = normalized.partition(" ")
+        clean_path = raw_arg.strip()
+        if (clean_path.startswith('"') and clean_path.endswith('"')) or (
+            clean_path.startswith("'") and clean_path.endswith("'")
+        ):
+            clean_path = clean_path[1:-1].strip()
+
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        store = AttachmentStore(ws_path or ".")
+
+        if not clean_path:
+            output_str = (
+                "Usage: :attach <file_or_archive_path> (or :upload <path>)\n"
+                "Supported formats:\n"
+                "  • Documents: .pdf, .docx, .md, .txt, .csv, .html\n"
+                "  • Images: .png, .jpg, .jpeg, .webp, .svg\n"
+                "  • Archives: .zip, .tar.gz (extracted safely with Zip-Slip protection)\n"
+                "Attachments are indexed into .sync/attachments/ and grounded into multi-agent turns."
+            )
+        else:
+            try:
+                record = store.ingest(clean_path)
+                term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                output_str = render_attachment_ingested_str(record, width=term_cols)
+            except Exception as exc:
+                output_str = f"[Error ingesting attachment] {exc}"
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized in {":attachments", ":files"}:
+        from validators.ingest import AttachmentStore
+        from cli.tui.attachments_panel import render_attachments_list_str
+
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        store = AttachmentStore(ws_path or ".")
+        records = store.list_attachments()
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        output_str = render_attachments_list_str(records, width=term_cols)
+
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":attachment ") or normalized.startswith(":file "):
+        from validators.ingest import AttachmentStore
+        from cli.tui.attachments_panel import render_attachment_detail_str
+
+        _, _, target_id = normalized.partition(" ")
+        ws_path = session.get("workspace") if isinstance(session, dict) else None
+        store = AttachmentStore(ws_path or ".")
+        record = store.get_attachment(target_id.strip())
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        if record:
+            output_str = render_attachment_detail_str(record, width=term_cols)
+        else:
+            output_str = f"Attachment '{target_id.strip()}' not found. Use :attachments to view all files."
 
         state.add_message("user", normalized)
         state.add_message("system", output_str)
@@ -2230,12 +2504,21 @@ def dispatch_delivery_command(
         return session, False
 
     if normalized == ":goal" or (normalized.startswith(":goal ") and not normalized[6:].strip()):
-        output_str = "Usage: :goal <product goal or feature request>"
-        state.add_message("user", normalized)
-        state.add_message("system", output_str)
-        if not is_tty:
-            click.echo(output_str)
-        return session, False
+        suggested = (
+            state.get_latest_suggested_goal()
+            if hasattr(state, "get_latest_suggested_goal")
+            else None
+        )
+        if suggested:
+            normalized = f":goal {suggested}"
+            state.add_message("system", f"[AUTO-ADOPT] Using Architect's suggested goal: :goal {suggested}")
+        else:
+            output_str = "Usage: :goal <product goal or feature request>"
+            state.add_message("user", normalized)
+            state.add_message("system", output_str)
+            if not is_tty:
+                click.echo(output_str)
+            return session, False
 
     if (
         normalized.startswith(":")
@@ -2281,7 +2564,17 @@ def dispatch_delivery_command(
     op_id = "turn"
 
     try:
-        result = adapter.command(normalized, session_id=session["session_id"])
+        turn_kwargs: dict[str, Any] = {}
+        if not is_goal and hasattr(state, "messages") and state.messages:
+            c_hist: list[dict[str, str]] = []
+            for msg in state.messages:
+                m_role = getattr(msg, "role", getattr(msg, "sender", None))
+                m_content = getattr(msg, "content", getattr(msg, "text", None))
+                if m_role in ("user", "assistant") and m_content and isinstance(m_content, str) and m_content.strip():
+                    c_hist.append({"role": m_role, "content": m_content.strip()})
+            if c_hist:
+                turn_kwargs["chat_history"] = c_hist[-12:]
+        result = adapter.command(normalized, session_id=session["session_id"], **turn_kwargs)
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         if is_goal:
             state.add_activity("User", "submitted goal to Architecture", op_id)

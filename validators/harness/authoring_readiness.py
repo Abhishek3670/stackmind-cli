@@ -491,16 +491,22 @@ def validate_authoring_readiness(
     wo_files: dict[str, tuple[str, dict[str, Any]]] = {}
     completed_wo_files: dict[str, tuple[str, dict[str, Any]]] = {}
     duplicate_ids: set[str] = set()
+    p_idx = _parse_wo_index(planning_wo_id)
     if active_dir.is_dir():
         for f in sorted(active_dir.glob("*.yaml")):
             rel = f.relative_to(ws).as_posix()
-            artifact_paths.append(rel)
             data = _load_yaml(f, issues, rel)
             if data is None:
                 continue
             wo_id = str(data.get("id") or f.stem)
             if wo_id in skip_ids:
                 continue
+            status = str(data.get("status", "")).upper()
+            if status in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                continue
+            if p_idx is not None and (_parse_wo_index(wo_id) or 0) <= p_idx:
+                continue
+            artifact_paths.append(rel)
             if wo_id in wo_files:
                 duplicate_ids.add(wo_id)
                 _issue(issues, "DUPLICATE_WORK_ORDER", "coverage", f"Work order '{wo_id}' is defined by more than one artifact " f"('{wo_files[wo_id][0]}' and '{rel}')", work_order_id=wo_id, artifact_path=rel)
@@ -524,13 +530,23 @@ def validate_authoring_readiness(
     if contracts_dir.is_dir():
         for f in sorted(contracts_dir.glob("*.yaml")):
             rel = f.relative_to(ws).as_posix()
-            artifact_paths.append(rel)
             data = _load_yaml(f, issues, rel)
             if data is None:
                 continue
-            wo_ref = str(data.get("work_order") or "")
+            wo_ref = str(data.get("work_order") or f.stem)
             if wo_ref in skip_ids:
                 continue
+            if p_idx is not None and (_parse_wo_index(wo_ref) or 0) <= p_idx:
+                continue
+            cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
+            if cand.is_file():
+                try:
+                    c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
+                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                        continue
+                except Exception:
+                    pass
+            artifact_paths.append(rel)
             contracts[wo_ref or f.stem] = _ContractArtifact(
                 path=rel, data=data, work_order=wo_ref or None, agent_id=data.get("agent_id")
             )
@@ -574,6 +590,17 @@ def validate_authoring_readiness(
         # an orphaned architect-authored artifact.
         if str(contract.data.get("synthesized_by") or "").startswith("recovery-repair"):
             continue
+        # Prior-run contracts or contracts for excluded/non-active work orders are not orphans of this run
+        if wo_ref in skip_ids or (p_idx is not None and (_parse_wo_index(wo_ref) or 0) <= p_idx):
+            continue
+        cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
+        if cand.is_file():
+            try:
+                c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
+                if str(c_data.get("status", "")).upper() in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                    continue
+            except Exception:
+                pass
         _issue(issues, "ORPHAN_CONTRACT", "coverage", f"Contract '{contract.path}' references work order '{wo_ref}' " f"which is not an active authored work order", work_order_id=wo_ref, artifact_path=contract.path)
 
     # ── 4. Milestone coverage ───────────────────────────────────────

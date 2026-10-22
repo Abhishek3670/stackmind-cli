@@ -14,9 +14,10 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -334,7 +335,6 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                 except Exception:
                     idx_data = None
             if idx_data is None:
-                from datetime import datetime, timezone
                 now_iso = datetime.now(timezone.utc).isoformat()
                 idx_data = {
                     "schema_version": 1,
@@ -372,8 +372,147 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                         shutil.copy2(s_file, dest_file)
         except Exception:
             pass
+
+        # 6. Ensure canonical runtime/TREE.yaml exists and complies with tree schema
+        ensure_canonical_tree(ws_path)
     except Exception:
         pass
+
+
+def ensure_canonical_tree(workspace: Path | str) -> dict[str, Any]:
+    """Ensure .sync/runtime/TREE.yaml exists and complies with tree.schema.json.
+
+    Guarantees required root properties: schema_version, tree_version, release,
+    agents, and work_orders (synchronized against INDEX.yaml).
+    Preserves all existing agent sessions, tasks, blockers, and assignments.
+    """
+    import yaml
+
+    ws_path = Path(workspace).resolve()
+    sync_path = ws_path / ".sync"
+    tree_file = sync_path / "runtime" / "TREE.yaml"
+    index_file = sync_path / "work-orders" / "INDEX.yaml"
+
+    tree_file.parent.mkdir(parents=True, exist_ok=True)
+
+    tree_data: dict[str, Any] = {}
+    if tree_file.is_file():
+        try:
+            loaded = yaml.safe_load(tree_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                tree_data = loaded
+        except Exception:
+            tree_data = {}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    needs_write = not tree_file.is_file()
+
+    if tree_data.get("schema_version") != 1:
+        tree_data["schema_version"] = 1
+        needs_write = True
+
+    tv = tree_data.get("tree_version")
+    if not isinstance(tv, int) or tv < 1:
+        tree_data["tree_version"] = 1
+        needs_write = True
+
+    if not tree_data.get("release"):
+        tree_data["release"] = RUNTIME_VERSION
+        needs_write = True
+
+    if not tree_data.get("last_updated"):
+        tree_data["last_updated"] = now_iso
+        needs_write = True
+
+    if not tree_data.get("current_phase"):
+        tree_data["current_phase"] = "ACTIVE"
+        needs_write = True
+
+    if not tree_data.get("phase_status"):
+        tree_data["phase_status"] = "ACTIVE"
+        needs_write = True
+
+    if "graph_version" not in tree_data:
+        tree_data["graph_version"] = None
+        needs_write = True
+
+    # Read INDEX.yaml for work order counts
+    idx_counts = {"total_active": 0, "total_completed": 0, "total_blocked": 0}
+    if index_file.is_file():
+        try:
+            idx = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+            if isinstance(idx, dict):
+                for k in idx_counts:
+                    if k in idx and isinstance(idx[k], int):
+                        idx_counts[k] = idx[k]
+        except Exception:
+            pass
+
+    wo_sec = tree_data.setdefault("work_orders", {})
+    if not isinstance(wo_sec, dict):
+        wo_sec = {}
+        tree_data["work_orders"] = wo_sec
+        needs_write = True
+
+    for k, v in idx_counts.items():
+        if wo_sec.get(k) != v:
+            wo_sec[k] = v
+            needs_write = True
+
+    if wo_sec.get("index_file") != "work-orders/INDEX.yaml":
+        wo_sec["index_file"] = "work-orders/INDEX.yaml"
+        needs_write = True
+
+    agents_sec = tree_data.setdefault("agents", {})
+    if not isinstance(agents_sec, dict):
+        agents_sec = {}
+        tree_data["agents"] = agents_sec
+        needs_write = True
+
+    # Ensure baseline agents exist
+    for agent in DEFAULT_AGENTS:
+        ag_entry = agents_sec.setdefault(agent, {
+            "status": "idle",
+            "session_count": 0,
+            "last_task": "Runtime initialized",
+            "next_task": "Await assignment",
+            "blockers": [],
+            "boot_version": "v1.0",
+            "assigned_work_orders": [],
+        })
+        if not isinstance(ag_entry, dict):
+            ag_entry = {
+                "status": "idle",
+                "session_count": 0,
+                "last_task": "Runtime initialized",
+                "next_task": "Await assignment",
+                "blockers": [],
+                "boot_version": "v1.0",
+                "assigned_work_orders": [],
+            }
+            agents_sec[agent] = ag_entry
+            needs_write = True
+        else:
+            if "status" not in ag_entry:
+                ag_entry["status"] = "idle"
+                needs_write = True
+            if "session_count" not in ag_entry:
+                ag_entry["session_count"] = 0
+                needs_write = True
+            if "assigned_work_orders" not in ag_entry or not isinstance(ag_entry["assigned_work_orders"], list):
+                ag_entry["assigned_work_orders"] = []
+                needs_write = True
+
+    if needs_write:
+        try:
+            from validators.kernel.io import durable_write_yaml
+            durable_write_yaml(tree_file, tree_data)
+        except Exception:
+            tmp_tree = tree_file.with_name(f"{tree_file.name}.tmp.{int(datetime.now().timestamp() * 1000)}")
+            tmp_tree.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+            tmp_tree.replace(tree_file)
+
+    return tree_data
 
 
 STACKMIND_ROOT_FILES = (

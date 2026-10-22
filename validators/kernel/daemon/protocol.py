@@ -55,7 +55,14 @@ class JsonRpcProtocol:
             return self._error(request_id, -32003, "Policy denied")
         except InterruptedError:
             return self._error(request_id, -32005, "Request cancelled")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as error:
+            err_msg = str(error).strip()
+            if "active operation" in err_msg.lower() or "contention" in err_msg.lower():
+                return self._error(request_id, -32002, err_msg)
+            if isinstance(error, TypeError):
+                return self._error(request_id, -32602, "Invalid params")
+            if err_msg and not any(k in err_msg.lower() for k in ("missing", "required", "positional", "unexpected")):
+                return self._error(request_id, -32602, err_msg)
             return self._error(request_id, -32602, "Invalid params")
         except Exception:  # pragma: no cover - defensive protocol boundary
             return self._error(request_id, -32603, "Internal error")

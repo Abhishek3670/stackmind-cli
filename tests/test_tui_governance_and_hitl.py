@@ -257,7 +257,7 @@ def test_skills_panel_rendering_and_dispatch(tmp_path: Path):
     )
 
     # 1. Empty state
-    empty_panel = render_skills_panel_str(tmp_path)
+    empty_panel = render_skills_panel_str(tmp_path, include_global=False)
     assert "AVAILABLE PROCEDURAL SKILLS" in empty_panel
     assert "No procedural skills found in .sync/skills/" in empty_panel
     assert "stackmind learn mine" in empty_panel
@@ -296,7 +296,7 @@ def test_skills_panel_rendering_and_dispatch(tmp_path: Path):
     store.save_version(skill)
 
     # 3. Table rendering
-    table_panel = render_skills_panel_str(tmp_path)
+    table_panel = render_skills_panel_str(tmp_path, width=100)
     assert "AVAILABLE PROCEDURAL SKILLS" in table_panel
     assert "SKL-TEST-001" in table_panel
     assert "pytest_run_and_fix" in table_panel

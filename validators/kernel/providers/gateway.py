@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 from pathlib import Path
 import shlex
@@ -893,6 +894,55 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
         },
     ),
     ToolDefinition(
+        name="trigger_goal",
+        description=(
+            "Trigger an autonomous multi-agent development run across the workspace. "
+            "Use this when the operator requests concrete feature implementation, structural code changes, "
+            "or multi-file projects requiring planning, authoring work orders, and QA verification."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "Comprehensive, actionable goal description for the multi-agent team.",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this run is being triggered and architectural guidance.",
+                },
+            },
+            "required": ["goal"],
+        },
+    ),
+    ToolDefinition(
+        name="delegate_task",
+        description=(
+            "Delegate a focused, single-component implementation task or visual effect directly to a specialized worker agent "
+            "(e.g. 'frontend' / 'gemini' for HTML/CSS/JS/UI, 'backend' / 'codex' for server/APIs/logic). "
+            "The delegated agent executes under its own scoped permissions to safely mutate source files."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_agent": {
+                    "type": "string",
+                    "description": "Specialist agent or role to execute the task: 'frontend' (or 'gemini'), 'backend' (or 'codex').",
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "Precise implementation instructions for the worker agent.",
+                },
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of workspace files the agent is instructed to modify (e.g. ['index.html', 'assets/js/main.js']).",
+                },
+            },
+            "required": ["target_agent", "instructions"],
+        },
+    ),
+    ToolDefinition(
         name="web_search",
         description="Perform a web search for documentation, media assets, and API references. Use media_type='images' to search for image assets.",
         parameters={
@@ -1170,6 +1220,8 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "git_log",
     "git_diff",
     "run_command",
+    "trigger_goal",
+    "delegate_task",
 )
 
 
@@ -1329,6 +1381,7 @@ class ProviderGateway:
         on_tool_result: Callable[[str, str, str, Any, Any], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
         on_token: Callable[[str], None] | None = None,
+        on_usage: Callable[[TokenUsage], None] | None = None,
     ) -> None:
         self.adapter = adapter
         self.tool_gateway = tool_gateway
@@ -1338,6 +1391,7 @@ class ProviderGateway:
         self.on_tool_result = on_tool_result
         self.on_thinking = on_thinking
         self.on_token = on_token
+        self.on_usage = on_usage
         active_tools = list(tools)
         if self.contract and hasattr(tool_gateway, "boundary") and hasattr(tool_gateway.boundary, "evaluator"):
             evaluator = tool_gateway.boundary.evaluator
@@ -1515,18 +1569,27 @@ class ProviderGateway:
                 return out
 
             if name == "write_file":
-                target = (
-                    args.get("path")
-                    or args.get("target")
-                    or args.get("filename")
-                    or args.get("file")
-                    or args.get("filepath")
-                    or args.get("file_path")
-                    or args.get("destination")
-                    or args.get("target_path")
-                    or getattr(self, "required_deliverable", None)
-                    or ""
-                )
+                target = ""
+                for k in ("path", "target", "filename", "file", "filepath", "file_path", "destination", "target_path", "target_files", "files"):
+                    v = args.get(k)
+                    if isinstance(v, list) and v:
+                        target = str(v[0]).strip()
+                        break
+                    elif isinstance(v, str) and v.strip():
+                        target = v.strip()
+                        break
+                if not target:
+                    target = getattr(self, "required_deliverable", None) or ""
+                if not target:
+                    for msg in reversed(getattr(self, "_active_messages", None) or []):
+                        m_tf = re.search(r"Target files?:\s*\n?\s*[-*]?\s*([a-zA-Z0-9_./\\-]+)", getattr(msg, "content", "") or "")
+                        if m_tf:
+                            target = m_tf.group(1).strip()
+                            break
+                if not target:
+                    content_val = args.get("content") or args.get("data") or args.get("text") or args.get("body") or args.get("code") or ""
+                    if isinstance(content_val, str) and ("<!DOCTYPE html" in content_val or "<html" in content_val):
+                        target = "index.html"
                 if not target:
                     self.consecutive_failures += 1
                     res = "Error: 'write_file' missing required argument 'path'. Example: {\"path\": \"src/api/auth.py\", \"content\": \"...\"}"
@@ -1740,6 +1803,12 @@ class ProviderGateway:
                         kwargs[param_name] = args.get("version")
                     elif param_name == "entry" and any(k in args for k in ("changelog", "text", "content")):
                         kwargs[param_name] = args.get("changelog") or args.get("text") or args.get("content")
+                    elif param_name == "goal" and any(k in args for k in ("prompt", "description", "task", "text")):
+                        kwargs[param_name] = args.get("goal") or args.get("prompt") or args.get("description") or args.get("task") or args.get("text")
+                    elif param_name == "target_agent" and any(k in args for k in ("agent", "agent_name", "role", "target")):
+                        kwargs[param_name] = args.get("target_agent") or args.get("agent") or args.get("agent_name") or args.get("role") or args.get("target")
+                    elif param_name == "target_files" and any(k in args for k in ("files", "target_file", "file", "paths")):
+                        kwargs[param_name] = args.get("target_files") or args.get("files") or args.get("target_file") or args.get("file") or args.get("paths")
 
                 result = method(**kwargs)
                 self.consecutive_failures = 0
@@ -1811,6 +1880,14 @@ class ProviderGateway:
                             f"CRITICAL: Do NOT retry accessing or writing {target_display} as it is outside your assigned scope. "
                             f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
                         )
+                        actor_str = str(getattr(getattr(self, "tool_gateway", None), "actor_id", "")).lower()
+                        if any(k in actor_str for k in ("claude", "architect", "architecture")) and name == "write_file":
+                            res += (
+                                "\nGUIDANCE FOR ARCHITECT: As the Lead Architect, you govern the system but cannot directly write workspace application source files. "
+                                "To implement these changes autonomously: "
+                                "1. Call `delegate_task(target_agent='frontend'|'backend', instructions=..., target_files=[...])` for focused UI tweaks, animations, or styling. "
+                                "2. Call `trigger_goal(goal=...)` for full multi-agent feature implementation."
+                            )
             else:
                 res = f"Error executing {name}: {type(ex).__name__}: {ex}"
 
@@ -1950,6 +2027,11 @@ class ProviderGateway:
         self._record_and_check_budget(response.usage)
         self.budget_status["tokens_used"] = self.total_usage.total_tokens
         self.budget_status["tool_calls_used"] = self.total_tool_calls
+        if self.on_usage:
+            try:
+                self.on_usage(self.total_usage)
+            except Exception:
+                pass
 
         messages.append(response.message)
 
@@ -2025,6 +2107,7 @@ class ProviderGateway:
         active_tools = self.active_tools_list
 
         self.budget_status["steps"] = 0
+        self._active_messages = messages
         if required_deliverable:
             self.required_deliverable = required_deliverable
 

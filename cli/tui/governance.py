@@ -384,8 +384,9 @@ def render_skills_panel(
         slug = s.name.strip().lower()
         if (store.active_dir / f"{slug}.json").is_file():
             n_local += 1
+        disp_id = s.skill_id if len(s.skill_id) <= 16 else f"{s.skill_id[:13]}…"
         table.add_row(
-            s.skill_id,
+            disp_id,
             s.name,
             f"v{s.version}",
             Text(s.status.value.upper(), style=status_style),

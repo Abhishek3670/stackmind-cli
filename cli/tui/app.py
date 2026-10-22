@@ -386,7 +386,7 @@ def tui(
         if is_tty:
             _ensure_utf8()
             enter_alternate_screen()
-            enable_mouse_reporting()
+            disable_mouse_reporting()
             redraw_full_screen(
                 session, state, clear=True, include_composer=True, composer_is_active=True
             )
@@ -405,7 +405,7 @@ def tui(
                 )
             )
 
-            layout = compute_layout(term_cols)
+            layout = compute_layout(term_cols, state=state)
             if layout.show_runtime:
                 landing_str = render_landing_block_str(
                     session=session,
@@ -454,7 +454,7 @@ def tui(
                             live_manager=live_ws,
                         )
                 term_cols = current_cols
-                layout_info = compute_layout(term_cols)
+                layout_info = compute_layout(term_cols, state=state)
                 conv_width = (
                     layout_info.conversation_width if layout_info.show_runtime else term_cols
                 )
@@ -512,7 +512,7 @@ def tui(
                                 ),
                             )
                         )
-                        l_layout = compute_layout(term_cols)
+                        l_layout = compute_layout(term_cols, state=state)
                         if l_layout.show_runtime:
                             l_str = render_landing_block_str(
                                 session=session,
@@ -541,8 +541,13 @@ def tui(
                         editor.redraw_line()
 
                 def _handle_ctrl_o(editor: Any = None) -> None:
-                    """Toggle thinking block expansion."""
-                    state.toggle_thinking()
+                    """Toggle thinking block and actions disclosure expansion (§22)."""
+                    if hasattr(state, "toggle_disclosures"):
+                        state.toggle_disclosures()
+                    else:
+                        state.toggle_thinking()
+                        state.toggle_actions()
+                    clear_transcript_cache()
                     if is_tty:
                         current_text = (
                             "".join(editor.buffer)
@@ -575,11 +580,55 @@ def tui(
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
+                def _handle_ctrl_b(editor: Any = None) -> None:
+                    """Toggle runtime sidebar visibility (full-width conversation toggle)."""
+                    nonlocal comp_width, layout_info
+                    state.toggle_runtime_panel()
+                    layout_info = compute_layout(term_cols, state=state)
+                    comp_width = layout_info.conversation_width if layout_info.show_runtime else term_cols
+                    if editor is not None:
+                        editor.width = comp_width
+                    if is_tty:
+                        current_text = (
+                            "".join(editor.buffer)
+                            if (
+                                editor is not None
+                                and isinstance(getattr(editor, "buffer", None), list)
+                            )
+                            else None
+                        )
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        clear_transcript_cache()
+                        redraw_full_screen(
+                            session,
+                            state,
+                            clear=True,
+                            include_composer=True,
+                            composer_is_active=True,
+                            composer_content=current_text,
+                            live_manager=live_ws,
+                        )
+                        cursor_col = _compute_cursor_col(editor)
+                        cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=state,
+                            composer_content=current_text,
+                            cursor_line=cursor_line,
+                        )
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        editor.redraw_line()
+
                 def _handle_page_up(editor: Any = None) -> None:
-                    """Scroll conversation viewport up by half a page."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_height = compute_viewport_height(term_lines, state=state)
-                    state.scroll_conversation_up(max(1, vp_height // 2))
+                    """Scroll conversation viewport or command dialog up by half a page."""
+                    if state is not None and getattr(state, "command_dialog_open", False):
+                        state.scroll_command_dialog_up(4)
+                    else:
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        vp_height = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_up(max(1, vp_height // 2))
                     if is_tty:
                         current_text = (
                             "".join(editor.buffer)
@@ -601,7 +650,7 @@ def tui(
                         cursor_col = _compute_cursor_col(editor)
                         cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
                         c_row = compute_composer_cursor_row(
-                            term_lines,
+                            term_lines if "term_lines" in locals() else shutil.get_terminal_size(fallback=(80, current_lines)).lines,
                             state=state,
                             composer_content=current_text,
                             cursor_line=cursor_line,
@@ -612,10 +661,14 @@ def tui(
                         editor.redraw_line()
 
                 def _handle_page_down(editor: Any = None) -> None:
-                    """Scroll conversation viewport down by half a page."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_height = compute_viewport_height(term_lines, state=state)
-                    state.scroll_conversation_down(max(1, vp_height // 2))
+                    """Scroll conversation viewport or command dialog down by half a page."""
+                    if state is not None and getattr(state, "command_dialog_open", False):
+                        state.scroll_command_dialog_down(4)
+                    else:
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        vp_height = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_down(max(1, vp_height // 2))
+
                     if is_tty:
                         current_text = (
                             "".join(editor.buffer)
@@ -717,7 +770,7 @@ def tui(
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
-                def _handle_height_change(editor: Any = None) -> None:
+                def _handle_height_change(editor: Any = None, clear: bool = False) -> None:
                     """Dynamically redraw full screen when composer content height changes."""
                     if not is_tty:
                         return
@@ -733,7 +786,7 @@ def tui(
                     redraw_full_screen(
                         session,
                         state,
-                        clear=False,
+                        clear=clear,
                         include_composer=True,
                         composer_is_active=True,
                         composer_content=current_text,
@@ -754,7 +807,7 @@ def tui(
                     nonlocal current_cols, current_lines, term_cols, comp_width, layout_info
                     current_cols, current_lines = new_cols, new_lines
                     term_cols = new_cols
-                    layout_info = compute_layout(new_cols)
+                    layout_info = compute_layout(new_cols, state=state)
                     conv_width = (
                         layout_info.conversation_width if layout_info.show_runtime else new_cols
                     )
@@ -872,7 +925,98 @@ def tui(
                     except Exception:
                         pass
 
+                def _handle_mouse_click(col: int, row: int, button: int, editor: Any = None) -> None:
+                    """Handle mouse clicks: clicking on the scrollbar track or dragging to scroll."""
+                    if button not in (0, 1, 32):
+                        return
+                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
+                    term_cols, term_lines = term_size.columns, term_size.lines
+                    layout = compute_layout(
+                        term_cols,
+                        term_lines,
+                        show_runtime=getattr(state, "runtime_panel_visible", False),
+                    )
+
+                    scrollbar_col = layout.conversation_width
+                    header_h = 1
+
+                    if scrollbar_col - 2 <= col <= scrollbar_col + 2:
+                        active_scroll = state.conversation_scroll
+                        tot_l = getattr(active_scroll, "total_lines", None)
+                        vp_h = getattr(active_scroll, "viewport_height", None) or max(1, term_lines - 6)
+                        cur_off = getattr(active_scroll, "scroll_offset", 0)
+
+                        if vp_h and tot_l and tot_l > vp_h:
+                            thumb_size = max(1, int(round(vp_h * (vp_h / tot_l))))
+                            thumb_size = min(thumb_size, vp_h)
+                            max_off = tot_l - vp_h
+                            start_idx = max_off - cur_off
+                            thumb_top = int(round((start_idx / max_off) * (vp_h - thumb_size)))
+                            click_r = max(0, min(vp_h - 1, row - header_h))
+
+                            if button == 32:
+                                # Continuous drag tracking: thumb position follows cursor directly
+                                travel_height = max(1, vp_h - thumb_size)
+                                thumb_pos = max(0, min(click_r, travel_height))
+                                ratio = thumb_pos / travel_height
+                                target_start = int(round(ratio * max_off))
+                                target_off = max(0, min(max_off, max_off - target_start))
+                                state.set_conversation_scroll_offset(target_off)
+                            elif click_r < thumb_top:
+                                state.scroll_conversation_up(max(1, vp_h // 2))
+                            elif click_r > thumb_top + thumb_size:
+                                state.scroll_conversation_down(max(1, vp_h // 2))
+                            else:
+                                travel_height = max(1, vp_h - thumb_size)
+                                thumb_pos = max(0, min(click_r, travel_height))
+                                ratio = thumb_pos / travel_height
+                                target_start = int(round(ratio * max_off))
+                                target_off = max(0, min(max_off, max_off - target_start))
+                                state.set_conversation_scroll_offset(target_off)
+
+                            if is_tty:
+                                current_text = (
+                                    "".join(editor.buffer)
+                                    if (
+                                        editor is not None
+                                        and isinstance(getattr(editor, "buffer", None), list)
+                                    )
+                                    else None
+                                )
+                                redraw_full_screen(
+                                    session,
+                                    state,
+                                    clear=False,
+                                    include_composer=True,
+                                    composer_is_active=True,
+                                    composer_content=current_text,
+                                    live_manager=live_ws,
+                                )
+                                cursor_col = _compute_cursor_col(editor)
+                                cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
+                                c_row = compute_composer_cursor_row(
+                                    term_lines,
+                                    state=state,
+                                    composer_content=current_text,
+                                    cursor_line=cursor_line,
+                                )
+                                sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                                sys.stdout.flush()
+                            if editor is not None and hasattr(editor, "redraw_line"):
+                                editor.redraw_line()
+
+                is_awaiting_plan = (
+                    getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+                    or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+                )
+                comp_placeholder = (
+                    "Plan ready: type :approve or 'continue' to execute..."
+                    if is_awaiting_plan
+                    else "Type a message..."
+                )
+
                 text = prompt_composer_input(
+                    placeholder=comp_placeholder,
                     width=comp_width,
                     terminal_width=term_cols,
                     state=state,
@@ -880,10 +1024,12 @@ def tui(
                     on_ctrl_k=_handle_ctrl_k,
                     on_ctrl_l=_handle_ctrl_l,
                     on_ctrl_o=_handle_ctrl_o,
+                    on_ctrl_b=_handle_ctrl_b,
                     on_page_up=_handle_page_up,
                     on_page_down=_handle_page_down,
                     on_wheel_up=_handle_wheel_up,
                     on_wheel_down=_handle_wheel_down,
+                    on_mouse_click=_handle_mouse_click,
                     on_height_change=_handle_height_change,
                     on_idle=_handle_idle,
                     on_resize=_handle_resize,

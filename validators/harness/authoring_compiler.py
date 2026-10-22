@@ -90,6 +90,7 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any] | None:
 def compile_authoring_artifacts(
     workspace: Path | str,
     plan_milestones: list[dict[str, Any]] | None = None,
+    planning_wo_id: str | None = None,
 ) -> AuthoringCompileResult:
     """Compile the authored artifact set into its canonical representation.
 
@@ -98,12 +99,16 @@ def compile_authoring_artifacts(
         plan_milestones: parsed plan milestones as
             [{"id": ..., "title": ..., "agent": ...}, ...]; None when PLAN.md
             is absent or unparseable (milestone injection is skipped then).
+        planning_wo_id: ID of the planning work order (e.g. 'WO-000', 'WO-009');
+            used to filter out prior-run work orders and prevent collision.
 
     Returns:
         AuthoringCompileResult with the paths normalized, the injections
         applied, and any ARCHITECT-DECISION-REQUIRED findings.  Artifacts are
         normalized in place; only safe system-owned invariants are written.
     """
+    from validators.harness.authoring_readiness import _parse_wo_index
+
     ws = Path(workspace)
     normalized: list[str] = []
     injections: dict[str, list[str]] = {}
@@ -111,6 +116,11 @@ def compile_authoring_artifacts(
 
     active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
     contracts_dir = ws / ".sync" / "contracts"
+
+    p_idx = _parse_wo_index(planning_wo_id)
+    skip_ids = {"WO-000"}
+    if planning_wo_id:
+        skip_ids.add(planning_wo_id)
 
     plan_ids: set[str] = set()
     if plan_milestones:
@@ -164,10 +174,18 @@ def compile_authoring_artifacts(
     # ── Work orders: milestone identity + declared test plan ──────────
     wo_records: list[tuple[str, Path, dict[str, Any]]] = []
     for wo_path in sorted(active_dir.glob("*.yaml")) if active_dir.is_dir() else []:
+        wo_id = wo_path.stem
+        if wo_id in skip_ids:
+            continue
         rel = wo_path.relative_to(ws).as_posix()
         data = _load_yaml_mapping(wo_path)
         if data is None:
             continue  # unreadable/invalid intent — reported by the readiness gate
+        status = str(data.get("status", "")).upper()
+        if status in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+            continue
+        if p_idx is not None and (_parse_wo_index(data.get("id") or wo_id) or 0) <= p_idx:
+            continue
         wo_records.append((rel, wo_path, data))
 
     mapped_ids: set[str] = set()

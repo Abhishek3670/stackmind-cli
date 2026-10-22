@@ -380,5 +380,109 @@ def test_chat_transcript_turn_header_deduplication():
     assert "● Edit(file.txt)" in rendered
     assert "All edits finished!" in rendered
 
+def test_ctrl_o_toggles_actions_when_thinking_absent():
+    """Verify Ctrl+O toggles actions and diff expansion when thinking block is absent (e.g. PLAN.md creation)."""
+    from cli.tui.chat import render_chat_transcript_str, clear_transcript_cache
+    from cli.tui.state import AutonomousDeliveryState, ActionsGroup, TurnAction, ChatMessage
 
+    state = AutonomousDeliveryState()
+    # Simulate Write(PLAN.md) action with a 30-line diff
+    diff_lines = "\n".join([f"+line {i}: plan step details" for i in range(1, 35)])
+    full_diff = f"--- a/PLAN.md\n+++ b/PLAN.md\n@@ -0,0 +1,34 @@\n{diff_lines}"
+    act = TurnAction("1", "Write PLAN.md", status="COMPLETED", tool_name="write_file", target="PLAN.md", diff=full_diff)
+    group = ActionsGroup(actions=[act], expanded=False)
+    state.add_message("assistant", "Plan created in PLAN.md", actions=group)
+
+    # 1. Collapsed by default: diff truncated with 'ctrl+o to expand'
+    clear_transcript_cache()
+    collapsed = render_chat_transcript_str(state.messages, width=90)
+    assert "● Write(PLAN.md)" in collapsed
+    assert "ctrl+o to expand" in collapsed
+    assert not group.expanded
+
+    # 2. Toggle via state.toggle_disclosures() (invoked by Ctrl+O)
+    state.toggle_disclosures()
+    assert group.expanded is True
+    clear_transcript_cache()
+    expanded = render_chat_transcript_str(state.messages, width=90)
+    assert "● Write(PLAN.md)" in expanded
+    # Expanded view shows lines beyond 16 and collapse hint
+    assert "ctrl+o to collapse" in expanded
+
+    # 3. Toggle again collapses back
+    state.toggle_disclosures()
+    assert group.expanded is False
+    clear_transcript_cache()
+    collapsed_again = render_chat_transcript_str(state.messages, width=90)
+    assert "ctrl+o to expand" in collapsed_again
+
+
+def test_ctrl_o_harmonic_toggle_with_thinking_and_actions():
+    """Verify Ctrl+O keeps thinking and actions expansion synchronized."""
+    from cli.tui.state import AutonomousDeliveryState, ActionsGroup, TurnAction
+
+    state = AutonomousDeliveryState()
+    act = TurnAction("1", "Read auth.py", status="COMPLETED", tool_name="read_file", target="auth.py", output="content")
+    group = ActionsGroup(actions=[act], expanded=False)
+    state.add_message("assistant", "Analysis", thinking="I need to inspect auth.", actions=group)
+
+    # Initially: thinking is expanded by default, actions is collapsed
+    assert state.thinking_expanded is True
+    assert group.expanded is False
+
+    # Ctrl+O expands all collapsed disclosures
+    state.toggle_disclosures()
+    assert state.thinking_expanded is True
+    assert group.expanded is True
+
+    # Next Ctrl+O collapses all disclosures
+    state.toggle_disclosures()
+    assert state.thinking_expanded is False
+    assert group.expanded is False
+
+    # Next Ctrl+O expands all disclosures
+    state.toggle_disclosures()
+    assert state.thinking_expanded is True
+    assert group.expanded is True
+
+
+def test_transcript_cache_invalidation_on_disclosure_toggle():
+    """Verify _compute_transcript_hash changes when thinking_expanded or actions.expanded toggles."""
+    from cli.tui.chat import _compute_transcript_hash
+    from cli.tui.state import ActionsGroup, TurnAction, ChatMessage
+
+    group = ActionsGroup(actions=[TurnAction("1", "Read file", status="COMPLETED")], expanded=False)
+    msg = ChatMessage(role="assistant", content="hello", thinking="my thought", thinking_expanded=False, actions=group)
+
+    h1 = _compute_transcript_hash([msg])
+
+    # Toggle thinking_expanded
+    msg.thinking_expanded = True
+    h2 = _compute_transcript_hash([msg])
+    assert h1 != h2, "Hash must change when thinking_expanded toggles"
+
+    # Toggle actions.expanded
+    group.expanded = True
+    h3 = _compute_transcript_hash([msg])
+    assert h2 != h3, "Hash must change when actions.expanded toggles"
+
+
+def test_raw_line_editor_ctrl_o_fallback_with_state():
+    """Verify RawLineEditor dispatches Key.CTRL_O to state.toggle_disclosures and redraws when on_ctrl_o is None."""
+    from cli.tui.keyboard import RawLineEditor, Key
+    from cli.tui.state import AutonomousDeliveryState, ActionsGroup, TurnAction
+    from unittest.mock import MagicMock
+
+    state = AutonomousDeliveryState()
+    act = TurnAction("1", "Read test.py", status="COMPLETED")
+    group = ActionsGroup(actions=[act], expanded=False)
+    state.add_message("assistant", "Done", actions=group)
+
+    editor = RawLineEditor(state=state)
+    editor._force_full_redraw = MagicMock()
+
+    ret = editor.handle_key(Key.CTRL_O)
+    assert ret is False
+    assert group.expanded is True
+    editor._force_full_redraw.assert_called_once_with(clear=False)
 

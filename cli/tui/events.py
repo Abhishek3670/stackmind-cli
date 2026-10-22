@@ -171,7 +171,10 @@ def format_action_description(tool_name: str, target: str = "", role: str = "") 
     if "graph" in lower:
         return f"Graphing ({t})" if t else "Graphing"
     if "harness" in lower:
-        agent_name = (role or (t if t and t != "long_running_task" else "")).strip()
+        raw_agent = role or (t if t and t not in ("long_running_task", "None", "none", "null") else "")
+        if str(raw_agent).lower() in ("none", "null"):
+            raw_agent = ""
+        agent_name = str(raw_agent).strip()
         if agent_name:
             cased = "QA" if agent_name.lower() == "qa" else (agent_name.title() if agent_name.islower() else agent_name)
             return f"Agent ({cased})"
@@ -192,6 +195,11 @@ def format_action_description(tool_name: str, target: str = "", role: str = "") 
         return f"List ({t})" if t else "List"
     if "verify" in lower:
         return f"Verify ({t})" if t else "Verify"
+    if lower in {"trigger_goal", "trigger goal"}:
+        g = t if len(t) <= 30 else t[:27] + "..."
+        return f"Trigger Goal ({g})" if g else "Trigger Goal"
+    if lower in {"delegate_task", "delegate task"}:
+        return f"Delegate ({t})" if t else "Delegate"
     base = cleaned_tool.replace("_", " ").title()
     return f"{base} ({t})" if t else base
 
@@ -637,7 +645,7 @@ def extract_action_target(args: Mapping[str, Any] | None) -> str:
     """Extract primary target path, command, or selector from tool arguments."""
     if not isinstance(args, Mapping):
         return ""
-    for k in ("path", "file", "test_path", "test_name", "selector", "command", "target", "directory", "dir_path", "name"):
+    for k in ("path", "file", "test_path", "test_name", "selector", "command", "target", "directory", "dir_path", "name", "goal", "target_agent", "agent"):
         v = args.get(k)
         if v:
             return str(v)
@@ -1014,7 +1022,17 @@ def recover_transcript_from_events(
         # 1. Recover user prompt from turn.started or operation.started
         if name in {"turn.started", "operation.started"}:
             prompt = payload.get("prompt") or payload.get("input")
-            if prompt and isinstance(prompt, str) and prompt.strip():
+            role = str(payload.get("role") or "").lower().strip()
+            agent_id = str(payload.get("agent_id") or "").lower().strip()
+            delegated_from = payload.get("delegated_from") or payload.get("metadata", {}).get("delegated_from")
+            work_order_id = payload.get("work_order_id")
+            is_subagent_task = bool(
+                delegated_from
+                or work_order_id
+                or (role and role not in ("architecture", "claude", "user"))
+                or (agent_id and agent_id not in ("architecture", "claude"))
+            )
+            if not is_subagent_task and prompt and isinstance(prompt, str) and prompt.strip():
                 clean_prompt = prompt.strip()
                 msg_key = ("user", clean_prompt)
                 if msg_key not in state.seen_message_keys:
@@ -1024,6 +1042,18 @@ def recover_transcript_from_events(
 
         # 2. Recover assistant response from toolResult, completed, or report
         elif name in {"event.toolResult", "operation.completed", "turn.completed"}:
+            res = payload.get("result") if isinstance(payload.get("result"), Mapping) else {}
+            rpt_raw = res.get("report_path")
+            if rpt_raw:
+                try:
+                    rp = Path(rpt_raw)
+                    if not rp.is_absolute() and workspace:
+                        rp = workspace / rp
+                    if hasattr(state, "seen_harness_reports"):
+                        state.seen_harness_reports.add(str(rp.resolve()))
+                except Exception:
+                    pass
+
             resp = extract_assistant_response(payload, workspace=workspace)
             thinking = extract_assistant_thinking(payload, workspace=workspace)
             if resp and isinstance(resp, str) and resp.strip():
@@ -1039,6 +1069,12 @@ def recover_transcript_from_events(
         outbox_dir = workspace / ".sync" / "outbox"
         if outbox_dir.exists():
             for rpt in sorted(outbox_dir.glob("**/harness-*.md")):
+                rpt_key = str(rpt.resolve())
+                if hasattr(state, "seen_harness_reports"):
+                    if rpt_key in state.seen_harness_reports:
+                        continue
+                    state.seen_harness_reports.add(rpt_key)
+
                 try:
                     content = rpt.read_text(encoding="utf-8")
                     thinking = None

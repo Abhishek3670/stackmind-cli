@@ -130,6 +130,8 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
             OperationType.CREATE_WORK_ORDER.value,
             OperationType.UPDATE_WORK_ORDER.value,
             OperationType.DISPATCH_SUBAGENT.value,
+            OperationType.TRIGGER_GOAL.value,
+            OperationType.DELEGATE_TASK.value,
             OperationType.WEB_SEARCH.value,
             OperationType.IMAGE_SEARCH.value,
             OperationType.WEB_FETCH.value,

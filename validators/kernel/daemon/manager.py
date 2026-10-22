@@ -203,6 +203,88 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             encoding="utf-8",
         )
 
+    # Scaffold default agent contracts for protocol citizens
+    agent_contract_file = sync_dir / "agents" / f"{agent}.contract.yaml"
+    if not agent_contract_file.exists():
+        agent_contract_file.parent.mkdir(parents=True, exist_ok=True)
+        if agent in ("gemini", "frontend"):
+            default_allow = [
+                {"module": "*.html"},
+                {"module": "*.css"},
+                {"module": "*.js"},
+                {"module": "*.jsx"},
+                {"module": "*.tsx"},
+                {"module": "index.html"},
+                {"module": "assets/**"},
+                {"module": "static/**"},
+                {"module": "public/**"},
+                {"module": "templates/**"},
+                {"module": "src/**"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "frontend"
+        elif agent in ("codex", "backend"):
+            default_allow = [
+                {"module": "src/**"},
+                {"module": "server/**"},
+                {"module": "api/**"},
+                {"module": "backend/**"},
+                {"module": "lib/**"},
+                {"module": "*.py"},
+                {"module": "*.js"},
+                {"module": "*.ts"},
+                {"module": "*.json"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "backend"
+        elif agent in ("gemma", "qa"):
+            default_allow = [
+                {"module": "tests/**"},
+                {"module": "*.test.*"},
+                {"module": "*.spec.*"},
+                {"module": ".sync/qa/**"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "qa"
+        elif agent in ("local-llm", "gitops"):
+            default_allow = [
+                {"module": "VERSION*"},
+                {"module": "CHANGELOG*"},
+                {"module": "package.json"},
+                {"module": "pyproject.toml"},
+                {"module": f".sync/inbox/{agent}/**"},
+            ]
+            default_role = "gitops"
+        else:
+            default_allow = [{"module": "workspace/**"}]
+            default_role = "worker"
+
+        if agent != "claude":
+            agent_contract_file.write_text(yaml.safe_dump({
+                "schema_version": 1,
+                "agent_id": agent,
+                "work_order": "WO-000",
+                "identity": {
+                    "role": default_role,
+                    "reports_to": "claude",
+                },
+                "scope": {
+                    "allow": default_allow,
+                    "deny": [
+                        {"module": ".git/**"},
+                        {"module": ".sync/runtime/**"},
+                        {"module": ".sync/agents/**"},
+                        {"module": ".env"},
+                        {"module": "__pycache__/**"},
+                    ],
+                    "write": "read-write",
+                },
+                "budget": {
+                    "max_files_touched": 20,
+                    "max_tokens": 50000,
+                },
+            }, sort_keys=False), encoding="utf-8")
+
     if agent == "claude":
         claude_contract = sync_dir / "agents" / "claude.contract.yaml"
         default_claude_allow = [
@@ -440,9 +522,10 @@ def synthesize_bootstrap_planning(
         )
 
     # 4. Write artifacts to disk
+    from validators.kernel.io import durable_write_text
     wo_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{actual_wo_id}.yaml"
     wo_path.parent.mkdir(parents=True, exist_ok=True)
-    wo_path.write_text(wo_yaml, encoding="utf-8")
+    durable_write_text(wo_path, wo_yaml)
 
     # Invariant: work order must not exist in multiple state directories
     for stale_dir in ("COMPLETED", "BLOCKED"):
@@ -455,7 +538,7 @@ def synthesize_bootstrap_planning(
 
     contract_path = ws / ".sync" / "contracts" / f"{actual_wo_id}.yaml"
     contract_path.parent.mkdir(parents=True, exist_ok=True)
-    contract_path.write_text(contract_yaml, encoding="utf-8")
+    durable_write_text(contract_path, contract_yaml)
 
     # 5. Update .sync/work-orders/INDEX.yaml
     index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
@@ -501,7 +584,8 @@ def synthesize_bootstrap_planning(
         1 for o in index_data["orders"] if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
     )
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(yaml.safe_dump(index_data, sort_keys=False), encoding="utf-8")
+    from validators.kernel.io import durable_write_yaml
+    durable_write_yaml(index_path, index_data)
 
     # 6. Update .sync/runtime/TREE.yaml
     tree_path = ws / ".sync" / "runtime" / "TREE.yaml"
@@ -529,7 +613,7 @@ def synthesize_bootstrap_planning(
     if actual_wo_id not in assigned_list:
         assigned_list.append(actual_wo_id)
     tree_path.parent.mkdir(parents=True, exist_ok=True)
-    tree_path.write_text(yaml.safe_dump(tree_data, sort_keys=False), encoding="utf-8")
+    durable_write_yaml(tree_path, tree_data)
 
     return wo_record, contract_record
 
@@ -649,6 +733,20 @@ class SessionManager:
                 session["state"] = "WAITING"
                 session["updated_at"] = _now()
                 self.events.publish("session.recovered", session["session_id"], state="WAITING")
+            # Clear orphaned active_operation from prior daemon process
+            active_op = session.get("active_operation")
+            if active_op:
+                for r in session.get("journal", []):
+                    if r.get("operation_id") == active_op and r.get("status") not in _OPERATION_TERMINAL:
+                        r["status"] = "CANCELLED"
+                        r.setdefault("transitions", []).append({
+                            "status": "CANCELLED",
+                            "at": _now(),
+                            "reason": "Recovered across daemon restart",
+                        })
+                        r["completed_at"] = _now()
+                        break
+                session["active_operation"] = None
             records = {
                 r["operation_id"]: r
                 for r in session.get("journal", [])
@@ -750,16 +848,24 @@ class SessionManager:
             has_disk_settings = is_local or ("PYTEST_CURRENT_TEST" not in os.environ and settings_path is not None)
             app_settings = load_settings(workspace) if has_disk_settings else None
 
-            if role_cfg.get("backend") and role_cfg.get("backend") != "echo-agent":
+            role_settings = app_settings.roles.get(canonical, {}) if app_settings else {}
+            configured_provider = role_settings.get("provider")
+            configured_model = role_settings.get("model")
+
+            if configured_provider:
+                backend_id = configured_provider
+                model_name = configured_model or role_cfg.get("model")
+            elif role_cfg.get("backend") and role_cfg.get("backend") != "echo-agent":
                 backend_id = role_cfg["backend"]
                 model_name = role_cfg.get("model")
-            elif app_settings:
-                role_settings = app_settings.roles.get(canonical, {})
-                backend_id = role_settings.get("provider") or role_cfg.get("backend", "echo-agent")
-                model_name = role_settings.get("model") or role_cfg.get("model")
             else:
-                backend_id = role_cfg.get("backend", "echo-agent")
+                backend_id = "echo-agent"
                 model_name = role_cfg.get("model")
+
+            if canonical in self._roles:
+                self._roles[canonical]["backend"] = backend_id
+                if model_name:
+                    self._roles[canonical]["model"] = model_name
 
             registry = get_default_registry()
             backend = registry.get(backend_id) if backend_id in registry else None
@@ -805,7 +911,7 @@ class SessionManager:
                 m = model_name or (prov_cfg.default_model if prov_cfg else None) or getattr(backend, "model", default_m) or default_m
                 m = sanitize_model_name(m, backend_id)
                 t_val = role_cfg.get("timeout") or getattr(backend, "timeout", None)
-                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, default_timeout=float(t_val) if t_val else None)
+                provider_adapter = OpenAICompatibleAdapter(base_url=base_url, api_key=api_key, model=m, provider_name=backend_id, default_timeout=float(t_val) if t_val else None)
 
             elif backend_id in ("gemini", "google"):
                 from validators.kernel.providers.adapter import GeminiAdapter
@@ -1658,7 +1764,7 @@ class SessionManager:
         try:
             from validators.harness.authoring_compiler import compile_authoring_artifacts
             from validators.harness.authoring_readiness import load_plan_milestones
-            compile_authoring_artifacts(ws, load_plan_milestones(ws))
+            compile_authoring_artifacts(ws, load_plan_milestones(ws), planning_wo_id=state.planning_wo_id)
         except Exception:
             pass
 
@@ -1761,16 +1867,18 @@ class SessionManager:
                         self.supervisor.__class__ = reloaded_mod.LifecycleSupervisor
                 except Exception:
                     pass
-            if "validators.harness.runner" in sys.modules:
-                try:
-                    importlib.reload(sys.modules["validators.harness.runner"])
-                except Exception:
-                    pass
-            if "validators.harness.d024_gate" in sys.modules:
-                try:
-                    importlib.reload(sys.modules["validators.harness.d024_gate"])
-                except Exception:
-                    pass
+            for mod_name in (
+                "validators.harness.authoring_compiler",
+                "validators.harness.authoring_readiness",
+                "validators.harness.integration_gate",
+                "validators.harness.runner",
+                "validators.harness.d024_gate",
+            ):
+                if mod_name in sys.modules:
+                    try:
+                        importlib.reload(sys.modules[mod_name])
+                    except Exception:
+                        pass
 
             session = self._sessions.get(session_id)
             if not session:
@@ -1891,9 +1999,34 @@ class SessionManager:
                     contract_scope = parent_record.get("contract_scope")
                 _verify_contract_scope_narrowing(parent_record.get("contract_scope"), contract_scope)
             else:
-                if session.get("active_operation"):
-                    from .supervisor import OperationContentionError
-                    raise OperationContentionError("session already has an active operation")
+                active_op_id = session.get("active_operation")
+                if active_op_id:
+                    is_thread_alive = (
+                        active_op_id in self._turn_threads
+                        and self._turn_threads[active_op_id].is_alive()
+                    )
+                    active_rec = None
+                    for r in session.get("journal", []):
+                        if r.get("operation_id") == active_op_id:
+                            active_rec = r
+                            break
+
+                    if (
+                        active_rec is None
+                        or active_rec.get("status") in _OPERATION_TERMINAL
+                        or not is_thread_alive
+                    ):
+                        if active_rec and active_rec.get("status") not in _OPERATION_TERMINAL:
+                            self.complete_operation(
+                                session_id,
+                                active_op_id,
+                                {"reason": "Orphaned operation cleaned up on new turn"},
+                                status="CANCELLED" if active_rec.get("status") == "CANCEL_REQUESTED" else "FAILED",
+                            )
+                        session["active_operation"] = None
+                    else:
+                        from .supervisor import OperationContentionError
+                        raise OperationContentionError("session already has an active operation")
 
             operation_id = str(uuid4())
             cancel = Event()
@@ -2030,7 +2163,16 @@ class SessionManager:
         """Request cooperative cancellation without changing the session lifecycle."""
         with self._lock:
             session, record = self._operation(operation_id)
+            is_thread_alive = (
+                operation_id in self._turn_threads
+                and self._turn_threads[operation_id].is_alive()
+            )
+            already_cancel_requested = record["status"] == "CANCEL_REQUESTED"
             if record["status"] not in _OPERATION_TERMINAL:
+                if not is_thread_alive or already_cancel_requested:
+                    return self.complete_operation(
+                        session["session_id"], operation_id, status="CANCELLED"
+                    )
                 self._transition(record, "CANCEL_REQUESTED")
                 cancel = self._active.get(operation_id)
                 if cancel:
@@ -2198,6 +2340,7 @@ class SessionManager:
                 work_order_id=op_wo,
                 operation=op_name,
                 error=op_err,
+                result=record.get("result"),
             )
             self._save()
             self._operation_event.set()
@@ -2211,6 +2354,12 @@ class SessionManager:
             operation_id = session.get("active_operation")
             if operation_id:
                 self.cancel_operation(operation_id)
+                try:
+                    _, record = self._operation(operation_id)
+                    if record.get("status") in _OPERATION_TERMINAL:
+                        session["active_operation"] = None
+                except KeyError:
+                    session["active_operation"] = None
                 return self._view(session)
             return self._set_state(session_id, "CANCELLED", "session.cancelled")
 
@@ -2511,6 +2660,14 @@ class SessionManager:
                 "reasoning.delta", session_id, text=think_text, operation_id=operation_id,
                 role=op_role, agent_id=agent,
             )
+            runner.on_usage = lambda usage: self.events.publish(
+                "token.usage", session_id,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                completion_tokens=getattr(usage, "completion_tokens", 0),
+                total_tokens=getattr(usage, "total_tokens", 0),
+                operation_id=operation_id,
+                role=op_role, agent_id=agent,
+            )
             with self._lock:
                 try:
                     _, op_rec = self._operation(operation_id)
@@ -2524,6 +2681,29 @@ class SessionManager:
                     pass
             wo_id_param = op_rec.get("work_order_id")
             is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
+            session_history: list[dict[str, str]] = []
+            client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
+            if isinstance(client_hist, list) and client_hist:
+                for h in client_hist:
+                    if isinstance(h, dict) and "role" in h and "content" in h:
+                        h_content = str(h["content"]).strip()
+                        if h_content:
+                            session_history.append({"role": str(h["role"]).lower(), "content": h_content})
+            else:
+                with self._lock:
+                    for r in session.get("journal", []):
+                        if r.get("operation_id") == operation_id:
+                            continue
+                        if r.get("operation") == "turn" and not r.get("work_order_id") and not (r.get("metadata") or {}).get("is_authoring"):
+                            u_p = (r.get("metadata") or {}).get("prompt") or r.get("prompt")
+                            res = r.get("result") or {}
+                            a_r = res.get("summary") or res.get("report_markdown")
+                            if u_p and a_r and isinstance(a_r, str) and a_r.strip():
+                                session_history.append({"role": "user", "content": str(u_p).strip()})
+                                session_history.append({"role": "assistant", "content": str(a_r).strip()})
+
+            if len(session_history) > 12:
+                session_history = session_history[-12:]
             try:
                 result = runner.run_once(
                     cancel_event=cancel_event,
@@ -2531,6 +2711,7 @@ class SessionManager:
                     prompt=prompt,
                     work_order_id=wo_id_param,
                     is_authoring=is_authoring_param,
+                    session_history=session_history,
                 )
             except TypeError:
                 try:
@@ -2621,7 +2802,9 @@ class SessionManager:
                 is_goal_turn = bool(op_rec.get("metadata", {}).get("is_goal"))
                 is_authoring_turn = bool(op_rec.get("metadata", {}).get("is_authoring"))
                 plan_file = ws_path / "PLAN.md"
-                if is_goal_turn and not is_authoring_turn and plan_file.is_file():
+                mod_files = [str(f).replace("\\", "/").strip().lstrip("/") for f in (res_meta.get("modified_files") or [])]
+                plan_written_this_turn = any(f.endswith("PLAN.md") for f in mod_files)
+                if (is_goal_turn or plan_written_this_turn) and not is_authoring_turn and plan_file.is_file():
                     try:
                         from validators.harness.plan import validate_plan_structure, parse_plan
                         plan_content = plan_file.read_text(encoding="utf-8")
@@ -2697,6 +2880,58 @@ class SessionManager:
                     result=result_data, role=op_role, agent_id=agent,
                 )
                 self.complete_operation(session_id, operation_id, result_data)
+
+                # Autonomous Multi-Agent Dispatch from Architect (Hybrid Pattern)
+                triggered_goal = res_meta.get("triggered_goal") or res_payload.get("triggered_goal")
+                if triggered_goal and isinstance(triggered_goal, dict) and triggered_goal.get("goal"):
+                    goal_text = str(triggered_goal["goal"]).strip()
+                    if goal_text:
+                        self.events.publish(
+                            "goal.auto_triggered",
+                            session_id,
+                            goal=goal_text,
+                            parent_operation_id=operation_id,
+                            triggered_by=agent,
+                        )
+                        try:
+                            self.start_turn(session_id, f":goal {goal_text}", is_goal=True)
+                        except Exception as e:
+                            self.events.publish("error", session_id, message=f"Failed to auto-trigger goal: {e}")
+
+                delegated_tasks = res_meta.get("delegated_tasks") or res_payload.get("delegated_tasks") or []
+                if isinstance(delegated_tasks, dict):
+                    delegated_tasks = [delegated_tasks]
+                for d_task in delegated_tasks:
+                    if isinstance(d_task, dict) and d_task.get("agent") and d_task.get("instructions"):
+                        target_agent = str(d_task["agent"]).lower().strip()
+                        target_role = str(d_task.get("role") or self._canonical_role(target_agent))
+                        target_instr = str(d_task["instructions"]).strip()
+                        target_files = d_task.get("target_files") or []
+                        self.events.publish(
+                            "task.auto_delegated",
+                            session_id,
+                            agent_id=target_agent,
+                            role=target_role,
+                            instructions=target_instr,
+                            target_files=target_files,
+                            parent_operation_id=operation_id,
+                        )
+                        files_str = "\n".join(f"- {f}" for f in target_files) if target_files else ""
+                        worker_prompt = (
+                            f"{target_instr}\n\nTarget files:\n{files_str}\n\nNote: When authoring files, invoke write_file with path and content."
+                            if files_str
+                            else target_instr
+                        )
+                        try:
+                            self.start_turn(
+                                session_id,
+                                worker_prompt,
+                                role=target_role,
+                                agent_id=target_agent,
+                                delegated_from=operation_id,
+                            )
+                        except Exception as e:
+                            self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")
             elif res_status == "blocked":
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "blocked", operation_id=operation_id,

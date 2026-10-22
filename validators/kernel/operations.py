@@ -69,6 +69,8 @@ class OperationType(str, Enum):
     INSPECT_WORK_ORDER = "inspect_work_order"
     INSPECT_AGENT = "inspect_agent"
     DISPATCH_SUBAGENT = "dispatch_subagent"
+    TRIGGER_GOAL = "trigger_goal"
+    DELEGATE_TASK = "delegate_task"
 
     # Git Inspection
     GIT_STATUS = "git_status"

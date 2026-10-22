@@ -51,6 +51,16 @@ class ToolGateway:
         self.process_manager = ProcessManager(workspace, self.sandbox)
         self._todo_list: list[dict[str, Any]] = []
         self._plan_mode: bool = False
+        self._triggered_goal: dict[str, Any] | None = None
+        self._delegated_tasks: list[dict[str, Any]] = []
+
+    @property
+    def triggered_goal(self) -> dict[str, Any] | None:
+        return getattr(self, "_triggered_goal", None)
+
+    @property
+    def delegated_tasks(self) -> list[dict[str, Any]]:
+        return list(getattr(self, "_delegated_tasks", []))
 
     def _request(self, operation_type: OperationType, target: str) -> OperationRequest:
         return OperationRequest(operation_type, target, self.session_id, self.attempt_id,
@@ -1805,6 +1815,103 @@ class ToolGateway:
         dispatch_path.write_text(content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, f"Dispatched to {agent_name}")
         return {"dispatched": True, "path": str(dispatch_path.relative_to(self.workspace.root))}
+
+    def trigger_goal(self, goal: str, rationale: str = "") -> dict[str, Any]:
+        clean_goal = str(goal).strip()
+        record = self._authorize(OperationType.TRIGGER_GOAL, "workspace/goal")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+        self._triggered_goal = {
+            "goal": clean_goal,
+            "rationale": str(rationale or "").strip(),
+            "triggered_by": self.actor_id,
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"Triggered goal: {clean_goal}")
+        return {
+            "status": "triggered",
+            "goal": clean_goal,
+            "message": (
+                f"Autonomous goal triggered: '{clean_goal}'. "
+                "The multi-agent supervisor will initiate planning, author child work orders, "
+                "and dispatch specialist agents (Backend/Codex, Frontend/Gemini, QA/Gemma, GitOps/Local-LLM) "
+                "to execute and verify this feature across the workspace."
+            ),
+        }
+
+    def delegate_task(
+        self,
+        target_agent: str,
+        instructions: str,
+        target_files: Sequence[str] | str | None = None,
+    ) -> dict[str, Any]:
+        clean_target = str(target_agent).lower().strip()
+        if clean_target in ("frontend", "ui", "web", "design", "gemini"):
+            canonical_agent = "gemini"
+            canonical_role = "frontend"
+        elif clean_target in ("backend", "api", "server", "codex"):
+            canonical_agent = "codex"
+            canonical_role = "backend"
+        elif clean_target in ("qa", "test", "tester", "gemma"):
+            canonical_agent = "gemma"
+            canonical_role = "qa"
+        elif clean_target in ("gitops", "git", "release", "local-llm", "localllm"):
+            canonical_agent = "local-llm"
+            canonical_role = "gitops"
+        else:
+            canonical_agent = clean_target
+            canonical_role = clean_target
+
+        record = self._authorize(OperationType.DELEGATE_TASK, f"inbox/{canonical_agent}/task")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        if isinstance(target_files, str):
+            clean_files = [f.strip() for f in target_files.split(",") if f.strip()]
+        elif isinstance(target_files, (list, tuple, set)):
+            clean_files = [str(f).replace("\\", "/").strip().lstrip("/") for f in target_files if str(f).strip()]
+        else:
+            clean_files = []
+
+        task_payload = {
+            "agent": canonical_agent,
+            "role": canonical_role,
+            "instructions": str(instructions).strip(),
+            "target_files": clean_files,
+            "delegated_by": self.actor_id,
+        }
+        if not hasattr(self, "_delegated_tasks"):
+            self._delegated_tasks = []
+        self._delegated_tasks.append(task_payload)
+
+        try:
+            inbox_dir = self.workspace.root / ".sync" / "inbox" / canonical_agent
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+            now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            assignment_file = inbox_dir / f"{now_str}_{self.actor_id}_delegation.md"
+            files_desc = "\n".join(f"- `{f}`" for f in clean_files) if clean_files else "Workspace scope"
+            assignment_file.write_text(
+                f"# Delegated Task: {canonical_role.title()}\n\n"
+                f"**To:** {canonical_agent} ({canonical_role})\n"
+                f"**From:** {self.actor_id}\n\n"
+                f"### Target Files\n{files_desc}\n\n"
+                f"### Instructions\n{instructions}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        self.boundary.journal.complete(record.request.operation_id, f"Delegated to {canonical_agent}")
+        return {
+            "status": "delegated",
+            "agent": canonical_agent,
+            "role": canonical_role,
+            "target_files": clean_files,
+            "message": (
+                f"Successfully delegated task to {canonical_role.title()} ({canonical_agent}). "
+                f"Target files: {clean_files if clean_files else 'General'}. "
+                "The specialist agent will execute with write permissions for the specified files."
+            ),
+        }
 
     def web_search(self, query: str, limit: int = 5, media_type: str | None = None) -> list[dict[str, Any]]:
         record = self._authorize(OperationType.WEB_SEARCH, f"web/search?q={query}")

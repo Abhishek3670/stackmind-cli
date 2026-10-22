@@ -31,6 +31,7 @@ from cli.tui.keyboard import (
     DISABLE_MOUSE_REPORTING_SEQ,
     ENABLE_MOUSE_REPORTING_SEQ,
     raw_prompt_input,
+    wrap_composer_text,
 )
 from cli.tui.layout import (
     compute_composer_cursor_row,
@@ -291,12 +292,8 @@ def render_composer_box(
                 line.append(right_plain, style="dim #64748b")
             body = line
     else:
-        if isinstance(content, str):
-            lines = content.split("\n") or [""]
-        elif content:
-            lines = list(content) or [""]
-        else:
-            lines = [""]
+        wrap_width = max(10, inner_width - 2)
+        lines = wrap_composer_text(content, wrap_width)
 
         total_lines = len(lines)
         max_box_h, max_input_lines = get_composer_line_limits(height)
@@ -311,8 +308,6 @@ def render_composer_box(
         rendered_lines: list[Text] = []
         first_text = visible_lines[0]
 
-        max_text_width = max(0, inner_width - 2)
-
         left_plain = f"> {first_text}"
         available_shortcuts_width = inner_width - len(left_plain) - 2
         right_plain = ""
@@ -320,11 +315,6 @@ def render_composer_box(
             if available_shortcuts_width >= len(sc):
                 right_plain = sc
                 break
-
-        if len(first_text) > max_text_width:
-            first_text = first_text[: max(0, max_text_width - 3)] + "..."
-            left_plain = f"> {first_text}"
-            right_plain = ""
 
         spaces_count = (
             max(2, inner_width - len(left_plain) - len(right_plain)) if right_plain else 0
@@ -339,8 +329,6 @@ def render_composer_box(
         rendered_lines.append(line1)
 
         for sub_line in visible_lines[1:]:
-            if len(sub_line) > max_text_width:
-                sub_line = sub_line[: max(0, max_text_width - 3)] + "..."
             line_n = Text(no_wrap=True)
             line_n.append("  ", style="dim #38bdf8")
             line_n.append(sub_line, style="white")
@@ -472,6 +460,14 @@ def _compute_cursor_col(editor: Any, default: int = 5) -> int:
     """Compute the visible cursor column for the composer prompt line."""
     if editor is None:
         return default
+    if hasattr(editor, "current_line_and_col"):
+        try:
+            _, col = editor.current_line_and_col
+            prefix = getattr(editor, "prompt_prefix", None)
+            v_prefix_len = len(_ANSI_STRIP_RE.sub("", prefix)) if isinstance(prefix, str) else 4
+            return v_prefix_len + col + 1
+        except Exception:
+            pass
     cursor = getattr(editor, "displayed_cursor", None)
     if not isinstance(cursor, int):
         cursor = getattr(editor, "cursor", None)
@@ -682,12 +678,34 @@ def redraw_full_screen(
     try:
         if target and hasattr(target, "write"):
             prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H"
-            target.write(f"{prefix}{frame}\n" if not include_composer else f"{prefix}{frame}")
+            # Pad every row to the terminal width when writing to the real
+            # terminal. The composer/status rows are narrower than the screen,
+            # so without padding the previous frame's runtime-panel glyphs
+            # survive to the right of them. Custom streams (tests/capture)
+            # receive the unpadded frame for byte-exact assertions.
+            payload = _pad_frame_to_width(frame, cols) if stream is None else frame
+            if not include_composer:
+                # Leave the cursor on the row where the raw prompt editor will
+                # draw its input line.
+                target.write(f"{prefix}{payload}\n")
+            else:
+                target.write(f"{prefix}{payload}")
             target.flush()
     except Exception:
         pass
 
     return frame
+
+
+def _pad_frame_to_width(frame: str, width: int) -> str:
+    """Pad every frame line to ``width`` display cells without touching ANSI styles."""
+    if width <= 0:
+        return frame
+    padded: list[str] = []
+    for line in frame.split("\n"):
+        visible = Text.from_ansi(line).cell_len
+        padded.append(line + " " * max(0, width - visible))
+    return "\n".join(padded)
 
 
 def render_composer_top_border(
@@ -708,10 +726,8 @@ def render_composer_top_border(
 
     lines_count = 1
     if content:
-        if isinstance(content, str):
-            lines_count = len(content.split("\n"))
-        elif isinstance(content, list):
-            lines_count = len(content)
+        wrap_width = max(10, width - 6)
+        lines_count = len(wrap_composer_text(content, wrap_width))
 
     max_box_h, max_input_lines = get_composer_line_limits(height)
 
@@ -893,6 +909,8 @@ def prompt_composer_input(
     on_ctrl_k: Callable[[], None] | None = None,
     on_ctrl_l: Callable[[], None] | None = None,
     on_ctrl_o: Callable[[], None] | None = None,
+    on_ctrl_b: Callable[[], None] | None = None,
+    on_ctrl_g: Callable[[], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_wheel_up: Callable[[], None] | None = None,
@@ -907,12 +925,13 @@ def prompt_composer_input(
     key_stream: Optional[Iterator[str]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
+    on_mouse_click: Optional[Callable[..., None]] = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
     """Prompt user for input inside styled composer box border."""
     term_width = terminal_width if terminal_width is not None else width
-    layout = compute_layout(term_width)
+    layout = compute_layout(term_width, state=state)
     if width != term_width:
         comp_width = width
     else:
@@ -992,7 +1011,7 @@ def prompt_composer_input(
                     redraw_full_screen(
                         session,
                         state,
-                        clear=False,
+                        clear=True,
                         include_composer=True,
                         composer_is_active=True,
                         composer_content=getattr(state, "composer_buffer", ""),
@@ -1104,6 +1123,8 @@ def prompt_composer_input(
                 on_ctrl_k=on_ctrl_k,
                 on_ctrl_l=on_ctrl_l,
                 on_ctrl_o=on_ctrl_o,
+                on_ctrl_b=on_ctrl_b,
+                on_ctrl_g=on_ctrl_g,
                 on_page_up=on_page_up,
                 on_page_down=on_page_down,
                 on_wheel_up=on_wheel_up,
@@ -1131,6 +1152,7 @@ def prompt_composer_input(
                 on_idle=on_idle,
                 on_height_change=on_height_change,
                 on_resize=_handle_prompt_resize,
+                on_mouse_click=on_mouse_click,
             )
         finally:
             if state is not None:

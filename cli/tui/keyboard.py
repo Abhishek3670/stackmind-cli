@@ -75,8 +75,10 @@ if DEBUG_KEYS_ENABLED:
 class Key:
     """Key code constants for decoded terminal input."""
 
+    CTRL_B = "\x02"  # Toggle runtime sidebar (full-width view)
     CTRL_C = "\x03"
     CTRL_D = "\x04"
+    CTRL_G = "\x07"  # Auto-fill / adopt Architect suggested goal
     BACKSPACE = "\x08"
     BACKSPACE_DEL = "\x7f"
     TAB = "\t"
@@ -101,17 +103,19 @@ class Key:
     PASTE_START = "<PASTE_START>"
     PASTE_END = "<PASTE_END>"
     SHIFT_ENTER = "<SHIFT_ENTER>"
+    CTRL_V = "\x16"  # Paste from clipboard (ASCII SYN / ord 22)
+    SHIFT_INSERT = "<SHIFT_INSERT>"
 
 
 # SGR Extended Mouse Mode control sequences (WO-054)
-ENABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000h\x1b[?1006h"
-DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1000l"
+ENABLE_MOUSE_REPORTING_SEQ = ""
+DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 
 
 def enable_mouse_reporting(stream: Any = None) -> None:
     """Enable terminal SGR mouse reporting (WO-054).
 
-    Emits \x1b[?1000h\x1b[?1006h (normal tracking + SGR extended coordinates).
+    Emits \\x1b[?1000h\\x1b[?1002h\\x1b[?1006h (button event tracking + SGR extended coordinates).
     """
     target = stream or sys.stdout
     try:
@@ -125,7 +129,7 @@ def enable_mouse_reporting(stream: Any = None) -> None:
 def disable_mouse_reporting(stream: Any = None) -> None:
     """Disable terminal SGR mouse reporting (WO-054).
 
-    Emits \x1b[?1006l\x1b[?1000l.
+    Emits \\x1b[?1006l\\x1b[?1002l\\x1b[?1000l.
     """
     target = stream or sys.stdout
     try:
@@ -139,9 +143,11 @@ def disable_mouse_reporting(stream: Any = None) -> None:
 class TerminalStateRestorer:
     """Context manager to ensure terminal attributes, mouse reporting, and bracketed paste are restored unconditionally."""
 
-    def __init__(self, fd: int = 0) -> None:
+    def __init__(self, fd: int = 0, state: Any = None) -> None:
         self.fd = fd
+        self.state = state
         self.old_termios = None
+        self.old_win_mode = None
         self.is_tty = False
 
     def __enter__(self) -> TerminalStateRestorer:
@@ -151,10 +157,31 @@ class TerminalStateRestorer:
             self.is_tty = False
 
         if self.is_tty:
-            enable_mouse_reporting(sys.stdout)
+            mouse_enabled = getattr(self.state, "mouse_reporting_enabled", False) if self.state is not None else False
+            if os.environ.get("STACKMIND_MOUSE", "").strip().lower() in ("1", "true", "yes"):
+                mouse_enabled = True
+            if mouse_enabled:
+                enable_mouse_reporting(sys.stdout)
+            else:
+                disable_mouse_reporting(sys.stdout)
             try:
                 sys.stdout.write("\x1b[?2004h")
                 sys.stdout.flush()
+            except Exception:
+                pass
+
+        if self.is_tty and os.name == "nt":
+            try:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                h = kernel32.GetStdHandle(-10)
+                if h not in (0, -1):
+                    mode = ctypes.c_uint32()
+                    if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                        self.old_win_mode = mode.value
+                        # Ensure QuickEdit mode (0x0040) and extended flags (0x0080) are enabled
+                        # so native terminal text selection & copy always works smoothly without Shift.
+                        new_mode = mode.value | 0x0040 | 0x0080
+                        kernel32.SetConsoleMode(h, new_mode)
             except Exception:
                 pass
 
@@ -175,6 +202,15 @@ class TerminalStateRestorer:
                 import termios
 
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_termios)
+            except Exception:
+                pass
+
+        if self.is_tty and os.name == "nt" and self.old_win_mode is not None:
+            try:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                h = kernel32.GetStdHandle(-10)
+                if h not in (0, -1):
+                    kernel32.SetConsoleMode(h, self.old_win_mode)
             except Exception:
                 pass
 
@@ -361,6 +397,12 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
             res = _parse_escape_sequence(seq)
         else:
             res = Key.ESCAPE
+    elif ch == Key.CTRL_V:
+        res = Key.CTRL_V
+    elif ch == Key.CTRL_B:
+        res = Key.CTRL_B
+    elif ch == Key.CTRL_G:
+        res = Key.CTRL_G
     else:
         if msvcrt.kbhit():
             debug_parts.append("kbhit=True")
@@ -458,8 +500,14 @@ class Win32ConsoleReader:
                     return Key.MOUSE_WHEEL_UP
                 elif delta < 0:
                     return Key.MOUSE_WHEEL_DOWN
-            # Non-wheel mouse events (clicks, motion) -> filtered by handle_key
-            btn = mouse.dwButtonState
+            # Filter out mouse motion with no buttons pressed to avoid event queue spam
+            if (mouse.dwEventFlags & 0x0001) and mouse.dwButtonState == 0:
+                return None
+            # If left mouse button is held while moving (MOUSE_MOVED), report as drag (btn=32)
+            if (mouse.dwEventFlags & 0x0001) and (mouse.dwButtonState & 0x0001):
+                btn = 32
+            else:
+                btn = mouse.dwButtonState
             return f"<MOUSE_{btn}_{mouse.dwMousePosition.X}_{mouse.dwMousePosition.Y}>"
 
         # Key Events (EventType == 0x0001)
@@ -502,7 +550,35 @@ class Win32ConsoleReader:
             # Discard stale high surrogate if followed by a regular char
             self._surrogate_high = None
 
-            # 2. Virtual Keys without Unicode representation (UnicodeChar == '\x00')
+            # 2. Control Key Combinations (Ctrl+O, Ctrl+K, Ctrl+L, Ctrl+C, Ctrl+D, Ctrl+V)
+            # Handle control keys regardless of whether UnicodeChar is null ('\x00') or letter
+            is_ctrl = bool(key.dwControlKeyState & (0x0004 | 0x0008))
+            is_shift = bool(key.dwControlKeyState & 0x0010)
+
+            if is_ctrl:
+                ctrl_vk_map = {
+                    0x42: Key.CTRL_B,  # VK_B -> '\x02' (Toggle sidebar)
+                    0x47: Key.CTRL_G,  # VK_G -> '\x07' (Adopt suggested goal)
+                    0x4F: Key.CTRL_O,  # VK_O -> '\x0f' (Toggle thinking)
+                    0x4B: Key.CTRL_K,  # VK_K -> '\x0b' (Command palette)
+                    0x4C: Key.CTRL_L,  # VK_L -> '\x0c' (Clear screen)
+                    0x43: Key.CTRL_C,  # VK_C -> '\x03' (Cancel / exit)
+                    0x44: Key.CTRL_D,  # VK_D -> '\x04' (EOF / exit)
+                    0x56: Key.CTRL_V,  # VK_V -> '\x16' (Paste clipboard)
+                }
+                res = ctrl_vk_map.get(vk)
+                if res:
+                    if key.wRepeatCount > 1:
+                        self._pending_keys.extend([res] * (key.wRepeatCount - 1))
+                    return res
+
+            # Virtual key override for Ctrl+V / Shift+Insert (paste from clipboard)
+            if (vk == 0x2D and is_shift) or char == Key.CTRL_V:
+                if key.wRepeatCount > 1:
+                    self._pending_keys.extend([Key.CTRL_V] * (key.wRepeatCount - 1))
+                return Key.CTRL_V
+
+            # 3. Virtual Keys without Unicode representation (UnicodeChar == '\x00')
             if char == "\x00":
                 vk_map = {
                     0x21: Key.PAGE_UP,      # VK_PRIOR
@@ -522,19 +598,19 @@ class Win32ConsoleReader:
                     return res
                 return None
 
-            # 3. Virtual key override for VK_DELETE if it arrived with a char code like '\x7f' or '\x00'
+            # 4. Virtual key override for VK_DELETE if it arrived with a char code like '\x7f' or '\x00'
             if vk == 0x2E:
                 if key.wRepeatCount > 1:
                     self._pending_keys.extend([Key.DELETE] * (key.wRepeatCount - 1))
                 return Key.DELETE
 
             # Virtual key override for VK_RETURN when Shift is held
-            if vk == 0x0D and (key.dwControlKeyState & 0x0010):
+            if vk == 0x0D and is_shift:
                 if key.wRepeatCount > 1:
                     self._pending_keys.extend([Key.SHIFT_ENTER] * (key.wRepeatCount - 1))
                 return Key.SHIFT_ENTER
 
-            # 4. Standard character or control character
+            # 5. Standard character or control character
             if key.wRepeatCount > 1:
                 self._pending_keys.extend([char] * (key.wRepeatCount - 1))
             return char
@@ -767,14 +843,17 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":plan", "Display Plan Approval surface & history", False),
     (":pause", "Pause active session turn", False),
     (":wo", "Display Work Orders table and progress", False),
-    (":goal", "Submit product goal to Architecture", True),
+    (":goal", "Submit product goal to Architecture (or adopt suggested goal)", True),
+    (":adopt", "Adopt suggested goal from Architecture", False),
+    (":panel", "Toggle runtime sidebar panel (Ctrl+B)", False),
+    (":sidebar", "Toggle runtime sidebar panel (Ctrl+B)", False),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
     (":roles", "Interactive Agent Roles & Execution Backend bindings panel", False),
-    (":rebind", "Rebind agent role to backend", True),
+    (":rebind", "Rebind agent role to backend (use :roles)", True),
     (":config", "Configure StackMind execution profile, governance & system policies", False),
-    (":providers", "Configure cloud & local LLM providers, API keys & base URLs", False),
-    (":models", "Configure and list available provider models", False),
+    (":provider", "Configure cloud & local LLM providers, API keys & base URLs", False),
+    (":providers", "Alias for :provider", False),
     (":tree", "Display Hierarchical Operation Tree", False),
     (":agents", "Display Hierarchical Agent Tree", False),
     (":completion", "Display Project Complete checklist", False),
@@ -795,6 +874,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":skill", "Display available procedural skills & runbooks", False),
     (":consume-skills", "Install/import procedural skills from file or directory", True),
     (":consume-skill", "Install/import procedural skill from file or directory", True),
+    (":copy", "Copy latest response (or :copy all for transcript) to clipboard", False),
     (":projects", "List registered projects and runtime home", False),
     (":help", "Show help menu with all commands", False),
     (":debugkeys", "Toggle debug key logging to file", False),
@@ -898,6 +978,92 @@ def format_dropdown_lines(
     return lines
 
 
+def wrap_composer_paragraph(para: str, width: int) -> list[tuple[int, int]]:
+    """Return list of (start, end) index spans in para for wrapping within width."""
+    if not para:
+        return [(0, 0)]
+    spans: list[tuple[int, int]] = []
+    start = 0
+    n = len(para)
+    while start < n:
+        if n - start <= width:
+            spans.append((start, n))
+            break
+        candidate_end = start + width
+        # Look for the last space within width to break cleanly at word boundary
+        space_idx = para.rfind(" ", start, candidate_end + 1)
+        if space_idx > start:
+            end = space_idx + 1
+        else:
+            # Word exceeds width, hard-break at width
+            end = candidate_end
+        spans.append((start, end))
+        start = end
+    return spans
+
+
+def wrap_composer_text_with_cursor(
+    text: str, width: int, cursor: int
+) -> tuple[list[str], list[int], int, int]:
+    """Wrap composer text to width and compute visual cursor coordinates.
+
+    Returns:
+        (visual_lines, line_starts, cursor_line_idx, cursor_col_idx)
+    """
+    if width <= 0:
+        width = 80
+    paras = text.split("\n")
+    visual_lines: list[str] = []
+    line_starts: list[int] = []
+    g_offset = 0
+    c_line = 0
+    c_col = 0
+    found_cursor = False
+
+    for p_idx, para in enumerate(paras):
+        spans = wrap_composer_paragraph(para, width)
+        for s_idx, (s, e) in enumerate(spans):
+            v_line_idx = len(visual_lines)
+            visual_lines.append(para[s:e])
+            g_start = g_offset + s
+            g_end = g_offset + e
+            line_starts.append(g_start)
+
+            if not found_cursor:
+                is_last_span_of_para = (s_idx == len(spans) - 1)
+                is_last_para = (p_idx == len(paras) - 1)
+
+                if g_start <= cursor < g_end:
+                    c_line = v_line_idx
+                    c_col = cursor - g_start
+                    found_cursor = True
+                elif cursor == g_end:
+                    if is_last_span_of_para:
+                        if is_last_para or cursor < g_offset + len(para) + 1:
+                            c_line = v_line_idx
+                            c_col = e - s
+                            found_cursor = True
+        g_offset += len(para) + 1
+
+    if not found_cursor:
+        c_line = max(0, len(visual_lines) - 1)
+        c_col = len(visual_lines[-1]) if visual_lines else 0
+
+    return visual_lines, line_starts, c_line, c_col
+
+
+def wrap_composer_text(content: str | list[str] | None, width: int) -> list[str]:
+    """Wrap composer text or lines into visual lines respecting width without ellipsis truncation."""
+    if not content:
+        return [""]
+    if isinstance(content, list):
+        text = "\n".join(content)
+    else:
+        text = str(content)
+    lines, _, _, _ = wrap_composer_text_with_cursor(text, width, cursor=0)
+    return lines or [""]
+
+
 class RawLineEditor:
     """In-memory line buffer maintaining cursor position, edit history, and rendering."""
 
@@ -910,6 +1076,8 @@ class RawLineEditor:
         on_ctrl_k: Optional[Callable[[], None]] = None,
         on_ctrl_l: Optional[Callable[[], None]] = None,
         on_ctrl_o: Optional[Callable[[], None]] = None,
+        on_ctrl_b: Optional[Callable[[], None]] = None,
+        on_ctrl_g: Optional[Callable[[], None]] = None,
         on_page_up: Optional[Callable[[], None]] = None,
         on_page_down: Optional[Callable[[], None]] = None,
         on_wheel_up: Optional[Callable[[], None]] = None,
@@ -923,13 +1091,13 @@ class RawLineEditor:
         bottom_border_renderer: Optional[Callable[[Optional[str]], str]] = None,
         on_alert: Optional[Callable[[Optional[str]], None]] = None,
         on_height_change: Optional[Callable[[Any], None]] = None,
+        on_mouse_click: Optional[Callable[[int, int, int], None]] = None,
     ) -> None:
         self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
         self.buffer: list[str] = list(initial_text)
         self.cursor: int = len(self.buffer)
         self.displayed_cursor: int = self.cursor
-        self._viewport_start: int = 0
         self.history: list[str] = list(history) if history is not None else list(GLOBAL_HISTORY)
         self.history_index: int = len(self.history)
         self.temp_buffer: str = initial_text
@@ -937,10 +1105,13 @@ class RawLineEditor:
         self.on_ctrl_k = on_ctrl_k
         self.on_ctrl_l = on_ctrl_l
         self.on_ctrl_o = on_ctrl_o
+        self.on_ctrl_b = on_ctrl_b
+        self.on_ctrl_g = on_ctrl_g
         self.on_page_up = on_page_up
         self.on_page_down = on_page_down
         self.on_wheel_up = on_wheel_up
         self.on_wheel_down = on_wheel_down
+        self.on_mouse_click = on_mouse_click
         self.on_transition = on_transition
         self.on_height_change = on_height_change
         self.width = width
@@ -974,12 +1145,49 @@ class RawLineEditor:
         self._update_state()
         self._update_dropdown()
 
+    def paste_from_clipboard(self) -> bool:
+        """Paste text from system clipboard directly into the composer buffer."""
+        from cli.tui.clipboard import get_clipboard_text
+
+        text = get_clipboard_text()
+        if not text:
+            return False
+
+        for ch in text:
+            if ch == "\r":
+                self._last_was_cr = True
+                self.insert_char("\n")
+            elif ch == "\n":
+                if self._last_was_cr:
+                    self._last_was_cr = False
+                    continue
+                self._last_was_cr = False
+                self.insert_char("\n")
+            else:
+                self._last_was_cr = False
+                if ch.isprintable() or ch == "\t":
+                    self.insert_char(ch)
+        self._notify_height_change()
+        self._update_state()
+        return True
+
     @property
     def text(self) -> str:
         return "".join(self.buffer)
 
+    def _get_wrap_width(self) -> int:
+        visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+        visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
+        inner_available = max(1, self.width - visible_prefix_len - visible_right_len)
+        return max(1, min(inner_available, self.width - 6)) if self.has_borders else max(10, self.width - 6)
+
+    def _get_visual_lines(self) -> tuple[list[str], list[int], int, int]:
+        wrap_width = self._get_wrap_width()
+        return wrap_composer_text_with_cursor(self.text, wrap_width, self.cursor)
+
     def _notify_height_change(self) -> None:
-        lines_count = max(1, "".join(self.buffer).count("\n") + 1)
+        v_lines, _, _, _ = self._get_visual_lines()
+        lines_count = max(1, len(v_lines))
         if lines_count != self._last_line_count:
             self._last_line_count = lines_count
             if getattr(self, "on_height_change", None):
@@ -988,20 +1196,32 @@ class RawLineEditor:
                 except Exception:
                     pass
 
+    def _force_full_redraw(self, clear: bool = True) -> None:
+        """Trigger a clean full-screen redraw when dialogs or panels close."""
+        if getattr(self, "on_height_change", None):
+            try:
+                self.on_height_change(self, clear=clear)
+                return
+            except TypeError:
+                try:
+                    self.on_height_change(self)
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if getattr(self, "on_clear_dropdown", None):
+            try:
+                self.on_clear_dropdown()
+            except Exception:
+                pass
+
     def _get_line_and_col(self, cursor: int | None = None) -> tuple[int, int, list[str]]:
         """Return (line_index, col_index, list_of_lines) for cursor in buffer."""
-        if cursor is None:
-            cursor = self.cursor
-        text = "".join(self.buffer)
-        lines = text.split("\n")
-        cur = 0
-        for l_idx, line in enumerate(lines):
-            line_len = len(line)
-            if cur <= cursor <= cur + line_len:
-                col = cursor - cur
-                return l_idx, col, lines
-            cur += line_len + 1
-        return max(0, len(lines) - 1), len(lines[-1]) if lines else 0, lines
+        cur = self.cursor if cursor is None else cursor
+        wrap_width = self._get_wrap_width()
+        v_lines, _, c_line, c_col = wrap_composer_text_with_cursor(self.text, wrap_width, cur)
+        return c_line, c_col, v_lines
 
     @property
     def current_line_and_col(self) -> tuple[int, int]:
@@ -1021,24 +1241,22 @@ class RawLineEditor:
         return l_idx
 
     def move_up(self) -> bool:
-        """Move cursor up one line within multiline buffer. Returns True if handled."""
-        l_idx, col, lines = self._get_line_and_col()
-        if l_idx > 0:
-            target_line = lines[l_idx - 1]
-            target_col = min(col, len(target_line))
-            new_cursor = sum(len(lines[i]) + 1 for i in range(l_idx - 1)) + target_col
-            self.cursor = new_cursor
+        """Move cursor up one visual line within buffer. Returns True if handled."""
+        v_lines, line_starts, c_line, c_col = self._get_visual_lines()
+        if c_line > 0:
+            target_line = c_line - 1
+            target_col = min(c_col, len(v_lines[target_line]))
+            self.cursor = line_starts[target_line] + target_col
             return True
         return False
 
     def move_down(self) -> bool:
-        """Move cursor down one line within multiline buffer. Returns True if handled."""
-        l_idx, col, lines = self._get_line_and_col()
-        if l_idx < len(lines) - 1:
-            target_line = lines[l_idx + 1]
-            target_col = min(col, len(target_line))
-            new_cursor = sum(len(lines[i]) + 1 for i in range(l_idx + 1)) + target_col
-            self.cursor = new_cursor
+        """Move cursor down one visual line within buffer. Returns True if handled."""
+        v_lines, line_starts, c_line, c_col = self._get_visual_lines()
+        if c_line < len(v_lines) - 1:
+            target_line = c_line + 1
+            target_col = min(c_col, len(v_lines[target_line]))
+            self.cursor = line_starts[target_line] + target_col
             return True
         return False
 
@@ -1282,6 +1500,9 @@ class RawLineEditor:
                 self._dropdown_dismissed = True
                 self.dropdown_active = False
                 self._erase_dropdown()
+                if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                    self.state.close_command_dialog()
+                    self._force_full_redraw(clear=True)
                 return False
             if key == Key.RIGHT and self.cursor == len(self.buffer):
                 cmd, desc, req_args = self.dropdown_matches[self.dropdown_index]
@@ -1307,8 +1528,19 @@ class RawLineEditor:
             self.insert_char("\n")
             return False
 
+        if key == Key.ESCAPE:
+            if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.close_command_dialog()
+                self._force_full_redraw(clear=True)
+                return False
+
         if key in (Key.ENTER, Key.NEWLINE):
+            if not self.buffer and not self.in_bracketed_paste and self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.close_command_dialog()
+                self._force_full_redraw(clear=True)
+                return False
             if self.in_bracketed_paste or has_pending_input():
+
                 if key == "\r":
                     self._last_was_cr = True
                     self.insert_char("\n")
@@ -1352,20 +1584,30 @@ class RawLineEditor:
             return False
 
         if key == Key.UP:
-            if "\n" in self.buffer:
-                if self.move_up():
-                    self._update_state()
-                    self._update_dropdown()
-                    return False
+            if self.move_up():
+                self._update_state()
+                self._update_dropdown()
+                return False
+            if has_pending_input():
+                if self.on_page_up:
+                    self.on_page_up()
+                elif self.state is not None and hasattr(self.state, "scroll_conversation_up"):
+                    self.state.scroll_conversation_up(3)
+                return False
             self.history_prev()
             return False
 
         if key == Key.DOWN:
-            if "\n" in self.buffer:
-                if self.move_down():
-                    self._update_state()
-                    self._update_dropdown()
-                    return False
+            if self.move_down():
+                self._update_state()
+                self._update_dropdown()
+                return False
+            if has_pending_input():
+                if self.on_page_down:
+                    self.on_page_down()
+                elif self.state is not None and hasattr(self.state, "scroll_conversation_down"):
+                    self.state.scroll_conversation_down(3)
+                return False
             self.history_next()
             return False
 
@@ -1381,10 +1623,53 @@ class RawLineEditor:
 
         if key == Key.CTRL_O:
             if self.on_ctrl_o:
-                self.on_ctrl_o()
+                try:
+                    self.on_ctrl_o(self)
+                except TypeError:
+                    self.on_ctrl_o()
+            elif self.state is not None:
+                if hasattr(self.state, "toggle_disclosures"):
+                    self.state.toggle_disclosures()
+                else:
+                    if hasattr(self.state, "toggle_thinking"):
+                        self.state.toggle_thinking()
+                    if hasattr(self.state, "toggle_actions"):
+                        self.state.toggle_actions()
+                try:
+                    from cli.tui.chat import clear_transcript_cache
+
+                    clear_transcript_cache()
+                except Exception:
+                    pass
+                self._force_full_redraw(clear=False)
+            return False
+
+        if key == Key.CTRL_B:
+            if self.on_ctrl_b:
+                self.on_ctrl_b()
+            elif self.state is not None and hasattr(self.state, "toggle_runtime_panel"):
+                self.state.toggle_runtime_panel()
+                self._force_full_redraw(clear=True)
+            return False
+
+        if key == Key.CTRL_G:
+            if self.state is not None:
+                goal = getattr(self.state, "get_latest_suggested_goal", lambda: None)()
+                if goal:
+                    self.buffer = list(f":goal {goal}")
+                    self.cursor = len(self.buffer)
+                    self._notify_height_change()
+                    self._update_state()
+                    return False
+            if self.on_ctrl_g:
+                self.on_ctrl_g()
             return False
 
         if key == Key.PAGE_UP:
+            if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.scroll_command_dialog_up(5)
+                self._force_full_redraw(clear=False)
+                return False
             if DEBUG_KEYS_ENABLED:
                 _log_debug_key(f"[handle_key] MATCHED Key.PAGE_UP (has on_page_up={self.on_page_up is not None})")
             if self.on_page_up:
@@ -1392,6 +1677,10 @@ class RawLineEditor:
             return False
 
         if key == Key.PAGE_DOWN:
+            if self.state is not None and getattr(self.state, "command_dialog_open", False):
+                self.state.scroll_command_dialog_down(5)
+                self._force_full_redraw(clear=False)
+                return False
             if DEBUG_KEYS_ENABLED:
                 _log_debug_key(f"[handle_key] MATCHED Key.PAGE_DOWN (has on_page_down={self.on_page_down is not None})")
             if self.on_page_down:
@@ -1416,9 +1705,29 @@ class RawLineEditor:
                 self.on_page_down()
             return False
 
+        if key == Key.CTRL_V:
+            self.paste_from_clipboard()
+            return False
+
         if key.startswith("<MOUSE_"):
+            parts = key.strip("<>").split("_")
+            if len(parts) >= 4:
+                try:
+                    btn = int(parts[1])
+                    col = int(parts[2])
+                    row = int(parts[3])
+                    action = parts[4] if len(parts) > 4 else "M"
+                    if action not in ("m",):
+                        # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
+                        if btn == 2 or (btn & 0x0002 != 0):
+                            self.paste_from_clipboard()
+                            return False
+                        if self.on_mouse_click:
+                            self.on_mouse_click(col, row, btn)
+                except Exception:
+                    pass
             if DEBUG_KEYS_ENABLED:
-                _log_debug_key(f"[handle_key] Filtered non-wheel mouse event: {key}")
+                _log_debug_key(f"[handle_key] Handled or filtered mouse event: {key}")
             return False
 
         if len(key) > 1 and not key.startswith(("<", "\x1b")):
@@ -1439,6 +1748,17 @@ class RawLineEditor:
             self._notify_height_change()
             return False
 
+        if key in (Key.TAB, "\t"):
+            cur_text = "".join(self.buffer).strip()
+            if (not cur_text or cur_text in (":goal", ":adopt", ":g")) and self.state is not None:
+                goal = getattr(self.state, "get_latest_suggested_goal", lambda: None)()
+                if goal:
+                    self.buffer = list(f":goal {goal}")
+                    self.cursor = len(self.buffer)
+                    self._notify_height_change()
+                    self._update_state()
+                    return False
+
         # Printable characters (ASCII or Unicode)
         if len(key) == 1 and (key.isprintable() or key == "\t"):
             if DEBUG_KEYS_ENABLED:
@@ -1454,29 +1774,31 @@ class RawLineEditor:
         """Redraw current line with exact cursor placement and composer border preservation."""
         target = out if out is not None else getattr(self, "out", sys.stdout)
         buf_str = "".join(self.buffer)
+        v_lines, _, c_line, c_col = self._get_visual_lines()
+        self.displayed_cursor = c_col
 
-        if "\n" in buf_str:
-            l_idx, col, lines = self._get_line_and_col()
-            self.displayed_cursor = col
+        # If multiline or wrapped, trigger full-screen height handler if available
+        if len(v_lines) > 1:
             if getattr(self, "on_height_change", None):
                 try:
                     self.on_height_change(self)
                     return
                 except Exception:
                     pass
-            cur_line_text = lines[l_idx]
-            prefix = self.prompt_prefix if l_idx == 0 else (
+
+            cur_line_text = v_lines[c_line]
+            prefix = self.prompt_prefix if c_line == 0 else (
                 "\033[90m│\033[0m   " if "\033[" in self.prompt_prefix else "│   "
             )
             visible_prefix_len = len(_ANSI_STRIP_RE.sub("", prefix))
             visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
             inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
             displayed = cur_line_text
-            self.displayed_cursor = col
+            self.displayed_cursor = c_col
             spaces_count = max(0, inner_available - len(displayed))
             line_out = f"\r{prefix}{displayed}{' ' * spaces_count}{self.right_border}"
             target.write(line_out)
-            cursor_col = visible_prefix_len + col + 1
+            cursor_col = visible_prefix_len + c_col + 1
             target.write(f"\x1b[{cursor_col}G")
             target.flush()
             return
@@ -1494,52 +1816,15 @@ class RawLineEditor:
         visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
         inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
 
-        # Show text around cursor position (like typical input fields)
-        # Use a stable viewport that only shifts when cursor goes out of bounds
-        if len(buf_str) > inner_available:
-            if inner_available <= 3:
-                # Terminal too narrow for ellipsis prefix; show raw slice clamped to cursor
-                start = max(0, min(self.cursor, len(buf_str) - inner_available))
-                displayed = buf_str[start:start + inner_available]
-                displayed_cursor = max(0, min(self.cursor - start, inner_available))
-                self._viewport_start = start
-            else:
-                viewport_width = inner_available - 3
+        displayed = buf_str
+        self.displayed_cursor = self.cursor
 
-                # Shift viewport to keep cursor visible
-                if self.cursor < self._viewport_start:
-                    # Cursor moved left of viewport - shift left
-                    self._viewport_start = max(0, self.cursor)
-                elif self.cursor >= self._viewport_start + viewport_width:
-                    # Cursor moved right of viewport - shift right
-                    self._viewport_start = self.cursor - viewport_width + 1
-
-                self._viewport_start = max(0, min(self._viewport_start, len(buf_str)))
-                start = self._viewport_start
-                end = min(start + viewport_width, len(buf_str))
-
-                if start > 0:
-                    displayed = "..." + buf_str[start:end]
-                    displayed_cursor = self.cursor - start + 3
-                else:
-                    if end < len(buf_str):
-                        displayed = buf_str[:end] + "..."
-                    else:
-                        displayed = buf_str[:end]
-                    displayed_cursor = self.cursor
-        else:
-            displayed = buf_str
-            displayed_cursor = self.cursor
-            # Reset viewport when buffer fits
-            self._viewport_start = 0
-
-        self.displayed_cursor = displayed_cursor
         spaces_count = max(0, inner_available - len(displayed))
         line_out = f"\r{self.prompt_prefix}{displayed}{' ' * spaces_count}{self.right_border}"
         target.write(line_out)
 
         # Move cursor to active edit position inside composer box
-        cursor_col = visible_prefix_len + displayed_cursor + 1
+        cursor_col = visible_prefix_len + self.displayed_cursor + 1
         target.write(f"\x1b[{cursor_col}G")
 
         if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
@@ -1591,6 +1876,9 @@ class RawLineEditor:
         target.flush()
 
 
+LineEditor = RawLineEditor
+
+
 def raw_prompt_input(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
@@ -1601,6 +1889,8 @@ def raw_prompt_input(
     on_ctrl_k: Optional[Callable[[], None]] = None,
     on_ctrl_l: Optional[Callable[[], None]] = None,
     on_ctrl_o: Optional[Callable[[], None]] = None,
+    on_ctrl_b: Optional[Callable[[], None]] = None,
+    on_ctrl_g: Optional[Callable[[], None]] = None,
     on_page_up: Optional[Callable[[], None]] = None,
     on_page_down: Optional[Callable[[], None]] = None,
     on_wheel_up: Optional[Callable[[], None]] = None,
@@ -1614,6 +1904,7 @@ def raw_prompt_input(
     on_idle: Optional[Callable[[Any], None]] = None,
     on_height_change: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
+    on_mouse_click: Optional[Callable[..., None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -1687,6 +1978,34 @@ def raw_prompt_input(
                 on_ctrl_o()
         editor.redraw_line()
 
+    def wrapped_ctrl_b() -> None:
+        """Handle Ctrl+B — toggle runtime sidebar, then restore prompt line."""
+        if on_ctrl_b:
+            try:
+                on_ctrl_b(editor)
+            except TypeError:
+                on_ctrl_b()
+        elif state is not None and hasattr(state, "toggle_runtime_panel"):
+            state.toggle_runtime_panel()
+            editor._force_full_redraw(clear=True)
+        editor.redraw_line()
+
+    def wrapped_ctrl_g() -> None:
+        """Handle Ctrl+G — adopt/auto-fill Architect's suggested goal."""
+        if on_ctrl_g:
+            try:
+                on_ctrl_g(editor)
+            except TypeError:
+                on_ctrl_g()
+        elif state is not None and hasattr(state, "get_latest_suggested_goal"):
+            goal = state.get_latest_suggested_goal()
+            if goal:
+                editor.buffer = list(f":goal {goal}")
+                editor.cursor = len(editor.buffer)
+                editor._notify_height_change()
+                editor._update_state()
+        editor.redraw_line()
+
     def wrapped_page_up() -> None:
         """Handle Page Up — scroll conversation viewport up, then restore prompt line."""
         if on_page_up:
@@ -1729,6 +2048,14 @@ def raw_prompt_input(
             except TypeError:
                 on_page_down()
 
+    def wrapped_mouse_click(col: int, row: int, button: int) -> None:
+        """Handle mouse clicks on layout elements like the vertical scrollbar."""
+        if on_mouse_click:
+            try:
+                on_mouse_click(col, row, button, editor)
+            except TypeError:
+                on_mouse_click(col, row, button)
+
     editor = RawLineEditor(
         prompt_prefix=prompt_prefix,
         initial_text=initial_text,
@@ -1737,10 +2064,13 @@ def raw_prompt_input(
         on_ctrl_k=wrapped_ctrl_k,
         on_ctrl_l=wrapped_ctrl_l,
         on_ctrl_o=wrapped_ctrl_o,
+        on_ctrl_b=wrapped_ctrl_b,
+        on_ctrl_g=wrapped_ctrl_g,
         on_page_up=wrapped_page_up,
         on_page_down=wrapped_page_down,
         on_wheel_up=wrapped_wheel_up,
         on_wheel_down=wrapped_wheel_down,
+        on_mouse_click=wrapped_mouse_click,
         on_transition=handle_transition,
         width=width,
         commands=commands,
@@ -1751,7 +2081,7 @@ def raw_prompt_input(
     )
 
     try:
-        with TerminalStateRestorer():
+        with TerminalStateRestorer(state=state):
             editor.redraw_line()
             last_term_size = shutil.get_terminal_size(fallback=(width, 24))
             while True:
