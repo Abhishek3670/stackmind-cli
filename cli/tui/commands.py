@@ -389,9 +389,17 @@ def _stream_turn_execution(
     last_progress_time = start_time
     last_poll_time = start_time
     last_redraw_time: float = -1.0
+    last_domain_event_time = start_time
     latest_act_desc = initial_activity_desc
     op_rec: dict[str, Any] | None = None
     op_status: str | None = None
+
+    # A new turn starts with a clean attempt/retry display. Stale counters from
+    # the previous turn otherwise bleed into this turn's composer border.
+    state.reset_attempts_and_retries()
+
+    _TERMINAL_OP_STATUS = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
+    _RUNNING_OP_STATUS = {"RUNNING", "ACTIVE", "IN_PROGRESS", "PENDING"}
 
     _diagnostics_enabled = os.environ.get("STACKMIND_TUI_DIAGNOSTICS") in {"1", "true", "yes"}
     _diagnostics_start = time.monotonic()
@@ -470,6 +478,47 @@ def _stream_turn_execution(
     install_resize_handler()
     init_term = shutil.get_terminal_size(fallback=(80, 24))
     current_cols, current_lines = init_term.columns, init_term.lines
+
+    def _daemon_has_running_work() -> bool:
+        """True when the daemon still reports an operation in flight for this session."""
+        for op in getattr(state, "operations", {}).values():
+            if str(getattr(op, "status", "")).upper() in _RUNNING_OP_STATUS:
+                return True
+        return False
+
+    def _reconcile_with_daemon(now: float) -> bool:
+        """Refresh daemon state and detect a turn that finished without a terminal event.
+
+        The daemon can complete a turn while the client is between SSE events
+        (or when the terminal event is missed entirely). The TUI used to wait
+        forever in that case, leaving a frozen "Working..." frame on screen
+        even though the daemon had nothing left to do.
+        """
+        nonlocal op_rec, op_status
+        sid = session.get("session_id")
+        if sid and hasattr(client, "get_session"):
+            try:
+                fresh_sess = client.get_session(sid)
+                if isinstance(fresh_sess, Mapping):
+                    state.update_from_session(fresh_sess)
+            except Exception:
+                pass
+        if op_id and op_id != "turn" and hasattr(client, "operation_get"):
+            try:
+                record = client.operation_get(op_id)
+                if isinstance(record, dict):
+                    op_rec = record
+                    op_status = record.get("status")
+                    if str(op_status).upper() in _TERMINAL_OP_STATUS:
+                        return True
+            except Exception:
+                pass
+        # No terminal event, no operation in flight, and the answer already
+        # arrived: the daemon is done with this turn.
+        if (streamed_chunks or assistant_rendered) and not _daemon_has_running_work():
+            if now - last_domain_event_time >= 3.0:
+                return True
+        return False
 
     try:
         stream_gen = adapter.stream(
@@ -562,27 +611,9 @@ def _stream_turn_execution(
 
                 if now - last_poll_time >= 0.5:
                     last_poll_time = now
-                    try:
-                        sid = session.get("session_id")
-                        if sid and hasattr(client, "get_session"):
-                            fresh_sess = client.get_session(sid)
-                            if isinstance(fresh_sess, Mapping):
-                                state.update_from_session(fresh_sess)
-                    except Exception:
-                        pass
-                    try:
-                        op_rec = (
-                            client.operation_get(op_id)
-                            if hasattr(client, "operation_get") and op_id and op_id != "turn"
-                            else None
-                        )
-                        if op_rec and isinstance(op_rec, dict):
-                            op_status = op_rec.get("status")
-                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                completed = True
-                                break
-                    except Exception:
-                        pass
+                    if _reconcile_with_daemon(now):
+                        completed = True
+                        break
                 time.sleep(0.05)
                 stream_gen = adapter.stream(
                     session["session_id"],
@@ -601,7 +632,11 @@ def _stream_turn_execution(
             if isinstance(ev, dict) and (
                 ev.get("_heartbeat") or ev.get("name") == "system.heartbeat"
             ):
-                if not streaming_active and (now - last_progress_time >= 2.0):
+                # Keep repainting even after the model stopped streaming. The
+                # previous gate (not streaming_active) froze the composer on the
+                # last painted frame, so a turn that was still running looked
+                # dead: the timer stopped and the frame never changed again.
+                if now - last_progress_time >= 2.0:
                     render_start = time.monotonic()
                     layout = compute_layout(shutil.get_terminal_size().columns)
                     tick_content = _build_in_progress_turn_content(
@@ -636,19 +671,9 @@ def _stream_turn_execution(
 
                 if now - last_poll_time >= 1.5:
                     last_poll_time = now
-                    try:
-                        op_rec = (
-                            client.operation_get(op_id)
-                            if hasattr(client, "operation_get") and op_id and op_id != "turn"
-                            else None
-                        )
-                        if op_rec and isinstance(op_rec, dict):
-                            op_status = op_rec.get("status")
-                            if op_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-                                completed = True
-                                break
-                    except Exception:
-                        pass
+                    if _reconcile_with_daemon(now):
+                        completed = True
+                        break
                 continue
 
             # 2. Process concrete domain event
@@ -657,6 +682,7 @@ def _stream_turn_execution(
             sequence = ev.get("sequence")
             if isinstance(sequence, int) and sequence <= state.last_sequence:
                 continue
+            last_domain_event_time = now
             state.process_event(ev)
             ev_name = str(ev.get("name", ""))
             ev_payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
@@ -781,9 +807,18 @@ def _stream_turn_execution(
                     )
                     t_role = str(ev_payload.get("role") or ev_payload.get("agent_id") or "")
                     if not t_role and state is not None:
-                        op_id = ev_payload.get("operation_id")
-                        if op_id and hasattr(state, "operations") and op_id in state.operations:
-                            t_role = state.operations[op_id].role
+                        # NOTE: never assign to op_id here. op_id tracks the turn
+                        # being streamed; overwriting it with the tool's
+                        # operation id made the TUI poll and match the wrong
+                        # operation, so the turn never reached its terminal
+                        # event and the "Working..." status stuck forever.
+                        tool_op_id = ev_payload.get("operation_id")
+                        if (
+                            tool_op_id
+                            and hasattr(state, "operations")
+                            and tool_op_id in state.operations
+                        ):
+                            t_role = state.operations[tool_op_id].role
                         if not t_role and hasattr(state, "operations"):
                             for op in state.operations.values():
                                 if getattr(op, "status", "") == "RUNNING":
@@ -946,6 +981,7 @@ def _stream_turn_execution(
         if streaming_active and not is_tty:
             click.echo("")
 
+        state.active_working_status = None
         cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
         turn_acts = state.current_turn_actions
         state.add_message("assistant", cancel_msg, actions=turn_acts)
@@ -973,6 +1009,12 @@ def _stream_turn_execution(
         restore_composer_focus(state)
         return session, False
 
+    # The turn is over (completed, failed, blocked, or timed out). Drop the
+    # transient timer and retry counters before the final frame so they cannot
+    # linger in the composer or be painted into the next idle frame.
+    state.active_working_status = None
+    state.reset_attempts_and_retries()
+
     # Finalize streaming if active
     if streamed_chunks and not assistant_rendered:
         full_resp = "".join(streamed_chunks).strip()
@@ -985,27 +1027,7 @@ def _stream_turn_execution(
         state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
         assistant_rendered = True
         streamed_chunks = []
-        is_awaiting_plan = (
-            getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
-            or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
-        )
-        post_placeholder = (
-            "Plan ready: type :approve or 'continue' to execute..."
-            if is_awaiting_plan
-            else "Type a message..."
-        )
-        if is_tty:
-            redraw_full_screen(
-                session,
-                state,
-                clear=False,
-                include_composer=True,
-                composer_is_active=False,
-                composer_placeholder=post_placeholder,
-                composer_content="",
-                live_manager=live_manager,
-            )
-        else:
+        if not is_tty:
             click.echo(
                 render_assistant_message_str(
                     full_resp, actions=turn_acts, thinking=thinking
@@ -1298,6 +1320,32 @@ def _stream_turn_execution(
 
     if hasattr(state, "current_turn_actions") and state.current_turn_actions:
         state.current_turn_actions.complete_all()
+
+    # Always repaint the final frame. When the turn completed via a full
+    # response event (assistant_rendered is already True) there are no
+    # streamed_chunks left to trigger a redraw, and the last frame painted
+    # during streaming still carries "Working..." and the attempt counters.
+    if is_tty:
+        is_awaiting_plan = (
+            getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
+            or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
+        )
+        post_placeholder = (
+            "Plan ready: type :approve or 'continue' to execute..."
+            if is_awaiting_plan
+            else "Type a message..."
+        )
+        redraw_full_screen(
+            session,
+            state,
+            clear=False,
+            include_composer=True,
+            composer_is_active=False,
+            composer_placeholder=post_placeholder,
+            composer_content="",
+            live_manager=live_manager,
+        )
+
     if live_manager is not None and not getattr(live_manager, "is_active", False):
         live_manager.start(include_composer=False)
     restore_composer_focus(state)

@@ -2121,6 +2121,7 @@ class AutonomousDeliveryState:
             self.reconcile_roles_from_work_orders()
 
         elif name in {"operation.cancelled", "agent.cancelled", "turn.cancelled", "session.cancelled"}:
+            self.active_working_status = None
             role = (payload.get("role") or "Agent").title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             op_id = payload.get("operation_id")
@@ -2142,6 +2143,7 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, "cancelled", payload.get("reason", ""))
 
         elif name in {"operation.failed", "turn.failed"}:
+            self.active_working_status = None
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -2159,6 +2161,7 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, "failed", str(err_msg))
 
         elif name in {"operation.blocked", "turn.blocked"}:
+            self.active_working_status = None
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role

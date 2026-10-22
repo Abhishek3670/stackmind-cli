@@ -678,12 +678,34 @@ def redraw_full_screen(
     try:
         if target and hasattr(target, "write"):
             prefix = "\x1b[2J\x1b[H" if clear else "\x1b[H"
-            target.write(f"{prefix}{frame}\n" if not include_composer else f"{prefix}{frame}")
+            # Pad every row to the terminal width when writing to the real
+            # terminal. The composer/status rows are narrower than the screen,
+            # so without padding the previous frame's runtime-panel glyphs
+            # survive to the right of them. Custom streams (tests/capture)
+            # receive the unpadded frame for byte-exact assertions.
+            payload = _pad_frame_to_width(frame, cols) if stream is None else frame
+            if not include_composer:
+                # Leave the cursor on the row where the raw prompt editor will
+                # draw its input line.
+                target.write(f"{prefix}{payload}\n")
+            else:
+                target.write(f"{prefix}{payload}")
             target.flush()
     except Exception:
         pass
 
     return frame
+
+
+def _pad_frame_to_width(frame: str, width: int) -> str:
+    """Pad every frame line to ``width`` display cells without touching ANSI styles."""
+    if width <= 0:
+        return frame
+    padded: list[str] = []
+    for line in frame.split("\n"):
+        visible = Text.from_ansi(line).cell_len
+        padded.append(line + " " * max(0, width - visible))
+    return "\n".join(padded)
 
 
 def render_composer_top_border(

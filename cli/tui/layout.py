@@ -919,8 +919,16 @@ def render_full_screen_workspace(
     )
 
     # 2. Viewport height (reserved 1 line for bottom status bar, dynamic composer box height, and settings panel if open)
+    # Use the same width as the composer so multi-line input wraps identically
+    # in the height calculation and in the rendered box. A mismatch here makes
+    # the composer jump vertically between frames and leaves ghost borders.
+    comp_width = layout.conversation_width if layout.show_runtime else width
     viewport_height = compute_viewport_height(
-        height, state=state, show_footer=True, composer_content=composer_content
+        height,
+        state=state,
+        show_footer=True,
+        composer_content=composer_content,
+        width=comp_width,
     )
 
     # 3. Conversation content
@@ -994,7 +1002,6 @@ def render_full_screen_workspace(
         return "\n".join(all_lines)
 
     # 5. Dynamic bottom composer box placed above bottom status bar / settings panel
-    comp_width = layout.conversation_width if layout.show_runtime else width
     effective_placeholder = composer_placeholder
     if (
         (effective_placeholder in {None, "", "Type a message..."})
