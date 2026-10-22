@@ -171,7 +171,10 @@ def format_action_description(tool_name: str, target: str = "", role: str = "") 
     if "graph" in lower:
         return f"Graphing ({t})" if t else "Graphing"
     if "harness" in lower:
-        agent_name = (role or (t if t and t != "long_running_task" else "")).strip()
+        raw_agent = role or (t if t and t not in ("long_running_task", "None", "none", "null") else "")
+        if str(raw_agent).lower() in ("none", "null"):
+            raw_agent = ""
+        agent_name = str(raw_agent).strip()
         if agent_name:
             cased = "QA" if agent_name.lower() == "qa" else (agent_name.title() if agent_name.islower() else agent_name)
             return f"Agent ({cased})"
@@ -1019,7 +1022,17 @@ def recover_transcript_from_events(
         # 1. Recover user prompt from turn.started or operation.started
         if name in {"turn.started", "operation.started"}:
             prompt = payload.get("prompt") or payload.get("input")
-            if prompt and isinstance(prompt, str) and prompt.strip():
+            role = str(payload.get("role") or "").lower().strip()
+            agent_id = str(payload.get("agent_id") or "").lower().strip()
+            delegated_from = payload.get("delegated_from") or payload.get("metadata", {}).get("delegated_from")
+            work_order_id = payload.get("work_order_id")
+            is_subagent_task = bool(
+                delegated_from
+                or work_order_id
+                or (role and role not in ("architecture", "claude", "user"))
+                or (agent_id and agent_id not in ("architecture", "claude"))
+            )
+            if not is_subagent_task and prompt and isinstance(prompt, str) and prompt.strip():
                 clean_prompt = prompt.strip()
                 msg_key = ("user", clean_prompt)
                 if msg_key not in state.seen_message_keys:

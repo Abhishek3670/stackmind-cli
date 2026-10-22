@@ -207,10 +207,13 @@ def format_agent_tree(
         r_status = str(root.get("status") or "orchestrating")
         sym, style, disp = get_status_symbol(r_status)
 
+        inner_w = max(10, (width or 36) - 4)
+
         root_line = Text()
         root_line.append(f"{sym} ", style=style)
-        root_line.append(f"{r_name:<16}", style="bold white")
-        root_line.append(f" {disp}", style="dim #94a3b8")
+        root_line.append(r_name, style="bold white")
+        pad = max(1, inner_w - 2 - len(r_name) - len(disp))
+        root_line.append(" " * pad + disp, style="dim #94a3b8")
         lines.append(root_line)
 
         # Render model/quantization badge for active role or configured model
@@ -221,7 +224,7 @@ def format_agent_tree(
         )
         is_active_root = r_status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
         if r_badge and (root.get("model") or is_active_root):
-            max_badge_len = max(10, (width or 36) - 8)
+            max_badge_len = max(10, inner_w - 6)
             trunc_badge = textwrap.shorten(r_badge, width=max_badge_len, placeholder="…")
             badge_line = Text()
             badge_line.append("    ")
@@ -238,8 +241,9 @@ def format_agent_tree(
             child_line = Text()
             child_line.append(prefix, style="dim #475569")
             child_line.append(f"{csym} ", style=cstyle)
-            child_line.append(f"{c_name:<12}", style="white")
-            child_line.append(f" {cdisp}", style="dim #94a3b8")
+            child_line.append(c_name, style="white")
+            c_pad = max(1, inner_w - 5 - 2 - len(c_name) - len(cdisp))
+            child_line.append(" " * c_pad + cdisp, style="dim #94a3b8")
             lines.append(child_line)
 
             c_badge = format_model_badge(
@@ -250,7 +254,7 @@ def format_agent_tree(
             is_active_child = c_status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
             if c_badge and (child.get("model") or is_active_child):
                 b_prefix = "      " if is_last else "  │   "
-                max_badge_len = max(10, (width or 36) - len(b_prefix) - 4)
+                max_badge_len = max(10, inner_w - len(b_prefix) - 2)
                 trunc_badge = textwrap.shorten(c_badge, width=max_badge_len, placeholder="…")
                 badge_line = Text()
                 badge_line.append(b_prefix, style="dim #475569")
@@ -259,6 +263,7 @@ def format_agent_tree(
 
     # Case 2: Flat list with symbols or simple dicts
     else:
+        inner_w = max(10, (width or 36) - 4)
         for item in normalized:
             name = str(item.get("name") or item.get("role") or "Worker")
             status = str(item.get("status") or "idle")
@@ -278,7 +283,7 @@ def format_agent_tree(
             )
             is_active_item = status.lower() in {"orchestrating", "running", "implementing", "active", "in_progress"}
             if f_badge and (item.get("model") or is_active_item):
-                max_badge_len = max(10, (width or 36) - 8)
+                max_badge_len = max(10, inner_w - 6)
                 trunc_badge = textwrap.shorten(f_badge, width=max_badge_len, placeholder="…")
                 badge_line = Text()
                 badge_line.append("    ")
@@ -297,7 +302,7 @@ def format_work_orders(
         return [Text("  No active orders", style="dim #475569")]
 
     lines: list[Text] = []
-    max_title_len = max(14, (width or 32) - 18)
+    inner_w = max(10, (width or 36) - 4)
 
     for wo in work_orders:
         if isinstance(wo, Mapping):
@@ -315,6 +320,8 @@ def format_work_orders(
 
         sym, style, _ = get_status_symbol(status)
 
+        prefix_len = 2 + 2 + len(wo_id)
+        max_title_len = max(6, inner_w - prefix_len - 2)
         trunc_title = textwrap.shorten(title, width=max_title_len, placeholder="…") if title else ""
         line = Text()
         line.append("  ")

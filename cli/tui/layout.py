@@ -624,9 +624,6 @@ def slice_conversation_viewport(
             if not raw_line:
                 visual_lines.append("")
                 continue
-            if len(raw_line) <= avail_width and "\x1b[" not in raw_line:
-                visual_lines.append(raw_line)
-                continue
             t = Text.from_ansi(raw_line) if "\x1b[" in raw_line else Text(raw_line)
             if t.cell_len <= avail_width:
                 visual_lines.append(raw_line)
@@ -775,7 +772,8 @@ def render_workspace_layout(
         )
         divider_char = Text("\n").join(s_rows)
     else:
-        divider_char = Text("│", style="dim #334155")
+        d_count = max(1, vp_h or 1)
+        divider_char = Text("\n").join([Text("│", style="dim #334155") for _ in range(d_count)])
 
     grid.add_row(conv_column, divider_char, runtime)
     return grid

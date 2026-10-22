@@ -394,12 +394,13 @@ def render_user_message(
             else:
                 lines.append(Text(""))
             continue
-        chunks = textwrap.wrap(
-            raw_line,
-            width=max_wrap_w,
-            break_long_words=True,
-            break_on_hyphens=False,
-        ) or [raw_line]
+        t_raw = Text(raw_line)
+        if t_raw.cell_len <= max_wrap_w:
+            chunks = [raw_line]
+        else:
+            c, _ = _make_capture_console(width=max_wrap_w)
+            parts = t_raw.wrap(c, max_wrap_w)
+            chunks = [p.plain for p in parts] if parts else [raw_line]
         for chunk in chunks:
             if accent:
                 msg_line = Text("│ ", style="bold #38bdf8")
@@ -456,9 +457,9 @@ def normalize_action_call(act: Any) -> tuple[str, str]:
             target = desc[6:].strip()
         if not target and getattr(act, "role", None):
             target = str(act.role).strip()
-        if not target:
-            target = "Worker"
-        cased = "QA" if target.lower() == "qa" else (target.title() if target.islower() else target)
+        if not target or target.lower() in ("none", "null"):
+            target = getattr(act, "agent_id", None) or getattr(act, "agent", None) or "Worker"
+        cased = "QA" if str(target).lower() == "qa" else (str(target).title() if str(target).islower() else str(target))
         return name, cased
 
     if t_name in {"read_file", "read", "view_file", "cat"} or desc.startswith("Read"):
@@ -812,7 +813,9 @@ def render_actions_group(
 
     for act, indent_lvl, t_name, arg, st, count in collapsed:
         if t_name == "Agent":
-            if arg and arg == active_agent:
+            if not arg or arg.lower() in ("none", "null"):
+                arg = "Architecture"
+            if arg == active_agent:
                 continue
             active_agent = arg
         else:
