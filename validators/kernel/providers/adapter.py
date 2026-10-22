@@ -250,13 +250,36 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         if isinstance(raw_stream, dict):
             raw_stream = [raw_stream]
 
-        if isinstance(raw_stream, (list, tuple, Iterator)):
+        # urllib's HTTPResponse inherits io.IOBase, so a live SSE response
+        # satisfies isinstance(x, Iterator) while yielding raw *lines* (bytes)
+        # rather than parsed payloads. Taking the pre-parsed branch for such a
+        # stream consumed every line and dropped it (neither StreamChunk nor
+        # dict matched), so the caller received an empty response. File-like
+        # streams must always go through the SSE line parser below.
+        is_file_like = hasattr(raw_stream, "read") or hasattr(raw_stream, "readline")
+
+        # OpenAI-compatible endpoints stream a tool call as several fragments:
+        # the first carries id/name, later ones carry argument pieces. Buffer
+        # them and emit one assembled call when the stream ends, otherwise every
+        # fragment becomes its own tool call with an empty name and unparsable
+        # arguments.
+        pending_tool_calls: dict[int, dict[str, Any]] = {}
+
+        def _flush_tool_calls() -> StreamChunk | None:
+            if not pending_tool_calls:
+                return None
+            return StreamChunk(delta_tool_calls=self._assemble_tool_calls(pending_tool_calls))
+
+        if not is_file_like and isinstance(raw_stream, (list, tuple, Iterator)):
             for item in raw_stream:
                 self._check_cancellation(cancellation_token)
                 if isinstance(item, StreamChunk):
                     yield item
                 elif isinstance(item, dict):
-                    yield self._parse_stream_dict(item)
+                    yield self._consume_stream_payload(item, pending_tool_calls)
+            flushed = _flush_tool_calls()
+            if flushed is not None:
+                yield flushed
             return
 
         try:
@@ -273,7 +296,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                     raw_json = line[6:].strip()
                     try:
                         chunk_data = json.loads(raw_json)
-                        yield self._parse_stream_dict(chunk_data)
+                        yield self._consume_stream_payload(chunk_data, pending_tool_calls)
                     except json.JSONDecodeError:
                         continue
                 elif line.startswith("{") and line.endswith("}"):
@@ -283,13 +306,110 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                             err_info = chunk_data["error"]
                             err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
                             raise ProviderError(f"Proxy error: {err_msg}", provider=self.provider_name)
-                        yield self._parse_stream_dict(chunk_data)
+                        yield self._consume_stream_payload(chunk_data, pending_tool_calls)
                     except json.JSONDecodeError:
                         continue
         except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
             raise TimeoutError(f"Connection or timeout error during stream: {ex}", provider=self.provider_name) from ex
         except Exception as ex:
             raise ProviderError(f"Unexpected stream failure: {ex}", provider=self.provider_name) from ex
+
+        flushed = _flush_tool_calls()
+        if flushed is not None:
+            yield flushed
+
+    @staticmethod
+    def _extract_tool_call_fragments(data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return the raw tool-call fragments carried by one SSE payload."""
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return []
+        container = choices[0].get("delta") or choices[0].get("message") or {}
+        if not isinstance(container, dict):
+            return []
+        raw = container.get("tool_calls")
+        if not isinstance(raw, list):
+            return []
+        return [frag for frag in raw if isinstance(frag, dict)]
+
+    @staticmethod
+    def _without_tool_call_fragments(data: dict[str, Any]) -> dict[str, Any]:
+        """Shallow-copy a payload with its tool-call fragments removed."""
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return data
+        choice = dict(choices[0])
+        # Mirror the extraction lookup so we trim the same container we read
+        # fragments from, whether it arrived as a delta or a full message.
+        container_key = "delta" if choice.get("delta") else "message" if choice.get("message") else None
+        if container_key is None:
+            return data
+        container = choice[container_key]
+        if isinstance(container, dict) and container.get("tool_calls"):
+            trimmed = dict(container)
+            trimmed.pop("tool_calls", None)
+            choice[container_key] = trimmed
+        out = dict(data)
+        out["choices"] = [choice, *choices[1:]]
+        return out
+
+    @staticmethod
+    def _merge_tool_call_fragments(
+        pending: dict[int, dict[str, Any]], fragments: list[dict[str, Any]]
+    ) -> None:
+        """Fold streamed tool-call fragments into one entry per call index."""
+        for fragment in fragments:
+            function = fragment.get("function")
+            if not isinstance(function, dict):
+                function = {}
+            index = fragment.get("index")
+            if isinstance(index, int):
+                entry = pending.setdefault(index, {"id": "", "name": "", "arguments": ""})
+            elif fragment.get("id") or function.get("name"):
+                # Providers that omit ``index`` still signal a new call with
+                # an id or a function name.
+                entry = pending.setdefault(len(pending), {"id": "", "name": "", "arguments": ""})
+            elif pending:
+                entry = pending[max(pending)]
+            else:
+                entry = pending.setdefault(0, {"id": "", "name": "", "arguments": ""})
+
+            if fragment.get("id"):
+                entry["id"] = str(fragment["id"])
+            if function.get("name"):
+                entry["name"] = str(function["name"])
+
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                entry["arguments"] += arguments
+            elif isinstance(arguments, dict):
+                entry["arguments"] = json.dumps(arguments)
+
+    @staticmethod
+    def _assemble_tool_calls(pending: dict[int, dict[str, Any]]) -> tuple[ToolCallRequest, ...]:
+        """Turn the buffered fragments into complete tool calls in index order."""
+        assembled: list[ToolCallRequest] = []
+        for key in sorted(pending):
+            entry = pending[key]
+            arguments = str(entry.get("arguments") or "").strip() or "{}"
+            assembled.append(
+                ToolCallRequest.from_provider_call(
+                    entry.get("id") or f"call_{uuid4().hex[:8]}",
+                    entry.get("name") or "",
+                    arguments,
+                )
+            )
+        return tuple(assembled)
+
+    def _consume_stream_payload(
+        self, data: dict[str, Any], pending_tool_calls: dict[int, dict[str, Any]]
+    ) -> StreamChunk:
+        """Parse one payload, buffering any tool-call fragments it carries."""
+        fragments = self._extract_tool_call_fragments(data)
+        if fragments:
+            self._merge_tool_call_fragments(pending_tool_calls, fragments)
+            data = self._without_tool_call_fragments(data)
+        return self._parse_stream_dict(data)
 
     def _parse_stream_dict(self, data: dict[str, Any]) -> StreamChunk:
         choices = data.get("choices") or []
