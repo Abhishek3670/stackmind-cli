@@ -1505,6 +1505,15 @@ def dispatch_delivery_command(
         getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
         or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
     )
+    if not is_awaiting_plan:
+        try:
+            remote_plan = client.plan_get(session.get("session_id", ""))
+            if remote_plan and remote_plan.get("state") == "AWAITING_APPROVAL":
+                is_awaiting_plan = True
+                state.plan = dict(remote_plan)
+                state.phase = ProjectPhase.AWAITING_APPROVAL
+        except Exception:
+            pass
     if is_awaiting_plan and normalized.lower() in {
         "continue", ":continue", "proceed", ":proceed", "go ahead", ":go", ":adopt", ":accept"
     }:
@@ -2138,6 +2147,24 @@ def dispatch_delivery_command(
         clean_reason = reason.strip() or "Approved by operator"
         # Check if plan is awaiting approval
         plan_id = state.plan.get("plan_id") or state.plan.get("id")
+        if not plan_id:
+            try:
+                sid = session.get("session_id", "")
+                remote_plan = client.plan_get(sid)
+                if remote_plan and remote_plan.get("state") == "AWAITING_APPROVAL":
+                    plan_id = remote_plan.get("plan_id") or remote_plan.get("id")
+                    state.plan = dict(remote_plan)
+                    state.phase = ProjectPhase.AWAITING_APPROVAL
+            except Exception:
+                pass
+        if not plan_id:
+            try:
+                active_run = client.run_get(session.get("session_id", ""))
+                if active_run and active_run.get("phase") == "AWAITING_APPROVAL":
+                    plan_id = active_run.get("plan_id") or "PLAN-001"
+                    state.phase = ProjectPhase.AWAITING_APPROVAL
+            except Exception:
+                pass
         if (
             state.phase == ProjectPhase.AWAITING_APPROVAL
             or state.plan.get("state") == "AWAITING_APPROVAL"

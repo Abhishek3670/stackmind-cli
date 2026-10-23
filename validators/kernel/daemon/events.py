@@ -31,10 +31,13 @@ class EventDispatcher:
         self._lock = RLock()
         self._listeners: dict[int, Callable[[RuntimeEvent], None]] = {}
         self._next_listener_id = 0
+        self._next_sequence = max((e.sequence for e in self._events), default=0) + 1
 
     def publish(self, name: str, session_id: str, **payload: Any) -> RuntimeEvent:
         with self._lock:
-            event = RuntimeEvent(len(self._events) + 1, name, session_id, payload, _now())
+            seq = self._next_sequence
+            self._next_sequence += 1
+            event = RuntimeEvent(seq, name, session_id, payload, _now())
             self._events.append(event)
             listeners = tuple(self._listeners.values())
             on_publish = self._on_publish
