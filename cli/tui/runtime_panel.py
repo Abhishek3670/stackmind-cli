@@ -305,15 +305,50 @@ def format_agent_tree(
 def format_work_orders(
     work_orders: list[dict[str, Any]] | list[Any] | None,
     width: int | None = None,
+    max_items: int | None = None,
 ) -> list[Text]:
-    """Format work orders section into clean status lines."""
+    """Format work orders section into clean status lines with responsive windowing."""
     if not work_orders:
         return [Text("  No active orders", style="dim #475569")]
 
-    lines: list[Text] = []
+    total_count = len(work_orders)
     inner_w = max(10, (width or 36) - 4)
 
-    for wo in work_orders:
+    earlier_count = 0
+    later_count = 0
+    if max_items is not None and max_items > 0 and total_count > max_items:
+        active_idx = None
+        for i, wo in enumerate(work_orders):
+            st = str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper()
+            if st in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}:
+                active_idx = i
+
+        capacity = max(1, max_items - 1)
+        if active_idx is not None:
+            end_idx = min(total_count, active_idx + max(1, capacity // 2) + 1)
+            start_idx = max(0, end_idx - capacity)
+            if start_idx == 0:
+                end_idx = min(total_count, capacity)
+        else:
+            start_idx = max(0, total_count - capacity)
+            end_idx = total_count
+
+        display_orders = work_orders[start_idx:end_idx]
+        earlier_count = start_idx
+        later_count = total_count - end_idx
+    else:
+        display_orders = work_orders
+
+    lines: list[Text] = []
+
+    if earlier_count > 0:
+        summary_line = Text()
+        summary_line.append("  ")
+        summary_line.append("… ", style="dim #64748b")
+        summary_line.append(f"({earlier_count} earlier completed)", style="dim #64748b")
+        lines.append(summary_line)
+
+    for wo in display_orders:
         if isinstance(wo, Mapping):
             wo_id = str(wo.get("id") or wo.get("wo_id") or "—")
             title = str(wo.get("title", ""))
@@ -339,6 +374,13 @@ def format_work_orders(
         if trunc_title:
             line.append(f": {trunc_title}", style="dim white")
         lines.append(line)
+
+    if later_count > 0:
+        summary_line = Text()
+        summary_line.append("  ")
+        summary_line.append("… ", style="dim #64748b")
+        summary_line.append(f"({later_count} upcoming orders)", style="dim #64748b")
+        lines.append(summary_line)
 
     return lines
 
@@ -483,7 +525,8 @@ def render_runtime_panel(
 
     # 2. Section: AGENTS
     items.append(Text("AGENTS", style="bold #38bdf8"))
-    for agent_line in format_agent_tree(agents or [], width=width):
+    agent_lines = format_agent_tree(agents or [], width=width)
+    for agent_line in agent_lines:
         items.append(agent_line)
     items.append(Text(""))
 
@@ -491,9 +534,21 @@ def render_runtime_panel(
     items.append(Rule(style="dim #334155"))
     items.append(Text(""))
 
+    # Pre-render CURRENT OPERATION to budget height accurately
+    op_lines = format_current_operation(current_operation, width=width, state=state)
+
+    # Budget work orders height if height constraint is active so CURRENT OPERATION is never clipped
+    max_wo_items: int | None = None
+    if height is not None and height > 0:
+        fixed_lines = 2 + (len(agent_lines) + 2) + 2 + 2 + 2 + (len(op_lines) + 2) + 2
+        if scroll is not None and scroll.has_new_activity:
+            fixed_lines += 2
+        avail = height - fixed_lines
+        max_wo_items = max(3, avail)
+
     # 4. Section: WORK ORDERS
     items.append(Text("WORK ORDERS", style="bold #60a5fa"))
-    for wo_line in format_work_orders(work_orders, width=width):
+    for wo_line in format_work_orders(work_orders, width=width, max_items=max_wo_items):
         items.append(wo_line)
     items.append(Text(""))
 
@@ -503,7 +558,7 @@ def render_runtime_panel(
 
     # 6. Section: CURRENT OPERATION
     items.append(Text("CURRENT OPERATION", style="bold #a855f7"))
-    for op_line in format_current_operation(current_operation, width=width, state=state):
+    for op_line in op_lines:
         items.append(op_line)
     items.append(Text(""))
 

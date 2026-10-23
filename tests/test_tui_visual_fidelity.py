@@ -529,6 +529,33 @@ def test_runtime_panel_with_dynamic_data():
     assert "running" in panel
 
 
+def test_runtime_panel_large_work_order_list_preserves_current_operation():
+    """Verify that when work orders grow large (e.g., 28 orders), the panel windows
+    them so that CURRENT OPERATION is not pushed out of the viewport."""
+    work_orders = [
+        {
+            "id": f"WO-{i:03d}",
+            "title": f"Task {i}",
+            "status": "COMPLETED" if i < 20 else ("ACTIVE" if i == 20 else "PENDING"),
+        }
+        for i in range(28)
+    ]
+    current_op = {"name": "Architecture", "status": "running", "role": "Architecture", "backend": "ollama"}
+
+    # Render with constrained height (35 lines)
+    panel = render_runtime_panel_str(
+        width=35,
+        height=35,
+        work_orders=work_orders,
+        current_operation=current_op,
+    )
+
+    assert "CURRENT OPERATION" in panel
+    assert "Architecture" in panel
+    assert "WO-020" in panel
+    assert "earlier completed" in panel
+
+
 def test_runtime_panel_no_stdout_leak(capsys: pytest.CaptureFixture[str]):
     """Verify runtime panel str renderer does not leak to stdout."""
     capsys.readouterr()
