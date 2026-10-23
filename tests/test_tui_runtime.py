@@ -472,3 +472,103 @@ def test_runtime_panel_independent_scroll_and_activity_indicator():
     assert "↓ New runtime activity" not in out_resumed
 
 
+def test_work_orders_scrolling_and_scrollbar_rendering():
+    """Verify scrolling through work orders with vertical scrollbar and range indicators."""
+    from cli.tui.runtime_panel import RuntimePanelScroll, render_runtime_panel_str
+    from cli.tui.state import AutonomousDeliveryState
+
+    scroll = RuntimePanelScroll()
+    state = AutonomousDeliveryState(session_id="test-wo-scroll", scroll=scroll)
+    work_orders = [
+        {"id": f"WO-{i:03d}", "title": f"Task {i}", "status": "COMPLETED" if i < 24 else "RUNNING"}
+        for i in range(28)
+    ]
+    current_op = {"name": "Architecture", "status": "running"}
+
+    # 1. At bottom (initial state): shows recent / active work orders, earlier completed indicator
+    out_bottom = render_runtime_panel_str(
+        width=36,
+        height=35,
+        work_orders=work_orders,
+        current_operation=current_op,
+        scroll=scroll,
+        state=state,
+    )
+    assert "earlier completed" in out_bottom
+    assert "WO-024" in out_bottom
+    assert "▐" in out_bottom  # Scrollbar thumb rendered
+
+    # 2. Scroll up 10 items
+    state.scroll_runtime_up(10)
+    assert scroll.scroll_offset == 10
+    out_mid = render_runtime_panel_str(
+        width=36,
+        height=35,
+        work_orders=work_orders,
+        current_operation=current_op,
+        scroll=scroll,
+        state=state,
+    )
+    assert "upcoming orders" in out_mid
+    assert "earlier completed" in out_mid
+
+    # 3. Scroll all the way to top
+    state.scroll_runtime_up(50)
+    out_top = render_runtime_panel_str(
+        width=36,
+        height=35,
+        work_orders=work_orders,
+        current_operation=current_op,
+        scroll=scroll,
+        state=state,
+    )
+    assert "WO-000" in out_top
+    assert "upcoming orders" in out_top
+    assert "earlier completed" not in out_top
+
+    # 4. Scroll back to bottom
+    state.scroll_runtime_to_bottom()
+    assert scroll.scroll_offset == 0
+    assert scroll.follow_bottom is True
+
+
+def test_work_orders_scroll_commands_and_focus():
+    """Verify :wo up/down/top/bottom commands and focus toggle."""
+    from cli.tui.commands import dispatch_delivery_command
+    from cli.tui.runtime_panel import RuntimePanelScroll
+    from cli.tui.state import AutonomousDeliveryState
+
+    scroll = RuntimePanelScroll()
+    state = AutonomousDeliveryState(session_id="test-wo-cmds", scroll=scroll)
+    state.work_orders = [
+        {"id": f"WO-{i:03d}", "title": f"Task {i}", "status": "COMPLETED"}
+        for i in range(25)
+    ]
+    scroll.viewport_height = 8
+    scroll.max_offset = 17
+
+    # Scroll focus toggle
+    assert state.scroll_focus == "conversation"
+    state.toggle_scroll_focus()
+    assert state.scroll_focus == "work_orders"
+    state.toggle_scroll_focus()
+    assert state.scroll_focus == "conversation"
+
+    # Command: :wo up
+    dispatch_delivery_command(None, None, {"session_id": "s"}, ":wo up 5", state)
+    assert state.scroll.scroll_offset == 5
+
+    # Command: :wo down
+    dispatch_delivery_command(None, None, {"session_id": "s"}, ":wo down 2", state)
+    assert state.scroll.scroll_offset == 3
+
+    # Command: :wo top
+    dispatch_delivery_command(None, None, {"session_id": "s"}, ":wo top", state)
+    assert state.scroll.scroll_offset == 17
+
+    # Command: :wo bottom
+    dispatch_delivery_command(None, None, {"session_id": "s"}, ":wo bottom", state)
+    assert state.scroll.scroll_offset == 0
+    assert state.scroll.follow_bottom is True
+
+

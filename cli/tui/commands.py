@@ -1921,13 +1921,79 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized == ":wo":
-        output_str = render_work_orders_panel(state)
-        state.add_message("user", normalized)
-        state.add_message("system", output_str)
-        if not is_tty:
-            click.echo(output_str)
-        return session, False
+    if (
+        normalized == ":wo"
+        or normalized.startswith(":wo ")
+        or normalized == ":workorders"
+        or normalized.startswith(":workorders ")
+        or normalized.startswith(":scroll wo")
+    ):
+        parts = normalized.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else ""
+        if subcmd == "wo" and len(parts) > 2:
+            subcmd = parts[2].lower()
+
+        if subcmd in ("up", "u"):
+            lines_to_scroll = 3
+            if len(parts) > 2 and parts[-1].isdigit():
+                lines_to_scroll = int(parts[-1])
+            state.scroll_runtime_up(lines_to_scroll)
+            cur_off = getattr(state.scroll, "scroll_offset", 0)
+            msg = f"Scrolled work orders up by {lines_to_scroll} (offset: {cur_off})"
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        elif subcmd in ("down", "dn", "d"):
+            lines_to_scroll = 3
+            if len(parts) > 2 and parts[-1].isdigit():
+                lines_to_scroll = int(parts[-1])
+            state.scroll_runtime_down(lines_to_scroll)
+            cur_off = getattr(state.scroll, "scroll_offset", 0)
+            msg = f"Scrolled work orders down by {lines_to_scroll} (offset: {cur_off})"
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        elif subcmd in ("top", "t"):
+            max_off = getattr(state.scroll, "max_offset", None) or 999
+            state.set_runtime_scroll_offset(max_off)
+            msg = f"Scrolled work orders to top (offset: {state.scroll.scroll_offset})"
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        elif subcmd in ("bottom", "b", "bot"):
+            state.scroll_runtime_to_bottom()
+            msg = "Scrolled work orders to bottom (live-follow resumed)"
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        elif subcmd.isdigit() or (subcmd.startswith("wo-") and subcmd[3:].isdigit()):
+            num_str = subcmd[3:] if subcmd.startswith("wo-") else subcmd
+            target_idx = int(num_str)
+            total = len(getattr(state, "work_orders", []))
+            cap = getattr(state.scroll, "viewport_height", 8) or 8
+            offset = max(0, total - (target_idx + cap // 2))
+            state.set_runtime_scroll_offset(offset)
+            msg = f"Jumped work orders view to WO-{target_idx:03d} (offset: {state.scroll.scroll_offset})"
+            state.add_message("user", normalized)
+            state.add_message("system", msg)
+            if not is_tty:
+                click.echo(msg)
+            return session, False
+        else:
+            output_str = render_work_orders_panel(state)
+            state.add_message("user", normalized)
+            state.add_message("system", output_str)
+            if not is_tty:
+                click.echo(output_str)
+            return session, False
 
     if normalized in {":tree", ":agents"}:
         try:

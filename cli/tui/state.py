@@ -589,6 +589,7 @@ class AutonomousDeliveryState:
         self.composer_alert: str | None = None
         self.is_typing: bool = False
         self.focus_target: str = "composer"
+        self.scroll_focus: str = "conversation"
         self.activity_log: list[ActivityEntry] = []
         self.messages: list[ChatMessage] = []
         self.completion_checklist: dict[str, bool] = {
@@ -1134,6 +1135,40 @@ class AutonomousDeliveryState:
     def set_conversation_scroll_offset(self, offset: int) -> None:
         """Set absolute conversation viewport scroll offset directly."""
         self.conversation_scroll.set_scroll_offset(offset)
+
+    def scroll_runtime_up(self, lines: int = 1) -> None:
+        """Scroll runtime panel (work orders) upward, detaching from live-follow (§10)."""
+        self.scroll.scroll_up(lines)
+
+    def scroll_runtime_down(self, lines: int = 1) -> None:
+        """Scroll runtime panel (work orders) downward towards bottom (§10)."""
+        self.scroll.scroll_down(lines)
+
+    def scroll_runtime_to_bottom(self) -> None:
+        """Jump runtime panel to bottom and resume live-following (§10)."""
+        self.scroll.scroll_to_bottom()
+
+    def set_runtime_scroll_offset(self, offset: int) -> None:
+        """Set absolute runtime panel scroll offset directly."""
+        if hasattr(self.scroll, "set_scroll_offset"):
+            self.scroll.set_scroll_offset(offset)
+        else:
+            max_limit = self.scroll.max_offset if (getattr(self.scroll, "max_offset", None) and self.scroll.max_offset > 0) else None
+            if max_limit is not None:
+                self.scroll.scroll_offset = max(0, min(offset, max_limit))
+            else:
+                self.scroll.scroll_offset = max(0, offset)
+            if self.scroll.scroll_offset == 0:
+                self.scroll.follow_bottom = True
+                self.scroll.has_new_activity = False
+            else:
+                self.scroll.follow_bottom = False
+
+    def toggle_scroll_focus(self) -> str:
+        """Toggle scroll focus between conversation and work orders."""
+        current = getattr(self, "scroll_focus", "conversation")
+        self.scroll_focus = "work_orders" if current == "conversation" else "conversation"
+        return self.scroll_focus
 
     def record_turn_action(
         self,

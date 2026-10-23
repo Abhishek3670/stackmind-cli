@@ -85,10 +85,14 @@ class RuntimePanelScroll:
     viewport_height: int | None = None
     has_new_activity: bool = False
     follow_bottom: bool = True
+    max_offset: int | None = None
+    total_lines: int | None = None
 
     def scroll_up(self, lines: int = 1) -> None:
         """Scroll view upward, detaching from live-following."""
         self.scroll_offset += max(1, lines)
+        if self.max_offset is not None and self.max_offset > 0:
+            self.scroll_offset = min(self.scroll_offset, self.max_offset)
         self.follow_bottom = False
 
     def scroll_down(self, lines: int = 1) -> None:
@@ -103,6 +107,19 @@ class RuntimePanelScroll:
         self.scroll_offset = 0
         self.follow_bottom = True
         self.has_new_activity = False
+
+    def set_scroll_offset(self, offset: int) -> None:
+        """Set absolute scroll offset directly (e.g. from mouse drag or jump)."""
+        max_limit = self.max_offset if (self.max_offset is not None and self.max_offset > 0) else None
+        if max_limit is not None:
+            self.scroll_offset = max(0, min(offset, max_limit))
+        else:
+            self.scroll_offset = max(0, offset)
+        if self.scroll_offset == 0:
+            self.follow_bottom = True
+            self.has_new_activity = False
+        else:
+            self.follow_bottom = False
 
     def notify_activity(self) -> None:
         """Notify that new runtime state arrived outside current viewport."""
@@ -306,8 +323,9 @@ def format_work_orders(
     work_orders: list[dict[str, Any]] | list[Any] | None,
     width: int | None = None,
     max_items: int | None = None,
+    scroll: RuntimePanelScroll | None = None,
 ) -> list[Text]:
-    """Format work orders section into clean status lines with responsive windowing."""
+    """Format work orders section into clean status lines with responsive windowing and scrolling."""
     if not work_orders:
         return [Text("  No active orders", style="dim #475569")]
 
@@ -316,22 +334,45 @@ def format_work_orders(
 
     earlier_count = 0
     later_count = 0
-    if max_items is not None and max_items > 0 and total_count > max_items:
-        active_idx = None
-        for i, wo in enumerate(work_orders):
-            st = str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper()
-            if st in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}:
-                active_idx = i
+    start_idx = 0
+    end_idx = total_count
 
-        capacity = max(1, max_items - 1)
-        if active_idx is not None:
-            end_idx = min(total_count, active_idx + max(1, capacity // 2) + 1)
+    if max_items is not None and max_items > 0 and total_count > max_items:
+        capacity = max(1, max_items - 2)
+        max_offset = max(0, total_count - capacity)
+
+        if scroll is not None:
+            scroll.total_lines = total_count
+            scroll.viewport_height = capacity
+            scroll.max_offset = max_offset
+            if scroll.scroll_offset > max_offset:
+                scroll.scroll_offset = max_offset
+            elif scroll.scroll_offset < 0:
+                scroll.scroll_offset = 0
+
+        # Check if user scrolled up manually
+        if scroll is not None and not scroll.follow_bottom and scroll.scroll_offset > 0:
+            effective_offset = min(scroll.scroll_offset, max_offset)
+            end_idx = total_count - effective_offset
             start_idx = max(0, end_idx - capacity)
             if start_idx == 0:
                 end_idx = min(total_count, capacity)
         else:
-            start_idx = max(0, total_count - capacity)
-            end_idx = total_count
+            # Default live-follow mode: center on active item, or show latest orders
+            active_idx = None
+            for i, wo in enumerate(work_orders):
+                st = str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper()
+                if st in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}:
+                    active_idx = i
+
+            if active_idx is not None:
+                end_idx = min(total_count, active_idx + max(1, capacity // 2) + 1)
+                start_idx = max(0, end_idx - capacity)
+                if start_idx == 0:
+                    end_idx = min(total_count, capacity)
+            else:
+                start_idx = max(0, total_count - capacity)
+                end_idx = total_count
 
         display_orders = work_orders[start_idx:end_idx]
         earlier_count = start_idx
@@ -341,14 +382,26 @@ def format_work_orders(
 
     lines: list[Text] = []
 
+    has_scrollbar = total_count > len(display_orders)
+    H = len(display_orders)
+    if has_scrollbar and H > 0:
+        thumb_size = max(1, int(round(H * (len(display_orders) / total_count))))
+        thumb_size = min(thumb_size, H)
+        max_pos = max(1, total_count - len(display_orders))
+        thumb_top = int(round((start_idx / max_pos) * (H - thumb_size)))
+        thumb_top = max(0, min(thumb_top, H - thumb_size))
+        thumb_rows = set(range(thumb_top, thumb_top + thumb_size))
+    else:
+        thumb_rows = set()
+
     if earlier_count > 0:
         summary_line = Text()
         summary_line.append("  ")
-        summary_line.append("… ", style="dim #64748b")
+        summary_line.append("▲ … ", style="dim #60a5fa")
         summary_line.append(f"({earlier_count} earlier completed)", style="dim #64748b")
         lines.append(summary_line)
 
-    for wo in display_orders:
+    for r_idx, wo in enumerate(display_orders):
         if isinstance(wo, Mapping):
             wo_id = str(wo.get("id") or wo.get("wo_id") or "—")
             title = str(wo.get("title", ""))
@@ -364,8 +417,9 @@ def format_work_orders(
 
         sym, style, _ = get_status_symbol(status)
 
+        scroll_margin = 2 if has_scrollbar else 0
         prefix_len = 2 + 2 + len(wo_id)
-        max_title_len = max(6, inner_w - prefix_len - 2)
+        max_title_len = max(4, inner_w - prefix_len - 2 - scroll_margin)
         trunc_title = textwrap.shorten(title, width=max_title_len, placeholder="…") if title else ""
         line = Text()
         line.append("  ")
@@ -373,12 +427,23 @@ def format_work_orders(
         line.append(f"{wo_id}", style="bold #60a5fa")
         if trunc_title:
             line.append(f": {trunc_title}", style="dim white")
+
+        if has_scrollbar:
+            current_len = len(line.plain)
+            target_col = inner_w - 1
+            if current_len < target_col:
+                line.append(" " * (target_col - current_len))
+            if r_idx in thumb_rows:
+                line.append("▐", style="bold #60a5fa")
+            else:
+                line.append("│", style="dim #334155")
+
         lines.append(line)
 
     if later_count > 0:
         summary_line = Text()
         summary_line.append("  ")
-        summary_line.append("… ", style="dim #64748b")
+        summary_line.append("▼ … ", style="dim #60a5fa")
         summary_line.append(f"({later_count} upcoming orders)", style="dim #64748b")
         lines.append(summary_line)
 
@@ -547,8 +612,14 @@ def render_runtime_panel(
         max_wo_items = max(3, avail)
 
     # 4. Section: WORK ORDERS
-    items.append(Text("WORK ORDERS", style="bold #60a5fa"))
-    for wo_line in format_work_orders(work_orders, width=width, max_items=max_wo_items):
+    is_focused = state is not None and getattr(state, "scroll_focus", "") == "work_orders"
+    wo_title = Text("WORK ORDERS", style="bold #38bdf8" if is_focused else "bold #60a5fa")
+    if work_orders and max_wo_items is not None and len(work_orders) > max_wo_items:
+        wo_title.append(f" ({len(work_orders)})", style="dim #64748b")
+        if is_focused:
+            wo_title.append(" [scroll active]", style="bold #38bdf8")
+    items.append(wo_title)
+    for wo_line in format_work_orders(work_orders, width=width, max_items=max_wo_items, scroll=scroll):
         items.append(wo_line)
     items.append(Text(""))
 

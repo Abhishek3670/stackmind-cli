@@ -104,7 +104,12 @@ class Key:
     PASTE_END = "<PASTE_END>"
     SHIFT_ENTER = "<SHIFT_ENTER>"
     CTRL_V = "\x16"  # Paste from clipboard (ASCII SYN / ord 22)
+    CTRL_W = "\x17"  # Toggle scroll focus (Conversation <-> Work Orders)
     SHIFT_INSERT = "<SHIFT_INSERT>"
+    ALT_UP = "<ALT_UP>"
+    ALT_DOWN = "<ALT_DOWN>"
+    ALT_PAGE_UP = "<ALT_PAGE_UP>"
+    ALT_PAGE_DOWN = "<ALT_PAGE_DOWN>"
 
 
 # SGR Extended Mouse Mode control sequences (WO-054)
@@ -278,6 +283,16 @@ def _parse_escape_sequence(seq: str) -> str:
         return Key.PAGE_UP
     elif seq == "[6~":
         return Key.PAGE_DOWN
+
+    # Alt+Up / Alt+Down / Alt+PgUp / Alt+PgDn (xterm / vt sequences)
+    elif seq in ("[1;3A", "[1;5A"):
+        return Key.ALT_UP
+    elif seq in ("[1;3B", "[1;5B"):
+        return Key.ALT_DOWN
+    elif seq in ("[5;3~", "[5;5~"):
+        return Key.ALT_PAGE_UP
+    elif seq in ("[6;3~", "[6;5~"):
+        return Key.ALT_PAGE_DOWN
 
     # Bracketed paste
     elif seq == "[200~":
@@ -491,6 +506,8 @@ class Win32ConsoleReader:
         # Mouse Events (EventType == 0x0002)
         if event_type == 0x0002:
             mouse = record.Event.MouseEvent
+            self.last_mouse_col = mouse.dwMousePosition.X
+            self.last_mouse_row = mouse.dwMousePosition.Y
             # MOUSE_WHEELED (vertical scroll) is flag 0x0004
             if mouse.dwEventFlags & 0x0004:
                 # High word of dwButtonState is signed 16-bit wheel delta
@@ -554,6 +571,7 @@ class Win32ConsoleReader:
             # Handle control keys regardless of whether UnicodeChar is null ('\x00') or letter
             is_ctrl = bool(key.dwControlKeyState & (0x0004 | 0x0008))
             is_shift = bool(key.dwControlKeyState & 0x0010)
+            is_alt = bool(key.dwControlKeyState & (0x0001 | 0x0002))
 
             if is_ctrl:
                 ctrl_vk_map = {
@@ -565,8 +583,22 @@ class Win32ConsoleReader:
                     0x43: Key.CTRL_C,  # VK_C -> '\x03' (Cancel / exit)
                     0x44: Key.CTRL_D,  # VK_D -> '\x04' (EOF / exit)
                     0x56: Key.CTRL_V,  # VK_V -> '\x16' (Paste clipboard)
+                    0x57: Key.CTRL_W,  # VK_W -> '\x17' (Toggle scroll focus)
                 }
                 res = ctrl_vk_map.get(vk)
+                if res:
+                    if key.wRepeatCount > 1:
+                        self._pending_keys.extend([res] * (key.wRepeatCount - 1))
+                    return res
+
+            if is_alt:
+                alt_vk_map = {
+                    0x26: Key.ALT_UP,         # VK_UP
+                    0x28: Key.ALT_DOWN,       # VK_DOWN
+                    0x21: Key.ALT_PAGE_UP,    # VK_PRIOR
+                    0x22: Key.ALT_PAGE_DOWN,  # VK_NEXT
+                }
+                res = alt_vk_map.get(vk)
                 if res:
                     if key.wRepeatCount > 1:
                         self._pending_keys.extend([res] * (key.wRepeatCount - 1))
@@ -1078,6 +1110,11 @@ class RawLineEditor:
         on_ctrl_o: Optional[Callable[[], None]] = None,
         on_ctrl_b: Optional[Callable[[], None]] = None,
         on_ctrl_g: Optional[Callable[[], None]] = None,
+        on_ctrl_w: Optional[Callable[[], None]] = None,
+        on_alt_up: Optional[Callable[[], None]] = None,
+        on_alt_down: Optional[Callable[[], None]] = None,
+        on_alt_page_up: Optional[Callable[[], None]] = None,
+        on_alt_page_down: Optional[Callable[[], None]] = None,
         on_page_up: Optional[Callable[[], None]] = None,
         on_page_down: Optional[Callable[[], None]] = None,
         on_wheel_up: Optional[Callable[[], None]] = None,
@@ -1107,6 +1144,13 @@ class RawLineEditor:
         self.on_ctrl_o = on_ctrl_o
         self.on_ctrl_b = on_ctrl_b
         self.on_ctrl_g = on_ctrl_g
+        self.on_ctrl_w = on_ctrl_w
+        self.on_alt_up = on_alt_up
+        self.on_alt_down = on_alt_down
+        self.on_alt_page_up = on_alt_page_up
+        self.on_alt_page_down = on_alt_page_down
+        self.last_mouse_col: Optional[int] = None
+        self.last_mouse_row: Optional[int] = None
         self.on_page_up = on_page_up
         self.on_page_down = on_page_down
         self.on_wheel_up = on_wheel_up
@@ -1665,7 +1709,77 @@ class RawLineEditor:
                 self.on_ctrl_g()
             return False
 
+        if key == Key.CTRL_W:
+            if self.on_ctrl_w:
+                try:
+                    self.on_ctrl_w(self)
+                except TypeError:
+                    self.on_ctrl_w()
+            elif self.state is not None and hasattr(self.state, "toggle_scroll_focus"):
+                self.state.toggle_scroll_focus()
+                self._force_full_redraw(clear=False)
+            return False
+
+        if key == Key.ALT_UP:
+            if self.on_alt_up:
+                try:
+                    self.on_alt_up(self)
+                except TypeError:
+                    self.on_alt_up()
+            elif self.state is not None and hasattr(self.state, "scroll_runtime_up"):
+                self.state.scroll_runtime_up(2)
+                self._force_full_redraw(clear=False)
+            return False
+
+        if key == Key.ALT_DOWN:
+            if self.on_alt_down:
+                try:
+                    self.on_alt_down(self)
+                except TypeError:
+                    self.on_alt_down()
+            elif self.state is not None and hasattr(self.state, "scroll_runtime_down"):
+                self.state.scroll_runtime_down(2)
+                self._force_full_redraw(clear=False)
+            return False
+
+        if key == Key.ALT_PAGE_UP:
+            if self.on_alt_page_up:
+                try:
+                    self.on_alt_page_up(self)
+                except TypeError:
+                    self.on_alt_page_up()
+            elif self.on_alt_up:
+                try:
+                    self.on_alt_up(self)
+                except TypeError:
+                    self.on_alt_up()
+            elif self.state is not None and hasattr(self.state, "scroll_runtime_up"):
+                self.state.scroll_runtime_up(6)
+                self._force_full_redraw(clear=False)
+            return False
+
+        if key == Key.ALT_PAGE_DOWN:
+            if self.on_alt_page_down:
+                try:
+                    self.on_alt_page_down(self)
+                except TypeError:
+                    self.on_alt_page_down()
+            elif self.on_alt_down:
+                try:
+                    self.on_alt_down(self)
+                except TypeError:
+                    self.on_alt_down()
+            elif self.state is not None and hasattr(self.state, "scroll_runtime_down"):
+                self.state.scroll_runtime_down(6)
+                self._force_full_redraw(clear=False)
+            return False
+
         if key == Key.PAGE_UP:
+            if self.state is not None and getattr(self.state, "scroll_focus", "") == "work_orders":
+                if hasattr(self.state, "scroll_runtime_up"):
+                    self.state.scroll_runtime_up(4)
+                self._force_full_redraw(clear=False)
+                return False
             if self.state is not None and getattr(self.state, "command_dialog_open", False):
                 self.state.scroll_command_dialog_up(5)
                 self._force_full_redraw(clear=False)
@@ -1677,6 +1791,11 @@ class RawLineEditor:
             return False
 
         if key == Key.PAGE_DOWN:
+            if self.state is not None and getattr(self.state, "scroll_focus", "") == "work_orders":
+                if hasattr(self.state, "scroll_runtime_down"):
+                    self.state.scroll_runtime_down(4)
+                self._force_full_redraw(clear=False)
+                return False
             if self.state is not None and getattr(self.state, "command_dialog_open", False):
                 self.state.scroll_command_dialog_down(5)
                 self._force_full_redraw(clear=False)
@@ -1716,6 +1835,8 @@ class RawLineEditor:
                     btn = int(parts[1])
                     col = int(parts[2])
                     row = int(parts[3])
+                    self.last_mouse_col = col
+                    self.last_mouse_row = row
                     action = parts[4] if len(parts) > 4 else "M"
                     if action not in ("m",):
                         # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
@@ -1891,6 +2012,11 @@ def raw_prompt_input(
     on_ctrl_o: Optional[Callable[[], None]] = None,
     on_ctrl_b: Optional[Callable[[], None]] = None,
     on_ctrl_g: Optional[Callable[[], None]] = None,
+    on_ctrl_w: Optional[Callable[[], None]] = None,
+    on_alt_up: Optional[Callable[[], None]] = None,
+    on_alt_down: Optional[Callable[[], None]] = None,
+    on_alt_page_up: Optional[Callable[[], None]] = None,
+    on_alt_page_down: Optional[Callable[[], None]] = None,
     on_page_up: Optional[Callable[[], None]] = None,
     on_page_down: Optional[Callable[[], None]] = None,
     on_wheel_up: Optional[Callable[[], None]] = None,
@@ -2006,6 +2132,72 @@ def raw_prompt_input(
                 editor._update_state()
         editor.redraw_line()
 
+    def wrapped_ctrl_w() -> None:
+        """Handle Ctrl+W — toggle scroll focus (Conversation <-> Work Orders)."""
+        if on_ctrl_w:
+            try:
+                on_ctrl_w(editor)
+            except TypeError:
+                on_ctrl_w()
+        elif state is not None and hasattr(state, "toggle_scroll_focus"):
+            state.toggle_scroll_focus()
+            editor._force_full_redraw(clear=False)
+        editor.redraw_line()
+
+    def wrapped_alt_up() -> None:
+        """Handle Alt+Up — scroll work orders upward."""
+        if on_alt_up:
+            try:
+                on_alt_up(editor)
+            except TypeError:
+                on_alt_up()
+        elif state is not None and hasattr(state, "scroll_runtime_up"):
+            state.scroll_runtime_up(2)
+            editor._force_full_redraw(clear=False)
+
+    def wrapped_alt_down() -> None:
+        """Handle Alt+Down — scroll work orders downward."""
+        if on_alt_down:
+            try:
+                on_alt_down(editor)
+            except TypeError:
+                on_alt_down()
+        elif state is not None and hasattr(state, "scroll_runtime_down"):
+            state.scroll_runtime_down(2)
+            editor._force_full_redraw(clear=False)
+
+    def wrapped_alt_page_up() -> None:
+        """Handle Alt+PageUp — scroll work orders upward by half page."""
+        if on_alt_page_up:
+            try:
+                on_alt_page_up(editor)
+            except TypeError:
+                on_alt_page_up()
+        elif on_alt_up:
+            try:
+                on_alt_up(editor)
+            except TypeError:
+                on_alt_up()
+        elif state is not None and hasattr(state, "scroll_runtime_up"):
+            state.scroll_runtime_up(6)
+            editor._force_full_redraw(clear=False)
+
+    def wrapped_alt_page_down() -> None:
+        """Handle Alt+PageDown — scroll work orders downward by half page."""
+        if on_alt_page_down:
+            try:
+                on_alt_page_down(editor)
+            except TypeError:
+                on_alt_page_down()
+        elif on_alt_down:
+            try:
+                on_alt_down(editor)
+            except TypeError:
+                on_alt_down()
+        elif state is not None and hasattr(state, "scroll_runtime_down"):
+            state.scroll_runtime_down(6)
+            editor._force_full_redraw(clear=False)
+
     def wrapped_page_up() -> None:
         """Handle Page Up — scroll conversation viewport up, then restore prompt line."""
         if on_page_up:
@@ -2066,6 +2258,11 @@ def raw_prompt_input(
         on_ctrl_o=wrapped_ctrl_o,
         on_ctrl_b=wrapped_ctrl_b,
         on_ctrl_g=wrapped_ctrl_g,
+        on_ctrl_w=wrapped_ctrl_w,
+        on_alt_up=wrapped_alt_up,
+        on_alt_down=wrapped_alt_down,
+        on_alt_page_up=wrapped_alt_page_up,
+        on_alt_page_down=wrapped_alt_page_down,
         on_page_up=wrapped_page_up,
         on_page_down=wrapped_page_down,
         on_wheel_up=wrapped_wheel_up,
