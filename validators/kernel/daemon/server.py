@@ -71,7 +71,7 @@ class LocalDaemon:
                         200,
                         {
                             "status": "ok",
-                            "sessions": len(daemon.manager.list_sessions()),
+                            "sessions": len(daemon.manager._sessions),
                         },
                     )
                 elif parsed.path == "/events":

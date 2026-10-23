@@ -38,7 +38,7 @@ class EventDispatcher:
             self._events.append(event)
             listeners = tuple(self._listeners.values())
             on_publish = self._on_publish
-        if on_publish:
+        if on_publish and name not in {"token.delta", "reasoning.delta"}:
             on_publish(event)
         for listener in listeners:
             try:
@@ -70,7 +70,10 @@ class EventDispatcher:
 
     def dump(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [event.as_dict() for event in self._events]
+            return [
+                event.as_dict() for event in self._events
+                if event.name not in {"token.delta", "reasoning.delta"}
+            ]
 
     def tool_call(
         self,

@@ -776,16 +776,23 @@ class SessionManager:
         self._active_runs: dict[str, Any] = {}
         self._run_driver_threads: dict[str, Thread] = {}
         self._run_stop_events: dict[str, Event] = {}
+        daemon_ws = self.storage.root.parent.parent.parent.resolve() if self.storage.root.name == "daemon" else None
+        seen_run_ids: set[str] = set()
         for session in self._sessions.values():
             ws_str = session.get("workspace")
             if ws_str:
                 ws = Path(ws_str)
+                if daemon_ws and ws.resolve() != daemon_ws:
+                    continue
                 sup_dir = ws / ".sync" / "runtime" / "supervisor"
                 if sup_dir.is_dir():
                     from .supervisor import Phase
                     for run_file in sup_dir.glob("run-*.yaml"):
+                        r_id = run_file.stem
+                        if r_id in seen_run_ids:
+                            continue
+                        seen_run_ids.add(r_id)
                         try:
-                            r_id = run_file.stem
                             loaded_state = self.supervisor.load_run_state(r_id, ws)
                             if loaded_state:
                                 self._active_runs[r_id] = loaded_state
@@ -815,9 +822,11 @@ class SessionManager:
                             pass
         self._save()
 
-    def _persist_event(self, _: RuntimeEvent) -> None:
+    def _persist_event(self, event: RuntimeEvent) -> None:
         # Event listeners may publish from runner threads; serialize persistence
         # with all session/operation transitions to avoid competing temp-file replaces.
+        if getattr(event, "name", None) in {"token.delta", "reasoning.delta"}:
+            return
         with self._lock:
             self._save()
 
