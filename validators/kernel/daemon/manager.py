@@ -1604,8 +1604,6 @@ class SessionManager:
         state.recovery_attempts.clear()
         state.dependency_escalation_retries.clear()
         state.worker_blockers.clear()
-        if getattr(state, "planning_wo_id", None) in getattr(state, "completed_wo_ids", []):
-            state.planning_wo_id = None
         # Operator resume grants a fresh rework budget: the human decided to
         # continue the run (often after a platform upgrade or manual repair),
         # so stale exhaustion from previous sessions must not dead-end it.
