@@ -572,3 +572,50 @@ def test_work_orders_scroll_commands_and_focus():
     assert state.scroll.follow_bottom is True
 
 
+def test_editor_work_orders_key_bindings():
+    """Verify RawLineEditor directly handles Alt+Up/Down, Alt+PageUp/Down, and Ctrl+W."""
+    from cli.tui.keyboard import RawLineEditor, Key
+    from cli.tui.runtime_panel import RuntimePanelScroll
+    from cli.tui.state import AutonomousDeliveryState
+
+    scroll = RuntimePanelScroll()
+    state = AutonomousDeliveryState(session_id="test-editor-keys", scroll=scroll)
+    state.work_orders = [
+        {"id": f"WO-{i:03d}", "title": f"Task {i}", "status": "COMPLETED"}
+        for i in range(20)
+    ]
+    scroll.viewport_height = 8
+    scroll.max_offset = 12
+
+    redrawn = []
+    editor = RawLineEditor(
+        state=state,
+        on_height_change=lambda ed, clear=False: redrawn.append(clear),
+    )
+
+    # 1. Alt+Up scrolls runtime up by 2
+    editor.handle_key(Key.ALT_UP)
+    assert scroll.scroll_offset == 2
+    assert redrawn == [False]
+
+    # 2. Alt+PageUp scrolls runtime up by 6
+    editor.handle_key(Key.ALT_PAGE_UP)
+    assert scroll.scroll_offset == 8
+
+    # 3. Alt+Down scrolls runtime down by 2
+    editor.handle_key(Key.ALT_DOWN)
+    assert scroll.scroll_offset == 6
+
+    # 4. Alt+PageDown scrolls runtime down by 6
+    editor.handle_key(Key.ALT_PAGE_DOWN)
+    assert scroll.scroll_offset == 0
+
+    # 5. Ctrl+W toggles scroll focus
+    assert state.scroll_focus == "conversation"
+    editor.handle_key(Key.CTRL_W)
+    assert state.scroll_focus == "work_orders"
+    editor.handle_key(Key.CTRL_W)
+    assert state.scroll_focus == "conversation"
+
+
+

@@ -342,41 +342,22 @@ def format_work_orders(
         max_offset = max(0, total_count - capacity)
 
         if scroll is not None:
-            scroll.total_lines = total_count
-            scroll.viewport_height = capacity
-            scroll.max_offset = max_offset
-            if scroll.scroll_offset > max_offset:
-                scroll.scroll_offset = max_offset
-            elif scroll.scroll_offset < 0:
-                scroll.scroll_offset = 0
+            scroll.total_lines, scroll.viewport_height, scroll.max_offset = total_count, capacity, max_offset
+            scroll.scroll_offset = max(0, min(scroll.scroll_offset, max_offset))
 
-        # Check if user scrolled up manually
         if scroll is not None and not scroll.follow_bottom and scroll.scroll_offset > 0:
-            effective_offset = min(scroll.scroll_offset, max_offset)
-            end_idx = total_count - effective_offset
+            end_idx = max(capacity, total_count - min(scroll.scroll_offset, max_offset))
             start_idx = max(0, end_idx - capacity)
-            if start_idx == 0:
-                end_idx = min(total_count, capacity)
         else:
-            # Default live-follow mode: center on active item, or show latest orders
-            active_idx = None
-            for i, wo in enumerate(work_orders):
-                st = str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper()
-                if st in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}:
-                    active_idx = i
-
-            if active_idx is not None:
-                end_idx = min(total_count, active_idx + max(1, capacity // 2) + 1)
+            active = next((i for i, w in enumerate(work_orders) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
+            if active is not None:
+                end_idx = min(total_count, max(capacity, active + max(1, capacity // 2) + 1))
                 start_idx = max(0, end_idx - capacity)
-                if start_idx == 0:
-                    end_idx = min(total_count, capacity)
             else:
-                start_idx = max(0, total_count - capacity)
-                end_idx = total_count
+                start_idx, end_idx = max(0, total_count - capacity), total_count
 
         display_orders = work_orders[start_idx:end_idx]
-        earlier_count = start_idx
-        later_count = total_count - end_idx
+        earlier_count, later_count = start_idx, total_count - end_idx
     else:
         display_orders = work_orders
 
@@ -385,11 +366,8 @@ def format_work_orders(
     has_scrollbar = total_count > len(display_orders)
     H = len(display_orders)
     if has_scrollbar and H > 0:
-        thumb_size = max(1, int(round(H * (len(display_orders) / total_count))))
-        thumb_size = min(thumb_size, H)
-        max_pos = max(1, total_count - len(display_orders))
-        thumb_top = int(round((start_idx / max_pos) * (H - thumb_size)))
-        thumb_top = max(0, min(thumb_top, H - thumb_size))
+        thumb_size = max(1, min(H, int(round(H * (len(display_orders) / total_count)))))
+        thumb_top = min(H - thumb_size, int(round((start_idx / max(1, total_count - len(display_orders))) * (H - thumb_size))))
         thumb_rows = set(range(thumb_top, thumb_top + thumb_size))
     else:
         thumb_rows = set()
@@ -429,14 +407,8 @@ def format_work_orders(
             line.append(f": {trunc_title}", style="dim white")
 
         if has_scrollbar:
-            current_len = len(line.plain)
-            target_col = inner_w - 1
-            if current_len < target_col:
-                line.append(" " * (target_col - current_len))
-            if r_idx in thumb_rows:
-                line.append("▐", style="bold #60a5fa")
-            else:
-                line.append("│", style="dim #334155")
+            pad = max(0, inner_w - 1 - len(line.plain))
+            line.append(" " * pad + ("▐" if r_idx in thumb_rows else "│"), style="bold #60a5fa" if r_idx in thumb_rows else "dim #334155")
 
         lines.append(line)
 

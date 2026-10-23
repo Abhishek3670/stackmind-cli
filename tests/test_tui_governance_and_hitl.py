@@ -323,7 +323,8 @@ def test_skills_panel_rendering_and_dispatch(tmp_path: Path):
     assert not should_exit
     assert state.messages[-2].content == ":skills"
     assert "AVAILABLE PROCEDURAL SKILLS" in state.messages[-1].content
-    assert "pytest_run_and_fix" in state.messages[-1].content
+    assert "SKL-TEST-001" in state.messages[-1].content
+    assert "pytest_run_and_" in state.messages[-1].content
 
     # Dispatch single skill detail
     sess, should_exit = dispatch_delivery_command(

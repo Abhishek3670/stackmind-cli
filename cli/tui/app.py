@@ -621,131 +621,8 @@ def tui(
                     if editor is not None and hasattr(editor, "redraw_line"):
                         editor.redraw_line()
 
-                def _refresh_display_after_scroll(editor: Any, term_lines: int) -> None:
-                    if not is_tty:
-                        return
-                    current_text = (
-                        "".join(editor.buffer)
-                        if (
-                            editor is not None
-                            and isinstance(getattr(editor, "buffer", None), list)
-                        )
-                        else None
-                    )
-                    redraw_full_screen(
-                        session,
-                        state,
-                        clear=False,
-                        include_composer=True,
-                        composer_is_active=True,
-                        composer_content=current_text,
-                        live_manager=live_ws,
-                    )
-                    cursor_col = _compute_cursor_col(editor)
-                    cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
-                    c_row = compute_composer_cursor_row(
-                        term_lines,
-                        state=state,
-                        composer_content=current_text,
-                        cursor_line=cursor_line,
-                    )
-                    sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
-                    sys.stdout.flush()
-                    if editor is not None and hasattr(editor, "redraw_line"):
-                        editor.redraw_line()
-
-                def _handle_page_up(editor: Any = None) -> None:
-                    """Scroll conversation viewport, work orders, or command dialog up by half a page."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    if state is not None and getattr(state, "command_dialog_open", False):
-                        state.scroll_command_dialog_up(4)
-                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
-                        state.scroll_runtime_up(4)
-                    else:
-                        vp_height = compute_viewport_height(term_lines, state=state)
-                        state.scroll_conversation_up(max(1, vp_height // 2))
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_page_down(editor: Any = None) -> None:
-                    """Scroll conversation viewport, work orders, or command dialog down by half a page."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    if state is not None and getattr(state, "command_dialog_open", False):
-                        state.scroll_command_dialog_down(4)
-                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
-                        state.scroll_runtime_down(4)
-                    else:
-                        vp_height = compute_viewport_height(term_lines, state=state)
-                        state.scroll_conversation_down(max(1, vp_height // 2))
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_wheel_up(editor: Any = None) -> None:
-                    """Scroll conversation or runtime viewport up by wheel step (3 lines)."""
-                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_cols, term_lines = term_size.columns, term_size.lines
-                    layout = compute_layout(
-                        term_cols,
-                        term_lines,
-                        show_runtime=getattr(state, "runtime_panel_visible", False),
-                    )
-                    last_col = getattr(editor, "last_mouse_col", None)
-                    if layout.show_runtime and isinstance(last_col, int) and last_col > layout.conversation_width:
-                        state.scroll_runtime_up(2)
-                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
-                        state.scroll_runtime_up(2)
-                    else:
-                        state.scroll_conversation_up(3)
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_wheel_down(editor: Any = None) -> None:
-                    """Scroll conversation or runtime viewport down by wheel step (3 lines)."""
-                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
-                    term_cols, term_lines = term_size.columns, term_size.lines
-                    layout = compute_layout(
-                        term_cols,
-                        term_lines,
-                        show_runtime=getattr(state, "runtime_panel_visible", False),
-                    )
-                    last_col = getattr(editor, "last_mouse_col", None)
-                    if layout.show_runtime and isinstance(last_col, int) and last_col > layout.conversation_width:
-                        state.scroll_runtime_down(2)
-                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
-                        state.scroll_runtime_down(2)
-                    else:
-                        state.scroll_conversation_down(3)
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_alt_up(editor: Any = None) -> None:
-                    """Scroll runtime work orders up by 2 lines."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    state.scroll_runtime_up(2)
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_alt_down(editor: Any = None) -> None:
-                    """Scroll runtime work orders down by 2 lines."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    state.scroll_runtime_down(2)
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_alt_page_up(editor: Any = None) -> None:
-                    """Scroll runtime work orders up by 6 lines."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    state.scroll_runtime_up(6)
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_alt_page_down(editor: Any = None) -> None:
-                    """Scroll runtime work orders down by 6 lines."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    state.scroll_runtime_down(6)
-                    _refresh_display_after_scroll(editor, term_lines)
-
-                def _handle_ctrl_w(editor: Any = None) -> None:
-                    """Toggle scroll focus between conversation and work orders."""
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    state.toggle_scroll_focus()
-                    _refresh_display_after_scroll(editor, term_lines)
-
                 def _handle_height_change(editor: Any = None, clear: bool = False) -> None:
-                    """Dynamically redraw full screen when composer content height changes."""
+                    """Dynamically redraw full screen when composer content height changes or viewport scrolls."""
                     if not is_tty:
                         return
                     current_text = (
@@ -776,6 +653,71 @@ def tui(
                     )
                     sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                     sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        try:
+                            editor.redraw_line()
+                        except Exception:
+                            pass
+
+                def _handle_page_up(editor: Any = None) -> None:
+                    """Scroll conversation viewport, work orders, or command dialog up by half a page."""
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    if state is not None and getattr(state, "command_dialog_open", False):
+                        state.scroll_command_dialog_up(4)
+                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
+                        state.scroll_runtime_up(4)
+                    else:
+                        vp_height = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_up(max(1, vp_height // 2))
+                    _handle_height_change(editor)
+
+                def _handle_page_down(editor: Any = None) -> None:
+                    """Scroll conversation viewport, work orders, or command dialog down by half a page."""
+                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    if state is not None and getattr(state, "command_dialog_open", False):
+                        state.scroll_command_dialog_down(4)
+                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
+                        state.scroll_runtime_down(4)
+                    else:
+                        vp_height = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_down(max(1, vp_height // 2))
+                    _handle_height_change(editor)
+
+                def _handle_wheel_up(editor: Any = None) -> None:
+                    """Scroll conversation or runtime viewport up by wheel step (3 lines)."""
+                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
+                    term_cols, term_lines = term_size.columns, term_size.lines
+                    layout = compute_layout(
+                        term_cols,
+                        term_lines,
+                        show_runtime=getattr(state, "runtime_panel_visible", False),
+                    )
+                    last_col = getattr(editor, "last_mouse_col", None)
+                    if layout.show_runtime and isinstance(last_col, int) and last_col > layout.conversation_width:
+                        state.scroll_runtime_up(2)
+                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
+                        state.scroll_runtime_up(2)
+                    else:
+                        state.scroll_conversation_up(3)
+                    _handle_height_change(editor)
+
+                def _handle_wheel_down(editor: Any = None) -> None:
+                    """Scroll conversation or runtime viewport down by wheel step (3 lines)."""
+                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
+                    term_cols, term_lines = term_size.columns, term_size.lines
+                    layout = compute_layout(
+                        term_cols,
+                        term_lines,
+                        show_runtime=getattr(state, "runtime_panel_visible", False),
+                    )
+                    last_col = getattr(editor, "last_mouse_col", None)
+                    if layout.show_runtime and isinstance(last_col, int) and last_col > layout.conversation_width:
+                        state.scroll_runtime_down(2)
+                    elif state is not None and getattr(state, "scroll_focus", "conversation") == "work_orders":
+                        state.scroll_runtime_down(2)
+                    else:
+                        state.scroll_conversation_down(3)
+                    _handle_height_change(editor)
 
                 def _handle_resize(new_cols: int, new_lines: int, editor: Any = None) -> None:
                     nonlocal current_cols, current_lines, term_cols, comp_width, layout_info
@@ -866,36 +808,7 @@ def tui(
                             if prev_wos != new_wos:
                                 did_update = True
                         if did_update:
-                            current_text = (
-                                "".join(editor.buffer)
-                                if (
-                                    editor is not None
-                                    and isinstance(getattr(editor, "buffer", None), list)
-                                )
-                                else None
-                            )
-                            term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                            redraw_full_screen(
-                                session,
-                                state,
-                                clear=False,
-                                include_composer=True,
-                                composer_is_active=True,
-                                composer_content=current_text,
-                                live_manager=live_ws,
-                            )
-                            cursor_col = _compute_cursor_col(editor)
-                            cursor_line = getattr(editor, "current_visible_line_index", None) if editor else None
-                            c_row = compute_composer_cursor_row(
-                                term_lines,
-                                state=state,
-                                composer_content=current_text,
-                                cursor_line=cursor_line,
-                            )
-                            sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
-                            sys.stdout.flush()
-                            if editor is not None and hasattr(editor, "redraw_line"):
-                                editor.redraw_line()
+                            _handle_height_change(editor)
                     except Exception:
                         pass
 
@@ -948,7 +861,7 @@ def tui(
                                 target_off = max(0, min(max_off, max_off - target_start))
                                 state.set_conversation_scroll_offset(target_off)
 
-                            _refresh_display_after_scroll(editor, term_lines)
+                            _handle_height_change(editor)
                     elif layout.show_runtime and col > scrollbar_col + 2:
                         total_wo = len(getattr(state, "work_orders", []))
                         cap = getattr(state.scroll, "viewport_height", 8) or 8
@@ -961,7 +874,7 @@ def tui(
                                 state.scroll_focus = "work_orders"
                         else:
                             state.scroll_focus = "work_orders"
-                        _refresh_display_after_scroll(editor, term_lines)
+                        _handle_height_change(editor)
 
                 is_awaiting_plan = (
                     getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
@@ -983,11 +896,6 @@ def tui(
                     on_ctrl_l=_handle_ctrl_l,
                     on_ctrl_o=_handle_ctrl_o,
                     on_ctrl_b=_handle_ctrl_b,
-                    on_ctrl_w=_handle_ctrl_w,
-                    on_alt_up=_handle_alt_up,
-                    on_alt_down=_handle_alt_down,
-                    on_alt_page_up=_handle_alt_page_up,
-                    on_alt_page_down=_handle_alt_page_down,
                     on_page_up=_handle_page_up,
                     on_page_down=_handle_page_down,
                     on_wheel_up=_handle_wheel_up,

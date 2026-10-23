@@ -1709,68 +1709,26 @@ class RawLineEditor:
                 self.on_ctrl_g()
             return False
 
-        if key == Key.CTRL_W:
-            if self.on_ctrl_w:
+        if key in (Key.CTRL_W, Key.ALT_UP, Key.ALT_DOWN, Key.ALT_PAGE_UP, Key.ALT_PAGE_DOWN):
+            cb = {
+                Key.CTRL_W: self.on_ctrl_w,
+                Key.ALT_UP: self.on_alt_up,
+                Key.ALT_DOWN: self.on_alt_down,
+                Key.ALT_PAGE_UP: self.on_alt_page_up or self.on_alt_up,
+                Key.ALT_PAGE_DOWN: self.on_alt_page_down or self.on_alt_down,
+            }.get(key)
+            if cb:
                 try:
-                    self.on_ctrl_w(self)
+                    cb(self)
                 except TypeError:
-                    self.on_ctrl_w()
-            elif self.state is not None and hasattr(self.state, "toggle_scroll_focus"):
-                self.state.toggle_scroll_focus()
-                self._force_full_redraw(clear=False)
-            return False
-
-        if key == Key.ALT_UP:
-            if self.on_alt_up:
-                try:
-                    self.on_alt_up(self)
-                except TypeError:
-                    self.on_alt_up()
-            elif self.state is not None and hasattr(self.state, "scroll_runtime_up"):
-                self.state.scroll_runtime_up(2)
-                self._force_full_redraw(clear=False)
-            return False
-
-        if key == Key.ALT_DOWN:
-            if self.on_alt_down:
-                try:
-                    self.on_alt_down(self)
-                except TypeError:
-                    self.on_alt_down()
-            elif self.state is not None and hasattr(self.state, "scroll_runtime_down"):
-                self.state.scroll_runtime_down(2)
-                self._force_full_redraw(clear=False)
-            return False
-
-        if key == Key.ALT_PAGE_UP:
-            if self.on_alt_page_up:
-                try:
-                    self.on_alt_page_up(self)
-                except TypeError:
-                    self.on_alt_page_up()
-            elif self.on_alt_up:
-                try:
-                    self.on_alt_up(self)
-                except TypeError:
-                    self.on_alt_up()
-            elif self.state is not None and hasattr(self.state, "scroll_runtime_up"):
-                self.state.scroll_runtime_up(6)
-                self._force_full_redraw(clear=False)
-            return False
-
-        if key == Key.ALT_PAGE_DOWN:
-            if self.on_alt_page_down:
-                try:
-                    self.on_alt_page_down(self)
-                except TypeError:
-                    self.on_alt_page_down()
-            elif self.on_alt_down:
-                try:
-                    self.on_alt_down(self)
-                except TypeError:
-                    self.on_alt_down()
-            elif self.state is not None and hasattr(self.state, "scroll_runtime_down"):
-                self.state.scroll_runtime_down(6)
+                    cb()
+            elif self.state:
+                if key == Key.CTRL_W:
+                    getattr(self.state, "toggle_scroll_focus", lambda: None)()
+                else:
+                    fn = getattr(self.state, "scroll_runtime_up" if "UP" in key else "scroll_runtime_down", None)
+                    if fn:
+                        fn(6 if "PAGE" in key else 2)
                 self._force_full_redraw(clear=False)
             return False
 
@@ -2132,72 +2090,6 @@ def raw_prompt_input(
                 editor._update_state()
         editor.redraw_line()
 
-    def wrapped_ctrl_w() -> None:
-        """Handle Ctrl+W — toggle scroll focus (Conversation <-> Work Orders)."""
-        if on_ctrl_w:
-            try:
-                on_ctrl_w(editor)
-            except TypeError:
-                on_ctrl_w()
-        elif state is not None and hasattr(state, "toggle_scroll_focus"):
-            state.toggle_scroll_focus()
-            editor._force_full_redraw(clear=False)
-        editor.redraw_line()
-
-    def wrapped_alt_up() -> None:
-        """Handle Alt+Up — scroll work orders upward."""
-        if on_alt_up:
-            try:
-                on_alt_up(editor)
-            except TypeError:
-                on_alt_up()
-        elif state is not None and hasattr(state, "scroll_runtime_up"):
-            state.scroll_runtime_up(2)
-            editor._force_full_redraw(clear=False)
-
-    def wrapped_alt_down() -> None:
-        """Handle Alt+Down — scroll work orders downward."""
-        if on_alt_down:
-            try:
-                on_alt_down(editor)
-            except TypeError:
-                on_alt_down()
-        elif state is not None and hasattr(state, "scroll_runtime_down"):
-            state.scroll_runtime_down(2)
-            editor._force_full_redraw(clear=False)
-
-    def wrapped_alt_page_up() -> None:
-        """Handle Alt+PageUp — scroll work orders upward by half page."""
-        if on_alt_page_up:
-            try:
-                on_alt_page_up(editor)
-            except TypeError:
-                on_alt_page_up()
-        elif on_alt_up:
-            try:
-                on_alt_up(editor)
-            except TypeError:
-                on_alt_up()
-        elif state is not None and hasattr(state, "scroll_runtime_up"):
-            state.scroll_runtime_up(6)
-            editor._force_full_redraw(clear=False)
-
-    def wrapped_alt_page_down() -> None:
-        """Handle Alt+PageDown — scroll work orders downward by half page."""
-        if on_alt_page_down:
-            try:
-                on_alt_page_down(editor)
-            except TypeError:
-                on_alt_page_down()
-        elif on_alt_down:
-            try:
-                on_alt_down(editor)
-            except TypeError:
-                on_alt_down()
-        elif state is not None and hasattr(state, "scroll_runtime_down"):
-            state.scroll_runtime_down(6)
-            editor._force_full_redraw(clear=False)
-
     def wrapped_page_up() -> None:
         """Handle Page Up — scroll conversation viewport up, then restore prompt line."""
         if on_page_up:
@@ -2258,11 +2150,11 @@ def raw_prompt_input(
         on_ctrl_o=wrapped_ctrl_o,
         on_ctrl_b=wrapped_ctrl_b,
         on_ctrl_g=wrapped_ctrl_g,
-        on_ctrl_w=wrapped_ctrl_w,
-        on_alt_up=wrapped_alt_up,
-        on_alt_down=wrapped_alt_down,
-        on_alt_page_up=wrapped_alt_page_up,
-        on_alt_page_down=wrapped_alt_page_down,
+        on_ctrl_w=on_ctrl_w,
+        on_alt_up=on_alt_up,
+        on_alt_down=on_alt_down,
+        on_alt_page_up=on_alt_page_up,
+        on_alt_page_down=on_alt_page_down,
         on_page_up=wrapped_page_up,
         on_page_down=wrapped_page_down,
         on_wheel_up=wrapped_wheel_up,
