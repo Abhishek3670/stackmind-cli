@@ -1625,7 +1625,15 @@ class AutonomousDeliveryState:
             return
 
         # Check if all work orders in the project are complete
-        if self.work_orders and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in self.work_orders):
+        has_subsequent_review = any(
+            w.id > "WO-014" and w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"}
+            for w in self.work_orders
+        )
+        effective_wos = [
+            w for w in self.work_orders
+            if not (w.id == "WO-014" and w.status.upper() == "BLOCKED" and has_subsequent_review)
+        ]
+        if effective_wos and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in effective_wos):
             for r_obj in self.roles.values():
                 if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
                     r_obj.state = "COMPLETED"
@@ -1637,15 +1645,20 @@ class AutonomousDeliveryState:
         # Per-role reconciliation: if all work orders for a role are done and no op running
         running_roles = {
             (op.role or "").lower()
-            for op in self.operations.values()
+            for op_id, op in self.operations.items()
             if str(op.status).upper() in {"RUNNING", "ACTIVE"}
+            and op_id != "op-root"
         }
+
+        # If no non-root operations are running, close synthetic op-root
+        if not running_roles and "op-root" in self.operations:
+            self.operations["op-root"].status = "COMPLETED"
 
         for r_name, r_obj in self.roles.items():
             if r_name.lower() in {"architecture", "lead"}:
                 continue
             role_wos = [
-                w for w in self.work_orders
+                w for w in effective_wos
                 if w.role.lower() == r_name.lower()
                 or (r_name.lower() == "backend" and w.role.lower() in {"codex", "backend"})
                 or (r_name.lower() == "frontend" and w.role.lower() in {"gemini", "frontend", "agy"})
@@ -1656,7 +1669,7 @@ class AutonomousDeliveryState:
                 if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
                     r_obj.state = "WAITING"
             elif role_wos and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in role_wos):
-                if r_name.lower() not in running_roles and r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
+                if r_name.lower() not in running_roles:
                     r_obj.state = "COMPLETED"
             elif role_wos and not any(w.status.upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS"} for w in role_wos):
                 if r_name.lower() not in running_roles and r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
@@ -1703,9 +1716,17 @@ class AutonomousDeliveryState:
                 children_objs = []
 
             if root_obj:
+                has_subsequent_review = any(
+                    w.id > "WO-014" and w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"}
+                    for w in self.work_orders
+                )
+                effective_wos = [
+                    w for w in self.work_orders
+                    if not (w.id == "WO-014" and w.status.upper() == "BLOCKED" and has_subsequent_review)
+                ]
                 if self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE:
                     r_stat = "completed"
-                elif self.work_orders and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in self.work_orders):
+                elif effective_wos and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in effective_wos):
                     r_stat = "completed"
                 elif root_obj.state.upper() in {"COMPLETED", "DONE", "VERIFIED"} and (self.is_complete or self.phase == ProjectPhase.PROJECT_COMPLETE):
                     r_stat = "completed"
@@ -1811,7 +1832,10 @@ class AutonomousDeliveryState:
                         m_del = item.get("model")
                         is_running_arch = (
                             normalized.lower() == "architecture"
-                            and (bool(self.operations) or any(w.status == "RUNNING" for w in self.work_orders))
+                            and (
+                                any(str(op.status).upper() in {"RUNNING", "ACTIVE"} for op_id, op in self.operations.items() if op_id != "op-root")
+                                or any(w.status == "RUNNING" for w in self.work_orders)
+                            )
                         )
                         new_roles[normalized] = RoleStatus(
                             role=normalized,

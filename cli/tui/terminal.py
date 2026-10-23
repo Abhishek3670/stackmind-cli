@@ -945,6 +945,7 @@ def prompt_composer_input(
             initial_text = state.composer_buffer
         state.is_typing = True
         state.focus_target = "composer"
+        state.reset_attempts_and_retries()
 
     is_live_active = live_manager is not None and getattr(live_manager, "is_active", False)
     is_full_screen = full_screen or getattr(state, "full_screen", False)
