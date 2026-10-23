@@ -701,28 +701,63 @@ def test_concurrent_turn_promotion_prevents_clobbering_under_runtime_lock(tmp_pa
             }
         return transport
 
-    runner_a = AgentRunner(project, "claude", provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_a)))
-    runner_b = AgentRunner(project, "architect", provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_b)))
+    # Deterministic interleaving of the real race: both turns must finish
+    # *staging* their conflicting write before either promotes. Events replace
+    # wall-clock sleeps:
+    #   A writes -> waits for B's write -> promotes -> signals finished
+    #   B writes -> waits for A's promotion -> then promotes (and is rejected)
+    a_wrote = threading.Event()
+    b_wrote = threading.Event()
+    a_finished = threading.Event()
+
+    def _a_after_tool(_name, _call_id, _status, _output, _error):
+        a_wrote.set()
+        b_wrote.wait(timeout=30)
+
+    def _b_after_tool(_name, _call_id, _status, _output, _error):
+        b_wrote.set()
+        a_finished.wait(timeout=30)
+
+    runner_a = AgentRunner(
+        project,
+        "claude",
+        provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_a)),
+        on_tool_result=_a_after_tool,
+    )
+    runner_b = AgentRunner(
+        project,
+        "architect",
+        provider_adapter=OpenAICompatibleAdapter(transport=make_transport(wo_b)),
+        on_tool_result=_b_after_tool,
+        sleep_fn=lambda _delay: a_finished.wait(timeout=30),
+    )
 
     results = {}
-    barrier = threading.Barrier(2)
 
     def run_worker(name, runner):
-        barrier.wait()
-        results[name] = runner.run_once(work_order_id="WO-031")
+        try:
+            results[name] = runner.run_once(work_order_id="WO-031")
+        finally:
+            if name == "A":
+                a_finished.set()
 
     t_a = threading.Thread(target=run_worker, args=("A", runner_a))
     t_b = threading.Thread(target=run_worker, args=("B", runner_b))
 
     t_a.start()
+    assert a_wrote.wait(timeout=30), "winning turn never staged its write"
     t_b.start()
     t_a.join(timeout=30)
     t_b.join(timeout=30)
+    assert not t_a.is_alive(), "runner A did not finish"
+    assert not t_b.is_alive(), "runner B did not finish"
 
-    # Exactly one runner succeeds in promoting; the other is blocked by the overwrite check
+    # Exactly one runner succeeds in promoting; the other is blocked at promotion
+    # by the governed-artifact conflict re-check.
     statuses = {results["A"].status, results["B"].status}
     assert "completed" in statuses
     assert "blocked" in statuses
+    assert "Overwrite conflict" in str(results["B"].reason)
 
     # The file on disk was NOT corrupted or overwritten; exactly one content won
     live_wo = (project / ".sync" / "work-orders" / "ACTIVE" / "WO-088.yaml").read_text(encoding="utf-8")

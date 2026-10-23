@@ -621,8 +621,13 @@ def test_supervisor_with_real_session_manager(tmp_path: Path) -> None:
     assert res1 == AdvanceResult.WAITING_FOR_OPERATION
     assert state.planning_operation_id is not None
 
-    # Wait briefly for runner thread to finish
-    time.sleep(0.1)
+    # Wait deterministically for the real runner thread to finish. A fixed
+    # sleep raced the turn on loaded machines; join the operation thread the
+    # manager actually dispatched instead.
+    planning_thread = manager._turn_threads.get(state.planning_operation_id)
+    assert planning_thread is not None, "planning turn was not dispatched"
+    planning_thread.join(timeout=30)
+    assert not planning_thread.is_alive(), "planning turn did not finish in 30s"
 
     # 2. Planning turn completes; simulate plan proposal
     manager.propose_plan(sid, "PLAN-001", "Plan for microservice")

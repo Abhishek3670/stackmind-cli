@@ -114,6 +114,21 @@ def format_contract_payload(content: str) -> str:
 
     text = content.strip()
 
+    # Strip any stray Working... or Attempt/Retry status remnants that bled into text
+    if ("Working..." in text or "Infusing..." in text or "Attempt ." in text) and ("tokens)" in text or "Retry)" in text):
+        clean_lines = []
+        for line in text.split("\n"):
+            stripped_line = line.strip()
+            if (
+                stripped_line.startswith(("Working...", "Infusing...", "Generating response...", "- Working...", "─ Working..."))
+                and ("tokens)" in stripped_line or "Attempt" in stripped_line)
+            ):
+                continue
+            if re.search(r"\((\d+/\d+)\s+Attempt(?:\s*\.\s*(\d+/\d+)\s+Retry)?\)", stripped_line) and ("Working..." in stripped_line or "tokens)" in stripped_line):
+                continue
+            clean_lines.append(line)
+        text = "\n".join(clean_lines).strip()
+
     # Check for markdown code fences wrapping JSON
     unfenced = text
     if unfenced.startswith("```"):
@@ -1269,6 +1284,8 @@ def is_stray_command_bar(content: str) -> bool:
         if len(stripped.splitlines()) <= 2 or "StackMind v" in stripped:
             return True
     if "Ctrl+K commands" in stripped and "Ctrl+L clear" in stripped:
+        return True
+    if ("Working..." in stripped or "Infusing..." in stripped or "Generating response..." in stripped) and ("tokens)" in stripped or "Attempt" in stripped or "... [" in stripped):
         return True
     return False
 

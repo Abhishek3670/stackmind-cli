@@ -232,7 +232,19 @@ class AuthoringGate:
             norm_path.startswith(".sync/contracts/")
             or norm_path.startswith("contracts/")
         )
-        if not (is_active_wo or is_contract):
+        # Terminal buckets are completion evidence: a governed write must never
+        # rewrite a COMPLETED/BLOCKED work order into a different task that
+        # still looks verified. Reopening is a lifecycle decision, not a write.
+        is_terminal_wo = any(
+            norm_path.startswith(prefix)
+            for prefix in (
+                ".sync/work-orders/COMPLETED/",
+                "work-orders/COMPLETED/",
+                ".sync/work-orders/BLOCKED/",
+                "work-orders/BLOCKED/",
+            )
+        )
+        if not (is_active_wo or is_contract or is_terminal_wo):
             return
 
         # Check candidate locations in project root
@@ -244,8 +256,9 @@ class AuthoringGate:
         if existing_file is None:
             return
 
-        # If already authored by THIS session, allow updating it
-        if norm_path in self._session_authored_paths:
+        # If already authored by THIS session, allow updating it (never for a
+        # terminal work order, whose content is completion evidence).
+        if norm_path in self._session_authored_paths and not is_terminal_wo:
             return
 
         # Check if existing content matches what this session is authoring
@@ -267,6 +280,14 @@ class AuthoringGate:
         if isinstance(existing_data, dict) and isinstance(data, dict) and existing_data == data:
             return
 
+        if is_terminal_wo:
+            errors.append(
+                f"Overwrite conflict: terminal work order '{norm_path}' cannot be rewritten "
+                "in place. Reopen or supersede it through the lifecycle so its completion "
+                "evidence is explicitly invalidated."
+            )
+            return
+
         # Scaffolding or repair artifacts: an authorized author (Architect/CEO)
         # may supersede synthesized artifacts or amend contracts with incremented revision.
         # Workers never reach this check (role gate runs first).
@@ -278,6 +299,14 @@ class AuthoringGate:
             if is_contract and isinstance(data, dict):
                 existing_rev = existing_data.get("contract_revision", 1)
                 new_rev = data.get("contract_revision")
+                if isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev:
+                    return
+            # Task amendment: an authorized author may sharpen a live work
+            # order in place, but only behind a strictly increasing revision
+            # (recorded with its amendment reason), never a silent clobber.
+            if is_active_wo and isinstance(data, dict):
+                existing_rev = existing_data.get("revision", 1)
+                new_rev = data.get("revision")
                 if isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev:
                     return
 

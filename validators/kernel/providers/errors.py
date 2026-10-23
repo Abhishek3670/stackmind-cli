@@ -161,6 +161,29 @@ class ConsecutiveToolFailureError(ProviderError):
         self.failures = failures
 
 
+class ProviderStreamInterruptedError(ProviderError):
+    """Raised when a provider stream stalls or ends before its terminal signal.
+
+    Carries whatever text the model produced before the interruption so the
+    caller can preserve partial output instead of discarding it.
+    """
+
+    def __init__(
+        self,
+        message: str = "Provider stream terminated before completion",
+        *,
+        partial_text: str = "",
+        chunks_received: int = 0,
+        reason: str = "",
+        **kwargs: Any,
+    ) -> None:
+        kwargs.setdefault("retryable", True)
+        super().__init__(message, **kwargs)
+        self.partial_text = partial_text
+        self.chunks_received = chunks_received
+        self.reason = reason
+
+
 class OperationCancelledError(ProviderError):
     """Raised when an operation or tool loop is cancelled via cancellation token."""
 

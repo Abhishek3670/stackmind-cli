@@ -38,6 +38,35 @@ class ProviderAdapter(ABC):
     def __init__(self, provider_name: str, model_name: str) -> None:
         self.provider_name = provider_name
         self.model_name = model_name
+        self._active_stream: Any = None
+
+    def abort(self) -> None:
+        """Release an in-flight streaming response so a blocked read returns.
+
+        Called when the gateway's stream watchdog fires or the operation is
+        cancelled.  Best-effort by design: it must never raise into the caller
+        that is already unwinding a timed-out turn.
+        """
+        response = self._active_stream
+        self._active_stream = None
+        if response is None:
+            return
+        # Closing the HTTPResponse alone can leave a thread blocked inside a
+        # read, so shut the socket down first when it is reachable.
+        file_obj = getattr(response, "fp", None)
+        raw = getattr(file_obj, "raw", None) or file_obj
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     @abstractmethod
     def complete(
@@ -246,6 +275,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         self._check_cancellation(cancellation_token)
         payload = self._prepare_payload(messages, tools, stream=True, **kwargs)
         raw_stream = self._execute_request(payload, stream=True, timeout=timeout, cancellation_token=cancellation_token)
+        self._active_stream = raw_stream
 
         if isinstance(raw_stream, dict):
             raw_stream = [raw_stream]
@@ -282,6 +312,8 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                 yield flushed
             return
 
+        saw_finish_reason = False
+        saw_done_sentinel = False
         try:
             for line in raw_stream:
                 self._check_cancellation(cancellation_token)
@@ -291,12 +323,15 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                 if not line or line.startswith(":"):
                     continue
                 if line == "data: [DONE]":
+                    saw_done_sentinel = True
                     break
                 if line.startswith("data: "):
                     raw_json = line[6:].strip()
                     try:
                         chunk_data = json.loads(raw_json)
-                        yield self._consume_stream_payload(chunk_data, pending_tool_calls)
+                        parsed = self._consume_stream_payload(chunk_data, pending_tool_calls)
+                        saw_finish_reason = saw_finish_reason or bool(parsed.finish_reason)
+                        yield parsed
                     except json.JSONDecodeError:
                         continue
                 elif line.startswith("{") and line.endswith("}"):
@@ -306,7 +341,9 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                             err_info = chunk_data["error"]
                             err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
                             raise ProviderError(f"Proxy error: {err_msg}", provider=self.provider_name)
-                        yield self._consume_stream_payload(chunk_data, pending_tool_calls)
+                        parsed = self._consume_stream_payload(chunk_data, pending_tool_calls)
+                        saw_finish_reason = saw_finish_reason or bool(parsed.finish_reason)
+                        yield parsed
                     except json.JSONDecodeError:
                         continue
         except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
@@ -317,6 +354,11 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         flushed = _flush_tool_calls()
         if flushed is not None:
             yield flushed
+        if saw_done_sentinel and not saw_finish_reason:
+            # Some proxies end the stream with [DONE] but omit finish_reason.
+            # The sentinel is the server's own terminal signal, so record it
+            # rather than letting the caller read this as a truncated stream.
+            yield StreamChunk(finish_reason="stop")
 
     @staticmethod
     def _extract_tool_call_fragments(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -762,6 +804,20 @@ class OllamaAdapter(ProviderAdapter):
         raw_stream = self._execute_request(
             payload, stream=True, timeout=timeout, cancellation_token=cancellation_token
         )
+        self._active_stream = raw_stream
+
+        # A transport that answers a streaming request with one complete body
+        # (dict) must be parsed as a single, terminal payload. Iterating the
+        # dict yielded its keys, dropped every line, and produced an empty
+        # stream that looked like a successful empty completion.
+        if isinstance(raw_stream, dict):
+            single = self._parse_stream_dict(raw_stream)
+            yield single
+            if not single.finish_reason:
+                yield StreamChunk(
+                    finish_reason=str(raw_stream.get("done_reason") or "stop")
+                )
+            return
 
         if isinstance(raw_stream, (list, tuple)):
             for item in raw_stream:
@@ -1013,6 +1069,7 @@ class AnthropicAdapter(ProviderAdapter):
     ) -> Iterator[StreamChunk]:
         payload = self._prepare_payload(messages, tools, stream=True, **kwargs)
         raw_stream = self._execute_request(payload, stream=True, timeout=timeout, cancellation_token=cancellation_token)
+        self._active_stream = raw_stream
 
         if isinstance(raw_stream, (list, tuple, Iterator)):
             for item in raw_stream:

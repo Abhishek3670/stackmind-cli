@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import shlex
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,57 @@ from typing import Any
 import yaml
 
 from validators.harness.deliverable_verifier import verify_work_order_deliverables
+from validators.kernel.work_order_ops import unresolved_operations
+
+
+def content_hash_16(path: Path) -> str | None:
+    """Deliverable-verifier compatible freshness hash (raw bytes, 16 hex chars)."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def detect_build_requirement(workspace: Path) -> dict[str, Any] | None:
+    """The build the workspace declares, or ``None`` when it declares none.
+
+    Work-order contracts do not carry a build command: a project declares a
+    required build through its build manifest (``package.json`` ``scripts.build``
+    or a ``Makefile`` ``build`` target). The release gate and runtime
+    revalidation both read the declaration from here, so revalidation cannot
+    assume "no build is needed" for a project whose release requires one.
+    """
+    workspace = Path(workspace)
+    pkg_json = workspace / "package.json"
+    if pkg_json.is_file():
+        try:
+            pkg_data = json.loads(pkg_json.read_text(encoding="utf-8"))
+        except Exception:
+            pkg_data = None
+        if isinstance(pkg_data, dict):
+            scripts = pkg_data.get("scripts")
+            if isinstance(scripts, dict) and "build" in scripts:
+                return {
+                    "manifest": "package.json",
+                    "path": str(pkg_json),
+                    "command": ["npm", "run", "build"],
+                    "script": scripts.get("build") if isinstance(scripts.get("build"), str) else None,
+                }
+
+    makefile = workspace / "Makefile"
+    if makefile.is_file():
+        try:
+            content = makefile.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+        if re.search(r"(?m)^build\s*:", content):
+            return {
+                "manifest": "Makefile",
+                "path": str(makefile),
+                "command": ["make", "build"],
+                "script": None,
+            }
+    return None
 
 
 @dataclass(frozen=True)
@@ -248,6 +300,45 @@ class IntegrationGate:
             if wo_id in excluded_ids:
                 continue
 
+            # An amendment or reopen invalidated this work order's evidence;
+            # it cannot be release-ready until re-verification clears the mark.
+            stale = wo_data.get("evidence_stale")
+            if isinstance(stale, dict) and stale:
+                all_verified = False
+                sources = [
+                    source for source in (stale.get("sources") or [])
+                    if isinstance(source, dict)
+                ]
+                upstreams = sorted({
+                    f"{source.get('upstream_work_order')} r{source.get('upstream_revision')}"
+                    for source in sources
+                    if source.get("upstream_work_order")
+                })
+                stale_evidence_msg = (
+                    f"Stale evidence for {wo_id}: revision {stale.get('revision')} was "
+                    f"invalidated ({stale.get('reason')})"
+                    + (f" by upstream {', '.join(upstreams)}" if upstreams else "")
+                    + "; re-verification is required before this work can be "
+                    "considered release-ready"
+                )
+                issues.append(stale_evidence_msg)
+                if stale.get("requires_rework"):
+                    remediation = (
+                        f"Reopen {wo_id} through the lifecycle and complete the required "
+                        "rework; re-verification alone does not satisfy this invalidation"
+                    )
+                else:
+                    remediation = (
+                        f"Re-run the required verification for {wo_id} against the current "
+                        "upstream revision, then clear the marker with revalidate_work_order"
+                    )
+                blockers.append({
+                    "finding": stale_evidence_msg,
+                    "remediation": remediation,
+                    "path": str((wo_data.get("deliverable") or {}).get("path") or ""),
+                })
+                continue
+
             # Skip pure sign-off doc deliverables without declared files
             deliv = wo_data.get("deliverable") or {}
             delivs = wo_data.get("deliverables") or []
@@ -266,6 +357,15 @@ class IntegrationGate:
                         "remediation": "Re-author deliverable to satisfy existence and content verification",
                         "path": str(deliv.get("path") or ""),
                     })
+
+            # A revalidation binds the exact artifacts it verified. If one of
+            # them changes afterwards the revalidated evidence is stale again.
+            history = wo_data.get("revalidation_history")
+            if isinstance(history, list) and history:
+                latest = history[-1] if isinstance(history[-1], dict) else {}
+                for rel_p, c_hash in (latest.get("artifact_hashes") or {}).items():
+                    if rel_p and c_hash:
+                        recorded_hashes[str(rel_p).replace("\\", "/")] = str(c_hash)
 
             # Check freshness against recorded hashes
             for item in ev.get("results") or []:
@@ -297,6 +397,30 @@ class IntegrationGate:
                             "remediation": f"Re-execute tests and verification against updated {rel_path}",
                             "path": rel_path,
                         })
+
+        # An interrupted work-order mutation left a pending journal record (or the
+        # audit append never completed). Release is not eligible until the durable
+        # journal is reconciled: an unresolved operation is exactly the state in
+        # which "applied" and "not applied" cannot be told apart.
+        unresolved = unresolved_operations(self.workspace)
+        if unresolved:
+            all_verified = False
+            for record in unresolved[:10]:
+                reason = record.get("reason") or "journal state is not consistent"
+                unresolved_msg = (
+                    f"Unreconciled work-order operation {record.get('op_id')} "
+                    f"({record.get('kind')} {record.get('work_order')}, status "
+                    f"'{record.get('status')}'): {reason}"
+                )
+                issues.append(unresolved_msg)
+                blockers.append({
+                    "finding": unresolved_msg,
+                    "remediation": (
+                        "Reconcile the work-order audit journal "
+                        "(.sync/runtime/work-order-ops) before release"
+                    ),
+                    "path": ".sync/runtime/work-order-ops",
+                })
 
         if not all_verified:
             return (
@@ -473,30 +597,11 @@ class IntegrationGate:
         issues: list[str] = []
         blockers: list[dict[str, str]] = []
 
-        # Detect build requirements
-        build_manifest: str | None = None
-        has_build_script = False
-
-        pkg_json = self.workspace / "package.json"
-        if pkg_json.is_file():
-            try:
-                pkg_data = json.loads(pkg_json.read_text(encoding="utf-8"))
-                if isinstance(pkg_data, dict) and "build" in (pkg_data.get("scripts") or {}):
-                    build_manifest = "package.json"
-                    has_build_script = True
-            except Exception:
-                pass
-
-        if not has_build_script:
-            makefile = self.workspace / "Makefile"
-            if makefile.is_file():
-                try:
-                    content = makefile.read_text(encoding="utf-8")
-                    if re.search(r"(?m)^build\s*:", content):
-                        build_manifest = "Makefile"
-                        has_build_script = True
-                except Exception:
-                    pass
+        # Detect build requirements. Contracts carry no build command; the
+        # manifest is the single declaration both this gate and revalidation use.
+        requirement = detect_build_requirement(self.workspace)
+        build_manifest: str | None = requirement["manifest"] if requirement else None
+        has_build_script = requirement is not None
 
         if not has_build_script:
             return (
@@ -510,6 +615,34 @@ class IntegrationGate:
                 [],
                 [],
                 {"has_build_script": False},
+            )
+
+        # A work order whose stale evidence was cleared by revalidation must
+        # still hold the build evidence it recorded: the build command that ran,
+        # the manifest it ran against, and the artifacts it produced.
+        excluded_ids = {"WO-000"}
+        if state:
+            for attr in ("planning_wo_id", "integration_wo_id", "gitops_wo_id"):
+                value = getattr(state, attr, None)
+                if value:
+                    excluded_ids.add(value)
+            for wo_id in getattr(state, "superseded_wo_ids", []):
+                excluded_ids.add(wo_id)
+        binding_issues, binding_blockers, binding_evidence = (
+            self._check_revalidation_build_binding(requirement, excluded_ids)
+        )
+        if binding_issues:
+            return (
+                IntegrationCheck(
+                    name="build_execution",
+                    passed=False,
+                    status="failed",
+                    message="Revalidated build evidence is missing or stale",
+                    evidence=binding_evidence,
+                ),
+                binding_issues,
+                binding_blockers,
+                binding_evidence,
             )
 
         # Collect command audits
@@ -569,26 +702,103 @@ class IntegrationGate:
                     [],
                     {"manifest": build_manifest, "runs": [], "node_modules_present": False},
                 )
-            elif not has_command_permission and not is_node:
+
+            # A detected build requirement is never optional. Missing command
+            # authorization, an unavailable build tool, or absent telemetry
+            # explains why no evidence exists; each is a release blocker, not a
+            # reason to skip the check. Only a workspace that declares no build
+            # at all (handled above) is exempt.
+            build_command = [str(part) for part in (requirement.get("command") or [])]
+            build_tool = build_command[0] if build_command else ""
+
+            if not has_command_permission:
+                msg = (
+                    f"Missing mandatory build evidence: project defines build in "
+                    f"{build_manifest} but no work-order contract grants "
+                    "'workspace/command', so the declared build cannot be executed "
+                    "and no build execution was recorded"
+                )
+                issues.append(msg)
+                blockers.append({
+                    "finding": msg,
+                    "remediation": (
+                        "Grant workspace/command to the work order that runs the "
+                        f"build and record '{' '.join(build_command)}' in telemetry"
+                    ),
+                    "path": build_manifest,
+                })
                 return (
                     IntegrationCheck(
                         name="build_execution",
-                        passed=True,
-                        status="skipped",
-                        message=f"No work orders authorized command execution; {build_manifest} build execution skipped",
-                        reason="No command execution authorization in contracts",
-                        evidence={"manifest": build_manifest, "runs": []},
+                        passed=False,
+                        status="failed",
+                        message=msg,
+                        evidence={
+                            "manifest": build_manifest,
+                            "runs": [],
+                            "command_permission": False,
+                            "build_command": build_command,
+                        },
                     ),
-                    [],
-                    [],
-                    {"manifest": build_manifest, "runs": []},
+                    issues,
+                    blockers,
+                    {
+                        "manifest": build_manifest,
+                        "runs": [],
+                        "command_permission": False,
+                        "build_command": build_command,
+                    },
+                )
+
+            if build_tool and shutil.which(build_tool) is None:
+                msg = (
+                    f"Missing mandatory build evidence: project defines build in "
+                    f"{build_manifest} but '{build_tool}' is not installed, so the "
+                    "declared build cannot be executed and no build execution was "
+                    "recorded"
+                )
+                issues.append(msg)
+                blockers.append({
+                    "finding": msg,
+                    "remediation": (
+                        f"Install '{build_tool}' or record the build execution "
+                        f"'{' '.join(build_command)}' in telemetry"
+                    ),
+                    "path": build_manifest,
+                })
+                return (
+                    IntegrationCheck(
+                        name="build_execution",
+                        passed=False,
+                        status="failed",
+                        message=msg,
+                        evidence={
+                            "manifest": build_manifest,
+                            "runs": [],
+                            "build_tool": build_tool,
+                            "build_tool_available": False,
+                            "build_command": build_command,
+                        },
+                    ),
+                    issues,
+                    blockers,
+                    {
+                        "manifest": build_manifest,
+                        "runs": [],
+                        "build_tool": build_tool,
+                        "build_tool_available": False,
+                        "build_command": build_command,
+                    },
                 )
 
             msg = f"Missing mandatory build evidence: project defines build in {build_manifest} but no build execution was recorded"
             issues.append(msg)
             blockers.append({
                 "finding": msg,
-                "remediation": f"Execute build script defined in {build_manifest} and record telemetry",
+                "remediation": (
+                    f"Execute '{' '.join(build_command) or build_manifest}' (declared in "
+                    f"{build_manifest}) and record telemetry"
+                ),
                 "path": build_manifest,
             })
             return (
@@ -645,6 +855,137 @@ class IntegrationGate:
             [],
             {"manifest": build_manifest, "runs": evaluated_builds},
         )
+
+    def _check_revalidation_build_binding(
+        self,
+        requirement: dict[str, Any] | None,
+        excluded_ids: set[str] | None = None,
+    ) -> tuple[list[str], list[dict[str, str]], dict[str, Any]]:
+        """Hold a revalidated work order to the build evidence it recorded.
+
+        Revalidation runs the declared build and stores the command, the manifest
+        hash and the artifact hashes it built. Release is refused when that
+        record is missing, failed, or no longer matches the workspace: a build
+        that ran against superseded inputs proves nothing about the bytes being
+        released.
+        """
+        issues: list[str] = []
+        blockers: list[dict[str, str]] = []
+        manifest_name = requirement["manifest"] if requirement else None
+        evidence: dict[str, Any] = {
+            "manifest": manifest_name,
+            "revalidated": [],
+        }
+        skip_ids = set(excluded_ids or ())
+
+        wo_files: list[Path] = []
+        for sub in ("COMPLETED", "ACTIVE"):
+            bucket = self.workspace / ".sync" / "work-orders" / sub
+            if bucket.is_dir():
+                wo_files.extend(sorted(bucket.glob("*.yaml")))
+
+        for wo_file in wo_files:
+            try:
+                wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            history = wo_data.get("revalidation_history")
+            if not isinstance(history, list) or not history:
+                continue
+            wo_id = wo_data.get("id", wo_file.stem)
+            if wo_id in skip_ids:
+                continue
+            latest = history[-1] if isinstance(history[-1], dict) else {}
+            build = latest.get("build")
+            record = {
+                "work_order_id": wo_id,
+                "revision": latest.get("revision"),
+                "contract_revision": latest.get("contract_revision"),
+                "build": build if isinstance(build, dict) else None,
+            }
+            evidence["revalidated"].append(record)
+
+            if not isinstance(build, dict):
+                if requirement is None:
+                    continue
+                msg = (
+                    f"Revalidation of {wo_id} recorded no build evidence although "
+                    f"{manifest_name} declares a build"
+                )
+                issues.append(msg)
+                blockers.append({
+                    "finding": msg,
+                    "remediation": (
+                        f"Re-run revalidate_work_order on {wo_id} so the declared "
+                        "build executes and its evidence is recorded"
+                    ),
+                    "path": str(manifest_name),
+                })
+                continue
+
+            if build.get("returncode") != 0:
+                msg = (
+                    f"Revalidated build evidence for {wo_id} is not a success "
+                    f"(command '{build.get('command')}' returned "
+                    f"{build.get('returncode')})"
+                )
+                issues.append(msg)
+                blockers.append({
+                    "finding": msg,
+                    "remediation": f"Fix the build and revalidate {wo_id}",
+                    "path": str(build.get("manifest") or manifest_name or ""),
+                })
+
+            recorded_manifest = build.get("manifest")
+            recorded_manifest_hash = build.get("manifest_sha256")
+            if recorded_manifest and recorded_manifest_hash:
+                current_manifest_hash = content_hash_16(
+                    self.workspace / str(recorded_manifest)
+                )
+                if current_manifest_hash != recorded_manifest_hash:
+                    msg = (
+                        f"Build evidence for {wo_id} was recorded against a different "
+                        f"{recorded_manifest} (recorded hash {recorded_manifest_hash}, "
+                        f"current hash {current_manifest_hash}); the build command may "
+                        "have changed since it was executed"
+                    )
+                    issues.append(msg)
+                    blockers.append({
+                        "finding": msg,
+                        "remediation": (
+                            f"Re-run the declared build and revalidate {wo_id} against "
+                            "the current manifest"
+                        ),
+                        "path": str(recorded_manifest),
+                    })
+
+            for rel_path, recorded_hash in (build.get("artifact_hashes") or {}).items():
+                norm_rel = str(rel_path).replace("\\", "/")
+                current_hash = content_hash_16(self.workspace / norm_rel)
+                if current_hash is None:
+                    msg = (
+                        f"Build evidence for {wo_id} covers '{norm_rel}', which no "
+                        "longer exists"
+                    )
+                elif str(recorded_hash) != current_hash:
+                    msg = (
+                        f"Stale build evidence for '{norm_rel}' on {wo_id}: the artifact "
+                        f"changed after the build was recorded (recorded hash "
+                        f"{recorded_hash}, current hash {current_hash})"
+                    )
+                else:
+                    continue
+                issues.append(msg)
+                blockers.append({
+                    "finding": msg,
+                    "remediation": (
+                        f"Re-run the declared build and revalidate {wo_id} against the "
+                        "current artifacts"
+                    ),
+                    "path": norm_rel,
+                })
+
+        return issues, blockers, evidence
 
     def _check_route_api_consistency(
         self,

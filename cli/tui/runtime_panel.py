@@ -231,6 +231,15 @@ def format_agent_tree(
             badge_line.append(f"[{trunc_badge}]", style="dim #a855f7")
             lines.append(badge_line)
 
+        seen_child_roles: set[str] = set()
+        deduped_children: list[dict[str, Any]] = []
+        for child in children:
+            c_name = str(child.get("name") or child.get("role") or "Worker").strip().lower()
+            if c_name not in seen_child_roles:
+                seen_child_roles.add(c_name)
+                deduped_children.append(child)
+        children = deduped_children
+
         for j, child in enumerate(children):
             is_last = (j == len(children) - 1)
             prefix = "  └─ " if is_last else "  ├─ "

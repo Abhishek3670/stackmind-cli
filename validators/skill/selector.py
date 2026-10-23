@@ -24,10 +24,21 @@ def get_available_skills(project_path: Path | str | None = None) -> list[SkillRe
         return []
 
 
-def format_skills_for_architect_prompt(project_path: Path | str | None = None) -> str:
-    """Format active procedural skills into guidance instructions for Architect planning."""
-    skills = get_available_skills(project_path)
-    if not skills:
+def format_skills_for_architect_prompt(
+    project_path: Path | str | None = None,
+    task_title: str = "",
+    task_description: str = "",
+    max_skills: int = 6,
+    laya_adapter: Any | None = None,
+) -> str:
+    """Format active procedural skills into guidance instructions for Architect planning.
+
+    When the library contains more skills than max_skills, delegates to the Laya Decision Engine
+    to pre-filter the most relevant procedural skills for the current task/domain,
+    preventing context bloat and token budget exhaustion.
+    """
+    all_skills = get_available_skills(project_path)
+    if not all_skills:
         return (
             "### Verified Procedural Skills Library (Governed by Laya Decision Engine)\n"
             "No active procedural skills currently installed in ~/.stackmindcli/skills/global/ or .sync/skills/active/.\n"
@@ -37,9 +48,39 @@ def format_skills_for_architect_prompt(project_path: Path | str | None = None) -
             "Append `(Skills: <skill_name>)` to milestone titles in PLAN.md alongside `(Agent: <agent>)`.\n"
         )
 
+    # Pre-filter using Laya if available and library exceeds max_skills
+    if len(all_skills) > max_skills:
+        if laya_adapter is None:
+            try:
+                from validators.kernel.settings import load_settings
+                settings = load_settings(project_path)
+                mode = getattr(settings, "laya_mode", "active")
+            except Exception:
+                mode = "active"
+            from validators.routing.laya_adapter import LayaDecisionAdapter
+            laya_adapter = LayaDecisionAdapter(mode=mode)
+
+        skills = laya_adapter.filter_skills_for_architect(
+            available_skills=all_skills,
+            task_title=task_title,
+            task_description=task_description,
+            max_skills=max_skills,
+        )
+    else:
+        skills = all_skills
+
+    total_count = len(all_skills)
+    shown_count = len(skills)
+
+    intro_header = (
+        f"The following {shown_count} recommended procedural skill(s) (curated by Laya from {total_count} available) are active."
+        if shown_count < total_count
+        else "The following active procedural skills are available in the workspace library."
+    )
+
     lines: list[str] = [
         "### Verified Procedural Skills Library (Governed by Laya Decision Engine)",
-        "The following active procedural skills are available in the workspace library.",
+        intro_header,
         "Skill selection is autonomously decided by the Laya Decision Engine (LayaDecisionAdapter) based on task domain, specialist role, and procedural rules.",
         "As Senior Architect, you may optionally designate or recommend skills to guide implementation:\n",
     ]
@@ -49,6 +90,9 @@ def format_skills_for_architect_prompt(project_path: Path | str | None = None) -
         if len(desc_clean) > 140:
             desc_clean = desc_clean[:140] + "..."
         lines.append(f"- `{s.name}` (Risk: {s.risk_tier.value.upper()}, {len(s.steps)} steps): {desc_clean}")
+
+    if shown_count < total_count:
+        lines.append(f"\n*(Note: {total_count - shown_count} other skills omitted from prompt to preserve token budget. You may still assign any installed skill by name in PLAN.md)*")
 
     lines.extend([
         "\nSKILL ASSIGNMENT SYNTAX:",

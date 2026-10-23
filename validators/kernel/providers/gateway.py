@@ -6,9 +6,11 @@ import json
 import re
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import shlex
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from threading import Thread
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +25,7 @@ from .errors import (
     NoProgressLoopError,
     OperationCancelledError,
     ProviderError,
+    ProviderStreamInterruptedError,
     TimeoutError,
     ToolLimitExceededError,
     ToolLoopExhaustedError,
@@ -410,14 +413,91 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ),
     ToolDefinition(
         name="update_work_order",
-        description="Update an existing work order (Claude exclusive).",
+        description=(
+            "Amend a live ACTIVE work order (Claude exclusive) under optimistic "
+            "concurrency. `expected_revision` MUST be the revision you last read; "
+            "a stale value is rejected with REVISION_CONFLICT and nothing is "
+            "written. The runtime sets the new revision (current + 1) and records "
+            "the reason in `amendments`, which the assigned worker receives as a "
+            "scoped correction on its next turn."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "wo_id": {"type": "string", "description": "Work order ID"},
                 "updates": {"type": "object", "description": "Fields to update"},
+                "reason": {
+                    "type": "string",
+                    "description": "Why the task is being amended; shown to the worker.",
+                },
+                "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Revision currently persisted for this work order. "
+                        "Required: updates are rejected when it does not match."
+                    ),
+                },
             },
-            "required": ["wo_id", "updates"],
+            "required": ["wo_id", "updates", "expected_revision"],
+        },
+    ),
+    ToolDefinition(
+        name="reopen_work_order",
+        description=(
+            "Reopen a COMPLETED work order through an explicit lifecycle transition "
+            "(Claude/CEO only). The prior completion record is retained for audit in "
+            "completion_history and the durable audit log, the revision increments, "
+            "and prior verification evidence is marked stale for the new revision. "
+            "`expected_revision` MUST be the revision you last read."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "wo_id": {"type": "string", "description": "Completed work order ID"},
+                "reason": {
+                    "type": "string",
+                    "description": "Why the completed task is being reopened.",
+                },
+                "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Revision currently persisted for this work order.",
+                },
+            },
+            "required": ["wo_id", "reason", "expected_revision"],
+        },
+    ),
+    ToolDefinition(
+        name="revalidate_work_order",
+        description=(
+            "Clear stale evidence on a COMPLETED work order after it was invalidated "
+            "by an upstream amendment (Claude/CEO only). The runtime re-verifies the "
+            "declared deliverables and re-executes the work order's declared "
+            "test_plan itself; self-reported evidence is not accepted. It does NOT "
+            "change status or history. It is refused when the invalidation requires "
+            "rework (reopen instead), when an upstream advanced past the revision "
+            "that caused the invalidation, or when no runnable verification is "
+            "declared. `expected_revision` MUST be the revision you last read."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "wo_id": {"type": "string", "description": "Completed work order ID"},
+                "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Revision currently persisted for this work order.",
+                },
+                "verification": {
+                    "type": "object",
+                    "description": (
+                        "Optional audit notes only ({'notes': <string>}). The runtime "
+                        "derives the checks from the work order and executes them."
+                    ),
+                },
+            },
+            "required": ["wo_id", "expected_revision"],
         },
     ),
     ToolDefinition(
@@ -1222,6 +1302,9 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "run_command",
     "trigger_goal",
     "delegate_task",
+    "update_work_order",
+    "reopen_work_order",
+    "revalidate_work_order",
 )
 
 
@@ -1314,6 +1397,19 @@ DEFAULT_MAX_TOOL_OUTPUT_CHARS: int = 16_000
 DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS: int = 3
 DEFAULT_MAX_CONSECUTIVE_FAILURES: int = 3
 DEFAULT_MAX_TOTAL_IDENTICAL_CALLS: int = 3
+# A streaming provider must keep producing. These bounds guarantee every turn
+# reaches a terminal state even when the transport never closes: silence longer
+# than the idle timeout aborts the stream, and the turn deadline bounds streams
+# that trickle output forever.
+DEFAULT_STREAM_IDLE_TIMEOUT: float = float(os.environ.get("PROVIDER_STREAM_IDLE_TIMEOUT", "120"))
+# Prompt prefill for a long planning prompt can legitimately take minutes before
+# the first token, so the wait for the first chunk is wider than the gap allowed
+# between chunks once generation has started.
+DEFAULT_STREAM_FIRST_CHUNK_TIMEOUT: float = float(
+    os.environ.get("PROVIDER_STREAM_FIRST_CHUNK_TIMEOUT", "300")
+)
+DEFAULT_TURN_TIMEOUT: float = float(os.environ.get("PROVIDER_TURN_TIMEOUT", "1800"))
+_STREAM_POLL_INTERVAL: float = 0.1
 
 
 def truncate_tool_output(output: str, max_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS) -> str:
@@ -1343,6 +1439,125 @@ def check_cancellation(cancellation_token: Any | None) -> None:
 
 
 _POLLING_TOOLS = {"process_status", "process_output", "process_poll", "task_status"}
+
+
+def _abort_stream(abort: Callable[[], None] | None) -> None:
+    """Best-effort release of an in-flight provider stream.
+
+    Runs off-thread on purpose: closing an ``http.client`` response whose read
+    is blocked in another thread can itself block until the socket read returns
+    (observed on Windows, where neither ``shutdown`` nor ``socket.close`` wakes
+    a pending recv). The turn must terminate now, not when the transport
+    eventually notices.
+    """
+    if abort is None:
+        return
+
+    def _release() -> None:
+        try:
+            abort()
+        except Exception:
+            pass
+
+    Thread(target=_release, name="provider-stream-abort", daemon=True).start()
+
+
+def _iter_stream_bounded(
+    chunks: Any,
+    *,
+    idle_timeout: float | None,
+    deadline: float | None,
+    first_chunk_timeout: float | None = None,
+    cancellation_token: Any | None = None,
+    abort: Callable[[], None] | None = None,
+    poll_interval: float | None = None,
+) -> Iterator[Any]:
+    """Yield chunks from ``chunks`` without ever blocking the turn forever.
+
+    The provider iterator runs on a worker thread, so a transport that stops
+    producing (a stalled socket, a server that holds the connection open, or a
+    generator that never returns) cannot pin the operation: this consumer
+    enforces an inactivity timeout between chunks, an optional wall-clock
+    deadline, and cooperative cancellation.  On any of those it aborts the
+    underlying stream and raises, so the caller always reaches a terminal
+    state and the transport resource is released.
+    """
+    queue: Queue[tuple[str, Any]] = Queue()
+
+    def _produce() -> None:
+        try:
+            for item in chunks:
+                queue.put(("chunk", item))
+        except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
+            queue.put(("error", exc))
+        finally:
+            queue.put(("done", None))
+
+    Thread(target=_produce, name="provider-stream", daemon=True).start()
+    interval = poll_interval if poll_interval is not None else _STREAM_POLL_INTERVAL
+    last_chunk_at = time.monotonic()
+    received = 0
+
+    while True:
+        if cancellation_token is not None:
+            try:
+                check_cancellation(cancellation_token)
+            except OperationCancelledError:
+                _abort_stream(abort)
+                raise
+
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            _abort_stream(abort)
+            raise ProviderStreamInterruptedError(
+                f"Provider stream exceeded the turn deadline after {received} chunk(s)",
+                chunks_received=received,
+                reason="deadline",
+            )
+
+        limit = first_chunk_timeout if received == 0 and first_chunk_timeout else idle_timeout
+        wait = interval
+        if limit is not None and limit > 0:
+            wait = min(wait, max(0.0, limit - (now - last_chunk_at)))
+        if deadline is not None:
+            wait = min(wait, max(0.0, deadline - now))
+
+        try:
+            kind, payload = queue.get(timeout=max(wait, 0.001))
+        except Empty:
+            silence = time.monotonic() - last_chunk_at
+            if limit is not None and limit > 0 and silence >= limit:
+                _abort_stream(abort)
+                if received == 0:
+                    raise ProviderStreamInterruptedError(
+                        f"Provider stream produced no output within {limit:g}s",
+                        chunks_received=0,
+                        reason="first_chunk_timeout",
+                    )
+                raise ProviderStreamInterruptedError(
+                    f"Provider stream stalled: no output for {limit:g}s "
+                    f"after {received} chunk(s)",
+                    chunks_received=received,
+                    reason="idle_timeout",
+                )
+            continue
+
+        if kind == "done":
+            return
+        if kind == "error":
+            _abort_stream(abort)
+            if cancellation_token is not None:
+                # Adapters may wrap their own cancellation check as a provider
+                # or timeout error (closing the socket mid-cancel does exactly
+                # that). A cancelled turn must be reported as cancelled, never
+                # as a stream failure.
+                check_cancellation(cancellation_token)
+            raise payload
+
+        received += 1
+        last_chunk_at = time.monotonic()
+        yield payload
+
 
 
 def detect_tool_cycle(signatures: list[tuple[str, str]]) -> str | None:
@@ -1836,6 +2051,16 @@ class ProviderGateway:
         except (ToolLimitExceededError, ConsecutiveToolFailureError, OperationCancelledError):
             raise
         except Exception as ex:
+            from validators.kernel.tools import RevisionConflictError
+            if isinstance(ex, RevisionConflictError):
+                import json as _json
+                self.consecutive_failures = 0
+                return (
+                    "Error: REVISION_CONFLICT "
+                    + _json.dumps(ex.to_dict(), sort_keys=True)
+                    + " Nothing was written. Re-read the work order with read_file, then "
+                    "retry update_work_order with the reported current_revision."
+                )
             self.consecutive_failures += 1
             if isinstance(ex, FileNotFoundError):
                 target_str = args.get("path") or args.get("target") or args.get("file") or ""
@@ -1930,20 +2155,49 @@ class ProviderGateway:
 
         if supports_streaming:
             # Use streaming for incremental text delivery (with tools if configured)
-            content_parts = []
-            accumulated_tool_calls = []
+            content_parts: list[str] = []
+            accumulated_tool_calls: list[ToolCallRequest] = []
             final_finish_reason = None
             final_usage = TokenUsage()
+            chunk_count = 0
+            effective_timeout = timeout if timeout is not None else DEFAULT_TURN_TIMEOUT
+            stream_deadline = (
+                time.monotonic() + effective_timeout if effective_timeout and effective_timeout > 0 else None
+            )
+            # Per-read socket timeout: never longer than the stream watchdog
+            # window, so a transport that stops sending releases its reader
+            # (and socket) within a bounded time even if it ignores the abort.
+            stream_socket_timeout = effective_timeout
+            watchdog_windows = [
+                window
+                for window in (DEFAULT_STREAM_FIRST_CHUNK_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT)
+                if window and window > 0
+            ]
+            if watchdog_windows:
+                cap = max(watchdog_windows)
+                stream_socket_timeout = (
+                    min(stream_socket_timeout, cap)
+                    if stream_socket_timeout and stream_socket_timeout > 0
+                    else cap
+                )
 
             try:
-                for chunk in self.adapter.stream(
-                    messages,
-                    tools=active_tools,
-                    timeout=timeout,
+                for chunk in _iter_stream_bounded(
+                    self.adapter.stream(
+                        messages,
+                        tools=active_tools,
+                        timeout=stream_socket_timeout,
+                        cancellation_token=cancellation_token,
+                        **kwargs,
+                    ),
+                    idle_timeout=DEFAULT_STREAM_IDLE_TIMEOUT,
+                    first_chunk_timeout=DEFAULT_STREAM_FIRST_CHUNK_TIMEOUT,
+                    deadline=stream_deadline,
                     cancellation_token=cancellation_token,
-                    **kwargs,
+                    abort=getattr(self.adapter, "abort", None),
                 ):
                     check_cancellation(cancellation_token)
+                    chunk_count += 1
 
                     # Forward thinking deltas immediately
                     if chunk.delta_thinking and self.on_thinking:
@@ -1971,27 +2225,75 @@ class ProviderGateway:
                     if chunk.finish_reason:
                         final_finish_reason = chunk.finish_reason
 
+                partial_text = "".join(content_parts)
+                if final_finish_reason is None and not accumulated_tool_calls:
+                    # The provider closed the stream without its terminal signal.
+                    # Returning this as a normal completion silently accepts a
+                    # truncated answer, so surface it with the text it did emit.
+                    if partial_text.strip():
+                        raise ProviderStreamInterruptedError(
+                            f"Provider stream ended after {chunk_count} chunk(s) without a completion signal",
+                            partial_text=partial_text,
+                            chunks_received=chunk_count,
+                            reason="premature_end",
+                        )
+                    raise ProviderStreamInterruptedError(
+                        "Provider stream ended without producing any output",
+                        chunks_received=chunk_count,
+                        reason="empty_stream",
+                    )
+
                 # Build final response
                 response_message = Message.assistant(
-                    content="".join(content_parts),
+                    content=partial_text,
                     tool_calls=accumulated_tool_calls,
                 )
                 response = ProviderResponse(
                     message=response_message,
                     usage=final_usage,
-                    finish_reason=final_finish_reason or "stop",
+                    finish_reason=final_finish_reason or "tool_calls",
                     model=getattr(self.adapter, "model_name", ""),
                     raw_payload={},
                 )
-            except (ProviderError, TimeoutError, NotImplementedError):
-                # Streaming failed or not implemented, fall back to complete
+            except NotImplementedError:
+                # Streaming is genuinely unsupported by this adapter: one
+                # bounded non-streaming request, never a blind retry of a
+                # stream that already produced output.
                 response = self.adapter.complete(
                     messages,
                     tools=active_tools,
-                    timeout=timeout,
+                    timeout=effective_timeout,
                     cancellation_token=cancellation_token,
                     **kwargs,
                 )
+            except OperationCancelledError:
+                # Already aborted by the bounded consumer that noticed the
+                # cancellation; propagate it unchanged for the daemon's
+                # CANCELLED terminal state.
+                raise
+            except ProviderStreamInterruptedError as exc:
+                if not exc.partial_text and content_parts:
+                    # The watchdog fires outside the per-chunk loop, so attach
+                    # the text the model had already produced.
+                    raise ProviderStreamInterruptedError(
+                        str(exc),
+                        partial_text="".join(content_parts),
+                        chunks_received=exc.chunks_received or chunk_count,
+                        reason=exc.reason,
+                    ) from exc
+                raise
+            except (ProviderError, TimeoutError) as exc:
+                partial_text = "".join(content_parts)
+                if partial_text.strip():
+                    # Retrying would discard what the user already saw and hide
+                    # the failure behind a second full-length request.
+                    raise ProviderStreamInterruptedError(
+                        f"Provider stream failed after partial output: {exc}",
+                        partial_text=partial_text,
+                        chunks_received=chunk_count,
+                        reason="stream_error",
+                    ) from exc
+                raise
         else:
             # Standard complete path (with tools or streaming not supported)
             response = self.adapter.complete(

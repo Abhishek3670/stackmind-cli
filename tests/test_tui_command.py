@@ -51,6 +51,10 @@ class _RecordingClient:
         self.resumes.append(session_id)
         return {"session_id": session_id, "state": "RUNNING", "provider": "daemon"}
 
+    def run_resume(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+        self.resumes.append(session_id)
+        return {"run_id": run_id or "run-1", "phase": "EXECUTING"}
+
     def cancel(self, session_id: str) -> dict[str, Any]:
         self.cancels.append(session_id)
         return {"session_id": session_id, "state": "CANCELLED", "provider": "daemon"}
@@ -300,3 +304,21 @@ def test_colon_commands_suppress_stdout_echo_in_tty_mode(monkeypatch):
     assert "AGENT ROLES" in state.messages[1].content
     # But click.echo must NOT have been called in TTY mode
     assert len(echoed) == 0
+
+
+def test_continue_in_autonomous_execution_routes_to_resume():
+    """Verify entering 'continue' during autonomous execution routes to :resume instead of a chat turn."""
+    from cli.tui.app import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase, WorkOrderItem
+
+    client = _RecordingClient()
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    session = {"session_id": "session-1", "workspace": "."}
+    state = AutonomousDeliveryState(session_id="session-1")
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+    state.work_orders.append(WorkOrderItem(id="WO-005", title="QA Fixes", status="ACTIVE"))
+
+    dispatch_delivery_command(adapter, client, session, "continue", state)
+    assert len(client.resumes) > 0
+    assert state.messages[-2].content == ":resume"
+    assert "Session RUNNING" in state.messages[-1].content

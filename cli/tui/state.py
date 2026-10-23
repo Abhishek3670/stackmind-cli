@@ -540,7 +540,7 @@ class AutonomousDeliveryState:
         scroll: RuntimePanelScroll | None = None,
         conversation_scroll: ConversationScroll | None = None,
         client_timeout: float = 0.0,
-        context_window_tokens: int = 8_192,
+        context_window_tokens: int = 32_768,
         compaction_threshold: float = 0.85,
         compaction_keep_recent: int = 6,
     ) -> None:
@@ -906,7 +906,18 @@ class AutonomousDeliveryState:
         if hasattr(self, "last_completion_tokens") and self.last_completion_tokens:
             active_in_progress = max(active_in_progress, self.last_completion_tokens)
         model_context = active_prompt + active_in_progress if active_prompt > 0 else 0
-        return max(transcript_est, model_context)
+        total = max(transcript_est, model_context)
+        # Dynamic self-healing: if measured tokens exceed context_window_tokens,
+        # expand to the next standard context tier so the meter reflects reality
+        # rather than being pegged at an outdated default.
+        if total > self.context_window_tokens:
+            for tier in (16_384, 32_768, 65_536, 131_072, 262_144):
+                if tier > total:
+                    self.context_window_tokens = tier
+                    break
+            else:
+                self.context_window_tokens = int(total * 1.5)
+        return total
 
     @property
     def context_utilization(self) -> float:
@@ -1669,8 +1680,14 @@ class AutonomousDeliveryState:
         if self.roles:
             arch_role = None
             worker_roles: list[RoleStatus] = []
+            seen_roles: set[str] = set()
             for r_name, r_obj in self.roles.items():
-                if r_name.lower() == "architecture" or "arch" in r_name.lower() or "lead" in r_name.lower():
+                r_norm = str(getattr(r_obj, "role", r_name) or r_name).strip()
+                r_key = r_norm.lower()
+                if r_key in seen_roles:
+                    continue
+                seen_roles.add(r_key)
+                if r_key == "architecture" or "arch" in r_key or "lead" in r_key:
                     arch_role = r_obj
                 else:
                     worker_roles.append(r_obj)
@@ -2006,9 +2023,19 @@ class AutonomousDeliveryState:
 
         elif name in {"event.agentSpawned", "agent.spawned"}:
             agent_id = payload.get("agent_id") or payload.get("agentId") or "agent-sub"
-            role_name = (payload.get("role") or self._infer_role_from_op(agent_id)).title()
-            normalized_role = "Q/A" if role_name.upper() in {"QA", "Q/A"} else role_name
-            existing_role = self.roles.get(normalized_role)
+            r_raw = str(payload.get("role") or self._infer_role_from_op(agent_id)).strip()
+            norm_lower = r_raw.lower()
+            if norm_lower in ("qa", "q/a"):
+                normalized_role = "Q/A"
+            elif norm_lower == "gitops":
+                normalized_role = "GitOps"
+            elif norm_lower in ("architecture", "arch"):
+                normalized_role = "Architecture"
+            else:
+                normalized_role = r_raw.title()
+            existing_key = next((k for k in self.roles if k.lower() == normalized_role.lower()), None)
+            target_key = existing_key or normalized_role
+            existing_role = self.roles.get(target_key)
             raw_backend = payload.get("backend") or payload.get("executionBackend")
             if raw_backend and str(raw_backend).strip().lower() == "daemon":
                 raw_backend = None
@@ -2023,8 +2050,8 @@ class AutonomousDeliveryState:
             op_id = payload.get("operation_id") or payload.get("operationId") or f"op-{agent_id}"
 
             # Update roles
-            self.roles[normalized_role] = RoleStatus(
-                normalized_role,
+            self.roles[target_key] = RoleStatus(
+                target_key,
                 backend=backend,
                 model=model,
                 quantization=quantization,

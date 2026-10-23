@@ -120,9 +120,12 @@ def test_work_order_creation_and_role_enforcement(tmp_path):
     wo_file = tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml"
     assert wo_file.is_file()
 
-    # Claude can update work order
-    updated = claude_gw.update_work_order("WO-002", {"title": "Updated Auth System"})
+    # Claude can update work order under optimistic concurrency
+    updated = claude_gw.update_work_order(
+        "WO-002", {"title": "Updated Auth System"}, expected_revision=1,
+    )
     assert updated["title"] == "Updated Auth System"
+    assert updated["revision"] == 2
 
 
 def test_contract_introspection_and_scope_verification(tmp_path):

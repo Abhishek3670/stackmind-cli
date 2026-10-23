@@ -2485,6 +2485,63 @@ class SessionManager:
         p = prompt or f"Execute work order {work_order_id}"
         return self.start_turn(session_id, p, work_order_id=work_order_id, **params)
 
+    def _reconcile_stopped_operations(self, session_id: str) -> bool:
+        """Fail non-terminal turn operations whose worker thread is gone.
+
+        The supervisor only waits on operations something is executing. A
+        thread that died without recording a terminal status (unhandled
+        ``BaseException``, killed thread, lost worker) would otherwise leave the
+        run waiting forever, so the operation is failed with a specific reason
+        and the run can progress to a terminal or recoverable state.
+        """
+        try:
+            grace = float(os.environ.get("STALE_OPERATION_GRACE_SECONDS", "15"))
+        except ValueError:
+            grace = 15.0
+        now = datetime.now(timezone.utc)
+        stale: list[tuple[str, str]] = []
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return False
+            for record in session.get("journal", []):
+                if record.get("operation") != "turn":
+                    continue
+                if record.get("status") in _OPERATION_TERMINAL:
+                    continue
+                op_id = record.get("operation_id")
+                if not op_id:
+                    continue
+                thread = self._turn_threads.get(op_id)
+                if thread is not None and thread.is_alive():
+                    continue
+                try:
+                    started = datetime.fromisoformat(str(record.get("started_at")))
+                    age = (now - started).total_seconds()
+                except (TypeError, ValueError):
+                    age = grace
+                # A turn registered but not yet started is still owned by a
+                # live caller; only fail it once the grace period has passed.
+                if age < grace:
+                    continue
+                stale.append((op_id, str(record.get("status") or "RUNNING")))
+
+        for op_id, status in stale:
+            reason = (
+                f"Operation thread exited without a terminal state (status {status}); "
+                "the provider turn produced no completion, error, timeout or cancellation"
+            )
+            try:
+                self.complete_operation(
+                    session_id,
+                    op_id,
+                    {"reason": reason, "error": reason, "status": "failed"},
+                    status="FAILED",
+                )
+            except (KeyError, ValueError):
+                continue
+        return bool(stale)
+
     def _drive_run(
         self,
         run_id: str,
@@ -2535,6 +2592,12 @@ class SessionManager:
                     self._operation_event.clear()
                     continue
                 if result == AdvanceResult.WAITING_FOR_OPERATION:
+                    # Never wait on an operation that nothing is executing. A
+                    # worker thread that exited without recording a terminal
+                    # status would otherwise hold the run open indefinitely.
+                    if self._reconcile_stopped_operations(state.session_id):
+                        continue
+
                     has_alive_threads = False
                     with self._lock:
                         has_alive_threads = any(t.is_alive() for t in self._turn_threads.values())

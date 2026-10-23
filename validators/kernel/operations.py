@@ -66,6 +66,8 @@ class OperationType(str, Enum):
     EXIT_PLAN_MODE = "exit_plan_mode"
     CREATE_WORK_ORDER = "create_work_order"
     UPDATE_WORK_ORDER = "update_work_order"
+    REOPEN_WORK_ORDER = "reopen_work_order"
+    REVALIDATE_WORK_ORDER = "revalidate_work_order"
     INSPECT_WORK_ORDER = "inspect_work_order"
     INSPECT_AGENT = "inspect_agent"
     DISPATCH_SUBAGENT = "dispatch_subagent"

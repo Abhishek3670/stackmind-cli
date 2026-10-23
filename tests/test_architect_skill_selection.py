@@ -442,4 +442,50 @@ def test_laya_decides_skills_for_arbitrary_new_skills(tmp_path: Path):
     assert "prisma-migrate" not in task_doc
 
 
+def test_laya_pre_filtering_for_architect_prompt(tmp_path: Path):
+    """Verify Laya pre-filters skills for Architect prompt to prevent context bloat and token exhaustion."""
+    store = SkillStore(tmp_path)
+
+    skills_to_create = [
+        ("frontend-canvas-physics", "Interactive HTML5 canvas graphics and browser physics simulation."),
+        ("tailwind-css-styler", "Responsive UI styling and CSS component layout."),
+        ("ponytail", "Write the simplest, minimal code possible standard library first."),
+        ("asd-ste100", "Simplified Technical English for unambiguous agent instructions and prompts."),
+        ("prisma-db-migration", "Relational database schema migration and SQL generation."),
+        ("docker-container-deployer", "Dockerfile generation and container deployment."),
+        ("kubernetes-helm-release", "Kubernetes cluster deployments and Helm charts."),
+        ("pytest-fixture-designer", "Python unit and integration test fixtures."),
+    ]
+
+    for name, desc in skills_to_create:
+        store.save_version(_make_test_skill(name=name, description=desc))
+
+    # 1. Frontend physics task -> Pre-filters to frontend/canvas/ui skills
+    frontend_briefing = format_skills_for_architect_prompt(
+        tmp_path,
+        task_title="Build interactive football physics simulation in browser with HTML5 canvas and CSS",
+        task_description="Create a bouncing football with deformation and custom cursor",
+        max_skills=3,
+    )
+
+    assert "frontend-canvas-physics" in frontend_briefing
+    assert "tailwind-css-styler" in frontend_briefing or "ponytail" in frontend_briefing
+    assert "prisma-db-migration" not in frontend_briefing
+    assert "kubernetes-helm-release" not in frontend_briefing
+    assert "omitted from prompt to preserve token budget" in frontend_briefing
+
+    # 2. Database migration task -> Pre-filters to database/backend skills
+    db_briefing = format_skills_for_architect_prompt(
+        tmp_path,
+        task_title="Postgres database schema migration",
+        task_description="Write SQL migrations for user accounts table",
+        max_skills=3,
+    )
+
+    assert "prisma-db-migration" in db_briefing
+    assert "frontend-canvas-physics" not in db_briefing
+    assert "kubernetes-helm-release" not in db_briefing
+
+
+
 

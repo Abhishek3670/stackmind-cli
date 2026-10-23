@@ -394,6 +394,27 @@ class LifecycleSupervisor:
             archive_blocked_work_orders(Path(workspace))
         except Exception:
             pass
+        # Resolve any work-order mutation that was interrupted before its audit
+        # record landed. Starting a run must not silently build on an unknown
+        # revision: unresolved records stay pending and block consequential work.
+        try:
+            from validators.kernel.work_order_ops import reconcile_operations
+            from validators.kernel.work_order_ops import mark_dependents_stale
+
+            def _repair(record: dict[str, Any]) -> bool:
+                result = mark_dependents_stale(
+                    Path(workspace),
+                    upstream_id=str(record.get("work_order") or ""),
+                    upstream_revision=int(record.get("target_revision") or 0),
+                    reason=str(record.get("reason") or "recovered amendment"),
+                    fields=[str(f) for f in record.get("changed_fields") or []],
+                    actor="runtime-recovery",
+                )
+                return not result["failed"]
+
+            reconcile_operations(Path(workspace), apply_stale=_repair)
+        except Exception:
+            pass
         state = RunState(
             run_id=run_id,
             product_goal=product_goal,
@@ -439,6 +460,9 @@ class LifecycleSupervisor:
         }.get(state.phase)
         if handler is None:
             return AdvanceResult.FAILED
+        # An Architect may reopen a completed work order mid-run; run state must
+        # not keep treating it as completed (or its old result as authoritative).
+        self.reconcile_reopened_work_orders(state)
         try:
             res = handler(state)
             state.contention_count = 0
@@ -4358,6 +4382,44 @@ class LifecycleSupervisor:
             seen.add(wo_id)
             self._mark_wo_status_on_disk(ws, wo_id, target_status, error=error)
 
+    def reconcile_reopened_work_orders(self, state: RunState) -> list[str]:
+        """Re-queue work orders reopened on disk since run state last looked.
+
+        A reopened work order is ACTIVE with `reopened_from` provenance. It is
+        removed from `completed_wo_ids`, granted a fresh retry budget, and its
+        pre-reopen operation is ignored so a stale completed result cannot
+        re-complete it. Returns the IDs reconciled.
+        """
+        ws = Path(state.workspace)
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        if not active_dir.is_dir():
+            return []
+        reconciled: list[str] = []
+        for wo_file in sorted(active_dir.glob("*.yaml")):
+            wo_id = wo_file.stem
+            if wo_id not in state.completed_wo_ids:
+                continue
+            try:
+                data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict) or not isinstance(data.get("reopened_from"), dict):
+                continue
+            state.completed_wo_ids.remove(wo_id)
+            for bucket in (state.blocked_wo_ids, state.failed_wo_ids):
+                if wo_id in bucket:
+                    bucket.remove(wo_id)
+            state.retry_counts[wo_id] = 0
+            prior = self._find_latest_wo_operation(state, wo_id)
+            if prior and prior.get("operation_id"):
+                prior_id = str(prior["operation_id"])
+                if prior_id not in state.ignored_operation_ids:
+                    state.ignored_operation_ids.append(prior_id)
+            if wo_id not in state.worker_wo_ids:
+                state.worker_wo_ids.append(wo_id)
+            reconciled.append(wo_id)
+        return reconciled
+
     def unblock_in_flight_work_orders(self, state: RunState) -> None:
         """Reset non-completed work orders on disk back to ACTIVE when resuming a run."""
         ws = Path(state.workspace)
@@ -4989,6 +5051,62 @@ def archive_completed_work_orders(
 
         wo_data["status"] = "COMPLETED"
         wo_data["updated"] = now_iso
+        # Bind this completion to the revision that actually ran, and keep the
+        # amendment that invalidated earlier evidence visible in the record
+        # instead of letting a stale verification silently look current.
+        stale = wo_data.get("evidence_stale")
+        if isinstance(stale, dict) and stale:
+            completion = wo_data.get("completion")
+            if not isinstance(completion, dict):
+                completion = {}
+            completion["prior_evidence_invalidated"] = stale
+            completion["verified_at_revision"] = wo_data.get("revision")
+            contract_file = sync_dir / "contracts" / f"{wo_id}.yaml"
+            if contract_file.is_file():
+                try:
+                    contract_data = yaml.safe_load(
+                        contract_file.read_text(encoding="utf-8")
+                    ) or {}
+                    completion["verified_at_contract_revision"] = (
+                        contract_data.get("contract_revision")
+                        if isinstance(contract_data, dict) else None
+                    )
+                except Exception:
+                    completion["verified_at_contract_revision"] = None
+            completion["reverified_at"] = now_iso
+            wo_data["completion"] = completion
+            from validators.kernel.work_order_ops import (
+                stale_requires_rework,
+                stale_sources_resolved,
+            )
+
+            resolved, unresolved_reason = stale_sources_resolved(ws, stale)
+            if resolved and stale_requires_rework(stale):
+                # A rework-class invalidation (acceptance criteria, description,
+                # deliverable, scope) is not satisfied by re-running the old
+                # checks: it needs a lifecycle reopen. Archiving must not clear
+                # it, or release would accept evidence the marker already
+                # rejected.
+                wo_data["evidence_stale"] = {
+                    **stale,
+                    "revalidation_blocked_reason": (
+                        "invalidation may require code changes; reopen the work "
+                        "order and complete the required rework"
+                    ),
+                }
+            elif resolved:
+                # Evidence is fresh for this revision again; the invalidation
+                # stays visible in the completion record and the durable audit.
+                wo_data.pop("evidence_stale", None)
+            else:
+                # An upstream advanced again while this work order was in
+                # flight. Archiving must not bless evidence that no longer
+                # applies: the marker survives, so release stays blocked until
+                # the dependent is re-verified (or reopened) against it.
+                wo_data["evidence_stale"] = {
+                    **stale,
+                    "revalidation_blocked_reason": unresolved_reason,
+                }
         target_file = completed_dir / wo_file.name
         from validators.kernel.io import durable_write_yaml
         durable_write_yaml(target_file, wo_data)

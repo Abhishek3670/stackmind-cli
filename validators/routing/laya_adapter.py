@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger("stackmind.routing.laya")
 
@@ -367,8 +367,8 @@ class LayaDecisionAdapter:
                         selected.append(clean)
                         seen.add(clean)
 
-        # 2. If Laya is disabled and explicit skills exist, return them
-        if self.mode == LayaMode.DISABLED and selected:
+        # 2. If explicit skills were designated by Architect/Operator, honor them as authoritative
+        if selected:
             return selected
 
         # 3. Classify task domain using Laya
@@ -501,6 +501,79 @@ class LayaDecisionAdapter:
                 seen.add(s_name)
 
         return selected
+
+    def filter_skills_for_architect(
+        self,
+        available_skills: Sequence[Any],
+        task_title: str = "",
+        task_description: str = "",
+        max_skills: int = 6,
+    ) -> list[Any]:
+        """Pre-filter and prioritize relevant procedural skills for the Architect's briefing.
+
+        Prevents context dilution and token budget exhaustion by selecting the top-scoring
+        skills aligned with the user goal/domain instead of dumping the entire library.
+        """
+        import re
+
+        if not available_skills:
+            return []
+        if len(available_skills) <= max_skills:
+            return list(available_skills)
+
+        combined_text = f"{task_title} {task_description}".lower().strip()
+        task_cat = self.classify_task(title=task_title, body=task_description).category if combined_text else TaskCategory.GENERAL
+
+        domain_cues: dict[TaskCategory, tuple[str, ...]] = {
+            TaskCategory.FRONTEND: ("ui", "css", "html", "style", "styling", "frontend", "layout", "view", "component", "dom", "browser", "animation"),
+            TaskCategory.BACKEND: ("backend", "api", "database", "sql", "orm", "endpoint", "route", "service", "migration", "server"),
+            TaskCategory.TESTING: ("test", "testing", "pytest", "qa", "verify", "assert", "coverage", "mock", "e2e"),
+            TaskCategory.GITOPS: ("git", "docker", "k8s", "kubernetes", "container", "deploy", "release", "ci", "cd"),
+            TaskCategory.ARCHITECTURE: ("architecture", "spec", "specification", "rfc", "contract", "plan", "milestone"),
+        }
+
+        stop_words = {"the", "and", "for", "with", "that", "this", "from", "into", "skill", "procedure", "will", "when", "using", "your", "build", "make"}
+        task_tokens = {t for t in re.findall(r"\w+", combined_text) if len(t) > 3 and t not in stop_words}
+
+        scored: list[tuple[float, int, Any]] = []
+        for idx, s in enumerate(available_skills):
+            s_name = getattr(s, "name", "").lower()
+            desc = getattr(s, "description", "").lower()
+            score = 0.0
+
+            # Direct name match in task text
+            if s_name and (s_name in combined_text or s_name.replace("-", "_") in combined_text or s_name.replace("_", "-") in combined_text):
+                score += 100.0
+
+            # Keyword token overlap with description
+            desc_tokens = {t for t in re.findall(r"\w+", desc) if len(t) > 3 and t not in stop_words}
+            overlap = len(desc_tokens.intersection(task_tokens))
+            score += overlap * 10.0
+
+            # Domain category alignment
+            if task_cat in domain_cues:
+                cues = domain_cues[task_cat]
+                matched = sum(1 for c in cues if c in desc or c in s_name)
+                score += matched * 8.0
+
+            # Foundational skills boost when relevant
+            if s_name == "ponytail":
+                if not combined_text or any(kw in combined_text for kw in ("implement", "code", "build", "create", "write", "feature", "app")):
+                    score += 15.0
+            elif s_name in ("asd-ste100", "asd_ste100"):
+                if not combined_text or any(kw in combined_text for kw in ("spec", "prompt", "instruct", "document", "clarity", "rule", "clean")):
+                    score += 15.0
+
+            # Metric bonus
+            metrics = getattr(s, "metrics", None)
+            if metrics and hasattr(metrics, "confidence_score"):
+                score += float(getattr(metrics, "confidence_score", 0.0) or 0.0) * 2.0
+
+            # Stable tie-breaking with negative index
+            scored.append((score, -idx, s))
+
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return [item[2] for item in scored[:max_skills]]
 
 
 def classify_task_category(

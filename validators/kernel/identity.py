@@ -129,6 +129,8 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
             OperationType.EXIT_PLAN_MODE.value,
             OperationType.CREATE_WORK_ORDER.value,
             OperationType.UPDATE_WORK_ORDER.value,
+            OperationType.REOPEN_WORK_ORDER.value,
+            OperationType.REVALIDATE_WORK_ORDER.value,
             OperationType.DISPATCH_SUBAGENT.value,
             OperationType.TRIGGER_GOAL.value,
             OperationType.DELEGATE_TASK.value,

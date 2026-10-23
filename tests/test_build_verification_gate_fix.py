@@ -204,3 +204,127 @@ def test_build_child_contract_grants_command_permission() -> None:
     authorized, reason = evaluator.authorize(norm_qa, "run_command", "workspace/command")
     assert authorized is True
     assert reason == "authorized"
+
+
+# ─── A declared build is mandatory, not permission-dependent ────────────────
+
+
+def _makefile(tmp_path: Path, target: str = "build", body: str = "\tpython -m compileall src\n") -> None:
+    (tmp_path / "Makefile").write_text(f"{target}:\n{body}", encoding="utf-8")
+
+
+def _grant_command_permission(tmp_path: Path) -> None:
+    contracts = tmp_path / ".sync" / "contracts"
+    contracts.mkdir(parents=True, exist_ok=True)
+    (contracts / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "agent_id": "codex",
+            "work_order": "WO-001",
+            "scope": {"allow": [{"module": "workspace/command"}], "deny": []},
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_non_node_build_without_command_permission_fails_closed(tmp_path: Path) -> None:
+    """A declared Makefile build with no command grant is a blocker, not a skip."""
+    _setup_clean_workspace(tmp_path)
+    _makefile(tmp_path)
+
+    gate = IntegrationGate(tmp_path)
+    check, issues, blockers, evidence = gate._check_build_execution_integrity(None, None, None)
+
+    assert check.passed is False
+    assert check.status == "failed"
+    assert "workspace/command" in check.message
+    assert "Makefile" in check.message
+    assert evidence["command_permission"] is False
+    assert evidence["build_command"] == ["make", "build"]
+    assert any("Grant workspace/command" in b["remediation"] for b in blockers)
+    assert any("no build execution was recorded" in issue for issue in issues)
+
+    # The release gate itself must refuse release, not silently pass.
+    decision = gate.evaluate()
+    assert decision.passed is False
+    assert any(
+        c.name == "build_execution" and c.status == "failed" for c in decision.checks
+    )
+
+
+def test_non_node_build_without_execution_evidence_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """Authorized build + no recorded execution is still a release blocker."""
+    _setup_clean_workspace(tmp_path)
+    _makefile(tmp_path)
+    _grant_command_permission(tmp_path)
+
+    import validators.harness.integration_gate as gate_module
+
+    monkeypatch.setattr(gate_module.shutil, "which", lambda name: "/usr/bin/make")
+
+    check, issues, blockers, evidence = (
+        IntegrationGate(tmp_path)._check_build_execution_integrity(None, None, None)
+    )
+
+    assert check.passed is False
+    assert "no build execution was recorded" in check.message
+    assert evidence["runs"] == []
+    assert any("make build" in b["remediation"] for b in blockers)
+
+
+def test_non_node_build_with_unavailable_tool_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """A missing build tool is a blocker with a diagnostic, not a skip."""
+    _setup_clean_workspace(tmp_path)
+    _makefile(tmp_path)
+    _grant_command_permission(tmp_path)
+
+    import validators.harness.integration_gate as gate_module
+
+    monkeypatch.setattr(gate_module.shutil, "which", lambda name: None)
+
+    check, _, blockers, evidence = (
+        IntegrationGate(tmp_path)._check_build_execution_integrity(None, None, None)
+    )
+
+    assert check.passed is False
+    assert "'make' is not installed" in check.message
+    assert evidence["build_tool"] == "make"
+    assert evidence["build_tool_available"] is False
+    assert any("Install 'make'" in b["remediation"] for b in blockers)
+
+
+def test_non_node_project_without_build_requirement_is_not_blocked(tmp_path: Path) -> None:
+    """A Makefile with no build target declares no build; nothing is required."""
+    _setup_clean_workspace(tmp_path)
+    _makefile(tmp_path, target="test", body="\tpython -m pytest\n")
+
+    check, issues, blockers, _ = (
+        IntegrationGate(tmp_path)._check_build_execution_integrity(None, None, None)
+    )
+
+    assert check.passed is True
+    assert check.status == "skipped"
+    assert "No build configuration" in check.message
+    assert issues == []
+    assert blockers == []
+
+
+def test_recorded_non_node_build_evidence_passes(tmp_path: Path) -> None:
+    """A recorded successful Makefile build satisfies the requirement."""
+    _setup_clean_workspace(tmp_path)
+    _makefile(tmp_path)
+    _grant_command_permission(tmp_path)
+
+    telemetry = {
+        "result": {"commands_audit": [{"command": "make build", "returncode": 0}]},
+    }
+
+    check, issues, blockers, evidence = (
+        IntegrationGate(tmp_path)._check_build_execution_integrity(None, telemetry, None)
+    )
+
+    assert check.passed is True
+    assert check.status == "passed"
+    assert issues == []
+    assert blockers == []
+    assert evidence["runs"][0]["command"] == "make build"
+    assert evidence["runs"][0]["returncode"] == 0

@@ -213,6 +213,158 @@
     "plan_ref": {
       "type": "string"
     },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic revision of this work order. The authoring gate only permits an Architect/CEO to rewrite a live ACTIVE work order when this value strictly increases."
+    },
+    "reopened_from": {
+      "type": "object",
+      "description": "Provenance of an explicit lifecycle reopen of a COMPLETED work order. The completion record it closed out is retained in completion_history.",
+      "required": ["revision", "reopened_at", "reopened_by", "reason", "previous_status"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1 },
+        "reopened_at": { "type": "string" },
+        "reopened_by": { "type": "string" },
+        "reason": { "type": "string" },
+        "previous_status": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "completion_history": {
+      "type": "array",
+      "description": "Append-only history of completion records closed out by an explicit reopen; never rewritten in place.",
+      "items": {
+        "type": "object",
+        "required": ["revision", "completed_at", "status"],
+        "properties": {
+          "revision": { "type": "integer", "minimum": 1 },
+          "completed_at": { "type": "string" },
+          "status": { "type": "string" },
+          "completion": { "type": "object", "additionalProperties": true },
+          "reopened_by": { "type": "string" },
+          "reopen_reason": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "evidence_stale": {
+      "type": "object",
+      "description": "Set by the runtime when an amendment changes a field that prior verification evidence depended on. Bound to the revision that invalidated it; completion must be re-established for that revision. For a dependent whose upstream changed, the historical completion record is preserved and only current evidence is invalidated.",
+      "required": ["invalidated_at", "invalidated_by", "revision", "reason", "fields"],
+      "properties": {
+        "invalidated_at": { "type": "string" },
+        "invalidated_by": { "type": "string" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "reason": { "type": "string" },
+        "fields": { "type": "array", "items": { "type": "string" } },
+        "dependents": { "type": "array", "items": { "type": "string" } },
+        "requires_revalidation": {
+          "type": "boolean",
+          "description": "True when the current evidence must be re-established before the work order is release-eligible."
+        },
+        "requires_rework": {
+          "type": "boolean",
+          "description": "True when the upstream change may require code changes, so re-verification alone cannot clear the marker."
+        },
+        "revalidation_blocked_reason": {
+          "type": "string",
+          "description": "Set when archiving found that a recorded upstream advanced again; the marker is retained and revalidation is refused until re-verification against the newer upstream."
+        },
+        "sources": {
+          "type": "array",
+          "description": "Append-only provenance of every upstream change that invalidated this evidence.",
+          "items": {
+            "type": "object",
+            "required": ["upstream_work_order", "upstream_revision", "fields", "reason", "invalidated_at"],
+            "properties": {
+              "upstream_work_order": { "type": "string" },
+              "upstream_revision": { "type": "integer", "minimum": 1 },
+              "upstream_contract_revision": { "type": ["integer", "null"] },
+              "via": { "type": "string" },
+              "depth": { "type": "integer", "minimum": 1 },
+              "fields": { "type": "array", "items": { "type": "string" } },
+              "reason": { "type": "string" },
+              "invalidated_at": { "type": "string" },
+              "requires_rework": { "type": "boolean" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "revalidation_history": {
+      "type": "array",
+      "description": "Append-only record of runtime re-verification that cleared a stale-evidence marker on a COMPLETED work order: the workspace's declared build (when it declares one) was executed, the declared test plan was re-executed, and the current deliverable hashes were recorded. Status and completion history are never changed by revalidation.",
+      "items": {
+        "type": "object",
+        "required": ["revalidated_at", "revalidated_by", "revision", "command", "returncode", "artifact_hashes"],
+        "properties": {
+          "revalidated_at": { "type": "string" },
+          "revalidated_by": { "type": "string" },
+          "revision": { "type": "integer", "minimum": 1 },
+          "contract_revision": { "type": ["integer", "null"], "minimum": 1 },
+          "upstream_revisions": { "type": "object", "additionalProperties": true },
+          "tests": { "type": "array", "items": { "type": "string" } },
+          "command": { "type": "string" },
+          "returncode": { "type": "integer" },
+          "artifact_hashes": {
+            "type": "object",
+            "description": "Content hashes of the deliverable files recomputed by the runtime during revalidation.",
+            "additionalProperties": { "type": "string" }
+          },
+          "build": {
+            "type": "object",
+            "description": "The build the workspace declared at revalidation time, the manifest it ran against, and the artifact hashes it produced. A project that declares a build cannot clear stale evidence without it.",
+            "required": ["manifest", "command", "returncode", "artifact_hashes"],
+            "properties": {
+              "manifest": { "type": "string" },
+              "manifest_sha256": { "type": ["string", "null"] },
+              "command": { "type": "string" },
+              "returncode": { "type": "integer" },
+              "artifact_hashes": {
+                "type": "object",
+                "description": "Content hashes of the deliverables as they stood immediately after the build completed.",
+                "additionalProperties": { "type": "string" }
+              }
+            },
+            "additionalProperties": false
+          },
+          "notes": { "type": "string" },
+          "cleared": { "type": "object", "additionalProperties": true }
+        },
+        "additionalProperties": false
+      }
+    },
+    "evidence_revalidated_at": {
+      "type": "string",
+      "description": "UTC timestamp of the most recent revalidation that cleared a stale-evidence marker."
+    },
+    "amended_by": {
+      "type": "string",
+      "description": "Agent that performed the most recent amendment."
+    },
+    "amended_at": {
+      "type": "string",
+      "description": "UTC timestamp of the most recent amendment."
+    },
+    "amendments": {
+      "type": "array",
+      "description": "Audit trail of Architect amendments; the latest entries are rendered into the worker task contract.",
+      "items": {
+        "type": "object",
+        "required": ["revision", "reason"],
+        "properties": {
+          "revision": { "type": "integer", "minimum": 1 },
+          "agent": { "type": "string" },
+          "date": { "type": "string" },
+          "reason": { "type": "string" },
+          "changed_fields": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
     "milestone_id": {
       "type": "string",
       "description": "Stable identifier linking this work order to its approved plan milestone (e.g. 'Milestone 1'); primary identity for readiness milestone-coverage validation."

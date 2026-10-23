@@ -534,6 +534,29 @@ def _stream_turn_execution(
                 clear_transcript_cache()
                 if live_manager is not None and getattr(live_manager, "is_active", False):
                     live_manager.handle_resize(new_cols, new_lines)
+                if is_tty:
+                    layout = compute_layout(new_cols)
+                    tick_content = _build_in_progress_turn_content(
+                        state,
+                        model_name,
+                        streamed_chunks,
+                        latest_act_desc,
+                        start_time,
+                        max_wait,
+                        layout.conversation_width,
+                    )
+                    redraw_full_screen(
+                        session,
+                        state,
+                        width=new_cols,
+                        height=new_lines,
+                        clear=True,
+                        include_composer=True,
+                        composer_is_active=False,
+                        composer_placeholder=_get_working_placeholder(),
+                        conversation_content=tick_content,
+                        live_manager=live_manager,
+                    )
 
             # Poll for scroll keys (PgUp/PgDn/Wheel) so users can scroll during streaming
             if is_tty:
@@ -1479,6 +1502,25 @@ def dispatch_delivery_command(
             client,
             session,
             ":approve Approved by operator",
+            state,
+            client_timeout=effective_timeout,
+            live_manager=live_manager,
+        )
+
+    # Route intuitive 'continue' / 'proceed' to :resume during autonomous delivery or when work orders exist
+    has_delivery_run = (
+        getattr(state, "phase", None) in (ProjectPhase.AUTONOMOUS_EXECUTION, ProjectPhase.PLAN_APPROVED, ProjectPhase.BLOCKED, ProjectPhase.FAILED)
+        or bool(getattr(state, "work_orders", None))
+        or bool(getattr(state, "runs", None))
+    )
+    if not is_awaiting_plan and has_delivery_run and normalized.lower() in {
+        "continue", ":continue", "proceed", ":proceed", "go ahead", ":go"
+    }:
+        return dispatch_delivery_command(
+            adapter,
+            client,
+            session,
+            ":resume",
             state,
             client_timeout=effective_timeout,
             live_manager=live_manager,

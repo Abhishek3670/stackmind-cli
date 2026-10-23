@@ -281,6 +281,46 @@ QA_SYSTEM_PROMPT = (
 )
 
 
+def provider_stream_interruption_result(
+    task: HarnessTask,
+    exc: Any,
+    *,
+    operation_id: str | None = None,
+) -> HarnessRunResult:
+    """Convert a truncated/aborted provider stream into an actionable result.
+
+    The partial text the model already produced is preserved on the result (and
+    echoed in the reason) so the operator sees what was generated and why the
+    turn stopped, instead of an empty or silently "successful" answer.
+    """
+    partial_output = str(getattr(exc, 'partial_text', '') or '')
+    reason = f"Provider stream terminated before completion: {exc}"
+    if partial_output.strip():
+        reason += (
+            f". Partial output preserved ({len(partial_output)} chars): "
+            f"{partial_output[:400]}"
+        )
+    return HarnessRunResult(
+        status='blocked',
+        persisted=False,
+        task_id=task.identifier,
+        reason=reason,
+        meta={
+            'partial_output': partial_output,
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+            'operation_id': operation_id,
+            'blockers': [reason],
+            'failure': {
+                'failure_code': 'PROVIDER_STREAM_INTERRUPTED',
+                'canonical_message': reason,
+                'work_order_id': task.work_order_id,
+                'raw_reason': str(exc),
+            },
+        },
+    )
+
+
 class AgentRunner:
     """Governed worker execution loop with staged verification."""
 
@@ -298,6 +338,7 @@ class AgentRunner:
         context_limit: int = 8,
         max_tool_calls: int | None = None,
         max_turns: int | None = None,
+        turn_timeout: float | None = None,
         max_lock_retries: int = 3,
         backoff_seconds: float = 0.1,
         now_fn: Any | None = None,
@@ -354,6 +395,14 @@ class AgentRunner:
         from validators.kernel.providers.gateway import DEFAULT_MAX_TURNS
         self.max_tool_calls = max_tool_calls
         self.max_turns = max_turns if max_turns is not None else DEFAULT_MAX_TURNS
+        # Every provider turn is bounded: the gateway enforces an inactivity
+        # timeout per stream and this wall-clock deadline across the tool loop,
+        # so a stalled provider can never leave an operation running forever.
+        self.turn_timeout = (
+            turn_timeout
+            if turn_timeout is not None
+            else float(os.environ.get("PROVIDER_TURN_TIMEOUT", "1800"))
+        )
         self.max_lock_retries = max_lock_retries
         self.backoff_seconds = backoff_seconds
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc).astimezone())
@@ -596,6 +645,7 @@ class AgentRunner:
                     ConsecutiveToolFailureError,
                     NoProgressLoopError,
                     OperationCancelledError,
+                    ProviderStreamInterruptedError,
                     TimeoutError,
                     ToolLimitExceededError,
                     ToolLoopExhaustedError,
@@ -604,6 +654,13 @@ class AgentRunner:
                 import socket
                 if isinstance(exc, OperationCancelledError) or self._is_cancelled(cancellation):
                     return self._cancelled_result(task, operation_id)
+                if isinstance(exc, ProviderStreamInterruptedError):
+                    # The provider stopped producing before its terminal signal.
+                    # Keep what the model already emitted and name the concrete
+                    # failure instead of discarding it or retrying blindly.
+                    return provider_stream_interruption_result(
+                        task, exc, operation_id=operation_id
+                    )
                 if isinstance(exc, (
                     BudgetExceededError,
                     ToolLimitExceededError,
@@ -1615,7 +1672,8 @@ class AgentRunner:
                 "6. Strict Prohibition on Fabricated Background Monitoring (MANDATORY INVARIANT):\n"
                 "   You CANNOT monitor, loop, or wait in the background. Once your response turn finishes, the system immediately returns to IDLE waiting for user input.\n"
                 "   NEVER tell the user 'the engine has taken over', 'I am monitoring the supervisor in the background', or 'you don't need to do anything else' unless you actually executed `trigger_goal` or `delegate_task` during this turn!\n"
-                "   If you created or modified PLAN.md, or if a plan is proposed, you MUST explicitly tell the user: 'I have prepared/updated the plan in PLAN.md. Please type `:approve` (or simply 'continue') to start autonomous multi-agent execution, or let me know if you would like adjustments.'"
+                "   If you created or modified PLAN.md, or if a plan is proposed, you MUST explicitly tell the user: 'I have prepared/updated the plan in PLAN.md. Please type `:approve` (or simply 'continue') to start autonomous multi-agent execution, or let me know if you would like adjustments.'\n"
+                "7. Improving a live Work Order: a read-only board of sibling work orders (owner, deliverable, acceptance criteria, last amendment) is included in your context whenever peer tasks exist. When a peer's ACTIVE task is vague, mis-scoped, or missing an integration requirement, amend it with `update_work_order(wo_id, updates, reason, expected_revision)` — the reason is delivered to the assigned worker as an authoritative correction on its next turn. A COMPLETED task is reopened with `reopen_work_order`, never rewritten. Approved requirements, architecture, scope, or constraints cannot be changed by an amendment: propose a plan revision and wait for operator approval. Never claim to have amended a task you did not actually write."
             )
         else:
             return (
@@ -1624,6 +1682,17 @@ class AgentRunner:
                 "Maintain context across chat turns. "
                 "Do NOT format your response as a JSON decision schema unless explicitly asked."
             )
+
+    def _architect_board_block(self, work_order_id: str | None = None) -> str:
+        """Sibling work-order board appended to Architect turns (empty for others)."""
+        if self.agent != 'claude':
+            return ""
+        try:
+            from validators.harness.task_contract import render_work_order_board
+            board = render_work_order_board(self.project_path, exclude_wo=work_order_id)
+        except Exception:
+            return ""
+        return f"\n\n{board}\n" if board else ""
 
     def _build_adhoc_messages(
         self,
@@ -1666,6 +1735,9 @@ class AgentRunner:
                     user_content = (request.task.body or request.task.title).strip()
                     if getattr(request.context, "text", None) and request.context.text.strip():
                         user_content = f"{user_content}\n\nContext:\n{request.context.text.strip()}"
+                    user_content += self._architect_board_block(
+                        getattr(request.task, 'work_order_id', None)
+                    )
                     messages = self._build_adhoc_messages(system_msg, user_content, request.session_history)
                 else:
                     task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
@@ -1777,7 +1849,13 @@ class AgentRunner:
             task_text += f"\n{ARCHITECTURE_RESEARCH_INSTRUCTIONS}\n"
             task_text += f"\nGoverned Artifact Authoring Schemas (for reference when planning tasks):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
-            skills_prompt = format_skills_for_architect_prompt(self.project_path)
+            t_title = getattr(request.task, 'title', '') or ''
+            t_desc = getattr(request.task, 'body', '') or getattr(request.task, 'query', '') or getattr(request.context, 'text', '') or ''
+            skills_prompt = format_skills_for_architect_prompt(
+                self.project_path,
+                task_title=t_title,
+                task_description=t_desc,
+            )
             if skills_prompt:
                 task_text += f"\n{skills_prompt}\n"
 
@@ -1789,7 +1867,13 @@ class AgentRunner:
             from validators.skill.selector import format_skills_for_architect_prompt
             task_text += f"\nGoverned Artifact Authoring Schemas (REQUIRED for writing child work orders and contracts):\n"
             task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
-            skills_prompt = format_skills_for_architect_prompt(self.project_path)
+            t_title = getattr(request.task, 'title', '') or ''
+            t_desc = getattr(request.task, 'body', '') or getattr(request.task, 'query', '') or getattr(request.context, 'text', '') or ''
+            skills_prompt = format_skills_for_architect_prompt(
+                self.project_path,
+                task_title=t_title,
+                task_description=t_desc,
+            )
             if skills_prompt:
                 task_text += f"\n{skills_prompt}\n"
 
@@ -1823,6 +1907,9 @@ class AgentRunner:
                 "element IDs (e.g. #animated-name) in its deliverable description and acceptance criteria so downstream "
                 "scripts and styles hook into existing elements. Never leave parent deliverables as empty placeholder scaffolding.\n"
                 "FILE OWNERSHIP RULE: In each Work Order's description and acceptance_criteria, you must ONLY instruct the worker to create or modify the specific file declared in its own `deliverable.path`. Never instruct a worker to initialize, create, or stub files that are the assigned deliverable of another work order (e.g. do not tell a scaffolding worker to touch index.html or main.js if those are deliverables of subsequent work orders), as runtime contract policies will deny out-of-scope file operations.\n"
+                "TASK AMENDMENT RULE: To sharpen an existing ACTIVE work order, call `update_work_order(wo_id, updates, reason, expected_revision)` — or rewrite it with `write_file` after incrementing its `revision` by one and appending an `amendments` entry that states the reason. A write that keeps or lowers `revision` is rejected as an overwrite conflict, and workers can never amend. Your amendment is handed to the assigned worker as an authoritative correction on its next turn, so make the reason a concrete instruction (the missing hook, the wrong path, the acceptance criterion to add).\n"
+                "COMPLETED WORK ORDER RULE: never rewrite a COMPLETED work order in place. Call `reopen_work_order(wo_id, reason, expected_revision)` — the lifecycle transition preserves the old completion record for audit, increments the revision, and marks prior verification evidence stale so the work must be re-verified. A higher revision is never authorization to bypass this.\n"
+                "GOVERNANCE CHANGE RULE: an amendment may not change `requirement_refs`, `plan_ref`, `scope`, `constraints`, or the work-order `type`. Those alter user-approved requirements, architecture, interfaces, or immutable constraints: update PLAN.md, obtain operator approval through the existing propose/approve plan flow, then re-author the affected work orders. Until that approval exists the current approved contract stands.\n"
                 "Only worker roles may be assigned to implementation work orders (e.g. codex for backend, gemini for frontend, gemma for qa, local-llm for gitops). "
                 "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
@@ -1910,6 +1997,11 @@ class AgentRunner:
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = f"{raw_context}\n{files_context}" if raw_context else files_context
 
+        # Pull-based sibling state: the Architect gets the same board the
+        # gates read, so peer tasks can be critiqued/amended from evidence
+        # instead of guesswork. Live turns remain invisible by design.
+        task_text += self._architect_board_block(getattr(request.task, 'work_order_id', None))
+
         if request.task.deliverable_path and not is_architecture:
             task_text += (
                 f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
@@ -1945,6 +2037,7 @@ class AgentRunner:
                 messages,
                 max_turns=self.max_turns,
                 max_tool_calls=self.max_tool_calls,
+                timeout=self.turn_timeout,
                 cancellation_token=request.cancellation,
                 required_deliverable=request.task.deliverable_path if not is_architecture else None,
             )
