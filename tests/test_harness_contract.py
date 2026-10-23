@@ -499,3 +499,16 @@ def test_narrower_ignore_list_no_false_positive_declaration_matches_for_ordinary
     assert result.persisted is True
     assert (project / "src" / "auth.py").exists()
     assert (project / "src" / "auth.py").read_text(encoding="utf-8") == "def authenticate(): return True\n"
+
+
+def test_contract_scope_permits_path_with_py_extension():
+    from validators.knowledge.contract import module_matches, path_to_module
+    mod = path_to_module("src/backend.py")
+    assert mod == "src.backend"
+    assert module_matches(mod, "src/backend.py")
+    assert module_matches(mod, "./src/backend.py")
+    assert module_matches(mod, "src/backend")
+    assert module_matches(mod, "src.backend")
+    assert module_matches(mod, "src/*")
+    assert module_matches(mod, "src/**")
+

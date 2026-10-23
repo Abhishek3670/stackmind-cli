@@ -289,8 +289,8 @@ def verify_post_execution(
         module_nodes = [s for s in api.ir.symbols if path_to_module(s.path) == mod]
         if module_nodes:
             allowed = any(contract.is_node_in_scope(s.node_id, api.ir) for s in module_nodes)
-        else:
-            # File might be new, check module pattern match directly
+        if not allowed:
+            # File might be new or not resolved in IR, check module pattern match directly
             for allow_rule in contract.allow_rules:
                 pattern = allow_rule.get("module") or allow_rule.get("path") or allow_rule.get("target")
                 if pattern:

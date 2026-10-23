@@ -37,13 +37,20 @@ def path_to_module(path: str) -> str:
 def module_matches(module_name: str, pattern: str) -> bool:
     """Check if module_name matches the pattern (supporting wildcards like * and path slashes)."""
     p_dot = pattern.replace("/", ".").replace("\\", ".")
+    p_mod = path_to_module(pattern)
     if "*" in pattern or "?" in pattern:
-        return fnmatch.fnmatch(module_name, pattern) or fnmatch.fnmatch(module_name, p_dot)
+        return (
+            fnmatch.fnmatch(module_name, pattern)
+            or fnmatch.fnmatch(module_name, p_dot)
+            or fnmatch.fnmatch(module_name, p_mod)
+        )
     return (
         module_name == pattern
         or module_name == p_dot
+        or module_name == p_mod
         or module_name.startswith(pattern + ".")
         or module_name.startswith(p_dot + ".")
+        or module_name.startswith(p_mod + ".")
     )
 
 class AgentContract:

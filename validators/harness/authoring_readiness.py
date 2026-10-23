@@ -502,7 +502,7 @@ def validate_authoring_readiness(
             if wo_id in skip_ids:
                 continue
             status = str(data.get("status", "")).upper()
-            if status in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+            if status in ("COMPLETED", "CANCELLED"):
                 continue
             if p_idx is not None and (_parse_wo_index(wo_id) or 0) <= p_idx:
                 continue
