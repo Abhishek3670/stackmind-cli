@@ -2099,6 +2099,7 @@ class AutonomousDeliveryState:
             self.active_tool_target = None
             self.active_tool_code = None
             self.active_working_status = None
+            self.reset_attempts_and_retries()
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -2149,6 +2150,7 @@ class AutonomousDeliveryState:
 
         elif name in {"operation.cancelled", "agent.cancelled", "turn.cancelled", "session.cancelled"}:
             self.active_working_status = None
+            self.reset_attempts_and_retries()
             role = (payload.get("role") or "Agent").title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
             op_id = payload.get("operation_id")
@@ -2373,6 +2375,7 @@ class AutonomousDeliveryState:
             for k in self.completion_checklist:
                 self.completion_checklist[k] = True
             self.is_complete = True
+            self.reset_attempts_and_retries()
             for r_obj in self.roles.values():
                 if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
                     r_obj.state = "COMPLETED"
@@ -2390,6 +2393,7 @@ class AutonomousDeliveryState:
                     self.completion_checklist[k] = True
                 self.is_complete = True
                 self.error = None
+                self.reset_attempts_and_retries()
                 for r_obj in self.roles.values():
                     if r_obj.state.upper() in {"RUNNING", "ACTIVE", "WAITING"}:
                         r_obj.state = "COMPLETED"

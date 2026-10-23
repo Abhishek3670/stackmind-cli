@@ -125,3 +125,109 @@ def test_completed_turn_repaints_composer_without_working_status(monkeypatch):
     )
     assert "Working..." not in frame
     assert "Attempt" not in frame
+
+
+def test_subsequent_turn_streams_tokens_even_when_project_is_complete(monkeypatch):
+    """When a project completed earlier, a subsequent prompt turn must still stream all tokens."""
+    from cli.tui import commands
+    from cli.tui.state import ProjectPhase
+
+    stream_events = [
+        {"name": "turn.started", "sequence": 1, "payload": {"operation_id": "turn-2", "prompt": "fix ball physics"}},
+        {"name": "token.delta", "sequence": 2, "payload": {"operation_id": "turn-2", "delta": "Adjusting "}},
+        {"name": "token.delta", "sequence": 3, "payload": {"operation_id": "turn-2", "delta": "spring stiffness."}},
+        {"name": "turn.completed", "sequence": 4, "payload": {"operation_id": "turn-2"}},
+    ]
+
+    class _Adapter:
+        def stream(self, *args, **kwargs):
+            return iter(stream_events)
+
+    class _Client:
+        pass
+
+    redraws: list[dict] = []
+    monkeypatch.setattr(commands, "redraw_full_screen", lambda *a, **k: redraws.append(k))
+    monkeypatch.setattr(commands, "install_resize_handler", lambda: None)
+    monkeypatch.setattr(commands, "check_terminal_resize", lambda cols, lines: (False, cols, lines))
+
+    state = AutonomousDeliveryState(project_name="demo", session_id="sess-1")
+    state.is_complete = True
+    state.phase = ProjectPhase.PROJECT_COMPLETE
+
+    commands._stream_turn_execution(
+        _Adapter(),
+        _Client(),
+        {"session_id": "sess-1"},
+        state,
+        op_id="turn-2",
+        is_tty=True,
+    )
+
+    # Must contain the streamed response and NOT the autonomous delivery complete message
+    assert len(state.messages) == 1
+    last_msg = state.messages[-1]
+    assert last_msg.role == "assistant"
+    assert "Adjusting spring stiffness." in last_msg.content
+    assert "Autonomous delivery complete" not in last_msg.content
+
+
+def test_subsequent_turn_actions_do_not_leak_prior_turn_actions(monkeypatch):
+    """A subsequent turn must never attach actions from a prior completed turn."""
+    from cli.tui import commands
+    from cli.tui.state import TurnAction
+
+    # Stale actions from a prior turn (e.g. Gitops writing files)
+    state = AutonomousDeliveryState(project_name="demo", session_id="sess-1")
+    state.current_turn_actions.actions.append(
+        TurnAction(action_id="act-1", tool_name="write_file", target="VERSION.md", description="Write(VERSION.md)", status="COMPLETED")
+    )
+    assert not state.current_turn_actions.is_empty
+
+    class _Adapter:
+        def stream(self, *args, **kwargs):
+            return iter([
+                {"name": "turn.started", "sequence": 1, "payload": {"operation_id": "turn-3"}},
+                {"name": "token.delta", "sequence": 2, "payload": {"operation_id": "turn-3", "delta": "Hello"}},
+                {"name": "turn.completed", "sequence": 3, "payload": {"operation_id": "turn-3"}},
+            ])
+
+    class _Client:
+        pass
+
+    monkeypatch.setattr(commands, "redraw_full_screen", lambda *a, **k: None)
+    monkeypatch.setattr(commands, "install_resize_handler", lambda: None)
+    monkeypatch.setattr(commands, "check_terminal_resize", lambda cols, lines: (False, cols, lines))
+
+    commands._stream_turn_execution(
+        _Adapter(),
+        _Client(),
+        {"session_id": "sess-1"},
+        state,
+        op_id="turn-3",
+        is_tty=True,
+    )
+
+    last_msg = state.messages[-1]
+    assert last_msg.content == "Hello"
+    # Actions should be None or empty, never containing the stale VERSION.md action
+    if last_msg.actions is not None:
+        assert last_msg.actions.is_empty or not any(a.target == "VERSION.md" for a in last_msg.actions.actions)
+
+
+def test_process_event_operation_completed_resets_attempts_and_retries():
+    """Terminal operation events must reset attempts and retries so idle frame never displays stale counters."""
+    state = AutonomousDeliveryState(project_name="demo", session_id="sess-1")
+    state.process_event({
+        "name": "turn.started",
+        "payload": {"attempt": 1, "retry": 0, "max_attempts": 10, "max_retries": 10},
+    })
+    assert state.retry_status_display == "(1/10 Attempt . 0/10 Retry)"
+
+    state.process_event({
+        "name": "operation.completed",
+        "payload": {"operation_id": "op-1", "role": "architecture"},
+    })
+    assert state.retry_status_display is None
+    assert state.attempt_count == 0
+    assert state.retry_count == 0

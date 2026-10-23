@@ -175,11 +175,12 @@ def test_tui_repl_interactive_session_execution(tmp_path: Path):
         ":exit",
     ]) + "\n"
 
-    result = CliRunner().invoke(
-        cli,
-        ["tui", "--workspace", str(tmp_path)],
-        input=user_inputs,
-    )
+    with LocalDaemon(tmp_path / "daemon", port=0) as daemon:
+        result = CliRunner().invoke(
+            cli,
+            ["tui", "--daemon-url", daemon.url, "--workspace", str(tmp_path), "--yes"],
+            input=user_inputs,
+        )
 
     assert result.exit_code == 0, result.output
     assert "Available commands:" in result.output

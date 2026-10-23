@@ -57,6 +57,7 @@ from cli.tui.layout import (
     render_runtime_panel_str,
 )
 from cli.tui.state import (
+    ActionsGroup,
     AutonomousDeliveryState,
     OperationNode,
     ProjectPhase,
@@ -394,9 +395,11 @@ def _stream_turn_execution(
     op_rec: dict[str, Any] | None = None
     op_status: str | None = None
 
-    # A new turn starts with a clean attempt/retry display. Stale counters from
-    # the previous turn otherwise bleed into this turn's composer border.
+    # A new turn starts with a clean attempt/retry display and clean actions.
+    # Stale counters and actions from the previous turn otherwise bleed into
+    # this turn's composer border and transcript.
     state.reset_attempts_and_retries()
+    state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
 
     _TERMINAL_OP_STATUS = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
     _RUNNING_OP_STATUS = {"RUNNING", "ACTIVE", "IN_PROGRESS", "PENDING"}
@@ -925,24 +928,23 @@ def _stream_turn_execution(
                 "run.blocked",
                 "project.completed",
                 "project.complete",
-            } or state.is_complete or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE:
+            }:
                 target_op = ev_payload.get("operation_id") or ev.get("operation_id")
-                if (
-                    ev_name in {
-                        "turn.completed",
-                        "turn.blocked",
-                        "run.complete",
-                        "run.failed",
-                        "run.blocked",
-                        "project.completed",
-                        "project.complete",
-                    }
-                    or state.is_complete
-                    or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE
-                    or (target_op and target_op == op_id)
+                is_matching_op = (
+                    (target_op and target_op == op_id)
                     or (not target_op and op_id in {"turn", "all"})
                     or op_id == "all"
-                ):
+                )
+                is_run_terminal = ev_name in {
+                    "turn.completed",
+                    "turn.blocked",
+                    "run.complete",
+                    "run.failed",
+                    "run.blocked",
+                    "project.completed",
+                    "project.complete",
+                }
+                if is_matching_op or is_run_terminal:
                     completed = True
                     if ev_name in {
                         "operation.failed",
@@ -1303,11 +1305,18 @@ def _stream_turn_execution(
                     click.echo(render_error_box_str(err_msg, title=err_title))
                 assistant_rendered = True
             elif completed:
-                if state.is_complete or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE:
+                if (
+                    op_id in {"delivery", "gitops", "integration", "run"}
+                    and (state.is_complete or getattr(state, "phase", None) == ProjectPhase.PROJECT_COMPLETE)
+                ):
                     completion_msg = "✓ Autonomous delivery complete. All work orders implemented, verified, and released."
                 else:
                     completion_msg = f"Turn operation {op_id} completed."
-                turn_acts = state.current_turn_actions
+                turn_acts = (
+                    state.current_turn_actions
+                    if (state.current_turn_actions and not state.current_turn_actions.is_empty)
+                    else None
+                )
                 state.add_message("assistant", completion_msg, actions=turn_acts)
                 if is_tty:
                     redraw_full_screen(
@@ -1343,6 +1352,7 @@ def _stream_turn_execution(
 
     if hasattr(state, "current_turn_actions") and state.current_turn_actions:
         state.current_turn_actions.complete_all()
+    state.reset_attempts_and_retries()
 
     # Always repaint the final frame. When the turn completed via a full
     # response event (assistant_rendered is already True) there are no
@@ -1390,8 +1400,9 @@ def dispatch_delivery_command(
         client_timeout if client_timeout is not None else getattr(state, "client_timeout", 0.0)
     )
     state.client_timeout = effective_timeout
-    # Clear thinking buffer at start of new turn to prevent stale thinking from previous turn
+    # Clear thinking buffer and turn actions at start of new turn to prevent stale state from previous turn
     state.current_turn_thinking = ""
+    state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
     normalized = text.strip()
     if not normalized:
         return session, False
@@ -2619,6 +2630,8 @@ def dispatch_delivery_command(
         result = adapter.command(normalized, session_id=session["session_id"], **turn_kwargs)
         op_id = result.get("operation_id", "turn") if isinstance(result, dict) else "turn"
         if is_goal:
+            state.is_complete = False
+            state.phase = ProjectPhase.INITIALIZING
             state.add_activity("User", "submitted goal to Architecture", op_id)
             # Convention note: state.roles keys are Title-cased ("Architecture", "Q/A").
             # The daemon registers operations under lowercase ("architecture").
