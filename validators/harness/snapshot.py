@@ -27,6 +27,11 @@ DEFAULT_IGNORED_PATTERNS = frozenset({
     ".vscode",
     ".windsurf",
     ".claude",
+    "node_modules",
+    ".next",
+    ".turbo",
+    "dist",
+    "build",
 })
 
 

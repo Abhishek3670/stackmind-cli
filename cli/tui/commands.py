@@ -398,8 +398,9 @@ def _stream_turn_execution(
     # A new turn starts with a clean attempt/retry display and clean actions.
     # Stale counters and actions from the previous turn otherwise bleed into
     # this turn's composer border and transcript.
-    state.reset_attempts_and_retries()
-    state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
+    if op_id == "turn":
+        state.reset_attempts_and_retries()
+        state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
 
     _TERMINAL_OP_STATUS = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
     _RUNNING_OP_STATUS = {"RUNNING", "ACTIVE", "IN_PROGRESS", "PENDING"}
@@ -2674,6 +2675,35 @@ def dispatch_delivery_command(
     op_id = "turn"
 
     try:
+        active_op = session.get("active_operation")
+        if not active_op and hasattr(client, "get_session"):
+            try:
+                fresh_s = client.get_session(session["session_id"])
+                if isinstance(fresh_s, Mapping) and fresh_s.get("active_operation"):
+                    active_op = fresh_s["active_operation"]
+                    session["active_operation"] = active_op
+            except Exception:
+                pass
+
+        if active_op:
+            cur_op = state.get_current_operation() or {}
+            active_role = cur_op.get("role") or session.get("active_role") or "Agent"
+            active_backend = cur_op.get("backend") or session.get("provider") or ""
+            model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+            return _stream_turn_execution(
+                adapter,
+                client,
+                session,
+                state,
+                op_id=active_op,
+                placeholder=f"⚡ {active_role} is working... (:cancel to abort)",
+                effective_timeout=effective_timeout,
+                is_tty=is_tty,
+                live_manager=live_manager,
+                model_name=model_label,
+                initial_activity_desc=f"{active_role} running",
+            )
+
         turn_kwargs: dict[str, Any] = {}
         if not is_goal and hasattr(state, "messages") and state.messages:
             c_hist: list[dict[str, str]] = []

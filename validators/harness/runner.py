@@ -64,6 +64,11 @@ HARNESS_SNAPSHOT_IGNORED = frozenset({
     '.vscode',
     '.windsurf',
     '.claude',
+    'node_modules',
+    '.next',
+    '.turbo',
+    'dist',
+    'build',
 })
 
 

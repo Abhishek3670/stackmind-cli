@@ -288,6 +288,12 @@ def _run_demo(client: DaemonClient, session: dict[str, Any]) -> None:
     show_default=True,
     help="Turn operation wait timeout in seconds (0=no timeout).",
 )
+class _ActiveOperationDetected(Exception):
+    def __init__(self, operation_id: str) -> None:
+        self.operation_id = operation_id
+        super().__init__(operation_id)
+
+
 def tui(
     daemon_url: str | None,
     agent: str,
@@ -460,6 +466,41 @@ def tui(
                 )
                 comp_width = conv_width if layout_info.show_runtime else term_cols
 
+                # Auto-attach to in-flight daemon operation if active
+                sid = session.get("session_id")
+                if client is not None and sid:
+                    try:
+                        fresh = client.get_session(sid)
+                        if isinstance(fresh, Mapping):
+                            session = dict(fresh)
+                            state.update_from_session(session)
+                    except Exception:
+                        pass
+
+                active_op = session.get("active_operation")
+                if active_op:
+                    from cli.tui.commands import _stream_turn_execution
+                    cur_op = state.get_current_operation() or {}
+                    active_role = cur_op.get("role") or session.get("active_role") or "Agent"
+                    active_backend = cur_op.get("backend") or session.get("provider") or ""
+                    model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                    session, should_exit = _stream_turn_execution(
+                        adapter,
+                        client,
+                        session,
+                        state,
+                        op_id=active_op,
+                        is_tty=is_tty,
+                        live_manager=live_ws,
+                        model_name=model_label,
+                        initial_activity_desc=f"{active_role} running",
+                    )
+                    if should_exit:
+                        if live_ws is not None:
+                            live_ws.stop()
+                        break
+                    continue
+
                 def _handle_ctrl_k() -> None:
                     out = get_help_str()
                     state.add_message("user", ":help")
@@ -482,6 +523,28 @@ def tui(
                             )
                             else None
                         )
+                        conv_content = None
+                        has_in_progress = (
+                            (hasattr(state, "current_turn_actions") and not state.current_turn_actions.is_empty)
+                            or bool(getattr(state, "current_turn_thinking", None))
+                            or bool(session.get("active_operation"))
+                        )
+                        if has_in_progress:
+                            from cli.tui.commands import _build_in_progress_turn_content
+                            layout_info = compute_layout(current_cols, state=state)
+                            cur_op = state.get_current_operation() or {}
+                            active_role = cur_op.get("role") or session.get("active_role") or "Agent"
+                            active_backend = cur_op.get("backend") or session.get("provider") or ""
+                            model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                            conv_content = _build_in_progress_turn_content(
+                                state,
+                                model_name=model_label,
+                                streamed_chunks=[],
+                                latest_act_desc="",
+                                start_time=time.time(),
+                                max_wait=0.0,
+                                layout_width=layout_info.conversation_width,
+                            )
                         redraw_full_screen(
                             session,
                             state,
@@ -489,6 +552,7 @@ def tui(
                             include_composer=True,
                             composer_is_active=True,
                             composer_content=current_text,
+                            conversation_content=conv_content,
                             live_manager=live_ws,
                         )
                         cursor_col = _compute_cursor_col(editor)
@@ -641,6 +705,28 @@ def tui(
                     term_size = shutil.get_terminal_size(fallback=(current_cols, current_lines))
                     term_cols = term_size.columns
                     term_lines = term_size.lines
+                    conv_content = None
+                    has_in_progress = (
+                        (hasattr(state, "current_turn_actions") and not state.current_turn_actions.is_empty)
+                        or bool(getattr(state, "current_turn_thinking", None))
+                        or bool(session.get("active_operation"))
+                    )
+                    if has_in_progress:
+                        from cli.tui.commands import _build_in_progress_turn_content
+                        layout_info = compute_layout(term_cols, state=state)
+                        cur_op = state.get_current_operation() or {}
+                        active_role = cur_op.get("role") or session.get("active_role") or "Agent"
+                        active_backend = cur_op.get("backend") or session.get("provider") or ""
+                        model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                        conv_content = _build_in_progress_turn_content(
+                            state,
+                            model_name=model_label,
+                            streamed_chunks=[],
+                            latest_act_desc="",
+                            start_time=time.time(),
+                            max_wait=0.0,
+                            layout_width=layout_info.conversation_width,
+                        )
                     redraw_full_screen(
                         session,
                         state,
@@ -650,6 +736,7 @@ def tui(
                         include_composer=True,
                         composer_is_active=True,
                         composer_content=current_text,
+                        conversation_content=conv_content,
                         live_manager=live_ws,
                     )
                     cursor_col = _compute_cursor_col(editor)
@@ -815,6 +902,22 @@ def tui(
                                 did_update = True
                         if did_update:
                             _handle_height_change(editor)
+                        if client is not None:
+                            try:
+                                fresh_sess = client.get_session(sid)
+                                if isinstance(fresh_sess, Mapping):
+                                    session.update(fresh_sess)
+                                    active_op_cand = fresh_sess.get("active_operation")
+                                    if active_op_cand:
+                                        if editor is not None and hasattr(editor, "buffer"):
+                                            preserve_composer_buffer(state, "".join(editor.buffer))
+                                        raise _ActiveOperationDetected(active_op_cand)
+                            except _ActiveOperationDetected:
+                                raise
+                            except Exception:
+                                pass
+                    except _ActiveOperationDetected:
+                        raise
                     except Exception:
                         pass
 
@@ -882,15 +985,21 @@ def tui(
                             state.scroll_focus = "work_orders"
                         _handle_height_change(editor)
 
+                active_op = session.get("active_operation")
                 is_awaiting_plan = (
                     getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
                     or (getattr(state, "plan", None) and state.plan.get("state") == "AWAITING_APPROVAL")
                 )
-                comp_placeholder = (
-                    "Plan ready: type :approve or 'continue' to execute..."
-                    if is_awaiting_plan
-                    else "Type a message..."
-                )
+                if active_op:
+                    cur_op = state.get_current_operation() or {}
+                    active_role = cur_op.get("role") or session.get("active_role") or "Agent"
+                    comp_placeholder = f"⚡ {active_role} is working... (:cancel to abort)"
+                elif is_awaiting_plan:
+                    comp_placeholder = (
+                        "Plan ready: type :approve or 'continue' to execute..."
+                    )
+                else:
+                    comp_placeholder = "Type a message..."
 
                 text = prompt_composer_input(
                     placeholder=comp_placeholder,
@@ -914,6 +1023,28 @@ def tui(
                     live_manager=live_ws,
                     full_screen=is_tty,
                 )
+            except _ActiveOperationDetected as aod:
+                from cli.tui.commands import _stream_turn_execution
+                cur_op = state.get_current_operation() or {}
+                active_role = cur_op.get("role") or session.get("active_role") or "Agent"
+                active_backend = cur_op.get("backend") or session.get("provider") or ""
+                model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                session, should_exit = _stream_turn_execution(
+                    adapter,
+                    client,
+                    session,
+                    state,
+                    op_id=aod.operation_id,
+                    is_tty=is_tty,
+                    live_manager=live_ws,
+                    model_name=model_label,
+                    initial_activity_desc=f"{active_role} running",
+                )
+                if should_exit:
+                    if live_ws is not None:
+                        live_ws.stop()
+                    break
+                continue
             except (EOFError, KeyboardInterrupt):
                 if live_ws is not None:
                     live_ws.stop()

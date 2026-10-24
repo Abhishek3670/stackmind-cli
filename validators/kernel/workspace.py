@@ -32,7 +32,19 @@ class ScratchWorkspace:
             rel = Path(directory).resolve().relative_to(authoritative)
             ignored = set()
             for name in files:
-                if name in (".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".coverage"):
+                if name in (
+                    ".git",
+                    ".venv",
+                    "__pycache__",
+                    ".pytest_cache",
+                    ".ruff_cache",
+                    ".coverage",
+                    "node_modules",
+                    ".next",
+                    ".turbo",
+                    "dist",
+                    "build",
+                ):
                     ignored.add(name)
                 elif rel == Path(".sync") and name in ("runtime", "knowledge", "snapshots", "reports", "state", "outbox", "lock", "drafts"):
                     ignored.add(name)

@@ -232,6 +232,7 @@ def verify_post_execution(
     project_files_to_check = tuple(
         f for f in files_to_check
         if not str(f).replace("\\", "/").startswith(".sync/")
+        and not any(str(f).replace("\\", "/").lstrip("/").startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/"))
     )
     if max_files is not None and len(project_files_to_check) > max_files:
         raise ContractAccessDenied(
@@ -245,6 +246,8 @@ def verify_post_execution(
         norm_fp = file_path.replace("\\", "/").lstrip("/")
         if norm_fp.startswith("./"):
             norm_fp = norm_fp[2:]
+        if any(norm_fp.startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")):
+            continue
         mod = path_to_module(norm_fp)
         if norm_fp.startswith("./"):
             norm_fp = norm_fp[2:]
