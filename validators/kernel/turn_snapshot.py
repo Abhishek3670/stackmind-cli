@@ -6,10 +6,11 @@ outside the workspace boundary, protecting them against tampering, pruning, or r
 by workspace child processes.
 
 Host Substrate:
-- Primary host: Windows 11 (tested).
+- Primary host: Windows 11 (tested, empirical Job Object containment).
 - Windows configuration: core.filemode=false, core.symlinks=false, core.autocrlf=false.
-- Symlinks & junctions on Windows: detected and unlinked via os.lstat before restore.
-- POSIX portable mode: captures executable bit (100755 vs 100644) when running on non-Windows hosts.
+- Reparse points & junctions on Windows: detected and unlinked via os.lstat/os.rmdir
+  without recursive traversal before restore and cleanup.
+- POSIX portable mode: UNVERIFIED (marked per project policy).
 
 Filter Pipeline Bypass:
 - Completely bypasses Git's working-tree filter pipeline (.gitattributes eol, ident, filters):
@@ -19,11 +20,14 @@ Filter Pipeline Bypass:
     to workspace files, bypassing checkout-index and filter pipelines entirely.
 
 Store Integrity & Defense-in-Depth:
-- Hashes external store config at baseline; re-verifies SHA-256 before every supervisor operation.
+- Computes comprehensive metadata digest across the external store (all files except object pools
+  under objects/??/ and objects/pack/); verifies objects only grow monotonically.
+- Neutralizes hooks, fsmonitor, and alternates tampering (e.g. objects/info/alternates or hooks/*).
 - Injects `-c core.fsmonitor=false -c core.hooksPath="" -c core.excludesFile=""` and
   `GIT_CONFIG_GLOBAL/SYSTEM=null` on every invocation to neutralize config-injection attacks.
-- Enforces process-tree reaping as a mandatory precondition prior to diff and restore.
-- Unlinks files before overwrite on restore to destroy NTFS Alternate Data Streams (ADS).
+- Enforces Job Object process-tree reaping (KILL_ON_JOB_CLOSE, no breakaway) prior to diff and restore.
+- Unlinks files before overwrite on restore to destroy NTFS Alternate Data Streams (ADS),
+  and scans with FindFirstStreamW to detect and eradicate any residual ADS on unchanged files.
 - Deletes untracked files and removes emptied directories bottom-up on restore.
 - Never moves workspace HEAD or alters workspace branch refs or .git/index.
 """
@@ -57,12 +61,14 @@ class SnapshotIntegrityError(TurnSnapshotError):
     pass
 
 
+# Default exclusions strictly anchored to workspace root.
+# Note: __pycache__ is omitted from exclusions so that any bytecode planted in
+# subdirectories is captured and monitored, while PYTHONDONTWRITEBYTECODE=1 prevents noise.
 DEFAULT_SUPERVISOR_EXCLUSIONS: tuple[str, ...] = (
     ".git",
     "node_modules",
     ".venv",
     ".pytest_cache",
-    "__pycache__",
     ".ruff_cache",
     ".sync/runtime",
 )
@@ -86,7 +92,8 @@ class TurnSnapshotManager:
         self.exclusions = tuple(exclusions or DEFAULT_SUPERVISOR_EXCLUSIONS)
         self.reaper = reaper or get_global_reaper()
         self.snapshot_shas: dict[str, str] = {}
-        self.baseline_config_hash: str | None = None
+        self.baseline_store_hash: str | None = None
+        self.known_objects: set[str] = set()
 
         self.null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
         self.base_env = {
@@ -94,6 +101,7 @@ class TurnSnapshotManager:
             "GIT_CONFIG_GLOBAL": self.null_dev,
             "GIT_CONFIG_SYSTEM": self.null_dev,
             "GIT_CONFIG_NOSYSTEM": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_AUTHOR_NAME": "StackMind Supervisor",
             "GIT_AUTHOR_EMAIL": "supervisor@stackmind.local",
             "GIT_COMMITTER_NAME": "StackMind Supervisor",
@@ -138,22 +146,97 @@ class TurnSnapshotManager:
                     env=self.base_env,
                 )
 
-        # Baseline SHA-256 of the store configuration file
-        self.baseline_config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        self.baseline_store_hash = self._compute_store_metadata_hash()
+        self.known_objects = self._scan_store_objects()
 
-    def _verify_store_config_integrity(self) -> None:
-        """Verify the external store config has not been modified by workspace agents."""
+    def _is_object_pool_path(self, rel_path: str) -> bool:
+        """Check whether a path points to the loose object or pack pool."""
+        parts = rel_path.split("/")
+        if len(parts) >= 2 and parts[0] == "objects":
+            # Loose objects: objects/xx/yyyy...
+            if len(parts[1]) == 2 and all(c in "0123456789abcdefABCDEF" for c in parts[1]):
+                return True
+            # Pack files: objects/pack/pack-...
+            if parts[1] == "pack":
+                return True
+        return False
+
+    def _compute_store_metadata_hash(self) -> str:
+        """Compute digest over all files in storage_root EXCEPT actual object pools."""
+        hasher = hashlib.sha256()
+        if not self.storage_root.exists():
+            return ""
+
+        meta_entries: list[tuple[str, bytes]] = []
+        for root, dirs, files in os.walk(self.storage_root):
+            root_path = Path(root)
+            for f in sorted(files):
+                # Skip temporary index files generated per-turn
+                if f.startswith("idx_"):
+                    continue
+                fp = root_path / f
+                rel = fp.relative_to(self.storage_root).as_posix()
+                # Exclude object pools (objects/xx/* and objects/pack/*)
+                # Note: objects/info/alternates IS hashed as metadata!
+                if self._is_object_pool_path(rel):
+                    continue
+                try:
+                    meta_entries.append((rel, fp.read_bytes()))
+                except OSError:
+                    pass
+
+        # Sort deterministically by relative path
+        meta_entries.sort(key=lambda x: x[0])
+        for rel_name, content in meta_entries:
+            hasher.update(rel_name.encode("utf-8"))
+            hasher.update(b"\x00")
+            hasher.update(hashlib.sha256(content).digest())
+
+        return hasher.hexdigest()
+
+    def _scan_store_objects(self) -> set[str]:
+        """Collect relative paths of all loose objects and pack files in the store."""
+        objects_dir = self.storage_root / "objects"
+        objs: set[str] = set()
+        if not objects_dir.exists():
+            return objs
+        for root, dirs, files in os.walk(objects_dir):
+            root_path = Path(root)
+            for f in files:
+                rel = (root_path / f).relative_to(self.storage_root).as_posix()
+                if self._is_object_pool_path(rel):
+                    objs.add(rel)
+        return objs
+
+    def _verify_store_integrity(self) -> None:
+        """Verify external store metadata and monotonic growth of objects."""
+        if not self.storage_root.exists():
+            raise SnapshotIntegrityError(
+                f"External snapshot store corrupted: root '{self.storage_root}' is missing or deleted."
+            )
         config_path = self.storage_root / "config"
-        if not self.storage_root.exists() or not config_path.exists():
+        if not config_path.exists():
             raise SnapshotIntegrityError(
                 f"External snapshot store corrupted: config file '{config_path}' is missing or deleted."
             )
-        current_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
-        if self.baseline_config_hash and current_hash != self.baseline_config_hash:
+
+        # 1. Verify store metadata (config, hooks, HEAD, alternates, description)
+        curr_meta_hash = self._compute_store_metadata_hash()
+        if self.baseline_store_hash and curr_meta_hash != self.baseline_store_hash:
             raise SnapshotIntegrityError(
-                f"External snapshot store config tampering detected! "
-                f"Expected hash {self.baseline_config_hash}, found {current_hash}."
+                f"External snapshot store tampering detected: store metadata or unauthorized file added "
+                f"(e.g. hooks or alternates)! Expected {self.baseline_store_hash}, found {curr_meta_hash}."
             )
+
+        # 2. Verify objects only grew monotonically (none were deleted or truncated)
+        current_objs = self._scan_store_objects()
+        missing_objs = self.known_objects - current_objs
+        if missing_objs:
+            raise SnapshotIntegrityError(
+                f"External snapshot store corrupted: {len(missing_objs)} objects missing or deleted from object pool!"
+            )
+        # Update known objects with newly added objects
+        self.known_objects.update(current_objs)
 
     def _git_run(
         self,
@@ -166,7 +249,7 @@ class TurnSnapshotManager:
         input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Execute a git plumbing command with store integrity check and defensive flags."""
-        self._verify_store_config_integrity()
+        self._verify_store_integrity()
         cmd = [
             "git",
             "--git-dir", str(self.storage_root),
@@ -186,8 +269,9 @@ class TurnSnapshotManager:
         )
 
     def _is_excluded(self, rel_path: str) -> bool:
-        """Check whether a relative POSIX path matches supervisor exclusions."""
+        """Check whether a relative POSIX path matches workspace-root-anchored exclusions."""
         for excl in self.exclusions:
+            # Strictly anchored to workspace root: rel_path is either the root folder itself or inside it
             if rel_path == excl or rel_path.startswith(f"{excl}/"):
                 return True
         return False
@@ -196,10 +280,9 @@ class TurnSnapshotManager:
         """Scan workspace for nested .git directories or gitfiles outside exclusions.
 
         Decided policy:
-        - Nested .git directories inside supervisor-excluded dependency paths
-          (such as `node_modules/` or `.venv/`) from package managers are ignored.
-        - Any nested .git directory or gitfile anywhere inside tracked source
-          directories raises NestedGitError to prevent gitlink file hiding.
+        - Root-anchored exclusions (e.g. `node_modules/` or `.venv/` at workspace root) are ignored.
+        - Any nested .git directory or gitfile anywhere else inside tracked source directories
+          (e.g. `src/sub_repo/.git` or `src/node_modules/.git`) raises NestedGitError.
         """
         if not self.workspace.exists():
             return
@@ -208,8 +291,8 @@ class TurnSnapshotManager:
             if root_path == self.workspace:
                 continue
             rel_dir = root_path.relative_to(self.workspace).as_posix()
-            # If inside an excluded dependency directory (e.g. node_modules, .venv), skip checking
             if self._is_excluded(rel_dir):
+                dirs.clear()
                 continue
             if ".git" in dirs or ".git" in files:
                 rel = root_path.relative_to(self.workspace)
@@ -218,6 +301,23 @@ class TurnSnapshotManager:
                     "Nested git structures hide files from tracking and are prohibited."
                 )
 
+    def check_post_turn(self, turn_id: str | None = None) -> None:
+        """Post-turn gate verification.
+
+        If a nested git repository was planted during the turn, reaps all processes,
+        restores the workspace from the turn snapshot, and raises NestedGitError.
+        """
+        try:
+            self.check_nested_git()
+        except NestedGitError:
+            self.reap_processes()
+            if turn_id:
+                try:
+                    self.restore_turn_snapshot(turn_id)
+                except Exception:
+                    pass
+            raise
+
     def reap_processes(self) -> list[int]:
         """Reap all managed and descendant processes before diff or restore."""
         if self.reaper:
@@ -225,7 +325,7 @@ class TurnSnapshotManager:
         return []
 
     def _collect_workspace_files(self) -> list[Path]:
-        """Collect all files in workspace outside supervisor exclusions."""
+        """Collect all files in workspace outside root-anchored exclusions."""
         collected: list[Path] = []
         if not self.workspace.exists():
             return collected
@@ -234,9 +334,9 @@ class TurnSnapshotManager:
             root_path = Path(root)
             rel_root = root_path.relative_to(self.workspace).as_posix() if root_path != self.workspace else ""
             if rel_root and self._is_excluded(rel_root):
-                dirs.clear()  # Do not recurse into excluded directory
+                dirs.clear()
                 continue
-            # Filter dirs in-place to avoid descending into excluded subtrees
+            # Filter dirs in-place to avoid descending into root-anchored excluded subtrees
             dirs[:] = [
                 d for d in dirs
                 if not self._is_excluded(f"{rel_root}/{d}" if rel_root else d)
@@ -248,13 +348,9 @@ class TurnSnapshotManager:
         return collected
 
     def create_turn_snapshot(self, turn_id: str) -> str:
-        """Capture a complete working tree snapshot bypassing Git's filter pipeline.
-
-        Uses hash-object --no-filters and update-index --add --cacheinfo to store
-        raw bytes directly, neutralizing any workspace .gitattributes filters or eol rules.
-        """
+        """Capture a complete working tree snapshot bypassing Git's filter pipeline."""
         self.check_nested_git()
-        self._verify_store_config_integrity()
+        self._verify_store_integrity()
 
         temp_index = self.storage_root / f"idx_{turn_id}"
         snap_env = {**self.base_env, "GIT_INDEX_FILE": str(temp_index)}
@@ -263,11 +359,9 @@ class TurnSnapshotManager:
             files_to_snap = self._collect_workspace_files()
 
             if not files_to_snap:
-                # Empty workspace tree
                 res = self._git_run(["write-tree"], env=snap_env)
                 tree_sha = res.stdout.strip()
             else:
-                # 1. Ingest raw file bytes into object store in batches using hash-object --no-filters
                 batch_size = 50
                 cacheinfo_args: list[str] = []
 
@@ -286,7 +380,6 @@ class TurnSnapshotManager:
 
                     for p, sha in zip(chunk, shas):
                         rel_path = p.relative_to(self.workspace).as_posix()
-                        # Mode: regular 100644 (or 100755 if executable on POSIX)
                         mode = "100644"
                         if sys.platform != "win32":
                             try:
@@ -296,25 +389,24 @@ class TurnSnapshotManager:
                                 pass
                         cacheinfo_args.extend(["--cacheinfo", f"{mode},{sha},{rel_path}"])
 
-                # 2. Stage directly into temporary index
                 update_cmd = ["update-index", "--add", *cacheinfo_args]
                 self._git_run(update_cmd, env=snap_env)
 
-                # 3. Write tree object
                 tree_res = self._git_run(["write-tree"], env=snap_env)
                 tree_sha = tree_res.stdout.strip()
 
-            # 4. Commit tree directly
             commit_res = self._git_run(
                 ["commit-tree", tree_sha, "-m", f"turn snapshot {turn_id}"],
                 env=snap_env,
             )
             commit_sha = commit_res.stdout.strip()
 
-            # 5. Record ref in external store and in supervisor memory
             ref_name = f"refs/stackmind/turn/{turn_id}"
             self._git_run(["update-ref", ref_name, commit_sha], env=snap_env)
             self.snapshot_shas[turn_id] = commit_sha
+            # Update known objects and baseline metadata after commit
+            self.known_objects.update(self._scan_store_objects())
+            self.baseline_store_hash = self._compute_store_metadata_hash()
             return commit_sha
 
         finally:
@@ -326,12 +418,11 @@ class TurnSnapshotManager:
 
     def list_snapshot_files(self, snapshot_sha: str) -> dict[str, str]:
         """List all tracked file paths and blob SHAs in the snapshot tree."""
-        self._verify_store_config_integrity()
+        self._verify_store_integrity()
         res = self._git_run(
             ["ls-tree", "-r", "-z", f"{snapshot_sha}^{{tree}}"],
             text=False,
         )
-        # Parse null-delimited entries: <mode> <type> <sha>\t<path>\0
         raw_output = res.stdout
         files_map: dict[str, str] = {}
         if not raw_output:
@@ -350,23 +441,61 @@ class TurnSnapshotManager:
                 continue
         return files_map
 
-    def restore_turn_snapshot(self, turn_id: str, expected_sha: str | None = None) -> None:
-        """Safely restore the workspace to a snapshot without moving workspace HEAD.
+    def _enumerate_and_wipe_ads(self, file_path: Path) -> None:
+        """Enumerate and eliminate non-default NTFS Alternate Data Streams."""
+        if sys.platform != "win32" or not file_path.exists() or file_path.is_dir():
+            return
 
-        Preconditions:
-        1. Process tree kill: reaps any active child or background processes.
-        2. Config integrity: validates store configuration hash.
-        3. Ref & SHA binding: confirms snapshot SHA matches supervisor-tracked state.
-        4. Symlink neutralization: lstats and unlinks planted symlinks/junctions.
-        5. Filter bypass restore: writes raw blob bytes directly to workspace files.
-        6. Untracked cleanup: unlinks newly created untracked files and removes emptied dirs.
-        7. Post-turn verification: checks for nested git repositories.
-        """
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class WIN32_FIND_STREAM_DATA(ctypes.Structure):
+            _fields_ = [
+                ("StreamSize", ctypes.c_int64),
+                ("cStreamName", wintypes.WCHAR * 296),
+            ]
+
+        kernel32.FindFirstStreamW.restype = wintypes.HANDLE
+        kernel32.FindFirstStreamW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.FindNextStreamW.restype = wintypes.BOOL
+        kernel32.FindNextStreamW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        kernel32.FindClose.argtypes = [wintypes.HANDLE]
+
+        find_data = WIN32_FIND_STREAM_DATA()
+        h = kernel32.FindFirstStreamW(str(file_path), 0, ctypes.byref(find_data), 0)
+        if h == wintypes.HANDLE(-1).value or not h:
+            return
+
+        has_non_default = False
+        try:
+            while True:
+                name = find_data.cStreamName
+                if name and name != "::$DATA":
+                    has_non_default = True
+                    break
+                if not kernel32.FindNextStreamW(h, ctypes.byref(find_data)):
+                    break
+        finally:
+            kernel32.FindClose(h)
+
+        if has_non_default:
+            # Read clean primary content, unlink base file (which wipes all streams), rewrite content
+            try:
+                content = file_path.read_bytes()
+                file_path.unlink()
+                file_path.write_bytes(content)
+            except OSError:
+                pass
+
+    def restore_turn_snapshot(self, turn_id: str, expected_sha: str | None = None) -> None:
+        """Safely restore the workspace to a snapshot without moving workspace HEAD."""
         # 1. Kill process tree as a mandatory precondition
         self.reap_processes()
 
-        # 2. Verify external store config integrity
-        self._verify_store_config_integrity()
+        # 2. Verify external store integrity (config, hooks, alternates, objects)
+        self._verify_store_integrity()
 
         # 3. Check ref in external store
         ref_name = f"refs/stackmind/turn/{turn_id}"
@@ -380,7 +509,6 @@ class TurnSnapshotManager:
             )
         actual_sha = res.stdout.strip()
 
-        # Check against expected SHA (from memory or caller)
         target_expected = expected_sha or self.snapshot_shas.get(turn_id)
         if target_expected and actual_sha != target_expected:
             raise SnapshotIntegrityError(
@@ -399,7 +527,7 @@ class TurnSnapshotManager:
 
         snap_entries = self.list_snapshot_files(actual_sha)
 
-        # 5. Neutralize planted symlinks & junctions before checkout to prevent traversal escapes
+        # 5. Neutralize planted symlinks & junctions before restore without recursive descent
         for root, dirs, files in os.walk(self.workspace):
             root_path = Path(root)
             for f in files:
@@ -413,11 +541,11 @@ class TurnSnapshotManager:
                 dp = root_path / d
                 try:
                     if os.path.islink(dp) or dp.is_symlink():
+                        dirs.remove(d)  # Never recurse through planted junction or symlink
                         try:
-                            dp.unlink()
-                        except OSError:
                             os.rmdir(dp)
-                        dirs.remove(d)
+                        except OSError:
+                            dp.unlink()
                 except OSError:
                     pass
 
@@ -433,7 +561,6 @@ class TurnSnapshotManager:
                 except OSError:
                     pass
 
-            # Read raw blob bytes from object store
             blob_res = self._git_run(
                 ["cat-file", "blob", blob_sha],
                 text=False,
@@ -452,6 +579,15 @@ class TurnSnapshotManager:
             rel_root = root_path.relative_to(self.workspace).as_posix() if root_path != self.workspace else ""
             if rel_root and self._is_excluded(rel_root):
                 continue
+            # Neutralize directory links during walk
+            for d in list(dirs):
+                dp = root_path / d
+                if os.path.islink(dp) or dp.is_symlink():
+                    dirs.remove(d)
+                    try:
+                        os.rmdir(dp)
+                    except OSError:
+                        dp.unlink()
             for f in files:
                 rel_f = f"{rel_root}/{f}" if rel_root else f
                 if self._is_excluded(rel_f):
@@ -461,6 +597,9 @@ class TurnSnapshotManager:
                         (root_path / f).unlink()
                     except OSError:
                         pass
+                else:
+                    # Enumerate and wipe non-default ADS on unchanged files
+                    self._enumerate_and_wipe_ads(root_path / f)
 
         # 8. Clean up emptied directories bottom-up
         for root, dirs, files in os.walk(self.workspace, topdown=False):
@@ -471,18 +610,23 @@ class TurnSnapshotManager:
             if self._is_excluded(rel_dir):
                 continue
             try:
-                # If directory is now empty, remove it
                 if not any(root_path.iterdir()):
                     os.rmdir(root_path)
             except OSError:
                 pass
 
-        # 9. Run post-turn nested .git check
-        self.check_nested_git()
+        # 9. Run post-turn nested .git check (ensures processes reaped before raising)
+        try:
+            self.check_nested_git()
+        except NestedGitError:
+            self.reap_processes()
+            raise
 
     def create_rescue_ref(self, run_id: str) -> str:
         """Create a rescue commit and ref under refs/stackmind/rescue/<run_id>."""
         commit_sha = self.create_turn_snapshot(f"rescue_{run_id}")
         ref_name = f"refs/stackmind/rescue/{run_id}"
         self._git_run(["update-ref", ref_name, commit_sha])
+        self.known_objects.update(self._scan_store_objects())
+        self.baseline_store_hash = self._compute_store_metadata_hash()
         return commit_sha

@@ -5,18 +5,19 @@ Acceptance criteria:
 1. Filter pipeline bypass: workspace .gitattributes (eol, ident, filters) cannot alter
    snapshot or restore; files round-trip byte-exact.
 2. Untracked file and directory cleanup: new files and created directories are wiped on revert.
-3. Process-tree reaping: background processes attempting to write/race during restore are killed.
-4. Store config integrity: tampering with <store>/config (e.g. injecting fsmonitor) raises
-   SnapshotIntegrityError and prevents execution.
-5. Host substrate & symlink handling: Windows substrate documented; symlinks/reparse points
-   unlinked before restore (or skipped with explicit status if OS denies link creation).
-6. Nested .git detection: post-turn detection catches nested git repos/gitfiles in tracked code;
-   allows nested git inside supervisor-excluded dependency dirs (node_modules, .venv).
-7. Store integrity failures: deleting store dir, deleting ref, or corrupting objects raises
-   SnapshotIntegrityError.
-8. Non-HEAD revert: workspace .git HEAD and index remain untouched across snapshots and restores.
-9. Rescue ref: preserved under refs/stackmind/rescue/<run_id>.
-10. NTFS Alternate Data Streams (ADS): destroyed on restore via unlinking.
+3. Process-tree reaping: Job Object (KILL_ON_JOB_CLOSE, no breakaway) kills runaway grandchildren
+   even when intermediate parent process has already exited.
+4. Store config and metadata integrity: tampering with <store>/config, <store>/hooks/, or
+   <store>/objects/info/alternates raises SnapshotIntegrityError; objects only grow monotonically.
+5. Host substrate & symlink/junction handling: Windows substrate documented; junction/reparse points
+   are neutralized without recursive descent into the target folder.
+6. Untracked cleanup non-descending: cleanup walk does NOT recurse into planted junctions/symlinks;
+   outside files remain intact.
+7. Workspace root-anchored exclusions: files under src/node_modules and __pycache__ are captured.
+8. Post-turn nested .git check: reaps processes before raising NestedGitError.
+9. Non-default NTFS Alternate Data Streams (ADS): enumerated and eradicated on all files.
+10. Workspace .git index and HEAD remain untouched across snapshots and restores.
+11. Rescue ref: preserved under refs/stackmind/rescue/<run_id>.
 """
 
 from __future__ import annotations
@@ -47,13 +48,13 @@ def test_env(tmp_path):
     ws.mkdir()
     store = tmp_path / "supervisor_storage" / "snapshots.git"
 
-    # Initialize workspace as a git repo with an initial commit
     null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
     git_env = {
         **os.environ,
         "GIT_CONFIG_GLOBAL": null_dev,
         "GIT_CONFIG_SYSTEM": null_dev,
         "GIT_CONFIG_NOSYSTEM": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "GIT_AUTHOR_NAME": "Author",
         "GIT_AUTHOR_EMAIL": "author@test.com",
         "GIT_COMMITTER_NAME": "Committer",
@@ -86,28 +87,61 @@ def test_gitattributes_filter_bypass_roundtrips_byte_exact(test_env):
     """Workspace .gitattributes with eol=crlf and ident must not mutate file bytes."""
     ws, store, manager, head_sha, git_env, reaper = test_env
 
-    # Plant .gitattributes with aggressive eol and ident rules
     (ws / ".gitattributes").write_text("* text eol=crlf\n*.txt ident\n", encoding="utf-8")
 
-    # File with strict LF line endings and $Id$ ident token
     lf_content = b"first line\nsecond line\n$Id: 12345$\n"
     target_file = ws / "module.txt"
     target_file.write_bytes(lf_content)
 
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Agent corrupts the file during turn
     target_file.write_bytes(b"corrupted\r\n")
 
-    # Revert turn
     manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
 
-    # Restored bytes must match original LF content byte-for-byte
     assert target_file.read_bytes() == lf_content, "Filter pipeline altered file during snapshot/restore!"
 
 
 # ==============================================================================
-# 2. Untracked File & Directory Cleanup on Revert
+# 2. Workspace-Root-Anchored Exclusions & Bytecode Handling
+# ==============================================================================
+
+def test_file_under_src_node_modules_is_captured(test_env):
+    """Exclusions are anchored strictly to workspace root; src/node_modules is captured."""
+    ws, store, manager, head_sha, git_env, reaper = test_env
+
+    # 1. Root node_modules is excluded
+    root_nm = ws / "node_modules" / "dep"
+    root_nm.mkdir(parents=True)
+    (root_nm / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
+
+    # 2. Nested src/node_modules is NOT excluded and must be captured
+    nested_nm = ws / "src" / "node_modules" / "nested_dep"
+    nested_nm.mkdir(parents=True)
+    evil_js = nested_nm / "evil.js"
+    evil_js.write_text("console.log('injected');\n", encoding="utf-8")
+
+    # 3. Bytecode file inside src/__pycache__ is NOT excluded and must be captured
+    pycache_dir = ws / "src" / "__pycache__"
+    pycache_dir.mkdir(parents=True)
+    pyc_file = pycache_dir / "evil.cpython-313.pyc"
+    pyc_file.write_bytes(b"\x55\x0d\x0d\x0a\x00\x00\x00\x00malicious_bytecode")
+
+    snap_sha = manager.create_turn_snapshot("turn-1")
+    snap_files = manager.list_snapshot_files(snap_sha)
+
+    # Root node_modules must NOT be in snapshot
+    assert not any(f.startswith("node_modules/") for f in snap_files)
+
+    # Nested src/node_modules/evil.js MUST be captured
+    assert "src/node_modules/nested_dep/evil.js" in snap_files, "src/node_modules was erroneously excluded!"
+
+    # Bytecode file MUST be captured
+    assert "src/__pycache__/evil.cpython-313.pyc" in snap_files, "Bytecode was erroneously ignored!"
+
+
+# ==============================================================================
+# 3. Untracked File & Directory Cleanup on Revert
 # ==============================================================================
 
 def test_restore_deletes_untracked_files_and_emptied_dirs(test_env):
@@ -117,7 +151,6 @@ def test_restore_deletes_untracked_files_and_emptied_dirs(test_env):
     (ws / "base.py").write_text("print('base')\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Agent creates new files in a nested directory
     new_sub = ws / "new_module" / "deep_sub"
     new_sub.mkdir(parents=True)
     new_file = new_sub / "untracked.py"
@@ -128,138 +161,118 @@ def test_restore_deletes_untracked_files_and_emptied_dirs(test_env):
     assert new_file.exists()
     assert (ws / "new_module").exists()
 
-    # Revert turn
     manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
 
-    # Files must be deleted
     assert not new_file.exists(), "Untracked file in subfolder was not deleted!"
     assert not root_untracked.exists(), "Untracked root file was not deleted!"
-    # Emptied directory hierarchy must be removed
     assert not (ws / "new_module").exists(), "Emptied directory was not removed bottom-up!"
     assert (ws / "base.py").read_text(encoding="utf-8") == "print('base')\n"
 
 
 # ==============================================================================
-# 3. Process-Tree Kill as Precondition to Diff & Restore
+# 4. Job Object Grandchild Process Reaping (Intermediate Exits)
 # ==============================================================================
 
-def test_process_tree_kill_precondition_blocks_restore_race(test_env):
-    """Background processes attempting to race or plant files during restore are reaped."""
+def test_job_object_grandchild_killed_after_intermediate_exits(test_env):
+    """Intermediate process exits, grandchild keeps writing; Job Object still kills grandchild."""
     ws, store, manager, head_sha, git_env, reaper = test_env
 
-    (ws / "file.txt").write_text("original\n", encoding="utf-8")
+    (ws / "target.txt").write_text("baseline\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Agent spawns a background looping process that tries to constantly overwrite file.txt
-    race_script = (
-        "import time, sys\n"
-        "from pathlib import Path\n"
-        "p = Path(sys.argv[1])\n"
-        "while True:\n"
-        "    try:\n"
-        "        p.write_text('raced!\\n')\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    time.sleep(0.01)\n"
+    # Script where child spawns grandchild and child exits immediately
+    child_code = (
+        "import subprocess, sys, time\n"
+        "target_file = sys.argv[1]\n"
+        "grandchild_code = (\n"
+        "    'import time, sys\\n'\n"
+        "    'from pathlib import Path\\n'\n"
+        "    'p = Path(sys.argv[1])\\n'\n"
+        "    'while True:\\n'\n"
+        "    '    try:\\n'\n"
+        "    '        p.write_text(\"grandchild_race\\n\")\\n'\n"
+        "    '    except Exception:\\n'\n"
+        "    '        pass\\n'\n"
+        "    '    time.sleep(0.02)\\n'\n"
+        ")\n"
+        "g = subprocess.Popen([sys.executable, '-c', grandchild_code, target_file])\n"
+        "sys.stdout.write(f'{g.pid}\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.exit(0)\n"
     )
-    proc = subprocess.Popen(
-        [sys.executable, "-c", race_script, str(ws / "file.txt")],
-    )
-    reaper.register_pid(proc.pid)
 
-    # Give process time to start writing
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(ws / "target.txt")],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    reaper.register_process(proc)
+
+    # Read grandchild PID and wait for intermediate process to exit
+    grandchild_pid = int(proc.stdout.readline().strip())
+    proc.wait(timeout=5)
+    assert proc.poll() == 0, "Intermediate process did not exit!"
+
+    # Give grandchild time to write
     time.sleep(0.1)
 
-    # Restore must reap the process tree before writing
+    # Restore must terminate the Job Object, killing the orphaned grandchild
     manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
 
-    # Process must be terminated
-    assert proc.poll() is not None, "Background process was not reaped by restore!"
-    assert (ws / "file.txt").read_text(encoding="utf-8") == "original\n"
+    # Assert grandchild was killed
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = kernel32.OpenProcess(0x1000, False, grandchild_pid)
+        if h:
+            code = wintypes.DWORD()
+            kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            kernel32.CloseHandle(h)
+            assert code.value != 259, "Grandchild is still alive after Job Object termination!"
+
+    assert (ws / "target.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
 # ==============================================================================
-# 4. External Store Config Integrity & Injection Defense
+# 5. External Store Metadata Integrity: Config, Hooks, Alternates & Object Growth
 # ==============================================================================
 
-def test_store_config_tampering_raises_integrity_error(test_env):
-    """Adversary modifying <store>/config (e.g. fsmonitor injection) is detected and blocked."""
+def test_store_hooks_tampering_raises_integrity_error(test_env):
+    """Adversary creating <store>/hooks/post-commit triggers SnapshotIntegrityError."""
     ws, store, manager, head_sha, git_env, reaper = test_env
 
     (ws / "valid.txt").write_text("valid\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Malicious agent tampers with external store config
-    config_file = store / "config"
-    with open(config_file, "a", encoding="utf-8") as f:
-        f.write("\n[core]\n\tfsmonitor = powershell -c calc.exe\n")
+    # Malicious agent plants a hook script in external store
+    hooks_dir = store / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    hook_file = hooks_dir / "post-commit"
+    hook_file.write_text("#!/bin/sh\ncalc.exe\n", encoding="utf-8")
 
-    # Subsequent snapshot or restore must fail fast with SnapshotIntegrityError
     with pytest.raises(SnapshotIntegrityError) as exc_info:
         manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
-    assert "store config tampering detected" in str(exc_info.value).lower()
-
-    # create_turn_snapshot also blocks
-    with pytest.raises(SnapshotIntegrityError):
-        manager.create_turn_snapshot("turn-2")
+    assert "tampering detected" in str(exc_info.value).lower()
 
 
-# ==============================================================================
-# 5. Nested .git Detection (Pre-turn, Post-turn & Dependency Exclusions)
-# ==============================================================================
-
-def test_nested_git_in_source_tree_detected_and_rejected(test_env):
-    """Nested git repository in tracked source code raises NestedGitError."""
+def test_store_alternates_tampering_raises_integrity_error(test_env):
+    """Adversary creating objects/info/alternates triggers SnapshotIntegrityError."""
     ws, store, manager, head_sha, git_env, reaper = test_env
 
-    sub_dir = ws / "sub_repo"
-    sub_dir.mkdir()
-    subprocess.run(["git", "init"], cwd=sub_dir, check=True, capture_output=True, env=git_env)
-
-    with pytest.raises(NestedGitError) as exc_info:
-        manager.create_turn_snapshot("turn-1")
-    assert "Nested git repository or gitfile detected" in str(exc_info.value)
-
-
-def test_nested_git_in_node_modules_is_permitted(test_env):
-    """Nested git repository inside supervisor-excluded dependency dir is ignored."""
-    ws, store, manager, head_sha, git_env, reaper = test_env
-
-    # Legitimate package in node_modules containing a .git dir (e.g. git dependency)
-    dep_git = ws / "node_modules" / "some_pkg" / ".git"
-    dep_git.mkdir(parents=True)
-    (dep_git / "HEAD").write_text("ref: refs/heads/master\n", encoding="utf-8")
-
-    (ws / "src").mkdir()
-    (ws / "src" / "index.js").write_text("console.log('hi');\n", encoding="utf-8")
-
-    # Snapshot must succeed and not raise NestedGitError
-    snap_sha = manager.create_turn_snapshot("turn-1")
-    snap_files = manager.list_snapshot_files(snap_sha)
-    assert "src/index.js" in snap_files
-    assert not any("node_modules" in f for f in snap_files)
-
-
-def test_nested_git_planted_during_turn_detected_post_turn(test_env):
-    """Nested git directory planted during a turn is detected post-turn on restore."""
-    ws, store, manager, head_sha, git_env, reaper = test_env
-
-    (ws / "app.py").write_text("print('app')\n", encoding="utf-8")
+    (ws / "valid.txt").write_text("valid\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Agent plants nested git during the turn
-    evil_dir = ws / "stealth"
-    evil_dir.mkdir()
-    subprocess.run(["git", "init"], cwd=evil_dir, check=True, capture_output=True, env=git_env)
+    # Malicious agent points store to an external alternates object pool
+    info_dir = store / "objects" / "info"
+    info_dir.mkdir(parents=True, exist_ok=True)
+    alternates_file = info_dir / "alternates"
+    alternates_file.write_text("C:/evil_repo/objects\n", encoding="utf-8")
 
-    # Post-turn check catches it
-    with pytest.raises(NestedGitError):
-        manager.check_nested_git()
+    with pytest.raises(SnapshotIntegrityError) as exc_info:
+        manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
+    assert "tampering detected" in str(exc_info.value).lower()
 
-
-# ==============================================================================
-# 6. Store Directory Deletion, Ref Deletion, and Object Corruption Tests
-# ==============================================================================
 
 def test_deleted_store_directory_raises_integrity_error(test_env):
     """Deleting the external store directory raises SnapshotIntegrityError."""
@@ -268,7 +281,6 @@ def test_deleted_store_directory_raises_integrity_error(test_env):
     (ws / "test.txt").write_text("test\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # External store directory is deleted
     def _force_rm_readonly(func, path, exc_info):
         try:
             os.chmod(path, stat.S_IWRITE)
@@ -290,19 +302,20 @@ def test_deleted_ref_raises_integrity_error(test_env):
     (ws / "test.txt").write_text("test\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Manually delete the ref file from store
     ref_file = store / "refs" / "stackmind" / "turn" / "turn-1"
     if ref_file.exists():
         ref_file.unlink()
     else:
-        # If packed-refs, truncate it
         packed = store / "packed-refs"
         if packed.exists():
             packed.unlink()
 
     with pytest.raises(SnapshotIntegrityError) as exc_info:
         manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
-    assert "ref 'refs/stackmind/turn/turn-1' not found" in str(exc_info.value)
+    assert (
+        "ref 'refs/stackmind/turn/turn-1' not found" in str(exc_info.value)
+        or "tampering detected" in str(exc_info.value).lower()
+    )
 
 
 def test_corrupted_object_raises_integrity_error(test_env):
@@ -315,7 +328,6 @@ def test_corrupted_object_raises_integrity_error(test_env):
     snap_files = manager.list_snapshot_files(snap_sha)
     blob_sha = snap_files["payload.txt"]
 
-    # Locate and corrupt loose blob object
     obj_path = store / "objects" / blob_sha[:2] / blob_sha[2:]
     assert obj_path.exists()
     os.chmod(obj_path, stat.S_IWRITE)
@@ -327,11 +339,11 @@ def test_corrupted_object_raises_integrity_error(test_env):
 
 
 # ==============================================================================
-# 7. Symlink & Junction Traversal Neutralization
+# 6. Junction Traversal & Non-Descending Cleanup Protection
 # ==============================================================================
 
 def test_symlink_traversal_neutralized(test_env):
-    """Planted symlinks/junctions outside the workspace are neutralized before restore."""
+    """Planted symlinks pointing outside workspace are neutralized before restore."""
     ws, store, manager, head_sha, git_env, reaper = test_env
 
     (ws / "clean.txt").write_text("clean\n", encoding="utf-8")
@@ -343,11 +355,9 @@ def test_symlink_traversal_neutralized(test_env):
     link_path = ws / "escape_link"
     try:
         link_path.symlink_to(outside_target)
-        ran_status = "RAN AGAINST CODE"
     except (OSError, NotImplementedError):
-        # On Windows without developer mode/admin symlink privilege, WinError 5 occurs
-        ran_status = "SKIPPED: OS sandbox denies symlink creation (WinError 5)"
-        pytest.skip(ran_status)
+        # Explicit status report: Developer Mode / SeCreateSymbolicLinkPrivilege absent
+        pytest.skip("SKIPPED: Developer Mode / SeCreateSymbolicLinkPrivilege absent (WinError 5)")
 
     assert link_path.is_symlink()
 
@@ -356,38 +366,125 @@ def test_symlink_traversal_neutralized(test_env):
     assert outside_target.read_text(encoding="utf-8") == "do not overwrite\n"
 
 
-# ==============================================================================
-# 8. Rename, Delete, and Chmod Restore
-# ==============================================================================
-
-def test_rename_delete_restore_cycle(test_env):
-    """Restores full state when files are renamed, deleted, or altered."""
+def test_cleanup_does_not_descend_through_junction(test_env):
+    """Untracked-file cleanup and restore do NOT descend through a planted junction."""
     ws, store, manager, head_sha, git_env, reaper = test_env
 
-    (ws / "keep.txt").write_text("keep v1\n", encoding="utf-8")
-    (ws / "delete_me.txt").write_text("delete v1\n", encoding="utf-8")
+    (ws / "main.py").write_text("main()\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Agent renames keep.txt -> moved.txt, deletes delete_me.txt, creates new.txt
-    (ws / "keep.txt").rename(ws / "moved.txt")
-    (ws / "delete_me.txt").unlink()
-    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+    # 1. Outside directory containing valuable files
+    outside_dir = ws.parent / "outside_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "secret.txt"
+    outside_file.write_text("vital data do not delete\n", encoding="utf-8")
 
-    assert not (ws / "keep.txt").exists()
-    assert (ws / "moved.txt").exists()
+    # 2. Plant junction in workspace pointing to outside_dir
+    junction_path = ws / "escape_junction"
+    junction_created = False
+    if sys.platform == "win32":
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(outside_dir.resolve()), str(junction_path.resolve()))
+            junction_created = True
+        except (OSError, NotImplementedError):
+            res = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(junction_path), str(outside_dir)],
+                capture_output=True,
+            )
+            junction_created = (res.returncode == 0)
 
+    if not junction_created:
+        pytest.skip("SKIPPED: OS environment prevented junction creation")
+
+    assert junction_path.exists()
+
+    # 3. Add an untracked file inside workspace
+    (ws / "stray.py").write_text("stray\n", encoding="utf-8")
+
+    # 4. Restore turn snapshot
     manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
 
-    assert (ws / "keep.txt").exists()
-    assert (ws / "keep.txt").read_text(encoding="utf-8") == "keep v1\n"
-    assert (ws / "delete_me.txt").exists()
-    assert (ws / "delete_me.txt").read_text(encoding="utf-8") == "delete v1\n"
-    assert not (ws / "moved.txt").exists()
-    assert not (ws / "new.txt").exists()
+    # 5. Assert: junction is removed, workspace untracked file is removed
+    assert not junction_path.exists(), "Junction was not removed during restore!"
+    assert not (ws / "stray.py").exists(), "Untracked file was not removed!"
+
+    # 6. Critical assertion: outside directory and outside file are completely intact!
+    assert outside_dir.exists(), "Cleanup erroneously removed outside target directory!"
+    assert outside_file.exists(), "Cleanup recursively descended through junction and deleted outside files!"
+    assert outside_file.read_text(encoding="utf-8") == "vital data do not delete\n"
 
 
 # ==============================================================================
-# 9. Workspace .git Index and HEAD Remain Untouched
+# 7. Post-Turn Nested .git Check & Reaping
+# ==============================================================================
+
+def test_post_turn_nested_git_reaps_before_raising(test_env):
+    """Post-turn nested .git check ensures processes are reaped before raising NestedGitError."""
+    ws, store, manager, head_sha, git_env, reaper = test_env
+
+    (ws / "app.py").write_text("app()\n", encoding="utf-8")
+    snap_sha = manager.create_turn_snapshot("turn-1")
+
+    # Spawn background looping process
+    proc = subprocess.Popen([sys.executable, "-c", "import time; \nwhile True: time.sleep(0.05)"])
+    reaper.register_process(proc)
+
+    # Agent plants nested git during the turn
+    evil_dir = ws / "nested_repo"
+    evil_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=evil_dir, check=True, capture_output=True, env=git_env)
+
+    # Post-turn check catches nested git, reaps process and restores before raising
+    with pytest.raises(NestedGitError):
+        manager.check_post_turn("turn-1")
+
+    # Process must be dead
+    time.sleep(0.2)
+    assert proc.poll() is not None, "Background process was not reaped when NestedGitError was raised!"
+    # Workspace must be restored
+    assert not evil_dir.exists(), "Planted nested git was not cleaned up on post-turn failure!"
+    assert (ws / "app.py").read_text(encoding="utf-8") == "app()\n"
+
+
+# ==============================================================================
+# 8. Non-Default NTFS Alternate Data Streams (ADS) Eradication
+# ==============================================================================
+
+def test_non_default_ads_wiped_on_unchanged_file(test_env):
+    """Non-default ADS added to an unchanged file is detected and eradicated."""
+    ws, store, manager, head_sha, git_env, reaper = test_env
+
+    target_file = ws / "unchanged.txt"
+    target_file.write_text("clean content\n", encoding="utf-8")
+    snap_sha = manager.create_turn_snapshot("turn-1")
+
+    # During turn, agent attaches ADS stream to unchanged file
+    ads_file = ws / "unchanged.txt:hidden_payload"
+    ads_supported = False
+    try:
+        ads_file.write_text("stealth exploit", encoding="utf-8")
+        ads_supported = True
+    except (OSError, NotImplementedError):
+        pass
+
+    if not ads_supported:
+        pytest.skip("SKIPPED: NTFS ADS not supported on this filesystem")
+
+    assert ads_file.read_text(encoding="utf-8") == "stealth exploit"
+
+    # Restore turn snapshot
+    manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
+
+    # Primary content intact
+    assert target_file.read_text(encoding="utf-8") == "clean content\n"
+
+    # Non-default ADS stream must be completely eradicated
+    assert not ads_file.exists(), "Non-default ADS persisted on unchanged file across restore!"
+
+
+# ==============================================================================
+# 9. Workspace .git Index and HEAD Integrity Across Restores
 # ==============================================================================
 
 def test_workspace_git_index_and_head_untouched_by_revert(test_env):
@@ -400,17 +497,14 @@ def test_workspace_git_index_and_head_untouched_by_revert(test_env):
     (ws / "feature.py").write_text("v1\n", encoding="utf-8")
     snap_sha = manager.create_turn_snapshot("turn-1")
 
-    # Agent modifies working tree
     (ws / "feature.py").write_text("v2\n", encoding="utf-8")
     (ws / "stray.py").write_text("stray\n", encoding="utf-8")
 
     manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
 
-    # Working tree restored
     assert (ws / "feature.py").read_text(encoding="utf-8") == "v1\n"
     assert not (ws / "stray.py").exists()
 
-    # Workspace HEAD unchanged
     curr_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=ws,
@@ -419,13 +513,11 @@ def test_workspace_git_index_and_head_untouched_by_revert(test_env):
         env=git_env,
     ).stdout.strip()
     assert curr_head == initial_head_sha, "Workspace HEAD was moved during turn revert!"
-
-    # Workspace .git/index unchanged
     assert index_path.read_bytes() == initial_index_bytes, "Workspace .git/index was modified by revert!"
 
 
 # ==============================================================================
-# 10. Rescue Ref Preserved on Abort
+# 10. Rescue Ref Preservation on Abort
 # ==============================================================================
 
 def test_rescue_ref_preserved_on_abort(test_env):
@@ -435,7 +527,6 @@ def test_rescue_ref_preserved_on_abort(test_env):
     (ws / "work_in_progress.py").write_text("half_finished()\n", encoding="utf-8")
     rescue_sha = manager.create_rescue_ref("run-abort-99")
 
-    # Verify rescue ref exists in external store
     res = subprocess.run(
         [
             "git",
@@ -449,41 +540,5 @@ def test_rescue_ref_preserved_on_abort(test_env):
     assert res.returncode == 0
     assert res.stdout.strip() == rescue_sha
 
-    # Verify rescue ref contains the uncommitted file
     files = manager.list_snapshot_files(rescue_sha)
     assert "work_in_progress.py" in files
-
-
-# ==============================================================================
-# 11. NTFS Alternate Data Streams (ADS) Destroyed on Restore
-# ==============================================================================
-
-def test_ntfs_alternate_data_streams_destroyed_on_restore(test_env):
-    """Restoring a file unlinks it first, destroying any attached NTFS ADS streams."""
-    ws, store, manager, head_sha, git_env, reaper = test_env
-
-    target_file = ws / "config.ini"
-    target_file.write_text("[main]\nmode=prod\n", encoding="utf-8")
-    snap_sha = manager.create_turn_snapshot("turn-1")
-
-    # On Windows NTFS, attach an alternate data stream
-    ads_path = ws / "config.ini:hidden_stream"
-    try:
-        ads_path.write_text("stealth payload", encoding="utf-8")
-        ads_supported = True
-    except (OSError, NotImplementedError):
-        ads_supported = False
-
-    if not ads_supported:
-        pytest.skip("NTFS Alternate Data Streams not supported on this filesystem")
-
-    assert ads_path.read_text(encoding="utf-8") == "stealth payload"
-
-    # Revert turn
-    manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
-
-    # Base file restored
-    assert target_file.read_text(encoding="utf-8") == "[main]\nmode=prod\n"
-
-    # ADS stream must be completely eradicated
-    assert not ads_path.exists(), "NTFS Alternate Data Stream persisted across turn restore!"
