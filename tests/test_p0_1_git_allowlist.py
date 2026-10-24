@@ -202,8 +202,13 @@ def test_per_subcommand_flags_allowed():
     # git diff flags
     assert check_command(["git", "diff", "--stat"], role="backend") is None
     assert check_command(["git", "diff", "--no-ext-diff"], role="backend") is None
+    assert check_command(["git", "diff", "--no-textconv"], role="backend") is None
     assert check_command(["git", "diff", "-w"], role="backend") is None
     assert check_command(["git", "diff", "-U3"], role="backend") is None
+
+    # git log and show flags
+    assert check_command(["git", "log", "--no-textconv"], role="backend") is None
+    assert check_command(["git", "show", "--no-textconv"], role="backend") is None
 
     # Dangerous output / exec flags stay denied under any subcommand
     assert check_command(["git", "diff", "--output=leak.txt"], role="backend") is not None
@@ -211,6 +216,13 @@ def test_per_subcommand_flags_allowed():
     assert check_command(["git", "diff", "--textconv"], role="backend") is not None
     assert check_command(["git", "log", "--output=leak.txt"], role="backend") is not None
     assert check_command(["git", "show", "--output=leak.txt"], role="backend") is not None
+
+
+def test_option_abbreviations_rejected():
+    """Verify that git option abbreviations (--out=x, --ext, --text) are rejected by the allowlist."""
+    for flag in ["--out=leak.txt", "--ext", "--text", "--out", "--ext-dif", "--textcon"]:
+        res = check_command(["git", "diff", flag], role="backend")
+        assert res is not None, f"Option abbreviation '{flag}' bypassed check_command allowlist!"
 
 
 def test_python_m_allowlist():

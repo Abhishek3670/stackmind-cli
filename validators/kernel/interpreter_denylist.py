@@ -88,7 +88,7 @@ _GIT_SUBCOMMAND_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
     "diff": frozenset({
         "--stat", "--name-only", "--name-status", "-p", "--patch", "-s",
         "--no-patch", "--summary", "--color", "--no-color", "--word-diff",
-        "--staged", "--cached", "--raw", "--no-ext-diff", "--no-index",
+        "--staged", "--cached", "--raw", "--no-ext-diff", "--no-textconv", "--no-index",
         "--no-optional-locks", "-U", "--unified", "-w", "--ignore-all-space",
         "-b", "--ignore-space-change", "--ignore-space-at-eol",
         "-M", "--find-renames", "-C", "--find-copies",
@@ -98,12 +98,12 @@ _GIT_SUBCOMMAND_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
         "-s", "--no-patch", "--graph", "--decorate", "--color", "--no-color",
         "-c", "--cc", "--no-merges", "--merges", "--first-parent",
         "--topo-order", "--date-order", "--reverse", "-n", "--max-count",
-        "--all", "--no-optional-locks", "--no-ext-diff",
+        "--all", "--no-optional-locks", "--no-ext-diff", "--no-textconv",
     }),
     "show": frozenset({
         "--stat", "--name-only", "--name-status", "-p", "--patch", "-s",
         "--no-patch", "--color", "--no-color", "-c", "--cc", "--oneline",
-        "--no-optional-locks", "--no-ext-diff",
+        "--no-optional-locks", "--no-ext-diff", "--no-textconv",
     }),
     "blame": frozenset({
         "-c", "-C", "-M", "-w", "-s", "-p", "--porcelain", "--line-porcelain",

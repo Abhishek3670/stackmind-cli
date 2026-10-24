@@ -260,8 +260,11 @@ class ToolGateway:
                         if not token.startswith("-"):
                             sub = token.lower()
                             break
-                    if sub in ("diff", "log", "show") and "--no-ext-diff" not in cmd_list:
-                        cmd_list.append("--no-ext-diff")
+                    if sub in ("diff", "log", "show"):
+                        if "--no-ext-diff" not in cmd_list:
+                            cmd_list.append("--no-ext-diff")
+                        if "--no-textconv" not in cmd_list:
+                            cmd_list.append("--no-textconv")
                         command = cmd_list
 
             env_extra = {
