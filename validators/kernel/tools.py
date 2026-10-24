@@ -19,7 +19,7 @@ from typing import Any
 from .boundary import RuntimeBoundary
 from .contract import AgentContract, ContractEvaluator, ContractNormalizer
 from .identity import AuthorizationPolicy
-from .interpreter_denylist import check_command
+from .interpreter_denylist import check_command, is_gitops_role
 from .operations import OperationRequest, OperationType
 from .process import ProcessManager
 from .sandbox import ProcessSandbox
@@ -228,10 +228,19 @@ class ToolGateway:
         # contract grants. Trusted platform-internal callers (canary verifier,
         # evidence tracer) construct their own ProcessSandbox and are not
         # subject to this gate.
-        denial_reason = check_command(command)
+        role = getattr(self, "actor_id", None) or "worker"
+        denial_reason = check_command(command, role=role)
         if denial_reason is not None:
             raise PermissionError(denial_reason)
-        result = self.sandbox.run(command)
+        env_extra = {}
+        if not is_gitops_role(role):
+            env_extra = {
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_PAGER": "cat",
+                "GIT_EXTERNAL_DIFF": "",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+        result = self.sandbox.run(command, env_extra=env_extra)
         self.boundary.journal.complete(record.request.operation_id, result)
         return result
 
