@@ -2948,18 +2948,22 @@ class AgentRunner:
                     r = rule_str.replace('\\', '/')
                     if r.startswith('./'):
                         r = r[2:]
+                    r_clean = r.rstrip('/*').rstrip('/')
                     if (
                         target_path == r
-                        or target_path.startswith(r.rstrip('/') + '/')
+                        or target_path == r_clean
+                        or target_path.startswith(r_clean + '/')
                         or fnmatch.fnmatch(target_path, r)
                         or (r.endswith('/**') and fnmatch.fnmatch(target_path, r))
+                        or fnmatch.fnmatch(target_path, r_clean + '/*')
+                        or fnmatch.fnmatch(target_path, r_clean + '/**')
                     ):
                         return True
-                    r_slash = r.replace('.', '/')
+                    r_slash = r_clean.replace('.', '/')
                     if (
                         target_path == r_slash
                         or target_path == (r_slash + '.py')
-                        or target_path.startswith(r_slash.rstrip('/') + '/')
+                        or target_path.startswith(r_slash + '/')
                         or fnmatch.fnmatch(target_path, r_slash)
                     ):
                         return True
