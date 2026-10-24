@@ -607,6 +607,8 @@ class TurnSnapshotManager:
                             dp.unlink()
                         except OSError:
                             pass
+                else:
+                    self._enumerate_and_wipe_ads(dp)
             for f in files:
                 rel_f = f"{rel_root}/{f}" if rel_root else f
                 if self._is_excluded(rel_f):

@@ -95,6 +95,40 @@ class ProcessReaper:
             kernel32.CloseHandle(job)
             self._job_handle = None
 
+    def launch_in_job(self, args: Sequence[str] | str, **kwargs: Any) -> subprocess.Popen:
+        """Launch a process with suspended ordering to eliminate Job Object assignment race.
+
+        Ordering:
+        1. CREATE_SUSPENDED (0x00000004) prevents the process from executing any instructions.
+        2. AssignProcessToJobObject assigns the suspended process to the Job Object.
+        3. NtResumeProcess resumes the process threads inside the job confinement.
+        """
+        if sys.platform == "win32" and self._job_handle:
+            import ctypes
+            from ctypes import wintypes
+
+            CREATE_SUSPENDED = 0x00000004
+            flags = kwargs.get("creationflags", 0) | CREATE_SUSPENDED
+            kwargs["creationflags"] = flags
+            proc = subprocess.Popen(args, **kwargs)
+            try:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+                kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+                if hasattr(proc, "_handle") and proc._handle:
+                    kernel32.AssignProcessToJobObject(self._job_handle, int(proc._handle))
+                ntdll = ctypes.WinDLL("ntdll")
+                ntdll.NtResumeProcess(int(proc._handle))
+            except Exception:
+                proc.kill()
+                raise
+            self._registered_pids.add(proc.pid)
+            return proc
+        else:
+            proc = subprocess.Popen(args, **kwargs)
+            self.register_process(proc)
+            return proc
+
     def register_process(self, proc: subprocess.Popen) -> None:
         """Assign a launched process to the supervisor Job Object."""
         self.register_pid(proc.pid)
@@ -255,6 +289,26 @@ class ProcessReaper:
 
 # Global supervisor reaper instance
 _GLOBAL_REAPER = ProcessReaper()
+
+
+class ServiceJobManager:
+    """Manages long-running services across turns with dedicated Job Object isolation.
+
+    Ensures worker turn-level cleanup (`reaper.reap_all()`) does NOT terminate
+    cross-turn persistent services (e.g. dev servers, local databases).
+    Services are terminated only on explicit supervisor shutdown.
+    """
+
+    def __init__(self) -> None:
+        self.service_reaper = ProcessReaper()
+
+    def launch_service(self, args: Sequence[str] | str, **kwargs: Any) -> subprocess.Popen:
+        """Launch a persistent service inside the dedicated service Job Object."""
+        return self.service_reaper.launch_in_job(args, **kwargs)
+
+    def shutdown_services(self) -> list[int]:
+        """Terminate all persistent services on supervisor shutdown."""
+        return self.service_reaper.reap_all()
 
 
 def get_global_reaper() -> ProcessReaper:
