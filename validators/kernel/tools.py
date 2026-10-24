@@ -248,11 +248,26 @@ class ToolGateway:
             empty_hooks_dir = Path(tempfile.gettempdir()) / "stackmind-empty-hooks"
             empty_hooks_dir.mkdir(parents=True, exist_ok=True)
             null_device = "NUL" if sys.platform == "win32" else "/dev/null"
+            # For git diff/log/show, ensure --no-ext-diff is passed to neutralize diff.external
+            # without breaking git diff execution (GIT_EXTERNAL_DIFF="" breaks git diff with exit code 128)
+            cmd_list = list(command)
+            if cmd_list:
+                from .interpreter_denylist import _exe_name, _unwrap_command
+                unwrapped = list(_unwrap_command(cmd_list))
+                if unwrapped and _exe_name(unwrapped[0]) == "git":
+                    sub = None
+                    for token in unwrapped[1:]:
+                        if not token.startswith("-"):
+                            sub = token.lower()
+                            break
+                    if sub in ("diff", "log", "show") and "--no-ext-diff" not in cmd_list:
+                        cmd_list.append("--no-ext-diff")
+                        command = cmd_list
+
             env_extra = {
                 # Advisory git hardening (P0-1)
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_PAGER": "cat",
-                "GIT_EXTERNAL_DIFF": "",
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": null_device,
                 "GIT_CONFIG_SYSTEM": null_device,

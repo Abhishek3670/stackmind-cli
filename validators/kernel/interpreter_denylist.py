@@ -22,6 +22,7 @@ _SHELLS = frozenset({
 # script file (python script.py) stays allowed (subject to P0-3 post-turn diff gate).
 _FLAGGED_INTERPRETERS = frozenset({
     "python", "python3", "pythonw", "pythonw.exe", "python.exe", "python3.exe",
+    "py", "py.exe",
     "pypy", "pypy3", "pypy.exe", "pypy3.exe",
     "perl", "perl.exe",
     "ruby", "ruby.exe",
@@ -74,44 +75,66 @@ _UNCONDITIONAL_LOWER = frozenset(name.lower() for name in _UNCONDITIONAL)
 # Non-GitOps Git restrictions (P0-1)
 _GIT_READ_ONLY_SUBCOMMANDS = frozenset({"status", "diff", "log", "show", "blame"})
 
-_GIT_DENIED_FLAG_PREFIXES = (
-    "-c",
-    "-C",
-    "--git-dir",
-    "--work-tree",
-    "--exec-path",
-    "--output",
-    "--ext-diff",
-    "--textconv",
-    "--config-env",
-)
+# Valueless global flags permitted before the subcommand for non-GitOps roles
+_GIT_ALLOWED_GLOBAL_FLAGS = frozenset({"--no-pager", "--no-optional-locks"})
 
-_GIT_ALLOWED_FLAGS = frozenset({
-    "--no-optional-locks",
-    "--no-pager",
-    "--oneline",
-    "--stat",
-    "--name-only",
-    "--name-status",
-    "-p",
-    "--patch",
-    "-s",
-    "--short",
-    "-b",
-    "--branch",
-    "--color",
-    "--no-color",
-    "-n",
-    "--max-count",
-    "-q",
-    "--quiet",
-    "--graph",
-    "--decorate",
-})
+# Per-subcommand flag allowlists (for tokens starting with '-')
+_GIT_SUBCOMMAND_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
+    "status": frozenset({
+        "-s", "--short", "-b", "--branch", "--show-stash", "--ahead-behind",
+        "--no-ahead-behind", "--porcelain", "--ignored", "--no-optional-locks",
+        "-u", "--untracked-files", "-uno", "-unormal", "-uall",
+    }),
+    "diff": frozenset({
+        "--stat", "--name-only", "--name-status", "-p", "--patch", "-s",
+        "--no-patch", "--summary", "--color", "--no-color", "--word-diff",
+        "--staged", "--cached", "--raw", "--no-ext-diff", "--no-index",
+        "--no-optional-locks", "-U", "--unified", "-w", "--ignore-all-space",
+        "-b", "--ignore-space-change", "--ignore-space-at-eol",
+        "-M", "--find-renames", "-C", "--find-copies",
+    }),
+    "log": frozenset({
+        "--oneline", "--stat", "--name-only", "--name-status", "-p", "--patch",
+        "-s", "--no-patch", "--graph", "--decorate", "--color", "--no-color",
+        "-c", "--cc", "--no-merges", "--merges", "--first-parent",
+        "--topo-order", "--date-order", "--reverse", "-n", "--max-count",
+        "--all", "--no-optional-locks", "--no-ext-diff",
+    }),
+    "show": frozenset({
+        "--stat", "--name-only", "--name-status", "-p", "--patch", "-s",
+        "--no-patch", "--color", "--no-color", "-c", "--cc", "--oneline",
+        "--no-optional-locks", "--no-ext-diff",
+    }),
+    "blame": frozenset({
+        "-c", "-C", "-M", "-w", "-s", "-p", "--porcelain", "--line-porcelain",
+        "--color-lines", "--color-by-age", "--show-stats", "--show-name",
+        "--show-number", "-l", "-t", "-L", "--score-debug", "--no-optional-locks",
+    }),
+}
+
+# Prefix-matched flags specifically permitted with parameter values (e.g. -n5, -L1,10, --format=...)
+_GIT_SUBCOMMAND_ALLOWED_PREFIXES: dict[str, tuple[str, ...]] = {
+    "status": ("--porcelain=", "--untracked-files="),
+    "diff": ("--diff-filter=", "-U", "--unified=", "--word-diff="),
+    "log": ("-n", "--max-count=", "--format=", "--pretty=", "--date=", "--author=", "--grep="),
+    "show": ("--format=", "--pretty="),
+    "blame": ("-L", "--date="),
+}
 
 _PUBLISH_TOOLS_NON_GITOPS = frozenset({"gh", "hub"})
 
 _GITOPS_ROLES = frozenset({"gitops", "release"})
+
+
+def _is_python_exe(exe: str) -> bool:
+    """Return True if the executable is a Python interpreter or launcher."""
+    if exe in ("python", "py", "pypy"):
+        return True
+    if re.match(r"^python\d+(\.\d+)*$", exe):
+        return True
+    if re.match(r"^pypy\d+(\.\d+)*$", exe):
+        return True
+    return False
 
 
 def is_gitops_role(role: str | None) -> bool:
@@ -278,12 +301,17 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
         return f"interpreter '{cmd[0]}' is denied unconditionally at the agent boundary"
 
     # 3. Flagged interpreters: blocked when a code-string/module flag is present
-    if exe in _FLAGGED_LOWER:
-        # Check for python -m specifically
-        for index, part in enumerate(cmd[1:], start=1):
-            if part == "-m" and exe.startswith("python"):
-                if index + 1 < len(cmd):
-                    mod = cmd[index + 1].lower()
+    if _is_python_exe(exe):
+        args = list(cmd[1:])
+        if exe == "py":
+            while args and (args[0].startswith("-2") or args[0].startswith("-3")):
+                args.pop(0)
+        for index, part in enumerate(args):
+            if part in ("-c", "--command") or part.lower() in ("-command", "-encodedcommand"):
+                return f"interpreter '{cmd[0]}' invoked with code-string flag '{part}' is denied at the agent boundary"
+            if part == "-m":
+                if index + 1 < len(args):
+                    mod = args[index + 1].lower()
                     if mod not in _PYTHON_ALLOWED_MODULES:
                         return (
                             f"python -m module '{mod}' is not in allowlisted modules "
@@ -291,11 +319,29 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
                         )
                 else:
                     return "python -m without a module name is denied"
-            elif part in _CODE_FLAGS or part.lower() in {f.lower() for f in _CODE_FLAGS}:
-                return (
-                    f"interpreter '{cmd[0]}' invoked with code-string flag '{part}' "
-                    "is denied at the agent boundary"
-                )
+            elif part.startswith("-m"):
+                mod = part[2:].lower()
+                if mod not in _PYTHON_ALLOWED_MODULES:
+                    return (
+                        f"python -m module '{mod}' is not in allowlisted modules "
+                        f"({', '.join(sorted(_PYTHON_ALLOWED_MODULES))})"
+                    )
+
+    elif exe in ("node", "node.exe") or exe.startswith("node"):
+        for part in cmd[1:]:
+            if part in ("-e", "--eval", "-p", "--print", "-r", "--require", "--loader", "--import"):
+                return f"node execution flag '{part}' is denied at the agent boundary"
+            if part.startswith("-r") or part.startswith("--require=") or part.startswith("--eval="):
+                return f"node execution flag '{part}' is denied at the agent boundary"
+
+    elif exe in _FLAGGED_LOWER:
+        flags = _code_flag_positions(cmd)
+        if flags:
+            flagged = ", ".join(cmd[i] for i in flags)
+            return (
+                f"interpreter '{cmd[0]}' invoked with code-string flag(s) "
+                f"({flagged}) is denied at the agent boundary"
+            )
 
     # 4. Non-GitOps specific constraints
     if not is_gitops:
@@ -312,33 +358,54 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
         # 4c. Git command and flag allowlist
         if exe == "git":
             args = list(cmd[1:])
-            # Check for denied flag prefixes anywhere in arguments
-            for arg in args:
-                for prefix in _GIT_DENIED_FLAG_PREFIXES:
-                    if (
-                        arg == prefix
-                        or arg.startswith(prefix + "=")
-                        or (prefix == "-c" and arg.startswith("-c"))
-                        or (prefix == "-C" and (arg == "-C" or arg.startswith("-C")))
-                    ):
-                        return f"git flag '{arg}' is denied for non-GitOps roles (advisory allowlist P0-1)"
+            idx = 0
+            # 1. Strict parse: only valueless global flags before subcommand
+            while idx < len(args) and args[idx].startswith("-"):
+                flag = args[idx]
+                if flag not in _GIT_ALLOWED_GLOBAL_FLAGS:
+                    return (
+                        f"global git flag '{flag}' before subcommand is denied for non-GitOps roles: "
+                        f"only valueless flags ({', '.join(sorted(_GIT_ALLOWED_GLOBAL_FLAGS))}) are allowed before subcommand"
+                    )
+                idx += 1
 
-            # Find the subcommand (first positional token not starting with '-')
-            subcmd = None
-            for arg in args:
-                if not arg.startswith("-"):
-                    subcmd = arg.lower()
-                    break
-
-            if subcmd is None:
-                # Bare 'git' or 'git --help' without a subcommand
+            if idx >= len(args):
                 return "bare 'git' invocation without an allowlisted read-only subcommand is denied"
 
+            subcmd = args[idx].lower()
             if subcmd not in _GIT_READ_ONLY_SUBCOMMANDS:
                 return (
                     f"git subcommand '{subcmd}' is denied for role '{role}': "
                     f"non-GitOps roles are limited to read-only git ({', '.join(sorted(_GIT_READ_ONLY_SUBCOMMANDS))})"
                 )
+
+            # 2. Per-subcommand flag validation
+            allowed_flags = _GIT_SUBCOMMAND_ALLOWED_FLAGS.get(subcmd, frozenset())
+            allowed_prefixes = _GIT_SUBCOMMAND_ALLOWED_PREFIXES.get(subcmd, ())
+
+            sub_args = args[idx + 1:]
+            for arg in sub_args:
+                if (
+                    arg.startswith("--output")
+                    or arg.startswith("--ext-diff")
+                    or arg.startswith("--textconv")
+                    or arg.startswith("--exec-path")
+                    or arg.startswith("--git-dir")
+                    or arg.startswith("--work-tree")
+                    or arg.startswith("--config-env")
+                ):
+                    return f"git flag '{arg}' is denied for non-GitOps roles under '{subcmd}'"
+
+                if arg.startswith("-"):
+                    if arg == "--":
+                        break
+                    if arg in allowed_flags:
+                        continue
+                    if any(arg.startswith(prefix) for prefix in allowed_prefixes):
+                        continue
+                    if subcmd == "log" and re.match(r"^-\d+$", arg):
+                        continue
+                    return f"git flag '{arg}' is not in the allowlist for '{subcmd}' (role: '{role}')"
 
     return None
 
