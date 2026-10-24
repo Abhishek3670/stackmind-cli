@@ -225,12 +225,18 @@ class JsonRpcProtocol:
             except ValueError as error:
                 raise _RpcError(-32003, f"Policy denied: {error}") from error
         if method == "event.list":
-            return [
-                event.as_dict()
-                for event in self.manager.events.events(
-                    params.get("session_id"), int(params.get("after", 0))
-                )
-            ]
+            events = self.manager.events.events(
+                params.get("session_id"), int(params.get("after", 0))
+            )
+            limit = params.get("limit")
+            if limit is not None:
+                try:
+                    limit_int = int(limit)
+                    if limit_int > 0:
+                        events = events[:limit_int]
+                except (ValueError, TypeError):
+                    pass
+            return [event.as_dict() for event in events]
         if method == "agent.list":
             session_id = params.get("sessionId") or params.get("session_id")
             operation_id = params.get("operationId") or params.get("operation_id")

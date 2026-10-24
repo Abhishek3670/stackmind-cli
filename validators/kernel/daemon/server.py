@@ -11,19 +11,42 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import sys
+import traceback
 from .manager import SessionManager
 from .protocol import JsonRpcProtocol
 from .storage import DaemonStorage
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
-    """Threading HTTPServer that gracefully ignores normal client disconnect errors."""
+    """Threading HTTPServer that gracefully handles errors and isolates logs."""
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        RequestHandlerClass: type[BaseHTTPRequestHandler],
+        state_dir: Path | None = None,
+    ) -> None:
+        super().__init__(server_address, RequestHandlerClass)
+        self.state_dir = Path(state_dir) if state_dir is not None else None
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc_type, _, _ = sys.exc_info()
         if exc_type is not None and issubclass(exc_type, (ConnectionError, BrokenPipeError)):
             return
-        super().handle_error(request, client_address)
+        # Log to daemon.log in state_dir rather than blasting to sys.stderr,
+        # which would corrupt the active TUI alternate screen buffer.
+        if self.state_dir:
+            try:
+                log_file = self.state_dir / "daemon.log"
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n--- Exception occurred during processing of request from {client_address} ---\n")
+                    traceback.print_exc(file=f)
+                return
+            except Exception:
+                pass
+        import logging
+        logging.getLogger("daemon").error("Exception during request from %s", client_address, exc_info=True)
 
 
 class LocalDaemon:
@@ -38,7 +61,7 @@ class LocalDaemon:
         self.manager = SessionManager(DaemonStorage(state_dir), runner_factory=runner_factory)
         self.protocol = JsonRpcProtocol(self.manager)
         self.mcp_protocol = mcp_protocol
-        self._server = _DaemonHTTPServer((host, port), self._handler())
+        self._server = _DaemonHTTPServer((host, port), self._handler(), state_dir=Path(state_dir))
         self._thread: Thread | None = None
 
     @property
@@ -57,7 +80,16 @@ class LocalDaemon:
             protocol_version = "HTTP/1.1"
 
             def _send(self, status: int, body: Any) -> None:
-                encoded = json.dumps(body).encode("utf-8")
+                try:
+                    encoded = json.dumps(body).encode("utf-8")
+                except (MemoryError, OverflowError):
+                    error_payload = {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32000, "message": "Response payload exceeded memory limits"},
+                        "id": getattr(body, "get", lambda k, d=None: None)("id") if isinstance(body, dict) else None,
+                    }
+                    encoded = json.dumps(error_payload).encode("utf-8")
+                    status = 500
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))

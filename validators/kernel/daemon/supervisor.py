@@ -2333,19 +2333,27 @@ class LifecycleSupervisor:
                         state.retry_counts[wo_id] = 0
                         self._archive_verdicts_for_wo(wo_id, ws)
                         agent = self._agent_for_wo(wo_id, ws)
+                        role = self._role_for_agent(agent)
+                        rework_prompt = (
+                            f"Rework work order {wo_id} (integration review round "
+                            f"{state.integration_rework_rounds}/{state.max_retries}): the "
+                            f"integration review blocked release with these findings "
+                            f"and prescribed fixes:\n"
+                            f"{feedback}\n"
+                            f"Apply each prescribed fix to your deliverable so every "
+                            f"blocker is resolved, then resubmit."
+                        )
+                        if role == "qa" or agent == "gemma":
+                            rework_prompt += (
+                                "\n\nNOTE: You are the QA agent. You must re-verify deliverables using your assigned "
+                                "test suite. Do NOT attempt to author or modify application files, documentation, "
+                                "or manifests outside your assigned test contract scope."
+                            )
                         try:
                             self.manager.start_turn(
                                 state.session_id,
-                                (
-                                    f"Rework work order {wo_id} (integration review round "
-                                    f"{state.integration_rework_rounds}/{state.max_retries}): the "
-                                    f"integration review blocked release with these findings "
-                                    f"and prescribed fixes:\n"
-                                    f"{feedback}\n"
-                                    f"Apply each prescribed fix to your deliverable so every "
-                                    f"blocker is resolved, then resubmit."
-                                ),
-                                role=self._role_for_agent(agent),
+                                rework_prompt,
+                                role=role,
                                 agent_id=agent,
                                 work_order_id=wo_id,
                                 parent_operation_id=parent_op_id,
@@ -2651,37 +2659,48 @@ class LifecycleSupervisor:
     def _reworkable_integration_wos(
         self, state: RunState, ws: Path, blockers: list[str],
     ) -> list[str]:
-        """Implementation and QA work orders that rework should re-run.
+        """Implementation, GitOps, and QA work orders that rework should re-run.
 
-        Planning, integration-review, and GitOps work orders are excluded.
-        When the blockers reference deliverable paths, only the accused work
-        orders (plus QA, which must re-verify after code changes) are
-        selected; unmappable blockers fall back to all code-producing WOs.
+        When the blockers reference deliverable paths, accused work orders (plus QA,
+        which must re-verify after code changes) are selected; unmappable blockers fall
+        back to code-producing and GitOps work orders.
         """
         excluded = {
             state.planning_wo_id,
             "WO-000",
             state.integration_wo_id,
-            state.gitops_wo_id,
         }
         blocker_text = " ".join(str(b) for b in blockers).lower()
+        gitops_keywords = ("version", "changelog", "package.json", "release", "manifest", "gitops", "tag")
+        is_gitops_blocker = any(kw in blocker_text for kw in gitops_keywords)
+        if state.gitops_wo_id and not is_gitops_blocker:
+            excluded.add(state.gitops_wo_id)
+
         code_wos: list[str] = []
         qa_wos: list[str] = []
+        gitops_wos: list[str] = []
         accused: list[str] = []
-        for wo_id in state.completed_wo_ids:
-            if wo_id in excluded:
-                continue
+
+        candidate_wos: list[str] = []
+        for wid in list(dict.fromkeys(state.completed_wo_ids + getattr(state, "worker_wo_ids", []))):
+            if wid and wid not in candidate_wos and wid not in excluded:
+                candidate_wos.append(wid)
+
+        for wo_id in candidate_wos:
             agent = self._agent_for_wo(wo_id, ws)
-            if agent not in ("codex", "gemini", "gemma"):
-                continue
-            if agent == "gemma":
+            role = self._role_for_agent(agent)
+            if agent == "gemma" or role == "qa":
                 qa_wos.append(wo_id)
                 continue
-            code_wos.append(wo_id)
+            if role == "gitops" or agent == "local-llm":
+                gitops_wos.append(wo_id)
+            else:
+                code_wos.append(wo_id)
+
             # Rework candidates are archived — resolve the deliverable from
-            # ACTIVE or COMPLETED.
+            # ACTIVE, COMPLETED, or BLOCKED.
             deliv = ""
-            for sub in ("ACTIVE", "COMPLETED"):
+            for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
                 wo_file = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
                 if not wo_file.is_file():
                     continue
@@ -2694,14 +2713,15 @@ class LifecycleSupervisor:
                     pass
                 break
             if not deliv:
-                accused.append(wo_id)  # no mappable footprint — include defensively
+                if role != "gitops":
+                    accused.append(wo_id)  # no mappable footprint — include defensively
                 continue
             stem = Path(deliv).stem.lower()
             if (deliv in blocker_text) or (stem and stem in blocker_text):
                 accused.append(wo_id)
         if accused:
-            return accused + qa_wos
-        return code_wos + qa_wos
+            return list(dict.fromkeys(accused + qa_wos))
+        return list(dict.fromkeys(code_wos + qa_wos + (gitops_wos if is_gitops_blocker else [])))
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
         """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""

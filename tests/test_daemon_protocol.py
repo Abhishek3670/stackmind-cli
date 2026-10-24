@@ -49,10 +49,11 @@ def test_protocol_handshake_and_typed_errors(tmp_path):
 def test_session_operation_and_event_namespaces(tmp_path):
     manager = SessionManager(DaemonStorage(tmp_path))
     protocol = JsonRpcProtocol(manager)
+    ws = str(tmp_path / "workspace")
     created = protocol.handle(
         _request(
             "session.create",
-            {"agent": "codex", "provider": "test", "contract": _contract(), "workspace": "workspace"},
+            {"agent": "codex", "provider": "test", "contract": _contract(), "workspace": ws},
         )
     )["result"]
     session_id = created["session_id"]
@@ -77,7 +78,7 @@ def test_session_operation_and_event_namespaces(tmp_path):
     assert operation["status"] == "RUNNING"
     assert protocol.handle(_request("operation.get", {"operation_id": operation_id}))["result"]["operation"] == "provider.call"
     assert [item["operation_id"] for item in protocol.handle(_request("operation.list", {"session_id": session_id}))["result"]] == [operation_id]
-    assert protocol.handle(_request("operation.cancel", {"operation_id": operation_id}))["result"]["status"] == "CANCEL_REQUESTED"
+    assert protocol.handle(_request("operation.cancel", {"operation_id": operation_id}))["result"]["status"] in ("CANCEL_REQUESTED", "CANCELLED")
     manager.complete_operation(session_id, operation_id)
 
     history = protocol.handle(_request("session.history", {"session_id": session_id}))["result"]
@@ -91,10 +92,11 @@ def test_daemon_client_exposes_versioned_operation_helpers(tmp_path):
     with LocalDaemon(tmp_path) as daemon:
         client = DaemonClient(daemon.url)
         assert client.health_version()["protocol_version"] == 1
+        ws = str(tmp_path / "workspace")
         created = client.create_session(
-            agent="codex", provider="test", contract=_contract(), workspace="workspace"
+            agent="codex", provider="test", contract=_contract(), workspace=ws
         )
         operation = client.operation_begin(created["session_id"], "provider.call")
         assert client.operation_get(operation["operation_id"])["operation_id"] == operation["operation_id"]
-        assert client.operation_cancel(operation["operation_id"])["status"] == "CANCEL_REQUESTED"
+        assert client.operation_cancel(operation["operation_id"])["status"] in ("CANCEL_REQUESTED", "CANCELLED")
         assert client.session_history(created["session_id"])

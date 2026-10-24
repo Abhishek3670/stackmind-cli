@@ -2773,20 +2773,29 @@ def dispatch_delivery_command(
         restore_composer_focus(state)
         return session, False
     except Exception as err:
-        if is_connection_error(err):
+        err_str = str(err).lower()
+        if "active operation" in err_str or "contention" in err_str:
+            state.add_message("system", "[INFO] An operation is currently running in the background. Please wait for it to complete or use :cancel to abort.")
+            err_box = render_error_box_str(
+                "An operation is currently running in the background.",
+                title="OPERATION IN FLIGHT",
+                hint="Wait for the current operation to complete, or use :cancel to abort it.",
+            )
+        elif is_connection_error(err):
             state.connection_status = "reconnecting"
             err_box = render_error_box_str(
                 f"Could not submit turn: {err}",
                 title="CONNECTION ERROR",
                 hint="Daemon connection was lost. Use :reconnect to restore connection.",
             )
+            state.add_message("system", f"[ERROR] Could not submit turn: {err}")
         else:
             err_box = render_error_box_str(
                 f"Could not submit turn: {err}",
                 title="TURN SUBMISSION ERROR",
                 hint="An operation may already be in flight. Use :status, :cancel, or :reconnect.",
             )
-        state.add_message("system", f"[ERROR] Could not submit turn: {err}")
+            state.add_message("system", f"[ERROR] Could not submit turn: {err}")
         if is_tty:
             redraw_full_screen(
                 session,
