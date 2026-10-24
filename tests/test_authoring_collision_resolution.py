@@ -503,3 +503,183 @@ def test_unblock_in_flight_work_orders_resets_failed_planning_wo(tmp_path: Path)
     wo8_disk = yaml.safe_load((act_dir / "WO-008.yaml").read_text(encoding="utf-8"))
     assert wo8_disk["status"] == "ACTIVE"
     assert "error" not in wo8_disk
+
+
+
+def test_reconcile_cancels_orphaned_work_orders_not_in_plan(tmp_path: Path):
+    """Rule 1: Active work orders not mapping to any plan milestone and not meta-orders get cancelled."""
+    from validators.kernel.daemon.authoring import reconcile_active_work_orders_with_plan
+    plan_content = """# Plan
+
+## Current Architecture
+Baseline environment.
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Implement Core Logic (Agent: codex)
+  - [ ] Task 1.1: Build core algorithms.
+"""
+    (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Valid WO matching plan
+    (act_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({"id": "WO-001", "title": "Implement Core Logic", "status": "ACTIVE", "assigned_agents": ["codex"]}),
+        encoding="utf-8",
+    )
+    # Stale/orphaned WO not in plan
+    (act_dir / "WO-009.yaml").write_text(
+        yaml.safe_dump({"id": "WO-009", "title": "Old Obsolete Task", "status": "ACTIVE", "assigned_agents": ["gemini"]}),
+        encoding="utf-8",
+    )
+    # Meta WO (Integration Review) assigned to claude
+    (act_dir / "WO-008.yaml").write_text(
+        yaml.safe_dump({"id": "WO-008", "type": "VALIDATION", "title": "Integration Review", "status": "ACTIVE", "assigned_agents": ["claude"]}),
+        encoding="utf-8",
+    )
+
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "orders": [
+                {"id": "WO-001", "status": "ACTIVE"},
+                {"id": "WO-009", "status": "ACTIVE"},
+                {"id": "WO-008", "status": "ACTIVE"},
+            ],
+            "total_active": 3,
+        }),
+        encoding="utf-8",
+    )
+
+    reconciled = reconcile_active_work_orders_with_plan(tmp_path)
+    assert "WO-009" in reconciled
+
+    wo9_data = yaml.safe_load((act_dir / "WO-009.yaml").read_text(encoding="utf-8"))
+    assert wo9_data["status"] == "CANCELLED"
+    assert "Orphaned work order" in wo9_data.get("error", "")
+
+    wo1_data = yaml.safe_load((act_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert wo1_data["status"] == "ACTIVE"
+
+    wo8_data = yaml.safe_load((act_dir / "WO-008.yaml").read_text(encoding="utf-8"))
+    assert wo8_data["status"] == "ACTIVE"
+
+    idx_data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    o9 = next(o for o in idx_data["orders"] if o["id"] == "WO-009")
+    assert o9["status"] == "CANCELLED"
+    assert idx_data["total_active"] == 2
+
+
+def test_authoring_readiness_ignores_meta_work_orders(tmp_path: Path):
+    """Rule 2: Supervisor meta-orders (Integration Review, planning) are excluded from worker checks."""
+    from validators.harness.authoring_readiness import validate_authoring_readiness
+    plan_content = """# Plan
+
+## Current Architecture
+Baseline environment.
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Implement Core Feature (Agent: codex)
+  - [ ] Task 1.1: Core backend implementation.
+"""
+    (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Worker work order + contract
+    (act_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Implement Core Feature",
+            "status": "ACTIVE",
+            "assigned_agents": ["codex"],
+            "deliverable": {"type": "code", "path": "src/core.py"},
+        }),
+        encoding="utf-8",
+    )
+    (contracts_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "agent_id": "codex",
+            "work_order": "WO-001",
+            "scope": {"allow": [{"module": "src/**"}]},
+            "budget": {"max_files_touched": 5},
+        }),
+        encoding="utf-8",
+    )
+
+    # Active meta work order assigned to claude with no contract
+    (act_dir / "WO-008.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-008",
+            "type": "VALIDATION",
+            "title": "Integration Review",
+            "status": "ACTIVE",
+            "assigned_agents": ["claude"],
+        }),
+        encoding="utf-8",
+    )
+
+    gate = validate_authoring_readiness(
+        tmp_path,
+        expected_milestones=[{"id": "", "title": "Implement Core Feature", "agent": "codex"}],
+    )
+    issue_codes = [i.code for i in gate.issues]
+    assert "WORKER_ROLE_NOT_PERMITTED" not in issue_codes
+    assert "MISSING_CONTRACT" not in issue_codes
+    assert not any("WO-008" in i.message or i.work_order_id == "WO-008" for i in gate.issues)
+
+
+def test_recovery_decision_cancel_work_order(tmp_path: Path):
+    """Rule 3: Recovery action cancel_work_order cancels work order and updates supervisor state."""
+    from validators.kernel.daemon.supervisor import LifecycleSupervisor, Phase, AdvanceResult
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.manager import SessionManager
+
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    storage = DaemonStorage(tmp_path / ".daemon_storage")
+    manager = SessionManager(storage)
+    session = manager.create_session("claude", "mock-provider", {"allow": ["*"], "deny": []}, str(tmp_path))
+    sid = session["session_id"]
+
+    supervisor = LifecycleSupervisor(manager)
+    state = supervisor.start_run("run-cancel-test", "Test cancel action", tmp_path, sid)
+
+    (act_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({"id": "WO-002", "status": "BLOCKED", "title": "Unwanted Order", "assigned_agents": ["codex"]}),
+        encoding="utf-8",
+    )
+    (contracts_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({"agent_id": "codex", "work_order": "WO-002"}),
+        encoding="utf-8",
+    )
+    state.phase = Phase.ARCHITECT_RECOVERY_DECISION
+    state.worker_wo_ids = ["WO-001", "WO-002"]
+    state.published_wo_ids = ["WO-001", "WO-002"]
+    state.blocked_wo_ids = ["WO-002"]
+    state.worker_blockers = {"WO-002": {"failure_code": "SCOPE_VIOLATION"}}
+
+    decision = {
+        "work_order": "WO-002",
+        "action": "cancel_work_order",
+        "reason": "superseded and no longer needed",
+    }
+    advance_res, err = supervisor._apply_recovery_decision(state, tmp_path, "WO-002", decision)
+
+    assert err is None
+    assert advance_res == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.EXECUTING
+    assert "WO-002" in state.superseded_wo_ids
+    assert "WO-002" not in state.worker_wo_ids
+    assert "WO-002" not in state.blocked_wo_ids
+    assert "WO-002" not in state.worker_blockers
+
+    wo2_disk = yaml.safe_load((act_dir / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert wo2_disk["status"] == "CANCELLED"

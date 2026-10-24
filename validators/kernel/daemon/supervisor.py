@@ -967,6 +967,11 @@ class LifecycleSupervisor:
                 return AdvanceResult.WAITING_FOR_OPERATION
 
             # Revalidate the complete artifact set with the readiness gate.
+            try:
+                from .authoring import reconcile_active_work_orders_with_plan
+                reconcile_active_work_orders_with_plan(ws)
+            except Exception:
+                pass
             self._discover_worker_wos(state)
             gate_result = self._run_readiness_gate(state, ws)
             if not gate_result.ready:
@@ -3648,7 +3653,8 @@ class LifecycleSupervisor:
             "failure_code/transient/replacement_work_orders/contract_revision as applicable).\n"
             f"2. Permitted actions: retry_unchanged (ONLY for transient failures with an unchanged contract), "
             f"amend_contract (set contract_revision to {current_rev + 1} or higher; current revision is {current_rev}; the amended contract is authored in the follow-up repair turn), "
-            "split_work_order (list replacement_work_orders child IDs), create_dependency_work_order (list new prerequisite WO IDs), escalate_human, terminal_block.\n"
+            "split_work_order (list replacement_work_orders child IDs), create_dependency_work_order (list new prerequisite WO IDs), "
+            "cancel_work_order (cancel invalid or orphaned work order), escalate_human, terminal_block.\n"
             "3. Budget, scope, and schema failures must NOT use retry_unchanged.\n"
             "4. Declare the decision file path in modified_files and return the final "
             "HarnessDecision JSON with status 'completed'."
@@ -3894,6 +3900,30 @@ class LifecycleSupervisor:
                 "original_contract": original_contract,
             }
             return self._enter_recovery_repair(state, ws, record)
+
+        if action in ("cancel_work_order", "cancel", "prune_untracked"):
+            target_wo = str(decision.get("work_order") or wo_id)
+            cancel_reason = reason or "Cancelled by Architect recovery decision"
+            self._mark_wo_status_on_disk(ws, target_wo, "CANCELLED", error=cancel_reason)
+            self._archive_recovery_artifact(ws, state.run_id, f".sync/contracts/{target_wo}.yaml")
+            if target_wo not in state.superseded_wo_ids:
+                state.superseded_wo_ids.append(target_wo)
+            if target_wo in state.worker_wo_ids:
+                state.worker_wo_ids.remove(target_wo)
+            if target_wo in state.published_wo_ids:
+                state.published_wo_ids.remove(target_wo)
+            if target_wo in state.blocked_wo_ids:
+                state.blocked_wo_ids.remove(target_wo)
+            if target_wo in state.failed_wo_ids:
+                state.failed_wo_ids.remove(target_wo)
+            evidence = state.worker_blockers.pop(target_wo, None) or {}
+            old_op_id = evidence.get("operation_id")
+            if old_op_id and old_op_id not in state.ignored_operation_ids:
+                state.ignored_operation_ids.append(str(old_op_id))
+            state.recovery_decisions.append({**record, "applied": True})
+            state.error = None
+            self._transition(state, Phase.EXECUTING)
+            return AdvanceResult.TRANSITIONED, None
 
         if action == "escalate_human":
             state.recovery_decisions.append({**record, "applied": True})

@@ -68,7 +68,8 @@
               "BLOCKED",
               "COMPLETE",
               "COMPLETED",
-              "FAILED"
+              "FAILED",
+              "CANCELLED"
             ]
           },
           "priority": {

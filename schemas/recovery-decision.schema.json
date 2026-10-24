@@ -20,6 +20,9 @@
         "amend_contract",
         "split_work_order",
         "create_dependency_work_order",
+        "cancel_work_order",
+        "cancel",
+        "prune_untracked",
         "escalate_human",
         "terminal_block"
       ]

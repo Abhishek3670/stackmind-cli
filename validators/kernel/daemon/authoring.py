@@ -473,14 +473,9 @@ def derive_implementation_estimate(
         else:
             expected.append(f"tests/test_{stem}.py")
 
-    is_scaffold_task = any(kw in f"{title} {description}".lower() for kw in (
-        "scaffold", "scaffolding", "setup", "asset setup", "structure", "init", "bootstrap"
-    ))
-    max_files = max(len(expected), 6) if is_scaffold_task else max(len(expected), len(expected) + 1)
-
     return {
         "expected_files": expected,
-        "max_files_touched": max_files,
+        "max_files_touched": len(expected),
         "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
     }
 
@@ -1334,7 +1329,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     if not active_dir.is_dir():
         return []
 
-    from validators.harness.authoring_readiness import load_plan_milestones, _wo_matches_milestone
+    from validators.harness.authoring_readiness import load_plan_milestones, _wo_matches_milestone, _is_meta_work_order
 
     plan_milestones = load_plan_milestones(ws)
     if not plan_milestones:
@@ -1356,6 +1351,11 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if not isinstance(wo_data, dict):
                 continue
             wo_id = wo_data.get("id") or wo_file.stem
+            current_status = str(wo_data.get("status", "")).upper()
+            if current_status in ("COMPLETED", "CANCELLED", "FAILED"):
+                continue
+            if _is_meta_work_order(wo_data):
+                continue
             current_assigned = wo_data.get("assigned_agents", [])
             primary_agent = current_assigned[0] if current_assigned else ""
             deliv = wo_data.get("deliverable", {})
@@ -1363,6 +1363,50 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             is_test_path = deliv_path.startswith("tests/") or "test" in Path(deliv_path).name
 
             matched_ref = next((r for r in plan_milestones if _wo_matches_milestone(wo_data, r)), None)
+
+            if matched_ref is None:
+                # Rule 1: Orphaned active work order not present in current PLAN.md -> CANCEL
+                now_str = _now()
+                wo_data["status"] = "CANCELLED"
+                wo_data["error"] = "Orphaned work order not present in current PLAN.md"
+                wo_data["updated"] = now_str
+                from validators.kernel.io import durable_write_yaml
+                durable_write_yaml(wo_file, wo_data)
+
+                # Update INDEX.yaml
+                index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
+                if index_path.is_file():
+                    try:
+                        index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+                        if isinstance(index_data, dict) and "orders" in index_data:
+                            for ord_entry in index_data["orders"]:
+                                if isinstance(ord_entry, dict) and ord_entry.get("id") == wo_id:
+                                    ord_entry["status"] = "CANCELLED"
+                                    ord_entry["updated"] = now_str
+                            index_data["total_active"] = sum(
+                                1 for o in index_data["orders"]
+                                if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+                            )
+                            durable_write_yaml(index_path, index_data)
+                    except Exception:
+                        pass
+
+                # Update TREE.yaml
+                try:
+                    from cli.init import ensure_canonical_tree
+                    tree_data = ensure_canonical_tree(ws)
+                    if "agents" in tree_data and isinstance(tree_data["agents"], dict):
+                        for ag_info in tree_data["agents"].values():
+                            if isinstance(ag_info, dict):
+                                orders = ag_info.get("assigned_work_orders", [])
+                                if wo_id in orders:
+                                    orders.remove(wo_id)
+                        durable_write_yaml(ws / ".sync" / "runtime" / "TREE.yaml", tree_data)
+                except Exception:
+                    pass
+
+                reconciled_ids.append(wo_id)
+                continue
 
             target_agent = None
             if matched_ref and matched_ref.get("agent"):

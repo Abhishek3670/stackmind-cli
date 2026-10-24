@@ -334,6 +334,20 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
     return False
 
 
+def _is_meta_work_order(data: dict[str, Any]) -> bool:
+    """Identify supervisor meta-orders (planning, integration review) not subject to worker checks."""
+    wo_id = str(data.get("id") or "").upper()
+    if wo_id == "WO-000":
+        return True
+    wo_type = str(data.get("type") or "").upper()
+    title = str(data.get("title") or "").lower()
+    if wo_type == "VALIDATION" and "integration review" in title:
+        return True
+    if wo_type == "RESEARCH" and "system architecture" in title:
+        return True
+    return False
+
+
 def _path_matches_rule(norm_path: str, pattern: str) -> bool:
     p_norm = pattern.replace("\\", "/")
     if p_norm.startswith("./"):
@@ -502,9 +516,11 @@ def validate_authoring_readiness(
             if wo_id in skip_ids:
                 continue
             status = str(data.get("status", "")).upper()
-            if status in ("COMPLETED", "CANCELLED"):
+            if status in ("COMPLETED", "CANCELLED", "FAILED"):
                 continue
             if p_idx is not None and (_parse_wo_index(wo_id) or 0) <= p_idx:
+                continue
+            if _is_meta_work_order(data):
                 continue
             artifact_paths.append(rel)
             if wo_id in wo_files:
@@ -522,7 +538,7 @@ def validate_authoring_readiness(
             if data is None:
                 continue
             wo_id = str(data.get("id") or f.stem)
-            if wo_id in skip_ids:
+            if wo_id in skip_ids or _is_meta_work_order(data):
                 continue
             completed_wo_files[wo_id] = (rel, data)
 
@@ -688,6 +704,8 @@ def validate_authoring_readiness(
 
     # ── 5. Contract binding, roles, deliverables, deps, budget, scope ──
     for wo_id, (rel, data) in sorted(wo_files.items()):
+        if _is_meta_work_order(data):
+            continue
         contract = contracts.get(wo_id)
 
         assigned = data.get("assigned_agents")
