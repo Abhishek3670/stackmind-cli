@@ -894,7 +894,7 @@ class OperationalEventManager:
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
                 acts = self.current_actions if not self.current_actions.is_empty else None
-                state.add_message("assistant", assistant_response, actions=acts, thinking=assistant_thinking)
+                state.add_message("assistant", assistant_response, deduplicate=True, actions=acts, thinking=assistant_thinking)
 
             return render_tool_activity(activity), assistant_response
 
@@ -905,7 +905,7 @@ class OperationalEventManager:
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
                 acts = self.current_actions if not self.current_actions.is_empty else None
-                state.add_message("assistant", assistant_response, actions=acts, thinking=assistant_thinking)
+                state.add_message("assistant", assistant_response, deduplicate=True, actions=acts, thinking=assistant_thinking)
 
         return render_operational_event(event), assistant_response
 

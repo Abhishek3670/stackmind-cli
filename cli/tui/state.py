@@ -1009,6 +1009,14 @@ class AutonomousDeliveryState:
             self.show_command_dialog(cmd_name, content)
         key = (role, clean)
 
+        # Suppress immediate back-to-back duplicate messages from toolResult and operation.completed
+        if self.messages and self.messages[-1].role == role and self.messages[-1].content.strip() == clean:
+            if actions is not None:
+                self.messages[-1].actions = actions
+            if thinking is not None:
+                self.messages[-1].thinking = thinking
+            return self.messages[-1]
+
         if deduplicate and key in self.seen_message_keys:
             for m in self.messages:
                 if m.role == role and m.content.strip() == clean:

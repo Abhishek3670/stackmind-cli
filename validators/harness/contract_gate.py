@@ -297,13 +297,15 @@ def verify_post_execution(
                     p_norm = pattern.replace("\\", "/")
                     if p_norm.startswith("./"):
                         p_norm = p_norm[2:]
+                    p_clean = p_norm.rstrip("/*").rstrip("/")
                     if (
                         module_matches(mod, pattern)
                         or fnmatch.fnmatch(norm_fp, p_norm)
-                        or fnmatch.fnmatch(norm_fp, p_norm.rstrip("/") + "/*")
-                        or fnmatch.fnmatch(norm_fp, p_norm.rstrip("/") + "/**")
+                        or fnmatch.fnmatch(norm_fp, p_clean + "/*")
+                        or fnmatch.fnmatch(norm_fp, p_clean + "/**")
                         or norm_fp == p_norm
-                        or norm_fp.startswith(p_norm.rstrip("/") + "/")
+                        or norm_fp == p_clean
+                        or norm_fp.startswith(p_clean + "/")
                     ):
                         allowed = True
                         break
