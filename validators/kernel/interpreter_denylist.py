@@ -37,13 +37,23 @@ _FLAGGED_INTERPRETERS = frozenset({
     "wish",
 })
 
-# Flags that take a string of code or execute arbitrary modules for the interpreters above.
+# Flags that take a string of code for the interpreters above.
 _CODE_FLAGS = frozenset({
     "-c", "--command",       # python/perl/ruby/php/lua -c
     "-e",                    # perl/ruby/node -e
     "--eval", "-p", "-n",    # perl -p/-n one-liners; node --eval
     "-Command", "-EncodedCommand",
-    "-m",                    # python -m arbitrary module execution
+})
+
+# Allowlisted standard modules for python -m (P0-1)
+# Blocks arbitrary script/server module execution while preserving test/package tooling.
+_PYTHON_ALLOWED_MODULES = frozenset({
+    "pytest",
+    "pip",
+    "venv",
+    "unittest",
+    "py_compile",
+    "json.tool",
 })
 
 # Interpreters blocked regardless of flags: their scripting model is a string
@@ -51,6 +61,7 @@ _CODE_FLAGS = frozenset({
 _UNCONDITIONAL = frozenset({
     "awk", "gawk", "mawk", "sed",
     "nc", "netcat", "ncat", "socat",
+    "start",
 })
 
 _EVAL = frozenset({"eval", "exec", "source", "."})
@@ -77,6 +88,7 @@ _GIT_DENIED_FLAG_PREFIXES = (
 
 _GIT_ALLOWED_FLAGS = frozenset({
     "--no-optional-locks",
+    "--no-pager",
     "--oneline",
     "--stat",
     "--name-only",
@@ -99,7 +111,7 @@ _GIT_ALLOWED_FLAGS = frozenset({
 
 _PUBLISH_TOOLS_NON_GITOPS = frozenset({"gh", "hub"})
 
-_GITOPS_ROLES = frozenset({"gitops", "local-llm", "release"})
+_GITOPS_ROLES = frozenset({"gitops", "release"})
 
 
 def is_gitops_role(role: str | None) -> bool:
@@ -127,22 +139,60 @@ def _unwrap_command(command: Sequence[str]) -> Sequence[str]:
     if not command:
         return command
 
+    import shlex
     exe = _exe_name(command[0])
 
     if exe in ("env", "command", "nice", "nohup", "sudo", "time", "timeout"):
         idx = 1
-        while idx < len(command) and command[idx].startswith("-"):
-            # skip option flags to wrappers (e.g. env -i, nice -n 10)
-            idx += 1
+        while idx < len(command):
+            arg = command[idx]
+            if exe == "env":
+                if arg in ("-S", "--split-string") and idx + 1 < len(command):
+                    return _unwrap_command(shlex.split(command[idx + 1]))
+                if arg in ("-u", "--unset") and idx + 1 < len(command):
+                    idx += 2
+                    continue
+                if arg.startswith("-") or "=" in arg:
+                    idx += 1
+                    continue
+                break
+            elif exe in ("nice", "timeout", "sudo"):
+                if arg.startswith("-"):
+                    idx += 1
+                    # Skip option flag argument (e.g. -n 10, -u root, -s 9)
+                    if idx < len(command) and not command[idx].startswith("-"):
+                        idx += 1
+                    continue
+                elif exe == "timeout" and (arg.isdigit() or (arg[:-1].isdigit() and arg[-1] in "smhd")):
+                    idx += 1
+                    continue
+                break
+            else:
+                if arg.startswith("-"):
+                    idx += 1
+                    continue
+                break
         if idx < len(command):
-            return _unwrap_command(command[idx:])
+            sub = command[idx:]
+            if len(sub) == 1 and " " in sub[0]:
+                return _unwrap_command(shlex.split(sub[0]))
+            return _unwrap_command(sub)
 
     if exe == "xargs":
         idx = 1
-        while idx < len(command) and command[idx].startswith("-"):
-            idx += 1
+        while idx < len(command):
+            arg = command[idx]
+            if arg.startswith("-"):
+                idx += 1
+                if arg in ("-I", "-i", "-n", "-s", "-d", "-E") and idx < len(command):
+                    idx += 1
+                continue
+            break
         if idx < len(command):
-            return _unwrap_command(command[idx:])
+            sub = command[idx:]
+            if len(sub) == 1 and " " in sub[0]:
+                return _unwrap_command(shlex.split(sub[0]))
+            return _unwrap_command(sub)
 
     if exe == "find":
         for i, part in enumerate(command):
@@ -154,7 +204,42 @@ def _unwrap_command(command: Sequence[str]) -> Sequence[str]:
                     if token != "{}":
                         inner.append(token)
                 if inner:
+                    if len(inner) == 1 and " " in inner[0]:
+                        return _unwrap_command(shlex.split(inner[0]))
                     return _unwrap_command(inner)
+
+    if exe in ("cmd", "cmd.exe"):
+        idx = 1
+        while idx < len(command):
+            arg = command[idx]
+            if arg.lower() in ("/c", "/k", "-c"):
+                idx += 1
+                if idx < len(command):
+                    sub = command[idx:]
+                    if len(sub) == 1 and " " in sub[0]:
+                        return _unwrap_command(shlex.split(sub[0]))
+                    return _unwrap_command(sub)
+            elif arg.startswith("/"):
+                idx += 1
+                continue
+            break
+
+    if exe == "start":
+        idx = 1
+        while idx < len(command):
+            arg = command[idx]
+            if arg.startswith("/") or arg.startswith("-"):
+                idx += 1
+                continue
+            if arg.startswith('"') and arg.endswith('"') and idx + 1 < len(command):
+                idx += 1
+                continue
+            break
+        if idx < len(command):
+            sub = command[idx:]
+            if len(sub) == 1 and " " in sub[0]:
+                return _unwrap_command(shlex.split(sub[0]))
+            return _unwrap_command(sub)
 
     return command
 
@@ -194,13 +279,23 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
 
     # 3. Flagged interpreters: blocked when a code-string/module flag is present
     if exe in _FLAGGED_LOWER:
-        flags = _code_flag_positions(cmd)
-        if flags:
-            flagged = ", ".join(cmd[i] for i in flags)
-            return (
-                f"interpreter '{cmd[0]}' invoked with code-string flag(s) "
-                f"({flagged}) is denied at the agent boundary"
-            )
+        # Check for python -m specifically
+        for index, part in enumerate(cmd[1:], start=1):
+            if part == "-m" and exe.startswith("python"):
+                if index + 1 < len(cmd):
+                    mod = cmd[index + 1].lower()
+                    if mod not in _PYTHON_ALLOWED_MODULES:
+                        return (
+                            f"python -m module '{mod}' is not in allowlisted modules "
+                            f"({', '.join(sorted(_PYTHON_ALLOWED_MODULES))})"
+                        )
+                else:
+                    return "python -m without a module name is denied"
+            elif part in _CODE_FLAGS or part.lower() in {f.lower() for f in _CODE_FLAGS}:
+                return (
+                    f"interpreter '{cmd[0]}' invoked with code-string flag '{part}' "
+                    "is denied at the agent boundary"
+                )
 
     # 4. Non-GitOps specific constraints
     if not is_gitops:
@@ -220,7 +315,12 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
             # Check for denied flag prefixes anywhere in arguments
             for arg in args:
                 for prefix in _GIT_DENIED_FLAG_PREFIXES:
-                    if arg == prefix or arg.startswith(prefix + "=") or (prefix.startswith("-c") and arg.startswith("-c")):
+                    if (
+                        arg == prefix
+                        or arg.startswith(prefix + "=")
+                        or (prefix == "-c" and arg.startswith("-c"))
+                        or (prefix == "-C" and (arg == "-C" or arg.startswith("-C")))
+                    ):
                         return f"git flag '{arg}' is denied for non-GitOps roles (advisory allowlist P0-1)"
 
             # Find the subcommand (first positional token not starting with '-')

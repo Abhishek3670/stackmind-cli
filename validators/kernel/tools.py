@@ -228,17 +228,45 @@ class ToolGateway:
         # contract grants. Trusted platform-internal callers (canary verifier,
         # evidence tracer) construct their own ProcessSandbox and are not
         # subject to this gate.
-        role = getattr(self, "actor_id", None) or "worker"
+        # Determine assigned role for this turn from policy or contract (P0-1)
+        role = "worker"
+        if hasattr(self, "policy") and hasattr(self.policy, "policy_id"):
+            pid = str(self.policy.policy_id).strip().lower()
+            if pid.startswith("policy-"):
+                role = pid.split("policy-", 1)[1]
+            else:
+                role = pid
+        elif hasattr(self, "contract") and getattr(self.contract, "role", None):
+            role = str(self.contract.role).strip().lower()
+
         denial_reason = check_command(command, role=role)
         if denial_reason is not None:
             raise PermissionError(denial_reason)
         env_extra = {}
         if not is_gitops_role(role):
+            import tempfile
+            empty_hooks_dir = Path(tempfile.gettempdir()) / "stackmind-empty-hooks"
+            empty_hooks_dir.mkdir(parents=True, exist_ok=True)
+            null_device = "NUL" if sys.platform == "win32" else "/dev/null"
             env_extra = {
+                # Advisory git hardening (P0-1)
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_PAGER": "cat",
                 "GIT_EXTERNAL_DIFF": "",
                 "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": null_device,
+                "GIT_CONFIG_SYSTEM": null_device,
+                "GIT_CONFIG_PARAMETERS": (
+                    f"'core.fsmonitor=false' 'core.hooksPath={empty_hooks_dir.as_posix()}'"
+                ),
+                # Credential isolation (Phase 0 Spec Amendment E)
+                "GITHUB_TOKEN": "",
+                "GH_TOKEN": "",
+                "GIT_SSH_COMMAND": "",
+                "SSH_AUTH_SOCK": "",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": "",
+                "SSH_ASKPASS": "",
             }
         result = self.sandbox.run(command, env_extra=env_extra)
         self.boundary.journal.complete(record.request.operation_id, result)
