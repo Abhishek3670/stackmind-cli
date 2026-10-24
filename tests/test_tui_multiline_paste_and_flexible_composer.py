@@ -88,6 +88,14 @@ def test_shift_enter_inserts_newline_without_submitting():
     assert result == "first\nsecond"
 
 
+def test_shift_enter_escape_sequences_parsing():
+    """Verify all terminal Shift+Enter escape sequences resolve to Key.SHIFT_ENTER."""
+    from cli.tui.keyboard import _parse_escape_sequence
+
+    for seq in ("[13;2u", "[27;2;13~", "[13;2~", "[10;2u", "[27;2;10~", "[10;2~", "OM"):
+        assert _parse_escape_sequence(seq) == Key.SHIFT_ENTER
+
+
 def test_burst_paste_fallback_with_pending_input(monkeypatch):
     """Verify that when unread input is pending, Enter is treated as newline insertion."""
     pending_state = [True, True, False]
@@ -298,3 +306,141 @@ def test_alternate_screen_bracketed_paste_lifecycle():
     restore_buf = io.StringIO()
     restore_terminal_state(stream=restore_buf)
     assert "\x1b[?2004l" in restore_buf.getvalue()
+
+
+def test_alt_enter_inserts_newline_without_submitting():
+    """Verify Alt+Enter inserts a newline character rather than submitting."""
+    keys = iter([
+        "first",
+        Key.ALT_ENTER,
+        "second",
+        Key.ENTER,
+    ])
+    result = raw_prompt_input(key_stream=keys)
+    assert result == "first\nsecond"
+
+
+def test_word_wrap_cursor_and_no_recursion():
+    """Verify word-wrapped multiline composer computes correct cursor row without recursion."""
+    calls = []
+    def on_h_change(ed):
+        calls.append(len(ed.buffer))
+
+    long_text = "1. What is Genset? it is a power generator company. 2. What is the primary goal of the page? simply provide information. 3. Who is the target audience? Every one who"
+    editor = RawLineEditor(width=80, on_height_change=on_h_change)
+    for ch in long_text:
+        editor.insert_char(ch)
+
+    # Height change should have been called on wrapping
+    assert len(calls) > 0
+
+    # Redraw line should NOT recursively blow up
+    out = io.StringIO()
+    editor.redraw_line(out=out)
+
+    c_line, c_col = editor.current_line_and_col
+    v_lines, _, _, _ = editor._get_visual_lines()
+    assert len(v_lines) > 1
+    # Check cursor row in 24-line terminal
+    row = compute_composer_cursor_row(24, composer_content=editor.text, cursor_line=c_line, width=170)
+    assert row == 22
+
+
+def test_ctrl_enter_inserts_newline_without_submitting():
+    """Verify Ctrl+Enter inserts a newline character rather than submitting."""
+    keys = iter([
+        "first",
+        Key.CTRL_ENTER,
+        "second",
+        Key.ENTER,
+    ])
+    result = raw_prompt_input(key_stream=keys)
+    assert result == "first\nsecond"
+
+
+def test_alt_v_pastes_image_and_updates_attachments(monkeypatch, tmp_path):
+    """Verify Alt+V extracts clipboard image, registers [IMAGE1.png], and appends to prompt on submit."""
+    fake_png = b"\x89PNG\r\n\x1a\nfakeimagebytes"
+    monkeypatch.setattr("cli.tui.clipboard.get_clipboard_image", lambda: (fake_png, "png"))
+
+    state = MagicMock()
+    state.workspace_dir = str(tmp_path)
+    state.attached_images = []
+    state.composer_alert = None
+
+    # Verify attachment tracking prior to submit
+    editor = RawLineEditor(state=state)
+    editor.handle_key(Key.ALT_V)
+    assert "[IMAGE1.png]" in editor.attached_images
+    assert "[IMAGE1.png]" in state.attached_images
+
+    # Verify submission appends image tag and resets state.attached_images
+    keys = iter([
+        "Describe this",
+        Key.ALT_V,
+        Key.ENTER,
+    ])
+    result = raw_prompt_input(key_stream=keys, state=state)
+    assert "[IMAGE1.png]" in result
+    assert result.startswith("Describe this")
+    assert state.attached_images == []
+
+    # Verify physical file written to .sync/attachments/pasted/
+    pasted_file = tmp_path / ".sync" / "attachments" / "pasted" / "IMAGE1.png"
+    assert pasted_file.exists()
+    assert pasted_file.read_bytes() == fake_png
+
+
+def test_alt_v_no_image_in_clipboard_shows_alert(monkeypatch):
+    """Verify Alt+V shows a non-blocking alert when no image is in the clipboard."""
+    monkeypatch.setattr("cli.tui.clipboard.get_clipboard_image", lambda: None)
+
+    state = MagicMock()
+    state.composer_alert = None
+    state.attached_images = []
+
+    editor = RawLineEditor(state=state)
+    success = editor.handle_key(Key.ALT_V)
+    assert success is False
+    assert editor.alert == "no image in clipboard"
+    assert state.composer_alert == "no image in clipboard"
+
+
+def test_backspace_on_empty_buffer_removes_last_attachment(monkeypatch, tmp_path):
+    """Verify backspace removes the most recent attached image when buffer is empty."""
+    fake_png = b"\x89PNG\r\n\x1a\nfakeimagebytes"
+    monkeypatch.setattr("cli.tui.clipboard.get_clipboard_image", lambda: (fake_png, "png"))
+
+    state = MagicMock()
+    state.workspace_dir = str(tmp_path)
+    state.attached_images = []
+
+    editor = RawLineEditor(state=state)
+    editor.handle_key(Key.ALT_V)
+    editor.handle_key(Key.ALT_V)
+    assert editor.attached_images == ["[IMAGE1.png]", "[IMAGE2.png]"]
+
+    # Press backspace with empty buffer
+    editor.handle_key(Key.BACKSPACE)
+    assert editor.attached_images == ["[IMAGE1.png]"]
+    assert state.attached_images == ["[IMAGE1.png]"]
+
+    editor.handle_key(Key.BACKSPACE)
+    assert editor.attached_images == []
+    assert state.attached_images == []
+
+
+def test_composer_bottom_border_renders_attachments():
+    """Verify bottom border includes attached image labels in blue style."""
+    from cli.tui.terminal import render_composer_bottom_border_str
+
+    border_str = render_composer_bottom_border_str(
+        width=60,
+        attachments=["[IMAGE1.png]", "[IMAGE2.png]"],
+        force_color=False,
+    )
+    assert "[IMAGE1.png]" in border_str
+    assert "[IMAGE2.png]" in border_str
+    assert "╰─" in border_str
+    assert "─╯" in border_str
+

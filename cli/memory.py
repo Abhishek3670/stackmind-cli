@@ -730,5 +730,16 @@ def memory_decay_audit(project, days, limit, fmt):
         click.echo()
 
 
+@memory_group.command("graph")
+@click.option("--project", "-p", type=click.Path(exists=True, file_okay=False), default=".", help="Project path")
+@click.option("--port", type=int, default=8766, help="Port to serve the visualizer (default: 8766)")
+@click.option("--no-browser", is_flag=True, default=False, help="Do not open browser automatically")
+def memory_graph(project, port, no_browser):
+    """Launch live interactive in-browser memory graph visualizer."""
+    from cli.memory_graph import serve_memory_graph
+
+    serve_memory_graph(project, port=port, open_browser=(not no_browser))
+
+
 # Export for main CLI
 __all__ = ["memory_group"]

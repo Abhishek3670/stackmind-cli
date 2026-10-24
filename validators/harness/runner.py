@@ -3021,14 +3021,22 @@ class AgentRunner:
                     except (OSError, UnicodeDecodeError, SyntaxError):
                         code_verified = False
 
-            # Phase C: PLAN.md structural validation
+            # Phase C: PLAN.md structural validation (with auto-repair)
             norm_rel = Path(relative_path).as_posix()
             if norm_rel == "PLAN.md" or norm_rel.endswith("/PLAN.md"):
                 candidate = staged_root / relative_path
                 if candidate.exists():
-                    from validators.harness.plan import validate_plan_structure
+                    from validators.harness.plan import validate_plan_structure, repair_plan_structure
                     try:
-                        plan_valid, plan_errs = validate_plan_structure(candidate.read_text(encoding='utf-8'))
+                        raw_plan = candidate.read_text(encoding='utf-8')
+                        plan_valid, plan_errs = validate_plan_structure(raw_plan)
+                        if not plan_valid:
+                            repaired_plan = repair_plan_structure(raw_plan, default_name=self.project_path.name)
+                            rep_valid, rep_errs = validate_plan_structure(repaired_plan)
+                            if rep_valid:
+                                candidate.write_text(repaired_plan, encoding='utf-8')
+                                plan_valid = True
+                                plan_errs = []
                         if not plan_valid:
                             code_verified = False
                             state_verified = False

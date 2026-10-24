@@ -40,6 +40,19 @@ def set_clipboard_text(text: str) -> bool:
         return _set_clipboard_linux(text)
 
 
+def get_clipboard_image() -> tuple[bytes, str] | None:
+    """Retrieve raw image bytes and file extension (e.g., (bytes, 'png')) from system clipboard.
+
+    Returns None if no image is present on the clipboard.
+    """
+    if os.name == "nt":
+        return _get_clipboard_image_windows()
+    elif sys.platform == "darwin":
+        return _get_clipboard_image_macos()
+    else:
+        return _get_clipboard_image_linux()
+
+
 # ─── Windows Implementation (ctypes Win32 API) ───────────────────────────────
 
 def _get_clipboard_windows() -> str:
@@ -125,6 +138,125 @@ def _set_clipboard_windows(text: str) -> bool:
         return False
 
 
+def _dib_to_bmp(dib_bytes: bytes) -> bytes:
+    """Prepend a standard 14-byte BITMAPFILEHEADER to raw DIB / DIBV5 bytes."""
+    import struct
+
+    if len(dib_bytes) < 40:
+        return b""
+    header_size = struct.unpack_from("<I", dib_bytes, 0)[0]
+    bit_count = struct.unpack_from("<H", dib_bytes, 14)[0]
+    compression = struct.unpack_from("<I", dib_bytes, 16)[0]
+    clr_used = struct.unpack_from("<I", dib_bytes, 32)[0] if header_size >= 36 else 0
+
+    if clr_used == 0 and bit_count <= 8:
+        palette_count = 1 << bit_count
+    else:
+        palette_count = clr_used
+
+    extra_masks = 12 if (compression == 3 and header_size == 40) else 0
+    bf_off_bits = 14 + header_size + extra_masks + (palette_count * 4)
+    file_header = struct.pack("<2sIHHI", b"BM", 14 + len(dib_bytes), 0, 0, bf_off_bits)
+    return file_header + dib_bytes
+
+
+def _get_clipboard_image_windows() -> tuple[bytes, str] | None:
+    """Retrieve raw image bytes and format extension from Windows clipboard."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.restype = ctypes.c_bool
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = ctypes.c_bool
+        user32.GetClipboardData.argtypes = [ctypes.c_uint]
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+        user32.IsClipboardFormatAvailable.restype = ctypes.c_bool
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = ctypes.c_bool
+        kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+
+        opened = False
+        for _ in range(5):
+            if user32.OpenClipboard(None):
+                opened = True
+                break
+            time.sleep(0.01)
+
+        if not opened:
+            return _get_clipboard_image_windows_powershell()
+
+        try:
+            # 1. First check registered PNG format (standard for modern browsers, discord, snipping tool)
+            png_fmt = user32.RegisterClipboardFormatW("PNG")
+            if png_fmt and user32.IsClipboardFormatAvailable(png_fmt):
+                h_data = user32.GetClipboardData(png_fmt)
+                if h_data:
+                    size = kernel32.GlobalSize(h_data)
+                    ptr = kernel32.GlobalLock(h_data)
+                    if ptr and size > 0:
+                        raw = ctypes.string_at(ptr, size)
+                        kernel32.GlobalUnlock(h_data)
+                        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                            return (raw, "png")
+
+            # 2. Check CF_DIB (8) or CF_DIBV5 (17) (universal on Windows for screenshots, printscreen)
+            for dib_id in (8, 17):
+                if user32.IsClipboardFormatAvailable(dib_id):
+                    h_data = user32.GetClipboardData(dib_id)
+                    if h_data:
+                        size = kernel32.GlobalSize(h_data)
+                        ptr = kernel32.GlobalLock(h_data)
+                        if ptr and size > 0:
+                            raw_dib = ctypes.string_at(ptr, size)
+                            kernel32.GlobalUnlock(h_data)
+                            bmp = _dib_to_bmp(raw_dib)
+                            if bmp:
+                                return (bmp, "bmp")
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        pass
+
+    return _get_clipboard_image_windows_powershell()
+
+
+def _get_clipboard_image_windows_powershell() -> tuple[bytes, str] | None:
+    """PowerShell STA fallback to convert any clipboard image into PNG bytes."""
+    try:
+        import base64
+
+        ps_cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$img = [System.Windows.Forms.Clipboard]::GetImage(); "
+            "if ($img) { "
+            "$ms = New-Object System.IO.MemoryStream; "
+            "$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); "
+            "[Convert]::ToBase64String($ms.ToArray()) "
+            "}"
+        )
+        res = subprocess.run(
+            ["powershell", "-Sta", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            data = base64.b64decode(res.stdout.strip())
+            if data.startswith(b"\x89PNG\r\n\x1a\n"):
+                return (data, "png")
+    except Exception:
+        pass
+    return None
+
+
 # ─── macOS Implementation (pbpaste / pbcopy) ──────────────────────────────────
 
 def _get_clipboard_macos() -> str:
@@ -146,6 +278,17 @@ def _set_clipboard_macos(text: str) -> bool:
         except Exception:
             pass
     return False
+
+
+def _get_clipboard_image_macos() -> tuple[bytes, str] | None:
+    if shutil.which("pngpaste"):
+        try:
+            res = subprocess.run(["pngpaste", "-"], capture_output=True, timeout=1.5)
+            if res.returncode == 0 and res.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+                return (res.stdout, "png")
+        except Exception:
+            pass
+    return None
 
 
 # ─── Linux Implementation (wl-paste / xclip / xsel) ───────────────────────────
@@ -207,3 +350,25 @@ def _set_clipboard_linux(text: str) -> bool:
             pass
 
     return False
+
+
+def _get_clipboard_image_linux() -> tuple[bytes, str] | None:
+    if shutil.which("wl-paste"):
+        try:
+            res = subprocess.run(["wl-paste", "-t", "image/png"], capture_output=True, timeout=1.5)
+            if res.returncode == 0 and res.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+                return (res.stdout, "png")
+        except Exception:
+            pass
+    if shutil.which("xclip"):
+        try:
+            res = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+                capture_output=True,
+                timeout=1.5,
+            )
+            if res.returncode == 0 and res.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+                return (res.stdout, "png")
+        except Exception:
+            pass
+    return None

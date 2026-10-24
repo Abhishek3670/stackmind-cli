@@ -498,6 +498,7 @@ def tui(
                             state=state,
                             composer_content=current_text,
                             cursor_line=cursor_line,
+                            width=comp_width,
                         )
                         sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
@@ -574,6 +575,7 @@ def tui(
                             state=state,
                             composer_content=current_text,
                             cursor_line=cursor_line,
+                            width=comp_width,
                         )
                         sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
@@ -615,6 +617,7 @@ def tui(
                             state=state,
                             composer_content=current_text,
                             cursor_line=cursor_line,
+                            width=comp_width,
                         )
                         sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()
@@ -625,6 +628,8 @@ def tui(
                     """Dynamically redraw full screen when composer content height changes or viewport scrolls."""
                     if not is_tty:
                         return
+                    if editor is not None:
+                        editor.width = comp_width
                     current_text = (
                         "".join(editor.buffer)
                         if (
@@ -633,10 +638,14 @@ def tui(
                         )
                         else None
                     )
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                    term_size = shutil.get_terminal_size(fallback=(current_cols, current_lines))
+                    term_cols = term_size.columns
+                    term_lines = term_size.lines
                     redraw_full_screen(
                         session,
                         state,
+                        width=term_cols,
+                        height=term_lines,
                         clear=clear,
                         include_composer=True,
                         composer_is_active=True,
@@ -650,14 +659,10 @@ def tui(
                         state=state,
                         composer_content=current_text,
                         cursor_line=cursor_line,
+                        width=comp_width,
                     )
                     sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                     sys.stdout.flush()
-                    if editor is not None and hasattr(editor, "redraw_line"):
-                        try:
-                            editor.redraw_line()
-                        except Exception:
-                            pass
 
                 def _handle_page_up(editor: Any = None) -> None:
                     """Scroll conversation viewport, work orders, or command dialog up by half a page."""
@@ -766,6 +771,7 @@ def tui(
                             state=state,
                             composer_content=current_text,
                             cursor_line=cursor_line,
+                            width=comp_width,
                         )
                         sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                         sys.stdout.flush()

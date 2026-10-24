@@ -226,6 +226,7 @@ def render_composer_box(
     is_active: bool = False,
     has_content: bool = False,
     alert: str | None = None,
+    attachments: list[str] | None = None,
     title: str | None = None,
     height: int | None = None,
     retry_status: str | None = None,
@@ -412,7 +413,8 @@ def render_composer_box(
         border_style=border_color,
         title=panel_title,
         title_align=title_align,
-        subtitle=f"[bold #f59e0b] {alert} [/]" if alert else None,
+        subtitle=f"[bold #f59e0b] {alert} [/]" if alert else (f"[bold #38bdf8] {' '.join(attachments)} [/]" if attachments else None),
+        subtitle_align="left",
         padding=(0, 1),
     )
 
@@ -428,6 +430,7 @@ def render_composer_box_str(
     force_color: bool | None = None,
     no_color: bool | None = None,
     alert: str | None = None,
+    attachments: list[str] | None = None,
     title: str | None = None,
     height: int | None = None,
     retry_status: str | None = None,
@@ -447,6 +450,7 @@ def render_composer_box_str(
             is_active=is_active,
             has_content=has_content,
             alert=alert,
+            attachments=attachments,
             title=title,
             height=height,
             retry_status=retry_status,
@@ -859,6 +863,7 @@ def render_composer_bottom_border(
     width: int = 80,
     is_active: bool = False,
     alert: str | None = None,
+    attachments: list[str] | None = None,
 ) -> RenderableType:
     """Render the bottom rounded border of the composer box, optionally embedding an alert."""
     border_color = "#f59e0b" if alert else ("#60a5fa" if is_active else "#475569")
@@ -877,6 +882,21 @@ def render_composer_bottom_border(
             text.append(f" {alert} ", style="bold #f59e0b")
             text.append("─╯", style=border_color)
             return text
+    elif attachments:
+        att_str = " ".join(attachments)
+        label = f" {att_str} "
+        fixed_len = len("╰─") + len(label) + len("─╯")
+        if width >= fixed_len + 2:
+            fill_count = max(0, width - fixed_len)
+            text.append("╰─", style=border_color)
+            text.append(label, style="bold #38bdf8")
+            text.append("─" * fill_count + "─╯", style=border_color)
+            return text
+        elif width >= len(att_str) + 4:
+            text.append("╰─", style=border_color)
+            text.append(f" {att_str} ", style="bold #38bdf8")
+            text.append("─╯", style=border_color)
+            return text
     text.append("╰" + "─" * max(2, width - 2) + "╯", style=border_color)
     return text
 
@@ -885,6 +905,7 @@ def render_composer_bottom_border_str(
     width: int = 80,
     is_active: bool = False,
     alert: str | None = None,
+    attachments: list[str] | None = None,
     *,
     force_color: bool | None = None,
     no_color: bool | None = None,
@@ -895,7 +916,11 @@ def render_composer_bottom_border_str(
         force_color=force_color,
         no_color=no_color,
     )
-    console.print(render_composer_bottom_border(width=width, is_active=is_active, alert=alert))
+    console.print(
+        render_composer_bottom_border(
+            width=width, is_active=is_active, alert=alert, attachments=attachments
+        )
+    )
     return console.export_text(styles=use_ansi).rstrip()
 
 
@@ -1019,7 +1044,7 @@ def prompt_composer_input(
                         live_manager=live_manager,
                     )
                     term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                    c_row = compute_composer_cursor_row(term_lines, state=state)
+                    c_row = compute_composer_cursor_row(term_lines, state=state, width=comp_width)
                     sys.stdout.write(f"\x1b[{c_row};1H")
                     sys.stdout.flush()
                     return True
@@ -1097,6 +1122,7 @@ def prompt_composer_input(
                         state=state,
                         composer_content=current_text,
                         cursor_line=cursor_line,
+                        width=comp_width,
                     )
                     c_col = _compute_cursor_col(ed) if ed else 5
                     sys.stdout.write(f"\x1b[{c_row};{c_col}H")
@@ -1142,10 +1168,11 @@ def prompt_composer_input(
                     no_color=no_color,
                     retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
                 ),
-                bottom_border_renderer=lambda alert: render_composer_bottom_border_str(
+                bottom_border_renderer=lambda alert, atts=None: render_composer_bottom_border_str(
                     width=comp_width,
                     is_active=True,
                     alert=alert,
+                    attachments=atts if atts is not None else (getattr(state, "attached_images", None) if state is not None else None),
                     force_color=force_color,
                     no_color=no_color,
                 ),

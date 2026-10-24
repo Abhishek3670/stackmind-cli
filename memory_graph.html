@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StackMind // Live Memory Graph</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: rgba(15, 23, 42, 0.85);
+      --card-border: #334155;
+      --text: #f8fafc;
+      --text-dim: #94a3b8;
+      --text-muted: #64748b;
+      --fact: #a855f7;
+      --decision: #10b981;
+      --lesson: #f59e0b;
+      --pattern: #06b6d4;
+      --preference: #f43f5e;
+      --agent: #38bdf8;
+      --workorder: #60a5fa;
+      --contradict: #ef4444;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "JetBrains Mono", monospace;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      height: 54px;
+      background: rgba(15, 23, 42, 0.95);
+      border-bottom: 1px solid var(--card-border);
+      backdrop-filter: blur(12px);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      z-index: 20;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-logo {
+      width: 28px;
+      height: 28px;
+      background: linear-gradient(135deg, #38bdf8, #a855f7);
+      border-radius: 6px;
+      display: grid;
+      place-content: center;
+      font-weight: 800;
+      font-size: 14px;
+      color: #000;
+    }
+    .brand-title {
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.5px;
+    }
+    .brand-sub {
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 400;
+      margin-left: 6px;
+    }
+
+    .hud-metrics {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .pill {
+      background: rgba(30, 41, 59, 0.7);
+      border: 1px solid var(--card-border);
+      border-radius: 9999px;
+      padding: 4px 12px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+    }
+    .dot.live {
+      box-shadow: 0 0 8px #10b981;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 0.6; }
+      50% { opacity: 1; transform: scale(1.1); }
+      100% { opacity: 0.6; }
+    }
+
+    .btn {
+      background: #1e293b;
+      border: 1px solid #475569;
+      color: var(--text);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { background: #334155; border-color: #64748b; }
+    .btn.active { background: #0284c7; border-color: #38bdf8; }
+
+    #workspace {
+      position: relative;
+      flex: 1;
+      width: 100%;
+      height: calc(100vh - 54px);
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+
+    .controls-overlay {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px;
+      backdrop-filter: blur(10px);
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      width: 270px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .search-box {
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid #334155;
+      padding: 6px 10px;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 12px;
+      outline: none;
+    }
+    .search-box:focus { border-color: #38bdf8; }
+
+    .filter-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .filter-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      font-weight: 700;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .chip {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: var(--text-dim);
+      cursor: pointer;
+      user-select: none;
+    }
+    .chip.active {
+      color: #fff;
+      font-weight: 600;
+    }
+    .chip[data-type="fact"].active { background: rgba(168, 85, 247, 0.2); border-color: var(--fact); color: var(--fact); }
+    .chip[data-type="decision"].active { background: rgba(16, 185, 129, 0.2); border-color: var(--decision); color: var(--decision); }
+    .chip[data-type="lesson"].active { background: rgba(245, 158, 11, 0.2); border-color: var(--lesson); color: var(--lesson); }
+    .chip[data-type="pattern"].active { background: rgba(6, 182, 212, 0.2); border-color: var(--pattern); color: var(--pattern); }
+    .chip[data-type="agent"].active { background: rgba(56, 189, 248, 0.2); border-color: var(--agent); color: var(--agent); }
+
+    .slider-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    input[type=range] {
+      width: 100%;
+      accent-color: #38bdf8;
+      cursor: pointer;
+    }
+
+    .drawer {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 360px;
+      max-height: calc(100vh - 86px);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 16px;
+      backdrop-filter: blur(12px);
+      z-index: 15;
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+      box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.6);
+      animation: slideIn 0.2s ease-out;
+    }
+    @keyframes slideIn {
+      from { transform: translateX(20px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+    .drawer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+    .drawer-close {
+      cursor: pointer;
+      color: var(--text-muted);
+      font-size: 16px;
+    }
+    .drawer-close:hover { color: #fff; }
+    .badge {
+      font-size: 10px;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    .drawer-title {
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.4;
+      margin-top: 4px;
+    }
+    .drawer-card {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 10px;
+      font-size: 12px;
+    }
+    .drawer-meta-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid #1e293b;
+      font-size: 11px;
+    }
+    .drawer-meta-label { color: var(--text-muted); }
+    .drawer-meta-val { color: var(--text-dim); font-weight: 500; }
+    .meter-bar {
+      height: 6px;
+      background: #1e293b;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .meter-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #38bdf8, #10b981);
+      width: 80%;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-logo">SM</div>
+      <div>
+        <span class="brand-title">StackMind // Memory Graph</span>
+        <span class="brand-sub" id="workspaceLabel">live runtime topology</span>
+      </div>
+    </div>
+    <div class="hud-metrics">
+      <div class="pill">
+        <div class="dot live"></div>
+        <span id="liveStatus">Live Sync: Active</span>
+      </div>
+      <div class="pill">
+        <span style="color: var(--fact)">●</span> Facts: <strong id="factCount">0</strong>
+        <span style="color: var(--decision); margin-left:6px;">●</span> Decisions: <strong id="decisionCount">0</strong>
+        <span style="color: var(--lesson); margin-left:6px;">●</span> Lessons: <strong id="lessonCount">0</strong>
+      </div>
+      <button class="btn" id="toggleDemoBtn">Toggle Demo Overlay</button>
+      <button class="btn" id="resetZoomBtn">Reset View</button>
+    </div>
+  </header>
+
+  <div id="workspace">
+    <canvas id="graphCanvas"></canvas>
+
+    <div class="controls-overlay">
+      <input type="text" class="search-box" id="searchBox" placeholder="Search memories, facts, agents...">
+      <div class="filter-group">
+        <span class="filter-title">Type Filters</span>
+        <div class="chips">
+          <div class="chip active" data-type="fact">Facts</div>
+          <div class="chip active" data-type="decision">Decisions</div>
+          <div class="chip active" data-type="lesson">Lessons</div>
+          <div class="chip active" data-type="pattern">Patterns</div>
+          <div class="chip active" data-type="agent">Agents</div>
+          <div class="chip active" data-type="work_order">Orders</div>
+        </div>
+      </div>
+      <div class="filter-group">
+        <div class="slider-row">
+          <span class="filter-title">Min Confidence</span>
+          <span id="confVal">0.00</span>
+        </div>
+        <input type="range" id="confSlider" min="0" max="1" step="0.05" value="0.0">
+      </div>
+    </div>
+
+    <div class="drawer" id="inspector">
+      <div class="drawer-header">
+        <span class="badge" id="inspBadge">FACT</span>
+        <span class="drawer-close" id="drawerClose">&times;</span>
+      </div>
+      <div class="drawer-title" id="inspTitle">Memory Title</div>
+      <div class="drawer-card" id="inspContent" style="color: #cbd5e1; line-height: 1.5;"></div>
+      
+      <div>
+        <div class="slider-row">
+          <span>Confidence Score</span>
+          <strong id="inspConf">95%</strong>
+        </div>
+        <div class="meter-bar">
+          <div class="meter-fill" id="inspConfFill"></div>
+        </div>
+      </div>
+
+      <div class="drawer-card">
+        <div class="drawer-meta-row">
+          <span class="drawer-meta-label">Memory ID</span>
+          <span class="drawer-meta-val" id="inspId">MEM-000</span>
+        </div>
+        <div class="drawer-meta-row">
+          <span class="drawer-meta-label">Learned By</span>
+          <span class="drawer-meta-val" id="inspAgent">Architecture</span>
+        </div>
+        <div class="drawer-meta-row">
+          <span class="drawer-meta-label">Status</span>
+          <span class="drawer-meta-val" id="inspStatus">ACTIVE</span>
+        </div>
+        <div class="drawer-meta-row">
+          <span class="drawer-meta-label">Created</span>
+          <span class="drawer-meta-val" id="inspDate">—</span>
+        </div>
+      </div>
+
+      <div class="filter-title">Provenance & Verification Evidence</div>
+      <div class="drawer-card" id="inspEvidence" style="font-size:11px; color: #94a3b8;">
+        Verified via test assertion and scope boundary checks.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('graphCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const COLOR_MAP = {
+      fact: '#a855f7',
+      decision: '#10b981',
+      lesson: '#f59e0b',
+      pattern: '#06b6d4',
+      preference: '#f43f5e',
+      agent: '#38bdf8',
+      work_order: '#60a5fa',
+      experience: '#64748b'
+    };
+
+    let nodes = [];
+    let links = [];
+    let activeFilters = new Set(['fact', 'decision', 'lesson', 'pattern', 'preference', 'agent', 'work_order', 'experience']);
+    let minConfidence = 0.0;
+    let searchQuery = '';
+    let selectedNode = null;
+    let hoveredNode = null;
+    let transform = { x: 0, y: 0, k: 1 };
+    let isDragging = false;
+    let dragNode = null;
+    let lastMouse = { x: 0, y: 0 };
+    let useDemo = false;
+
+    function resize() {
+      canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+      canvas.height = canvas.parentElement.clientHeight * window.devicePixelRatio;
+      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    transform.x = canvas.parentElement.clientWidth / 2;
+    transform.y = canvas.parentElement.clientHeight / 2;
+
+    async function fetchGraphData() {
+      try {
+        const url = useDemo ? '/api/graph?demo=1' : '/api/graph';
+        const res = await fetch(url);
+        const data = await res.json();
+        processData(data);
+      } catch (e) {
+        console.warn("Polling error:", e);
+        if (nodes.length === 0 && window.FALLBACK_DEMO_DATA) {
+          processData(window.FALLBACK_DEMO_DATA);
+        }
+      }
+    }
+
+    function processData(data) {
+      document.getElementById('workspaceLabel').textContent = data.meta.workspace || 'live runtime topology';
+      
+      const existingMap = new Map(nodes.map(n => [n.id, n]));
+      nodes = (data.nodes || []).map(n => {
+        const prev = existingMap.get(n.id);
+        const radius = n.category === 'agent' ? 24 : (n.category === 'work_order' ? 18 : 14 + (n.confidence || 0.8) * 8);
+        return {
+          ...n,
+          radius: radius,
+          x: prev ? prev.x : (transform.x + (Math.random() - 0.5) * 300),
+          y: prev ? prev.y : (transform.y + (Math.random() - 0.5) * 300),
+          vx: prev ? prev.vx : 0,
+          vy: prev ? prev.vy : 0,
+        };
+      });
+
+      const nodeMap = new Map(nodes.map(n => [n.id, n]));
+      links = (data.links || []).map(l => {
+        return {
+          ...l,
+          sourceNode: nodeMap.get(typeof l.source === 'object' ? l.source.id : l.source),
+          targetNode: nodeMap.get(typeof l.target === 'object' ? l.target.id : l.target)
+        };
+      }).filter(l => l.sourceNode && l.targetNode);
+
+      let facts = 0, decisions = 0, lessons = 0;
+      nodes.forEach(n => {
+        if (n.type === 'fact') facts++;
+        if (n.type === 'decision') decisions++;
+        if (n.type === 'lesson') lessons++;
+      });
+      document.getElementById('factCount').textContent = facts;
+      document.getElementById('decisionCount').textContent = decisions;
+      document.getElementById('lessonCount').textContent = lessons;
+    }
+
+    function tickPhysics() {
+      const kRepel = 1200;
+      const kLink = 0.04;
+      const friction = 0.85;
+
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i];
+          const b = nodes[j];
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let distSq = dx * dx + dy * dy || 1;
+          let dist = Math.sqrt(distSq);
+          if (dist < 400) {
+            let force = kRepel / distSq;
+            let fx = (dx / dist) * force;
+            let fy = (dy / dist) * force;
+            a.vx -= fx;
+            a.vy -= fy;
+            b.vx += fx;
+            b.vy += fy;
+          }
+        }
+      }
+
+      for (let l of links) {
+        let a = l.sourceNode;
+        let b = l.targetNode;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        let targetDist = l.type === 'contradicts' ? 180 : 100;
+        let diff = dist - targetDist;
+        let force = diff * kLink;
+        let fx = (dx / dist) * force;
+        let fy = (dy / dist) * force;
+        a.vx += fx;
+        a.vy += fy;
+        b.vx += fx;
+        b.vy += fy;
+      }
+
+      const cx = canvas.parentElement.clientWidth / 2;
+      const cy = canvas.parentElement.clientHeight / 2;
+      for (let n of nodes) {
+        if (n === dragNode) continue;
+        n.vx += (cx - n.x) * 0.001;
+        n.vy += (cy - n.y) * 0.001;
+        n.vx *= friction;
+        n.vy *= friction;
+        n.x += n.vx;
+        n.y += n.vy;
+      }
+    }
+
+    function isNodeVisible(n) {
+      const t = n.type || n.category;
+      if (!activeFilters.has(t) && !activeFilters.has(n.category)) return false;
+      if (n.category === 'memory' && (n.confidence || 0) < minConfidence) return false;
+      if (searchQuery) {
+        const text = (n.label + ' ' + (n.content || '') + ' ' + (n.agent || '')).toLowerCase();
+        if (!text.includes(searchQuery)) return false;
+      }
+      return true;
+    }
+
+    function render() {
+      tickPhysics();
+
+      const w = canvas.parentElement.clientWidth;
+      const h = canvas.parentElement.clientHeight;
+      ctx.save();
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.translate(transform.x, transform.y);
+      ctx.scale(transform.k, transform.k);
+      ctx.translate(-w / 2, -h / 2);
+
+      for (let l of links) {
+        const a = l.sourceNode;
+        const b = l.targetNode;
+        if (!isNodeVisible(a) || !isNodeVisible(b)) continue;
+
+        const isContradiction = l.type === 'contradicts';
+        const isHovered = hoveredNode && (hoveredNode === a || hoveredNode === b);
+
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+
+        if (isContradiction) {
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = isHovered ? 3 : 2;
+          ctx.setLineDash([6, 4]);
+        } else if (l.type === 'supersedes') {
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([3, 3]);
+        } else {
+          ctx.strokeStyle = isHovered ? '#38bdf8' : 'rgba(51, 65, 85, 0.6)';
+          ctx.lineWidth = isHovered ? 2 : 1;
+          ctx.setLineDash([]);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      for (let n of nodes) {
+        if (!isNodeVisible(n)) continue;
+
+        const color = COLOR_MAP[n.type] || COLOR_MAP[n.category] || '#94a3b8';
+        const isSel = selectedNode === n;
+        const isHov = hoveredNode === n;
+
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius + (isSel ? 6 : (isHov ? 4 : 0)), 0, Math.PI * 2);
+        ctx.fillStyle = isSel ? 'rgba(56, 189, 248, 0.4)' : (isHov ? 'rgba(255, 255, 255, 0.15)' : 'rgba(15, 23, 42, 0.8)');
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#0f172a';
+        ctx.fill();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = isSel ? 3 : 2;
+        ctx.stroke();
+
+        ctx.fillStyle = color;
+        ctx.font = `${Math.round(n.radius * 0.7)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        let sym = '●';
+        if (n.category === 'agent') sym = '⚡';
+        else if (n.category === 'work_order') sym = 'WO';
+        else if (n.type === 'fact') sym = 'F';
+        else if (n.type === 'decision') sym = 'D';
+        else if (n.type === 'lesson') sym = 'L';
+        else if (n.type === 'pattern') sym = 'P';
+        ctx.fillText(sym, n.x, n.y);
+
+        ctx.fillStyle = isSel ? '#38bdf8' : (isHov ? '#ffffff' : '#cbd5e1');
+        ctx.font = isSel ? 'bold 11px sans-serif' : '10px sans-serif';
+        ctx.fillText(n.label, n.x, n.y + n.radius + 12);
+      }
+
+      ctx.restore();
+      requestAnimationFrame(render);
+    }
+
+    function toWorld(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      const sx = clientX - rect.left;
+      const sy = clientY - rect.top;
+      const w = canvas.parentElement.clientWidth;
+      const h = canvas.parentElement.clientHeight;
+      const wx = (sx - transform.x) / transform.k + (w / 2);
+      const wy = (sy - transform.y) / transform.k + (h / 2);
+      return { x: wx, y: wy };
+    }
+
+    function hitNode(clientX, clientY) {
+      const pt = toWorld(clientX, clientY);
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i];
+        if (!isNodeVisible(n)) continue;
+        const dx = pt.x - n.x;
+        const dy = pt.y - n.y;
+        if (dx * dx + dy * dy <= (n.radius + 4) * (n.radius + 4)) {
+          return n;
+        }
+      }
+      return null;
+    }
+
+    canvas.addEventListener('mousedown', e => {
+      const hit = hitNode(e.clientX, e.clientY);
+      if (hit) {
+        dragNode = hit;
+        selectedNode = hit;
+        showInspector(hit);
+      } else {
+        isDragging = true;
+      }
+      lastMouse = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener('mousemove', e => {
+      if (dragNode) {
+        const pt = toWorld(e.clientX, e.clientY);
+        dragNode.x = pt.x;
+        dragNode.y = pt.y;
+        dragNode.vx = 0;
+        dragNode.vy = 0;
+      } else if (isDragging) {
+        transform.x += (e.clientX - lastMouse.x);
+        transform.y += (e.clientY - lastMouse.y);
+      } else {
+        hoveredNode = hitNode(e.clientX, e.clientY);
+      }
+      lastMouse = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener('mouseup', () => {
+      isDragging = false;
+      dragNode = null;
+    });
+
+    canvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+      transform.k = Math.max(0.3, Math.min(3.0, transform.k * zoomFactor));
+    });
+
+    function showInspector(n) {
+      const insp = document.getElementById('inspector');
+      insp.style.display = 'flex';
+      
+      const badge = document.getElementById('inspBadge');
+      badge.textContent = (n.type || n.category).toUpperCase();
+      badge.style.background = (COLOR_MAP[n.type] || '#38bdf8') + '22';
+      badge.style.color = COLOR_MAP[n.type] || '#38bdf8';
+
+      document.getElementById('inspTitle').textContent = n.label;
+      document.getElementById('inspContent').textContent = n.content || 'System node representing execution participant or work package.';
+      
+      const conf = Math.round((n.confidence || 0.8) * 100);
+      document.getElementById('inspConf').textContent = conf + '%';
+      document.getElementById('inspConfFill').style.width = conf + '%';
+
+      document.getElementById('inspId').textContent = n.id;
+      document.getElementById('inspAgent').textContent = n.agent || n.role || '—';
+      document.getElementById('inspStatus').textContent = (n.status || 'ACTIVE').toUpperCase();
+      document.getElementById('inspDate').textContent = n.created_at ? n.created_at.slice(0, 19).replace('T', ' ') : 'Live session';
+
+      const evDiv = document.getElementById('inspEvidence');
+      if (n.evidence && n.evidence.length > 0) {
+        evDiv.innerHTML = n.evidence.map(e => `<div style="margin-bottom:4px;">• ${e}</div>`).join('');
+      } else {
+        evDiv.textContent = 'Standard verified experience telemetry.';
+      }
+    }
+
+    document.getElementById('drawerClose').onclick = () => {
+      document.getElementById('inspector').style.display = 'none';
+      selectedNode = null;
+    };
+
+    document.querySelectorAll('.chip').forEach(chip => {
+      chip.onclick = () => {
+        const type = chip.getAttribute('data-type');
+        if (activeFilters.has(type)) {
+          activeFilters.delete(type);
+          chip.classList.remove('active');
+        } else {
+          activeFilters.add(type);
+          chip.classList.add('active');
+        }
+      };
+    });
+
+    document.getElementById('confSlider').oninput = e => {
+      minConfidence = parseFloat(e.target.value);
+      document.getElementById('confVal').textContent = minConfidence.toFixed(2);
+    };
+
+    document.getElementById('searchBox').oninput = e => {
+      searchQuery = e.target.value.trim().toLowerCase();
+    };
+
+    document.getElementById('resetZoomBtn').onclick = () => {
+      transform = {
+        x: canvas.parentElement.clientWidth / 2,
+        y: canvas.parentElement.clientHeight / 2,
+        k: 1
+      };
+    };
+
+    document.getElementById('toggleDemoBtn').onclick = () => {
+      useDemo = !useDemo;
+      document.getElementById('toggleDemoBtn').classList.toggle('active', useDemo);
+      fetchGraphData();
+    };
+
+    setInterval(fetchGraphData, 2500);
+    fetchGraphData();
+    render();
+  </script>
+</body>
+</html>

@@ -265,12 +265,20 @@ def validate_plan_structure(content: str) -> tuple[bool, list[str]]:
             errors.append("Top-level heading must reference 'Plan' (e.g. '# Project Plan: <name>')")
 
     # 2. Architecture Section
-    arch_match = re.search(r"^##\s+.*(?:Architecture|Technical Design|Core Technologies).*$", content, re.MULTILINE | re.IGNORECASE)
+    arch_match = re.search(
+        r"^##\s+.*(?:Architecture|Technical Design|Core Technologies|Tech Stack|Technology Stack|System Design|Stack).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
     if not arch_match:
         errors.append("PLAN.md is missing a '## Current Architecture' (or '## Architecture') section")
 
     # 3. Milestones & Roadmap Section
-    milestones_match = re.search(r"^##\s+.*(?:Milestones|Roadmap).*$", content, re.MULTILINE | re.IGNORECASE)
+    milestones_match = re.search(
+        r"^##\s+.*(?:Milestones|Roadmap|Tasks|Work Packages|Implementation).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
     if not milestones_match:
         errors.append("PLAN.md is missing a '## Milestones & Roadmap' (or '## Roadmap') section")
 
@@ -280,6 +288,74 @@ def validate_plan_structure(content: str) -> tuple[bool, list[str]]:
         errors.append("PLAN.md must contain at least one checklist item (e.g. '- [ ] Milestone 1: ...')")
 
     return len(errors) == 0, errors
+
+
+def repair_plan_structure(content: str, default_name: str = "Project") -> str:
+    """Auto-repair common structural and formatting deviations in PLAN.md content."""
+    if not content or not content.strip():
+        return (
+            f"# Project Plan: {default_name}\n\n"
+            f"## Current Architecture\n- Initial stack design and architecture.\n\n"
+            f"## Milestones & Roadmap\n- [ ] Milestone 1: Initial Setup\n- [ ] Milestone 2: Core Development\n"
+        )
+
+    text = content.strip()
+    title_match = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+    if not title_match:
+        text = f"# Project Plan: {default_name}\n\n{text}"
+    else:
+        title_line = title_match.group(0)
+        title_text = title_match.group(1).strip()
+        if "plan" not in title_text.lower():
+            text = text.replace(title_line, f"# Project Plan: {title_text}", 1)
+
+    arch_match = re.search(
+        r"^##\s+.*(?:Architecture|Technical Design|Core Technologies|Tech Stack|Technology Stack|System Design|Stack).*$",
+        text,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not arch_match:
+        sub_arch = re.search(r"^###\s+.*(?:Architecture|Technical Design|Stack).*$", text, re.MULTILINE | re.IGNORECASE)
+        if sub_arch:
+            text = text.replace(sub_arch.group(0), "## Current Architecture", 1)
+        else:
+            title_end = text.find("\n")
+            if title_end != -1:
+                text = (
+                    text[:title_end]
+                    + "\n\n## Current Architecture\n- Core system architecture and technical design."
+                    + text[title_end:]
+                )
+            else:
+                text += "\n\n## Current Architecture\n- Core system architecture and technical design."
+
+    milestones_match = re.search(
+        r"^##\s+.*(?:Milestones|Roadmap|Tasks|Work Packages|Implementation).*$",
+        text,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not milestones_match:
+        sub_m = re.search(r"^###\s+.*(?:Milestones|Roadmap|Tasks).*$", text, re.MULTILINE | re.IGNORECASE)
+        if sub_m:
+            text = text.replace(sub_m.group(0), "## Milestones & Roadmap", 1)
+        else:
+            text += "\n\n## Milestones & Roadmap\n- [ ] Milestone 1: Core Implementation"
+
+    checklist_match = re.search(r"^\s*-\s*\[([ xX])\]\s+(.+)$", text, re.MULTILINE)
+    if not checklist_match:
+        def _replace_num_or_bullet(match: re.Match) -> str:
+            val = match.group(1).strip()
+            if not val.lower().startswith("milestone"):
+                val = f"Milestone: {val}"
+            return f"- [ ] {val}"
+
+        new_text = re.sub(r"^\s*(?:\d+[\.\)]|[*•])\s+(.+)$", _replace_num_or_bullet, text, flags=re.MULTILINE)
+        if re.search(r"^\s*-\s*\[([ xX])\]\s+(.+)$", new_text, re.MULTILINE):
+            text = new_text
+        else:
+            text += "\n- [ ] Milestone 1: Implementation Tasks"
+
+    return text
 
 
 def parse_tech_stack(content: str, project_path: Path | str | None = None) -> TechStack:

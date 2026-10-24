@@ -103,6 +103,9 @@ class Key:
     PASTE_START = "<PASTE_START>"
     PASTE_END = "<PASTE_END>"
     SHIFT_ENTER = "<SHIFT_ENTER>"
+    ALT_ENTER = "<ALT_ENTER>"
+    CTRL_ENTER = "<CTRL_ENTER>"
+    ALT_V = "<ALT_V>"
     CTRL_V = "\x16"  # Paste from clipboard (ASCII SYN / ord 22)
     CTRL_W = "\x17"  # Toggle scroll focus (Conversation <-> Work Orders)
     SHIFT_INSERT = "<SHIFT_INSERT>"
@@ -300,9 +303,33 @@ def _parse_escape_sequence(seq: str) -> str:
     elif seq == "[201~":
         return Key.PASTE_END
 
-    # Shift+Enter / Alt+Enter
-    elif seq in ("[13;2u", "[27;2;13~", "OM"):
+    # Shift+Enter / Alt+Enter / Ctrl+Enter
+    elif seq in (
+        "[13;2u",
+        "[27;2;13~",
+        "[13;2~",
+        "[10;2u",
+        "[27;2;10~",
+        "[10;2~",
+        "OM",
+    ):
         return Key.SHIFT_ENTER
+    elif seq in (
+        "\r",
+        "\n",
+        "\r\n",
+        "[13;3u",
+        "[27;3;13~",
+        "[13;4u",
+        "[27;4;13~",
+    ):
+        return Key.ALT_ENTER
+    elif seq in ("[13;5u", "[27;5;13~", "[10;5u", "[27;5;10~"):
+        return Key.CTRL_ENTER
+
+    # Alt+V (Paste image from clipboard)
+    elif seq in ("v", "V", "[118;3u", "[27;3;118~", "[118;5u"):
+        return Key.ALT_V
 
     return f"<ESC_{seq}>"
 
@@ -327,7 +354,9 @@ def _read_escape_sequence_windows() -> str:
                 break
             elif seq.startswith("[M") and len(seq) >= 5:
                 break
-            elif seq.startswith("[") and not seq.startswith(("[<", "[M")) and c in ("~", "A", "B", "C", "D", "H", "F"):
+            elif seq.startswith("[") and not seq.startswith(("[<", "[M")) and c in ("~", "A", "B", "C", "D", "H", "F", "u"):
+                break
+            elif seq in ("\r", "\n", "\r\n", "v", "V"):
                 break
         else:
             time.sleep(0.005)
@@ -335,7 +364,7 @@ def _read_escape_sequence_windows() -> str:
                 # If we've started an escape sequence but haven't received the terminator, keep waiting up to timeout
                 if seq.startswith("[<") and not (seq.endswith("M") or seq.endswith("m")):
                     continue
-                if seq.startswith("[") and not (seq.endswith("~") or seq[-1] in "ABCDHF"):
+                if seq.startswith("[") and not (seq.endswith("~") or seq[-1] in "ABCDHFu"):
                     continue
                 break
 
@@ -403,6 +432,10 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
             res = Key.PAGE_UP
         elif ch2 == "Q":
             res = Key.PAGE_DOWN
+        elif ch2 in ("\xa6", "\x1c"):
+            res = Key.ALT_ENTER
+        elif ch2 in ("\x2f", "\xaf"):
+            res = Key.ALT_V
         else:
             res = f"<EXT_{ch2}>"
     elif ch == Key.ESCAPE:
@@ -418,6 +451,18 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
         res = Key.CTRL_B
     elif ch == Key.CTRL_G:
         res = Key.CTRL_G
+    elif ch in ("\r", "\n"):
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            if user32.GetKeyState(0x10) < 0:  # VK_SHIFT
+                res = Key.SHIFT_ENTER
+            elif user32.GetKeyState(0x11) < 0:  # VK_CONTROL
+                res = Key.CTRL_ENTER
+            else:
+                res = ch
+        except Exception:
+            res = ch
     else:
         if msvcrt.kbhit():
             debug_parts.append("kbhit=True")
@@ -584,6 +629,8 @@ class Win32ConsoleReader:
                     0x44: Key.CTRL_D,  # VK_D -> '\x04' (EOF / exit)
                     0x56: Key.CTRL_V,  # VK_V -> '\x16' (Paste clipboard)
                     0x57: Key.CTRL_W,  # VK_W -> '\x17' (Toggle scroll focus)
+                    0x0D: Key.CTRL_ENTER,  # VK_RETURN
+                    0x0A: Key.CTRL_ENTER,  # VK_RETURN (LF)
                 }
                 res = ctrl_vk_map.get(vk)
                 if res:
@@ -597,6 +644,9 @@ class Win32ConsoleReader:
                     0x28: Key.ALT_DOWN,       # VK_DOWN
                     0x21: Key.ALT_PAGE_UP,    # VK_PRIOR
                     0x22: Key.ALT_PAGE_DOWN,  # VK_NEXT
+                    0x0D: Key.ALT_ENTER,      # VK_RETURN (Enter)
+                    0x0A: Key.ALT_ENTER,      # VK_RETURN (LF)
+                    0x56: Key.ALT_V,          # VK_V (Paste Image)
                 }
                 res = alt_vk_map.get(vk)
                 if res:
@@ -636,11 +686,20 @@ class Win32ConsoleReader:
                     self._pending_keys.extend([Key.DELETE] * (key.wRepeatCount - 1))
                 return Key.DELETE
 
-            # Virtual key override for VK_RETURN when Shift is held
-            if vk == 0x0D and is_shift:
-                if key.wRepeatCount > 1:
-                    self._pending_keys.extend([Key.SHIFT_ENTER] * (key.wRepeatCount - 1))
-                return Key.SHIFT_ENTER
+            # Virtual key override for VK_RETURN when Shift, Ctrl, or Alt is held
+            if vk in (0x0D, 0x0A):
+                if is_shift:
+                    if key.wRepeatCount > 1:
+                        self._pending_keys.extend([Key.SHIFT_ENTER] * (key.wRepeatCount - 1))
+                    return Key.SHIFT_ENTER
+                if is_ctrl:
+                    if key.wRepeatCount > 1:
+                        self._pending_keys.extend([Key.CTRL_ENTER] * (key.wRepeatCount - 1))
+                    return Key.CTRL_ENTER
+                if is_alt:
+                    if key.wRepeatCount > 1:
+                        self._pending_keys.extend([Key.ALT_ENTER] * (key.wRepeatCount - 1))
+                    return Key.ALT_ENTER
 
             # 5. Standard character or control character
             if key.wRepeatCount > 1:
@@ -688,6 +747,15 @@ class Win32ConsoleReader:
                                     # Legacy X10 mouse mode: [M...
                                     if len(seq) >= 5 and seq.startswith("[M"):
                                         break
+                                    # Alt+Enter / Alt+V / Kitty u protocol
+                                    if c in ("\r", "\n", "v", "V") or (len(seq) >= 3 and c == "u"):
+                                        break
+                                elif key.wVirtualKeyCode in (0x0D, 0x0A):
+                                    seq += "\r"
+                                    break
+                                elif key.wVirtualKeyCode == 0x56:  # VK_V
+                                    seq += "v"
+                                    break
                         elif rec.EventType == 0x0002:  # MOUSE_EVENT
                             m_parsed = self.parse_input_record(rec)
                             if m_parsed:
@@ -1181,6 +1249,11 @@ class RawLineEditor:
         self.alert: Optional[str] = None
         self.bottom_border_renderer = bottom_border_renderer
         self.on_alert = on_alert
+        self.attached_images: list[str] = (
+            list(getattr(state, "attached_images", []))
+            if state is not None and getattr(state, "attached_images", None)
+            else []
+        )
 
         self.in_bracketed_paste: bool = False
         self._last_was_cr: bool = False
@@ -1213,6 +1286,63 @@ class RawLineEditor:
                     self.insert_char(ch)
         self._notify_height_change()
         self._update_state()
+        return True
+
+    def paste_image_from_clipboard(self) -> bool:
+        """Paste image from system clipboard directly as [IMAGE<sequence_no>.<format>]."""
+        from cli.tui.clipboard import get_clipboard_image
+
+        result = get_clipboard_image()
+        if not result:
+            self.alert = "no image in clipboard"
+            if self.state is not None and hasattr(self.state, "composer_alert"):
+                self.state.composer_alert = self.alert
+            if self.on_alert:
+                try:
+                    self.on_alert(self.alert)
+                except Exception:
+                    pass
+            self.redraw_line()
+            return False
+
+        img_bytes, ext = result
+        ext = ext.lower().lstrip(".") or "png"
+        seq_num = len(self.attached_images) + 1
+        tag = f"[IMAGE{seq_num}.{ext}]"
+
+        try:
+            workspace_dir = None
+            if self.state is not None:
+                workspace_dir = getattr(self.state, "workspace_dir", None) or getattr(self.state, "project_path", None)
+            if not workspace_dir:
+                workspace_dir = os.getcwd()
+            from pathlib import Path
+            from validators.ingest.store import AttachmentStore
+
+            ws_path = Path(workspace_dir)
+            store = AttachmentStore(ws_path)
+            store.ingest_bytes(img_bytes, filename=f"IMAGE{seq_num}.{ext}")
+
+            pasted_dir = ws_path / ".sync" / "attachments" / "pasted"
+            pasted_dir.mkdir(parents=True, exist_ok=True)
+            (pasted_dir / f"IMAGE{seq_num}.{ext}").write_bytes(img_bytes)
+        except Exception:
+            pass
+
+        self.attached_images.append(tag)
+        if self.state is not None:
+            self.state.attached_images = list(self.attached_images)
+        self.alert = None
+        if self.state is not None and hasattr(self.state, "composer_alert"):
+            self.state.composer_alert = None
+        if self.on_alert:
+            try:
+                self.on_alert(None)
+            except Exception:
+                pass
+
+        self._notify_height_change()
+        self.redraw_line()
         return True
 
     @property
@@ -1368,8 +1498,7 @@ class RawLineEditor:
         self._update_dropdown()
         if was_empty and self.on_transition:
             self.on_transition(True)
-        if ch == "\n":
-            self._notify_height_change()
+        self._notify_height_change()
 
     def delete_backspace(self) -> None:
         if self.cursor > 0:
@@ -1380,8 +1509,13 @@ class RawLineEditor:
             self._update_dropdown()
             if len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
-            if removed == "\n":
-                self._notify_height_change()
+            self._notify_height_change()
+        elif self.cursor == 0 and not self.buffer and self.attached_images:
+            self.attached_images.pop()
+            if self.state is not None:
+                self.state.attached_images = list(self.attached_images)
+            self._notify_height_change()
+            self.redraw_line()
 
     def delete_forward(self) -> None:
         if self.cursor < len(self.buffer):
@@ -1391,8 +1525,7 @@ class RawLineEditor:
             self._update_dropdown()
             if len(self.buffer) == 0 and self.on_transition:
                 self.on_transition(False)
-            if removed == "\n":
-                self._notify_height_change()
+            self._notify_height_change()
 
     def move_left(self) -> None:
         if self.cursor > 0:
@@ -1497,10 +1630,18 @@ class RawLineEditor:
                     pass
             if self.bottom_border_renderer and self.has_borders:
                 try:
-                    border_str = self.bottom_border_renderer(None)
+                    border_str = self.bottom_border_renderer(None, self.attached_images)
                     target = getattr(self, "out", sys.stdout)
                     target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
                     target.flush()
+                except TypeError:
+                    try:
+                        border_str = self.bottom_border_renderer(None)
+                        target = getattr(self, "out", sys.stdout)
+                        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+                        target.flush()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -1568,7 +1709,11 @@ class RawLineEditor:
             self._notify_height_change()
             return False
 
-        if key == Key.SHIFT_ENTER:
+        if key == Key.ALT_V:
+            self.paste_image_from_clipboard()
+            return False
+
+        if key in (Key.SHIFT_ENTER, Key.ALT_ENTER, Key.CTRL_ENTER):
             self.insert_char("\n")
             return False
 
@@ -1851,6 +1996,15 @@ class RawLineEditor:
 
     def redraw_line(self, out: Any = None) -> None:
         """Redraw current line with exact cursor placement and composer border preservation."""
+        if getattr(self, "_in_redraw", False):
+            return
+        self._in_redraw = True
+        try:
+            self._do_redraw_line(out=out)
+        finally:
+            self._in_redraw = False
+
+    def _do_redraw_line(self, out: Any = None) -> None:
         target = out if out is not None else getattr(self, "out", sys.stdout)
         buf_str = "".join(self.buffer)
         v_lines, _, c_line, c_col = self._get_visual_lines()
@@ -1879,6 +2033,18 @@ class RawLineEditor:
             target.write(line_out)
             cursor_col = visible_prefix_len + c_col + 1
             target.write(f"\x1b[{cursor_col}G")
+            if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
+                try:
+                    border_str = self.bottom_border_renderer(self.alert, self.attached_images)
+                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+                except TypeError:
+                    try:
+                        border_str = self.bottom_border_renderer(self.alert)
+                        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             target.flush()
             return
 
@@ -1908,8 +2074,14 @@ class RawLineEditor:
 
         if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
             try:
-                border_str = self.bottom_border_renderer(self.alert)
+                border_str = self.bottom_border_renderer(self.alert, self.attached_images)
                 target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+            except TypeError:
+                try:
+                    border_str = self.bottom_border_renderer(self.alert)
+                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -2253,6 +2425,13 @@ def raw_prompt_input(
                 state.composer_alert = None
 
     result = editor.text
+    if editor.attached_images:
+        for tag in editor.attached_images:
+            if tag not in result:
+                result = f"{result}\n{tag}".strip() if result.strip() else tag
+        editor.attached_images.clear()
+        if state is not None and hasattr(state, "attached_images"):
+            state.attached_images = []
     if result.strip():
         GLOBAL_HISTORY.append(result)
         if history is not None and result not in history:

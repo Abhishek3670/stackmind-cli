@@ -30,6 +30,7 @@ from .plan import (
     PlanStructure,
     PlanValidationError,
     parse_plan,
+    repair_plan_structure,
     validate_plan_structure,
 )
 from .retrieval import (
@@ -97,6 +98,7 @@ __all__ = [
     'WorkspaceSnapshot',
     'evaluate_learning_eligibility',
     'parse_plan',
+    'repair_plan_structure',
     'sanitize_search_results',
     'validate_plan_structure',
 ]

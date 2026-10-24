@@ -554,11 +554,13 @@ def validate_authoring_readiness(
                 continue
             if p_idx is not None and (_parse_wo_index(wo_ref) or 0) <= p_idx:
                 continue
+            if _is_meta_work_order(data) or str(data.get("agent_id") or "").lower() in ("claude", "architecture"):
+                continue
             cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
             if cand.is_file():
                 try:
                     c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
-                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "CANCELLED", "FAILED"):
                         continue
                 except Exception:
                     pass
@@ -608,6 +610,8 @@ def validate_authoring_readiness(
             continue
         # Prior-run contracts or contracts for excluded/non-active work orders are not orphans of this run
         if wo_ref in skip_ids or (p_idx is not None and (_parse_wo_index(wo_ref) or 0) <= p_idx):
+            continue
+        if _is_meta_work_order(contract.data) or str(contract.data.get("agent_id") or "").lower() in ("claude", "architecture"):
             continue
         cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
         if cand.is_file():

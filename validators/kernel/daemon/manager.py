@@ -3003,6 +3003,44 @@ class SessionManager:
                         except Exception as e:
                             self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")
             elif res_status == "blocked":
+                err_text = str(computed_err or "")
+                is_plan_gate_failure = "PLAN.md" in err_text and "verification gate failed" in err_text.lower()
+                retry_count = int((op_rec.get("metadata") or {}).get("plan_repair_attempt", 0))
+                if is_plan_gate_failure and retry_count < 2:
+                    self.events.publish(
+                        "plan.auto_repair_requested",
+                        session_id,
+                        attempt=retry_count + 1,
+                        errors=computed_err,
+                        operation_id=operation_id,
+                    )
+                    repair_prompt = (
+                        f"CRITICAL ARCHITECTURE INSTRUCTION: Your previous staged PLAN.md was REJECTED by the verification gate with the following errors:\n"
+                        f"{computed_err}\n\n"
+                        f"Please immediately re-author a strictly compliant PLAN.md file using write_file with the following structure:\n"
+                        f"# Project Plan: <Project Name>\n\n"
+                        f"## Current Architecture\n"
+                        f"- Backend: <technologies and design>\n"
+                        f"- Frontend: <technologies and design>\n"
+                        f"- Database: <technologies and design>\n\n"
+                        f"## Milestones & Roadmap\n"
+                        f"- [ ] Milestone 1: <Description>\n"
+                        f"- [ ] Milestone 2: <Description>\n\n"
+                        f"Write the valid PLAN.md file now."
+                    )
+                    try:
+                        self.start_turn(
+                            session_id,
+                            repair_prompt,
+                            role=op_role,
+                            agent_id=agent,
+                            is_authoring=True,
+                            plan_repair_attempt=retry_count + 1,
+                        )
+                        return
+                    except Exception as repair_exc:
+                        self.events.publish("error", session_id, message=f"Failed to auto-revert plan to architect: {repair_exc}")
+
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
                     result=result_data, role=op_role, agent_id=agent,

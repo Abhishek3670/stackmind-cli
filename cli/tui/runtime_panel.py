@@ -349,7 +349,7 @@ def format_work_orders(
             end_idx = max(capacity, total_count - min(scroll.scroll_offset, max_offset))
             start_idx = max(0, end_idx - capacity)
         else:
-            active = next((i for i, w in enumerate(work_orders) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
+            active = next((i for i, w in reversed(list(enumerate(work_orders))) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
             if active is not None:
                 end_idx = min(total_count, max(capacity, active + max(1, capacity // 2) + 1))
                 start_idx = max(0, end_idx - capacity)
@@ -574,14 +574,16 @@ def render_runtime_panel(
     # Pre-render CURRENT OPERATION to budget height accurately
     op_lines = format_current_operation(current_operation, width=width, state=state)
 
-    # Budget work orders height if height constraint is active so CURRENT OPERATION is never clipped
-    max_wo_items: int | None = None
-    if height is not None and height > 0:
-        fixed_lines = 2 + (len(agent_lines) + 2) + 2 + 2 + 2 + (len(op_lines) + 2) + 2
-        if scroll is not None and scroll.has_new_activity:
-            fixed_lines += 2
-        avail = height - fixed_lines
-        max_wo_items = max(3, avail)
+    # Budget work orders height so CURRENT OPERATION is never clipped
+    eff_h = height
+    if eff_h is None or eff_h <= 0:
+        import shutil
+        eff_h = max(12, shutil.get_terminal_size(fallback=(80, 24)).lines - 4)
+    fixed_lines = 2 + (len(agent_lines) + 2) + 2 + 2 + 2 + (len(op_lines) + 2) + 2
+    if scroll is not None and scroll.has_new_activity:
+        fixed_lines += 2
+    avail = eff_h - fixed_lines
+    max_wo_items = max(3, avail)
 
     # 4. Section: WORK ORDERS
     is_focused = state is not None and getattr(state, "scroll_focus", "") == "work_orders"

@@ -94,7 +94,12 @@ def compute_composer_height(
         content = state.composer_buffer
 
     if content:
-        w = width if width is not None else 80
+        if width is None:
+            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+            layout = compute_layout(term_cols, state=state)
+            w = layout.conversation_width if layout.show_runtime else term_cols
+        else:
+            w = width
         wrap_width = max(10, w - 6)
         from cli.tui.keyboard import wrap_composer_text
 
@@ -123,10 +128,17 @@ def compute_viewport_height(
     This is the single canonical source of truth for vertical viewport sizing in the TUI.
     """
     lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
+    if width is None:
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        layout = compute_layout(term_cols, state=state)
+        w = layout.conversation_width if layout.show_runtime else term_cols
+    else:
+        w = width
+
     if composer_height is not None:
         comp_h = composer_height
     elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
-        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=width)
+        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=w)
     else:
         comp_h = COMPOSER_BOX_HEIGHT
 
@@ -162,10 +174,17 @@ def compute_composer_cursor_row(
     pushed upwards by SETTINGS_PANEL_HEIGHT (11 lines).
     """
     lines = height if height is not None else shutil.get_terminal_size(fallback=(80, 24)).lines
+    if width is None:
+        term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        layout = compute_layout(term_cols, state=state)
+        w = layout.conversation_width if layout.show_runtime else term_cols
+    else:
+        w = width
+
     if composer_height is not None:
         comp_h = composer_height
     elif composer_content is not None or (state is not None and getattr(state, "composer_buffer", "")):
-        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=width)
+        comp_h = compute_composer_height(composer_content, height=lines, state=state, width=w)
     else:
         comp_h = COMPOSER_BOX_HEIGHT
 
@@ -1019,6 +1038,7 @@ def render_full_screen_workspace(
         force_color=force_color,
         no_color=no_color,
         alert=getattr(state, "composer_alert", None) if state is not None else None,
+        attachments=getattr(state, "attached_images", None) if state is not None else None,
         height=height,
         retry_status=getattr(state, "retry_status_display", None) if state is not None else None,
     )
