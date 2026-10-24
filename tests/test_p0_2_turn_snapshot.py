@@ -415,6 +415,101 @@ def test_cleanup_does_not_descend_through_junction(test_env):
     assert outside_file.read_text(encoding="utf-8") == "vital data do not delete\n"
 
 
+def test_replace_tracked_dir_with_junction_restores_cleanly(test_env):
+    """Replace a tracked directory with a junction to an outside folder;
+    revert removes the junction first, restores a real dir, and writes nothing outside."""
+    ws, store, manager, head_sha, git_env, reaper = test_env
+
+    # 1. Pre-turn: create tracked directory with file
+    tracked_dir = ws / "tracked_dir"
+    tracked_dir.mkdir()
+    (tracked_dir / "file.txt").write_text("tracked content\n", encoding="utf-8")
+    snap_sha = manager.create_turn_snapshot("turn-1")
+
+    # 2. Outside directory with target files
+    outside_dir = ws.parent / "outside_sensitive_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "target.txt"
+    outside_file.write_text("untouchable payload\n", encoding="utf-8")
+
+    # 3. Agent deletes tracked_dir and replaces it with junction pointing to outside_dir
+    (tracked_dir / "file.txt").unlink()
+    tracked_dir.rmdir()
+
+    junction_created = False
+    if sys.platform == "win32":
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(outside_dir.resolve()), str(tracked_dir.resolve()))
+            junction_created = True
+        except (OSError, NotImplementedError):
+            res = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(tracked_dir), str(outside_dir)],
+                capture_output=True,
+            )
+            junction_created = (res.returncode == 0)
+
+    if not junction_created:
+        pytest.skip("SKIPPED: OS environment prevented junction creation")
+
+    # Verify tracked_dir is now a reparse point
+    st = os.lstat(str(tracked_dir))
+    assert bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+    # 4. Restore turn snapshot
+    manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
+
+    # 5. Assert: junction is removed and replaced with a genuine directory
+    assert tracked_dir.exists()
+    st_after = os.lstat(str(tracked_dir))
+    assert not bool(st_after.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT), "Tracked dir remained a junction!"
+    assert (tracked_dir / "file.txt").exists()
+    assert (tracked_dir / "file.txt").read_text(encoding="utf-8") == "tracked content\n"
+
+    # 6. Outside target directory is completely intact
+    assert outside_file.exists()
+    assert outside_file.read_text(encoding="utf-8") == "untouchable payload\n"
+
+
+def test_gitignore_edit_cannot_hide_files(test_env):
+    """Edits to workspace .gitignore cannot hide files from turn snapshot."""
+    ws, store, manager, head_sha, git_env, reaper = test_env
+
+    (ws / "app.py").write_text("print('app')\n", encoding="utf-8")
+    (ws / ".gitignore").write_text("evil.py\n", encoding="utf-8")
+    (ws / "evil.py").write_text("print('evil')\n", encoding="utf-8")
+
+    snap_sha = manager.create_turn_snapshot("turn-1")
+    snap_files = manager.list_snapshot_files(snap_sha)
+    assert "evil.py" in snap_files, "evil.py was hidden from snapshot by .gitignore!"
+    assert "app.py" in snap_files
+
+
+def test_rename_delete_restore_cycle(test_env):
+    """Restores full state when files are renamed, deleted, or altered."""
+    ws, store, manager, head_sha, git_env, reaper = test_env
+
+    (ws / "keep.txt").write_text("keep v1\n", encoding="utf-8")
+    (ws / "delete_me.txt").write_text("delete v1\n", encoding="utf-8")
+    snap_sha = manager.create_turn_snapshot("turn-1")
+
+    (ws / "keep.txt").rename(ws / "moved.txt")
+    (ws / "delete_me.txt").unlink()
+    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+
+    assert not (ws / "keep.txt").exists()
+    assert (ws / "moved.txt").exists()
+
+    manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
+
+    assert (ws / "keep.txt").exists()
+    assert (ws / "keep.txt").read_text(encoding="utf-8") == "keep v1\n"
+    assert (ws / "delete_me.txt").exists()
+    assert (ws / "delete_me.txt").read_text(encoding="utf-8") == "delete v1\n"
+    assert not (ws / "moved.txt").exists()
+    assert not (ws / "new.txt").exists()
+
+
 # ==============================================================================
 # 7. Post-Turn Nested .git Check & Reaping
 # ==============================================================================

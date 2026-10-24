@@ -61,6 +61,17 @@ class SnapshotIntegrityError(TurnSnapshotError):
     pass
 
 
+def is_reparse_point(path: Path | str) -> bool:
+    """Detect whether a path is a Windows directory junction, symlink, or reparse point."""
+    try:
+        st = os.lstat(path)
+        if hasattr(st, "st_file_attributes"):
+            return bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        return os.path.islink(path)
+    except OSError:
+        return False
+
+
 # Default exclusions strictly anchored to workspace root.
 # Note: __pycache__ is omitted from exclusions so that any bytecode planted in
 # subdirectories is captured and monitored, while PYTHONDONTWRITEBYTECODE=1 prevents noise.
@@ -94,6 +105,7 @@ class TurnSnapshotManager:
         self.snapshot_shas: dict[str, str] = {}
         self.baseline_store_hash: str | None = None
         self.known_objects: set[str] = set()
+        self.ads_violations: list[str] = []
 
         self.null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
         self.base_env = {
@@ -441,10 +453,10 @@ class TurnSnapshotManager:
                 continue
         return files_map
 
-    def _enumerate_and_wipe_ads(self, file_path: Path) -> None:
-        """Enumerate and eliminate non-default NTFS Alternate Data Streams."""
-        if sys.platform != "win32" or not file_path.exists() or file_path.is_dir():
-            return
+    def _enumerate_and_wipe_ads(self, path: Path) -> list[str]:
+        """Enumerate, record violation, and eliminate non-default NTFS Alternate Data Streams on files/dirs."""
+        if sys.platform != "win32" or not path.exists():
+            return []
 
         import ctypes
         from ctypes import wintypes
@@ -464,30 +476,34 @@ class TurnSnapshotManager:
         kernel32.FindClose.argtypes = [wintypes.HANDLE]
 
         find_data = WIN32_FIND_STREAM_DATA()
-        h = kernel32.FindFirstStreamW(str(file_path), 0, ctypes.byref(find_data), 0)
+        h = kernel32.FindFirstStreamW(str(path), 0, ctypes.byref(find_data), 0)
         if h == wintypes.HANDLE(-1).value or not h:
-            return
+            return []
 
-        has_non_default = False
+        found_streams: list[str] = []
         try:
             while True:
                 name = find_data.cStreamName
                 if name and name != "::$DATA":
-                    has_non_default = True
-                    break
+                    found_streams.append(name)
                 if not kernel32.FindNextStreamW(h, ctypes.byref(find_data)):
                     break
         finally:
             kernel32.FindClose(h)
 
-        if has_non_default:
-            # Read clean primary content, unlink base file (which wipes all streams), rewrite content
-            try:
-                content = file_path.read_bytes()
-                file_path.unlink()
-                file_path.write_bytes(content)
-            except OSError:
-                pass
+        if found_streams:
+            rel = path.relative_to(self.workspace).as_posix() if path != self.workspace else "."
+            for s in found_streams:
+                self.ads_violations.append(f"{rel}:{s}")
+            # Eradicate stream on regular files by re-writing base file
+            if not path.is_dir():
+                try:
+                    content = path.read_bytes()
+                    path.unlink()
+                    path.write_bytes(content)
+                except OSError:
+                    pass
+        return found_streams
 
     def restore_turn_snapshot(self, turn_id: str, expected_sha: str | None = None) -> None:
         """Safely restore the workspace to a snapshot without moving workspace HEAD."""
@@ -532,22 +548,22 @@ class TurnSnapshotManager:
             root_path = Path(root)
             for f in files:
                 fp = root_path / f
-                try:
-                    if os.path.islink(fp) or fp.is_symlink():
+                if is_reparse_point(fp):
+                    try:
                         fp.unlink()
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
             for d in list(dirs):
                 dp = root_path / d
-                try:
-                    if os.path.islink(dp) or dp.is_symlink():
-                        dirs.remove(d)  # Never recurse through planted junction or symlink
+                if is_reparse_point(dp):
+                    dirs.remove(d)  # Never recurse through planted junction or symlink
+                    try:
+                        os.rmdir(dp)
+                    except OSError:
                         try:
-                            os.rmdir(dp)
-                        except OSError:
                             dp.unlink()
-                except OSError:
-                    pass
+                        except OSError:
+                            pass
 
         # 6. Stream raw blob bytes directly to workspace files (bypassing checkout-index & filters)
         for rel_path, blob_sha in snap_entries.items():
@@ -579,15 +595,18 @@ class TurnSnapshotManager:
             rel_root = root_path.relative_to(self.workspace).as_posix() if root_path != self.workspace else ""
             if rel_root and self._is_excluded(rel_root):
                 continue
-            # Neutralize directory links during walk
+            # Neutralize directory links during walk and do not descend
             for d in list(dirs):
                 dp = root_path / d
-                if os.path.islink(dp) or dp.is_symlink():
+                if is_reparse_point(dp):
                     dirs.remove(d)
                     try:
                         os.rmdir(dp)
                     except OSError:
-                        dp.unlink()
+                        try:
+                            dp.unlink()
+                        except OSError:
+                            pass
             for f in files:
                 rel_f = f"{rel_root}/{f}" if rel_root else f
                 if self._is_excluded(rel_f):
@@ -608,6 +627,12 @@ class TurnSnapshotManager:
                 continue
             rel_dir = root_path.relative_to(self.workspace).as_posix()
             if self._is_excluded(rel_dir):
+                continue
+            if is_reparse_point(root_path):
+                try:
+                    os.rmdir(root_path)
+                except OSError:
+                    pass
                 continue
             try:
                 if not any(root_path.iterdir()):
