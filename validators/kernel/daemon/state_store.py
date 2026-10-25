@@ -201,10 +201,13 @@ class SupervisorStateManager:
         """Check if run has valid in-memory attestation."""
         return run_id in self._attested_runs
 
-    def re_attest_run(self, run_id: str, reason: str) -> None:
-        """Operator explicitly re-attests run after daemon restart."""
+    def re_attest_run(self, run_id: str, reason: str, metadata: dict[str, Any] | None = None) -> None:
+        """Operator explicitly re-attests run after daemon restart, recording in HMAC journal chain."""
         self._attested_runs.add(run_id)
-        self.record_journal_event("HUMAN_RE_ATTESTATION", {"run_id": run_id, "reason": reason})
+        details = {"run_id": run_id, "reason": reason}
+        if metadata:
+            details.update(metadata)
+        self.record_journal_event("HUMAN_RE_ATTESTATION", details)
 
     def load_latest_checkpoint(self, run_id: str) -> dict[str, Any]:
         """Load and verify the latest checkpoint for run_id from storage dir, failing closed on tampering."""

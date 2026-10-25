@@ -830,6 +830,84 @@ def test_commit_tree_verified_against_derived_tree_before_ref_update(gate_env, m
     assert current_head == original_head, "HEAD ref moved despite tree mismatch!"
 
 
+def test_e2e_supervisor_commit_read_by_real_git(gate_env):
+    """End-to-end verification: real git parses and verifies the supervisor-generated commit tree byte-exact."""
+    ws, store, snapshot_mgr, reaper, git_env = gate_env
+    pre_sha = snapshot_mgr.create_turn_snapshot("turn-0")
+
+    src_dir = ws / "src"
+    src_dir.mkdir(exist_ok=True)
+    (src_dir / "calc.py").write_text("def add(a, b): return a + b\n", encoding="utf-8")
+    (ws / "app.py").write_text("import src.calc\ndef main(): return src.calc.add(1, 2)\n", encoding="utf-8")
+    snap_sha = snapshot_mgr.create_turn_snapshot("turn-1")
+
+    gate = DiffGate(workspace=ws, snapshot_manager=snapshot_mgr, role="GitOps", reaper=reaper)
+    commit_sha = gate.supervisor_git_commit(
+        message="feat(e2e): real git commit test",
+        approved_snapshot_sha=snap_sha,
+        pre_turn_snapshot_sha=pre_sha,
+    )
+
+    # 1. Real git log verifies commit object, commit message, and author
+    log_out = subprocess.run(
+        ["git", "log", "-1", "--format=%H|%s|%an"],
+        cwd=ws,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=git_env,
+    ).stdout.strip()
+    c_hash, c_msg, c_author = log_out.split("|")
+    assert c_hash == commit_sha
+    assert c_msg == "feat(e2e): real git commit test"
+    assert c_author == "StackMind Supervisor"
+
+    # 2. Real git cat-file -p HEAD parses tree structure
+    cat_commit = subprocess.run(
+        ["git", "cat-file", "-p", "HEAD"],
+        cwd=ws,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=git_env,
+    ).stdout
+    assert "tree " in cat_commit
+    assert "parent " in cat_commit
+    assert "feat(e2e): real git commit test" in cat_commit
+
+    # 3. Real git ls-tree recursively inspects tracked files and mode bits
+    ls_out = subprocess.run(
+        ["git", "ls-tree", "-r", "HEAD"],
+        cwd=ws,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=git_env,
+    ).stdout.strip().splitlines()
+
+    paths_in_tree = {}
+    for line in ls_out:
+        parts = line.split()
+        mode, obj_type, blob_sha, path = parts[0], parts[1], parts[2], parts[3]
+        paths_in_tree[path] = (mode, blob_sha)
+
+    assert "app.py" in paths_in_tree
+    assert "src/calc.py" in paths_in_tree
+    assert paths_in_tree["app.py"][0] == "100644"
+    assert paths_in_tree["src/calc.py"][0] == "100644"
+
+    # 4. Real git cat-file extracts exact blob contents
+    calc_blob = subprocess.run(
+        ["git", "cat-file", "-p", paths_in_tree["src/calc.py"][1]],
+        cwd=ws,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=git_env,
+    ).stdout
+    assert calc_blob == "def add(a, b): return a + b\n"
+
+
 # ==============================================================================
 # 6. ServiceJobManager Suspension & Isolation
 # ==============================================================================

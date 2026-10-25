@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 import pytest
@@ -707,9 +708,10 @@ def test_re_attest_restores_interrupted_phase_without_consuming_resume_count(tmp
     sup = LifecycleSupervisor(manager=mgr)
     state = sup.start_run("run-reattest-1", "Goal", tmp_path, "session-1")
 
-    # Move state to EXECUTING
+    # Move state to EXECUTING with pre-crash budget of 35
     state.phase = Phase.EXECUTING
     state.worker_wo_ids = ["WO-001"]
+    state.global_turn_budget = 35
 
     # Transition to WAITING_FOR_HUMAN (simulating daemon restart fail-closed)
     sup._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -783,6 +785,55 @@ def test_tampered_checkpoint_before_restart_not_silently_restored(tmp_path: Path
     assert state.global_turn_budget == 10  # Human authoritative budget, NOT 99999
     assert state.phase == Phase.EXECUTING
 
+    # Verify journal entry in the new HMAC chain
+    journal = sup2.state_manager._journal_chain
+    assert len(journal) >= 1
+    re_attest_event = [e for e in journal if e["event_type"] == "HUMAN_RE_ATTESTATION"][-1]
+    assert re_attest_event["details"]["run_id"] == state.run_id
+    assert re_attest_event["details"]["confirmed_budget"] == 10
+    assert re_attest_event["details"]["confirmed_counters"]["gitops_retries"] == 2
+    assert "hmac" in re_attest_event and len(re_attest_event["hmac"]) == 64
+
+
+def test_re_attest_restart_cap_and_budget_rules(tmp_path: Path):
+    """Restart cap bounds crash-loops; budget increase across restart requires human resume count."""
+    storage_dir = tmp_path / "supervisor_storage"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    sup.state_manager._storage_dir = storage_dir
+
+    state = sup.start_run("run-restart-cap", "Goal", ws, "session-1")
+    state.global_turn_budget = 10
+    state.max_daemon_restarts = 2
+    state.daemon_restarts = 0
+    state.human_resumes_used = 0
+    state.max_human_resumes = 2
+
+    # 1. Budget increase without consuming resume count is rejected if resume count exhausted
+    state.human_resumes_used = 2
+    with pytest.raises(ValueError, match="human resume cap .* is exhausted"):
+        sup.re_attest_run(state, human_signature="lead", confirmed_budget=15)
+
+    # 2. Budget increase with remaining resume count consumes 1 human resume
+    state.human_resumes_used = 1
+    sup.re_attest_run(state, human_signature="lead", confirmed_budget=15)
+    assert state.human_resumes_used == 2
+    assert state.global_turn_budget == 15
+    assert len(state.human_override_logs) == 1
+    assert state.human_override_logs[-1]["action"] == "re_attest_budget_increase"
+
+    # 3. Exceeding max_daemon_restarts (restart cap) fails closed
+    assert state.daemon_restarts == 1  # From the re_attest above
+    state.daemon_restarts = 2  # At cap
+    with pytest.raises(ValueError, match="maximum allowed daemon restarts"):
+        sup.re_attest_run(state, human_signature="lead", confirmed_budget=15)
+
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert "MAX_DAEMON_RESTARTS_EXCEEDED" in str(state.error)
+
 
 # ==============================================================================
 # 16. B2: Daemon IPC Authentication for Administrative Actions
@@ -837,20 +888,50 @@ def test_sandboxed_unauthenticated_client_cannot_resume_daemon(tmp_path: Path):
 
     # 4. Storage & isolation verification
     from validators.kernel.daemon.server import LocalDaemon
-    daemon = LocalDaemon(tmp_path / "daemon_secure_state")
-    token_file = (tmp_path / "daemon_secure_state") / ".daemon_token"
+    from validators.kernel.process_reaper import ProcessReaper
+
+    state_dir = tmp_path / "daemon_secure_state"
+    daemon = LocalDaemon(state_dir)
+    token_file = state_dir / ".daemon_token"
     assert token_file.is_file(), "Daemon must generate and persist .daemon_token in secure state dir"
     token_val = token_file.read_text(encoding="utf-8").strip()
     assert len(token_val) >= 32
 
-    # Verify token is NOT placed into child env
+    # Vector 1: Verify token is NOT placed into child env
     assert "STACKMIND_ADMIN_TOKEN" not in os.environ
     assert "DAEMON_TOKEN" not in os.environ
 
-    # Verify workspace cannot access secure state directory
+    # Vector 2: Verify workspace cannot access secure state directory
     ws = tmp_path / "workspace"
     ws.mkdir()
     assert not (ws / ".daemon_token").exists()
+
+    # Vector 3: Sandboxed child launched via launch_in_job probing env, workspace, and unauthenticated IPC
+    child_script = ws / "probe_token.py"
+    child_log = ws / "child_findings.json"
+    child_script.write_text(
+        "import os, json\n"
+        "findings = {\n"
+        "    'env_has_token': 'STACKMIND_ADMIN_TOKEN' in os.environ or 'DAEMON_TOKEN' in os.environ,\n"
+        "    'workspace_has_token': os.path.exists('.daemon_token'),\n"
+        "}\n"
+        f"with open(r'{child_log}', 'w') as f: json.dump(findings, f)\n",
+        encoding="utf-8",
+    )
+    reaper = ProcessReaper()
+    p = reaper.launch_in_job([sys.executable, str(child_script)], cwd=ws)
+    p.wait(timeout=5)
+    reaper.reap_all()
+
+    findings = json.loads(child_log.read_text(encoding="utf-8"))
+    assert not findings["env_has_token"], "Admin token leaked into child environment!"
+    assert not findings["workspace_has_token"], "Admin token present in workspace filesystem!"
+
+    # Vector 4: Direct filesystem path read of ~/.stackmind/daemon/.daemon_token
+    # [REASONED ONLY]: On Windows, standard 0o600 chmod does not isolate against same-user
+    # unconfined tokens without AppContainer / P1-1 token confinement. This is documented
+    # as an ACCEPTED RISK until P1-1. Unauthenticated or un-piped administrative actions
+    # require interactive confirmation on the daemon's own console.
 
 
 # ==============================================================================
@@ -899,36 +980,53 @@ def test_checkpoint_and_journal_forgery_truncation_deletion_fails_closed(tmp_pat
 # ==============================================================================
 
 @pytest.mark.p1_1
-def test_confined_child_cannot_open_daemon_process_memory():
-    """Confined child processes lack PROCESS_VM_READ access to supervisor daemon memory.
+@pytest.mark.xfail(
+    strict=True,
+    reason="Under unconfined execution on Windows, same-user processes can open each other; true isolation requires P1-1 token confinement",
+)
+def test_confined_child_cannot_open_daemon_process_memory(tmp_path: Path):
+    """Child launched via launch_in_job tries OpenProcess(PROCESS_VM_READ) on daemon PID.
 
-    [REASONED ONLY]: StackMind does not confine agent processes with CreateRestrictedToken yet (P1-1).
-    Under unconfined Windows execution, same-user processes can open each other. Full memory
-    protection will land once child process token confinement is implemented in P1-1.
+    [REASONED ONLY]: Strict xfail until P1-1 token confinement lands.
     """
     import sys
     if sys.platform != "win32":
         pytest.skip("Windows PROCESS_VM_READ security boundary test")
 
-    import ctypes
-    from ctypes import wintypes
+    from validators.kernel.process_reaper import ProcessReaper
 
-    PROCESS_VM_READ = 0x0010
-    PROCESS_QUERY_INFORMATION = 0x0400
+    daemon_pid = os.getpid()
+    script = tmp_path / "probe_mem.py"
+    result_file = tmp_path / "probe_result.txt"
+    script.write_text(
+        "import ctypes, sys\n"
+        "from ctypes import wintypes\n"
+        f"daemon_pid = {daemon_pid}\n"
+        "PROCESS_VM_READ = 0x0010\n"
+        "PROCESS_QUERY_INFORMATION = 0x0400\n"
+        "kernel32 = ctypes.windll.kernel32\n"
+        "kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]\n"
+        "kernel32.OpenProcess.restype = wintypes.HANDLE\n"
+        "h = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, daemon_pid)\n"
+        f"with open(r'{result_file}', 'w') as f:\n"
+        "    if h:\n"
+        "        f.write('OPEN_SUCCESS')\n"
+        "        kernel32.CloseHandle(h)\n"
+        "    else:\n"
+        "        f.write(f'DENIED_{ctypes.GetLastError()}')\n",
+        encoding="utf-8",
+    )
 
-    # In a confined security context (AppContainer or Restricted Token), opening
-    # another process or high-integrity process handle with PROCESS_VM_READ is denied.
-    # We verify the Windows API access check contract:
-    kernel32 = ctypes.windll.kernel32
-    OpenProcess = kernel32.OpenProcess
-    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    OpenProcess.restype = wintypes.HANDLE
+    reaper = ProcessReaper()
+    proc = reaper.launch_in_job([sys.executable, str(script)])
+    proc.wait(timeout=5)
+    reaper.reap_all()
 
-    # Windows kernel boundary check against PID 4 (System)
-    h_proc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, 4)
-    if not h_proc:
-        err = ctypes.GetLastError()
-        assert err in (5, 87)  # 5 == ERROR_ACCESS_DENIED, 87 == ERROR_INVALID_PARAMETER
+    res = result_file.read_text(encoding="utf-8").strip()
+    # Confinement invariant: opening daemon process memory MUST be denied!
+    # Under current unconfined execution, res == 'OPEN_SUCCESS', causing this assertion
+    # to fail, which fulfills xfail(strict=True).
+    assert res.startswith("DENIED"), f"Child process successfully opened daemon memory (res={res})!"
 
 
 # ==============================================================================
@@ -1058,3 +1156,33 @@ def test_every_turn_path_decrements_budget_full_stub_run(tmp_path: Path):
     assert len(mgr.turns_dispatched) == 10
     assert state.global_turn_budget == initial_budget - 10
     assert initial_budget - state.global_turn_budget == len(mgr.turns_dispatched)
+
+
+# ==============================================================================
+# 21. Test Suite Manifest Integrity
+# ==============================================================================
+
+def test_collected_tests_manifest_matches_suite():
+    """CI check verifying that the generated collected_tests.txt manifest strictly matches the collected suite."""
+    manifest_path = Path("collected_tests.txt")
+    if not manifest_path.is_file():
+        pytest.skip("collected_tests.txt not found in workspace root")
+
+    manifest_lines = [l.strip() for l in manifest_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    # Collect Phase 0 test node IDs
+    import subprocess
+    cmd = [
+        sys.executable, "-m", "pytest",
+        "tests/test_p0_1_git_allowlist.py",
+        "tests/test_p0_2_turn_snapshot.py",
+        "tests/test_p0_3_diff_gate.py",
+        "tests/test_p0_5_counters_and_budget.py",
+        "tests/test_p0_6_timeouts_and_liveness.py",
+        "--collect-only", "-q",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    collected = [l.strip() for l in res.stdout.splitlines() if "::" in l]
+
+    assert len(collected) == len(manifest_lines), f"Manifest count ({len(manifest_lines)}) != collected count ({len(collected)})"
+    assert set(collected) == set(manifest_lines), "Manifest items diverge from collected tests"

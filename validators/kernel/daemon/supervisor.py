@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from collections.abc import Callable, Mapping
@@ -115,6 +117,18 @@ EXIT_RETRIES_EXHAUSTED = 3
 EXIT_PLAN_REJECTED = 4
 EXIT_INTEGRITY_VIOLATION = 5
 EXIT_HEADLESS_TIMEOUT = 137
+
+DEFAULT_TIMEOUTS: dict[Any, float] = {
+    Phase.PLANNING: 600.0,
+    Phase.AUTHORING: 600.0,
+    Phase.EXECUTING: 900.0,
+    Phase.INTEGRATION_REVIEW: 300.0,
+    Phase.ARCHITECT_REPAIR: 600.0,
+    Phase.ARCHITECT_RECOVERY_DECISION: 600.0,
+    Phase.GITOPS: 300.0,
+    "gate": 60.0,
+    "ci_wait_timeout": 1800.0,
+}
 
 
 from .state_store import (
@@ -212,6 +226,13 @@ class RunState:
     stall_ticks: int = 0
     max_stall_ticks: int = 3
     interrupted_phase: str | None = None
+    daemon_restarts: int = 0
+    max_daemon_restarts: int = 2
+    executing_wo_id: str | None = None
+    # In-memory only monotonic deadlines for state timeouts (never persisted to disk)
+    turn_deadline: float | None = None
+    turn_started_at: float | None = None
+    run_started_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -288,6 +309,9 @@ class RunState:
             "stall_ticks": self.stall_ticks,
             "max_stall_ticks": self.max_stall_ticks,
             "interrupted_phase": self.interrupted_phase,
+            "daemon_restarts": self.daemon_restarts,
+            "max_daemon_restarts": self.max_daemon_restarts,
+            "executing_wo_id": self.executing_wo_id,
         }
 
     @classmethod
@@ -366,6 +390,9 @@ class RunState:
             stall_ticks=int(data.get("stall_ticks", 0)),
             max_stall_ticks=int(data.get("max_stall_ticks", 3)),
             interrupted_phase=data.get("interrupted_phase"),
+            daemon_restarts=int(data.get("daemon_restarts", 0)),
+            max_daemon_restarts=int(data.get("max_daemon_restarts", 2)),
+            executing_wo_id=data.get("executing_wo_id"),
         )
 
 
@@ -452,13 +479,264 @@ class LifecycleSupervisor:
         manager: Any,
         max_contention_retries: int = 50,
         state_manager: SupervisorStateManager | None = None,
+        reaper: Any | None = None,
+        timeouts: dict[Any, float] | None = None,
+        ci_wait_timeout: float | None = None,
     ) -> None:
         """Initialise with a SessionManager (or compatible mock)."""
         self.manager = manager
         self.max_contention_retries = max_contention_retries
         self.state_manager = state_manager or SupervisorStateManager()
         self._current_state: RunState | None = None
+        if reaper is not None:
+            self.reaper = reaper
+        else:
+            try:
+                from validators.kernel.process_reaper import get_global_reaper
+                self.reaper = get_global_reaper()
+            except Exception:
+                self.reaper = None
+
+        self.timeouts = dict(DEFAULT_TIMEOUTS)
+        if timeouts:
+            self.timeouts.update(timeouts)
+        self.ci_wait_timeout = float(
+            ci_wait_timeout
+            if ci_wait_timeout is not None
+            else os.environ.get("SUPERVISOR_CI_WAIT_TIMEOUT", self.timeouts.get("ci_wait_timeout", 1800.0))
+        )
         self._wrap_manager_for_budget()
+
+    def get_timeout_for_phase(self, phase: Phase | str) -> float:
+        """Retrieve the configured timeout for a given phase."""
+        if phase in self.timeouts:
+            return float(self.timeouts[phase])
+        key = phase.value if isinstance(phase, Phase) else str(phase)
+        env_key = f"SUPERVISOR_TIMEOUT_{key.upper()}"
+        if env_key in os.environ:
+            try:
+                return float(os.environ[env_key])
+            except ValueError:
+                pass
+        return float(self.timeouts.get(phase, 600.0))
+
+    def handle_rejection_without_reworkable(
+        self,
+        state: RunState,
+        rejecting_role: str,
+        reason: str,
+        affected_paths: list[str] | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> AdvanceResult:
+        """Route QA/GitOps rejection with empty reworkable to ARCHITECT_RECOVERY with structured diagnostic context."""
+        state.repair_context = {
+            "source_phase": state.phase.value,
+            "rejecting_role": rejecting_role,
+            "error": "UNIDENTIFIABLE_REWORKABLE_WO",
+            "reason": reason,
+            "affected_paths": list(affected_paths or []),
+            "diagnostics": dict(diagnostics or {}),
+            "timestamp": _now(),
+        }
+        state.recovery_wo_id = "SYSTEM_UNIDENTIFIABLE"
+        self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+        return AdvanceResult.TRANSITIONED
+
+    def handle_invalid_turn_output(
+        self,
+        state: RunState,
+        role: str,
+        wo_id: str | None = None,
+        raw_output: str | None = None,
+        error_type: str = "EMPTY_OUTPUT",
+    ) -> AdvanceResult:
+        """Handle empty, malformed, or schema-invalid agent output as an explicit failure outcome."""
+        state.global_turn_budget = max(0, state.global_turn_budget - 1)
+        self._sync_budget_file(state)
+
+        if state.global_turn_budget <= 0:
+            state.budget_exhausted = True
+            state.error = f"BUDGET_EXHAUSTED: Invalid output ({error_type}) exhausted global budget."
+            state.exit_code = EXIT_BUDGET_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
+        role_lower = str(role).lower()
+        if role_lower in ("backend", "frontend", "worker") or state.phase == Phase.EXECUTING:
+            wid = wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
+            retries = state.worker_retries.get(wid, 0) + 1
+            state.worker_retries[wid] = retries
+            if retries >= state.max_worker_retries:
+                self.escalate_wo_to_recovery(state, wid, reason=f"Worker returned {error_type}")
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            else:
+                state.error = f"WORKER_INVALID_OUTPUT: {error_type} on {wid} (retry {retries}/{state.max_worker_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif role_lower == "qa" or state.phase == Phase.INTEGRATION_REVIEW:
+            wid = wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
+            reworks = state.qa_reworks.get(wid, 0) + 1
+            state.qa_reworks[wid] = reworks
+            if reworks >= state.max_qa_reworks:
+                self.escalate_wo_to_recovery(state, wid, reason=f"QA returned {error_type}")
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            else:
+                state.error = f"QA_INVALID_OUTPUT: {error_type} on {wid} (round {reworks}/{state.max_qa_reworks})"
+            return AdvanceResult.TRANSITIONED
+
+        elif role_lower == "gitops" or state.phase == Phase.GITOPS:
+            state.gitops_retries += 1
+            if state.gitops_retries >= state.max_gitops_retries:
+                state.error = f"MAX_GITOPS_RETRIES_EXHAUSTED: GitOps returned {error_type}"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"GITOPS_INVALID_OUTPUT: {error_type} (retry {state.gitops_retries}/{state.max_gitops_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif role_lower == "architecture" or state.phase in (Phase.PLANNING, Phase.AUTHORING, Phase.ARCHITECT_REPAIR):
+            state.authoring_repair_attempts += 1
+            if state.authoring_repair_attempts >= state.max_authoring_repairs:
+                state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Architecture returned {error_type}"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"ARCHITECTURE_INVALID_OUTPUT: {error_type} in {state.phase.value}"
+            return AdvanceResult.TRANSITIONED
+
+        else:
+            state.error = f"INVALID_OUTPUT: {error_type} in phase {state.phase.value}"
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
+    def _handle_turn_timeout(self, state: RunState) -> AdvanceResult:
+        """Supervisor monotonic deadline expired: terminate process tree, decrement budget, consume counter, and transition."""
+        if self.reaper is not None:
+            try:
+                self.reaper.reap_all()
+            except Exception:
+                pass
+
+        timeout_phase = state.phase
+        timeout_val = self.get_timeout_for_phase(timeout_phase)
+        state.turn_deadline = None
+        state.turn_started_at = None
+
+        state.global_turn_budget = max(0, state.global_turn_budget - 1)
+        self._sync_budget_file(state)
+
+        if state.global_turn_budget <= 0:
+            state.budget_exhausted = True
+            state.error = f"BUDGET_EXHAUSTED: Turn timeout in {timeout_phase.value} exhausted global budget."
+            state.exit_code = EXIT_BUDGET_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
+        if timeout_phase == Phase.EXECUTING:
+            wo_id = state.executing_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
+            retries = state.worker_retries.get(wo_id, 0) + 1
+            state.worker_retries[wo_id] = retries
+            if retries >= state.max_worker_retries:
+                self.escalate_wo_to_recovery(state, wo_id, reason=f"Worker turn timed out after {timeout_val:.1f}s")
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            else:
+                state.error = f"WORKER_TIMEOUT: Turn timed out after {timeout_val:.1f}s (retry {retries}/{state.max_worker_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase == Phase.INTEGRATION_REVIEW:
+            wo_id = state.integration_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
+            reworks = state.qa_reworks.get(wo_id, 0) + 1
+            state.qa_reworks[wo_id] = reworks
+            if reworks >= state.max_qa_reworks:
+                self.escalate_wo_to_recovery(state, wo_id, reason=f"QA review timed out after {timeout_val:.1f}s")
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            else:
+                state.error = f"QA_TIMEOUT: Review timed out after {timeout_val:.1f}s (round {reworks}/{state.max_qa_reworks})"
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase == Phase.GITOPS:
+            state.gitops_retries += 1
+            if state.gitops_retries >= state.max_gitops_retries:
+                state.error = f"MAX_GITOPS_RETRIES_EXHAUSTED: GitOps release timed out after {timeout_val:.1f}s"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"GITOPS_TIMEOUT: Release timed out after {timeout_val:.1f}s (retry {state.gitops_retries}/{state.max_gitops_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase in (Phase.ARCHITECT_REPAIR, Phase.ARCHITECT_RECOVERY_DECISION, Phase.PLANNING, Phase.AUTHORING):
+            state.authoring_repair_attempts += 1
+            if state.authoring_repair_attempts >= state.max_authoring_repairs:
+                state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Architecture state {timeout_phase.value} timed out after {timeout_val:.1f}s"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"ARCHITECTURE_TIMEOUT: {timeout_phase.value} timed out after {timeout_val:.1f}s"
+            return AdvanceResult.TRANSITIONED
+
+        else:
+            state.error = f"STATE_TIMEOUT: Phase {timeout_phase.value} timed out after {timeout_val:.1f}s"
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
+    def _handle_ci_timeout(self, state: RunState) -> AdvanceResult:
+        """Headless CI run abort on total wall-clock timeout: write crash bundle and rescue ref."""
+        if self.reaper is not None:
+            try:
+                self.reaper.reap_all()
+            except Exception:
+                pass
+
+        storage_dir = Path(self.state_manager._storage_dir) if hasattr(self, "state_manager") and self.state_manager else Path(state.workspace).parent / "supervisor_storage"
+        bundle_dir = storage_dir / "crash_bundles"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        bundle_path = bundle_dir / f"crash_bundle_{state.run_id}_{ts}.json"
+        bundle_data = {
+            "run_id": state.run_id,
+            "phase": state.phase.value,
+            "error": f"HEADLESS_CI_TIMEOUT: Total wall-clock time exceeded {self.ci_wait_timeout}s.",
+            "exit_code": EXIT_HEADLESS_TIMEOUT,  # 137
+            "state_snapshot": state.to_dict(),
+            "transitions": list(state.transitions),
+            "timestamp": _now(),
+        }
+        bundle_path.write_text(json.dumps(bundle_data, indent=2), encoding="utf-8")
+
+        store_git = storage_dir / "snapshots.git"
+        if store_git.is_dir():
+            try:
+                from validators.kernel.turn_snapshot import TurnSnapshotManager
+                snap_mgr = TurnSnapshotManager(workspace=Path(state.workspace), storage_root=store_git, reaper=self.reaper)
+                rescue_snap = snap_mgr.create_turn_snapshot(f"rescue-{state.run_id}")
+                ref_name = f"refs/rescue/{state.run_id}/{state.phase.value.lower()}"
+                null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
+                git_env = {
+                    **os.environ,
+                    "GIT_CONFIG_GLOBAL": null_dev,
+                    "GIT_CONFIG_SYSTEM": null_dev,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG": null_dev,
+                }
+                subprocess.run(
+                    ["git", "--git-dir", str(store_git), "update-ref", ref_name, rescue_snap],
+                    capture_output=True,
+                    check=True,
+                    env=git_env,
+                )
+            except Exception:
+                pass
+
+        state.exit_code = EXIT_HEADLESS_TIMEOUT  # 137
+        state.error = f"HEADLESS_CI_TIMEOUT: Total wall-clock time exceeded {self.ci_wait_timeout}s."
+        self._transition(state, Phase.WAITING_FOR_HUMAN)
+        return AdvanceResult.WAITING_FOR_HUMAN
 
     def _wrap_manager_for_budget(self) -> None:
         """Intercept manager.start_turn to enforce global turn budget decrement."""
@@ -561,6 +839,7 @@ class LifecycleSupervisor:
         )
         if hasattr(self, "state_manager") and self.state_manager is not None:
             self.state_manager.register_state(run_id, state)
+        state.run_started_at = time.monotonic()
         self._current_state = state
         self._sync_budget_file(state)
         self._transition(state, Phase.PLANNING)
@@ -579,6 +858,16 @@ class LifecycleSupervisor:
         predictable and auditable.
         """
         self._current_state = state
+        now_mono = time.monotonic()
+
+        # 1. Monotonic CI wait timeout check for headless runs
+        if state.run_started_at is not None and (now_mono - state.run_started_at) > self.ci_wait_timeout:
+            return self._handle_ci_timeout(state)
+
+        # 2. Monotonic turn deadline check
+        if state.turn_deadline is not None and now_mono > state.turn_deadline:
+            return self._handle_turn_timeout(state)
+
         if hasattr(self, "state_manager") and self.state_manager is not None:
             if not self.state_manager.is_run_attested(state.run_id):
                 state.error = (
@@ -595,6 +884,18 @@ class LifecycleSupervisor:
             state.exit_code = EXIT_BUDGET_EXHAUSTED
             self._transition(state, Phase.WAITING_FOR_HUMAN)
             return AdvanceResult.WAITING_FOR_HUMAN
+
+        terminal_or_waiting = (
+            Phase.COMPLETE,
+            Phase.FAILED,
+            Phase.BLOCKED,
+            Phase.WAITING_FOR_HUMAN,
+            Phase.AWAITING_APPROVAL,
+        )
+        if state.turn_deadline is None and state.phase not in terminal_or_waiting:
+            timeout = self.get_timeout_for_phase(state.phase)
+            state.turn_deadline = now_mono + timeout
+            state.turn_started_at = now_mono
 
         handler = {
             Phase.INIT: self._advance_init,
@@ -4562,6 +4863,8 @@ class LifecycleSupervisor:
 
     def _transition(self, state: RunState, new_phase: Phase) -> None:
         """Record a phase transition in the run state."""
+        state.turn_deadline = None
+        state.turn_started_at = None
         now = _now()
         if new_phase == Phase.WAITING_FOR_HUMAN and state.phase != Phase.WAITING_FOR_HUMAN:
             state.interrupted_phase = state.phase.value
@@ -5442,6 +5745,32 @@ class LifecycleSupervisor:
         if confirmed_budget is None or not isinstance(confirmed_budget, int) or confirmed_budget <= 0:
             raise ValueError("Human re-attestation requires an explicit confirmed_budget > 0.")
 
+        # 1. Enforce restart cap to prevent crash-loops from acting as budget refills
+        if state.daemon_restarts >= state.max_daemon_restarts:
+            state.phase = Phase.WAITING_FOR_HUMAN
+            state.error = f"MAX_DAEMON_RESTARTS_EXCEEDED: run reached restart cap ({state.max_daemon_restarts})"
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            raise ValueError(f"Run reached maximum allowed daemon restarts ({state.max_daemon_restarts}).")
+
+        # 2. Budget non-increasing across restarts rule:
+        # Increasing budget requires consuming an authoritative human resume count.
+        prior_budget = state.global_turn_budget
+        if confirmed_budget > prior_budget:
+            if state.human_resumes_used >= state.max_human_resumes:
+                raise ValueError(
+                    f"Confirmed budget ({confirmed_budget}) exceeds prior budget ({prior_budget}) and "
+                    f"human resume cap ({state.max_human_resumes}) is exhausted."
+                )
+            state.human_resumes_used += 1
+            state.human_override_logs.append({
+                "timestamp": _now(),
+                "action": "re_attest_budget_increase",
+                "prior_budget": prior_budget,
+                "new_budget": confirmed_budget,
+                "human_signature": human_signature,
+            })
+
+        state.daemon_restarts += 1
         state.error = None
         state.exit_code = EXIT_SUCCESS
         state.stall_ticks = 0
@@ -5464,10 +5793,21 @@ class LifecycleSupervisor:
             for wo, reworks in conf_qa.items():
                 state.qa_reworks[wo] = max(state.qa_reworks.get(wo, 0), int(reworks))
 
-        # Mark attested in in-memory state manager if present
+        # Mark attested and journal in HMAC chain in state manager if present
         if hasattr(self, "state_manager") and self.state_manager is not None:
             self.state_manager.register_state(state.run_id, state)
-            self.state_manager.re_attest_run(state.run_id, f"Human re-attestation by {human_signature}")
+            re_attest_meta = {
+                "confirmed_budget": confirmed_budget,
+                "confirmed_counters": confirmed_counters or {},
+                "human_signature": human_signature,
+                "daemon_restarts": state.daemon_restarts,
+                "human_resumes_used": state.human_resumes_used,
+            }
+            self.state_manager.re_attest_run(
+                state.run_id,
+                f"Human re-attestation by {human_signature}",
+                metadata=re_attest_meta,
+            )
             self.state_manager.create_checkpoint(state, workspace=state.workspace)
 
         # Determine target resume phase: explicit target, or recorded interrupted phase, or PLANNING
