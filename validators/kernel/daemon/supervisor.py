@@ -81,6 +81,7 @@ class Phase(StrEnum):
     INTEGRATION_REVIEW = "INTEGRATION_REVIEW"
     PRODUCT_READY = "PRODUCT_READY"
     GITOPS = "GITOPS"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
@@ -169,6 +170,22 @@ class RunState:
     qa_rework_targets: dict[str, list[str]] = field(default_factory=dict)
     execution_profile: str = "medium"
     gitops_feedback: str | None = None
+    # ── P0-5 Counters and Global Turn Budget ─────────────────────────────
+    worker_retries: dict[str, int] = field(default_factory=dict)
+    qa_reworks: dict[str, int] = field(default_factory=dict)
+    gitops_retries: int = 0
+    max_gitops_retries: int = 2
+    max_worker_retries: int = 2
+    max_qa_reworks: int = 2
+    global_turn_budget: int = 50
+    initial_turn_budget: int = 50
+    budget_exhausted: bool = False
+    human_resumes_used: int = 0
+    max_human_resumes: int = 2
+    human_override_logs: list[dict[str, Any]] = field(default_factory=list)
+    blocked_by_escalation: dict[str, str] = field(default_factory=dict)
+    wo_dependencies: dict[str, list[str]] = field(default_factory=dict)
+    exit_code: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +244,21 @@ class RunState:
             "qa_rework_targets": dict(self.qa_rework_targets),
             "execution_profile": self.execution_profile,
             "gitops_feedback": self.gitops_feedback,
+            "worker_retries": dict(self.worker_retries),
+            "qa_reworks": dict(self.qa_reworks),
+            "gitops_retries": self.gitops_retries,
+            "max_gitops_retries": self.max_gitops_retries,
+            "max_worker_retries": self.max_worker_retries,
+            "max_qa_reworks": self.max_qa_reworks,
+            "global_turn_budget": self.global_turn_budget,
+            "initial_turn_budget": self.initial_turn_budget,
+            "budget_exhausted": bool(self.budget_exhausted),
+            "human_resumes_used": self.human_resumes_used,
+            "max_human_resumes": self.max_human_resumes,
+            "human_override_logs": list(self.human_override_logs),
+            "blocked_by_escalation": dict(self.blocked_by_escalation),
+            "wo_dependencies": {k: list(v) for k, v in self.wo_dependencies.items()},
+            "exit_code": self.exit_code,
         }
 
     @classmethod
@@ -287,6 +319,21 @@ class RunState:
             qa_rework_targets=dict(data.get("qa_rework_targets", {}) or {}),
             execution_profile=str(data.get("execution_profile", "medium")),
             gitops_feedback=data.get("gitops_feedback"),
+            worker_retries=dict(data.get("worker_retries", {}) or {}),
+            qa_reworks=dict(data.get("qa_reworks", {}) or {}),
+            gitops_retries=int(data.get("gitops_retries", 0)),
+            max_gitops_retries=int(data.get("max_gitops_retries", 2)),
+            max_worker_retries=int(data.get("max_worker_retries", 2)),
+            max_qa_reworks=int(data.get("max_qa_reworks", 2)),
+            global_turn_budget=int(data.get("global_turn_budget", 50)),
+            initial_turn_budget=int(data.get("initial_turn_budget", 50)),
+            budget_exhausted=bool(data.get("budget_exhausted", False)),
+            human_resumes_used=int(data.get("human_resumes_used", 0)),
+            max_human_resumes=int(data.get("max_human_resumes", 2)),
+            human_override_logs=list(data.get("human_override_logs", []) or []),
+            blocked_by_escalation=dict(data.get("blocked_by_escalation", {}) or {}),
+            wo_dependencies=dict(data.get("wo_dependencies", {}) or {}),
+            exit_code=int(data.get("exit_code", 0)),
         )
 
 
@@ -372,6 +419,45 @@ class LifecycleSupervisor:
         """Initialise with a SessionManager (or compatible mock)."""
         self.manager = manager
         self.max_contention_retries = max_contention_retries
+        self._current_state: RunState | None = None
+        self._wrap_manager_for_budget()
+
+    def _wrap_manager_for_budget(self) -> None:
+        """Intercept manager.start_turn to enforce global turn budget decrement."""
+        original_start_turn = getattr(self.manager, "start_turn", None)
+        if original_start_turn is None:
+            return
+
+        def hooked_start_turn(*args: Any, **kwargs: Any) -> Any:
+            state = self._current_state
+            if state is not None:
+                if state.global_turn_budget <= 0:
+                    state.budget_exhausted = True
+                    state.error = "BUDGET_EXHAUSTED: Global turn budget (B) reached 0."
+                    state.exit_code = 2
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    raise OperationContentionError("Global turn budget exhausted.")
+                state.global_turn_budget -= 1
+                self._sync_budget_file(state)
+            return original_start_turn(*args, **kwargs)
+
+        self.manager.start_turn = hooked_start_turn
+
+    def _sync_budget_file(self, state: RunState) -> None:
+        """Persist remaining and initial turn budget to supervisor storage."""
+        try:
+            ws = Path(state.workspace)
+            b_file = ws / ".sync" / "runtime" / "supervisor" / "budget.json"
+            b_file.parent.mkdir(parents=True, exist_ok=True)
+            b_data = {
+                "remaining_turn_budget": state.global_turn_budget,
+                "initial_turn_budget": state.initial_turn_budget,
+                "budget_exhausted": bool(state.budget_exhausted),
+                "updated_at": _now(),
+            }
+            b_file.write_text(json.dumps(b_data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     # ── Lifecycle entry point ─────────────────────────────────────────
 
@@ -415,6 +501,7 @@ class LifecycleSupervisor:
             reconcile_operations(Path(workspace), apply_stale=_repair)
         except Exception:
             pass
+        initial_budget = 18 + 5 * 1  # 23 turns default for initial planning
         state = RunState(
             run_id=run_id,
             product_goal=product_goal,
@@ -423,9 +510,12 @@ class LifecycleSupervisor:
             phase=Phase.INIT,
             bootstrap_mode=bootstrap_mode,
             execution_profile=profile_val,
+            global_turn_budget=initial_budget,
+            initial_turn_budget=initial_budget,
             created_at=now,
             updated_at=now,
         )
+        self._sync_budget_file(state)
         self._transition(state, Phase.PLANNING)
         return state
 
@@ -441,6 +531,14 @@ class LifecycleSupervisor:
         Each call makes AT MOST one state transition to keep the loop
         predictable and auditable.
         """
+        self._current_state = state
+        if state.global_turn_budget <= 0 and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN):
+            state.budget_exhausted = True
+            state.error = "BUDGET_EXHAUSTED: Global turn budget (B) reached 0."
+            state.exit_code = 2
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
         handler = {
             Phase.INIT: self._advance_init,
             Phase.PLANNING: self._advance_planning,
@@ -454,6 +552,7 @@ class LifecycleSupervisor:
             Phase.INTEGRATION_REVIEW: self._advance_integration_review,
             Phase.PRODUCT_READY: self._advance_product_ready,
             Phase.GITOPS: self._advance_gitops,
+            Phase.WAITING_FOR_HUMAN: lambda _s: AdvanceResult.WAITING_FOR_HUMAN,
             Phase.COMPLETE: lambda _s: AdvanceResult.COMPLETE,
             Phase.FAILED: lambda _s: AdvanceResult.FAILED,
             Phase.BLOCKED: lambda _s: AdvanceResult.BLOCKED,
@@ -891,6 +990,13 @@ class LifecycleSupervisor:
             state.published_wo_ids = sorted(state.worker_wo_ids)
             state.readiness_issues = []
             state.error = None
+            # Dynamic budget scaling: B = 18 + 5N (Amendment D)
+            n_wos = max(1, len(state.published_wo_ids or state.worker_wo_ids))
+            dynamic_budget = 18 + 5 * n_wos
+            state.initial_turn_budget = dynamic_budget
+            if state.global_turn_budget < dynamic_budget:
+                state.global_turn_budget = dynamic_budget
+            self._sync_budget_file(state)
             self._transition(state, Phase.DISPATCHING)
             return AdvanceResult.TRANSITIONED
         issue_summary = "; ".join(
@@ -1310,6 +1416,14 @@ class LifecycleSupervisor:
                 continue
 
             if status == "FAILED":
+                retries = state.worker_retries.get(wo_id, 0)
+                if retries >= state.max_worker_retries:
+                    state.error = f"Work order {wo_id} exceeded worker retries ({retries}/{state.max_worker_retries})"
+                    state.exit_code = 3
+                    self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+                    self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                    return AdvanceResult.TRANSITIONED
+                state.worker_retries[wo_id] = retries + 1
                 if self._retry_worker(state, ws, wo_id, lambda n, a: f"Retry work order {wo_id} (attempt {n})"):
                     all_done = False
                 continue
@@ -1372,6 +1486,16 @@ class LifecycleSupervisor:
                 self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
                 and self._check_qa_verdict(wo_id, ws) == "NEEDS_CHANGES"
             ):
+                reworks = state.qa_reworks.get(wo_id, 0)
+                if reworks >= state.max_qa_reworks:
+                    state.error = f"Work order {wo_id} exceeded QA rework limit ({reworks}/{state.max_qa_reworks})"
+                    state.exit_code = 3
+                    self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+                    self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                    return AdvanceResult.TRANSITIONED
+
+                state.qa_reworks[wo_id] = reworks + 1
+
                 def _rework_prompt(n: int, agent: str) -> str:
                     feedback = self._get_qa_feedback(wo_id, ws)
                     head = f"Rework work order {wo_id} after QA feedback (attempt {n})"
@@ -2821,9 +2945,9 @@ class LifecycleSupervisor:
                     return AdvanceResult.BLOCKED
 
                 # Bounded retry for GitOps blockers (verification gate failures, scope, budget, etc.)
-                retries = state.retry_counts.get(wo_id, 0)
-                if retries < state.max_retries:
-                    state.retry_counts[wo_id] = retries + 1
+                if state.gitops_retries < state.max_gitops_retries:
+                    state.gitops_retries += 1
+                    state.retry_counts[wo_id] = state.gitops_retries
                     op_id = op.get("operation_id")
                     if op_id and op_id not in state.ignored_operation_ids:
                         state.ignored_operation_ids.append(str(op_id))
@@ -2832,15 +2956,16 @@ class LifecycleSupervisor:
                     state.gitops_feedback = err_msg
                     return self._advance_gitops(state)
 
-                state.error = f"GitOps turn blocked: {err_msg} — retries exhausted ({retries}/{state.max_retries})"
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.error = f"GitOps turn blocked: {err_msg} — retries exhausted ({state.gitops_retries}/{state.max_gitops_retries})"
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
 
             if status == "FAILED" or result_status == "failed":
                 wo_id = state.gitops_wo_id or "WO-GITOPS"
-                retries = state.retry_counts.get(wo_id, 0)
-                if retries < state.max_retries:
-                    state.retry_counts[wo_id] = retries + 1
+                if state.gitops_retries < state.max_gitops_retries:
+                    state.gitops_retries += 1
+                    state.retry_counts[wo_id] = state.gitops_retries
                     op_id = op.get("operation_id")
                     if op_id and op_id not in state.ignored_operation_ids:
                         state.ignored_operation_ids.append(str(op_id))
@@ -2848,9 +2973,10 @@ class LifecycleSupervisor:
                     state.error = None
                     state.gitops_feedback = str(op_result.get("error", op.get("error", "GitOps turn failed")))
                     return self._advance_gitops(state)
-                state.error = f"GitOps turn failed: {op_result.get('error', op.get('error', 'unknown'))}"
-                self._transition(state, Phase.FAILED)
-                return AdvanceResult.FAILED
+                state.error = f"GitOps turn failed: {op_result.get('error', op.get('error', 'unknown'))} — retries exhausted ({state.gitops_retries}/{state.max_gitops_retries})"
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
 
             # GitOps completed — if workspace has a git repository, perform governed release commit
             ws = Path(state.workspace)
@@ -4987,6 +5113,135 @@ class LifecycleSupervisor:
         if not state_dir.is_dir():
             return []
         return sorted(f.stem for f in state_dir.glob("*.yaml"))
+
+    # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
+
+    def resume_run_with_human_override(
+        self,
+        state: RunState,
+        reason: str,
+        reset_counters: list[str] | None = None,
+        new_budget: int | None = None,
+    ) -> AdvanceResult:
+        """Resume a halted run via explicit, logged, and bounded human override."""
+        if state.human_resumes_used >= state.max_human_resumes:
+            state.error = (
+                f"Maximum human resumes ({state.max_human_resumes}) exceeded. Run permanently failed."
+            )
+            state.exit_code = 1
+            self._transition(state, Phase.FAILED)
+            return AdvanceResult.FAILED
+
+        state.human_resumes_used += 1
+        prev_phase = state.phase.value
+
+        # Log human override explicitly
+        log_entry = {
+            "timestamp": _now(),
+            "resumes_count": state.human_resumes_used,
+            "reason": reason,
+            "reset_counters": list(reset_counters or []),
+            "previous_phase": prev_phase,
+        }
+        state.human_override_logs.append(log_entry)
+
+        # Reset requested named counters
+        if reset_counters:
+            for c in reset_counters:
+                if c == "gitops_retries":
+                    state.gitops_retries = 0
+                elif c == "qa_reworks":
+                    state.qa_reworks.clear()
+                elif c == "worker_retries":
+                    state.worker_retries.clear()
+                elif c == "global_turn_budget":
+                    state.global_turn_budget = new_budget or state.initial_turn_budget
+                    state.budget_exhausted = False
+                elif c == "all":
+                    state.gitops_retries = 0
+                    state.qa_reworks.clear()
+                    state.worker_retries.clear()
+                    state.global_turn_budget = new_budget or state.initial_turn_budget
+                    state.budget_exhausted = False
+
+        if state.global_turn_budget <= 0:
+            state.global_turn_budget = new_budget or state.initial_turn_budget
+            state.budget_exhausted = False
+
+        self._sync_budget_file(state)
+        state.error = None
+        target_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+        self._transition(state, target_phase)
+        return AdvanceResult.TRANSITIONED
+
+    def escalate_wo_to_recovery(self, state: RunState, wo_id: str, reason: str = "") -> None:
+        """Escalate a work order to Architect recovery and update blocked dependents."""
+        if wo_id not in state.recovery_attempts:
+            state.recovery_attempts[wo_id] = 1
+        state.recovery_wo_id = wo_id
+        state.repair_context = {"work_order_id": wo_id, "reason": reason}
+        self.evaluate_blocked_by_escalation(state)
+
+    def set_wo_dependencies(self, state: RunState, wo_id: str, deps: list[str]) -> None:
+        """Register explicit dependencies for a work order."""
+        state.wo_dependencies[wo_id] = list(deps)
+
+    def evaluate_blocked_by_escalation(self, state: RunState) -> None:
+        """Mark dependent work orders as BLOCKED_BY_ESCALATION if their upstream is in recovery."""
+        recovering_wos = set()
+        if state.recovery_wo_id:
+            recovering_wos.add(state.recovery_wo_id)
+        for wid, att in state.recovery_attempts.items():
+            if att > 0 and wid not in state.completed_wo_ids:
+                recovering_wos.add(wid)
+
+        for wo_id in state.worker_wo_ids:
+            deps = state.wo_dependencies.get(wo_id, [])
+            for d in deps:
+                if d in recovering_wos:
+                    state.blocked_by_escalation[wo_id] = d
+                    if wo_id in state.completed_wo_ids:
+                        state.completed_wo_ids.remove(wo_id)
+                    break
+            else:
+                if wo_id in state.blocked_by_escalation:
+                    upstream = state.blocked_by_escalation[wo_id]
+                    if upstream not in recovering_wos:
+                        state.blocked_by_escalation.pop(wo_id, None)
+
+    def resolve_escalation_with_amendment(self, state: RunState, wo_id: str) -> None:
+        """Resolve Architect recovery for a work order, updating contracts and unblocking dependents."""
+        if state.recovery_wo_id == wo_id:
+            state.recovery_wo_id = None
+        state.recovery_attempts[wo_id] = 0
+        state.worker_retries[wo_id] = 0
+        self.evaluate_blocked_by_escalation(state)
+
+    def get_exit_code(self, state: RunState, is_headless_abort: bool = False) -> int:
+        """Map current run state to standard StackMind exit code table."""
+        if is_headless_abort:
+            return 137
+        if state.phase == Phase.COMPLETE:
+            return 0
+        if state.phase == Phase.FAILED:
+            return 1
+        if state.phase in (Phase.WAITING_FOR_HUMAN, Phase.BLOCKED):
+            if state.budget_exhausted or state.global_turn_budget <= 0:
+                return 2
+            if state.gitops_retries >= state.max_gitops_retries:
+                return 3
+            for w, r in state.qa_reworks.items():
+                if r >= state.max_qa_reworks:
+                    return 3
+            for w, r in state.worker_retries.items():
+                if r >= state.max_worker_retries:
+                    return 3
+            if state.phase == Phase.AWAITING_APPROVAL or "plan" in str(state.error).lower():
+                return 4
+            return 2
+        if state.phase == Phase.AWAITING_APPROVAL:
+            return 4
+        return state.exit_code
 
 
 # ─── Release Commit Provenance ────────────────────────────────────────
