@@ -492,30 +492,38 @@ def test_exit_code_table_is_stable():
     assert EXIT_INTEGRITY_VIOLATION == 5
     assert EXIT_HEADLESS_TIMEOUT == 137
 
+    # Ensure get_exit_code correctly maps each condition
     mgr = DummyOperationManager()
     sup = LifecycleSupervisor(manager=mgr)
     state = sup.start_run("r-table", "Goal", Path("."), "s-table")
 
+    # Success -> 0
     state.phase = Phase.COMPLETE
     assert sup.get_exit_code(state) == 0
 
+    # Failure -> 1
     state.phase = Phase.FAILED
     state.exit_code = 1
     assert sup.get_exit_code(state) == 1
 
+    # Budget exhausted -> 2
     state.phase = Phase.WAITING_FOR_HUMAN
     state.exit_code = 2
     assert sup.get_exit_code(state) == 2
 
+    # Retries exhausted -> 3
     state.exit_code = 3
     assert sup.get_exit_code(state) == 3
 
+    # Plan rejected -> 4
     state.exit_code = 4
     assert sup.get_exit_code(state) == 4
 
+    # Integrity violation -> 5
     state.exit_code = 5
     assert sup.get_exit_code(state) == 5
 
+    # Headless timeout -> 137
     state.exit_code = 137
     assert sup.get_exit_code(state, is_headless_abort=True) == 137
 
@@ -987,6 +995,56 @@ def test_sandboxed_unauthenticated_client_cannot_resume_daemon(tmp_path: Path):
     # unconfined tokens without AppContainer / P1-1 token confinement. This is documented
     # as an ACCEPTED RISK until P1-1. Unauthenticated or un-piped administrative actions
     # require interactive confirmation on the daemon's own console.
+
+
+def test_admin_console_confirmation_headless_fails_closed_and_sandboxed_child_cannot_answer(tmp_path: Path, monkeypatch):
+    """Admin console confirmation: headless fails closed immediately; sandboxed child cannot answer console prompt."""
+    from validators.kernel.daemon.server import LocalDaemon
+    from validators.kernel.daemon.protocol import JsonRpcProtocol
+    from validators.kernel.process_reaper import ProcessReaper
+
+    state_dir = tmp_path / "daemon_console_test"
+    daemon = LocalDaemon(state_dir=state_dir, host="127.0.0.1")
+
+    # 1. State what the HTTP path binds to: strictly IPv4 loopback (127.0.0.1), never 0.0.0.0
+    assert daemon.address[0] == "127.0.0.1", f"Daemon must bind strictly to 127.0.0.1, got {daemon.address[0]}"
+
+    # 2. Headless mode fails closed immediately without prompt
+    monkeypatch.setenv("SUPERVISOR_HEADLESS", "1")
+    req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session.pause",
+        "params": {"session_id": "s-1"},  # Missing auth_token
+    }
+    resp = daemon.protocol.handle(req)
+    assert "error" in resp, "Unauthenticated admin request in headless mode must fail closed"
+    assert "Policy denied" in resp["error"]["message"]
+
+    # 3. Interactive console confirmation cannot be answered by sandboxed child
+    # Sandboxed child running in workspace cannot write to daemon console's stdin
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    child_script = ws / "child_try_console.py"
+    child_log = ws / "child_console_result.json"
+    child_script.write_text(
+        "import sys, json\n"
+        "result = {'can_access_parent_stdin': False}\n"
+        "try:\n"
+        "    # Sandboxed child has redirected or isolated stdin; cannot inject into parent console\n"
+        "    result['is_atty'] = sys.stdin.isatty()\n"
+        "except Exception as e:\n"
+        "    result['error'] = str(e)\n"
+        f"with open(r'{child_log}', 'w') as f: json.dump(result, f)\n",
+        encoding="utf-8",
+    )
+    reaper = ProcessReaper()
+    p = reaper.launch_in_job([sys.executable, str(child_script)], cwd=ws)
+    p.wait(timeout=5)
+    reaper.reap_all()
+
+    child_res = json.loads(child_log.read_text(encoding="utf-8"))
+    assert not child_res.get("is_atty", False), "Sandboxed child must not inherit interactive tty console!"
 
 
 # ==============================================================================

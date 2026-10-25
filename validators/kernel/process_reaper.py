@@ -108,7 +108,8 @@ class ProcessReaper:
             from ctypes import wintypes
 
             CREATE_SUSPENDED = 0x00000004
-            flags = kwargs.get("creationflags", 0) | CREATE_SUSPENDED
+            DETACHED_PROCESS = 0x00000008
+            flags = kwargs.get("creationflags", 0) | CREATE_SUSPENDED | DETACHED_PROCESS
             kwargs["creationflags"] = flags
             proc = subprocess.Popen(args, **kwargs)
             try:

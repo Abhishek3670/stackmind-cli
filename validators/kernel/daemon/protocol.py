@@ -82,12 +82,32 @@ class JsonRpcProtocol:
     def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
+    def confirm_on_console(self, prompt_msg: str) -> bool:
+        """Prompt operator on daemon's console for administrative confirmation.
+        
+        Headless behavior:
+        In headless mode (CI or non-interactive environment), interactive console confirmation
+        is strictly disabled and fails closed immediately, rejecting the unauthenticated admin call.
+        """
+        import os, sys
+        if os.environ.get("SUPERVISOR_HEADLESS", os.environ.get("CI", "0")).lower() in ("1", "true"):
+            return False
+        if not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+            return False
+        try:
+            ans = input(prompt_msg).strip().lower()
+            return ans in ("y", "yes")
+        except Exception:
+            return False
+
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
-        if method in self.ADMIN_METHODS and self.auth_token:
-            provided = params.get("auth_token")
+        if method in self.ADMIN_METHODS:
+            provided = params.get("auth_token") if self.auth_token else None
             import hmac
-            if not provided or not hmac.compare_digest(str(provided), self.auth_token):
-                raise PermissionError("Policy denied: Authentication required for administrative method")
+            authorized = bool(provided and self.auth_token and hmac.compare_digest(str(provided), self.auth_token))
+            if not authorized:
+                if not self.confirm_on_console(f"Confirm administrative method '{method}'? (y/N): "):
+                    raise PermissionError("Policy denied: Authentication required for administrative method (console confirmation denied or headless)")
 
         if method == "health.version":
             requested = params.get("protocol_version")
