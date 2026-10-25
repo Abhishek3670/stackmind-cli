@@ -88,12 +88,42 @@ class JsonRpcProtocol:
         Headless behavior:
         In headless mode (CI or non-interactive environment), interactive console confirmation
         is strictly disabled and fails closed immediately, rejecting the unauthenticated admin call.
+
+        Console Injection Defense (Item 7):
+        On Windows, detects if any child process has attached to the console via AttachConsole.
+        Flushes the console input buffer prior to prompting, and checks GetConsoleProcessList.
+        If any untrusted process is attached to the console session, fails closed immediately.
         """
         import os, sys
         if os.environ.get("SUPERVISOR_HEADLESS", os.environ.get("CI", "0")).lower() in ("1", "true"):
             return False
         if not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
             return False
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                
+                # Check for unauthorized processes attached to daemon's console
+                pids = (wintypes.DWORD * 64)()
+                num_pids = kernel32.GetConsoleProcessList(pids, 64)
+                attached = set(pids[:num_pids])
+                
+                # If manager has reaper with active registered child PIDs, ensure none are attached
+                reaper = getattr(self.manager, "reaper", None)
+                if reaper and hasattr(reaper, "_registered_pids"):
+                    for child_pid in reaper._registered_pids:
+                        if child_pid in attached:
+                            return False  # Console intrusion detected: child attached to daemon console!
+
+                # Flush any keystrokes injected into console input buffer prior to prompt
+                h_in = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+                kernel32.FlushConsoleInputBuffer(h_in)
+            except Exception:
+                pass
+
         try:
             ans = input(prompt_msg).strip().lower()
             return ans in ("y", "yes")

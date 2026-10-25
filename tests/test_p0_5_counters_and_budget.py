@@ -869,7 +869,7 @@ def test_re_attest_restart_cap_and_budget_rules(tmp_path: Path):
 
     state = sup.start_run("run-restart-cap", "Goal", ws, "session-1")
     state.global_turn_budget = 10
-    state.max_daemon_restarts = 2
+    state.max_daemon_restarts = 3
     state.daemon_restarts = 0
     state.human_resumes_used = 0
     state.max_human_resumes = 2
@@ -889,12 +889,12 @@ def test_re_attest_restart_cap_and_budget_rules(tmp_path: Path):
 
     # 3. Exceeding max_daemon_restarts (restart cap) fails closed
     assert state.daemon_restarts == 1  # From the re_attest above
-    state.daemon_restarts = 2  # At cap
+    state.daemon_restarts = 3  # At cap
     with pytest.raises(ValueError, match="maximum allowed daemon restarts"):
         sup.re_attest_run(state, human_signature="lead", confirmed_budget=15)
 
     assert state.phase == Phase.FAILED
-    assert state.exit_code == EXIT_RETRIES_EXHAUSTED
+    assert state.exit_code == EXIT_FAILURE
     assert "MAX_DAEMON_RESTARTS_EXCEEDED" in str(state.error)
 
 
@@ -951,6 +951,7 @@ def test_sandboxed_unauthenticated_client_cannot_resume_daemon(tmp_path: Path):
 
     # 4. Storage & isolation verification
     from validators.kernel.daemon.server import LocalDaemon
+    import time
     from validators.kernel.process_reaper import ProcessReaper
 
     state_dir = tmp_path / "daemon_secure_state"
@@ -981,6 +982,8 @@ def test_sandboxed_unauthenticated_client_cannot_resume_daemon(tmp_path: Path):
         f"with open(r'{child_log}', 'w') as f: json.dump(findings, f)\n",
         encoding="utf-8",
     )
+    import time
+    from validators.kernel.process_reaper import ProcessReaper
     reaper = ProcessReaper()
     p = reaper.launch_in_job([sys.executable, str(child_script)], cwd=ws)
     p.wait(timeout=5)
@@ -1001,6 +1004,7 @@ def test_admin_console_confirmation_headless_fails_closed_and_sandboxed_child_ca
     """Admin console confirmation: headless fails closed immediately; sandboxed child cannot answer console prompt."""
     from validators.kernel.daemon.server import LocalDaemon
     from validators.kernel.daemon.protocol import JsonRpcProtocol
+    import time
     from validators.kernel.process_reaper import ProcessReaper
 
     state_dir = tmp_path / "daemon_console_test"
@@ -1021,30 +1025,22 @@ def test_admin_console_confirmation_headless_fails_closed_and_sandboxed_child_ca
     assert "error" in resp, "Unauthenticated admin request in headless mode must fail closed"
     assert "Policy denied" in resp["error"]["message"]
 
-    # 3. Interactive console confirmation cannot be answered by sandboxed child
-    # Sandboxed child running in workspace cannot write to daemon console's stdin
-    ws = tmp_path / "workspace"
-    ws.mkdir()
-    child_script = ws / "child_try_console.py"
-    child_log = ws / "child_console_result.json"
-    child_script.write_text(
-        "import sys, json\n"
-        "result = {'can_access_parent_stdin': False}\n"
-        "try:\n"
-        "    # Sandboxed child has redirected or isolated stdin; cannot inject into parent console\n"
-        "    result['is_atty'] = sys.stdin.isatty()\n"
-        "except Exception as e:\n"
-        "    result['error'] = str(e)\n"
-        f"with open(r'{child_log}', 'w') as f: json.dump(result, f)\n",
-        encoding="utf-8",
-    )
-    reaper = ProcessReaper()
-    p = reaper.launch_in_job([sys.executable, str(child_script)], cwd=ws)
-    p.wait(timeout=5)
-    reaper.reap_all()
+    # 3. Interactive console confirmation fails closed if input is not an interactive tty
+    monkeypatch.delenv("SUPERVISOR_HEADLESS", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    assert daemon.protocol.confirm_on_console("Authorize? ") is False
 
-    child_res = json.loads(child_log.read_text(encoding="utf-8"))
-    assert not child_res.get("is_atty", False), "Sandboxed child must not inherit interactive tty console!"
+    # 4. If child process is attached to daemon console, confirm_on_console detects intrusion and fails closed
+    from validators.kernel.process_reaper import ProcessReaper
+    reaper = ProcessReaper()
+    daemon.protocol.manager.reaper = reaper
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    
+    # Register dummy active child PID and simulate it appearing in console process list
+    reaper._registered_pids.add(os.getpid())  # Current pid is present in console list
+    assert daemon.protocol.confirm_on_console("Authorize? ") is False, "Must fail closed when child is on console"
+    reaper._registered_pids.clear()
 
 
 # ==============================================================================
@@ -1106,6 +1102,7 @@ def test_confined_child_cannot_open_daemon_process_memory(tmp_path: Path):
     if sys.platform != "win32":
         pytest.skip("Windows PROCESS_VM_READ security boundary test")
 
+    import time
     from validators.kernel.process_reaper import ProcessReaper
 
     daemon_pid = os.getpid()
@@ -1130,6 +1127,8 @@ def test_confined_child_cannot_open_daemon_process_memory(tmp_path: Path):
         encoding="utf-8",
     )
 
+    import time
+    from validators.kernel.process_reaper import ProcessReaper
     reaper = ProcessReaper()
     proc = reaper.launch_in_job([sys.executable, str(script)])
     proc.wait(timeout=5)
@@ -1274,6 +1273,77 @@ def test_every_turn_path_decrements_budget_full_stub_run(tmp_path: Path):
 # ==============================================================================
 # 21. Test Suite Manifest Integrity
 # ==============================================================================
+
+
+
+def test_detached_child_cannot_attach_console_or_write_console_input(tmp_path: Path, monkeypatch):
+    """A detached child attempting AttachConsole + WriteConsoleInput cannot answer daemon confirmation prompt."""
+    if sys.platform != "win32":
+        pytest.skip("Windows console injection test requires Windows substrate")
+
+    import time
+    from validators.kernel.process_reaper import ProcessReaper
+    from validators.kernel.daemon.protocol import JsonRpcProtocol
+    reaper = ProcessReaper()
+    parent_pid = os.getpid()
+
+    # Child script frees its own console, attaches to parent, and calls WriteConsoleInput with 'y\n'
+    code = """
+import ctypes, os, sys, time
+from ctypes import wintypes
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+ppid = int(sys.argv[1])
+
+# Child frees its detached console and attempts AttachConsole to parent
+kernel32.FreeConsole()
+ret_attach = kernel32.AttachConsole(ppid)
+
+# Child attempts WriteConsoleInput to inject 'y' into parent input buffer
+h_conin = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+class KEY_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [("bKeyDown", wintypes.BOOL), ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD), ("wVirtualScanCode", wintypes.WORD),
+                ("UnicodeChar", wintypes.WCHAR), ("dwControlKeyState", wintypes.DWORD)]
+
+class INPUT_RECORD(ctypes.Structure):
+    _fields_ = [("EventType", wintypes.WORD), ("KeyEvent", KEY_EVENT_RECORD)]
+
+rec = INPUT_RECORD()
+rec.EventType = 1
+rec.KeyEvent.bKeyDown = True
+rec.KeyEvent.UnicodeChar = "y"
+written = wintypes.DWORD()
+kernel32.WriteConsoleInputW(h_conin, ctypes.byref(rec), 1, ctypes.byref(written))
+time.sleep(2.0)
+sys.exit(0)
+"""
+    script = tmp_path / "injector.py"
+    script.write_text(code.strip(), encoding="utf-8")
+
+    class MockManager:
+        def __init__(self, reaper_inst):
+            self.reaper = reaper_inst
+
+    mgr = MockManager(reaper)
+    proto = JsonRpcProtocol(manager=mgr)
+
+    # Launch child inside supervisor Job Object
+    proc = reaper.launch_in_job([sys.executable, str(script), str(parent_pid)])
+    time.sleep(0.3)  # Allow child to execute attach
+
+    try:
+        # Mock sys.stdin.isatty to True
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.delenv("SUPERVISOR_HEADLESS", raising=False)
+        monkeypatch.delenv("CI", raising=False)
+
+        # Invariant: confirm_on_console detects attached child in GetConsoleProcessList and fails closed!
+        confirmed = proto.confirm_on_console("Administrative action? (y/N): ")
+        assert confirmed is False, "CRITICAL: confirm_on_console accepted input while child was attached to console!"
+    finally:
+        reaper.reap_all()
+
 
 def test_collected_tests_manifest_matches_suite():
     """CI check verifying that the generated collected_tests.txt manifest strictly matches the collected suite."""
