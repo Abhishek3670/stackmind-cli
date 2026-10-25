@@ -113,6 +113,7 @@ class TurnSnapshotManager:
             "GIT_CONFIG_GLOBAL": self.null_dev,
             "GIT_CONFIG_SYSTEM": self.null_dev,
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG": self.null_dev,
             "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_AUTHOR_NAME": "StackMind Supervisor",
             "GIT_AUTHOR_EMAIL": "supervisor@stackmind.local",
@@ -155,7 +156,7 @@ class TurnSnapshotManager:
                     ],
                     check=True,
                     capture_output=True,
-                    env=self.base_env,
+                    env={k: v for k, v in self.base_env.items() if k != "GIT_CONFIG"},
                 )
 
         self.baseline_store_hash = self._compute_store_metadata_hash()
@@ -374,35 +375,38 @@ class TurnSnapshotManager:
                 res = self._git_run(["write-tree"], env=snap_env)
                 tree_sha = res.stdout.strip()
             else:
-                batch_size = 50
-                cacheinfo_args: list[str] = []
+                # Hash all files in one invocation via --stdin-paths
+                stdin_paths = "\n".join(str(p) for p in files_to_snap) + "\n"
+                hash_res = self._git_run(
+                    ["hash-object", "-w", "--no-filters", "--stdin-paths"],
+                    input=stdin_paths,
+                    env=snap_env,
+                )
+                shas = [s.strip() for s in hash_res.stdout.splitlines() if s.strip()]
+                if len(shas) != len(files_to_snap):
+                    raise TurnSnapshotError(
+                        f"hash-object returned {len(shas)} SHAs for {len(files_to_snap)} files."
+                    )
 
-                for i in range(0, len(files_to_snap), batch_size):
-                    chunk = files_to_snap[i : i + batch_size]
-                    hash_cmd = [
-                        "hash-object", "-w", "--no-filters",
-                        *[str(p) for p in chunk],
-                    ]
-                    hash_res = self._git_run(hash_cmd, env=snap_env)
-                    shas = [s.strip() for s in hash_res.stdout.splitlines() if s.strip()]
-                    if len(shas) != len(chunk):
-                        raise TurnSnapshotError(
-                            f"hash-object returned {len(shas)} SHAs for {len(chunk)} files."
-                        )
+                index_lines: list[str] = []
+                for p, sha in zip(files_to_snap, shas):
+                    rel_path = p.relative_to(self.workspace).as_posix()
+                    mode = "100644"
+                    if sys.platform != "win32":
+                        try:
+                            if os.stat(p).st_mode & 0o111:
+                                mode = "100755"
+                        except OSError:
+                            pass
+                    index_lines.append(f"{mode} {sha} 0\t{rel_path}")
 
-                    for p, sha in zip(chunk, shas):
-                        rel_path = p.relative_to(self.workspace).as_posix()
-                        mode = "100644"
-                        if sys.platform != "win32":
-                            try:
-                                if os.stat(p).st_mode & 0o111:
-                                    mode = "100755"
-                            except OSError:
-                                pass
-                        cacheinfo_args.extend(["--cacheinfo", f"{mode},{sha},{rel_path}"])
-
-                update_cmd = ["update-index", "--add", *cacheinfo_args]
-                self._git_run(update_cmd, env=snap_env)
+                # Populate index in one invocation via --index-info -z
+                index_input = "\x00".join(index_lines) + "\x00"
+                self._git_run(
+                    ["update-index", "-z", "--index-info"],
+                    input=index_input,
+                    env=snap_env,
+                )
 
                 tree_res = self._git_run(["write-tree"], env=snap_env)
                 tree_sha = tree_res.stdout.strip()

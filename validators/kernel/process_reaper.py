@@ -296,19 +296,48 @@ class ServiceJobManager:
 
     Ensures worker turn-level cleanup (`reaper.reap_all()`) does NOT terminate
     cross-turn persistent services (e.g. dev servers, local databases).
-    Services are terminated only on explicit supervisor shutdown.
+
+    Design Guarantees:
+    - Workspace-writing cross-turn services are strictly prohibited.
+      Services must write only to stdout/stderr pipes, memory, or external runtime dirs.
+    - Persistent services are suspended (NtSuspendProcess) during post-turn diff gate
+      evaluation and workspace restore to eliminate race conditions and avoid blame leakage.
+    - Resumed (NtResumeProcess) after gate evaluation passes.
     """
 
     def __init__(self) -> None:
         self.service_reaper = ProcessReaper()
+        self._service_procs: list[subprocess.Popen] = []
 
     def launch_service(self, args: Sequence[str] | str, **kwargs: Any) -> subprocess.Popen:
         """Launch a persistent service inside the dedicated service Job Object."""
-        return self.service_reaper.launch_in_job(args, **kwargs)
+        proc = self.service_reaper.launch_in_job(args, **kwargs)
+        self._service_procs.append(proc)
+        return proc
+
+    def suspend_all(self) -> None:
+        """Suspend all persistent services during diff evaluation and workspace restore."""
+        if sys.platform == "win32":
+            import ctypes
+            ntdll = ctypes.WinDLL("ntdll")
+            for proc in self._service_procs:
+                if proc.poll() is None and hasattr(proc, "_handle") and proc._handle:
+                    ntdll.NtSuspendProcess(int(proc._handle))
+
+    def resume_all(self) -> None:
+        """Resume all persistent services after gate evaluation and restore complete."""
+        if sys.platform == "win32":
+            import ctypes
+            ntdll = ctypes.WinDLL("ntdll")
+            for proc in self._service_procs:
+                if proc.poll() is None and hasattr(proc, "_handle") and proc._handle:
+                    ntdll.NtResumeProcess(int(proc._handle))
 
     def shutdown_services(self) -> list[int]:
         """Terminate all persistent services on supervisor shutdown."""
-        return self.service_reaper.reap_all()
+        reaped = self.service_reaper.reap_all()
+        self._service_procs.clear()
+        return reaped
 
 
 def get_global_reaper() -> ProcessReaper:
