@@ -2,21 +2,21 @@
 
 Drives the complete multi-agent lifecycle from CEO product request through
 GitOps release commit.  This is *deterministic orchestration logic*, NOT an
-autonomous LLM agent â€” it reads disk/session state after each operation
+autonomous LLM agent — it reads disk/session state after each operation
 completes and dispatches the next valid action.
 
 State Machine
-â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-INIT â†’ PLANNING â†’ AWAITING_APPROVAL â†’ AUTHORING â†’ DISPATCHING
-â†’ EXECUTING â†’ INTEGRATION_REVIEW â†’ PRODUCT_READY â†’ GITOPS â†’ COMPLETE
+─────────────
+INIT → PLANNING → AWAITING_APPROVAL → AUTHORING → DISPATCHING
+→ EXECUTING → INTEGRATION_REVIEW → PRODUCT_READY → GITOPS → COMPLETE
 
 Constraints honoured:
- â€¢ Agents run through existing governed Harness/AgentRunner
- â€¢ File-based delegation via inbox/work-order/state (IDE-01)
- â€¢ All existing gates preserved (D024, Contract, Security, Staged-diff)
- â€¢ Human approval gate at plan review
- â€¢ Resumable from any state on restart
- â€¢ One product request = one identifiable lifecycle run
+ • Agents run through existing governed Harness/AgentRunner
+ • File-based delegation via inbox/work-order/state (IDE-01)
+ • All existing gates preserved (D024, Contract, Security, Staged-diff)
+ • Human approval gate at plan review
+ • Resumable from any state on restart
+ • One product request = one identifiable lifecycle run
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def _extract_op_error(op: Any) -> str | None:
     return None
 
 
-# â”€â”€â”€ Lifecycle phases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Lifecycle phases ─────────────────────────────────────────────────
 
 class Phase(StrEnum):
     """Deterministic lifecycle phases for a product delivery run."""
@@ -109,7 +109,7 @@ class BudgetExhaustedError(Exception):
     pass
 
 
-# â”€â”€â”€ Standard StackMind Unified Exit Codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Standard StackMind Unified Exit Codes ────────────────────────────
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_BUDGET_EXHAUSTED = 2
@@ -119,15 +119,18 @@ EXIT_INTEGRITY_VIOLATION = 5
 EXIT_HEADLESS_TIMEOUT = 137
 
 DEFAULT_TIMEOUTS: dict[Any, float] = {
-    Phase.PLANNING: 600.0,
+    Phase.PLANNING: 300.0,
     Phase.AUTHORING: 600.0,
-    Phase.EXECUTING: 900.0,
-    Phase.INTEGRATION_REVIEW: 300.0,
+    Phase.AUTHORING_READINESS_GATE: 60.0,
+    Phase.DISPATCHING: 60.0,
+    Phase.EXECUTING: 600.0,
+    Phase.INTEGRATION_REVIEW: 600.0,
     Phase.ARCHITECT_REPAIR: 600.0,
-    Phase.ARCHITECT_RECOVERY_DECISION: 600.0,
+    Phase.ARCHITECT_RECOVERY_DECISION: 300.0,
     Phase.GITOPS: 300.0,
     "gate": 60.0,
-    "ci_wait_timeout": 1800.0,
+    "ci_wait_timeout": 60.0,
+    "ci_run_timeout": 1800.0,
 }
 
 
@@ -139,7 +142,7 @@ from .state_store import (
 )
 
 
-# â”€â”€â”€ Run state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Run state ────────────────────────────────────────────────────────
 
 @dataclass
 class RunState:
@@ -178,7 +181,7 @@ class RunState:
     dependency_escalation_op_id: str | None = None
     dependency_escalation_wo_id: str | None = None
     dependency_escalation_retries: dict[str, int] = field(default_factory=dict)
-    # â”€â”€ Authoring readiness / architect recovery (fail-closed lifecycle) â”€â”€
+    # ── Authoring readiness / architect recovery (fail-closed lifecycle) ──
     # Explicit operator-approved bootstrap mode: the only condition under which
     # deterministic child-WO synthesis may run, and never after an Architect
     # authoring failure.
@@ -192,7 +195,7 @@ class RunState:
     readiness_issues: list[dict[str, Any]] = field(default_factory=list)
     architect_repair_operation_id: str | None = None
     repair_context: dict[str, Any] = field(default_factory=dict)
-    # Per-WO durable worker-blocker evidence packets (failure_code, observed filesâ€¦)
+    # Per-WO durable worker-blocker evidence packets (failure_code, observed files…)
     worker_blockers: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_decision_operation_id: str | None = None
     recovery_wo_id: str | None = None
@@ -202,12 +205,12 @@ class RunState:
     milestone_exemptions: list[str] = field(default_factory=list)
     contract_revisions: dict[str, int] = field(default_factory=dict)
     integration_rework_rounds: int = 0
-    # QA defect routing: QA work order â†’ developer work order IDs whose
+    # QA defect routing: QA work order → developer work order IDs whose
     # rework must re-complete before the QA work order may be re-dispatched.
     qa_rework_targets: dict[str, list[str]] = field(default_factory=dict)
     execution_profile: str = "medium"
     gitops_feedback: str | None = None
-    # â”€â”€ P0-5 Counters and Global Turn Budget â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── P0-5 Counters and Global Turn Budget ─────────────────────────────
     worker_retries: dict[str, int] = field(default_factory=dict)
     qa_reworks: dict[str, int] = field(default_factory=dict)
     gitops_retries: int = 0
@@ -229,6 +232,8 @@ class RunState:
     daemon_restarts: int = 0
     max_daemon_restarts: int = 2
     executing_wo_id: str | None = None
+    planning_retries: int = 0
+    max_planning_retries: int = 2
     # In-memory only monotonic deadlines for state timeouts (never persisted to disk)
     turn_deadline: float | None = None
     turn_started_at: float | None = None
@@ -313,6 +318,8 @@ class RunState:
             "daemon_restarts": self.daemon_restarts,
             "max_daemon_restarts": self.max_daemon_restarts,
             "executing_wo_id": self.executing_wo_id,
+            "planning_retries": self.planning_retries,
+            "max_planning_retries": self.max_planning_retries,
         }
 
     @classmethod
@@ -394,13 +401,15 @@ class RunState:
             daemon_restarts=int(data.get("daemon_restarts", 0)),
             max_daemon_restarts=int(data.get("max_daemon_restarts", 2)),
             executing_wo_id=data.get("executing_wo_id"),
+            planning_retries=int(data.get("planning_retries", 0)),
+            max_planning_retries=int(data.get("max_planning_retries", 2)),
         )
 
 
 from validators.clock import now as _now
 
 
-# â”€â”€â”€ Supervisor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Supervisor ───────────────────────────────────────────────────────
 
 _OPERATION_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
 
@@ -420,7 +429,7 @@ GOVERNANCE_FAILURE_CODES = {
 }
 
 # Failure classes for which retrying the worker with an unchanged contract is
-# permissible â€” exclusively transient execution problems, never scope/budget/
+# permissible — exclusively transient execution problems, never scope/budget/
 # schema governance failures.
 TRANSIENT_RETRYABLE_CODES = {
     "OUTCOME_NOT_VERIFIED",
@@ -524,14 +533,30 @@ class LifecycleSupervisor:
         """Retrieve the configured timeout for a given phase."""
         if phase in self.timeouts:
             return float(self.timeouts[phase])
-        key = phase.value if isinstance(phase, Phase) else str(phase)
-        env_key = f"SUPERVISOR_TIMEOUT_{key.upper()}"
-        if env_key in os.environ:
-            try:
-                return float(os.environ[env_key])
-            except ValueError:
-                pass
-        return float(self.timeouts.get(phase, 600.0))
+        if isinstance(phase, Phase):
+            if phase.value in self.timeouts:
+                return float(self.timeouts[phase.value])
+            if phase.name.lower() in self.timeouts:
+                return float(self.timeouts[phase.name.lower()])
+            env_key = f"SUPERVISOR_TIMEOUT_{phase.name.upper()}"
+            if env_key in os.environ:
+                try:
+                    return float(os.environ[env_key])
+                except ValueError:
+                    pass
+        elif isinstance(phase, str):
+            for k, v in self.timeouts.items():
+                if isinstance(k, Phase) and (k.value == phase or k.name.lower() == phase.lower()):
+                    return float(v)
+                if isinstance(k, str) and k.lower() == phase.lower():
+                    return float(v)
+            env_key = f"SUPERVISOR_TIMEOUT_{phase.upper()}"
+            if env_key in os.environ:
+                try:
+                    return float(os.environ[env_key])
+                except ValueError:
+                    pass
+        return float(DEFAULT_TIMEOUTS.get(phase, 600.0))
 
     def handle_rejection_without_reworkable(
         self,
@@ -551,7 +576,15 @@ class LifecycleSupervisor:
             "diagnostics": dict(diagnostics or {}),
             "timestamp": _now(),
         }
-        state.recovery_wo_id = "SYSTEM_UNIDENTIFIABLE"
+        wo_id = "SYSTEM_UNIDENTIFIABLE"
+        state.recovery_wo_id = wo_id
+        attempts = state.recovery_attempts.get(wo_id, 0) + 1
+        state.recovery_attempts[wo_id] = attempts
+        if attempts >= state.max_retries:
+            state.error = f"MAX_RECOVERY_ATTEMPTS_EXHAUSTED: Unidentifiable rejection cap reached ({attempts}/{state.max_retries})"
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
         self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
         return AdvanceResult.TRANSITIONED
 
@@ -626,7 +659,7 @@ class LifecycleSupervisor:
             return AdvanceResult.WAITING_FOR_HUMAN
 
     def _handle_turn_timeout(self, state: RunState) -> AdvanceResult:
-        """Supervisor monotonic deadline expired: terminate process tree, decrement budget, consume counter, and transition."""
+        """Supervisor monotonic deadline expired: terminate process tree, consume counter, and transition."""
         if self.reaper is not None:
             try:
                 self.reaper.reap_all()
@@ -674,15 +707,49 @@ class LifecycleSupervisor:
                 state.error = f"GITOPS_TIMEOUT: Release timed out after {timeout_val:.1f}s (retry {state.gitops_retries}/{state.max_gitops_retries})"
             return AdvanceResult.TRANSITIONED
 
-        elif timeout_phase in (Phase.ARCHITECT_REPAIR, Phase.ARCHITECT_RECOVERY_DECISION, Phase.PLANNING, Phase.AUTHORING):
+        elif timeout_phase == Phase.PLANNING:
+            state.planning_retries += 1
+            if state.planning_retries >= state.max_planning_retries:
+                state.error = f"MAX_PLANNING_RETRIES_EXHAUSTED: Planning turn timed out after {timeout_val:.1f}s"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"PLANNING_TIMEOUT: Planning timed out after {timeout_val:.1f}s (retry {state.planning_retries}/{state.max_planning_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase in (Phase.AUTHORING, Phase.ARCHITECT_REPAIR):
             state.authoring_repair_attempts += 1
             if state.authoring_repair_attempts >= state.max_authoring_repairs:
-                state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Architecture state {timeout_phase.value} timed out after {timeout_val:.1f}s"
+                state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Authoring state {timeout_phase.value} timed out after {timeout_val:.1f}s"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
                 return AdvanceResult.WAITING_FOR_HUMAN
             else:
                 state.error = f"ARCHITECTURE_TIMEOUT: {timeout_phase.value} timed out after {timeout_val:.1f}s"
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase == Phase.ARCHITECT_RECOVERY_DECISION:
+            wo_id = str(state.recovery_wo_id or "SYSTEM_UNIDENTIFIABLE")
+            attempts = state.recovery_attempts.get(wo_id, 0) + 1
+            state.recovery_attempts[wo_id] = attempts
+            if attempts >= state.max_retries:
+                state.error = f"MAX_RECOVERY_ATTEMPTS_EXHAUSTED: Recovery decision for {wo_id} timed out after {timeout_val:.1f}s"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"RECOVERY_TIMEOUT: Recovery timed out after {timeout_val:.1f}s (attempt {attempts}/{state.max_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase == Phase.AUTHORING_READINESS_GATE:
+            state.error = f"GATE_TIMEOUT: Authoring readiness gate timed out after {timeout_val:.1f}s"
+            self._transition(state, Phase.ARCHITECT_REPAIR)
+            return AdvanceResult.TRANSITIONED
+
+        elif timeout_phase == Phase.DISPATCHING:
+            state.error = f"DISPATCH_TIMEOUT: Dispatching timed out after {timeout_val:.1f}s"
+            self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
             return AdvanceResult.TRANSITIONED
 
         else:
@@ -691,8 +758,8 @@ class LifecycleSupervisor:
             self._transition(state, Phase.WAITING_FOR_HUMAN)
             return AdvanceResult.WAITING_FOR_HUMAN
 
-    def _handle_ci_timeout(self, state: RunState) -> AdvanceResult:
-        """Headless CI run abort on total wall-clock timeout: write crash bundle and rescue ref."""
+    def _handle_ci_timeout(self, state: RunState, reason: str | None = None) -> AdvanceResult:
+        """Headless CI run abort on timeout: write crash bundle and rescue ref, terminate FAILED (137)."""
         if self.reaper is not None:
             try:
                 self.reaper.reap_all()
@@ -704,11 +771,31 @@ class LifecycleSupervisor:
         bundle_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
         bundle_path = bundle_dir / f"crash_bundle_{state.run_id}_{ts}.json"
+        
+        # Checkpoint hash
+        ckpt_hash = None
+        if hasattr(self, "state_manager") and self.state_manager is not None:
+            ckpt_hash = getattr(self.state_manager, "latest_checkpoint_hash", None)
+            if not ckpt_hash and hasattr(self.state_manager, "_in_memory_chain_hashes"):
+                ckpt_hash = self.state_manager._in_memory_chain_hashes.get(state.run_id)
+
+        err_msg = reason or f"HEADLESS_CI_TIMEOUT: Timeout exceeded {self.ci_wait_timeout}s."
         bundle_data = {
             "run_id": state.run_id,
             "phase": state.phase.value,
-            "error": f"HEADLESS_CI_TIMEOUT: Total wall-clock time exceeded {self.ci_wait_timeout}s.",
+            "error": err_msg,
             "exit_code": EXIT_HEADLESS_TIMEOUT,  # 137
+            "budget": state.global_turn_budget,
+            "counters": {
+                "worker_retries": dict(state.worker_retries),
+                "qa_reworks": dict(state.qa_reworks),
+                "gitops_retries": state.gitops_retries,
+                "planning_retries": state.planning_retries,
+                "authoring_repair_attempts": state.authoring_repair_attempts,
+                "daemon_restarts": state.daemon_restarts,
+                "human_resumes_used": state.human_resumes_used,
+            },
+            "checkpoint_hash": ckpt_hash or "none",
             "state_snapshot": state.to_dict(),
             "transitions": list(state.transitions),
             "timestamp": _now(),
@@ -787,7 +874,7 @@ class LifecycleSupervisor:
         except Exception:
             pass
 
-    # â”€â”€ Lifecycle entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Lifecycle entry point ─────────────────────────────────────────
 
     def start_run(
         self,
@@ -851,7 +938,7 @@ class LifecycleSupervisor:
         self._transition(state, Phase.PLANNING)
         return state
 
-    # â”€â”€ Core advance loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Core advance loop ─────────────────────────────────────────────
 
     def advance(self, state: RunState) -> AdvanceResult:
         """Evaluate the current phase and advance to the next valid state.
@@ -1076,10 +1163,10 @@ class LifecycleSupervisor:
         state.error = f"Exceeded max advance steps ({max_steps})"
         return AdvanceResult.BLOCKED
 
-    # â”€â”€ Phase handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Phase handlers ────────────────────────────────────────────────
 
     def _advance_init(self, state: RunState) -> AdvanceResult:
-        """INIT â†’ PLANNING: synthesise bootstrap WO and dispatch Architecture."""
+        """INIT → PLANNING: synthesise bootstrap WO and dispatch Architecture."""
         self._transition(state, Phase.PLANNING)
         return self._advance_planning(state)
 
@@ -1105,7 +1192,7 @@ class LifecycleSupervisor:
                 return self._advance_planning(state)
             op = self._get_operation(state.planning_operation_id)
             if op is None:
-                # Operation record lost â€” re-dispatch
+                # Operation record lost — re-dispatch
                 state.planning_operation_id = None
                 return self._advance_planning(state)
             status = str(op.get("status", "")).upper()
@@ -1116,7 +1203,7 @@ class LifecycleSupervisor:
                 state.error = f"Planning turn failed ({status.lower()}): {err_detail}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED
-            # Planning completed â€” check if a plan was proposed for this turn
+            # Planning completed — check if a plan was proposed for this turn
             plans = self.manager.list_plans(state.session_id)
             matching_plan = None
             if state.planning_operation_id:
@@ -1140,7 +1227,7 @@ class LifecycleSupervisor:
                 if plan_state == "APPROVED":
                     self._transition(state, Phase.AUTHORING)
                     return AdvanceResult.TRANSITIONED
-            # No plan proposed but turn completed â€” this is unexpected
+            # No plan proposed but turn completed — this is unexpected
             state.error = "Planning turn completed without proposing a plan"
             self._transition(state, Phase.FAILED)
             return AdvanceResult.FAILED
@@ -1240,7 +1327,7 @@ class LifecycleSupervisor:
                     reason=f"Authoring operation failed: {err_detail}",
                 )
 
-            # Authoring completed â€” discover authored artifacts from disk only.
+            # Authoring completed — discover authored artifacts from disk only.
             self._discover_worker_wos(state)
             if not state.worker_wo_ids:
                 # Deterministic synthesis is permitted ONLY in explicit bootstrap
@@ -1333,10 +1420,10 @@ class LifecycleSupervisor:
             "(expected_files and max_files_touched) in the work order and set the contract budget "
             "max_files_touched to cover it.\n"
             "4b. Populate `acceptance_criteria` in each Work Order with machine-checkable statements "
-            "(e.g. \"average([]) returns 0\", \"letter_grade(95) returns 'A'\") â€” QA verifies the "
+            "(e.g. \"average([]) returns 0\", \"letter_grade(95) returns 'A'\") — QA verifies the "
             "delivery against them, so keep them objective and testable.\n"
             "5. QA/verification Work Orders (assigned to gemma) MUST declare an executable code deliverable "
-            "under tests/ â€” the test suite the QA worker will author and execute end-to-end â€” with tasks "
+            "under tests/ — the test suite the QA worker will author and execute end-to-end — with tasks "
             "ordered author-suite, execute-suite, record-verdict. Never declare a QA deliverable as a bare "
             "sign-off document, and plan a companion test (e.g. tests/test_<stem>.py) for every code deliverable. "
             "Tests must use standard Python and pytest (never require external browser automation like playwright or selenium unless explicitly scaffolded).\n"
@@ -1467,7 +1554,7 @@ class LifecycleSupervisor:
                 state.architect_repair_operation_id = new_op.get("operation_id")
                 return AdvanceResult.WAITING_FOR_OPERATION
 
-            # Repair turn completed â€” verify action-specific expectations.
+            # Repair turn completed — verify action-specific expectations.
             post_check_error = self._verify_repair_outcome(state, ws, action, wo_id)
             if post_check_error:
                 state.authoring_repair_attempts += 1
@@ -1519,7 +1606,7 @@ class LifecycleSupervisor:
                 state.architect_repair_operation_id = new_op.get("operation_id")
                 return AdvanceResult.WAITING_FOR_OPERATION
 
-            # Repair succeeded â€” publish the revision and route by repair source.
+            # Repair succeeded — publish the revision and route by repair source.
             state.published_wo_ids = sorted(
                 w for w in state.worker_wo_ids if w not in state.superseded_wo_ids
             )
@@ -1552,7 +1639,7 @@ class LifecycleSupervisor:
             self._transition(state, Phase.DISPATCHING)
             return AdvanceResult.TRANSITIONED
 
-        # Repair operation lost (crash/resume) â€” re-dispatch from stored evidence.
+        # Repair operation lost (crash/resume) — re-dispatch from stored evidence.
         ws = Path(state.workspace)
         new_op = self._dispatch_repair_turn(state, ws)
         if new_op is None:
@@ -1602,7 +1689,7 @@ class LifecycleSupervisor:
                     return advance if advance is not None else AdvanceResult.WAITING_FOR_OPERATION
                 decision_error = apply_error
 
-            # Invalid/failed decision â€” bounded re-dispatch with corrective feedback.
+            # Invalid/failed decision — bounded re-dispatch with corrective feedback.
             attempts = state.recovery_attempts.get(str(wo_id), 0)
             if attempts >= state.max_retries:
                 state.error = (
@@ -1624,7 +1711,7 @@ class LifecycleSupervisor:
             state.recovery_decision_operation_id = new_op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
 
-        # Decision operation lost (crash/resume) â€” check if decision file already exists on disk,
+        # Decision operation lost (crash/resume) — check if decision file already exists on disk,
         # otherwise re-dispatch from stored evidence.
         if wo_id:
             decision, decision_error = self._load_recovery_decision(ws, str(wo_id), {})
@@ -1663,7 +1750,7 @@ class LifecycleSupervisor:
             if wo_id in superseded:
                 continue
             if published and wo_id not in published:
-                continue  # pending authoring revision â€” not publishable yet
+                continue  # pending authoring revision — not publishable yet
             if wo_id == state.gitops_wo_id or self._role_for_agent(self._agent_for_wo(wo_id, ws)) == "gitops":
                 if not state.gitops_wo_id:
                     state.gitops_wo_id = wo_id
@@ -1706,7 +1793,7 @@ class LifecycleSupervisor:
                 )
                 dispatched_any = True
             except Exception as exc:
-                # D024 gate or other pre-check might block â€” record and continue
+                # D024 gate or other pre-check might block — record and continue
                 if wo_id not in state.blocked_wo_ids:
                     state.blocked_wo_ids.append(wo_id)
                 state.error = f"Dispatch failed for {wo_id}: {exc}"
@@ -1780,7 +1867,7 @@ class LifecycleSupervisor:
             if wo_id in superseded:
                 continue
             if published and wo_id not in published:
-                continue  # pending authoring revision â€” not publishable yet
+                continue  # pending authoring revision — not publishable yet
             if wo_id == state.gitops_wo_id or self._role_for_agent(self._agent_for_wo(wo_id, ws)) == "gitops":
                 if not state.gitops_wo_id:
                     state.gitops_wo_id = wo_id
@@ -1791,7 +1878,7 @@ class LifecycleSupervisor:
             # Check if this WO's operation has completed
             op = self._find_latest_wo_operation(state, wo_id)
             if op is None:
-                # Not dispatched yet â€” check deps and dispatch
+                # Not dispatched yet — check deps and dispatch
                 if (
                     wo_id in state.blocked_by_escalation
                     or wo_id in state.blocked_wo_ids
@@ -1803,7 +1890,7 @@ class LifecycleSupervisor:
                 pending_rework = state.qa_rework_targets.get(wo_id)
                 if pending_rework:
                     if all(t in state.completed_wo_ids for t in pending_rework):
-                        # Developer rework landed â€” the QA work order may
+                        # Developer rework landed — the QA work order may
                         # re-run against the fixed deliverables.
                         state.qa_rework_targets.pop(wo_id, None)
                     else:
@@ -1895,7 +1982,7 @@ class LifecycleSupervisor:
                     all_done = False
                 continue
 
-            # Completed with deliverable on disk â€” QA work orders must also show
+            # Completed with deliverable on disk — QA work orders must also show
             # real execution evidence (authored suite + a recorded test run).
             if self._agent_for_wo(wo_id, ws) == "gemma":
                 gap = self._qa_execution_evidence_gap(wo_id, op, ws)
@@ -1915,7 +2002,7 @@ class LifecycleSupervisor:
                     if routed is not None:
                         return routed
 
-            # Completed with deliverable on disk â€” check QA verdict (developer work orders only;
+            # Completed with deliverable on disk — check QA verdict (developer work orders only;
             # QA work orders produce verdicts and are never subject to QA review on themselves).
             if (
                 self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
@@ -2105,7 +2192,7 @@ class LifecycleSupervisor:
                 return routed
 
         # Route verified governance failures to an Architect recovery
-        # decision â€” never to an automatic same-contract worker retry.
+        # decision — never to an automatic same-contract worker retry.
         # Transient failures keep the bounded auto-retry path until the
         # retry budget is exhausted, then also escalate to the Architect.
         transient_exhausted = (
@@ -2116,7 +2203,7 @@ class LifecycleSupervisor:
             attempts = state.recovery_attempts.get(wo_id, 0)
             if attempts >= state.max_retries:
                 state.error = (
-                    f"Work order {wo_id} blocked: {err_msg} â€” recovery decision "
+                    f"Work order {wo_id} blocked: {err_msg} — recovery decision "
                     f"attempts exhausted ({attempts}/{state.max_retries})"
                 )
                 self._transition(state, Phase.BLOCKED)
@@ -2129,7 +2216,7 @@ class LifecycleSupervisor:
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
                 return AdvanceResult.WAITING_FOR_OPERATION
             state.error = (
-                f"Work order {wo_id} blocked: {err_msg} â€” recovery decision turn "
+                f"Work order {wo_id} blocked: {err_msg} — recovery decision turn "
                 f"could not be dispatched"
             )
             self._transition(state, Phase.BLOCKED)
@@ -2156,7 +2243,7 @@ class LifecycleSupervisor:
                 if wo_id not in state.blocked_wo_ids:
                     state.blocked_wo_ids.append(wo_id)
                 state.error = (
-                    f"Work order {wo_id} blocked: {err_msg} â€” dependency escalation "
+                    f"Work order {wo_id} blocked: {err_msg} — dependency escalation "
                     f"retries exhausted ({esc_retries}/{state.max_retries})"
                 )
                 self._transition(state, Phase.BLOCKED)
@@ -2210,14 +2297,14 @@ class LifecycleSupervisor:
                 except OperationContentionError:
                     # Parallel sibling turns share the session: the nudge cannot
                     # start while a sibling operation is running.  Roll the
-                    # retry budget back and let advance() wait â€” the work order
+                    # retry budget back and let advance() wait — the work order
                     # stays ACTIVE and is re-dispatched once the session frees,
                     # without consuming retry budget on a turn that never ran.
                     state.retry_counts[wo_id] = retries
                     raise
                 except Exception as e:
                     logger.error(f"Failed to nudge-retry {wo_id}: {e}", exc_info=True)
-                return None  # retry dispatched â€” keep executing
+                return None  # retry dispatched — keep executing
 
         # Check if this blockage is a transient outcome_verified, unwritten deliverable, or tool loop halt
         err_lower = err_msg.lower()
@@ -2261,7 +2348,7 @@ class LifecycleSupervisor:
                 deliv_path = self._get_wo_deliverable_path(wo_id, ws)
                 target_str = f" '{deliv_path}'" if deliv_path else ""
                 # Targeted feedback: the scope evidence tells the model exactly
-                # which declarations were not written â€” a blind "author the
+                # which declarations were not written — a blind "author the
                 # deliverable" retry converges poorly with small local models.
                 evidence_lines = ""
                 if isinstance(scope_evidence, dict):
@@ -2292,7 +2379,7 @@ class LifecycleSupervisor:
                             )
                             + " "
                             f"You MUST resolve any reported issues, invoke write_file to author the deliverable{target_str} "
-                            "at EXACTLY that path â€” no renamed or extra-nested folders â€” and "
+                            "at EXACTLY that path — no renamed or extra-nested folders — and "
                             "declare in modified_files ONLY files you actually wrote with "
                             f"write_file this turn (attempt {retries + 2})"
                         ),
@@ -2303,7 +2390,7 @@ class LifecycleSupervisor:
                     return None
                 except OperationContentionError:
                     # Parallel sibling turns share the session: roll the retry
-                    # budget back and let advance() wait â€” the work order stays
+                    # budget back and let advance() wait — the work order stays
                     # ACTIVE and is re-dispatched once the session frees.
                     state.retry_counts[wo_id] = retries
                     raise
@@ -2316,7 +2403,7 @@ class LifecycleSupervisor:
         self._transition(state, Phase.BLOCKED)
         return AdvanceResult.BLOCKED
 
-    # â”€â”€ QA defect routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── QA defect routing ──────────────────────────────────────────────
 
     _WO_ID_RE = re.compile(r"WO-\d{3,}")
     _PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_][\w./\\-]*\.[A-Za-z0-9]{1,6}")
@@ -2410,7 +2497,7 @@ class LifecycleSupervisor:
             def _rework_prompt(n: int, agent: str, _t=target_id, _f=finding) -> str:
                 return (
                     f"Rework work order {_t} after a QA defect finding (attempt {n}). "
-                    f"Gemma's QA suite reports the following failing check â€” fix the "
+                    f"Gemma's QA suite reports the following failing check — fix the "
                     f"application deliverable so the test passes; do NOT modify the "
                     f"test suite (QA owns it):\n{_f}\n\nQA finding context:\n{feedback}"
                 )
@@ -2770,8 +2857,8 @@ class LifecycleSupervisor:
             deterministic_blocked = not gate_decision.passed
 
             if llm_blocked or deterministic_blocked:
-                # A valid blocked review or deterministic failure routes its blockers â€” with the
-                # prescribed fixes when provided â€” back to the implementation and QA workers for
+                # A valid blocked review or deterministic failure routes its blockers — with the
+                # prescribed fixes when provided — back to the implementation and QA workers for
                 # bounded rework; the review re-runs after they complete. Terminal BLOCKED only when the
                 # rework rounds are exhausted.
                 blockers: list[str] = []
@@ -3171,7 +3258,7 @@ class LifecycleSupervisor:
             )
         else:
             security_checklist = (
-                "SECURITY & QUALITY CHECKLIST (ENVIRONMENT: PRODUCTION) â€” verify each item and list any unmet item as a blocker:\n"
+                "SECURITY & QUALITY CHECKLIST (ENVIRONMENT: PRODUCTION) — verify each item and list any unmet item as a blocker:\n"
                 "- No hardcoded secrets and no hardcoded env-fallback defaults (e.g. SECRET_KEY = "
                 "os.environ.get(..., 'literal') must fail fast instead).\n"
                 "- Debug flags are disabled for production (debug=True / DEBUG = True must not appear).\n"
@@ -3217,7 +3304,7 @@ class LifecycleSupervisor:
             "Do NOT rely on prose in the summary to satisfy the schema.\n"
             "- When status is 'blocked', 'blocker_details' SHOULD accompany each blocker with a "
             "'remediation': the concrete fix the worker should apply (you are the prescribing "
-            "architect â€” prescribe precisely; workers apply your prescription verbatim).\n"
+            "architect — prescribe precisely; workers apply your prescription verbatim).\n"
             "- When status is 'completed', 'blockers' MUST be an empty array [].\n"
             "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files.\n\n"
             f"{security_checklist}"
@@ -3264,7 +3351,7 @@ class LifecycleSupervisor:
             else:
                 code_wos.append(wo_id)
 
-            # Rework candidates are archived â€” resolve the deliverable from
+            # Rework candidates are archived — resolve the deliverable from
             # ACTIVE, COMPLETED, or BLOCKED.
             deliv = ""
             for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
@@ -3281,7 +3368,7 @@ class LifecycleSupervisor:
                 break
             if not deliv:
                 if role != "gitops":
-                    accused.append(wo_id)  # no mappable footprint â€” include defensively
+                    accused.append(wo_id)  # no mappable footprint — include defensively
                 continue
             stem = Path(deliv).stem.lower()
             if (deliv in blocker_text) or (stem and stem in blocker_text):
@@ -3325,7 +3412,7 @@ class LifecycleSupervisor:
             self._transition(state, Phase.GITOPS)
             return AdvanceResult.TRANSITIONED
 
-        # No GitOps WO exists â€” architecture should have created one.
+        # No GitOps WO exists — architecture should have created one.
         # Transition anyway and let GITOPS handle dispatching without a WO.
         self._transition(state, Phase.GITOPS)
         return AdvanceResult.TRANSITIONED
@@ -3381,7 +3468,7 @@ class LifecycleSupervisor:
                         state.error = None
                         return self._advance_gitops(state)
                     state.error = (
-                        f"GitOps turn blocked: {err_msg} â€” budget retries exhausted "
+                        f"GitOps turn blocked: {err_msg} — budget retries exhausted "
                         f"({retries}/{state.max_retries})"
                     )
                     self._transition(state, Phase.BLOCKED)
@@ -3399,7 +3486,7 @@ class LifecycleSupervisor:
                     state.gitops_feedback = err_msg
                     return self._advance_gitops(state)
 
-                state.error = f"GitOps turn blocked: {err_msg} â€” retries exhausted ({state.gitops_retries}/{state.max_gitops_retries})"
+                state.error = f"GitOps turn blocked: {err_msg} — retries exhausted ({state.gitops_retries}/{state.max_gitops_retries})"
                 state.exit_code = 3
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
                 return AdvanceResult.WAITING_FOR_HUMAN
@@ -3416,12 +3503,12 @@ class LifecycleSupervisor:
                     state.error = None
                     state.gitops_feedback = str(op_result.get("error", op.get("error", "GitOps turn failed")))
                     return self._advance_gitops(state)
-                state.error = f"GitOps turn failed: {op_result.get('error', op.get('error', 'unknown'))} â€” retries exhausted ({state.gitops_retries}/{state.max_gitops_retries})"
+                state.error = f"GitOps turn failed: {op_result.get('error', op.get('error', 'unknown'))} — retries exhausted ({state.gitops_retries}/{state.max_gitops_retries})"
                 state.exit_code = 3
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
                 return AdvanceResult.WAITING_FOR_HUMAN
 
-            # GitOps completed â€” if workspace has a git repository, perform governed release commit
+            # GitOps completed — if workspace has a git repository, perform governed release commit
             ws = Path(state.workspace)
             # Before committing, archive completed work orders to .sync/work-orders/COMPLETED/
             to_archive = list(state.completed_wo_ids)
@@ -3486,7 +3573,7 @@ class LifecycleSupervisor:
                 "As GitOps Release Lead, finalize the release documentation:\n"
                 "1. Write VERSION.md with version '0.1.0'.\n"
                 "2. Write CHANGELOG.md summarizing the completed deliverables and the release.\n"
-                "3. Ensure deployment manifests (e.g. docker-compose.yml, Dockerfile) contain NO hardcoded passwords, secrets, or keys â€” use environment variables (e.g. '${POSTGRES_PASSWORD:-postgres}') or placeholder values (e.g. 'dev_password', 'change-me').\n"
+                "3. Ensure deployment manifests (e.g. docker-compose.yml, Dockerfile) contain NO hardcoded passwords, secrets, or keys — use environment variables (e.g. '${POSTGRES_PASSWORD:-postgres}') or placeholder values (e.g. 'dev_password', 'change-me').\n"
                 "4. Return the final HarnessDecision JSON with status 'completed'. Do not run git commands; the supervisor creates the release commit automatically."
             )
             feedback = getattr(state, "gitops_feedback", None)
@@ -3516,18 +3603,18 @@ class LifecycleSupervisor:
             state.gitops_operation_id = op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
         except Exception as exc:
-            # D024 gate may block GitOps â€” this is expected if QA verdicts
+            # D024 gate may block GitOps — this is expected if QA verdicts
             # aren't present in the correct inbox location
             state.error = f"GitOps dispatch blocked: {exc}"
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
 
-    # â”€â”€ Authoring readiness & architect recovery helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Authoring readiness & architect recovery helpers ──────────────
 
     def _worker_dispatch_prompt(self, state: RunState, wo_id: str, ws: Path) -> str:
         """Build the worker dispatch prompt.
 
-        QA workers get explicit authorâ†’executeâ†’verdict instructions so a QA
+        QA workers get explicit author→execute→verdict instructions so a QA
         turn cannot be satisfied by a bare sign-off: the declared test suite
         must be written and actually executed end-to-end.
         """
@@ -3536,7 +3623,7 @@ class LifecycleSupervisor:
         if agent == "gemma" and deliv_path:
             return (
                 f"Execute work order {wo_id} as the QA worker.\n"
-                f"1. Author the declared test suite '{deliv_path}' with write_file â€” thorough "
+                f"1. Author the declared test suite '{deliv_path}' with write_file — thorough "
                 f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.\n"
                 f"2. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
                 f"3. Run the run_security_scan tool over the deliverables and triage the output; "
@@ -3569,10 +3656,10 @@ class LifecycleSupervisor:
         if not isinstance(result, dict):
             return None
         if ("commands_audit" not in result) and ("tool_calls_audit" not in result):
-            return None  # no execution telemetry reported â€” legacy provider
+            return None  # no execution telemetry reported — legacy provider
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         if not deliv_path:
-            return None  # sign-off style QA work order â€” nothing executable declared
+            return None  # sign-off style QA work order — nothing executable declared
         target = ws / deliv_path
         try:
             if not target.is_file() or target.stat().st_size == 0:
@@ -3601,7 +3688,7 @@ class LifecycleSupervisor:
                 f"(run_tests/pytest absent from the turn audit)"
             )
 
-        # QA must also run the deterministic security scan â€” the report-class
+        # QA must also run the deterministic security scan — the report-class
         # findings (hardcoded secret fallbacks, debug flags) that a model
         # reviewer routinely misses.
         def _is_security_scan(entry: Any) -> bool:
@@ -3646,15 +3733,15 @@ class LifecycleSupervisor:
                         f"QA work order {wo_id} (attempt {retries + 2}): {gap}. You MUST author "
                         f"the test suite '{deliv_path}' with write_file using standard Python "
                         f"(pytest, html.parser, re, pathlib; do NOT import external browser drivers like playwright/selenium), "
-                        f"execute it end-to-end with the run_tests tool (pytest), and IMMEDIATELY after run_tests â€” "
-                        f"whatever its outcome â€” run the run_security_scan tool over the "
+                        f"execute it end-to-end with the run_tests tool (pytest), and IMMEDIATELY after run_tests — "
+                        f"whatever its outcome — run the run_security_scan tool over the "
                         f"deliverables; never defer or skip the scan because tests failed. "
                         f"If the tests fail because an application deliverable is defective "
                         f"(the test itself is correct), do NOT rewrite or re-run the suite "
                         f"more than once: write a NEEDS_CHANGES verdict to "
                         f".sync/inbox/claude/<TARGET-WORK-ORDER-ID>-qa-verdict.md (e.g. WO-001-qa-verdict.md) naming the "
                         f"defective deliverable, then finalize declaring status 'blocked' "
-                        f"with a blocker naming that deliverable path â€” the supervisor "
+                        f"with a blocker naming that deliverable path — the supervisor "
                         f"routes the fix to the developer. Declare in modified_files ONLY "
                         f"files you actually wrote with write_file."
                     ),
@@ -3667,7 +3754,7 @@ class LifecycleSupervisor:
                 logger.error(f"Failed to retry QA work order {wo_id}: {exc}", exc_info=True)
                 state.failed_wo_ids.append(wo_id)
                 return AdvanceResult.WAITING_FOR_OPERATION
-        # Retries exhausted â€” route to the Architect with durable evidence.
+        # Retries exhausted — route to the Architect with durable evidence.
         state.worker_blockers[wo_id] = {
             "failure_code": "QA_EVIDENCE_MISSING",
             "canonical_message": f"QA_EVIDENCE_MISSING: work order {wo_id}: {gap}",
@@ -3680,14 +3767,14 @@ class LifecycleSupervisor:
         }
         attempts = state.recovery_attempts.get(wo_id, 0)
         if attempts >= state.max_retries:
-            state.error = f"Work order {wo_id}: {gap} â€” recovery decision attempts exhausted"
+            state.error = f"Work order {wo_id}: {gap} — recovery decision attempts exhausted"
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
         state.recovery_attempts[wo_id] = attempts + 1
         state.recovery_wo_id = wo_id
         recovery_op = self._dispatch_recovery_decision(state, ws, wo_id)
         if recovery_op is None:
-            state.error = f"Work order {wo_id}: {gap} â€” recovery decision turn could not be dispatched"
+            state.error = f"Work order {wo_id}: {gap} — recovery decision turn could not be dispatched"
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
         state.recovery_decision_operation_id = recovery_op.get("operation_id")
@@ -3860,7 +3947,7 @@ class LifecycleSupervisor:
         """
         if state.authoring_repair_attempts >= state.max_authoring_repairs:
             state.error = (
-                f"{reason} â€” architect repair attempts exhausted "
+                f"{reason} — architect repair attempts exhausted "
                 f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
                 f"operator intervention required"
             )
@@ -3879,7 +3966,7 @@ class LifecycleSupervisor:
         state.authoring_repair_attempts += 1
         op = self._dispatch_repair_turn(state, ws)
         if op is None:
-            state.error = f"{reason} â€” failed to dispatch the Architect repair turn"
+            state.error = f"{reason} — failed to dispatch the Architect repair turn"
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
         state.architect_repair_operation_id = op.get("operation_id")
@@ -3954,14 +4041,14 @@ class LifecycleSupervisor:
                 f"Contract schema requirements: schema_version: 1 (integer), agent_id, work_order, identity: {{role: ..., reports_to: ...}}, "
                 f"scope: allow must be a list of rule mappings (e.g. - module: 'tests/**'), deny must be a list of rule mappings (e.g. - module: 'gacche.db'), "
                 f"write must be the string 'read-write', budget: {{max_files_touched: 10, max_tokens: 50000}}. Optional: contract_revision, guidelines. "
-                f"A transitional repair contract is already in place at that path â€” overwrite it with the amended contract; do not delete it.\n"
+                f"A transitional repair contract is already in place at that path — overwrite it with the amended contract; do not delete it.\n"
                 if action == "amend_contract" else ""
             )
             + (
                 "- split_work_order: write each replacement child Work Order to "
                 ".sync/work-orders/ACTIVE/<WO-ID>.yaml and its contract to .sync/contracts/<WO-ID>.yaml. "
                 "Child 1 inherits the original dependencies; each following child depends on the "
-                "previous one. Never assign an unbounded file budget â€” split further instead.\n"
+                "previous one. Never assign an unbounded file budget — split further instead.\n"
                 f"Replacement children:\n{children_lines}\n"
                 if action == "split_work_order" else ""
             )
@@ -3980,7 +4067,7 @@ class LifecycleSupervisor:
         """Bounded authoring-repair prompt from the persisted readiness diagnostics.
 
         Every diagnostic carries its required_action, and the affected-artifact
-        list is derived from ALL issue attachments â€” relational findings
+        list is derived from ALL issue attachments — relational findings
         (milestone coverage, QA channel, test planning) name their artifacts
         here, so the prompt never claims "affected: none" while demanding fixes.
         """
@@ -4086,7 +4173,7 @@ class LifecycleSupervisor:
     ) -> str | None:
         """Enforce action-specific expectations after a recovery repair turn."""
         if not action or not wo_id:
-            return None  # plain authoring repair â€” readiness gate is the arbiter
+            return None  # plain authoring repair — readiness gate is the arbiter
         wo_id = str(wo_id)
         if action == "amend_contract":
             expected_revision = state.repair_context.get("decision", {}).get("contract_revision")
@@ -4399,7 +4486,7 @@ class LifecycleSupervisor:
                 })
                 return None, "split_work_order requires a non-empty replacement_work_orders list"
             # Collision guard: replacement children must not reuse the ids of
-            # other active work orders â€” the split archives the blocked WO's
+            # other active work orders — the split archives the blocked WO's
             # artifacts and re-authors the children, so a colliding id would
             # clobber a live, contracted work order mid-execution.
             active_ids = {
@@ -4453,7 +4540,7 @@ class LifecycleSupervisor:
                     "rejected_reason": "create_dependency_work_order requires replacement_work_orders",
                 })
                 return None, "create_dependency_work_order requires a non-empty replacement_work_orders list"
-            # Collision guard: a NEW prerequisite work order must use a fresh id â€”
+            # Collision guard: a NEW prerequisite work order must use a fresh id —
             # reusing an active work order's id would clobber it.
             active_ids = {
                 p.stem for p in (ws / ".sync" / "work-orders" / "ACTIVE").glob("*.yaml")
@@ -4877,7 +4964,7 @@ class LifecycleSupervisor:
         """Backward-compatible alias: clear the blocker and re-dispatch the worker."""
         return self._clear_worker_blocker(state, ws, wo_id, redispatch=True)
 
-    # â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Helpers ───────────────────────────────────────────────────────
 
     def _transition(self, state: RunState, new_phase: Phase) -> None:
         """Record a phase transition in the run state."""
@@ -4902,7 +4989,7 @@ class LifecycleSupervisor:
         if new_phase in (Phase.FAILED, Phase.BLOCKED):
             self._finalize_in_flight_work_orders(state, new_phase.value)
 
-    # â”€â”€ Work-order disk cleanup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Work-order disk cleanup ───────────────────────────────────────
 
     @staticmethod
     def _mark_wo_status_on_disk(
@@ -4930,7 +5017,7 @@ class LifecycleSupervisor:
                 return False
             current = str(data.get("status", "")).upper()
             if current in _WO_TERMINAL and target_status != "ACTIVE":
-                return False  # Already terminal â€” don't overwrite
+                return False  # Already terminal — don't overwrite
             data["status"] = target_status
             data["updated"] = _now()
             if error:
@@ -5578,7 +5665,7 @@ class LifecycleSupervisor:
                 continue
         return None
 
-    # â”€â”€ Persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Persistence ───────────────────────────────────────────────────
 
     @classmethod
     def save_run_state(
@@ -5635,7 +5722,7 @@ class LifecycleSupervisor:
             return []
         return sorted(f.stem for f in state_dir.glob("*.yaml"))
 
-    # â”€â”€ P0-5 Human Override, Escalation, and Exit Codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
 
     VALID_RESETTABLE_COUNTERS = {
         "gitops_retries",
@@ -5938,7 +6025,7 @@ class LifecycleSupervisor:
         return state.exit_code
 
 
-# â”€â”€â”€ Release Commit Provenance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Release Commit Provenance ────────────────────────────────────────
 
 def format_release_commit_message(
     summary: str,

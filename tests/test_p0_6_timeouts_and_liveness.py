@@ -526,3 +526,116 @@ def test_turn_timeout_does_not_double_charge_budget(tmp_path: Path):
     sup.advance(state)
 
     assert initial_budget - state.global_turn_budget == len(mgr.dispatched_turns)
+
+
+def test_full_timeout_table_execution_and_counters(tmp_path: Path):
+    """Verify every row of published timeout table: state, key, default, target, and counter consumed."""
+    mgr = StubSessionManager()
+    reaper = ProcessReaper()
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper)
+
+    assert sup.get_timeout_for_phase(Phase.PLANNING) == 300.0
+    assert sup.get_timeout_for_phase(Phase.AUTHORING) == 600.0
+    assert sup.get_timeout_for_phase(Phase.AUTHORING_READINESS_GATE) == 60.0
+    assert sup.get_timeout_for_phase(Phase.DISPATCHING) == 60.0
+    assert sup.get_timeout_for_phase(Phase.EXECUTING) == 600.0
+    assert sup.get_timeout_for_phase(Phase.INTEGRATION_REVIEW) == 600.0
+    assert sup.get_timeout_for_phase(Phase.ARCHITECT_REPAIR) == 600.0
+    assert sup.get_timeout_for_phase(Phase.ARCHITECT_RECOVERY_DECISION) == 300.0
+    assert sup.get_timeout_for_phase(Phase.GITOPS) == 300.0
+    assert sup.ci_wait_timeout == 60.0
+    assert sup.ci_run_timeout == 1800.0
+
+    s = sup.start_run("r-timeout-planning", "Goal", tmp_path, "s1")
+    s.phase = Phase.PLANNING
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.planning_retries == 1
+    assert s.authoring_repair_attempts == 0
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.planning_retries == 2
+    assert s.phase == Phase.WAITING_FOR_HUMAN
+    assert s.exit_code == EXIT_RETRIES_EXHAUSTED
+
+    s = sup.start_run("r-timeout-auth", "Goal", tmp_path, "s2")
+    s.phase = Phase.AUTHORING
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.authoring_repair_attempts == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.authoring_repair_attempts == 2
+    assert s.phase == Phase.WAITING_FOR_HUMAN
+    assert s.exit_code == EXIT_RETRIES_EXHAUSTED
+
+    s = sup.start_run("r-timeout-gate", "Goal", tmp_path, "s3")
+    s.phase = Phase.AUTHORING_READINESS_GATE
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.phase == Phase.ARCHITECT_REPAIR
+
+    s = sup.start_run("r-timeout-dispatch", "Goal", tmp_path, "s4")
+    s.phase = Phase.DISPATCHING
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
+
+    s = sup.start_run("r-timeout-exec", "Goal", tmp_path, "s5")
+    s.phase = Phase.EXECUTING
+    s.worker_wo_ids = ["WO-101"]
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.worker_retries["WO-101"] == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.worker_retries["WO-101"] == 2
+    assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
+    assert s.recovery_wo_id == "WO-101"
+
+    s = sup.start_run("r-timeout-qa", "Goal", tmp_path, "s6")
+    s.phase = Phase.INTEGRATION_REVIEW
+    s.integration_wo_id = "WO-101"
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.qa_reworks["WO-101"] == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.qa_reworks["WO-101"] == 2
+    assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
+    assert s.recovery_wo_id == "WO-101"
+
+    s = sup.start_run("r-timeout-repair", "Goal", tmp_path, "s7")
+    s.phase = Phase.ARCHITECT_REPAIR
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.authoring_repair_attempts == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.authoring_repair_attempts == 2
+    assert s.phase == Phase.WAITING_FOR_HUMAN
+    assert s.exit_code == EXIT_RETRIES_EXHAUSTED
+
+    s = sup.start_run("r-timeout-recovery", "Goal", tmp_path, "s8")
+    s.phase = Phase.ARCHITECT_RECOVERY_DECISION
+    s.recovery_wo_id = "WO-101"
+    s.max_retries = 2
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.recovery_attempts["WO-101"] == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.recovery_attempts["WO-101"] == 2
+    assert s.phase == Phase.WAITING_FOR_HUMAN
+    assert s.exit_code == EXIT_RETRIES_EXHAUSTED
+
+    s = sup.start_run("r-timeout-gitops", "Goal", tmp_path, "s9")
+    s.phase = Phase.GITOPS
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.gitops_retries == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.gitops_retries == 2
+    assert s.phase == Phase.WAITING_FOR_HUMAN
+    assert s.exit_code == EXIT_RETRIES_EXHAUSTED
