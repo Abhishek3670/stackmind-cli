@@ -79,6 +79,7 @@ class Phase(StrEnum):
     ARCHITECT_REPAIR = "ARCHITECT_REPAIR"
     DISPATCHING = "DISPATCHING"
     EXECUTING = "EXECUTING"
+    QA_REVIEW = "QA_REVIEW"
     ARCHITECT_RECOVERY_DECISION = "ARCHITECT_RECOVERY_DECISION"
     INTEGRATION_REVIEW = "INTEGRATION_REVIEW"
     PRODUCT_READY = "PRODUCT_READY"
@@ -119,15 +120,16 @@ EXIT_INTEGRITY_VIOLATION = 5
 EXIT_HEADLESS_TIMEOUT = 137
 
 DEFAULT_TIMEOUTS: dict[Any, float] = {
-    Phase.PLANNING: 300.0,
+    Phase.PLANNING: 60.0,
     Phase.AUTHORING: 600.0,
     Phase.AUTHORING_READINESS_GATE: 60.0,
     Phase.DISPATCHING: 60.0,
-    Phase.EXECUTING: 600.0,
-    Phase.INTEGRATION_REVIEW: 600.0,
-    Phase.ARCHITECT_REPAIR: 600.0,
+    Phase.EXECUTING: 180.0,
+    Phase.QA_REVIEW: 180.0,
+    Phase.INTEGRATION_REVIEW: 180.0,
+    Phase.ARCHITECT_REPAIR: 180.0,
     Phase.ARCHITECT_RECOVERY_DECISION: 300.0,
-    Phase.GITOPS: 300.0,
+    Phase.GITOPS: 60.0,
     "gate": 60.0,
     "ci_wait_timeout": 60.0,
     "ci_run_timeout": 1800.0,
@@ -230,7 +232,7 @@ class RunState:
     max_stall_ticks: int = 3
     interrupted_phase: str | None = None
     daemon_restarts: int = 0
-    max_daemon_restarts: int = 2
+    max_daemon_restarts: int = 3
     executing_wo_id: str | None = None
     planning_retries: int = 0
     max_planning_retries: int = 2
@@ -399,7 +401,7 @@ class RunState:
             max_stall_ticks=int(data.get("max_stall_ticks", 3)),
             interrupted_phase=data.get("interrupted_phase"),
             daemon_restarts=int(data.get("daemon_restarts", 0)),
-            max_daemon_restarts=int(data.get("max_daemon_restarts", 2)),
+            max_daemon_restarts=int(data.get("max_daemon_restarts", 3)),
             executing_wo_id=data.get("executing_wo_id"),
             planning_retries=int(data.get("planning_retries", 0)),
             max_planning_retries=int(data.get("max_planning_retries", 2)),
@@ -619,7 +621,7 @@ class LifecycleSupervisor:
                 state.error = f"WORKER_INVALID_OUTPUT: {error_type} on {wid} (retry {retries}/{state.max_worker_retries})"
             return AdvanceResult.TRANSITIONED
 
-        elif role_lower == "qa" or state.phase == Phase.INTEGRATION_REVIEW:
+        elif role_lower == "qa" or state.phase in (Phase.INTEGRATION_REVIEW, Phase.QA_REVIEW):
             wid = wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             reworks = state.qa_reworks.get(wid, 0) + 1
             state.qa_reworks[wid] = reworks
@@ -685,7 +687,7 @@ class LifecycleSupervisor:
                 state.error = f"WORKER_TIMEOUT: Turn timed out after {timeout_val:.1f}s (retry {retries}/{state.max_worker_retries})"
             return AdvanceResult.TRANSITIONED
 
-        elif timeout_phase == Phase.INTEGRATION_REVIEW:
+        elif timeout_phase in (Phase.INTEGRATION_REVIEW, Phase.QA_REVIEW):
             wo_id = state.integration_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             reworks = state.qa_reworks.get(wo_id, 0) + 1
             state.qa_reworks[wo_id] = reworks
@@ -760,72 +762,7 @@ class LifecycleSupervisor:
 
     def _handle_ci_timeout(self, state: RunState, reason: str | None = None) -> AdvanceResult:
         """Headless CI run abort on timeout: write crash bundle and rescue ref, terminate FAILED (137)."""
-        if self.reaper is not None:
-            try:
-                self.reaper.reap_all()
-            except Exception:
-                pass
-
-        storage_dir = Path(self.state_manager._storage_dir) if hasattr(self, "state_manager") and self.state_manager else Path(state.workspace).parent / "supervisor_storage"
-        bundle_dir = storage_dir / "crash_bundles"
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        bundle_path = bundle_dir / f"crash_bundle_{state.run_id}_{ts}.json"
-        
-        # Checkpoint hash
-        ckpt_hash = None
-        if hasattr(self, "state_manager") and self.state_manager is not None:
-            ckpt_hash = getattr(self.state_manager, "latest_checkpoint_hash", None)
-            if not ckpt_hash and hasattr(self.state_manager, "_in_memory_chain_hashes"):
-                ckpt_hash = self.state_manager._in_memory_chain_hashes.get(state.run_id)
-
         err_msg = reason or f"HEADLESS_CI_TIMEOUT: Timeout exceeded {self.ci_wait_timeout}s."
-        bundle_data = {
-            "run_id": state.run_id,
-            "phase": state.phase.value,
-            "error": err_msg,
-            "exit_code": EXIT_HEADLESS_TIMEOUT,  # 137
-            "budget": state.global_turn_budget,
-            "counters": {
-                "worker_retries": dict(state.worker_retries),
-                "qa_reworks": dict(state.qa_reworks),
-                "gitops_retries": state.gitops_retries,
-                "planning_retries": state.planning_retries,
-                "authoring_repair_attempts": state.authoring_repair_attempts,
-                "daemon_restarts": state.daemon_restarts,
-                "human_resumes_used": state.human_resumes_used,
-            },
-            "checkpoint_hash": ckpt_hash or "none",
-            "state_snapshot": state.to_dict(),
-            "transitions": list(state.transitions),
-            "timestamp": _now(),
-        }
-        bundle_path.write_text(json.dumps(bundle_data, indent=2), encoding="utf-8")
-
-        store_git = storage_dir / "snapshots.git"
-        if store_git.is_dir():
-            try:
-                from validators.kernel.turn_snapshot import TurnSnapshotManager
-                snap_mgr = TurnSnapshotManager(workspace=Path(state.workspace), storage_root=store_git, reaper=self.reaper)
-                rescue_snap = snap_mgr.create_turn_snapshot(f"rescue-{state.run_id}")
-                ref_name = f"refs/rescue/{state.run_id}/{state.phase.value.lower()}"
-                null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
-                git_env = {
-                    **os.environ,
-                    "GIT_CONFIG_GLOBAL": null_dev,
-                    "GIT_CONFIG_SYSTEM": null_dev,
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_CONFIG": null_dev,
-                }
-                subprocess.run(
-                    ["git", "--git-dir", str(store_git), "update-ref", ref_name, rescue_snap],
-                    capture_output=True,
-                    check=True,
-                    env=git_env,
-                )
-            except Exception:
-                pass
-
         state.exit_code = EXIT_HEADLESS_TIMEOUT  # 137
         state.error = err_msg
         self._transition(state, Phase.FAILED)
@@ -1012,6 +949,7 @@ class LifecycleSupervisor:
             Phase.DISPATCHING: self._advance_dispatching,
             Phase.EXECUTING: self._advance_executing,
             Phase.ARCHITECT_RECOVERY_DECISION: self._advance_recovery_decision,
+            Phase.QA_REVIEW: self._advance_integration_review,
             Phase.INTEGRATION_REVIEW: self._advance_integration_review,
             Phase.PRODUCT_READY: self._advance_product_ready,
             Phase.GITOPS: self._advance_gitops,
@@ -4966,6 +4904,84 @@ class LifecycleSupervisor:
 
     # ── Helpers ───────────────────────────────────────────────────────
 
+
+    def _capture_terminal_crash_bundle(self, state: RunState) -> None:
+        """Capture rescue ref in external store and write crash bundle for any terminal FAILED transition."""
+        if getattr(self, "reaper", None) is not None:
+            try:
+                self.reaper.reap_all()
+            except Exception:
+                pass
+
+        storage_dir = Path(self.state_manager._storage_dir) if hasattr(self, "state_manager") and self.state_manager else Path(state.workspace).parent / "supervisor_storage"
+        bundle_dir = storage_dir / "crash_bundles"
+        try:
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            bundle_path = bundle_dir / f"crash_bundle_{state.run_id}_{ts}.json"
+            
+            ckpt_hash = None
+            if hasattr(self, "state_manager") and self.state_manager is not None:
+                ckpt_hash = getattr(self.state_manager, "latest_checkpoint_hash", None)
+                if not ckpt_hash and hasattr(self.state_manager, "_in_memory_chain_hashes"):
+                    ckpt_hash = self.state_manager._in_memory_chain_hashes.get(state.run_id)
+
+            err_msg = state.error or f"TERMINAL_FAILURE in phase {state.phase.value}"
+            bundle_data = {
+                "run_id": state.run_id,
+                "phase": state.phase.value,
+                "error": str(err_msg),
+                "exit_code": state.exit_code,
+                "budget": state.global_turn_budget,
+                "counters": {
+                    "worker_retries": dict(state.worker_retries),
+                    "qa_reworks": dict(state.qa_reworks),
+                    "gitops_retries": state.gitops_retries,
+                    "planning_retries": state.planning_retries,
+                    "authoring_repair_attempts": state.authoring_repair_attempts,
+                    "daemon_restarts": state.daemon_restarts,
+                    "human_resumes_used": state.human_resumes_used,
+                },
+                "checkpoint_hash": ckpt_hash or "none",
+                "state_snapshot": state.to_dict(),
+                "transitions": list(state.transitions),
+                "timestamp": _now(),
+            }
+            bundle_path.write_text(json.dumps(bundle_data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        store_git = storage_dir / "snapshots.git"
+        if store_git.is_dir():
+            try:
+                from validators.kernel.turn_snapshot import TurnSnapshotManager
+                snap_mgr = TurnSnapshotManager(workspace=Path(state.workspace), storage_root=store_git, reaper=getattr(self, "reaper", None))
+                rescue_snap = snap_mgr.create_turn_snapshot(f"rescue-{state.run_id}")
+                null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
+                git_env = {
+                    **os.environ,
+                    "GIT_CONFIG_GLOBAL": null_dev,
+                    "GIT_CONFIG_SYSTEM": null_dev,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG": null_dev,
+                }
+                refs_to_update = [f"refs/rescue/{state.run_id}/failed"]
+                if state.interrupted_phase:
+                    refs_to_update.append(f"refs/rescue/{state.run_id}/{state.interrupted_phase.lower()}")
+                if state.transitions:
+                    last_from = state.transitions[-1].get("from", "").lower()
+                    if last_from and last_from != "failed":
+                        refs_to_update.append(f"refs/rescue/{state.run_id}/{last_from}")
+                for ref_name in set(refs_to_update):
+                    subprocess.run(
+                        ["git", "--git-dir", str(store_git), "update-ref", ref_name, rescue_snap],
+                        capture_output=True,
+                        check=True,
+                        env=git_env,
+                    )
+            except Exception:
+                pass
+
     def _transition(self, state: RunState, new_phase: Phase) -> None:
         """Record a phase transition in the run state."""
         state.turn_deadline = None
@@ -4982,6 +4998,8 @@ class LifecycleSupervisor:
             "at": now,
         })
         state.phase = new_phase
+        if new_phase == Phase.FAILED:
+            self._capture_terminal_crash_bundle(state)
         state.updated_at = now
 
         # When the run terminates, mark all in-flight work orders on disk
@@ -5871,7 +5889,7 @@ class LifecycleSupervisor:
         if state.daemon_restarts >= state.max_daemon_restarts:
             state.phase = Phase.FAILED
             state.error = f"MAX_DAEMON_RESTARTS_EXCEEDED: run reached restart cap ({state.max_daemon_restarts})"
-            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            state.exit_code = EXIT_FAILURE
             raise ValueError(f"Run reached maximum allowed daemon restarts ({state.max_daemon_restarts}).")
 
         # 2. Budget non-increasing across restarts rule:

@@ -456,11 +456,11 @@ def test_no_resumable_dead_ends_every_waiting_state_reaches_terminal(tmp_path: P
     # 2. Daemon restart cap exceeded -> fails terminal FAILED
     s2 = sup.start_run("r-dead-2", "Goal", tmp_path, "s2")
     s2.phase = Phase.WAITING_FOR_HUMAN
-    s2.daemon_restarts = s2.max_daemon_restarts  # 2
+    s2.daemon_restarts = s2.max_daemon_restarts  # 3
     with pytest.raises(ValueError, match="maximum allowed daemon restarts"):
         sup.re_attest_run(s2, human_signature="admin", confirmed_budget=20)
     assert s2.phase == Phase.FAILED
-    assert s2.exit_code == EXIT_RETRIES_EXHAUSTED
+    assert s2.exit_code == EXIT_FAILURE
 
     # 3. Re-attest cannot raise budget when resumes exhausted -> fails terminal FAILED
     s3 = sup.start_run("r-dead-3", "Goal", tmp_path, "s3")
@@ -511,15 +511,16 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     sup = LifecycleSupervisor(manager=mgr, reaper=reaper)
 
     # 1. Defaults verification
-    assert sup.get_timeout_for_phase(Phase.PLANNING) == 300.0
+    assert sup.get_timeout_for_phase(Phase.PLANNING) == 60.0
     assert sup.get_timeout_for_phase(Phase.AUTHORING) == 600.0
     assert sup.get_timeout_for_phase(Phase.AUTHORING_READINESS_GATE) == 60.0
     assert sup.get_timeout_for_phase(Phase.DISPATCHING) == 60.0
-    assert sup.get_timeout_for_phase(Phase.EXECUTING) == 600.0
-    assert sup.get_timeout_for_phase(Phase.INTEGRATION_REVIEW) == 600.0
-    assert sup.get_timeout_for_phase(Phase.ARCHITECT_REPAIR) == 600.0
+    assert sup.get_timeout_for_phase(Phase.EXECUTING) == 180.0
+    assert sup.get_timeout_for_phase(Phase.QA_REVIEW) == 180.0
+    assert sup.get_timeout_for_phase(Phase.INTEGRATION_REVIEW) == 180.0
+    assert sup.get_timeout_for_phase(Phase.ARCHITECT_REPAIR) == 180.0
     assert sup.get_timeout_for_phase(Phase.ARCHITECT_RECOVERY_DECISION) == 300.0
-    assert sup.get_timeout_for_phase(Phase.GITOPS) == 300.0
+    assert sup.get_timeout_for_phase(Phase.GITOPS) == 60.0
     assert sup.ci_wait_timeout == 60.0
     assert sup.ci_run_timeout == 1800.0
 
@@ -573,6 +574,19 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     s.turn_deadline = time.monotonic() - 1.0
     sup.advance(s)
     assert s.worker_retries["WO-101"] == 2
+    assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
+    assert s.recovery_wo_id == "WO-101"
+
+# 7b. QA_REVIEW timeout consumes qa_reworks[wo_id] -> ARCHITECT_RECOVERY_DECISION
+    s = sup.start_run("r-timeout-qareview", "Goal", tmp_path, "s6b")
+    s.phase = Phase.QA_REVIEW
+    s.integration_wo_id = "WO-101"
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.qa_reworks["WO-101"] == 1
+    s.turn_deadline = time.monotonic() - 1.0
+    sup.advance(s)
+    assert s.qa_reworks["WO-101"] == 2
     assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
     assert s.recovery_wo_id == "WO-101"
 
@@ -631,7 +645,9 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
 AGENT_OWNED_PHASES = [
     Phase.PLANNING,
     Phase.EXECUTING,
+    Phase.QA_REVIEW,
     Phase.INTEGRATION_REVIEW,
+    Phase.ARCHITECT_REPAIR,
     Phase.ARCHITECT_RECOVERY_DECISION,
     Phase.GITOPS,
 ]
@@ -705,6 +721,8 @@ def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase
                 sup._transition(state, Phase.EXECUTING)
             elif state.phase == Phase.EXECUTING:
                 sup._transition(state, Phase.INTEGRATION_REVIEW)
+            elif state.phase == Phase.QA_REVIEW:
+                sup._transition(state, Phase.INTEGRATION_REVIEW)
             elif state.phase == Phase.INTEGRATION_REVIEW:
                 sup._transition(state, Phase.GITOPS)
             elif state.phase == Phase.GITOPS:
@@ -727,3 +745,99 @@ def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase
     assert step_count < max_steps, f"Phase {agent_phase.name} with behavior '{stub_behavior}' exceeded 30 steps ({step_count})!"
     assert duration < 3.0, f"Phase {agent_phase.name} with behavior '{stub_behavior}' took {duration:.2f}s (exceeded 3.0s)!"
     assert state.phase in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN, Phase.AWAITING_APPROVAL, Phase.BLOCKED)
+
+
+def test_every_terminal_failed_path_creates_rescue_ref_and_crash_bundle(tmp_path: Path):
+    """Every terminal FAILED path writes a rescue ref and crash bundle to the supervisor store outside the workspace."""
+    import subprocess
+    storage_dir = tmp_path / "supervisor_storage"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    store_git = storage_dir / "snapshots.git"
+    store_git.mkdir(parents=True, exist_ok=True)
+    null_dev = "NUL" if sys.platform == "win32" else "/dev/null"
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Supervisor",
+        "GIT_AUTHOR_EMAIL": "supervisor@example.com",
+        "GIT_COMMITTER_NAME": "Supervisor",
+        "GIT_COMMITTER_EMAIL": "supervisor@example.com",
+        "GIT_CONFIG_GLOBAL": null_dev,
+        "GIT_CONFIG_SYSTEM": null_dev,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG": null_dev,
+    }
+    subprocess.run(["git", "init", "--bare"], cwd=store_git, capture_output=True, check=True, env=git_env)
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "main.py").write_text("print('critical production rescue')\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=ws, capture_output=True, check=True, env=git_env)
+    subprocess.run(["git", "add", "main.py"], cwd=ws, capture_output=True, check=True, env=git_env)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=ws, capture_output=True, check=True, env=git_env)
+
+    mgr = StubSessionManager()
+    reaper = ProcessReaper()
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper)
+    sup.state_manager._storage_dir = storage_dir
+
+    # 1. Plan rejection terminal path
+    s_reject = sup.start_run("run-failed-plan-reject", "Goal", ws, "session-r1")
+    s_reject.phase = Phase.AWAITING_APPROVAL
+    sup.reject_plan(s_reject, reason="Architecture plan rejected")
+    assert s_reject.phase == Phase.FAILED
+
+    bundle_dir = storage_dir / "crash_bundles"
+    assert bundle_dir.is_dir()
+    bundles_reject = list(bundle_dir.glob("crash_bundle_run-failed-plan-reject_*.json"))
+    assert len(bundles_reject) == 1
+    assert "rejected" in bundles_reject[0].read_text(encoding="utf-8").lower()
+
+    # Rescue ref exists in external store
+    cat_out = subprocess.run(
+        ["git", "--git-dir", str(store_git), "cat-file", "-p", "refs/rescue/run-failed-plan-reject/failed:main.py"],
+        capture_output=True, text=True, check=True, env=git_env
+    ).stdout
+    assert "print('critical production rescue')" in cat_out
+
+    # 2. Resumes exhausted terminal path
+    s_resume = sup.start_run("run-failed-resumes", "Goal", ws, "session-r2")
+    s_resume.phase = Phase.WAITING_FOR_HUMAN
+    s_resume.human_resumes_used = s_resume.max_human_resumes  # 2
+    res = sup.human_resume(s_resume, reason="excess resume")
+    assert res == AdvanceResult.FAILED
+    assert s_resume.phase == Phase.FAILED
+
+    bundles_resume = list(bundle_dir.glob("crash_bundle_run-failed-resumes_*.json"))
+    assert len(bundles_resume) == 1
+
+    cat_out2 = subprocess.run(
+        ["git", "--git-dir", str(store_git), "cat-file", "-p", "refs/rescue/run-failed-resumes/failed:main.py"],
+        capture_output=True, text=True, check=True, env=git_env
+    ).stdout
+    assert "print('critical production rescue')" in cat_out2
+
+
+def test_legitimate_long_run_below_ci_run_timeout_is_not_aborted(tmp_path: Path):
+    """A legitimate long run executing multiple turns below ci_run_timeout is not aborted."""
+    mgr = StubSessionManager()
+    reaper = ProcessReaper()
+    # Configure ci_run_timeout to 10.0s for test
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, ci_run_timeout=10.0, headless=True)
+    state = sup.start_run("run-legit-long", "Goal", tmp_path, "session-long")
+    state.global_turn_budget = 30
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001"]
+
+    # Run executes actively across multiple simulated steps over 0.2s (< 10.0s)
+    mgr.operations["op-wo1"] = {
+        "operation_id": "op-wo1",
+        "work_order_id": "WO-001",
+        "agent_id": "codex",
+        "role": "backend",
+        "status": "RUNNING",
+    }
+    time.sleep(0.1)
+    res = sup.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.exit_code == 0
