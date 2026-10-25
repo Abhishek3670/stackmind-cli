@@ -638,15 +638,8 @@ class LifecycleSupervisor:
         state.turn_deadline = None
         state.turn_started_at = None
 
-        state.global_turn_budget = max(0, state.global_turn_budget - 1)
-        self._sync_budget_file(state)
-
-        if state.global_turn_budget <= 0:
-            state.budget_exhausted = True
-            state.error = f"BUDGET_EXHAUSTED: Turn timeout in {timeout_phase.value} exhausted global budget."
-            state.exit_code = EXIT_BUDGET_EXHAUSTED
-            self._transition(state, Phase.WAITING_FOR_HUMAN)
-            return AdvanceResult.WAITING_FOR_HUMAN
+        # Note: self._wrap_manager_for_budget already decrements global_turn_budget upon turn dispatch.
+        # No duplicate decrement here to avoid double-charging (Item 4).
 
         if timeout_phase == Phase.EXECUTING:
             wo_id = state.executing_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")

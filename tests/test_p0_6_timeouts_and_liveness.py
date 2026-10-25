@@ -505,3 +505,24 @@ def test_no_resumable_dead_ends_every_waiting_state_reaches_terminal(tmp_path: P
     sup.reject_plan(s4, reason="Architecture unacceptable")
     assert s4.phase == Phase.FAILED
     assert s4.exit_code == EXIT_PLAN_REJECTED
+
+
+def test_turn_timeout_does_not_double_charge_budget(tmp_path: Path):
+    """Dispatching a turn decrements budget once; timing out does NOT double charge."""
+    mgr = StubSessionManager()
+    mgr.next_response_type = "hang"
+    reaper = ProcessReaper()
+    timeouts = {Phase.PLANNING: 0.1}
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, timeouts=timeouts)
+
+    state = sup.start_run("run-no-double-charge", "Goal", tmp_path, "session-1")
+    initial_budget = state.global_turn_budget
+
+    res = sup.advance(state)
+    assert len(mgr.dispatched_turns) == 1
+    assert state.global_turn_budget == initial_budget - 1
+
+    time.sleep(0.15)
+    sup.advance(state)
+
+    assert initial_budget - state.global_turn_budget == len(mgr.dispatched_turns)
