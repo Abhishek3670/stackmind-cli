@@ -302,12 +302,14 @@ class ServiceJobManager:
       Services must write only to stdout/stderr pipes, memory, or external runtime dirs.
     - Persistent services are suspended (NtSuspendProcess) during post-turn diff gate
       evaluation and workspace restore to eliminate race conditions and avoid blame leakage.
+      Suspension covers ALL processes in the service Job Object (trampolines, children, grandchildren).
     - Resumed (NtResumeProcess) after gate evaluation passes.
     """
 
     def __init__(self) -> None:
         self.service_reaper = ProcessReaper()
         self._service_procs: list[subprocess.Popen] = []
+        self._suspended_pids: set[int] = set()
 
     def launch_service(self, args: Sequence[str] | str, **kwargs: Any) -> subprocess.Popen:
         """Launch a persistent service inside the dedicated service Job Object."""
@@ -315,28 +317,89 @@ class ServiceJobManager:
         self._service_procs.append(proc)
         return proc
 
+    def _get_all_service_pids(self) -> set[int]:
+        """Collect all PIDs assigned to the service Job Object and known service procs."""
+        pids: set[int] = {p.pid for p in self._service_procs if p.poll() is None and p.pid > 0}
+        if sys.platform == "win32" and self.service_reaper._job_handle:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            class _HEADER(ctypes.Structure):
+                _fields_ = [
+                    ("NumberOfAssignedProcesses", wintypes.DWORD),
+                    ("NumberOfProcessIdsInList", wintypes.DWORD),
+                    ("ProcessIdList", ctypes.c_size_t * 1),
+                ]
+
+            h = _HEADER()
+            ret_len = wintypes.DWORD()
+            kernel32.QueryInformationJobObject(
+                self.service_reaper._job_handle, 3, ctypes.byref(h), ctypes.sizeof(h), ctypes.byref(ret_len)
+            )
+            count = max(h.NumberOfAssignedProcesses, h.NumberOfProcessIdsInList, 1)
+
+            class _FULL(ctypes.Structure):
+                _fields_ = [
+                    ("NumberOfAssignedProcesses", wintypes.DWORD),
+                    ("NumberOfProcessIdsInList", wintypes.DWORD),
+                    ("ProcessIdList", ctypes.c_size_t * count),
+                ]
+
+            full = _FULL()
+            if kernel32.QueryInformationJobObject(
+                self.service_reaper._job_handle, 3, ctypes.byref(full), ctypes.sizeof(full), ctypes.byref(ret_len)
+            ):
+                for i in range(full.NumberOfProcessIdsInList):
+                    pid_val = int(full.ProcessIdList[i])
+                    if pid_val > 0 and pid_val != os.getpid():
+                        pids.add(pid_val)
+        return pids
+
     def suspend_all(self) -> None:
-        """Suspend all persistent services during diff evaluation and workspace restore."""
+        """Suspend all persistent services and descendants during diff evaluation and workspace restore."""
         if sys.platform == "win32":
             import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             ntdll = ctypes.WinDLL("ntdll")
-            for proc in self._service_procs:
-                if proc.poll() is None and hasattr(proc, "_handle") and proc._handle:
-                    ntdll.NtSuspendProcess(int(proc._handle))
+            PROCESS_SUSPEND_RESUME = 0x0800
+
+            target_pids = self._get_all_service_pids()
+            for pid in target_pids:
+                h = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+                if h:
+                    try:
+                        ntdll.NtSuspendProcess(h)
+                        self._suspended_pids.add(pid)
+                    finally:
+                        kernel32.CloseHandle(h)
 
     def resume_all(self) -> None:
         """Resume all persistent services after gate evaluation and restore complete."""
         if sys.platform == "win32":
             import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             ntdll = ctypes.WinDLL("ntdll")
-            for proc in self._service_procs:
-                if proc.poll() is None and hasattr(proc, "_handle") and proc._handle:
-                    ntdll.NtResumeProcess(int(proc._handle))
+            PROCESS_SUSPEND_RESUME = 0x0800
+
+            for pid in list(self._suspended_pids):
+                h = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+                if h:
+                    try:
+                        ntdll.NtResumeProcess(h)
+                    finally:
+                        kernel32.CloseHandle(h)
+            self._suspended_pids.clear()
 
     def shutdown_services(self) -> list[int]:
         """Terminate all persistent services on supervisor shutdown."""
+        self.resume_all()
         reaped = self.service_reaper.reap_all()
         self._service_procs.clear()
+        self._suspended_pids.clear()
         return reaped
 
 

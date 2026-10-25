@@ -28,8 +28,18 @@ class _RpcError(Exception):
 
 
 class JsonRpcProtocol:
-    def __init__(self, manager: SessionManager) -> None:
+    ADMIN_METHODS = {
+        "run.resume",
+        "run.re_attest",
+        "run.approve",
+        "run.reject",
+        "session.pause",
+        "session.cancel",
+    }
+
+    def __init__(self, manager: SessionManager, auth_token: str | None = None) -> None:
         self.manager = manager
+        self.auth_token = auth_token
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(request, dict):
@@ -73,6 +83,12 @@ class JsonRpcProtocol:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method in self.ADMIN_METHODS and self.auth_token:
+            provided = params.get("auth_token")
+            import hmac
+            if not provided or not hmac.compare_digest(str(provided), self.auth_token):
+                raise PermissionError("Policy denied: Authentication required for administrative method")
+
         if method == "health.version":
             requested = params.get("protocol_version")
             if requested is not None and requested != _PROTOCOL_VERSION:
@@ -184,6 +200,20 @@ class JsonRpcProtocol:
             try:
                 return self.manager.resume_run(
                     params["session_id"], run_id=params.get("run_id")
+                )
+            except (KeyError, ValueError) as error:
+                raise _RpcError(-32003, str(error)) from error
+        if method == "run.re_attest":
+            try:
+                sig = str(params.get("human_signature", "operator"))
+                budget = int(params.get("confirmed_budget", 50))
+                counters = params.get("confirmed_counters")
+                return self.manager.re_attest_run(
+                    params["session_id"],
+                    human_signature=sig,
+                    confirmed_budget=budget,
+                    confirmed_counters=counters,
+                    run_id=params.get("run_id"),
                 )
             except (KeyError, ValueError) as error:
                 raise _RpcError(-32003, str(error)) from error

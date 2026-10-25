@@ -42,6 +42,13 @@ from validators.kernel.turn_snapshot import (
 )
 
 
+def check_strict_skip(reason: str):
+    """Enforce strict security policy: by default, any skip of a security-critical test is a failure."""
+    if os.environ.get("ALLOW_SECURITY_SKIPS") == "1":
+        pytest.skip(f"PERMITTED SKIP: {reason}")
+    pytest.fail(f"STRICT SECURITY FAILURE (Strict mode default): {reason}")
+
+
 @pytest.fixture
 def test_env(tmp_path):
     ws = tmp_path / "workspace"
@@ -357,7 +364,7 @@ def test_symlink_traversal_neutralized(test_env):
         link_path.symlink_to(outside_target)
     except (OSError, NotImplementedError):
         # Explicit status report: Developer Mode / SeCreateSymbolicLinkPrivilege absent
-        pytest.skip("SKIPPED: Developer Mode / SeCreateSymbolicLinkPrivilege absent (WinError 5)")
+        check_strict_skip("Developer Mode / SeCreateSymbolicLinkPrivilege absent (WinError 5)")
 
     assert link_path.is_symlink()
 
@@ -395,7 +402,7 @@ def test_cleanup_does_not_descend_through_junction(test_env):
             junction_created = (res.returncode == 0)
 
     if not junction_created:
-        pytest.skip("SKIPPED: OS environment prevented junction creation")
+        check_strict_skip("OS environment prevented junction creation")
 
     assert junction_path.exists()
 
@@ -450,7 +457,7 @@ def test_replace_tracked_dir_with_junction_restores_cleanly(test_env):
             junction_created = (res.returncode == 0)
 
     if not junction_created:
-        pytest.skip("SKIPPED: OS environment prevented junction creation")
+        check_strict_skip("OS environment prevented junction creation")
 
     # Verify tracked_dir is now a reparse point
     st = os.lstat(str(tracked_dir))
@@ -564,7 +571,7 @@ def test_non_default_ads_wiped_on_unchanged_file(test_env):
         pass
 
     if not ads_supported:
-        pytest.skip("SKIPPED: NTFS ADS not supported on this filesystem")
+        check_strict_skip("NTFS ADS not supported on this filesystem")
 
     assert ads_file.read_text(encoding="utf-8") == "stealth exploit"
 

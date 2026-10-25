@@ -1957,6 +1957,52 @@ class SessionManager:
             self._operation_event.set()
             return state.to_dict()
 
+    def re_attest_run(
+        self,
+        session_id: str,
+        human_signature: str,
+        confirmed_budget: int = 50,
+        confirmed_counters: dict[str, Any] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Re-attest and resume a halted supervisor run after daemon restart."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise KeyError("unknown session")
+            ws = Path(session.get("workspace", ""))
+            target_run_id = run_id
+            if not target_run_id:
+                sup_dir = ws / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    run_files = sorted(sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True)
+                    if run_files:
+                        target_run_id = run_files[0].stem
+            if not target_run_id:
+                raise KeyError("no supervisor run found to re-attest")
+
+            state = self._active_runs.get(target_run_id)
+            if state is None:
+                state = self.supervisor.load_run_state(target_run_id, ws)
+            if state is None:
+                raise KeyError(f"run '{target_run_id}' not found")
+
+            self.supervisor.re_attest_run(
+                state,
+                human_signature=human_signature,
+                confirmed_budget=confirmed_budget,
+                confirmed_counters=confirmed_counters,
+            )
+            self._active_runs[target_run_id] = state
+            self.events.publish(
+                "run.re_attested",
+                session_id,
+                run_id=target_run_id,
+                phase=state.phase.value,
+            )
+            self._save()
+            return state.to_dict()
+
     def synthesize_bootstrap_planning(
         self,
         workspace: Path | str,

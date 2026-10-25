@@ -57,9 +57,27 @@ class LocalDaemon:
         port: int = 0,
         mcp_protocol: Any | None = None,
         runner_factory: Any | None = None,
+        auth_token: str | None = None,
     ) -> None:
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if auth_token is None:
+            token_file = self.state_dir / ".daemon_token"
+            if token_file.is_file():
+                self.auth_token = token_file.read_text(encoding="utf-8").strip()
+            else:
+                import secrets
+                self.auth_token = secrets.token_hex(32)
+                token_file.write_text(self.auth_token, encoding="utf-8")
+                try:
+                    import os
+                    os.chmod(token_file, 0o600)
+                except Exception:
+                    pass
+        else:
+            self.auth_token = auth_token
         self.manager = SessionManager(DaemonStorage(state_dir), runner_factory=runner_factory)
-        self.protocol = JsonRpcProtocol(self.manager)
+        self.protocol = JsonRpcProtocol(self.manager, auth_token=self.auth_token)
         self.mcp_protocol = mcp_protocol
         self._server = _DaemonHTTPServer((host, port), self._handler(), state_dir=Path(state_dir))
         self._thread: Thread | None = None
@@ -170,6 +188,11 @@ class LocalDaemon:
                 if protocol is None:
                     self._send(404, {"error": "MCP is not configured"})
                     return
+                auth_header = self.headers.get("Authorization", "")
+                if auth_header.startswith("Bearer "):
+                    token = auth_header[7:].strip()
+                    if isinstance(request, dict) and isinstance(request.get("params"), dict):
+                        request["params"].setdefault("auth_token", token)
                 response = protocol.handle(request)
                 if response is None:
                     self._send(202, {})

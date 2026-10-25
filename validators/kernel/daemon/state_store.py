@@ -106,7 +106,7 @@ class SupervisorStateManager:
             prev_hmac=self._last_hmac,
             hmac_signature=sig,
             timestamp=now_ts,
-            run_id=getattr(state, "run_id", "default"),
+            run_id=state.get("run_id", "default") if isinstance(state, dict) else getattr(state, "run_id", "default"),
             state_payload=state_dict,
         )
 
@@ -205,3 +205,17 @@ class SupervisorStateManager:
         """Operator explicitly re-attests run after daemon restart."""
         self._attested_runs.add(run_id)
         self.record_journal_event("HUMAN_RE_ATTESTATION", {"run_id": run_id, "reason": reason})
+
+    def load_latest_checkpoint(self, run_id: str) -> dict[str, Any]:
+        """Load and verify the latest checkpoint for run_id from storage dir, failing closed on tampering."""
+        pattern = f"{run_id}_seq_*.json"
+        matching = sorted(self._storage_dir.glob(pattern))
+        if not matching:
+            raise FileNotFoundError(f"No checkpoint file found for run {run_id}")
+        latest_file = matching[-1]
+        try:
+            content = latest_file.read_text(encoding="utf-8")
+            data = json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise StateIntegrityError(f"Corrupted or truncated checkpoint file {latest_file.name}: {exc}") from exc
+        return self.restore_checkpoint(data)

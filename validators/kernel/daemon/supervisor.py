@@ -209,6 +209,9 @@ class RunState:
     blocked_by_escalation: dict[str, str] = field(default_factory=dict)
     wo_dependencies: dict[str, list[str]] = field(default_factory=dict)
     exit_code: int = 0
+    stall_ticks: int = 0
+    max_stall_ticks: int = 3
+    interrupted_phase: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -282,6 +285,9 @@ class RunState:
             "blocked_by_escalation": dict(self.blocked_by_escalation),
             "wo_dependencies": {k: list(v) for k, v in self.wo_dependencies.items()},
             "exit_code": self.exit_code,
+            "stall_ticks": self.stall_ticks,
+            "max_stall_ticks": self.max_stall_ticks,
+            "interrupted_phase": self.interrupted_phase,
         }
 
     @classmethod
@@ -357,6 +363,9 @@ class RunState:
             blocked_by_escalation=dict(data.get("blocked_by_escalation", {}) or {}),
             wo_dependencies=dict(data.get("wo_dependencies", {}) or {}),
             exit_code=int(data.get("exit_code", 0)),
+            stall_ticks=int(data.get("stall_ticks", 0)),
+            max_stall_ticks=int(data.get("max_stall_ticks", 3)),
+            interrupted_phase=data.get("interrupted_phase"),
         )
 
 
@@ -552,6 +561,7 @@ class LifecycleSupervisor:
         )
         if hasattr(self, "state_manager") and self.state_manager is not None:
             self.state_manager.register_state(run_id, state)
+        self._current_state = state
         self._sync_budget_file(state)
         self._transition(state, Phase.PLANNING)
         return state
@@ -609,17 +619,50 @@ class LifecycleSupervisor:
         # An Architect may reopen a completed work order mid-run; run state must
         # not keep treating it as completed (or its old result as authoritative).
         self.reconcile_reopened_work_orders(state)
+        old_phase = state.phase
+        old_budget = state.global_turn_budget
         try:
             res = handler(state)
             state.contention_count = 0
+
+            # Generalized C_stall: Check non-terminal, non-waiting phases for stalled progress
+            terminal_or_waiting = (
+                Phase.COMPLETE,
+                Phase.FAILED,
+                Phase.BLOCKED,
+                Phase.WAITING_FOR_HUMAN,
+                Phase.AWAITING_APPROVAL,
+            )
+            if state.phase not in terminal_or_waiting:
+                phase_changed = (state.phase != old_phase)
+                turn_dispatched = (state.global_turn_budget < old_budget)
+                active_op = self._has_active_operations(state)
+                if phase_changed or turn_dispatched or active_op:
+                    state.stall_ticks = 0
+                else:
+                    state.stall_ticks += 1
+                    if state.stall_ticks >= state.max_stall_ticks:
+                        state.error = (
+                            f"IDLE_STALL (C_stall): Phase {state.phase.value} stalled for "
+                            f"{state.stall_ticks} consecutive ticks with no active operations "
+                            "and no eligible transitions. Stalled awaiting human intervention."
+                        )
+                        state.exit_code = EXIT_RETRIES_EXHAUSTED
+                        self._transition(state, Phase.WAITING_FOR_HUMAN)
+                        return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.stall_ticks = 0
+
             return res
         except BudgetExhaustedError as exc:
             state.budget_exhausted = True
+            state.stall_ticks = 0
             state.error = f"BUDGET_EXHAUSTED: {exc}"
             state.exit_code = EXIT_BUDGET_EXHAUSTED
             self._transition(state, Phase.WAITING_FOR_HUMAN)
             return AdvanceResult.WAITING_FOR_HUMAN
         except OperationContentionError as exc:
+            state.stall_ticks = 0
             threads_alive = False
             if hasattr(self.manager, "_turn_threads"):
                 threads_alive = any(t.is_alive() for t in getattr(self.manager, "_turn_threads", {}).values())
@@ -640,6 +683,7 @@ class LifecycleSupervisor:
             # Fallback for mock session managers or unmigrated call sites
             err_str = str(exc).lower()
             if "running root operation" in err_str or "active operation" in err_str:
+                state.stall_ticks = 0
                 threads_alive = False
                 if hasattr(self.manager, "_turn_threads"):
                     threads_alive = any(t.is_alive() for t in getattr(self.manager, "_turn_threads", {}).values())
@@ -1602,15 +1646,11 @@ class LifecycleSupervisor:
             return AdvanceResult.TRANSITIONED
 
         # Idle stall condition (C_stall):
-        # C_stall <=> (phase == EXECUTING) and (not all_done) and (turns_dispatched == 0) and (active_in_flight_ops == 0)
+        # When all remaining work orders are blocked or waiting on unmet dependencies with no turns
+        # in progress, return WAITING_FOR_OPERATION so the generalized C_stall in advance() tracks
+        # consecutive ticks and transitions to WAITING_FOR_HUMAN upon reaching max_stall_ticks.
         if not all_done and turns_dispatched == 0 and active_in_flight_ops == 0 and not state.dependency_escalation_op_id:
-            state.error = (
-                "IDLE_STALL (C_stall): All remaining work orders are blocked or waiting on "
-                "unmet dependencies with no active turns in progress. Stalled awaiting human intervention."
-            )
-            state.exit_code = EXIT_RETRIES_EXHAUSTED
-            self._transition(state, Phase.WAITING_FOR_HUMAN)
-            return AdvanceResult.WAITING_FOR_HUMAN
+            return AdvanceResult.WAITING_FOR_OPERATION
 
         return AdvanceResult.WAITING_FOR_OPERATION
 
@@ -4523,6 +4563,8 @@ class LifecycleSupervisor:
     def _transition(self, state: RunState, new_phase: Phase) -> None:
         """Record a phase transition in the run state."""
         now = _now()
+        if new_phase == Phase.WAITING_FOR_HUMAN and state.phase != Phase.WAITING_FOR_HUMAN:
+            state.interrupted_phase = state.phase.value
         state.transitions.append({
             "from": state.phase.value,
             "to": new_phase.value,
@@ -4751,6 +4793,45 @@ class LifecycleSupervisor:
         if op is None:
             return False
         return str(op.get("status", "")).upper() not in _OPERATION_TERMINAL
+
+    def _has_active_operations(self, state: RunState) -> bool:
+        """Check if any asynchronous operation or worker thread is actively in-flight."""
+        # 1. Active worker threads
+        if hasattr(self.manager, "_turn_threads"):
+            if any(t.is_alive() for t in getattr(self.manager, "_turn_threads", {}).values()):
+                return True
+
+        # 2. Tracked state operation IDs
+        tracked_op_ids = [
+            state.planning_operation_id,
+            state.authoring_operation_id,
+            state.architect_repair_operation_id,
+            state.recovery_decision_operation_id,
+            state.integration_operation_id,
+            state.gitops_operation_id,
+            state.dependency_escalation_op_id,
+            state.batch_operation_id,
+        ]
+        for op_id in tracked_op_ids:
+            if op_id:
+                op = self._get_operation(op_id)
+                if op and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                    return True
+
+        # 3. Work order running operations
+        for wo_id in state.worker_wo_ids:
+            if self._is_wo_running(state, wo_id):
+                return True
+
+        # 4. Session-level active operation
+        if hasattr(self.manager, "_sessions"):
+            sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+            if sess and sess.get("active_operation"):
+                act_op = self._get_operation(sess.get("active_operation"))
+                if act_op and str(act_op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                    return True
+
+        return False
 
     def _discover_worker_wos(self, state: RunState) -> None:
         """Read .sync/work-orders/ACTIVE/ to find all worker WOs (excluding WO-000)."""
@@ -5246,6 +5327,7 @@ class LifecycleSupervisor:
         reset_counters: list[str] | None = None,
         additional_budget: int | None = None,
         new_budget: int | None = None,
+        target_phase: Phase | None = None,
     ) -> AdvanceResult:
         """Resume a halted run via explicit, logged, and bounded human override."""
         if not reason or not str(reason).strip():
@@ -5321,8 +5403,85 @@ class LifecycleSupervisor:
         self._sync_budget_file(state)
         state.error = None
         state.exit_code = EXIT_SUCCESS
-        target_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
-        self._transition(state, target_phase)
+        state.stall_ticks = 0
+        if target_phase is not None:
+            dest_phase = target_phase
+        elif state.interrupted_phase and state.interrupted_phase not in (Phase.WAITING_FOR_HUMAN.value, Phase.FAILED.value, Phase.BLOCKED.value):
+            try:
+                dest_phase = Phase(state.interrupted_phase)
+            except ValueError:
+                dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+        else:
+            dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+        self._transition(state, dest_phase)
+        return AdvanceResult.TRANSITIONED
+
+    def re_attest_run(
+        self,
+        state: RunState,
+        human_signature: str,
+        confirmed_budget: int | None = None,
+        confirmed_counters: dict[str, Any] | None = None,
+        target_phase: Phase | None = None,
+    ) -> AdvanceResult:
+        """Re-attest and resume a run halted due to daemon restart or integrity fail-closed.
+
+        Per Amendment A / Item 3:
+        1. On daemon restart, the in-memory HMAC key is lost and re-generated, so pre-restart
+           checkpoint files on disk cannot be verified cryptographically and are UNTRUSTED HINTS.
+        2. The human supplies the authoritative budget (`confirmed_budget > 0`). If not supplied,
+           raises ValueError.
+        3. Restored counters MAY NOT BE LOWER than the last values confirmed out-of-band by the human
+           (preventing an adversary from editing on-disk checkpoints to silently reset retry counters).
+        4. Does NOT increment state.human_resumes_used (daemon restart is not an override of budget/policy).
+        5. Returns to the interrupted phase recorded in the checkpoint (or PLANNING if unstarted).
+        """
+        if not human_signature or not str(human_signature).strip():
+            raise ValueError("Human re-attestation requires a valid signature / credential.")
+
+        if confirmed_budget is None or not isinstance(confirmed_budget, int) or confirmed_budget <= 0:
+            raise ValueError("Human re-attestation requires an explicit confirmed_budget > 0.")
+
+        state.error = None
+        state.exit_code = EXIT_SUCCESS
+        state.stall_ticks = 0
+
+        # Human supplies authoritative budget:
+        state.global_turn_budget = confirmed_budget
+        state.budget_exhausted = False
+
+        # Restored counters may not be lower than the confirmed values:
+        if confirmed_counters:
+            conf_gitops = int(confirmed_counters.get("gitops_retries", 0))
+            if state.gitops_retries < conf_gitops:
+                state.gitops_retries = conf_gitops
+
+            conf_workers = dict(confirmed_counters.get("worker_retries", {}) or {})
+            for wo, retries in conf_workers.items():
+                state.worker_retries[wo] = max(state.worker_retries.get(wo, 0), int(retries))
+
+            conf_qa = dict(confirmed_counters.get("qa_reworks", {}) or {})
+            for wo, reworks in conf_qa.items():
+                state.qa_reworks[wo] = max(state.qa_reworks.get(wo, 0), int(reworks))
+
+        # Mark attested in in-memory state manager if present
+        if hasattr(self, "state_manager") and self.state_manager is not None:
+            self.state_manager.register_state(state.run_id, state)
+            self.state_manager.re_attest_run(state.run_id, f"Human re-attestation by {human_signature}")
+            self.state_manager.create_checkpoint(state, workspace=state.workspace)
+
+        # Determine target resume phase: explicit target, or recorded interrupted phase, or PLANNING
+        resume_phase = target_phase
+        if resume_phase is None and state.interrupted_phase:
+            try:
+                resume_phase = Phase(state.interrupted_phase)
+            except ValueError:
+                resume_phase = None
+
+        if resume_phase is None or resume_phase == Phase.WAITING_FOR_HUMAN:
+            resume_phase = Phase.EXECUTING if state.worker_wo_ids else Phase.PLANNING
+
+        self._transition(state, resume_phase)
         return AdvanceResult.TRANSITIONED
 
     def escalate_wo_to_recovery(self, state: RunState, wo_id: str, reason: str = "") -> None:
