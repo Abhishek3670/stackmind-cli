@@ -28,6 +28,13 @@ import pytest
 
 from validators.kernel.daemon.supervisor import (
     AdvanceResult,
+    EXIT_BUDGET_EXHAUSTED,
+    EXIT_FAILURE,
+    EXIT_HEADLESS_TIMEOUT,
+    EXIT_INTEGRITY_VIOLATION,
+    EXIT_PLAN_REJECTED,
+    EXIT_RETRIES_EXHAUSTED,
+    EXIT_SUCCESS,
     LifecycleSupervisor,
     Phase,
     RunState,
@@ -464,6 +471,53 @@ def test_exit_code_table_mapping(tmp_path: Path):
     s_integrity.exit_code = 5
     s_integrity.error = "DAEMON_RESTART_FAIL_CLOSED: In-memory session key lost"
     assert sup.get_exit_code(s_integrity) == 5
+
+
+def test_exit_code_table_is_stable():
+    """Assert the full published exit-code table mapping is strictly stable and immutable."""
+    from validators.kernel.daemon.supervisor import (
+        EXIT_SUCCESS,
+        EXIT_FAILURE,
+        EXIT_BUDGET_EXHAUSTED,
+        EXIT_RETRIES_EXHAUSTED,
+        EXIT_PLAN_REJECTED,
+        EXIT_INTEGRITY_VIOLATION,
+        EXIT_HEADLESS_TIMEOUT,
+    )
+    assert EXIT_SUCCESS == 0
+    assert EXIT_FAILURE == 1
+    assert EXIT_BUDGET_EXHAUSTED == 2
+    assert EXIT_RETRIES_EXHAUSTED == 3
+    assert EXIT_PLAN_REJECTED == 4
+    assert EXIT_INTEGRITY_VIOLATION == 5
+    assert EXIT_HEADLESS_TIMEOUT == 137
+
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    state = sup.start_run("r-table", "Goal", Path("."), "s-table")
+
+    state.phase = Phase.COMPLETE
+    assert sup.get_exit_code(state) == 0
+
+    state.phase = Phase.FAILED
+    state.exit_code = 1
+    assert sup.get_exit_code(state) == 1
+
+    state.phase = Phase.WAITING_FOR_HUMAN
+    state.exit_code = 2
+    assert sup.get_exit_code(state) == 2
+
+    state.exit_code = 3
+    assert sup.get_exit_code(state) == 3
+
+    state.exit_code = 4
+    assert sup.get_exit_code(state) == 4
+
+    state.exit_code = 5
+    assert sup.get_exit_code(state) == 5
+
+    state.exit_code = 137
+    assert sup.get_exit_code(state, is_headless_abort=True) == 137
 
 
 # ==============================================================================
