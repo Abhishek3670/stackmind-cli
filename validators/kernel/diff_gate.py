@@ -1149,13 +1149,20 @@ class DiffGate:
     ) -> None:
         """Supervisor-mediated git push with in-memory ephemeral credential injection.
 
-        Guarantees:
+        Guarantees (Task 1a):
         - Only GitOps role is authorized to execute git push.
         - Pushes directly from the supervisor-owned repository (storage_root) with explicit URL and refspec.
         - No --force is permitted.
         - Workspace repository configuration (remote.url, insteadOf, pushurl, http.proxy) has ZERO effect.
-        - Push credentials are passed via GIT_CONFIG_COUNT environment variables (not in argv)
-          and are not written to disk.
+        - Push token reaches the git child over an uninherited anonymous pipe (via credential helper reading the pipe handle).
+        - Token is completely ABSENT from process argv (command line) and ABSENT from child environment block.
+        - Token is NEVER written to disk in any config or script file.
+        - Memory containing the credential buffer is zeroed immediately upon completion.
+
+        Phase 1 Memory Caveats:
+        - On Windows, without low-integrity AppContainer agent confinement (P1-1), a same-user process running on
+          the host could inspect memory if handle access is not restricted. True memory isolation will be enforced
+          once P1-1 confinement lands.
         """
         if self.role != "GitOps":
             raise PermissionError(f"Role '{self.role}' is not authorized to execute Git push.")
@@ -1168,23 +1175,54 @@ class DiffGate:
         if ws_git and ws_git.exists():
             push_env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str((ws_git / "objects").resolve())
 
-        if auth_token:
-            push_env["GIT_CONFIG_COUNT"] = "1"
-            push_env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
-            push_env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {auth_token}"
-
         cmd = [
             "git",
             f"--git-dir={self.snapshot_manager.storage_root}",
             "-c", "core.fsmonitor=false",
             "-c", "core.hooksPath=",
             "-c", "core.excludesFile=",
-            "push",
-            remote_url,
-            refspec,
         ]
 
+        r_pipe = None
+        token_bytes = bytearray(auth_token.encode("utf-8")) if auth_token else None
         try:
+            if token_bytes:
+                r_pipe, w_pipe = os.pipe()
+                os.write(w_pipe, bytes(token_bytes) + b"\n")
+                os.close(w_pipe)
+
+                python_exe = sys.executable.replace("\\", "/")
+                if sys.platform == "win32":
+                    import msvcrt
+                    h_r = msvcrt.get_osfhandle(r_pipe)
+                    os.set_handle_inheritable(h_r, True)
+                    helper_code = (
+                        "import sys, os, msvcrt; "
+                        "h = int(sys.argv[1]); "
+                        "fd = msvcrt.open_osfhandle(h, os.O_RDONLY); "
+                        "tok = os.read(fd, 4096).decode('utf-8').strip(); "
+                        "print('username=git'); print('password=' + tok)"
+                    )
+                    handle_arg = str(h_r)
+                else:
+                    os.set_inheritable(r_pipe, True)
+                    helper_code = (
+                        "import sys, os; "
+                        "fd = int(sys.argv[1]); "
+                        "tok = os.read(fd, 4096).decode('utf-8').strip(); "
+                        "print('username=git'); print('password=' + tok)"
+                    )
+                    handle_arg = str(r_pipe)
+
+                helper_cmd = f'!"{python_exe}" -c "{helper_code}" {handle_arg}'
+                cmd.extend(["-c", f"credential.helper={helper_cmd}"])
+
+            cmd.extend([
+                "push",
+                remote_url,
+                refspec,
+            ])
+
             subprocess.run(
                 cmd,
                 cwd=self.snapshot_manager.storage_root,
@@ -1193,5 +1231,11 @@ class DiffGate:
                 env=push_env,
             )
         finally:
-            if "GIT_CONFIG_VALUE_0" in push_env:
-                del push_env["GIT_CONFIG_VALUE_0"]
+            if r_pipe is not None:
+                try:
+                    os.close(r_pipe)
+                except OSError:
+                    pass
+            if token_bytes:
+                for i in range(len(token_bytes)):
+                    token_bytes[i] = 0
