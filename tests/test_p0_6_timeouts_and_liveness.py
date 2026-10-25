@@ -465,3 +465,43 @@ def test_ci_wait_timeout_does_not_abort_long_run_without_human_wait(tmp_path: Pa
     assert state.phase == Phase.EXECUTING
     assert state.exit_code == 0
     assert state.error is None
+
+
+def test_no_resumable_dead_ends_every_waiting_state_reaches_terminal(tmp_path: Path):
+    """From every WAITING_FOR_HUMAN reachable state, there is a verified path to terminal in bounded steps."""
+    from validators.kernel.daemon.supervisor import (
+        EXIT_FAILURE,
+        EXIT_BUDGET_EXHAUSTED,
+        EXIT_RETRIES_EXHAUSTED,
+        EXIT_PLAN_REJECTED,
+        EXIT_HEADLESS_TIMEOUT,
+    )
+    mgr = StubSessionManager()
+    sup = LifecycleSupervisor(manager=mgr)
+
+    s1 = sup.start_run("r-dead-1", "Goal", tmp_path, "s1")
+    s1.phase = Phase.WAITING_FOR_HUMAN
+    s1.human_resumes_used = s1.max_human_resumes
+    res1 = sup.human_resume(s1, reason="attempt resume when exhausted")
+    assert res1 == AdvanceResult.FAILED
+    assert s1.phase == Phase.FAILED
+
+    s2 = sup.start_run("r-dead-2", "Goal", tmp_path, "s2")
+    s2.daemon_restarts = s2.max_daemon_restarts
+    with pytest.raises(ValueError, match="maximum allowed daemon restarts"):
+        sup.re_attest_run(s2, human_signature="admin", confirmed_budget=10)
+    assert s2.phase == Phase.FAILED
+
+    s3 = sup.start_run("r-dead-3", "Goal", tmp_path, "s3")
+    s3.phase = Phase.WAITING_FOR_HUMAN
+    s3.global_turn_budget = 5
+    s3.human_resumes_used = s3.max_human_resumes
+    with pytest.raises(ValueError, match="human resume cap .* is exhausted"):
+        sup.re_attest_run(s3, human_signature="admin", confirmed_budget=10)
+    assert s3.phase == Phase.FAILED
+
+    s4 = sup.start_run("r-dead-4", "Goal", tmp_path, "s4")
+    s4.phase = Phase.AWAITING_APPROVAL
+    sup.reject_plan(s4, reason="Architecture unacceptable")
+    assert s4.phase == Phase.FAILED
+    assert s4.exit_code == EXIT_PLAN_REJECTED

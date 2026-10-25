@@ -747,9 +747,9 @@ class LifecycleSupervisor:
                 pass
 
         state.exit_code = EXIT_HEADLESS_TIMEOUT  # 137
-        state.error = f"HEADLESS_CI_TIMEOUT: Total wall-clock time exceeded {self.ci_wait_timeout}s."
-        self._transition(state, Phase.WAITING_FOR_HUMAN)
-        return AdvanceResult.WAITING_FOR_HUMAN
+        state.error = err_msg
+        self._transition(state, Phase.FAILED)
+        return AdvanceResult.FAILED
 
     def _wrap_manager_for_budget(self) -> None:
         """Intercept manager.start_turn to enforce global turn budget decrement."""
@@ -5651,6 +5651,18 @@ class LifecycleSupervisor:
         "global_turn_budget",
     }
 
+    def reject_plan(self, state: RunState, reason: str = "") -> AdvanceResult:
+        """Explicit operator rejection of the proposed architecture plan."""
+        state.error = f"PLAN_REJECTED: {reason or 'Human operator rejected proposed plan'}"
+        state.exit_code = EXIT_PLAN_REJECTED  # 4
+        self._transition(state, Phase.FAILED)
+        return AdvanceResult.FAILED
+
+    def approve_plan(self, state: RunState) -> AdvanceResult:
+        """Explicit operator approval of the proposed architecture plan."""
+        self._transition(state, Phase.AUTHORING)
+        return AdvanceResult.TRANSITIONED
+
     def resume_run_with_human_override(
         self,
         state: RunState,
@@ -5747,6 +5759,8 @@ class LifecycleSupervisor:
         self._transition(state, dest_phase)
         return AdvanceResult.TRANSITIONED
 
+    human_resume = resume_run_with_human_override
+
     def re_attest_run(
         self,
         state: RunState,
@@ -5775,7 +5789,7 @@ class LifecycleSupervisor:
 
         # 1. Enforce restart cap to prevent crash-loops from acting as budget refills
         if state.daemon_restarts >= state.max_daemon_restarts:
-            state.phase = Phase.WAITING_FOR_HUMAN
+            state.phase = Phase.FAILED
             state.error = f"MAX_DAEMON_RESTARTS_EXCEEDED: run reached restart cap ({state.max_daemon_restarts})"
             state.exit_code = EXIT_RETRIES_EXHAUSTED
             raise ValueError(f"Run reached maximum allowed daemon restarts ({state.max_daemon_restarts}).")
@@ -5785,6 +5799,9 @@ class LifecycleSupervisor:
         prior_budget = state.global_turn_budget
         if confirmed_budget > prior_budget:
             if state.human_resumes_used >= state.max_human_resumes:
+                state.phase = Phase.FAILED
+                state.error = f"Confirmed budget ({confirmed_budget}) exceeds prior budget ({prior_budget}) and human resume cap is exhausted."
+                state.exit_code = EXIT_BUDGET_EXHAUSTED
                 raise ValueError(
                     f"Confirmed budget ({confirmed_budget}) exceeds prior budget ({prior_budget}) and "
                     f"human resume cap ({state.max_human_resumes}) is exhausted."

@@ -885,7 +885,8 @@ def test_re_attest_restart_cap_and_budget_rules(tmp_path: Path):
     with pytest.raises(ValueError, match="maximum allowed daemon restarts"):
         sup.re_attest_run(state, human_signature="lead", confirmed_budget=15)
 
-    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.phase == Phase.FAILED
+    assert state.exit_code == EXIT_RETRIES_EXHAUSTED
     assert "MAX_DAEMON_RESTARTS_EXCEEDED" in str(state.error)
 
 
