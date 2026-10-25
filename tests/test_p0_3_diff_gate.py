@@ -823,7 +823,7 @@ def test_commit_tree_verified_against_derived_tree_before_ref_update(gate_env, m
             pre_turn_snapshot_sha=pre_sha,
         )
 
-    # Assert branch ref did not move — remains completely untouched!
+    # Assert branch ref did not move â€” remains completely untouched!
     current_head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ws, capture_output=True, text=True, check=True, env=git_env
     ).stdout.strip()
@@ -951,6 +951,40 @@ def test_service_job_manager_suspended_during_diff_evaluation_and_restore(gate_e
     service_mgr.shutdown_services()
     time.sleep(0.1)
     assert service_proc.poll() is not None
+
+
+def test_persistent_service_writing_between_turns_flagged_by_comparing_against_previous_post_turn_snapshot(gate_env, tmp_path: Path):
+    """A persistent service writing between turns is detected by comparing against previous post-turn snapshot, not fresh pre-turn."""
+    ws, store, snapshot_mgr, reaper, git_env = gate_env
+    service_mgr = ServiceJobManager()
+
+    (ws / "src").mkdir(parents=True, exist_ok=True)
+    (ws / "src" / "app.py").write_text("print('version 1')\n", encoding="utf-8")
+    turn_0_snap = snapshot_mgr.create_turn_snapshot("turn-0")
+
+    (ws / "src" / "app.py").write_text("print('version 2')\n", encoding="utf-8")
+    contract_t1 = AgentContract(agent_id="be", work_order="WO-001", allow=("src/**",), deny=(), write_mode="read-write")
+    gate_t1 = DiffGate(workspace=ws, snapshot_manager=snapshot_mgr, role="backend", contract=contract_t1, reaper=reaper)
+    res_t1 = gate_t1.evaluate_turn(pre_turn_snapshot_sha=turn_0_snap, turn_id="turn-1")
+    assert res_t1.passed is True
+
+    post_turn_1_snap = snapshot_mgr.create_turn_snapshot("turn-1-post")
+
+    rogue_file = ws / "src" / "unauthorized_service_log.txt"
+    rogue_file.write_text("SERVICE LOG DATA WRITTEN BETWEEN TURNS\n", encoding="utf-8")
+
+    fresh_naive_pre_snap = snapshot_mgr.create_turn_snapshot("turn-2-fresh-naive")
+
+    contract_t2 = AgentContract(agent_id="qa", work_order="WO-002", allow=("tests/**",), deny=(), write_mode="read-write")
+    gate_t2 = DiffGate(workspace=ws, snapshot_manager=snapshot_mgr, role="qa", contract=contract_t2, reaper=reaper)
+
+    res_naive = gate_t2.evaluate_turn(pre_turn_snapshot_sha=fresh_naive_pre_snap, turn_id="turn-2-naive")
+    assert res_naive.passed is True
+
+    res_hardened = gate_t2.evaluate_turn(pre_turn_snapshot_sha=post_turn_1_snap, turn_id="turn-2-hardened")
+    assert res_hardened.passed is False
+    assert any("unauthorized_service_log.txt" in v.path for v in res_hardened.violations)
+    assert not rogue_file.exists()
 
 
 # ==============================================================================

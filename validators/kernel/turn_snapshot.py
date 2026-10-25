@@ -518,16 +518,30 @@ class TurnSnapshotManager:
         self._verify_store_integrity()
 
         # 3. Check ref in external store
-        ref_name = f"refs/stackmind/turn/{turn_id}"
+        if turn_id.startswith("refs/"):
+            ref_name = turn_id
+        else:
+            ref_name = f"refs/stackmind/turn/{turn_id}"
         res = self._git_run(
             ["rev-parse", "--verify", "--quiet", ref_name],
             check=False,
         )
         if res.returncode != 0:
-            raise SnapshotIntegrityError(
-                f"Snapshot integrity verification failed: ref '{ref_name}' not found."
-            )
-        actual_sha = res.stdout.strip()
+            if expected_sha:
+                # Check if expected_sha is a valid object in the external store
+                tree_res = self._git_run(["cat-file", "-e", f"{expected_sha}^{{tree}}"], check=False)
+                if tree_res.returncode == 0:
+                    actual_sha = expected_sha
+                else:
+                    raise SnapshotIntegrityError(
+                        f"Snapshot integrity verification failed: ref '{ref_name}' not found and sha '{expected_sha}' not in store."
+                    )
+            else:
+                raise SnapshotIntegrityError(
+                    f"Snapshot integrity verification failed: ref '{ref_name}' not found."
+                )
+        else:
+            actual_sha = res.stdout.strip()
 
         target_expected = expected_sha or self.snapshot_shas.get(turn_id)
         if target_expected and actual_sha != target_expected:
