@@ -238,15 +238,45 @@ def test_human_override_bounded_and_logged(tmp_path: Path):
     state.global_turn_budget = 0
     state.gitops_retries = 2
 
-    # 1st resume: succeeds, logs, and resets specified counters
+    # Resume without additional_budget when budget is exhausted MUST raise ValueError
+    with pytest.raises(ValueError) as exc_budget:
+        sup.resume_run_with_human_override(
+            state,
+            reason="Attempt without budget grant",
+            reset_counters=["gitops_retries"],
+        )
+    assert "requires additional_budget > 0" in str(exc_budget.value)
+
+    # Resume with wildcard "all" MUST raise ValueError
+    with pytest.raises(ValueError) as exc_all:
+        sup.resume_run_with_human_override(
+            state,
+            reason="Attempt with wildcard all",
+            reset_counters=["all"],
+            additional_budget=10,
+        )
+    assert "wildcard 'all' is prohibited" in str(exc_all.value).lower()
+
+    # Resume with invalid counter MUST raise ValueError
+    with pytest.raises(ValueError) as exc_invalid:
+        sup.resume_run_with_human_override(
+            state,
+            reason="Attempt with invalid counter",
+            reset_counters=["non_existent_counter"],
+            additional_budget=10,
+        )
+    assert "invalid reset counter" in str(exc_invalid.value).lower()
+
+    # 1st resume: succeeds, logs, grants budget, and resets specified counters
     res1 = sup.resume_run_with_human_override(
         state,
         reason="Operator approved extra turn budget and retry reset",
         reset_counters=["gitops_retries", "global_turn_budget"],
+        additional_budget=15,
     )
     assert state.human_resumes_used == 1
     assert state.gitops_retries == 0
-    assert state.global_turn_budget > 0
+    assert state.global_turn_budget == 15
     assert len(state.human_override_logs) == 1
     assert state.human_override_logs[0]["reason"] == "Operator approved extra turn budget and retry reset"
 
@@ -254,11 +284,12 @@ def test_human_override_bounded_and_logged(tmp_path: Path):
     state.phase = Phase.WAITING_FOR_HUMAN
     state.global_turn_budget = 0
 
-    # 2nd resume: succeeds
+    # 2nd resume: succeeds with additional budget
     res2 = sup.resume_run_with_human_override(
         state,
         reason="Second operator extension",
         reset_counters=["global_turn_budget"],
+        additional_budget=10,
     )
     assert state.human_resumes_used == 2
     assert len(state.human_override_logs) == 2
@@ -268,6 +299,7 @@ def test_human_override_bounded_and_logged(tmp_path: Path):
     res3 = sup.resume_run_with_human_override(
         state,
         reason="Third resume attempt should be denied",
+        additional_budget=10,
     )
     assert res3 == AdvanceResult.FAILED
     assert state.phase == Phase.FAILED
@@ -423,3 +455,234 @@ def test_exit_code_table_mapping(tmp_path: Path):
     s_headless.error = "Headless CI timeout expired in WAITING_FOR_HUMAN"
     s_headless.phase = Phase.FAILED
     assert sup.get_exit_code(s_headless, is_headless_abort=True) == 137
+
+    # 7. WAITING_FOR_HUMAN (Integrity Violation / Daemon Restart) -> 5
+    s_integrity = sup.start_run("r7", "Goal", tmp_path, "s7")
+    s_integrity.phase = Phase.WAITING_FOR_HUMAN
+    s_integrity.exit_code = 5
+    s_integrity.error = "DAEMON_RESTART_FAIL_CLOSED: In-memory session key lost"
+    assert sup.get_exit_code(s_integrity) == 5
+
+
+# ==============================================================================
+# 9. Amendment A: Authoritative State Location & HMAC Signatures
+# ==============================================================================
+
+def test_agent_edits_workspace_state_file_has_no_effect(tmp_path: Path):
+    """Authoritative state lives in memory; edits to workspace state files are ignored."""
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    state = sup.start_run("run-tamper-test", "Goal", tmp_path, "session-1")
+    initial_budget = state.global_turn_budget
+
+    # Adversary agent tampers with workspace shadow copies
+    ws = Path(state.workspace)
+    shadow_budget = ws / ".sync" / "runtime" / "supervisor" / "budget.json"
+    shadow_yaml = ws / ".sync" / "runtime" / "supervisor" / f"{state.run_id}.yaml"
+
+    assert shadow_budget.exists()
+    assert shadow_yaml.exists()
+
+    # Agent inflates budget to 99999 and clears retries in workspace
+    shadow_budget.write_text(json.dumps({"remaining_turn_budget": 99999}), encoding="utf-8")
+    shadow_yaml.write_text("global_turn_budget: 99999\nphase: COMPLETE\n", encoding="utf-8")
+
+    # Supervisor loads state - reads strictly from memory, not workspace
+    loaded_state = sup.load_run_state(state.run_id, ws, state_manager=sup.state_manager)
+    assert loaded_state is not None
+    assert loaded_state.global_turn_budget == initial_budget
+    assert loaded_state.global_turn_budget != 99999
+    assert loaded_state.phase == Phase.PLANNING
+
+
+def test_daemon_restart_fails_closed_to_waiting_for_human(tmp_path: Path):
+    """Daemon restart without in-memory secret fails closed requiring human re-attestation."""
+    mgr = DummyOperationManager()
+    sup1 = LifecycleSupervisor(manager=mgr)
+    state = sup1.start_run("run-restart-test", "Goal", tmp_path, "session-1")
+
+    # Fast-forward to AWAITING_APPROVAL
+    state.phase = Phase.AWAITING_APPROVAL
+
+    # Daemon crashes / restarts: new supervisor instance with fresh unshared state_manager
+    from validators.kernel.daemon.state_store import SupervisorStateManager
+    fresh_mgr = SupervisorStateManager()  # New random 32-byte secret, empty attested set
+    sup2 = LifecycleSupervisor(manager=mgr, state_manager=fresh_mgr)
+
+    # Calling advance on un-attested run fails closed immediately
+    res = sup2.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 5
+    assert "daemon_restart_fail_closed" in str(state.error).lower()
+
+    # Human operator performs out-of-band attestation and resumes run
+    sup2.state_manager.re_attest_run(state.run_id, reason="Operator confirmed daemon restart legitimacy")
+    assert sup2.state_manager.is_run_attested(state.run_id) is True
+
+    # Calling resume_run_with_human_override transitions run out of WAITING_FOR_HUMAN
+    res_after = sup2.resume_run_with_human_override(state, reason="Operator resumed post-attestation", additional_budget=10)
+    assert res_after == AdvanceResult.TRANSITIONED
+    assert state.phase != Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 0
+
+
+def test_replay_older_signed_checkpoint_rejected(tmp_path: Path):
+    """Older signed checkpoints cannot be replayed past in-memory sequence number."""
+    from validators.kernel.daemon.state_store import SupervisorStateManager, ReplayAttackError
+    store = SupervisorStateManager(storage_dir=tmp_path / "checkpoints")
+
+    class FakeState:
+        def __init__(self, run_id: str, seq_val: int):
+            self.run_id = run_id
+            self.value = seq_val
+        def to_dict(self):
+            return {"run_id": self.run_id, "value": self.value}
+
+    s1 = FakeState("run-replay", 10)
+    cp1 = store.create_checkpoint(s1)
+    assert cp1.seq == 1
+
+    s2 = FakeState("run-replay", 20)
+    cp2 = store.create_checkpoint(s2)
+    assert cp2.seq == 2
+
+    s3 = FakeState("run-replay", 30)
+    cp3 = store.create_checkpoint(s3)
+    assert cp3.seq == 3
+
+    # Attempting to restore older checkpoint cp1 (seq 1) when store sequence is 3
+    with pytest.raises(ReplayAttackError) as exc_info:
+        store.restore_checkpoint(cp1.to_dict())
+    assert "replay attack detected" in str(exc_info.value).lower()
+
+
+# ==============================================================================
+# 10. Idle Stall (C_stall) Transition
+# ==============================================================================
+
+def test_idle_stall_transitions_to_waiting_for_human(tmp_path: Path):
+    """When no work orders are dispatchable and no turns are running, supervisor enters WAITING_FOR_HUMAN."""
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    state = sup.start_run("run-idle-stall", "Goal", tmp_path, "session-1")
+
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001", "WO-002"]
+    state.published_wo_ids = ["WO-001", "WO-002"]
+
+    # WO-001 is in recovery (blocked by escalation)
+    state.recovery_attempts["WO-001"] = 1
+    state.recovery_wo_id = "WO-001"
+    sup.set_wo_dependencies(state, "WO-002", ["WO-001"])
+    sup.evaluate_blocked_by_escalation(state)
+
+    assert "WO-002" in state.blocked_by_escalation
+
+    # Advance while in EXECUTING with no active turns and no dispatchable WOs
+    res = sup.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 3
+    assert "idle_stall" in str(state.error).lower()
+
+
+# ==============================================================================
+# 11. Tool Registry Isolation for Human Resume
+# ==============================================================================
+
+def test_human_resume_not_callable_from_agent_tools():
+    """Agent tool definitions must never expose supervisor management methods."""
+    from validators.kernel.daemon.supervisor import LifecycleSupervisor
+    assert hasattr(LifecycleSupervisor, "resume_run_with_human_override")
+    import importlib
+    tool_module = importlib.import_module("validators.kernel.tools") if importlib.util.find_spec("validators.kernel.tools") else None
+    if tool_module and hasattr(tool_module, "TOOL_REGISTRY"):
+        assert "resume_run_with_human_override" not in tool_module.TOOL_REGISTRY
+
+
+# ==============================================================================
+# 12. Budget Exhaustion vs Contention Isolation
+# ==============================================================================
+
+def test_budget_exhaustion_not_retried_by_contention_path(tmp_path: Path):
+    """Budget exhaustion must transition immediately to WAITING_FOR_HUMAN without contention retries."""
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    state = sup.start_run("run-contention-test", "Goal", tmp_path, "session-1")
+
+    state.phase = Phase.EXECUTING
+    state.global_turn_budget = 0
+    state.contention_count = 0
+
+    res = sup.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.contention_count == 0  # Contention retry loop was not invoked
+    assert state.exit_code == 2
+
+
+# ==============================================================================
+# 13. Failing-First Behavioral Comparisons (Old vs New)
+# ==============================================================================
+
+def test_rev2_cycle_behavioral_comparison_old_vs_new(tmp_path: Path):
+    """Demonstrate actual behavioral difference between unconstrained loop and bounded gitops_retries."""
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    state = sup.start_run("run-comp-rev2", "Goal", tmp_path, "session-1")
+    state.phase = Phase.GITOPS
+    state.gitops_wo_id = "WO-GITOPS"
+
+    # Simulate 5 consecutive GitOps failures
+    outcomes = []
+    for i in range(1, 6):
+        op_id = f"op-fail-{i}"
+        mgr.operations[op_id] = {
+            "operation_id": op_id,
+            "status": "BLOCKED",
+            "result": {"status": "blocked", "error": f"Rejection {i}"},
+        }
+        state.gitops_operation_id = op_id
+        res = sup.advance(state)
+        outcomes.append((state.gitops_retries, state.phase, res))
+        if state.phase == Phase.WAITING_FOR_HUMAN:
+            break
+
+    # Old unbounded code would loop 5+ times; new code halts strictly after 2 retries on 3rd failure
+    assert len(outcomes) == 3
+    assert outcomes[0] == (1, Phase.GITOPS, AdvanceResult.WAITING_FOR_OPERATION)
+    assert outcomes[1] == (2, Phase.GITOPS, AdvanceResult.WAITING_FOR_OPERATION)
+    assert outcomes[2] == (2, Phase.WAITING_FOR_HUMAN, AdvanceResult.WAITING_FOR_HUMAN)
+
+
+def test_multi_wo_behavioral_comparison_run_wide_vs_per_wo(tmp_path: Path):
+    """Demonstrate per-WO rework isolation prevents premature run-wide exhaustion across 10 WOs."""
+    mgr = DummyOperationManager()
+    sup = LifecycleSupervisor(manager=mgr)
+    state = sup.start_run("run-comp-10wo", "Goal", tmp_path, "session-1")
+    state.worker_wo_ids = [f"WO-{i:03d}" for i in range(1, 11)]
+
+    # Dynamic budget scaling allocates B = 18 + 5 * 10 = 68 turns
+    n_wos = len(state.worker_wo_ids)
+    budget = 18 + 5 * n_wos
+    state.global_turn_budget = budget
+    state.initial_turn_budget = budget
+
+    # WO-001 reworks twice (reaching max_qa_reworks = 2)
+    state.qa_reworks["WO-001"] = 2
+    # WO-002 reworks once
+    state.qa_reworks["WO-002"] = 1
+
+    # In a naive run-wide model (sum >= 2), total reworks (3) would abort the entire run.
+    # In the per-WO model:
+    # WO-001 exceeding reworks escalates ONLY WO-001 to Architect recovery
+    sup.escalate_wo_to_recovery(state, "WO-001", reason="WO-001 QA rework limit reached")
+
+    assert state.recovery_wo_id == "WO-001"
+    # WO-002 through WO-010 are NOT halted or failed
+    assert "WO-002" not in state.failed_wo_ids
+    assert state.qa_reworks["WO-002"] < state.max_qa_reworks
+    assert state.global_turn_budget == 68

@@ -102,6 +102,29 @@ class OperationContentionError(ValueError):
     pass
 
 
+class BudgetExhaustedError(Exception):
+    """Raised when the global turn budget reaches 0 and no further turns can be dispatched."""
+    pass
+
+
+# ─── Standard StackMind Unified Exit Codes ────────────────────────────
+EXIT_SUCCESS = 0
+EXIT_FAILURE = 1
+EXIT_BUDGET_EXHAUSTED = 2
+EXIT_RETRIES_EXHAUSTED = 3
+EXIT_PLAN_REJECTED = 4
+EXIT_INTEGRITY_VIOLATION = 5
+EXIT_HEADLESS_TIMEOUT = 137
+
+
+from .state_store import (
+    DaemonRestartFailClosedError,
+    ReplayAttackError,
+    StateIntegrityError,
+    SupervisorStateManager,
+)
+
+
 # ─── Run state ────────────────────────────────────────────────────────
 
 @dataclass
@@ -415,10 +438,16 @@ class LifecycleSupervisor:
                 time.sleep(2)
     """
 
-    def __init__(self, manager: Any, max_contention_retries: int = 50) -> None:
+    def __init__(
+        self,
+        manager: Any,
+        max_contention_retries: int = 50,
+        state_manager: SupervisorStateManager | None = None,
+    ) -> None:
         """Initialise with a SessionManager (or compatible mock)."""
         self.manager = manager
         self.max_contention_retries = max_contention_retries
+        self.state_manager = state_manager or SupervisorStateManager()
         self._current_state: RunState | None = None
         self._wrap_manager_for_budget()
 
@@ -434,9 +463,9 @@ class LifecycleSupervisor:
                 if state.global_turn_budget <= 0:
                     state.budget_exhausted = True
                     state.error = "BUDGET_EXHAUSTED: Global turn budget (B) reached 0."
-                    state.exit_code = 2
+                    state.exit_code = EXIT_BUDGET_EXHAUSTED
                     self._transition(state, Phase.WAITING_FOR_HUMAN)
-                    raise OperationContentionError("Global turn budget exhausted.")
+                    raise BudgetExhaustedError("Global turn budget exhausted.")
                 state.global_turn_budget -= 1
                 self._sync_budget_file(state)
             return original_start_turn(*args, **kwargs)
@@ -444,12 +473,18 @@ class LifecycleSupervisor:
         self.manager.start_turn = hooked_start_turn
 
     def _sync_budget_file(self, state: RunState) -> None:
-        """Persist remaining and initial turn budget to supervisor storage."""
+        """Persist remaining and initial turn budget to external checkpoint and shadow file."""
+        if hasattr(self, "state_manager") and self.state_manager is not None:
+            try:
+                self.state_manager.create_checkpoint(state, workspace=state.workspace)
+            except Exception:
+                pass
         try:
             ws = Path(state.workspace)
             b_file = ws / ".sync" / "runtime" / "supervisor" / "budget.json"
             b_file.parent.mkdir(parents=True, exist_ok=True)
             b_data = {
+                "_comment": "SHADOW READ-ONLY COPY -- NOT AN INPUT TO SUPERVISOR ADVANCE LOOP",
                 "remaining_turn_budget": state.global_turn_budget,
                 "initial_turn_budget": state.initial_turn_budget,
                 "budget_exhausted": bool(state.budget_exhausted),
@@ -515,6 +550,8 @@ class LifecycleSupervisor:
             created_at=now,
             updated_at=now,
         )
+        if hasattr(self, "state_manager") and self.state_manager is not None:
+            self.state_manager.register_state(run_id, state)
         self._sync_budget_file(state)
         self._transition(state, Phase.PLANNING)
         return state
@@ -532,10 +569,20 @@ class LifecycleSupervisor:
         predictable and auditable.
         """
         self._current_state = state
+        if hasattr(self, "state_manager") and self.state_manager is not None:
+            if not self.state_manager.is_run_attested(state.run_id):
+                state.error = (
+                    "DAEMON_RESTART_FAIL_CLOSED: In-memory session key lost on daemon restart. "
+                    "Human re-attestation required."
+                )
+                state.exit_code = EXIT_INTEGRITY_VIOLATION
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+
         if state.global_turn_budget <= 0 and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN):
             state.budget_exhausted = True
             state.error = "BUDGET_EXHAUSTED: Global turn budget (B) reached 0."
-            state.exit_code = 2
+            state.exit_code = EXIT_BUDGET_EXHAUSTED
             self._transition(state, Phase.WAITING_FOR_HUMAN)
             return AdvanceResult.WAITING_FOR_HUMAN
 
@@ -566,6 +613,12 @@ class LifecycleSupervisor:
             res = handler(state)
             state.contention_count = 0
             return res
+        except BudgetExhaustedError as exc:
+            state.budget_exhausted = True
+            state.error = f"BUDGET_EXHAUSTED: {exc}"
+            state.exit_code = EXIT_BUDGET_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
         except OperationContentionError as exc:
             threads_alive = False
             if hasattr(self.manager, "_turn_threads"):
@@ -1308,6 +1361,12 @@ class LifecycleSupervisor:
         """EXECUTING: monitor worker operations and QA flow."""
         ws = Path(state.workspace)
         all_done = True
+        turns_dispatched = 0
+        active_in_flight_ops = 0
+
+        # Check turn threads on manager if available
+        if hasattr(self.manager, "_turn_threads"):
+            active_in_flight_ops += sum(1 for t in getattr(self.manager, "_turn_threads", {}).values() if t.is_alive())
 
         # S6 Concurrency: Reconcile batch operation if one is tracked.
         # If all its child operations have reached terminal state, finalize the container
@@ -1335,6 +1394,7 @@ class LifecycleSupervisor:
             escalation = self._poll_dependency_escalation(state, ws)
             if escalation is not None:
                 return escalation
+            active_in_flight_ops += 1
 
         if not state.worker_wo_ids:
             self._discover_worker_wos(state)
@@ -1369,6 +1429,14 @@ class LifecycleSupervisor:
             op = self._find_latest_wo_operation(state, wo_id)
             if op is None:
                 # Not dispatched yet — check deps and dispatch
+                if (
+                    wo_id in state.blocked_by_escalation
+                    or wo_id in state.blocked_wo_ids
+                    or wo_id == state.recovery_wo_id
+                    or state.recovery_attempts.get(wo_id, 0) > 0
+                ):
+                    all_done = False
+                    continue
                 pending_rework = state.qa_rework_targets.get(wo_id)
                 if pending_rework:
                     if all(t in state.completed_wo_ids for t in pending_rework):
@@ -1392,6 +1460,7 @@ class LifecycleSupervisor:
                                 work_order_id=wo_id,
                                 parent_operation_id=state.batch_operation_id,
                             )
+                            turns_dispatched += 1
                         except OperationContentionError:
                             all_done = False
                             continue
@@ -1402,6 +1471,7 @@ class LifecycleSupervisor:
 
             status = str(op.get("status", "")).upper()
             if status not in _OPERATION_TERMINAL:
+                active_in_flight_ops += 1
                 all_done = False
                 continue
 
@@ -1425,6 +1495,7 @@ class LifecycleSupervisor:
                     return AdvanceResult.TRANSITIONED
                 state.worker_retries[wo_id] = retries + 1
                 if self._retry_worker(state, ws, wo_id, lambda n, a: f"Retry work order {wo_id} (attempt {n})"):
+                    turns_dispatched += 1
                     all_done = False
                 continue
 
@@ -1457,6 +1528,7 @@ class LifecycleSupervisor:
                     return prompt
 
                 if self._retry_worker(state, ws, wo_id, _missing_prompt):
+                    turns_dispatched += 1
                     all_done = False
                 continue
 
@@ -1502,6 +1574,7 @@ class LifecycleSupervisor:
                     return f"{head}:\n{feedback}" if feedback else head
 
                 if self._retry_worker(state, ws, wo_id, _rework_prompt):
+                    turns_dispatched += 1
                     all_done = False
                 continue
 
@@ -1527,6 +1600,17 @@ class LifecycleSupervisor:
             self._close_batch_operation(state, "COMPLETED")
             self._transition(state, Phase.INTEGRATION_REVIEW)
             return AdvanceResult.TRANSITIONED
+
+        # Idle stall condition (C_stall):
+        # C_stall <=> (phase == EXECUTING) and (not all_done) and (turns_dispatched == 0) and (active_in_flight_ops == 0)
+        if not all_done and turns_dispatched == 0 and active_in_flight_ops == 0 and not state.dependency_escalation_op_id:
+            state.error = (
+                "IDLE_STALL (C_stall): All remaining work orders are blocked or waiting on "
+                "unmet dependencies with no active turns in progress. Stalled awaiting human intervention."
+            )
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
 
         return AdvanceResult.WAITING_FOR_OPERATION
 
@@ -4725,6 +4809,14 @@ class LifecycleSupervisor:
 
     def _dependencies_met(self, state: RunState, wo_id: str, ws: Path) -> bool:
         """Check that all dependencies of a WO are in completed_wo_ids."""
+        if wo_id in state.blocked_by_escalation:
+            return False
+        # Check explicit dependencies in state
+        for dep in state.wo_dependencies.get(wo_id, []):
+            dep_str = str(dep).strip()
+            if dep_str and dep_str not in state.completed_wo_ids:
+                if dep_str != state.planning_wo_id and dep_str != "WO-000":
+                    return False
         wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if not wo_file.exists():
             return True  # No file means no declared dependencies
@@ -5083,27 +5175,51 @@ class LifecycleSupervisor:
 
     # ── Persistence ───────────────────────────────────────────────────
 
-    @staticmethod
-    def save_run_state(state: RunState, ws: Path) -> Path:
-        """Persist run state to .sync/runtime/supervisor/<run_id>.yaml."""
+    @classmethod
+    def save_run_state(
+        cls,
+        state: RunState,
+        ws: Path,
+        state_manager: SupervisorStateManager | None = None,
+    ) -> Path:
+        """Persist authoritative state in memory/HMAC store and mirror shadow telemetry.
+
+        Per Amendment A: Authoritative state is kept in memory and signed checkpoints outside
+        the workspace. Workspace copy is write-only shadow telemetry.
+        """
+        if state_manager is not None:
+            state_manager.register_state(state.run_id, state)
+            state_manager.create_checkpoint(state, workspace=ws)
+
         state_dir = ws / ".sync" / "runtime" / "supervisor"
         state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / f"{state.run_id}.yaml"
-        path.write_text(yaml.safe_dump(state.to_dict(), sort_keys=False), encoding="utf-8")
+        header = (
+            "# =====================================================================\n"
+            "# SHADOW TELEMETRY COPY ONLY -- NOT AN INPUT TO SUPERVISOR ADVANCE LOOP\n"
+            "# Authoritative state is maintained in supervisor memory with HMAC chain.\n"
+            "# Any edits made here by agents or child processes will be ignored.\n"
+            "# =====================================================================\n"
+        )
+        path.write_text(header + yaml.safe_dump(state.to_dict(), sort_keys=False), encoding="utf-8")
         return path
 
-    @staticmethod
-    def load_run_state(run_id: str, ws: Path) -> RunState | None:
-        """Load a previously persisted run state."""
-        path = ws / ".sync" / "runtime" / "supervisor" / f"{run_id}.yaml"
-        if not path.exists():
-            return None
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return RunState.from_dict(data)
-        except Exception:
-            pass
+    @classmethod
+    def load_run_state(
+        cls,
+        run_id: str,
+        ws: Path | None = None,
+        state_manager: SupervisorStateManager | None = None,
+    ) -> RunState | None:
+        """Load authoritative run state from supervisor memory.
+
+        Per Amendment A: Workspace copies are never inputs. Authoritative state lives strictly
+        in supervisor memory or signed external checkpoints.
+        """
+        if state_manager is not None:
+            s = state_manager.get_state(run_id)
+            if s is not None:
+                return s
         return None
 
     @staticmethod
@@ -5116,60 +5232,95 @@ class LifecycleSupervisor:
 
     # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
 
+    VALID_RESETTABLE_COUNTERS = {
+        "gitops_retries",
+        "qa_reworks",
+        "worker_retries",
+        "global_turn_budget",
+    }
+
     def resume_run_with_human_override(
         self,
         state: RunState,
         reason: str,
         reset_counters: list[str] | None = None,
+        additional_budget: int | None = None,
         new_budget: int | None = None,
     ) -> AdvanceResult:
         """Resume a halted run via explicit, logged, and bounded human override."""
+        if not reason or not str(reason).strip():
+            raise ValueError("Human override resume requires an explicit non-empty reason.")
+
         if state.human_resumes_used >= state.max_human_resumes:
             state.error = (
                 f"Maximum human resumes ({state.max_human_resumes}) exceeded. Run permanently failed."
             )
-            state.exit_code = 1
+            state.exit_code = EXIT_FAILURE
             self._transition(state, Phase.FAILED)
             return AdvanceResult.FAILED
+
+        counters = list(reset_counters or [])
+        # Check for invalid counter names or wildcard "all"
+        for c in counters:
+            if c not in self.VALID_RESETTABLE_COUNTERS:
+                raise ValueError(
+                    f"Invalid reset counter '{c}'. Wildcard 'all' is prohibited; "
+                    f"must be one of {sorted(self.VALID_RESETTABLE_COUNTERS)}"
+                )
+
+        # If budget was exhausted, require additional budget > 0
+        budget_grant = 0
+        if state.budget_exhausted or state.global_turn_budget <= 0:
+            if additional_budget is not None and additional_budget > 0:
+                budget_grant = additional_budget
+            elif new_budget is not None and new_budget > 0:
+                budget_grant = new_budget
+            else:
+                raise ValueError(
+                    "Global turn budget is exhausted; human override resume requires "
+                    "additional_budget > 0 to continue."
+                )
 
         state.human_resumes_used += 1
         prev_phase = state.phase.value
 
-        # Log human override explicitly
         log_entry = {
             "timestamp": _now(),
             "resumes_count": state.human_resumes_used,
-            "reason": reason,
-            "reset_counters": list(reset_counters or []),
+            "reason": str(reason).strip(),
+            "reset_counters": counters,
+            "additional_budget": budget_grant,
             "previous_phase": prev_phase,
         }
         state.human_override_logs.append(log_entry)
 
-        # Reset requested named counters
-        if reset_counters:
-            for c in reset_counters:
-                if c == "gitops_retries":
-                    state.gitops_retries = 0
-                elif c == "qa_reworks":
-                    state.qa_reworks.clear()
-                elif c == "worker_retries":
-                    state.worker_retries.clear()
-                elif c == "global_turn_budget":
-                    state.global_turn_budget = new_budget or state.initial_turn_budget
-                    state.budget_exhausted = False
-                elif c == "all":
-                    state.gitops_retries = 0
-                    state.qa_reworks.clear()
-                    state.worker_retries.clear()
-                    state.global_turn_budget = new_budget or state.initial_turn_budget
-                    state.budget_exhausted = False
+        # Record override event in HMAC journal chain
+        if hasattr(self, "state_manager") and self.state_manager is not None:
+            try:
+                self.state_manager.record_journal_event("HUMAN_RESUME_OVERRIDE", log_entry)
+            except Exception:
+                pass
 
-        if state.global_turn_budget <= 0:
-            state.global_turn_budget = new_budget or state.initial_turn_budget
+        # Reset requested named counters
+        for c in counters:
+            if c == "gitops_retries":
+                state.gitops_retries = 0
+            elif c == "qa_reworks":
+                state.qa_reworks.clear()
+            elif c == "worker_retries":
+                state.worker_retries.clear()
+            elif c == "global_turn_budget":
+                state.global_turn_budget = budget_grant if budget_grant > 0 else (new_budget or state.initial_turn_budget)
+                state.budget_exhausted = False
+
+        if budget_grant > 0:
+            if "global_turn_budget" not in counters:
+                state.global_turn_budget += budget_grant
             state.budget_exhausted = False
 
         self._sync_budget_file(state)
         state.error = None
+        state.exit_code = EXIT_SUCCESS
         target_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
         self._transition(state, target_phase)
         return AdvanceResult.TRANSITIONED
@@ -5220,27 +5371,33 @@ class LifecycleSupervisor:
     def get_exit_code(self, state: RunState, is_headless_abort: bool = False) -> int:
         """Map current run state to standard StackMind exit code table."""
         if is_headless_abort:
-            return 137
+            return EXIT_HEADLESS_TIMEOUT  # 137
+        if state.exit_code == EXIT_INTEGRITY_VIOLATION or any(
+            kw in str(state.error).lower() for kw in ("daemon_restart", "replay", "integrity", "tamper")
+        ):
+            return EXIT_INTEGRITY_VIOLATION  # 5
         if state.phase == Phase.COMPLETE:
-            return 0
+            return EXIT_SUCCESS  # 0
         if state.phase == Phase.FAILED:
-            return 1
+            return EXIT_FAILURE  # 1
         if state.phase in (Phase.WAITING_FOR_HUMAN, Phase.BLOCKED):
+            if state.exit_code in (EXIT_BUDGET_EXHAUSTED, EXIT_RETRIES_EXHAUSTED, EXIT_PLAN_REJECTED, EXIT_INTEGRITY_VIOLATION):
+                return state.exit_code
             if state.budget_exhausted or state.global_turn_budget <= 0:
-                return 2
+                return EXIT_BUDGET_EXHAUSTED  # 2
             if state.gitops_retries >= state.max_gitops_retries:
-                return 3
+                return EXIT_RETRIES_EXHAUSTED  # 3
             for w, r in state.qa_reworks.items():
                 if r >= state.max_qa_reworks:
-                    return 3
+                    return EXIT_RETRIES_EXHAUSTED  # 3
             for w, r in state.worker_retries.items():
                 if r >= state.max_worker_retries:
-                    return 3
+                    return EXIT_RETRIES_EXHAUSTED  # 3
             if state.phase == Phase.AWAITING_APPROVAL or "plan" in str(state.error).lower():
-                return 4
-            return 2
+                return EXIT_PLAN_REJECTED  # 4
+            return state.exit_code or EXIT_FAILURE
         if state.phase == Phase.AWAITING_APPROVAL:
-            return 4
+            return EXIT_PLAN_REJECTED  # 4
         return state.exit_code
 
 
