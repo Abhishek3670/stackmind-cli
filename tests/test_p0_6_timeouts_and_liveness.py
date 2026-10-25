@@ -441,3 +441,27 @@ def test_stub_agent_liveness_suite_terminates_in_bounded_steps(tmp_path: Path, s
     assert step_count < max_steps, f"Run with behavior '{stub_behavior}' exceeded step ceiling ({max_steps})!"
     assert duration < 5.0, f"Run with behavior '{stub_behavior}' exceeded wall-clock ceiling (took {duration:.2f}s)!"
     assert state.phase in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN, Phase.BLOCKED, Phase.AWAITING_APPROVAL)
+
+
+def test_ci_wait_timeout_does_not_abort_long_run_without_human_wait(tmp_path: Path):
+    """ci_wait_timeout measures time waiting for human; an active running turn is NOT aborted."""
+    mgr = StubSessionManager()
+    mgr.operations["op-wo1"] = {
+        "operation_id": "op-wo1",
+        "work_order_id": "WO-001",
+        "agent_id": "codex",
+        "role": "backend",
+        "status": "RUNNING",
+    }
+    sup = LifecycleSupervisor(manager=mgr, ci_wait_timeout=0.1, timeouts={Phase.EXECUTING: 5.0}, headless=True)
+    state = sup.start_run("run-long-active", "Goal", tmp_path, "session-1")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001"]
+
+    time.sleep(0.15)
+    res = sup.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.exit_code == 0
+    assert state.error is None
