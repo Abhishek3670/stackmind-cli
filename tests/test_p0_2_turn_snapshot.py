@@ -295,7 +295,10 @@ def test_deleted_store_directory_raises_integrity_error(test_env):
         except OSError:
             pass
 
-    shutil.rmtree(store, onexc=_force_rm_readonly)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(store, onexc=_force_rm_readonly)
+    else:
+        shutil.rmtree(store, onerror=_force_rm_readonly)
 
     with pytest.raises(SnapshotIntegrityError) as exc_info:
         manager.restore_turn_snapshot("turn-1", expected_sha=snap_sha)
