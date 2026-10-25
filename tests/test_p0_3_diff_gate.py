@@ -1039,7 +1039,11 @@ def test_service_job_manager_suspended_during_diff_evaluation_and_restore(gate_e
     )
 
     service_proc = service_mgr.launch_service([sys.executable, str(writer_script)])
-    time.sleep(0.2)
+    t0 = time.time()
+    while time.time() - t0 < 3.0:
+        if log_file.is_file() and log_file.stat().st_size > 0:
+            break
+        time.sleep(0.05)
     assert log_file.is_file() and log_file.stat().st_size > 0
 
     # 1. Suspend all services via NtSuspendProcess
