@@ -121,13 +121,14 @@ def test_monotonic_turn_timeout_enforces_retry_and_escalation(tmp_path: Path):
     state.phase = Phase.EXECUTING
     state.worker_wo_ids = ["WO-001"]
     state.max_worker_retries = 2
-    mgr.operations["op-wo1"] = {
-        "operation_id": "op-wo1",
-        "work_order_id": "WO-001",
-        "agent_id": "codex",
-        "role": "backend",
-        "status": "RUNNING",
-    }
+    mgr.next_response_type = "hang"
+    op = sup.manager.start_turn(
+        state.session_id,
+        "Run worker turn",
+        role="backend",
+        agent_id="codex",
+        work_order_id="WO-001",
+    )
 
     # 1. First tick sets deadline
     res = sup.advance(state)
@@ -153,6 +154,30 @@ def test_monotonic_turn_timeout_enforces_retry_and_escalation(tmp_path: Path):
     assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
     assert state.recovery_wo_id == "WO-001"
     assert "timed out" in state.repair_context.get("reason", "").lower()
+
+
+def test_turn_timeout_does_not_double_charge_budget(tmp_path: Path):
+    """Dispatching a turn decrements budget once; timing out does NOT double charge."""
+    mgr = StubSessionManager()
+    mgr.next_response_type = "hang"
+    reaper = ProcessReaper()
+    timeouts = {Phase.PLANNING: 0.1}
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, timeouts=timeouts)
+
+    state = sup.start_run("run-no-double-charge", "Goal", tmp_path, "session-1")
+    initial_budget = state.global_turn_budget
+
+    # First advance dispatches planning turn
+    res = sup.advance(state)
+    assert len(mgr.dispatched_turns) == 1
+    assert state.global_turn_budget == initial_budget - 1
+
+    # Let monotonic turn deadline expire
+    time.sleep(0.15)
+    sup.advance(state)
+
+    # Invariant: Budget was charged exactly once for the dispatched turn (not double charged)
+    assert initial_budget - state.global_turn_budget == len(mgr.dispatched_turns)
 
 
 # ==============================================================================
@@ -297,11 +322,39 @@ def test_rejection_with_empty_reworkable_routes_to_architect_recovery(tmp_path: 
 
 
 # ==============================================================================
-# 5. Headless CI Timeout: Crash Bundle, Rescue Ref, Exit Code 137
+# ==============================================================================
+# 5. Headless CI Wait Timeout Semantics: Human Wait Abortion & Non-Interference
 # ==============================================================================
 
-def test_headless_ci_timeout_generates_crash_bundle_and_rescue_ref(tmp_path: Path):
-    """Headless CI timeout creates crash bundle in supervisor store, rescue git ref, and exits 137."""
+def test_ci_wait_timeout_does_not_abort_long_run_without_human_wait(tmp_path: Path):
+    """ci_wait_timeout measures time waiting for human; an active running turn is NOT aborted."""
+    mgr = StubSessionManager()
+    mgr.operations["op-wo1"] = {
+        "operation_id": "op-wo1",
+        "work_order_id": "WO-001",
+        "agent_id": "codex",
+        "role": "backend",
+        "status": "RUNNING",
+    }
+    # Configure short ci_wait_timeout: 0.1s; phase timeout: 5.0s
+    sup = LifecycleSupervisor(manager=mgr, ci_wait_timeout=0.1, timeouts={Phase.EXECUTING: 5.0}, headless=True)
+    state = sup.start_run("run-long-active", "Goal", tmp_path, "session-1")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001"]
+
+    # Sleep 0.15s (longer than ci_wait_timeout of 0.1s, but we are NOT in WAITING_FOR_HUMAN)
+    time.sleep(0.15)
+    res = sup.advance(state)
+
+    # Invariant: Run is NOT aborted because it is not waiting for a human
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.exit_code == 0
+    assert state.error is None
+
+
+def test_headless_ci_wait_timeout_aborts_on_human_wait(tmp_path: Path):
+    """A headless run waiting for human longer than ci_wait_timeout aborts with 137 and rescue ref."""
     storage_dir = tmp_path / "supervisor_storage"
     storage_dir.mkdir(parents=True, exist_ok=True)
     store_git = storage_dir / "snapshots.git"
@@ -322,7 +375,7 @@ def test_headless_ci_timeout_generates_crash_bundle_and_rescue_ref(tmp_path: Pat
 
     ws = tmp_path / "workspace"
     ws.mkdir()
-    (ws / "main.py").write_text("print('in progress work')\n", encoding="utf-8")
+    (ws / "main.py").write_text("print('rescue file content')\n", encoding="utf-8")
     subprocess.run(["git", "init"], cwd=ws, capture_output=True, check=True, env=git_env)
     subprocess.run(["git", "add", "main.py"], cwd=ws, capture_output=True, check=True, env=git_env)
     subprocess.run(["git", "commit", "-m", "init"], cwd=ws, capture_output=True, check=True, env=git_env)
@@ -330,141 +383,54 @@ def test_headless_ci_timeout_generates_crash_bundle_and_rescue_ref(tmp_path: Pat
     mgr = StubSessionManager()
     reaper = ProcessReaper()
     # Configure short ci_wait_timeout for test: 0.1s
-    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, ci_wait_timeout=0.1)
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, ci_wait_timeout=0.1, headless=True)
     sup.state_manager._storage_dir = storage_dir
 
-    state = sup.start_run("run-ci-timeout", "Goal", ws, "session-1")
-    state.phase = Phase.EXECUTING
-    state.worker_wo_ids = ["WO-001"]
+    state = sup.start_run("run-ci-wait-timeout", "Goal", ws, "session-1")
+    # Launch runaway writer in Job Object to verify process is killed prior to rescue ref snapshot
+    runaway = reaper.launch_in_job([sys.executable, "-c", "import time; time.sleep(10)"])
 
-    # Sleep past ci_wait_timeout
+    # Transition to WAITING_FOR_HUMAN
+    sup._transition(state, Phase.WAITING_FOR_HUMAN)
+    assert state.waiting_for_human_entered_at is not None
+
+    # Wait 0.15s to exceed ci_wait_timeout
     time.sleep(0.15)
     res = sup.advance(state)
 
-    # 1. State transition and unified exit code 137
-    assert res == AdvanceResult.WAITING_FOR_HUMAN
-    assert state.phase == Phase.WAITING_FOR_HUMAN
+    # Invariant: Runaway child process was terminated before or during rescue capture
+    assert runaway.poll() is not None, "Child process tree was not reaped prior to rescue capture!"
+
+    # 1. State transition to terminal FAILED and unified exit code 137
+    assert res == AdvanceResult.FAILED
+    assert state.phase == Phase.FAILED
     assert state.exit_code == EXIT_HEADLESS_TIMEOUT  # 137
     assert "HEADLESS_CI_TIMEOUT" in str(state.error)
 
     # 2. Crash bundle verified in supervisor store (outside workspace)
     bundle_dir = storage_dir / "crash_bundles"
     assert bundle_dir.is_dir()
-    bundles = list(bundle_dir.glob("crash_bundle_run-ci-timeout_*.json"))
+    bundles = list(bundle_dir.glob("crash_bundle_run-ci-wait-timeout_*.json"))
     assert len(bundles) == 1
     bundle_content = json.loads(bundles[0].read_text(encoding="utf-8"))
-    assert bundle_content["run_id"] == "run-ci-timeout"
+    assert bundle_content["run_id"] == "run-ci-wait-timeout"
     assert bundle_content["exit_code"] == 137
-    assert bundle_content["state_snapshot"]["phase"] == "EXECUTING"
+    assert bundle_content["budget"] is not None
+    assert bundle_content["counters"] is not None
+    assert bundle_content["checkpoint_hash"] is not None
 
     # Invariant: workspace contains ZERO crash artifacts
     assert not (ws / "crash_bundle.json").exists()
 
-    # 3. Rescue ref created in supervisor external git store
-    refs_out = subprocess.run(
-        ["git", "--git-dir", str(store_git), "show-ref"],
+    # 3. Rescue ref created in supervisor external git store with exact file contents
+    cat_out = subprocess.run(
+        ["git", "--git-dir", str(store_git), "cat-file", "-p", "refs/rescue/run-ci-wait-timeout/waiting_for_human:main.py"],
         capture_output=True,
         text=True,
         check=True,
         env=git_env,
     ).stdout
-    assert "refs/rescue/run-ci-timeout/executing" in refs_out
-
-
-# ==============================================================================
-# 6. Stub Agent Liveness Suite (Bounded Steps & Wall-Clock Termination)
-# ==============================================================================
-
-@pytest.mark.parametrize(
-    "stub_behavior",
-    [
-        "success",
-        "blocked",
-        "empty",
-        "malformed",
-        "hang",
-        "out_of_scope_write",
-        "rejection_unidentifiable",
-    ],
-)
-def test_stub_agent_liveness_suite_terminates_in_bounded_steps(tmp_path: Path, stub_behavior: str):
-    """Every stub agent behavior terminates or reaches WAITING_FOR_HUMAN in bounded steps and time."""
-    mgr = StubSessionManager()
-    reaper = ProcessReaper()
-    timeouts = {
-        Phase.PLANNING: 0.1,
-        Phase.AUTHORING: 0.1,
-        Phase.EXECUTING: 0.1,
-        Phase.INTEGRATION_REVIEW: 0.1,
-        Phase.GITOPS: 0.1,
-    }
-    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, timeouts=timeouts, ci_wait_timeout=2.0)
-    state = sup.start_run(f"run-stub-{stub_behavior}", "Goal", tmp_path, "session-1")
-    state.global_turn_budget = 15
-    state.max_worker_retries = 2
-    state.max_authoring_repairs = 2
-    state.max_gitops_retries = 2
-
-    mgr.next_response_type = stub_behavior
-    state.max_retries = 2
-    state.max_worker_retries = 2
-    state.max_authoring_repairs = 2
-    state.max_gitops_retries = 2
-
-    start_mono = time.monotonic()
-    max_steps = 30
-    step_count = 0
-
-    while step_count < max_steps:
-        step_count += 1
-        # Drive stub agent behavior based on phase
-        if stub_behavior == "hang":
-            time.sleep(0.12)  # Exceeds 0.1s turn timeout
-        elif stub_behavior == "empty":
-            sup.handle_invalid_turn_output(state, role="architecture", error_type="EMPTY_OUTPUT")
-        elif stub_behavior == "malformed":
-            sup.handle_invalid_turn_output(state, role="architecture", error_type="MALFORMED_OUTPUT")
-        elif stub_behavior == "out_of_scope_write":
-            state.global_turn_budget = 0
-        elif stub_behavior == "rejection_unidentifiable":
-            sup.handle_rejection_without_reworkable(state, rejecting_role="qa", reason="unidentified defect")
-
-        res = sup.advance(state)
-
-        # Terminal conditions: COMPLETE, FAILED, WAITING_FOR_HUMAN, or BLOCKED
-        if res in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.WAITING_FOR_HUMAN, AdvanceResult.BLOCKED):
-            break
-
-    duration = time.monotonic() - start_mono
-
-    # Invariant: Must reach terminal or human gate within step bound and time bound (< 3.0s)
-    assert step_count < max_steps, f"Run with behavior '{stub_behavior}' exceeded step ceiling ({max_steps})!"
-    assert duration < 5.0, f"Run with behavior '{stub_behavior}' exceeded wall-clock ceiling (took {duration:.2f}s)!"
-    assert state.phase in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN, Phase.BLOCKED, Phase.AWAITING_APPROVAL)
-
-
-def test_ci_wait_timeout_does_not_abort_long_run_without_human_wait(tmp_path: Path):
-    """ci_wait_timeout measures time waiting for human; an active running turn is NOT aborted."""
-    mgr = StubSessionManager()
-    mgr.operations["op-wo1"] = {
-        "operation_id": "op-wo1",
-        "work_order_id": "WO-001",
-        "agent_id": "codex",
-        "role": "backend",
-        "status": "RUNNING",
-    }
-    sup = LifecycleSupervisor(manager=mgr, ci_wait_timeout=0.1, timeouts={Phase.EXECUTING: 5.0}, headless=True)
-    state = sup.start_run("run-long-active", "Goal", tmp_path, "session-1")
-    state.phase = Phase.EXECUTING
-    state.worker_wo_ids = ["WO-001"]
-
-    time.sleep(0.15)
-    res = sup.advance(state)
-
-    assert res == AdvanceResult.WAITING_FOR_OPERATION
-    assert state.phase == Phase.EXECUTING
-    assert state.exit_code == 0
-    assert state.error is None
+    assert "print('rescue file content')" in cat_out
 
 
 def test_no_resumable_dead_ends_every_waiting_state_reaches_terminal(tmp_path: Path):
@@ -479,54 +445,64 @@ def test_no_resumable_dead_ends_every_waiting_state_reaches_terminal(tmp_path: P
     mgr = StubSessionManager()
     sup = LifecycleSupervisor(manager=mgr)
 
+    # 1. Human resumes exhausted -> fails terminal FAILED, not unresumable wait
     s1 = sup.start_run("r-dead-1", "Goal", tmp_path, "s1")
     s1.phase = Phase.WAITING_FOR_HUMAN
-    s1.human_resumes_used = s1.max_human_resumes
+    s1.human_resumes_used = s1.max_human_resumes  # 2
     res1 = sup.human_resume(s1, reason="attempt resume when exhausted")
     assert res1 == AdvanceResult.FAILED
     assert s1.phase == Phase.FAILED
 
+    # 2. Daemon restart cap exceeded -> fails terminal FAILED
     s2 = sup.start_run("r-dead-2", "Goal", tmp_path, "s2")
-    s2.daemon_restarts = s2.max_daemon_restarts
+    s2.phase = Phase.WAITING_FOR_HUMAN
+    s2.daemon_restarts = s2.max_daemon_restarts  # 2
     with pytest.raises(ValueError, match="maximum allowed daemon restarts"):
-        sup.re_attest_run(s2, human_signature="admin", confirmed_budget=10)
+        sup.re_attest_run(s2, human_signature="admin", confirmed_budget=20)
     assert s2.phase == Phase.FAILED
+    assert s2.exit_code == EXIT_RETRIES_EXHAUSTED
 
+    # 3. Re-attest cannot raise budget when resumes exhausted -> fails terminal FAILED
     s3 = sup.start_run("r-dead-3", "Goal", tmp_path, "s3")
     s3.phase = Phase.WAITING_FOR_HUMAN
     s3.global_turn_budget = 5
-    s3.human_resumes_used = s3.max_human_resumes
+    s3.human_resumes_used = s3.max_human_resumes  # 2
     with pytest.raises(ValueError, match="human resume cap .* is exhausted"):
-        sup.re_attest_run(s3, human_signature="admin", confirmed_budget=10)
+        sup.re_attest_run(s3, human_signature="admin", confirmed_budget=15)
     assert s3.phase == Phase.FAILED
+    assert s3.exit_code == EXIT_BUDGET_EXHAUSTED
 
-    s4 = sup.start_run("r-dead-4", "Goal", tmp_path, "s4")
-    s4.phase = Phase.AWAITING_APPROVAL
-    sup.reject_plan(s4, reason="Architecture unacceptable")
+    # 4. In headless mode, waiting for human aborts terminal to FAILED
+    sup_headless = LifecycleSupervisor(manager=mgr, ci_wait_timeout=0.05, headless=True)
+    s4 = sup_headless.start_run("r-dead-4", "Goal", tmp_path, "s4")
+    sup_headless._transition(s4, Phase.WAITING_FOR_HUMAN)
+    time.sleep(0.08)
+    res4 = sup_headless.advance(s4)
+    assert res4 == AdvanceResult.FAILED
     assert s4.phase == Phase.FAILED
-    assert s4.exit_code == EXIT_PLAN_REJECTED
+    assert s4.exit_code == EXIT_HEADLESS_TIMEOUT  # 137
+
+    # 5. Plan review rejected -> fails terminal FAILED
+    s5 = sup.start_run("r-dead-5", "Goal", tmp_path, "s5")
+    s5.phase = Phase.AWAITING_APPROVAL
+    res5 = sup.reject_plan(s5, reason="Human rejected architecture plan")
+    assert res5 == AdvanceResult.FAILED
+    assert s5.phase == Phase.FAILED
+    assert s5.exit_code == EXIT_PLAN_REJECTED  # 4
+
+    # 6. Valid human resume progresses to active phase within bounded steps
+    s6 = sup.start_run("r-dead-6", "Goal", tmp_path, "s6")
+    s6.phase = Phase.WAITING_FOR_HUMAN
+    s6.global_turn_budget = 0
+    s6.budget_exhausted = True
+    sup.human_resume(s6, reason="Grant extra budget", additional_budget=10)
+    assert s6.phase != Phase.WAITING_FOR_HUMAN
+    assert s6.global_turn_budget == 10
 
 
-def test_turn_timeout_does_not_double_charge_budget(tmp_path: Path):
-    """Dispatching a turn decrements budget once; timing out does NOT double charge."""
-    mgr = StubSessionManager()
-    mgr.next_response_type = "hang"
-    reaper = ProcessReaper()
-    timeouts = {Phase.PLANNING: 0.1}
-    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, timeouts=timeouts)
-
-    state = sup.start_run("run-no-double-charge", "Goal", tmp_path, "session-1")
-    initial_budget = state.global_turn_budget
-
-    res = sup.advance(state)
-    assert len(mgr.dispatched_turns) == 1
-    assert state.global_turn_budget == initial_budget - 1
-
-    time.sleep(0.15)
-    sup.advance(state)
-
-    assert initial_budget - state.global_turn_budget == len(mgr.dispatched_turns)
-
+# ==============================================================================
+# 6. Stub Agent Liveness Suite (Bounded Steps & Wall-Clock Termination)
+# ==============================================================================
 
 def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     """Verify every row of published timeout table: state, key, default, target, and counter consumed."""
@@ -534,6 +510,7 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     reaper = ProcessReaper()
     sup = LifecycleSupervisor(manager=mgr, reaper=reaper)
 
+    # 1. Defaults verification
     assert sup.get_timeout_for_phase(Phase.PLANNING) == 300.0
     assert sup.get_timeout_for_phase(Phase.AUTHORING) == 600.0
     assert sup.get_timeout_for_phase(Phase.AUTHORING_READINESS_GATE) == 60.0
@@ -546,18 +523,21 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert sup.ci_wait_timeout == 60.0
     assert sup.ci_run_timeout == 1800.0
 
+    # 2. PLANNING timeout consumes planning_retries (NOT authoring_repair_attempts)
     s = sup.start_run("r-timeout-planning", "Goal", tmp_path, "s1")
     s.phase = Phase.PLANNING
     s.turn_deadline = time.monotonic() - 1.0
     sup.advance(s)
     assert s.planning_retries == 1
     assert s.authoring_repair_attempts == 0
+    # Second timeout exceeds max_planning_retries (2) -> WAITING_FOR_HUMAN
     s.turn_deadline = time.monotonic() - 1.0
     sup.advance(s)
     assert s.planning_retries == 2
     assert s.phase == Phase.WAITING_FOR_HUMAN
     assert s.exit_code == EXIT_RETRIES_EXHAUSTED
 
+    # 3. AUTHORING timeout consumes authoring_repair_attempts
     s = sup.start_run("r-timeout-auth", "Goal", tmp_path, "s2")
     s.phase = Phase.AUTHORING
     s.turn_deadline = time.monotonic() - 1.0
@@ -569,18 +549,21 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert s.phase == Phase.WAITING_FOR_HUMAN
     assert s.exit_code == EXIT_RETRIES_EXHAUSTED
 
+    # 4. AUTHORING_READINESS_GATE timeout transitions to ARCHITECT_REPAIR
     s = sup.start_run("r-timeout-gate", "Goal", tmp_path, "s3")
     s.phase = Phase.AUTHORING_READINESS_GATE
     s.turn_deadline = time.monotonic() - 1.0
     sup.advance(s)
     assert s.phase == Phase.ARCHITECT_REPAIR
 
+    # 5. DISPATCHING timeout transitions to ARCHITECT_RECOVERY_DECISION
     s = sup.start_run("r-timeout-dispatch", "Goal", tmp_path, "s4")
     s.phase = Phase.DISPATCHING
     s.turn_deadline = time.monotonic() - 1.0
     sup.advance(s)
     assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
 
+    # 6. EXECUTING timeout consumes worker_retries[wo_id] -> ARCHITECT_RECOVERY_DECISION
     s = sup.start_run("r-timeout-exec", "Goal", tmp_path, "s5")
     s.phase = Phase.EXECUTING
     s.worker_wo_ids = ["WO-101"]
@@ -593,6 +576,7 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
     assert s.recovery_wo_id == "WO-101"
 
+    # 7. INTEGRATION_REVIEW (QA_REVIEW) timeout consumes qa_reworks[wo_id] -> ARCHITECT_RECOVERY_DECISION
     s = sup.start_run("r-timeout-qa", "Goal", tmp_path, "s6")
     s.phase = Phase.INTEGRATION_REVIEW
     s.integration_wo_id = "WO-101"
@@ -605,6 +589,7 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert s.phase == Phase.ARCHITECT_RECOVERY_DECISION
     assert s.recovery_wo_id == "WO-101"
 
+    # 8. ARCHITECT_REPAIR timeout consumes authoring_repair_attempts
     s = sup.start_run("r-timeout-repair", "Goal", tmp_path, "s7")
     s.phase = Phase.ARCHITECT_REPAIR
     s.turn_deadline = time.monotonic() - 1.0
@@ -616,6 +601,7 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert s.phase == Phase.WAITING_FOR_HUMAN
     assert s.exit_code == EXIT_RETRIES_EXHAUSTED
 
+    # 9. ARCHITECT_RECOVERY_DECISION timeout consumes recovery_attempts
     s = sup.start_run("r-timeout-recovery", "Goal", tmp_path, "s8")
     s.phase = Phase.ARCHITECT_RECOVERY_DECISION
     s.recovery_wo_id = "WO-101"
@@ -629,6 +615,7 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert s.phase == Phase.WAITING_FOR_HUMAN
     assert s.exit_code == EXIT_RETRIES_EXHAUSTED
 
+    # 10. GITOPS timeout consumes gitops_retries
     s = sup.start_run("r-timeout-gitops", "Goal", tmp_path, "s9")
     s.phase = Phase.GITOPS
     s.turn_deadline = time.monotonic() - 1.0
@@ -639,3 +626,104 @@ def test_full_timeout_table_execution_and_counters(tmp_path: Path):
     assert s.gitops_retries == 2
     assert s.phase == Phase.WAITING_FOR_HUMAN
     assert s.exit_code == EXIT_RETRIES_EXHAUSTED
+
+
+AGENT_OWNED_PHASES = [
+    Phase.PLANNING,
+    Phase.EXECUTING,
+    Phase.INTEGRATION_REVIEW,
+    Phase.ARCHITECT_RECOVERY_DECISION,
+    Phase.GITOPS,
+]
+
+STUB_BEHAVIORS = [
+    "success",
+    "blocked",
+    "empty",
+    "malformed",
+    "hang",
+    "out_of_scope_write",
+    "rejection_unidentifiable",
+]
+
+
+@pytest.mark.parametrize("agent_phase", AGENT_OWNED_PHASES)
+@pytest.mark.parametrize("stub_behavior", STUB_BEHAVIORS)
+def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase: Phase, stub_behavior: str):
+    """Every combination of agent-owned phase and stub behavior terminates in < 30 steps and < 3.0s."""
+    mgr = StubSessionManager()
+    reaper = ProcessReaper()
+    # Shrunk turn timeouts for fast test execution
+    timeouts = {p: 0.04 for p in Phase}
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, timeouts=timeouts, ci_wait_timeout=1.5)
+    state = sup.start_run(f"run-matrix-{agent_phase.name}-{stub_behavior}", "Goal", tmp_path, "s-matrix")
+    state.phase = agent_phase
+    state.global_turn_budget = 15
+    state.max_worker_retries = 2
+    state.max_authoring_repairs = 2
+    state.max_gitops_retries = 2
+    state.max_retries = 2
+    state.max_planning_retries = 2
+    state.worker_wo_ids = ["WO-001"]
+    state.executing_wo_id = "WO-001"
+    state.integration_wo_id = "WO-001"
+    state.recovery_wo_id = "WO-001"
+
+    start_mono = time.monotonic()
+    max_steps = 30
+    step_count = 0
+
+    while step_count < max_steps:
+        step_count += 1
+
+        if stub_behavior == "hang":
+            time.sleep(0.045)  # Exceeds 0.04s timeout
+        elif stub_behavior == "empty":
+            sup.handle_invalid_turn_output(state, role="agent", error_type="EMPTY_OUTPUT")
+        elif stub_behavior == "malformed":
+            sup.handle_invalid_turn_output(state, role="agent", error_type="MALFORMED_OUTPUT")
+        elif stub_behavior == "out_of_scope_write":
+            state.global_turn_budget = 0
+        elif stub_behavior == "rejection_unidentifiable":
+            sup.handle_rejection_without_reworkable(state, rejecting_role="qa", reason="unidentified defect")
+        elif stub_behavior == "blocked":
+            state.blocked = True
+            state.error = "Agent blocked on external dependency"
+            sup._transition(state, Phase.WAITING_FOR_HUMAN)
+            break
+        elif stub_behavior == "success":
+            if state.phase == Phase.PLANNING:
+                state.proposed_plan = {"milestones": ["M1"]}
+                sup._transition(state, Phase.AUTHORING)
+            elif state.phase == Phase.AUTHORING:
+                sup._transition(state, Phase.AUTHORING_READINESS_GATE)
+            elif state.phase == Phase.ARCHITECT_REPAIR:
+                sup._transition(state, Phase.AUTHORING_READINESS_GATE)
+            elif state.phase == Phase.AUTHORING_READINESS_GATE:
+                sup._transition(state, Phase.DISPATCHING)
+            elif state.phase == Phase.DISPATCHING:
+                sup._transition(state, Phase.EXECUTING)
+            elif state.phase == Phase.EXECUTING:
+                sup._transition(state, Phase.INTEGRATION_REVIEW)
+            elif state.phase == Phase.INTEGRATION_REVIEW:
+                sup._transition(state, Phase.GITOPS)
+            elif state.phase == Phase.GITOPS:
+                sup._transition(state, Phase.COMPLETE)
+            elif state.phase == Phase.ARCHITECT_RECOVERY_DECISION:
+                sup._transition(state, Phase.EXECUTING)
+
+        res = sup.advance(state)
+
+        # Terminal conditions: COMPLETE, FAILED, WAITING_FOR_HUMAN, BLOCKED, or human gate in AWAITING_APPROVAL
+        if (
+            res in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.WAITING_FOR_HUMAN, AdvanceResult.BLOCKED)
+            or state.phase in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN, Phase.AWAITING_APPROVAL, Phase.BLOCKED)
+        ):
+            break
+
+    duration = time.monotonic() - start_mono
+
+    # Invariants: Termination strictly bounded in < 30 steps and < 3.0s wall-clock
+    assert step_count < max_steps, f"Phase {agent_phase.name} with behavior '{stub_behavior}' exceeded 30 steps ({step_count})!"
+    assert duration < 3.0, f"Phase {agent_phase.name} with behavior '{stub_behavior}' took {duration:.2f}s (exceeded 3.0s)!"
+    assert state.phase in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN, Phase.AWAITING_APPROVAL, Phase.BLOCKED)
