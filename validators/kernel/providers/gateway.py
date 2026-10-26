@@ -1630,8 +1630,7 @@ class ProviderGateway:
         self._step_count: int = 0
         self._file_write_count: int = 0
         self.budget_status: dict[str, Any] = {"tokens_used": 0, "max_tokens": None, "tool_calls_used": 0, "max_tool_calls": None, "steps": 0}
-        provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
-        is_local = provider in ("ollama", "local", "llamacpp")
+        is_local = self._is_local_provider(self.adapter)
         if max_tool_output_chars == DEFAULT_MAX_TOOL_OUTPUT_CHARS and is_local:
             max_tool_output_chars = int(os.environ.get("LOCAL_TOOL_OUTPUT_CHARS", "4000"))
         self.max_tool_output_chars: int = max_tool_output_chars
@@ -1650,8 +1649,7 @@ class ProviderGateway:
 
     def _compact_messages_for_context(self, messages: list[Message]) -> None:
         """Compact older tool outputs in multi-turn loops to avoid blowing model context window."""
-        provider = str(getattr(self.adapter, "provider_name", "") or "").lower()
-        is_local = provider in ("ollama", "local", "llamacpp")
+        is_local = self._is_local_provider(self.adapter)
 
         tool_indices = [i for i, m in enumerate(messages) if str(m.role).lower() == "tool"]
         if not tool_indices:
@@ -1678,10 +1676,33 @@ class ProviderGateway:
                     name=m.name,
                 )
 
+    @staticmethod
+    def _is_local_provider(adapter: "ProviderAdapter") -> bool:
+        """Detect whether an adapter targets a local/self-hosted model.
+
+        Checks provider_name for known local providers AND base_url/endpoint
+        for localhost/127.0.0.1 addresses so that 'custom' providers pointing
+        at local servers also bypass cloud-oriented token budgets.
+        """
+        provider = str(getattr(adapter, "provider_name", "") or "").lower()
+        if provider in ("ollama", "local", "llamacpp"):
+            return True
+        # Check base_url / endpoint for localhost addresses
+        base_url = str(
+            getattr(adapter, "base_url", None)
+            or getattr(adapter, "endpoint", None)
+            or ""
+        ).lower()
+        if base_url:
+            # Match http://localhost:*, http://127.0.0.1:*, http://[::1]:*
+            for local_host in ("localhost", "127.0.0.1", "[::1]"):
+                if f"//{local_host}" in base_url:
+                    return True
+        return False
+
     def _get_max_tokens(self) -> int | None:
         # Local models have no token limit (infinite budget)
-        provider = getattr(self.adapter, "provider_name", "") or ""
-        if str(provider).lower() in ("ollama", "local", "llamacpp"):
+        if self._is_local_provider(self.adapter):
             return None
         if self.contract and hasattr(self.contract, "budget") and self.contract.budget:
             mt = self.contract.budget.get("max_tokens")
