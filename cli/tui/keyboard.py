@@ -957,6 +957,8 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":tree", "Display Hierarchical Operation Tree", False),
     (":agents", "Display Hierarchical Agent Tree", False),
     (":completion", "Display Project Complete checklist", False),
+    (":delivery-status", "Display official Lead Architect Product Delivery Status report", False),
+    (":delivery", "Alias for :delivery-status", False),
     (":cancel", "Cancel in-flight turn, agent, or operation", False),
     (":contract", "Display Contract Boundary HUD & permissions", False),
     (":diff", "Display Unified Diff viewer", False),

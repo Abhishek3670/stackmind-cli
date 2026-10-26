@@ -20,6 +20,9 @@ from cli.tui.chat import _make_capture_console, should_render_ansi
 
 COMMAND_NAMES: dict[str, str] = {
     ":status": "Status",
+    ":delivery-status": "Product Delivery Status",
+    ":delivery": "Product Delivery Status",
+    ":deliverystatus": "Product Delivery Status",
     ":resume": "Resume",
     ":plan": "Plan",
     ":pause": "Pause",

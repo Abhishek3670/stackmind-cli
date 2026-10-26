@@ -229,3 +229,37 @@ def test_dispatch_delivery_status_command(tmp_path: Path) -> None:
     assert "Lead Architect Report" in state.messages[-1].content
     assert "Delivery complete and verified" in state.messages[-1].content
 
+
+def test_tui_delivery_status_keyboard_autocomplete_and_dialog() -> None:
+    """TUI keyboard composer autocompletes :delivery-status when typing :d, and command dialog recognizes it."""
+    from cli.tui.keyboard import DEFAULT_COMMANDS, RawLineEditor
+    from cli.tui.command_dialog import COMMAND_NAMES, get_command_friendly_name
+
+    # 1. Verify DEFAULT_COMMANDS contains :delivery-status and :delivery
+    commands_dict = {cmd: (desc, req_args) for cmd, desc, req_args in DEFAULT_COMMANDS}
+    assert ":delivery-status" in commands_dict
+    assert ":delivery" in commands_dict
+    assert commands_dict[":delivery-status"][1] is False  # No required arguments
+    assert commands_dict[":delivery"][1] is False
+
+    # 2. Verify typing :d produces dropdown matches including :delivery-status and :delivery
+    editor = RawLineEditor()
+    editor.handle_key(":")
+    editor.handle_key("d")
+
+    assert editor.dropdown_active is True
+    matched_names = [c[0] for c in editor.dropdown_matches]
+    assert ":delivery-status" in matched_names
+    assert ":delivery" in matched_names
+    assert ":diff" in matched_names
+    assert ":debugkeys" in matched_names
+
+    # 3. Verify COMMAND_NAMES mapping and friendly name
+    assert ":delivery-status" in COMMAND_NAMES
+    assert ":delivery" in COMMAND_NAMES
+    assert ":deliverystatus" in COMMAND_NAMES
+    assert get_command_friendly_name(":delivery-status") == "Product Delivery Status"
+    assert get_command_friendly_name(":delivery") == "Product Delivery Status"
+    assert get_command_friendly_name(":deliverystatus") == "Product Delivery Status"
+
+
