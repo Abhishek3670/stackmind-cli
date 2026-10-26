@@ -212,3 +212,69 @@ def test_session_manager_extracts_and_supplies_chat_history(tmp_path: Path):
     assert recorded_histories[2][3]["content"] == (
         "Response to: I want to build a landing for my business"
     )
+
+
+def test_adhoc_mode_does_not_leak_context_into_user_message(tmp_path: Path, monkeypatch):
+    """Verify skills and context are not prepended/appended into Message.user in adhoc mode."""
+    project = _init_dummy_project(tmp_path)
+    adapter = RecordingProviderAdapter("Hello! How can I help you today?")
+    runner = AgentRunner(project, "claude")
+    runner.provider_adapter = adapter
+
+    from types import SimpleNamespace
+    from validators.knowledge.api import KnowledgeAPI
+
+    mock_bundle = SimpleNamespace(
+        text="#### Skill Summary: git-guardrails-claude-code\n#### Skill Summary: wizard",
+        symbols={},
+        files=[],
+    )
+    monkeypatch.setattr(KnowledgeAPI, "assemble_context", lambda self, *args, **kwargs: mock_bundle)
+
+    # Run an adhoc turn
+    result = runner.run_once(prompt="hey")
+
+    assert result.status == "completed"
+    assert len(adapter.received_messages) >= 2
+
+    # User message must be strictly the user prompt
+    user_msg = adapter.received_messages[-1]
+    assert user_msg.role == "user"
+    assert user_msg.content == "hey"
+    assert "git-guardrails-claude-code" not in user_msg.content
+    assert "Context:" not in user_msg.content
+
+    # System message contains the background context
+    sys_msg = adapter.received_messages[0]
+    assert sys_msg.role == "system"
+    assert "git-guardrails-claude-code" in sys_msg.content
+    assert "Background Reference Only" in sys_msg.content
+
+
+def test_adhoc_mode_filters_out_colon_commands_from_history(tmp_path: Path):
+    """Verify internal TUI colon commands are never fed into the model as user messages."""
+    project = _init_dummy_project(tmp_path)
+    adapter = RecordingProviderAdapter("Understood.")
+    runner = AgentRunner(project, "claude")
+    runner.provider_adapter = adapter
+
+    history = [
+        {"role": "user", "content": ":provider"},
+        {"role": "assistant", "content": "Available providers: ollama, anthropic"},
+        {"role": "user", "content": ":roles"},
+        {"role": "assistant", "content": "Roles configured"},
+        {"role": "user", "content": "hello world"},
+    ]
+
+    result = runner.run_once(
+        prompt="let's start",
+        session_history=history,
+    )
+
+    assert result.status == "completed"
+    received_user_texts = [m.content for m in adapter.received_messages if m.role == "user"]
+
+    assert ":provider" not in received_user_texts
+    assert ":roles" not in received_user_texts
+    assert "hello world" in received_user_texts
+    assert "let's start" in received_user_texts

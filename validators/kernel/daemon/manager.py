@@ -2803,7 +2803,7 @@ class SessionManager:
                 for h in client_hist:
                     if isinstance(h, dict) and "role" in h and "content" in h:
                         h_content = str(h["content"]).strip()
-                        if h_content:
+                        if h_content and not h_content.startswith(":"):
                             session_history.append({"role": str(h["role"]).lower(), "content": h_content})
             else:
                 with self._lock:
@@ -2815,8 +2815,10 @@ class SessionManager:
                             res = r.get("result") or {}
                             a_r = res.get("summary") or res.get("report_markdown")
                             if u_p and a_r and isinstance(a_r, str) and a_r.strip():
-                                session_history.append({"role": "user", "content": str(u_p).strip()})
-                                session_history.append({"role": "assistant", "content": str(a_r).strip()})
+                                u_clean = str(u_p).strip()
+                                if not u_clean.startswith(":"):
+                                    session_history.append({"role": "user", "content": u_clean})
+                                    session_history.append({"role": "assistant", "content": str(a_r).strip()})
 
             if len(session_history) > 12:
                 session_history = session_history[-12:]

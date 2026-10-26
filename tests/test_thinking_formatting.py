@@ -144,5 +144,56 @@ class TestThinkingRendering:
             assert all(words), f"Line should have words: {line}"
 
 
+
+
+class TestDetokenizationAndTimer:
+    """Tests for tokenization repairs, punctuation spacing, and thinking timer duration."""
+
+    def test_clean_detokenized_text_repairs_punctuation_and_subwords(self):
+        """Verify tokenization glitches from TUI streaming are cleaned."""
+        from cli.tui.chat import clean_detokenized_text
+
+        glitches = [
+            ("instructions , I need to :", "instructions, I need to:"),
+            ("1 . Understand before prescribing - consult and listen", "1. Understand before prescribing - consult and listen"),
+            ("2 . Co -design iteratively - don 't dump massive boilerplate", "2. Co-design iteratively - don't dump massive boilerplate"),
+            ("3 . Use autonomous multi -agent dispatch when needed", "3. Use autonomous multi-agent dispatch when needed"),
+            ('The user has sent ": provider " and ": roles "', 'The user has sent ":provider" and ":roles"'),
+            ("- git -guard rails -cl aude -code : for hooks", "- git-guardrails-claude-code: for hooks"),
+            ("role /provider", "role/provider"),
+            ("system .", "system."),
+        ]
+        for raw, expected in glitches:
+            assert clean_detokenized_text(raw) == expected
+
+    def test_render_thinking_block_duration_calculation(self):
+        """Verify thinking timer never displays 0.0s for non-empty thinking."""
+        from cli.tui.chat import render_thinking_block_str
+
+        sample_thinking = "Analyzing user prompt and planning response across multiple agent stages."
+
+        # Case 1: Explicit elapsed time provided
+        rendered_explicit = render_thinking_block_str(sample_thinking, expanded=True, elapsed=1.5, tokens=20, width=80)
+        assert "Thought for 1.5s, 20 tokens" in rendered_explicit
+
+        # Case 2: No elapsed time provided (historical/turn replay) - must compute realistic time > 0.0s
+        rendered_fallback = render_thinking_block_str(sample_thinking, expanded=True, elapsed=None, tokens=243, width=80)
+        assert "Thought for 6.9s, 243 tokens" in rendered_fallback
+        assert "0.0s" not in rendered_fallback
+
+    def test_state_add_message_cleans_thinking_and_records_elapsed(self):
+        """Verify state.add_message cleans assistant thinking text and stores elapsed time."""
+        from cli.tui.state import AutonomousDeliveryState
+
+        state = AutonomousDeliveryState()
+        raw_think = "instructions , I need to :\n1 . Co -design iteratively"
+        msg = state.add_message("assistant", "Hello", thinking=raw_think, thinking_elapsed=2.4, thinking_tokens=15)
+
+        assert "instructions, I need to:" in msg.thinking
+        assert "1. Co-design iteratively" in msg.thinking
+        assert msg.thinking_elapsed == 2.4
+        assert msg.thinking_tokens == 15
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

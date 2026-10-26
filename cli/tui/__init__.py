@@ -22,6 +22,7 @@ from .app import (
     tui,
 )
 from .chat import (
+    clean_detokenized_text,
     render_assistant_message,
     render_assistant_message_str,
     render_chat_transcript,
@@ -107,6 +108,7 @@ __all__ = [
     "reconnect_and_sync",
     "recover_transcript_from_events",
     "render_activity_stream",
+    "clean_detokenized_text",
     "render_assistant_message",
     "render_assistant_message_str",
     "render_bottom_footer_bar",

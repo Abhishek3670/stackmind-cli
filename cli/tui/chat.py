@@ -1205,6 +1205,36 @@ def extract_thinking_summary(thinking: str, max_width: int = 76) -> str:
     return summary
 
 
+def clean_detokenized_text(text: str) -> str:
+    """Repair tokenization and punctuation spacing glitches in streamed or extracted thinking."""
+    if not text:
+        return text
+    # 1. Numbered lists: '1 . ' -> '1. '
+    text = re.sub(r'(^|\n)(\s*\d+)[ \t]+\.[ \t]+', r'\1\2. ', text)
+    # 2. Horizontal spaces before standard punctuation: 'word ,' -> 'word,'
+    text = re.sub(r'(\w)[ \t]+([,.:;!?])', r'\1\2', text)
+    # 3. Hyphenated compound words: "Co -design" -> "Co-design", "multi -agent" -> "multi-agent"
+    text = re.sub(r'(\w)[ \t]+(-[a-zA-Z0-9])', r'\1\2', text)
+    text = re.sub(r'([a-zA-Z0-9]-)[ \t]+([a-zA-Z0-9])', r'\1\2', text)
+    # Subword/token fragment repairs
+    text = re.sub(r'\bcl[ \t]+aude\b', 'claude', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bguard[ \t]+rails\b', 'guardrails', text, flags=re.IGNORECASE)
+    # 4. Slashes: 'role /provider' -> 'role/provider'
+    text = re.sub(r'(\w)[ \t]*/[ \t]*(\w)', r'\1/\2', text)
+    # 5. Spaces inside quotes: '" hey "' -> '"hey"', '": provider "' -> '":provider"'
+    text = re.sub(r'"([^"\r\n]+)"', lambda m: f'"{m.group(1).strip()}"', text)
+    # 6. Colons before known commands: ': provider' -> ':provider'
+    text = re.sub(r'(?:^|(?<=[\s"\x27`])):[ \t]+([a-zA-Z0-9_-]+)', r':\1', text)
+    # 7. Contractions: "don 't" -> "don't"
+    text = re.sub(r"[ \t]+(['’])(s|t|re|ve|m|ll|d)\b", r'\1\2', text, flags=re.IGNORECASE)
+    # 8. Parentheses: '( something )' -> '(something)'
+    text = re.sub(r'\([ \t]+', '(', text)
+    text = re.sub(r'[ \t]+\)', ')', text)
+    # 9. Normalize multiple horizontal spaces (excluding newlines)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text
+
+
 def render_thinking_block(
     thinking: str,
     expanded: bool = False,
@@ -1214,7 +1244,7 @@ def render_thinking_block(
     avail_width: int = 80,
 ) -> RenderableType:
     """Render collapsible styled thinking block (2-line ▸ Thought summary when collapsed)."""
-    clean_think = thinking.strip() if thinking else ""
+    clean_think = clean_detokenized_text(thinking.strip()) if thinking else ""
     if not clean_think:
         return Text("")
 
@@ -1222,9 +1252,12 @@ def render_thinking_block(
         return Text("Thinking... ✓", style="dim italic #94a3b8")
 
     arrow = "▾" if expanded else "▸"
-    el_val = 0.0 if elapsed is None else elapsed
-    el_str = f"{el_val:.1f}s" if isinstance(el_val, float) else f"{el_val}s"
     tok_val = max(1, len(clean_think.split())) if tokens is None else tokens
+    if elapsed is not None and elapsed > 0.0:
+        el_val = elapsed
+    else:
+        el_val = max(0.1, round(tok_val / 35.0, 1))
+    el_str = f"{el_val:.1f}s" if isinstance(el_val, float) else f"{el_val}s"
 
     header_text = f"{arrow} Thought for {el_str}, {tok_val} tokens"
     header = Text(header_text, style="dim white")
@@ -1299,6 +1332,8 @@ def render_assistant_message(
     actions: Any | None = None,
     thinking: str | None = None,
     thinking_expanded: bool = True,
+    thinking_elapsed: float | None = None,
+    thinking_tokens: int | None = None,
     model: str | None = None,
     show_header: bool = True,
     avail_width: int = 80,
@@ -1348,7 +1383,16 @@ def render_assistant_message(
     # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24, §27)
     if thinking and thinking.strip():
         elements.append(Text(""))
-        elements.append(render_thinking_block(thinking, expanded=thinking_expanded, in_progress=False))
+        elements.append(
+            render_thinking_block(
+                thinking,
+                expanded=thinking_expanded,
+                in_progress=False,
+                elapsed=thinking_elapsed,
+                tokens=thinking_tokens,
+                avail_width=avail_width,
+            )
+        )
 
     cleaned = strip_internal_reasoning(working_content)
     if cleaned:
@@ -1398,6 +1442,8 @@ def render_assistant_message_str(
     actions: Any | None = None,
     thinking: str | None = None,
     thinking_expanded: bool = False,
+    thinking_elapsed: float | None = None,
+    thinking_tokens: int | None = None,
     model: str | None = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
@@ -1417,6 +1463,8 @@ def render_assistant_message_str(
             actions=actions,
             thinking=thinking,
             thinking_expanded=thinking_expanded,
+            thinking_elapsed=thinking_elapsed,
+            thinking_tokens=thinking_tokens,
             model=model,
             avail_width=width,
         )
@@ -1553,6 +1601,8 @@ def render_chat_transcript(
                     actions=getattr(msg, "actions", None),
                     thinking=getattr(msg, "thinking", None),
                     thinking_expanded=getattr(msg, "thinking_expanded", False),
+                    thinking_elapsed=getattr(msg, "thinking_elapsed", None),
+                    thinking_tokens=getattr(msg, "thinking_tokens", None),
                     model=getattr(msg, "model", None),
                     inline_diffs=inline_diffs,
                     show_header=show_hdr,
@@ -1644,6 +1694,7 @@ def render_chat_transcript_str(
 
 
 __all__ = [
+    "clean_detokenized_text",
     "_make_capture_console",
     "extract_internal_reasoning",
     "compute_diff_stats",

@@ -348,7 +348,21 @@ def _build_in_progress_turn_content(
         clean_think = thinking.strip()
         from cli.tui.chat import render_thinking_block_str
         is_exp = getattr(state, "live_thinking_expanded", True)
-        think_str = render_thinking_block_str(clean_think, expanded=is_exp, in_progress=True, width=layout_width)
+        live_elapsed = None
+        if getattr(state, "current_turn_thinking_start_time", None) is not None:
+            import time
+            live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
+        elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
+            live_elapsed = state.current_turn_thinking_elapsed
+        tok_cnt = len(clean_think.split())
+        think_str = render_thinking_block_str(
+            clean_think,
+            expanded=is_exp,
+            in_progress=True,
+            elapsed=live_elapsed,
+            tokens=tok_cnt,
+            width=layout_width,
+        )
         if think_str:
             parts.append(think_str)
 
@@ -721,6 +735,8 @@ def _stream_turn_execution(
             delta = extract_text_delta(ev)
             think_delta = extract_reasoning_delta(ev)
             if think_delta:
+                if getattr(state, "current_turn_thinking_start_time", None) is None:
+                    state.current_turn_thinking_start_time = time.monotonic()
                 if not streaming_active:
                     streaming_active = True
                     if model_name is None:
@@ -754,6 +770,13 @@ def _stream_turn_execution(
                     last_redraw_time = now_mono
 
             if delta:
+                if (
+                    getattr(state, "current_turn_thinking_start_time", None) is not None
+                    and getattr(state, "current_turn_thinking_elapsed", None) is None
+                ):
+                    state.current_turn_thinking_elapsed = max(
+                        0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1)
+                    )
                 if not streaming_active:
                     streaming_active = True
                     if model_name is None:
@@ -2708,10 +2731,15 @@ def dispatch_delivery_command(
         if not is_goal and hasattr(state, "messages") and state.messages:
             c_hist: list[dict[str, str]] = []
             for msg in state.messages:
+                if getattr(msg, "is_command", False) or getattr(msg, "_is_command_output", False):
+                    continue
                 m_role = getattr(msg, "role", getattr(msg, "sender", None))
                 m_content = getattr(msg, "content", getattr(msg, "text", None))
-                if m_role in ("user", "assistant") and m_content and isinstance(m_content, str) and m_content.strip():
-                    c_hist.append({"role": m_role, "content": m_content.strip()})
+                if m_role in ("user", "assistant") and m_content and isinstance(m_content, str):
+                    clean = m_content.strip()
+                    if not clean or clean.startswith(":"):
+                        continue
+                    c_hist.append({"role": m_role, "content": clean})
             if c_hist:
                 turn_kwargs["chat_history"] = c_hist[-12:]
         result = adapter.command(normalized, session_id=session["session_id"], **turn_kwargs)

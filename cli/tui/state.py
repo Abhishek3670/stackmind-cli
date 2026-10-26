@@ -472,6 +472,8 @@ class ChatMessage:
     turn_id: str | None = None
     thinking_expanded: bool = False
     is_command: bool = False
+    thinking_elapsed: float | None = None
+    thinking_tokens: int | None = None
 
 
 @dataclass
@@ -619,6 +621,8 @@ class AutonomousDeliveryState:
         self.govern_verbosity: str = "tree"  # "tree" | "flat" | "compact"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False, verbosity=self.govern_verbosity)
         self.current_turn_thinking: str = ""
+        self.current_turn_thinking_start_time: float | None = None
+        self.current_turn_thinking_elapsed: float | None = None
         self.thinking_expanded: bool = True
         self.live_thinking_expanded: bool = True
         self.actions_expanded: bool = False
@@ -994,6 +998,8 @@ class AutonomousDeliveryState:
         thinking: str | None = None,
         turn_id: str | None = None,
         is_command: bool = False,
+        thinking_elapsed: float | None = None,
+        thinking_tokens: int | None = None,
     ) -> ChatMessage:
         clean = content.strip()
         if not is_command and role == "user" and clean.startswith(":"):
@@ -1029,14 +1035,24 @@ class AutonomousDeliveryState:
 
         msg_thinking = thinking
         msg_content = content
+        msg_thinking_elapsed = thinking_elapsed
+        msg_thinking_tokens = thinking_tokens
         if role == "assistant":
-            from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning
+            from cli.tui.chat import extract_internal_reasoning, strip_internal_reasoning, clean_detokenized_text
             if msg_thinking is None:
                 if getattr(self, "current_turn_thinking", None):
                     msg_thinking = self.current_turn_thinking
                 elif "<think" in content.lower():
                     msg_thinking = extract_internal_reasoning(content)
+            if msg_thinking:
+                msg_thinking = clean_detokenized_text(msg_thinking)
+                if msg_thinking_tokens is None:
+                    msg_thinking_tokens = len(msg_thinking.split())
+                if msg_thinking_elapsed is None:
+                    msg_thinking_elapsed = getattr(self, "current_turn_thinking_elapsed", None)
             self.current_turn_thinking = ""
+            self.current_turn_thinking_start_time = None
+            self.current_turn_thinking_elapsed = None
             if "<think" in msg_content.lower():
                 msg_content = strip_internal_reasoning(msg_content)
 
@@ -1080,6 +1096,8 @@ class AutonomousDeliveryState:
             turn_id=turn_id,
             thinking_expanded=self.thinking_expanded,
             is_command=is_command,
+            thinking_elapsed=msg_thinking_elapsed,
+            thinking_tokens=msg_thinking_tokens,
         )
         self.messages.append(msg)
 
@@ -2412,20 +2430,26 @@ class AutonomousDeliveryState:
         elif name in {"agent.thinking", "turn.thinking", "reasoning.delta"}:
             raw_think = payload.get("text") or payload.get("thinking") or payload.get("thought") or payload.get("reasoning") or payload.get("delta") or ""
             think_text = str(raw_think)
-            if think_text.strip():
-                # Preserve leading whitespace (including paragraph breaks)
-                # Only strip trailing whitespace to avoid double-spaces
-                chunk = think_text.rstrip()
-                if chunk:
-                    if getattr(self, "current_turn_thinking", None):
-                        # Preserve leading whitespace for chunks like " how", " ,", " ."
-                        # This maintains provider's original spacing and punctuation
-                        if chunk.startswith((" ", "\t", "\n")):
-                            self.current_turn_thinking += chunk
-                        else:
-                            self.current_turn_thinking += " " + chunk
+            if think_text and think_text.strip():
+                if getattr(self, "current_turn_thinking_start_time", None) is None:
+                    import time
+                    self.current_turn_thinking_start_time = time.monotonic()
+                if getattr(self, "current_turn_thinking", None):
+                    curr = self.current_turn_thinking
+                    if curr.endswith((" ", "\t", "\n")) or think_text.startswith((" ", "\t", "\n")):
+                        self.current_turn_thinking += think_text
+                    elif think_text[0] in ".,:;!?')]}->/\"'`:":
+                        self.current_turn_thinking += think_text
+                    elif curr[-1] in "-/([{\"':":
+                        self.current_turn_thinking += think_text
+                    elif " " in think_text:
+                        self.current_turn_thinking += " " + think_text
                     else:
-                        self.current_turn_thinking = chunk
+                        self.current_turn_thinking += think_text
+                else:
+                    self.current_turn_thinking = think_text
+            elif think_text and getattr(self, "current_turn_thinking", None):
+                self.current_turn_thinking += think_text
 
         elif name in {"verification.completed", "verification.recorded"}:
             res = payload.get("result")

@@ -1672,7 +1672,7 @@ class AgentRunner:
                 "   - For focused UI tweaks, animations, CSS effects, styling, or isolated file modifications: Call `delegate_task(target_agent='frontend'|'backend', instructions='...', target_files=['...'])`. The delegated specialist worker (e.g. Frontend/Gemini) will be immediately spawned with authorized write access to those target files.\n"
                 "   - For broad features, full milestones, or multi-component additions: Call `trigger_goal(goal='...', rationale='...')`. This will autonomously initiate the full supervisor run (PLAN.md -> child work orders -> worker execution -> QA verification).\n"
                 "   - You may also advise the operator that they can run `:goal <description>` manually if they prefer.\n"
-                "4. Strict Project Grounding: You are designing the user's software for this workspace. Never deflect to building, packaging, or deploying StackMind CLI itself unless the user explicitly tells you that the project being built IS StackMind CLI. Never assume or claim procedural skills (such as 'ponytail', 'audit', etc.) are active unless the user explicitly requested them or they are installed in the workspace.\n"
+                "4. Strict Project Grounding: You are designing the user's software for this workspace. Never deflect to building, packaging, or deploying StackMind CLI itself unless the user explicitly tells you that the project being built IS StackMind CLI. Never assume or claim procedural skills (such as 'ponytail', 'audit', etc.) are active unless the user explicitly requested them or they are installed in the workspace. Never assume or bring up workspace skills or tools (such as git guardrails, bash wizards, ponytail) on a casual greeting (like 'hey' or 'hello'); only reference skills when the operator's prompt directly pertains to them.\n"
                 "5. Output Style: Deliver conversational, clear Markdown prose directly to the user. Do not output raw JSON decision schemas in chat mode unless explicitly requested.\n"
                 "6. Strict Prohibition on Fabricated Background Monitoring (MANDATORY INVARIANT):\n"
                 "   You CANNOT monitor, loop, or wait in the background. Once your response turn finishes, the system immediately returns to IDLE waiting for user input.\n"
@@ -1711,7 +1711,7 @@ class AgentRunner:
             for turn in history[-12:]:
                 role = str(turn.get("role", "")).lower().strip()
                 content = str(turn.get("content", "")).strip()
-                if not content:
+                if not content or content.startswith(":"):
                     continue
                 if len(content) > 2000:
                     content = content[:2000] + "..."
@@ -1738,11 +1738,17 @@ class AgentRunner:
                 if request.task.kind == 'adhoc':
                     system_msg = self._build_adhoc_system_message()
                     user_content = (request.task.body or request.task.title).strip()
-                    if getattr(request.context, "text", None) and request.context.text.strip():
-                        user_content = f"{user_content}\n\nContext:\n{request.context.text.strip()}"
-                    user_content += self._architect_board_block(
+                    board_block = self._architect_board_block(
                         getattr(request.task, 'work_order_id', None)
                     )
+                    if board_block:
+                        system_msg = f"{system_msg}\n{board_block}"
+                    if getattr(request.context, "text", None) and request.context.text.strip():
+                        system_msg = (
+                            f"{system_msg}\n\n"
+                            "WORKSPACE CONTEXT & AVAILABLE SKILLS (Background Reference Only - do not assume operator requested these unless explicitly mentioned in prompt):\n"
+                            f"{request.context.text.strip()}\n"
+                        )
                     messages = self._build_adhoc_messages(system_msg, user_content, request.session_history)
                 else:
                     task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
@@ -2002,27 +2008,32 @@ class AgentRunner:
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = f"{raw_context}\n{files_context}" if raw_context else files_context
 
-        # Pull-based sibling state: the Architect gets the same board the
-        # gates read, so peer tasks can be critiqued/amended from evidence
-        # instead of guesswork. Live turns remain invisible by design.
-        task_text += self._architect_board_block(getattr(request.task, 'work_order_id', None))
-
-        if request.task.deliverable_path and not is_architecture:
-            task_text += (
-                f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
-                "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file. "
-                "INTEGRATION REQUIREMENT: Ensure your deliverable integrates with other workspace files (e.g. element IDs in JS matching HTML, classes in CSS matching markup). If your deliverable references an ID or class from a companion file in scope, make sure it matches.\n"
-            )
-
-        user_content = task_text
-        if request.task.kind != 'adhoc':
-            user_content = f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
-        elif getattr(request.context, "text", None) and request.context.text.strip():
-            user_content = f'{task_text}\n\nContext:\n{request.context.text.strip()}'
-
         if request.task.kind == 'adhoc':
+            user_content = (request.task.body or request.task.title).strip()
+            board_block = self._architect_board_block(getattr(request.task, 'work_order_id', None))
+            if board_block:
+                system_msg = f"{system_msg}\n{board_block}"
+            if getattr(request.context, "text", None) and request.context.text.strip():
+                system_msg = (
+                    f"{system_msg}\n\n"
+                    "WORKSPACE CONTEXT & AVAILABLE SKILLS (Background Reference Only - do not assume operator requested these unless explicitly mentioned in prompt):\n"
+                    f"{request.context.text.strip()}\n"
+                )
             messages = self._build_adhoc_messages(system_msg, user_content, request.session_history)
         else:
+            # Pull-based sibling state: the Architect gets the same board the
+            # gates read, so peer tasks can be critiqued/amended from evidence
+            # instead of guesswork. Live turns remain invisible by design.
+            task_text += self._architect_board_block(getattr(request.task, 'work_order_id', None))
+
+            if request.task.deliverable_path and not is_architecture:
+                task_text += (
+                    f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
+                    "Do NOT just explain your plan or describe the solution in plain text. You must call `write_file` directly to author the code into the file. "
+                    "INTEGRATION REQUIREMENT: Ensure your deliverable integrates with other workspace files (e.g. element IDs in JS matching HTML, classes in CSS matching markup). If your deliverable references an ID or class from a companion file in scope, make sure it matches.\n"
+                )
+
+            user_content = f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
             messages = [
                 Message.system(system_msg),
                 Message.user(user_content),
