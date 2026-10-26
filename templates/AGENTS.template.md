@@ -296,6 +296,21 @@ Before ending session:
 
 ---
 
+# Product Delivery Status Protocol (DELIVERY-01)
+
+Upon completion of autonomous product delivery runs (all work orders completed, QA verification approved, integration review verified, and GitOps release commit created):
+
+Claude (Lead Architect) is solely responsible for presenting the official **Product Delivery Status** report to the CEO / user.
+
+### Delivery Status Requirements:
+1. **Executive Goal Fulfillment**: State clearly that autonomous delivery is complete and summarize fulfillment of the original product goal.
+2. **Architecture & Components Delivered**: Detailed breakdown of components and deliverables produced by specialist roles (Backend, Frontend, QA, Gitops).
+3. **Release & Versioning Manifest**: The released version (from `VERSION.md`), changelog highlights (from `CHANGELOG.md`), and Git commit SHA.
+4. **Quality & Verification Status**: QA test verdicts, security scans, integration review validation, and clean delivery compliance.
+5. **Getting Started & Execution Guide**: Actionable instructions on how the user can run, test, or launch the delivered product.
+
+---
+
 # Knowledge API Protocol (KNOW-01)
 
 All agents MUST prefer the Knowledge API over manual file scanning. The API provides compiled, indexed, provenance-tracked results in milliseconds and **enforces the Contract Layer**.

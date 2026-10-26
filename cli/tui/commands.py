@@ -270,6 +270,7 @@ def get_help_str() -> str:
     return (
         "Available commands:\n"
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
+        "  :delivery-status  Display official Lead Architect Product Delivery Status report\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :reconnect        Reconnect to daemon and replay missed events\n"
         "  :roles            Interactive Agent Roles & Execution Backend bindings panel (preferred)\n"
@@ -1634,6 +1635,46 @@ def dispatch_delivery_command(
         output_str = "\n".join(output_parts)
         state.add_message("user", normalized)
         state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized in {":delivery-status", ":delivery", ":deliverystatus"}:
+        report = None
+        sid = session.get("session_id")
+        ws = Path(session["workspace"]) if session.get("workspace") else None
+        if ws:
+            run_state_file = ws / ".sync" / "runtime" / "daemon" / "active_run.json"
+            if run_state_file.is_file():
+                try:
+                    import json
+                    r_data = json.loads(run_state_file.read_text(encoding="utf-8"))
+                    report = r_data.get("delivery_status_summary")
+                except Exception:
+                    pass
+        if not report and sid:
+            try:
+                run_obj = client.get_active_run()
+                if run_obj:
+                    report = run_obj.get("delivery_status_summary")
+            except Exception:
+                pass
+        if not report and ws:
+            try:
+                from validators.kernel.daemon.supervisor import LifecycleSupervisor, RunState
+                dummy_state = RunState(
+                    run_id="delivery",
+                    product_goal=session.get("goal") or "Product Delivery",
+                    workspace=str(ws),
+                    session_id=sid or "sess",
+                )
+                sup = LifecycleSupervisor(None)
+                report = sup.generate_delivery_status_report(dummy_state)
+            except Exception:
+                pass
+        output_str = report or "No Product Delivery Status recorded yet."
+        state.add_message("user", normalized)
+        state.add_message("assistant", output_str)
         if not is_tty:
             click.echo(output_str)
         return session, False

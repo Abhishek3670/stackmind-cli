@@ -2708,6 +2708,44 @@ class SessionManager:
                     self._operation_event.clear()
                     continue
                 if result in (AdvanceResult.COMPLETE, AdvanceResult.FAILED, AdvanceResult.BLOCKED):
+                    if (
+                        result == AdvanceResult.COMPLETE
+                        and state.phase == Phase.COMPLETE
+                        and not getattr(state, "delivery_status_delivered", False)
+                    ):
+                        state.delivery_status_delivered = True
+                        try:
+                            delivery_prompt = self.supervisor.format_delivery_status_prompt(state)
+                            op = self.start_turn(
+                                state.session_id,
+                                delivery_prompt,
+                                role="architecture",
+                                agent_id="claude",
+                                is_delivery_status=True,
+                                run_id=run_id,
+                            )
+                            op_id = op.get("operation_id")
+                            if op_id:
+                                state.delivery_status_operation_id = op_id
+                                while not stop_event.is_set():
+                                    try:
+                                        op_rec = self.get_operation(op_id)
+                                    except Exception:
+                                        op_rec = {}
+                                    st = str(op_rec.get("status", "")).upper()
+                                    if st in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED"):
+                                        res = op_rec.get("result") or {}
+                                        state.delivery_status_summary = (
+                                            res.get("summary") or res.get("report_markdown")
+                                        )
+                                        break
+                                    self._operation_event.wait(timeout=0.5)
+                                    self._operation_event.clear()
+                        except Exception:
+                            try:
+                                state.delivery_status_summary = self.supervisor.generate_delivery_status_report(state)
+                            except Exception:
+                                pass
                     try:
                         self.supervisor.save_run_state(state, ws)
                     except Exception:
@@ -2808,6 +2846,7 @@ class SessionManager:
                     pass
             wo_id_param = op_rec.get("work_order_id")
             is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
+            is_delivery_status_param = bool(op_rec.get("metadata", {}).get("is_delivery_status"))
             session_history: list[dict[str, str]] = []
             client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
             if isinstance(client_hist, list) and client_hist:
@@ -2840,6 +2879,7 @@ class SessionManager:
                     prompt=prompt,
                     work_order_id=wo_id_param,
                     is_authoring=is_authoring_param,
+                    is_delivery_status=is_delivery_status_param,
                     session_history=session_history,
                 )
             except TypeError:

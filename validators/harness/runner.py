@@ -88,6 +88,7 @@ class HarnessTask:
     work_order_type: str | None = None
     deliverable_type: str | None = None
     deliverable_paths: tuple[str, ...] = ()
+    is_delivery_status: bool = False
 
 
 @dataclass(frozen=True)
@@ -442,6 +443,7 @@ class AgentRunner:
         prompt: str | None = None,
         work_order_id: str | None = None,
         is_authoring: bool = False,
+        is_delivery_status: bool = False,
         session_history: Sequence[dict[str, str]] | None = None,
     ) -> HarnessRunResult:
         """Run one task, cooperatively stopping at operation lifecycle boundaries."""
@@ -457,7 +459,8 @@ class AgentRunner:
                 m_tf = re.search(r"Target files?:\s*\n?\s*[-*]?\s*([a-zA-Z0-9_./\\-]+)", prompt)
                 deliv_path = m_tf.group(1).strip() if m_tf else None
                 task = HarnessTask(
-                    kind='adhoc',
+                    kind='delivery_status' if is_delivery_status else 'adhoc',
+                    is_delivery_status=is_delivery_status,
                     identifier=operation_id or 'adhoc',
                     path=adhoc_file,
                     title=prompt.strip() or 'User Prompt',
@@ -1814,7 +1817,26 @@ class AgentRunner:
                 )
             )
         )
+        is_delivery_status = (
+            is_architecture
+            and (
+                getattr(request.task, 'is_delivery_status', False)
+                or getattr(request, 'is_delivery_status', False)
+                or request.task.kind in ('delivery_status', 'product_delivery_status')
+                or any(
+                    kw in full_task_desc.lower()
+                    for kw in (
+                        "product delivery status",
+                        "delivery status",
+                        "provide the product delivery status",
+                        "product delivery report",
+                    )
+                )
+            )
+        )
         is_plan_task = (
+            not is_delivery_status
+            and
             not is_authoring_task
             and not is_integration_review
             and (
@@ -1827,6 +1849,7 @@ class AgentRunner:
             "planning" if is_plan_task
             else "authoring" if is_authoring_task
             else "integration" if is_integration_review
+            else "delivery_status" if is_delivery_status
             else None
         )
         uses_task_contract = False
@@ -1924,6 +1947,28 @@ class AgentRunner:
                 "Only worker roles may be assigned to implementation work orders (e.g. codex for backend, gemini for frontend, gemma for qa, local-llm for gitops). "
                 "Architects must NEVER assign implementation tasks to claude.\n"
                 "When all work orders and contracts are written, return the final HarnessDecision as JSON."
+            )
+        elif is_architecture and is_delivery_status:
+            system_msg = (
+                "You are Claude, the Senior Architect and Technical Lead for StackMind CLI. "
+                "Autonomous product delivery is now COMPLETE: all implementation work orders have been executed, "
+                "QA-verified by Gemma, integration-reviewed by you, and versioned/released by GitOps.\n\n"
+                "Your objective is to present the official PRODUCT DELIVERY STATUS report to the user / CEO.\n\n"
+                "PRODUCT DELIVERY STATUS PROMPT FEATURE RULES:\n"
+                "1. Executive Goal Fulfillment: State clearly that autonomous product delivery is complete and summarize how the delivered solution fulfills the original product goal.\n"
+                "2. Architecture & Components Delivered: Provide a comprehensive breakdown of architectural components, modules, and key files delivered across all completed milestones/work orders (by Backend, Frontend, QA, and GitOps).\n"
+                "3. Release & Versioning Manifest: Cite the released version (from VERSION.md), changelog highlights (from CHANGELOG.md), and Git commit SHA.\n"
+                "4. Quality Assurance & Verification: Summarize QA test suite results, security scan status, and integration review validation.\n"
+                "5. Getting Started & Execution Guide: Provide clear, actionable instructions for the user on how to run, test, or launch the delivered application.\n"
+                "6. Format: Present your report directly in clean, well-structured Markdown conforming to the standard Product Delivery Status layout. Return the final HarnessDecision JSON declaring status 'completed'."
+            )
+            raw_context = getattr(request.context, 'text', '') if request.context else ''
+            full_context = raw_context
+            task_text = (request.task.body or request.task.title).strip()
+            task_text += (
+                "\n\nINSTRUCTIONS: Formulate and present the official Product Delivery Status report now, adhering strictly "
+                "to the Product Delivery Status prompt feature rules. Include executive goal fulfillment, architecture & components, "
+                "release manifest, verification proof, and getting started instructions.\n"
             )
         elif request.task.kind == 'adhoc':
             system_msg = self._build_adhoc_system_message()
@@ -2320,7 +2365,7 @@ class AgentRunner:
                     'blockers': [blocker_detail],
                 }
             else:
-                summary_text = extracted_summary or (effective_raw_text if (request.task.kind == 'adhoc' and effective_raw_text) else (effective_raw_text[:200] if effective_raw_text else None))
+                summary_text = extracted_summary or (effective_raw_text if ((request.task.kind == 'adhoc' or is_delivery_status) and effective_raw_text) else (effective_raw_text[:200] if effective_raw_text else None))
                 payload = {
                     'status': 'completed',
                     'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
@@ -2347,6 +2392,7 @@ class AgentRunner:
         is_read_only = (
             (kernel_contract is not None and getattr(kernel_contract, 'write_mode', None) == 'read-only')
             or is_integration_review
+            or is_delivery_status
         )
         if is_read_only:
             payload['modified_files'] = []
