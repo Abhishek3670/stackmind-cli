@@ -122,6 +122,27 @@ def test_tool_gateway_delegate_task():
         content = inbox_file[0].read_text(encoding="utf-8")
         assert "Floating Petals" in content or "floating petals" in content
 
+        # Delegate to QA
+        res_qa = gw.delegate_task(
+            target_agent="qa",
+            instructions="Run regression test suite on auth endpoints",
+            target_files=["tests/test_auth.py"],
+        )
+        assert res_qa["status"] == "delegated"
+        assert res_qa["agent"] == "gemma"
+        assert res_qa["role"] == "qa"
+
+        # Delegate to GitOps
+        res_gitops = gw.delegate_task(
+            target_agent="gitops",
+            instructions="Bump version to 1.1.0 and update changelog",
+            target_files=["VERSION.md", "CHANGELOG.md"],
+        )
+        assert res_gitops["status"] == "delegated"
+        assert res_gitops["agent"] == "local-llm"
+        assert res_gitops["role"] == "gitops"
+        assert len(gw.delegated_tasks) == 3
+
 
 def test_provider_gateway_translation_and_write_file_guidance():
     """Test ProviderGateway tool execution and Architect guidance on denied writes."""

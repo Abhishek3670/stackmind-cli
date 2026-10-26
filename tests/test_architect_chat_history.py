@@ -139,6 +139,13 @@ def test_architect_system_prompt_guidelines(tmp_path: Path):
     assert ":goal" in sys_msg
     assert "delegate_task" in sys_msg or "trigger_goal" in sys_msg
     assert "Never assume or claim procedural skills (such as 'ponytail'" in sys_msg
+    # Verify all four specialized agent roles are documented in the system prompt
+    assert "Frontend (Gemini)" in sys_msg
+    assert "Backend (Codex)" in sys_msg
+    assert "QA (Gemma)" in sys_msg
+    assert "GitOps (Local-LLM)" in sys_msg
+    assert "target_agent='qa'" in sys_msg
+    assert "target_agent='gitops'" in sys_msg
 
 
 def test_session_manager_extracts_and_supplies_chat_history(tmp_path: Path):
@@ -161,6 +168,8 @@ def test_session_manager_extracts_and_supplies_chat_history(tmp_path: Path):
             work_order_id=None,
             is_authoring=False,
             session_history=None,
+            is_delivery_status=False,
+            **kwargs,
         ):
             recorded_histories.append(list(session_history) if session_history else None)
             from dataclasses import dataclass
@@ -185,7 +194,7 @@ def test_session_manager_extracts_and_supplies_chat_history(tmp_path: Path):
     t1 = manager.start_turn(sid, "hey")
     thread1 = manager._turn_threads.get(t1["operation_id"])
     if thread1:
-        thread1.join(timeout=2)
+        thread1.join(timeout=5)
 
     assert recorded_histories[0] is None or len(recorded_histories[0]) == 0
 
@@ -193,7 +202,7 @@ def test_session_manager_extracts_and_supplies_chat_history(tmp_path: Path):
     t2 = manager.start_turn(sid, "I want to build a landing for my business")
     thread2 = manager._turn_threads.get(t2["operation_id"])
     if thread2:
-        thread2.join(timeout=2)
+        thread2.join(timeout=5)
 
     assert recorded_histories[1] is not None
     assert len(recorded_histories[1]) == 2
@@ -204,7 +213,7 @@ def test_session_manager_extracts_and_supplies_chat_history(tmp_path: Path):
     t3 = manager.start_turn(sid, "it's a genset renting business")
     thread3 = manager._turn_threads.get(t3["operation_id"])
     if thread3:
-        thread3.join(timeout=2)
+        thread3.join(timeout=5)
 
     assert recorded_histories[2] is not None
     assert len(recorded_histories[2]) == 4

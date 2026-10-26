@@ -998,8 +998,8 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         name="delegate_task",
         description=(
-            "Delegate a focused, single-component implementation task or visual effect directly to a specialized worker agent "
-            "(e.g. 'frontend' / 'gemini' for HTML/CSS/JS/UI, 'backend' / 'codex' for server/APIs/logic). "
+            "Delegate a focused, single-component implementation, test, or release task directly to a specialized worker agent "
+            "('frontend' / 'gemini' for UI/HTML/CSS/JS, 'backend' / 'codex' for server/APIs/logic, 'qa' / 'gemma' for test authoring/verification, 'gitops' / 'local-llm' for git/versioning/release). "
             "The delegated agent executes under its own scoped permissions to safely mutate source files."
         ),
         parameters={
@@ -1007,7 +1007,7 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
             "properties": {
                 "target_agent": {
                     "type": "string",
-                    "description": "Specialist agent or role to execute the task: 'frontend' (or 'gemini'), 'backend' (or 'codex').",
+                    "description": "Specialist agent or role to execute the task: 'frontend' (or 'gemini'), 'backend' (or 'codex'), 'qa' (or 'gemma'), 'gitops' (or 'local-llm').",
                 },
                 "instructions": {
                     "type": "string",
@@ -2131,7 +2131,7 @@ class ProviderGateway:
                             res += (
                                 "\nGUIDANCE FOR ARCHITECT: As the Lead Architect, you govern the system but cannot directly write workspace application source files. "
                                 "To implement these changes autonomously: "
-                                "1. Call `delegate_task(target_agent='frontend'|'backend', instructions=..., target_files=[...])` for focused UI tweaks, animations, or styling. "
+                                "1. Call `delegate_task(target_agent='frontend'|'backend'|'qa'|'gitops', instructions=..., target_files=[...])` for focused changes, tests, or release tasks. "
                                 "2. Call `trigger_goal(goal=...)` for full multi-agent feature implementation."
                             )
             else:
