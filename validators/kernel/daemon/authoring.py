@@ -1473,4 +1473,185 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         except Exception:
             continue
 
+    # Phase 2: Check for uncovered plan milestones and synthesize missing work orders
+    try:
+        existing_wos = []
+        for sub in ("ACTIVE", "COMPLETED"):
+            d = ws / ".sync" / "work-orders" / sub
+            if d.is_dir():
+                for f in d.glob("*.yaml"):
+                    if f.name == ".gitkeep":
+                        continue
+                    try:
+                        data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            existing_wos.append(data)
+                    except Exception:
+                        pass
+
+        plan_file = ws / "PLAN.md"
+        parsed_plan = None
+        if plan_file.is_file():
+            try:
+                from validators.harness.plan import parse_plan
+                parsed_plan = parse_plan(plan_file.read_text(encoding="utf-8"), project_path=ws)
+            except Exception:
+                pass
+
+        uncovered_milestones = [
+            m for m in plan_milestones
+            if not any(_wo_matches_milestone(w, m) for w in existing_wos)
+        ]
+
+        if uncovered_milestones:
+            gate = AuthoringGate(project_root=ws)
+            contracts_dir = ws / ".sync" / "contracts"
+            contracts_dir.mkdir(parents=True, exist_ok=True)
+
+            tech_stack = parsed_plan.tech_stack if parsed_plan else None
+
+            for m in uncovered_milestones:
+                m_title = m.get("title", "")
+                m_obj = None
+                if parsed_plan and parsed_plan.milestones:
+                    m_obj = next((pm for pm in parsed_plan.milestones if pm.title == m_title), None)
+                if m_obj is None:
+                    from validators.harness.plan import PlanMilestone
+                    m_obj = PlanMilestone(
+                        id=m.get("id", ""),
+                        title=m_title,
+                        tasks=[],
+                        agent_hint=m.get("agent"),
+                    )
+
+                start_idx = get_next_work_order_int(ws)
+                prev_wo_id = f"WO-{start_idx - 1:03d}" if start_idx > 1 else None
+
+                child_wos, _ = decompose_milestone(
+                    m_obj,
+                    start_idx=start_idx,
+                    stack=tech_stack,
+                    project_path=ws,
+                    prev_wo_id=prev_wo_id,
+                )
+
+                for wo in child_wos:
+                    wo_id = str(wo.get("id"))
+                    assigned = wo.get("assigned_agents", ["codex"])
+                    primary_agent = assigned[0] if assigned else "codex"
+                    w_title = wo.get("title", m_title)
+                    w_desc = wo.get("description", w_title)
+                    w_deps = wo.get("dependencies", [])
+                    w_prio = wo.get("priority", "P1")
+                    w_deliv = wo.get("deliverable") or {}
+
+                    w_role = "backend"
+                    if primary_agent == "gemini":
+                        w_role = "frontend"
+                    elif primary_agent == "gemma":
+                        w_role = "qa"
+                    elif primary_agent in ("local-llm", "gitops"):
+                        w_role = "gitops"
+
+                    task_candidates = extract_candidate_paths(f"{w_title}\n{w_desc}")
+                    if w_deliv.get("path"):
+                        deliv_p = str(w_deliv["path"]).replace("\\", "/").strip().lstrip("/")
+                        if deliv_p and deliv_p not in task_candidates:
+                            task_candidates.append(deliv_p)
+
+                    impl_est = derive_implementation_estimate(
+                        w_title, w_desc, w_deliv.get("path"), task_candidates,
+                        deliverable_type=w_deliv.get("type"),
+                        stack=tech_stack,
+                    )
+                    if primary_agent in ("local-llm", "gitops") and impl_est:
+                        for rel in ("VERSION.md", "CHANGELOG.md"):
+                            if rel not in impl_est["expected_files"]:
+                                impl_est["expected_files"].append(rel)
+                        impl_est["max_files_touched"] = len(impl_est["expected_files"])
+
+                    resolved_skills = select_skills_for_task(
+                        title=w_title,
+                        description=w_desc,
+                        agent_id=primary_agent,
+                        role=w_role,
+                        deliverable_path=w_deliv.get("path"),
+                        explicit_skills=wo.get("skills") or [],
+                        project_path=ws,
+                    )
+
+                    contract_rec = build_child_contract(
+                        wo_id=wo_id,
+                        agent_id=primary_agent,
+                        role=w_role,
+                        deliverable_path=w_deliv.get("path"),
+                        candidate_paths=task_candidates,
+                        max_files_touched=impl_est["max_files_touched"] if impl_est else None,
+                        skills=resolved_skills if resolved_skills else None,
+                        title=w_title,
+                        description=w_desc,
+                    )
+
+                    wo_rec = build_child_work_order(
+                        wo_id=wo_id,
+                        title=w_title,
+                        description=w_desc,
+                        assigned_agents=[primary_agent],
+                        dependencies=w_deps,
+                        priority=w_prio,
+                        deliverable=w_deliv,
+                        implementation_estimate=impl_est,
+                        milestone_id=wo.get("milestone_id"),
+                        skills=resolved_skills if resolved_skills else None,
+                    )
+                    wo_rec["synthesized_by"] = "reconcile"
+                    contract_rec["synthesized_by"] = "reconcile"
+
+                    from validators.kernel.io import durable_write_yaml
+                    wo_file_path = active_dir / f"{wo_id}.yaml"
+                    contract_file_path = contracts_dir / f"{wo_id}.yaml"
+
+                    durable_write_yaml(wo_file_path, wo_rec)
+                    durable_write_yaml(contract_file_path, contract_rec)
+                    existing_wos.append(wo_rec)
+                    reconciled_ids.append(wo_id)
+
+                    index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
+                    if index_path.is_file():
+                        try:
+                            index_data = yaml.safe_load(index_path.read_text(encoding="utf-8")) or {}
+                            orders = index_data.setdefault("orders", [])
+                            if not any(o.get("id") == wo_id for o in orders if isinstance(o, dict)):
+                                orders.append({
+                                    "id": wo_id,
+                                    "type": wo_rec.get("type", "FEATURE"),
+                                    "title": w_title,
+                                    "status": "ACTIVE",
+                                    "priority": w_prio,
+                                    "assigned_agents": [primary_agent],
+                                    "dependencies": w_deps,
+                                    "deliverable": w_deliv,
+                                    "created": wo_rec.get("created"),
+                                    "updated": wo_rec.get("updated"),
+                                    "file": f"work-orders/ACTIVE/{wo_id}.yaml",
+                                })
+                                index_data["next_id"] = start_idx + 1
+                                durable_write_yaml(index_path, index_data)
+                        except Exception:
+                            pass
+
+                    try:
+                        from cli.init import ensure_canonical_tree
+                        tree_data = ensure_canonical_tree(ws)
+                        agents_map = tree_data.setdefault("agents", {})
+                        a_info = agents_map.setdefault(primary_agent, {"assigned_work_orders": [], "status": "idle", "session_count": 0})
+                        a_orders = a_info.setdefault("assigned_work_orders", [])
+                        if wo_id not in a_orders:
+                            a_orders.append(wo_id)
+                        durable_write_yaml(ws / ".sync" / "runtime" / "TREE.yaml", tree_data)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     return reconciled_ids

@@ -11,13 +11,30 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 
 class DaemonClient:
-    def __init__(self, url: str | None = None, base_url: str | None = None) -> None:
+    ADMIN_METHODS = {
+        "run.resume",
+        "run.re_attest",
+        "run.approve",
+        "run.reject",
+        "session.pause",
+        "session.cancel",
+    }
+
+    def __init__(
+        self,
+        url: str | None = None,
+        base_url: str | None = None,
+        auth_token: str | None = None,
+    ) -> None:
         target = url or base_url or "http://127.0.0.1:9999"
         self.url = target.rstrip("/")
+        self.auth_token = auth_token
         self._request_id = 0
         self._opener = build_opener(ProxyHandler({}))
 
     def call(self, method: str, **params: Any) -> Any:
+        if self.auth_token and method in self.ADMIN_METHODS and "auth_token" not in params:
+            params["auth_token"] = self.auth_token
         self._request_id += 1
         payload = json.dumps(
             {"jsonrpc": "2.0", "id": self._request_id, "method": method, "params": params}
@@ -135,16 +152,33 @@ class DaemonClient:
     def run_get(self, session_id: str) -> dict[str, Any] | None:
         return self.call("run.get", session_id=session_id)
 
-    def run_approve(self, session_id: str, reason: str = "") -> dict[str, Any]:
-        return self.call("run.approve", session_id=session_id, reason=reason)
+    def run_approve(
+        self, session_id: str, reason: str = "", auth_token: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"session_id": session_id, "reason": reason}
+        tok = auth_token or self.auth_token
+        if tok is not None:
+            params["auth_token"] = tok
+        return self.call("run.approve", **params)
 
-    def run_reject(self, session_id: str, reason: str = "") -> dict[str, Any]:
-        return self.call("run.reject", session_id=session_id, reason=reason)
+    def run_reject(
+        self, session_id: str, reason: str = "", auth_token: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"session_id": session_id, "reason": reason}
+        tok = auth_token or self.auth_token
+        if tok is not None:
+            params["auth_token"] = tok
+        return self.call("run.reject", **params)
 
-    def run_resume(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+    def run_resume(
+        self, session_id: str, run_id: str | None = None, auth_token: str | None = None
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {"session_id": session_id}
         if run_id is not None:
             params["run_id"] = run_id
+        tok = auth_token or self.auth_token
+        if tok is not None:
+            params["auth_token"] = tok
         return self.call("run.resume", **params)
 
     def approve(self, session_id: str, approved: bool, reason: str = "") -> dict[str, Any]:

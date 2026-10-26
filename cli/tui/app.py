@@ -109,9 +109,9 @@ from validators.kernel.tui.views import diff_viewer, verification_matrix
 _terminal_resized: bool = False
 
 
-def create_tui_adapter(daemon_url: str) -> StackMindTuiAdapter:
+def create_tui_adapter(daemon_url: str, auth_token: str | None = None) -> StackMindTuiAdapter:
     """Create a presentation adapter; all actions remain daemon RPC calls."""
-    return StackMindTuiAdapter(DaemonClient(daemon_url))
+    return StackMindTuiAdapter(DaemonClient(daemon_url, auth_token=auth_token))
 
 
 def resolve_tui_daemon(workspace: Path) -> tuple[LocalDaemon | None, str, bool]:
@@ -310,8 +310,20 @@ def tui(
     if daemon_url is None:
         daemon, daemon_url, is_attached = resolve_tui_daemon(workspace)
 
+    daemon_auth_token: str | None = None
+    if daemon and getattr(daemon, "auth_token", None):
+        daemon_auth_token = daemon.auth_token
+    else:
+        state_dir = workspace.resolve() / ".sync" / "runtime" / "daemon"
+        token_file = state_dir / ".daemon_token"
+        if token_file.is_file():
+            try:
+                daemon_auth_token = token_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
     try:
-        client = DaemonClient(daemon_url)
+        client = DaemonClient(daemon_url, auth_token=daemon_auth_token)
         adapter = StackMindTuiAdapter(client)
 
         session = None

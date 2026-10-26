@@ -1926,6 +1926,17 @@ class SessionManager:
                     pass
             if state.phase in (Phase.FAILED, Phase.BLOCKED):
                 self._prepare_run_for_resume(state, session, ws)
+            elif state.phase == Phase.WAITING_FOR_HUMAN:
+                if hasattr(self.supervisor, "re_attest_run"):
+                    try:
+                        self.supervisor.re_attest_run(
+                            state,
+                            human_signature="operator",
+                            confirmed_budget=state.global_turn_budget or 50,
+                        )
+                    except Exception:
+                        pass
+                self._prepare_run_for_resume(state, session, ws)
             else:
                 self._cleanup_orphaned_operations(state, session)
 

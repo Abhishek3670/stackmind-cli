@@ -26,7 +26,7 @@ def session_params(tmp_path: Path) -> dict:
 
 def test_tui_daemon_connection_and_lifecycle(tmp_path):
     with LocalDaemon(tmp_path / "daemon") as daemon:
-        adapter = StackMindTuiAdapter(DaemonClient(daemon.url))
+        adapter = StackMindTuiAdapter(DaemonClient(daemon.url, auth_token=daemon.auth_token))
         session = adapter.command(":new", **session_params(tmp_path))
         assert adapter.command(f":pause {session['session_id']}")["state"] == "PAUSED"
         assert adapter.client.resume(session["session_id"])["state"] == "RUNNING"

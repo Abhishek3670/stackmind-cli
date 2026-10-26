@@ -5726,10 +5726,23 @@ class LifecycleSupervisor:
         Per Amendment A: Workspace copies are never inputs. Authoritative state lives strictly
         in supervisor memory or signed external checkpoints.
         """
-        if state_manager is not None:
-            s = state_manager.get_state(run_id)
+        sm = state_manager or getattr(cls, "state_manager", None)
+        if sm is not None:
+            s = sm.get_state(run_id)
             if s is not None:
                 return s
+        if ws is not None:
+            state_file = Path(ws) / ".sync" / "runtime" / "supervisor" / f"{run_id}.yaml"
+            if state_file.is_file():
+                try:
+                    data = yaml.safe_load(state_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        state = RunState.from_dict(data)
+                        if sm is not None:
+                            sm.register_state(run_id, state)
+                        return state
+                except Exception:
+                    pass
         return None
 
     @staticmethod
