@@ -150,16 +150,22 @@ class AuthoringGate:
                 errors=[f"Artifact '{norm_path}' is empty."],
             )
 
+        normalized_content: str | None = None
         try:
             data = yaml.safe_load(content)
         except yaml.YAMLError as exc:
-            return AuthoringGateDecision(
-                passed=False,
-                artifact_type=artifact_type,
-                path=norm_path,
-                author=author,
-                errors=[f"YAML syntax parsing error: {exc}"],
-            )
+            repaired_text = self.repair_yaml_block_scalars(content)
+            try:
+                data = yaml.safe_load(repaired_text)
+                normalized_content = repaired_text
+            except Exception:
+                return AuthoringGateDecision(
+                    passed=False,
+                    artifact_type=artifact_type,
+                    path=norm_path,
+                    author=author,
+                    errors=[f"YAML syntax parsing error: {exc}"],
+                )
         except Exception as exc:
             return AuthoringGateDecision(
                 passed=False,
@@ -179,9 +185,14 @@ class AuthoringGate:
             )
 
         # 3. Schema & Semantic Validation by Artifact Type
-        normalized_content: str | None = None
         if artifact_type == "work_order":
+            data = self.normalize_work_order_data(data)
             self._validate_work_order(norm_path, data, errors)
+            if not errors:
+                try:
+                    normalized_content = yaml.safe_dump(data, sort_keys=False)
+                except Exception:
+                    pass
         elif artifact_type == "contract":
             data = self.normalize_contract_data(data)
             self._validate_contract(norm_path, data, errors)
@@ -352,6 +363,54 @@ class AuthoringGate:
                     errors.append(f"requirement_refs entry '{ref}' must be a string")
                 elif not ref.startswith("R"):
                     errors.append(f"requirement_refs entry '{ref}' must start with 'R' (e.g., R001)")
+
+    @staticmethod
+    def repair_yaml_block_scalars(text: str) -> str:
+        """Repair inconsistent indentation inside block scalars (e.g. description: > or |)."""
+        lines = text.splitlines()
+        repaired_lines = []
+        in_block = False
+        key_indent = 0
+        block_indent = 0
+
+        for line in lines:
+            block_start = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*:\s*[>|][+-]?\s*$", line)
+            if block_start:
+                in_block = True
+                key_indent = len(block_start.group(1))
+                block_indent = key_indent + 2
+                repaired_lines.append(line)
+                continue
+
+            if in_block:
+                key_match = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*:", line)
+                if key_match and len(key_match.group(1)) <= key_indent:
+                    in_block = False
+                    repaired_lines.append(line)
+                    continue
+
+                stripped = line.strip()
+                if stripped:
+                    curr_indent = len(line) - len(line.lstrip())
+                    if curr_indent < block_indent:
+                        line = " " * block_indent + stripped
+                repaired_lines.append(line)
+            else:
+                repaired_lines.append(line)
+
+        return "\n".join(repaired_lines)
+
+    @staticmethod
+    def normalize_work_order_data(data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize common LLM shorthand/structure issues in work order dictionaries."""
+        if not isinstance(data, dict):
+            return data
+        deliverable = data.get("deliverable")
+        if isinstance(deliverable, dict) and "acceptance_criteria" in deliverable:
+            crit = deliverable.pop("acceptance_criteria")
+            if "acceptance_criteria" not in data or not data["acceptance_criteria"]:
+                data["acceptance_criteria"] = crit
+        return data
 
     @staticmethod
     def normalize_contract_data(data: dict[str, Any]) -> dict[str, Any]:

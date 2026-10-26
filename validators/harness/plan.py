@@ -398,10 +398,24 @@ def parse_tech_stack(content: str, project_path: Path | str | None = None) -> Te
 
         competing = [k for k, v in [("node", b_node), ("python", b_py), ("go", b_go), ("rust", b_rust)] if v]
         if len(competing) > 1:
-            return TechStack(
-                is_ambiguous=True,
-                ambiguity_reason=f"Conflicting backend technologies explicitly declared: {', '.join(competing)}",
-            )
+            # Check for alternative/choice phrasing
+            is_alternative = bool(re.search(
+                r"(?:choose\s+one|pick\s+one|select\s+one|either\s+|\bor\b|tbd|tba|decide|preference|preferred)",
+                b_lower,
+            ))
+            if not is_alternative:
+                # Also detect "X/Y" where slash directly separates competing technologies
+                slash_parts = [p.strip() for p in b_lower.split("/")]
+                tech_in_slash = sum(1 for p in slash_parts if re.search(
+                    r"\b(node(?:\.js)?|python(?:3)?|go(?:lang)?|rust)\b", p
+                ))
+                if tech_in_slash >= 2:
+                    is_alternative = True
+            if not is_alternative:
+                return TechStack(
+                    is_ambiguous=True,
+                    ambiguity_reason=f"Conflicting backend technologies explicitly declared: {', '.join(competing)}",
+                )
 
     backend_lang = None
     backend_fw = None
@@ -409,14 +423,48 @@ def parse_tech_stack(content: str, project_path: Path | str | None = None) -> Te
 
     if backend_val:
         b_lower = backend_val.lower()
-        if re.search(r"\b(node(?:\.js)?|express(?:\.js)?|javascript)\b", b_lower):
+        b_node = bool(re.search(r"\b(node(?:\.js)?|express(?:\.js)?|javascript)\b", b_lower))
+        b_py = bool(re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", b_lower))
+        b_go = bool(re.search(r"\b(go|golang)\b", b_lower))
+        b_rust = bool(re.search(r"\b(rust)\b", b_lower))
+        competing = [k for k, v in [("node", b_node), ("python", b_py), ("go", b_go), ("rust", b_rust)] if v]
+
+        chosen_candidate = None
+        if len(competing) > 1 and project_path:
+            pp = Path(project_path).resolve()
+            if (pp / "package.json").is_file() and "node" in competing:
+                chosen_candidate = "node"
+            elif ((pp / "requirements.txt").is_file() or (pp / "pyproject.toml").is_file()) and "python" in competing:
+                chosen_candidate = "python"
+            elif (pp / "go.mod").is_file() and "go" in competing:
+                chosen_candidate = "go"
+            elif (pp / "Cargo.toml").is_file() and "rust" in competing:
+                chosen_candidate = "rust"
+
+        if not chosen_candidate and len(competing) > 1:
+            cand_positions = []
+            for cand, pattern in [
+                ("node", r"\b(node(?:\.js)?|express(?:\.js)?|javascript)\b"),
+                ("python", r"\b(python(?:3)?|flask|fastapi|django)\b"),
+                ("go", r"\b(go|golang)\b"),
+                ("rust", r"\b(rust)\b"),
+            ]:
+                if cand in competing:
+                    m = re.search(pattern, b_lower)
+                    if m:
+                        cand_positions.append((m.start(), cand))
+            if cand_positions:
+                cand_positions.sort()
+                chosen_candidate = cand_positions[0][1]
+
+        if (chosen_candidate == "node") or (not chosen_candidate and re.search(r"\b(node(?:\.js)?|express(?:\.js)?|javascript)\b", b_lower)):
             backend_lang = "typescript" if re.search(r"\btypescript\b", b_lower) else "javascript"
             if re.search(r"\bexpress(?:\.js)?\b", b_lower):
                 backend_fw = "express"
             elif re.search(r"\bnest(?:\.js)?\b", b_lower):
                 backend_fw = "nest"
             manifest = "package.json"
-        elif re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", b_lower):
+        elif (chosen_candidate == "python") or (not chosen_candidate and re.search(r"\b(python(?:3)?|flask|fastapi|django)\b", b_lower)):
             backend_lang = "python"
             if re.search(r"\bflask\b", b_lower):
                 backend_fw = "flask"
@@ -425,10 +473,10 @@ def parse_tech_stack(content: str, project_path: Path | str | None = None) -> Te
             elif re.search(r"\bdjango\b", b_lower):
                 backend_fw = "django"
             manifest = "requirements.txt"
-        elif re.search(r"\b(go|golang)\b", b_lower):
+        elif (chosen_candidate == "go") or (not chosen_candidate and re.search(r"\b(go|golang)\b", b_lower)):
             backend_lang = "go"
             manifest = "go.mod"
-        elif re.search(r"\brust\b", b_lower):
+        elif (chosen_candidate == "rust") or (not chosen_candidate and re.search(r"\b(rust)\b", b_lower)):
             backend_lang = "rust"
             manifest = "Cargo.toml"
 
