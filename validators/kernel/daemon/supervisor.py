@@ -909,7 +909,7 @@ class LifecycleSupervisor:
                 )
 
         # 2. Monotonic total run wall-clock timeout check
-        if state.run_started_at is not None and (now_mono - state.run_started_at) > self.ci_run_timeout:
+        if self.headless and state.run_started_at is not None and (now_mono - state.run_started_at) > self.ci_run_timeout:
             return self._handle_ci_timeout(
                 state,
                 reason=f"HEADLESS_RUN_TIMEOUT: Total run wall-clock time exceeded {self.ci_run_timeout}s.",

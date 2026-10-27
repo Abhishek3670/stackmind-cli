@@ -841,3 +841,49 @@ def test_legitimate_long_run_below_ci_run_timeout_is_not_aborted(tmp_path: Path)
     assert res == AdvanceResult.WAITING_FOR_OPERATION
     assert state.phase == Phase.EXECUTING
     assert state.exit_code == 0
+
+
+def test_interactive_run_ignores_ci_run_timeout(tmp_path: Path):
+    """An interactive/TUI run (headless=False) is never aborted by ci_run_timeout."""
+    mgr = StubSessionManager()
+    reaper = ProcessReaper()
+    # Configure low ci_run_timeout (0.01s) but headless=False
+    sup = LifecycleSupervisor(manager=mgr, reaper=reaper, ci_run_timeout=0.01, headless=False)
+    state = sup.start_run("run-interactive", "Goal", tmp_path, "session-int")
+    state.phase = Phase.EXECUTING
+    state.worker_wo_ids = ["WO-001"]
+    mgr.operations["op-wo1"] = {
+        "operation_id": "op-wo1",
+        "work_order_id": "WO-001",
+        "agent_id": "codex",
+        "role": "backend",
+        "status": "RUNNING",
+    }
+    # Artificially set run_started_at far in the past (> 0.01s)
+    state.run_started_at = time.monotonic() - 100.0
+
+    res = sup.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.EXECUTING
+    assert state.error is None
+
+
+def test_prepare_run_for_resume_resets_run_started_at(tmp_path: Path):
+    """Resuming a failed or blocked run resets run_started_at to current monotonic time."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon-storage.json")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("claude", "test", {}, str(tmp_path))
+    state = mgr.supervisor.start_run("run-test-resume", "Goal", tmp_path, session["session_id"])
+    state.phase = Phase.FAILED
+    state.error = "HEADLESS_RUN_TIMEOUT: Total run wall-clock time exceeded 1800.0s."
+    state.run_started_at = time.monotonic() - 5000.0
+    state.turn_deadline = time.monotonic() - 100.0
+
+    mgr._prepare_run_for_resume(state, session, tmp_path)
+
+    assert state.error is None
+    assert abs(state.run_started_at - time.monotonic()) < 2.0
+    assert state.turn_deadline is None

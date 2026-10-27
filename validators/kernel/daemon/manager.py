@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1611,6 +1612,9 @@ class SessionManager:
         state.failed_wo_ids.clear()
         state.retry_counts.clear()
         state.recovery_attempts.clear()
+        state.run_started_at = time.monotonic()
+        state.turn_deadline = None
+        state.waiting_for_human_entered_at = None
         state.dependency_escalation_retries.clear()
         state.worker_blockers.clear()
         # Operator resume grants a fresh rework budget: the human decided to
