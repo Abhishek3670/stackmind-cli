@@ -2434,6 +2434,10 @@ def dispatch_delivery_command(
                 state.error = None
         except Exception as run_err:
             run_resumed_msg = f" (supervisor note: {run_err})"
+        try:
+            session = client.get_session(session["session_id"])
+        except Exception:
+            pass
         if session.get("workspace"):
             state.sync_work_orders_from_disk(session.get("workspace"))
         output_str = f"Session {session.get('state', 'RUNNING')}{run_resumed_msg}"

@@ -1176,11 +1176,11 @@ class SessionManager:
         with self._lock:
             return self._set_state(session_id, "COMPLETED", "session.completed")
 
-    def _set_state(self, session_id: str, state: str, event: str) -> dict[str, Any]:
+    def _set_state(self, session_id: str, state: str, event: str, allow_terminal: bool = False) -> dict[str, Any]:
         session = self._sessions.get(session_id)
         if not session:
             raise KeyError("unknown session")
-        if session["state"] in _TERMINAL:
+        if not allow_terminal and session["state"] in _TERMINAL:
             raise ValueError("session is terminal")
         session["state"] = state
         session["updated_at"] = _now()
@@ -1195,9 +1195,9 @@ class SessionManager:
     def resume_session(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
-            if not session or session["state"] not in {"PAUSED", "WAITING"}:
+            if not session or (session["state"] not in {"PAUSED", "WAITING", "CANCELLED", "BLOCKED", "FAILED"} and session["state"] != "RUNNING"):
                 raise ValueError("only paused or waiting sessions can be resumed")
-            return self._set_state(session_id, "RUNNING", "session.resumed")
+            return self._set_state(session_id, "RUNNING", "session.resumed", allow_terminal=True)
 
     def propose_plan(
         self,
@@ -1612,11 +1612,22 @@ class SessionManager:
         state.failed_wo_ids.clear()
         state.retry_counts.clear()
         state.recovery_attempts.clear()
+        state.recovery_wo_id = None
+        state.recovery_decision_operation_id = None
+        state.stall_ticks = 0
         state.run_started_at = time.monotonic()
         state.turn_deadline = None
         state.waiting_for_human_entered_at = None
         state.dependency_escalation_retries.clear()
         state.worker_blockers.clear()
+        if session.get("state") != "COMPLETED":
+            session["state"] = "RUNNING"
+            session["updated_at"] = _now()
+        if hasattr(self, "_sessions"):
+            real_sess = self._sessions.get(state.session_id)
+            if real_sess and real_sess.get("state") != "COMPLETED":
+                real_sess["state"] = "RUNNING"
+                real_sess["updated_at"] = _now()
         # Operator resume grants a fresh rework budget: the human decided to
         # continue the run (often after a platform upgrade or manual repair),
         # so stale exhaustion from previous sessions must not dead-end it.
@@ -1916,12 +1927,13 @@ class SessionManager:
             if state is None:
                 raise KeyError(f"run '{target_run_id}' not found")
 
-            if session.get("state") in {"PAUSED", "WAITING"}:
+            if session.get("state") in {"PAUSED", "WAITING", "CANCELLED", "BLOCKED", "FAILED"}:
                 session["state"] = "RUNNING"
                 session["updated_at"] = _now()
                 self.events.publish("session.resumed", session_id)
 
             from .supervisor import Phase
+            self._save()
             if state.session_id != session_id:
                 state.session_id = session_id
                 try:

@@ -1727,6 +1727,16 @@ class LifecycleSupervisor:
                 parent_op_id = None
 
         # 3. Dispatch each eligible work order (sharing parent_op_id if batch)
+        if hasattr(self.manager, "_sessions"):
+            sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+            if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
+                sess["state"] = "RUNNING"
+                sess["updated_at"] = _now()
+                if hasattr(self.manager, "_save"):
+                    try:
+                        self.manager._save()
+                    except Exception:
+                        pass
         for wo_id in eligible_wos:
             agent = self._agent_for_wo(wo_id, ws)
             try:
@@ -1846,6 +1856,16 @@ class LifecycleSupervisor:
                         all_done = False
                         continue
                 if self._dependencies_met(state, wo_id, ws):
+                    if hasattr(self.manager, "_sessions"):
+                        sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+                        if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
+                            sess["state"] = "RUNNING"
+                            sess["updated_at"] = _now()
+                            if hasattr(self.manager, "_save"):
+                                try:
+                                    self.manager._save()
+                                except Exception:
+                                    pass
                     if wo_id not in state.blocked_wo_ids:
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
@@ -5252,6 +5272,20 @@ class LifecycleSupervisor:
 
     def unblock_in_flight_work_orders(self, state: RunState) -> None:
         """Reset non-completed work orders on disk back to ACTIVE when resuming a run."""
+        state.stall_ticks = 0
+        state.blocked_wo_ids.clear()
+        state.recovery_wo_id = None
+        state.recovery_decision_operation_id = None
+        if hasattr(self.manager, "_sessions"):
+            sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+            if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
+                sess["state"] = "RUNNING"
+                sess["updated_at"] = _now()
+                if hasattr(self.manager, "_save"):
+                    try:
+                        self.manager._save()
+                    except Exception:
+                        pass
         ws = Path(state.workspace)
         candidate_ids: list[str] = []
         if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:

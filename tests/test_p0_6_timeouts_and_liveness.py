@@ -887,3 +887,75 @@ def test_prepare_run_for_resume_resets_run_started_at(tmp_path: Path):
     assert state.error is None
     assert abs(state.run_started_at - time.monotonic()) < 2.0
     assert state.turn_deadline is None
+
+
+def test_resume_cancelled_session_and_run(tmp_path: Path):
+    """A session cancelled by operator (e.g. Ctrl+C) can be resumed cleanly."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon-storage.json")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("claude", "test", {}, str(tmp_path))
+    session_id = session["session_id"]
+
+    # Simulate operator interruption
+    mgr.cancel_session(session_id)
+    assert mgr._sessions[session_id]["state"] == "CANCELLED"
+
+    # Operator runs :resume
+    resumed = mgr.resume_session(session_id)
+    assert resumed["state"] == "RUNNING"
+    assert mgr._sessions[session_id]["state"] == "RUNNING"
+
+
+def test_prepare_run_for_resume_unblocks_cancelled_session_and_stall(tmp_path: Path):
+    """Resuming a run with a cancelled session clears stall ticks and unblocks the session."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon-storage.json")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("claude", "test", {}, str(tmp_path))
+    session_id = session["session_id"]
+    mgr.cancel_session(session_id)
+    assert mgr._sessions[session_id]["state"] == "CANCELLED"
+    raw_session = mgr._sessions[session_id]
+
+    state = mgr.supervisor.start_run("run-test-stall", "Goal", tmp_path, session_id)
+    state.phase = Phase.WAITING_FOR_HUMAN
+    state.stall_ticks = 3
+    state.blocked_wo_ids = ["WO-004"]
+    state.recovery_wo_id = "WO-001"
+    state.error = "IDLE_STALL (C_stall): Phase EXECUTING stalled for 3 consecutive ticks"
+
+    mgr._prepare_run_for_resume(state, session, tmp_path)
+
+    assert state.stall_ticks == 0
+    assert state.blocked_wo_ids == []
+    assert state.recovery_wo_id is None
+    assert state.error is None
+    assert mgr._sessions[session_id]["state"] == "RUNNING"
+    assert mgr._sessions[session_id]["state"] == "RUNNING"
+
+
+def test_supervisor_unblock_in_flight_work_orders_restores_session(tmp_path: Path):
+    """LifecycleSupervisor.unblock_in_flight_work_orders restores cancelled session and resets stall ticks."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon-storage.json")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("claude", "test", {}, str(tmp_path))
+    session_id = session["session_id"]
+    mgr._sessions[session_id]["state"] = "CANCELLED"
+
+    state = mgr.supervisor.start_run("run-test-unblock", "Goal", tmp_path, session_id)
+    state.stall_ticks = 3
+    state.blocked_wo_ids = ["WO-004"]
+
+    mgr.supervisor.unblock_in_flight_work_orders(state)
+
+    assert state.stall_ticks == 0
+    assert state.blocked_wo_ids == []
+    assert mgr._sessions[session_id]["state"] == "RUNNING"
