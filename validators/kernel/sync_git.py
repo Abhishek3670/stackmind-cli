@@ -52,29 +52,14 @@ def commit_sync_governance(
 
         # 2. Stage changes (specific paths or all)
         if paths:
-            rel_paths: list[str] = []
-            for p in paths:
-                try:
-                    p_path = Path(p)
-                    if p_path.is_absolute():
-                        rel_paths.append(str(p_path.relative_to(sync_path)))
-                    else:
-                        rel_paths.append(str(p))
-                except Exception:
-                    rel_paths.append(str(p))
-            subprocess.run(
-                ["git", "add", "--", *rel_paths],
-                cwd=str(sync_path),
-                check=False,
-                capture_output=True,
-            )
+            rel_paths = [
+                str(Path(p).relative_to(sync_path) if Path(p).is_absolute() else p)
+                for p in paths
+            ]
+            add_args = ["git", "add", "--", *rel_paths]
         else:
-            subprocess.run(
-                ["git", "add", "."],
-                cwd=str(sync_path),
-                check=False,
-                capture_output=True,
-            )
+            add_args = ["git", "add", "."]
+        subprocess.run(add_args, cwd=str(sync_path), check=False, capture_output=True)
 
         # 3. Check if anything is staged
         status_proc = subprocess.run(

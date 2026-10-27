@@ -318,6 +318,36 @@ def get_help_str() -> str:
     )
 
 
+def _render_live_thinking_block(state: Any, think_text: str, layout_width: int) -> str | None:
+    """Render live thinking block for active turn stream."""
+    clean = think_text.strip()
+    if not clean:
+        return None
+    from cli.tui.chat import render_thinking_block_str
+    live_elapsed = None
+    if getattr(state, "current_turn_thinking_start_time", None) is not None:
+        live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
+    elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
+        live_elapsed = state.current_turn_thinking_elapsed
+    return render_thinking_block_str(
+        clean,
+        expanded=getattr(state, "live_thinking_expanded", True),
+        in_progress=True,
+        elapsed=live_elapsed,
+        tokens=len(clean.split()),
+        width=layout_width,
+    )
+
+
+def _render_payload_text(text: str, layout_width: int) -> str | None:
+    """Format and wrap text payload to layout width."""
+    clean = text.strip()
+    if not clean:
+        return None
+    from cli.tui.chat import format_contract_payload
+    return _wrap_text_to_width(format_contract_payload(clean), layout_width) or None
+
+
 def _build_in_progress_turn_content(
     state: AutonomousDeliveryState,
     model_name: str | None,
@@ -339,39 +369,18 @@ def _build_in_progress_turn_content(
     segs = getattr(state, "current_turn_segments", None)
     if segs:
         idx = 0
-        from cli.tui.chat import render_thinking_block_str, format_contract_payload
         while idx < len(segs):
             seg = segs[idx]
             kind = seg.get("kind")
             if kind == "thinking":
-                think_text = seg.get("content", "").strip()
-                if think_text:
-                    is_exp = getattr(state, "live_thinking_expanded", True)
-                    live_elapsed = None
-                    if getattr(state, "current_turn_thinking_start_time", None) is not None:
-                        import time
-                        live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
-                    elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
-                        live_elapsed = state.current_turn_thinking_elapsed
-                    tok_cnt = len(think_text.split())
-                    think_str = render_thinking_block_str(
-                        think_text,
-                        expanded=is_exp,
-                        in_progress=True,
-                        elapsed=live_elapsed,
-                        tokens=tok_cnt,
-                        width=layout_width,
-                    )
-                    if think_str:
-                        parts.append(think_str)
+                t_str = _render_live_thinking_block(state, seg.get("content", ""), layout_width)
+                if t_str:
+                    parts.append(t_str)
                 idx += 1
             elif kind == "text":
-                content_text = seg.get("content", "").strip()
-                if content_text:
-                    formatted_text = format_contract_payload(content_text)
-                    wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
-                    if wrapped_text:
-                        parts.append(wrapped_text)
+                w_str = _render_payload_text(seg.get("content", ""), layout_width)
+                if w_str:
+                    parts.append(w_str)
                 idx += 1
             elif kind == "action":
                 act_list = []
@@ -395,48 +404,24 @@ def _build_in_progress_turn_content(
         curr_text = "".join(streamed_chunks).strip()
         all_seg_text = "".join(s.get("content", "") for s in segs if s.get("kind") == "text").strip()
         if curr_text and not all_seg_text:
-            formatted_text = format_contract_payload(curr_text)
-            wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
-            if wrapped_text:
-                parts.append(wrapped_text)
+            w_str = _render_payload_text(curr_text, layout_width)
+            if w_str:
+                parts.append(w_str)
     else:
-        # Fallback to standard ordering when no explicit segments are recorded
         turn_acts = getattr(state, "current_turn_actions", None)
         if turn_acts and not getattr(turn_acts, "is_empty", True):
             act_str = render_actions_group_str(turn_acts, width=layout_width)
             if act_str:
                 parts.append(act_str)
 
-        thinking = getattr(state, "current_turn_thinking", None)
-        if thinking and thinking.strip():
-            clean_think = thinking.strip()
-            from cli.tui.chat import render_thinking_block_str
-            is_exp = getattr(state, "live_thinking_expanded", True)
-            live_elapsed = None
-            if getattr(state, "current_turn_thinking_start_time", None) is not None:
-                import time
-                live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
-            elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
-                live_elapsed = state.current_turn_thinking_elapsed
-            tok_cnt = len(clean_think.split())
-            think_str = render_thinking_block_str(
-                clean_think,
-                expanded=is_exp,
-                in_progress=True,
-                elapsed=live_elapsed,
-                tokens=tok_cnt,
-                width=layout_width,
-            )
-            if think_str:
-                parts.append(think_str)
+        t_str = _render_live_thinking_block(state, getattr(state, "current_turn_thinking", "") or "", layout_width)
+        if t_str:
+            parts.append(t_str)
 
         if streamed_chunks:
-            curr_text = "".join(streamed_chunks)
-            from cli.tui.chat import format_contract_payload
-            formatted_text = format_contract_payload(curr_text)
-            wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
-            if wrapped_text:
-                parts.append(wrapped_text)
+            w_str = _render_payload_text("".join(streamed_chunks), layout_width)
+            if w_str:
+                parts.append(w_str)
 
     in_progress = "\n\n".join(parts)
     if len(parts) == 1 and not (streamed_chunks and "".join(streamed_chunks).strip()):

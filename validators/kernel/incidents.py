@@ -63,14 +63,11 @@ def record_permission_incident(
     try:
         incidents_path.parent.mkdir(parents=True, exist_ok=True)
         # Read existing records to enforce bounding
-        existing_lines: list[str] = []
-        if incidents_path.is_file():
-            try:
-                existing_lines = [
-                    l for l in incidents_path.read_text(encoding="utf-8").splitlines() if l.strip()
-                ]
-            except Exception:
-                existing_lines = []
+        existing_lines = (
+            [l for l in incidents_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if incidents_path.is_file()
+            else []
+        )
 
         existing_lines.append(json.dumps(record, sort_keys=True))
         if len(existing_lines) > DEFAULT_MAX_INCIDENTS:

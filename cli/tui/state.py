@@ -1252,6 +1252,15 @@ class AutonomousDeliveryState:
         self.scroll_focus = "work_orders" if current == "conversation" else "conversation"
         return self.scroll_focus
 
+    @property
+    def has_in_progress_turn(self) -> bool:
+        """Return True if there is active, uncommitted turn content (streaming segments, running tools, or thinking)."""
+        return bool(
+            (getattr(self, "current_turn_segments", None) and any(s.get("kind") in ("text", "thinking", "action") for s in self.current_turn_segments))
+            or (self.current_turn_actions and not self.current_turn_actions.is_empty and any(getattr(a, "status", "").upper() == "RUNNING" for a in self.current_turn_actions.all_actions))
+            or getattr(self, "current_turn_thinking", None)
+        )
+
     def record_turn_action(
         self,
         action_id: str,
