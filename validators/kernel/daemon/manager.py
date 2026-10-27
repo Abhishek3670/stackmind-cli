@@ -1509,7 +1509,17 @@ class SessionManager:
                         "and modified_files listing all authored files."
                     )
                     turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
-                    self.start_turn(
+                    if turn_wo_id == "WO-000" and not (workspace / ".sync" / "work-orders" / "ACTIVE" / "WO-000.yaml").exists() and not (workspace / ".sync" / "work-orders" / "COMPLETED" / "WO-000.yaml").exists():
+                        try:
+                            synthesize_bootstrap_planning(
+                                workspace,
+                                plan.get("title", "Architecture Planning"),
+                                wo_id="WO-000",
+                                assigned_agent="claude",
+                            )
+                        except Exception:
+                            pass
+                    turn_op = self.start_turn(
                         session_id,
                         authoring_prompt,
                         role="architecture",
@@ -1517,6 +1527,38 @@ class SessionManager:
                         work_order_id=turn_wo_id,
                         is_authoring=True,
                     )
+                    from .supervisor import Phase
+                    has_active_run = any(
+                        r.session_id == session_id and r.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED)
+                        for r in self._active_runs.values()
+                    )
+                    if not has_active_run and (workspace / ".sync").exists():
+                        try:
+                            run_id = f"run-{uuid4().hex[:8]}"
+                            run_state = self.supervisor.start_run(
+                                run_id,
+                                plan.get("title") or "Goal Execution",
+                                workspace,
+                                session_id,
+                                bootstrap_mode=True,
+                            )
+                            run_state.plan_id = plan_id
+                            run_state.phase = Phase.AUTHORING
+                            if turn_op and isinstance(turn_op, dict) and turn_op.get("operation_id"):
+                                run_state.authoring_operation_id = turn_op["operation_id"]
+                            self._active_runs[run_id] = run_state
+                            stop_event = Event()
+                            self._run_stop_events[run_id] = stop_event
+                            driver_thread = Thread(
+                                target=self._drive_run,
+                                args=(run_id, stop_event),
+                                name=f"stackmind-supervisor-{run_id}",
+                                daemon=True,
+                            )
+                            self._run_driver_threads[run_id] = driver_thread
+                            driver_thread.start()
+                        except Exception:
+                            pass
 
             self._operation_event.set()
             return [dict(w) for w in created_work_orders]

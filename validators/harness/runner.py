@@ -488,6 +488,22 @@ class AgentRunner:
                         deliverable_type=task.deliverable_type,
                         deliverable_paths=(),
                     )
+            if task is None and is_authoring and prompt and prompt.strip():
+                authoring_id = work_order_id or "WO-000"
+                task = HarnessTask(
+                    kind='work_order',
+                    identifier=authoring_id,
+                    path=self.sync_path / 'work-orders' / 'ACTIVE' / f"{authoring_id}.yaml",
+                    title=f"Authoring: {prompt.strip()[:80]}",
+                    body=prompt.strip(),
+                    query=prompt.strip(),
+                    work_order_id=authoring_id,
+                    deliverable_path=None,
+                    is_authoring=True,
+                    work_order_type='RESEARCH',
+                    deliverable_type=None,
+                    deliverable_paths=(),
+                )
             if task is None:
                 return HarnessRunResult(
                     status='idle',
@@ -2689,7 +2705,7 @@ class AgentRunner:
                     if candidate.exists():
                         wo_log_path = candidate
                         break
-            if wo_log_path is not None:
+            if wo_log_path is not None and wo_log_path.exists():
                 cached_payload = stage_inputs.get('_work_order_payload')
                 if cached_payload is None:
                     cached_payload = self._read_yaml(wo_log_path)

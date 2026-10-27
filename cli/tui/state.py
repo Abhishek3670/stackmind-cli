@@ -2190,14 +2190,11 @@ class AutonomousDeliveryState:
             created_records = payload.get("created_records") or payload.get("work_orders")
             if isinstance(created_records, list) and created_records and isinstance(created_records[0], Mapping):
                 self.sync_work_orders(created_records)
-            first_role = self.work_orders[0].role if self.work_orders else "Backend"
+            # Worker roles remain WAITING until daemon operations actually start
             for r_name, r_obj in self.roles.items():
-                if r_name.lower() in {"architecture", "lead"}:
-                    r_obj.state = "RUNNING"
-                elif r_name.lower() == first_role.lower():
-                    r_obj.state = "RUNNING"
-                else:
+                if r_name.lower() not in {"architecture", "lead"}:
                     r_obj.state = "WAITING"
+            self.reconcile_roles_from_work_orders()
             self.add_activity("Architecture", f"plan approved: {plan_id}")
 
         elif name == "plan.rejected":
