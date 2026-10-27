@@ -2088,36 +2088,53 @@ class ProviderGateway:
                 )
             self.consecutive_failures += 1
             if isinstance(ex, FileNotFoundError):
-                target_str = args.get("path") or args.get("target") or args.get("file") or ""
-                existing_files: list[str] = []
-                try:
-                    ws_root = getattr(getattr(self.tool_gateway, "workspace", None), "root", None)
-                    if ws_root and ws_root.is_dir():
-                        for p in ws_root.rglob("*"):
-                            if p.is_file() and not any(part in (".git", ".sync", "__pycache__", ".venv", "node_modules") for part in p.parts):
-                                existing_files.append(p.relative_to(ws_root).as_posix())
-                except Exception:
-                    pass
-                files_hint = f" Existing workspace files: {', '.join(sorted(existing_files)[:25])}." if existing_files else ""
-                res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace.{files_hint}"
-            elif isinstance(ex, PermissionError):
-                if name == "run_command":
+                if name in ("run_command", "bash", "execute_command"):
                     cmd_val = args.get("command") or args.get("cmd") or args.get("args") or ""
                     cmd_str = " ".join(str(c) for c in cmd_val) if isinstance(cmd_val, list) else str(cmd_val)
                     res = (
-                        f"Error: PermissionError: Command execution '{cmd_str}' was denied: "
-                        f"command execution is not permitted for this work order's contract. "
-                        f"Retrying will not help. Files should be finished with write_file and the final decision returned."
+                        f"Error: Command execution '{cmd_str}' failed: executable or file not found. "
+                        f"In StackMind CLI, shell tools like grep/cat/mkdir are restricted. "
+                        f"Use 'read_file' to inspect file contents or 'list_directory' to list files."
                     )
                 else:
-                    target_str = (
-                        args.get("path")
-                        or args.get("target")
-                        or args.get("file")
-                        or args.get("query")
-                        or args.get("q")
-                        or ("." if name in ("list_directory", "glob") else "")
+                    target_str = args.get("path") or args.get("target") or args.get("file") or ""
+                    existing_files: list[str] = []
+                    try:
+                        ws_root = getattr(getattr(self.tool_gateway, "workspace", None), "root", None)
+                        if ws_root and ws_root.is_dir():
+                            for p in ws_root.rglob("*"):
+                                if p.is_file() and not any(part in (".git", ".sync", "__pycache__", ".venv", "node_modules") for part in p.parts):
+                                    existing_files.append(p.relative_to(ws_root).as_posix())
+                    except Exception:
+                        pass
+                    files_hint = f" Existing workspace files: {', '.join(sorted(existing_files)[:25])}." if existing_files else ""
+                    res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace.{files_hint}"
+            elif isinstance(ex, PermissionError):
+                actor_str = str(getattr(getattr(self, "tool_gateway", None), "actor_id", "")).lower()
+                target_str = (
+                    args.get("path")
+                    or args.get("target")
+                    or args.get("file")
+                    or args.get("query")
+                    or args.get("q")
+                    or ("." if name in ("list_directory", "glob") else "")
+                )
+                if name == "run_command":
+                    cmd_val = args.get("command") or args.get("cmd") or args.get("args") or ""
+                    cmd_str = " ".join(str(c) for c in cmd_val) if isinstance(cmd_val, list) else str(cmd_val)
+                    target_str = cmd_str
+                    res = (
+                        f"Error: PermissionError: Command execution '{cmd_str}' was denied: "
+                        f"command execution is not permitted for this role's contract. "
+                        f"Retrying will not help. Use 'read_file' to read files and return your decision."
                     )
+                    if any(k in actor_str for k in ("claude", "architect", "architecture")):
+                        res += (
+                            "\nGUIDANCE FOR ARCHITECT: As the Lead Architect, shell/bash command execution is strictly denied. "
+                            "Use 'read_file' to inspect file contents or 'list_directory' to list files. "
+                            "If you need shell tasks (builds, tests) run, delegate them to Backend (Codex) or QA (Gemma)."
+                        )
+                else:
                     target_display = f"'{target_str}'" if target_str else f"tool '{name}'"
                     if "Authoring validation failed" in str(ex):
                         res = (
@@ -2130,7 +2147,6 @@ class ProviderGateway:
                             f"CRITICAL: Do NOT retry accessing or writing {target_display} as it is outside your assigned scope. "
                             f"Please proceed immediately with your assigned tasks and deliverables or conclude your turn."
                         )
-                        actor_str = str(getattr(getattr(self, "tool_gateway", None), "actor_id", "")).lower()
                         if any(k in actor_str for k in ("claude", "architect", "architecture")) and name == "write_file":
                             res += (
                                 "\nGUIDANCE FOR ARCHITECT: As the Lead Architect, you govern the system but cannot directly write workspace application source files. "
@@ -2138,6 +2154,25 @@ class ProviderGateway:
                                 "1. Call `delegate_task(target_agent='frontend'|'backend'|'qa'|'gitops', instructions=..., target_files=[...])` for focused changes, tests, or release tasks. "
                                 "2. Call `trigger_goal(goal=...)` for full multi-agent feature implementation."
                             )
+
+                # Record incident to .sync/state/incidents.jsonl
+                try:
+                    from validators.kernel.incidents import record_permission_incident
+                    proj_path = (
+                        getattr(getattr(self.tool_gateway, "workspace", None), "authoritative_root", None)
+                        or getattr(getattr(self.tool_gateway, "workspace", None), "root", None)
+                    )
+                    actor_id = getattr(self.tool_gateway, "actor_id", "agent")
+                    record_permission_incident(
+                        project_path=proj_path,
+                        agent=actor_id,
+                        role=actor_str,
+                        tool=name,
+                        target=target_str,
+                        reason=str(ex),
+                    )
+                except Exception:
+                    pass
             else:
                 res = f"Error executing {name}: {type(ex).__name__}: {ex}"
 

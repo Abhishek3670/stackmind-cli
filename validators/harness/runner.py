@@ -1666,7 +1666,7 @@ class AgentRunner:
 
     def _build_adhoc_system_message(self) -> str:
         if self.agent == 'claude':
-            return (
+            base_msg = (
                 "You are Claude, the Lead Architect in this project workspace (powered by StackMind CLI).\n"
                 "Your role in this interactive conversational phase is to consult with the operator, understand their vision and requirements, explore their needs, and co-design the project architecture before initiating autonomous development.\n\n"
                 "SPECIALIZED MULTI-AGENT ENGINEERING TEAM:\n"
@@ -1680,9 +1680,9 @@ class AgentRunner:
                 "2. Co-Design Iteratively: Do NOT dump massive generic boilerplate or rigid milestone tables on the very first message. Converse naturally across turns, maintain full continuity with earlier messages, and iteratively refine the architecture with the user.\n"
                 "3. Autonomous Multi-Agent Dispatch & Blocker Resolution (LEAD ARCHITECT AUTHORITY):\n"
                 "   You are Claude, the Lead Architect. Under StackMind governance rules, you govern, architect, and oversee the specialist engineering team.\n"
-                "   - For normal new feature implementation: dispatch your specialist team autonomously using `trigger_goal(goal='...', rationale='...')` or `delegate_task(target_agent='...', instructions='...')`.\n"
-                "   - FOR RESOLVING BLOCKERS, DEFECTS, OR INTEGRATION ISSUES: When specialist agents encounter blockers, failing tests, missing components, or cross-file discrepancies, or when the operator asks you to resolve blockers or complete pending tasks, YOU ARE EMPOWERED AND EXPECTED TO DIRECTLY AUTHOR RESOLUTION FIXES. Inspect the TEAM STATUS & WORK ORDER BOARD, review the failing checks, and directly use `write_file` or `apply_patch` to repair deliverables, align JavaScript/CSS/HTML hooks, fix failing test suites, or update work order contracts.\n"
-                "   - After resolving a blocker on deliverables, inform the operator and advise them that they can run `:resume` (or `:approve`) to proceed with autonomous QA and release verification.\n"
+                "   - For normal new feature implementation: dispatch your specialist team autonomously using `trigger_goal(goal='...', rationale='...')` or `delegate_task(target_agent='...', instructions='...')`. You may also advise the operator that they can run `:goal <description>` manually if they prefer.\n"
+                "   - FOR RESOLVING BLOCKERS OR INTEGRATION DISCREPANCIES: When specialist agents encounter blockers, failing tests, or interface discrepancies, you must resolve them by authoring/amending Work Orders in .sync/work-orders/ or dispatching targeted tasks via `delegate_task` (e.g. `target_agent='frontend'`, `target_agent='backend'`, `target_agent='qa'`, `target_agent='gitops'`). Under StackMind security invariants, you NEVER directly write application source files (assets/**, src/**, *.html, *.css, *.js) or run shell commands.\n"
+                "   - After resolving or delegating a blocker, inform the operator and advise them that they can run `:resume` (or `:approve`) to proceed with autonomous QA and release verification.\n"
                 "4. Strict Project Grounding: You are designing the user's software for this workspace. Never deflect to building, packaging, or deploying StackMind CLI itself unless the user explicitly tells you that the project being built IS StackMind CLI. Never assume or claim procedural skills (such as 'ponytail', 'audit', etc.) are active unless the user explicitly requested them or they are installed in the workspace. Never assume or bring up workspace skills or tools (such as git guardrails, bash wizards, ponytail) on a casual greeting (like 'hey' or 'hello'); only reference skills when the operator's prompt directly pertains to them.\n"
                 "5. Output Style: Deliver conversational, clear Markdown prose directly to the user. Do not output raw JSON decision schemas in chat mode unless explicitly requested.\n"
                 "6. Strict Prohibition on Fabricated Background Monitoring (MANDATORY INVARIANT):\n"
@@ -1692,12 +1692,26 @@ class AgentRunner:
                 "7. Improving a live Work Order: a read-only board of sibling work orders (owner, deliverable, acceptance criteria, last amendment) is included in your context whenever peer tasks exist. When a peer's ACTIVE task is vague, mis-scoped, or missing an integration requirement, amend it with `update_work_order(wo_id, updates, reason, expected_revision)` — the reason is delivered to the assigned worker as an authoritative correction on its next turn. A COMPLETED task is reopened with `reopen_work_order`, never rewritten. Approved requirements, architecture, scope, or constraints cannot be changed by an amendment: propose a plan revision and wait for operator approval. Never claim to have amended a task you did not actually write."
             )
         else:
-            return (
+            base_msg = (
                 f"You are StackMind's {self.agent.title()} agent, paired with the operator in this project workspace. "
                 "Respond conversationally, helpfully, and directly to the operator's message. "
                 "Maintain context across chat turns. "
                 "Do NOT format your response as a JSON decision schema unless explicitly asked."
             )
+
+        try:
+            from validators.kernel.permission_matrix import get_permission_matrix_prompt
+            from validators.kernel.incidents import format_incidents_for_prompt
+            perm_prompt = get_permission_matrix_prompt(self.agent)
+            if perm_prompt:
+                base_msg = f"{base_msg}\n\n{perm_prompt}"
+            incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
+            if incidents_prompt:
+                base_msg = f"{base_msg}\n\n{incidents_prompt}"
+        except Exception:
+            pass
+
+        return base_msg
 
     def _architect_board_block(self, work_order_id: str | None = None) -> str:
         """Team status and work-order board appended to Architect turns (empty for others)."""
@@ -2003,6 +2017,17 @@ class AgentRunner:
                 "sequence them with explicit interface and DOM contracts so the assembled page delivers every element and text string requested in the product goal.\n"
                 "Return the final HarnessDecision as JSON."
             )
+            try:
+                from validators.kernel.permission_matrix import get_permission_matrix_prompt
+                from validators.kernel.incidents import format_incidents_for_prompt
+                perm_prompt = get_permission_matrix_prompt(self.agent)
+                if perm_prompt:
+                    system_msg = f"{system_msg}\n\n{perm_prompt}"
+                incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
+                if incidents_prompt:
+                    system_msg = f"{system_msg}\n\n{incidents_prompt}"
+            except Exception:
+                pass
         elif self.agent in ('gemma', 'qa'):
             system_msg = QA_SYSTEM_PROMPT
             raw_context = getattr(request.context, 'text', '') if request.context else ''

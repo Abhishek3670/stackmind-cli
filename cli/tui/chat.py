@@ -824,6 +824,11 @@ def render_actions_group(
             collapsed.append((act, indent_lvl, t_name, arg, st, 1))
 
     # Pass 2: Suppress duplicate consecutive Agent headers and render flat lines
+    # If there are NO concrete tool actions (only 'Agent' headers), suppress the entire group.
+    has_concrete_actions = any(item[2] != 'Agent' for item in collapsed)
+    if not has_concrete_actions:
+        return Text('')
+
     active_agent: str | None = None
 
     for act, indent_lvl, t_name, arg, st, count in collapsed:
@@ -1347,6 +1352,11 @@ def render_assistant_message(
             model_val = m.group(1).strip()
             working_content = working_content[m.end():]
 
+    if model_val:
+        parts = [p.strip() for p in model_val.split('·') if p.strip()]
+        cleaned_parts = [p for p in parts if p.lower() not in ('daemon', 'agent')]
+        model_val = ' · '.join(cleaned_parts) if cleaned_parts else None
+
     hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
     if model_val:
         hdr.append(f" ({model_val})", style="italic dim #94a3b8")
@@ -1370,6 +1380,7 @@ def render_assistant_message(
         elements.extend([Text(""), top_elem])
 
     # Dynamic Region 1: Turn Actions disclosure group (§18, §20, §21)
+    has_rendered_actions = False
     if actions is not None:
         if isinstance(actions, list):
             from cli.tui.state import ActionsGroup
@@ -1377,8 +1388,12 @@ def render_assistant_message(
         else:
             actions_obj = actions
         if not getattr(actions_obj, "is_empty", False):
-            elements.append(Text(""))
-            elements.append(render_actions_group(actions_obj, avail_width=avail_width))
+            rendered_acts = render_actions_group(actions_obj, avail_width=avail_width)
+            acts_text = rendered_acts.plain.strip() if hasattr(rendered_acts, 'plain') else str(rendered_acts).strip()
+            if acts_text:
+                elements.append(Text(""))
+                elements.append(rendered_acts)
+                has_rendered_actions = True
 
     # Dynamic Region 2: Provider-generated thinking/reasoning (§18, §24, §27)
     if thinking and thinking.strip():
@@ -1428,6 +1443,9 @@ def render_assistant_message(
         for tline in telemetry_lines:
             elements.append(Text(""))
             elements.append(Text(tline, style="dim #64748b"))
+
+    if not cleaned and not (thinking and thinking.strip()) and not has_rendered_actions:
+        return Text("")
 
     return Group(*elements)
 
@@ -1480,9 +1498,15 @@ def render_assistant_stream_header(
     no_color: bool | None = None,
 ) -> str:
     """Render the opening header for progressive assistant response streaming."""
+    model_val = model
+    if model_val:
+        parts = [p.strip() for p in model_val.split('·') if p.strip()]
+        cleaned_parts = [p for p in parts if p.lower() not in ('daemon', 'agent')]
+        model_val = ' · '.join(cleaned_parts) if cleaned_parts else None
+
     hdr = Text("✦ ", style="bold #a855f7").append("StackMind", style="bold white")
-    if model:
-        hdr.append(f" ({model})", style="italic dim #94a3b8")
+    if model_val:
+        hdr.append(f" ({model_val})", style="italic dim #94a3b8")
     console, use_ansi = _make_capture_console(
         width=width,
         force_color=force_color,
@@ -1592,23 +1616,31 @@ def render_chat_transcript(
             )
         elif role == "assistant":
             show_hdr = not assistant_header_shown
-            assistant_header_shown = True
-            elements.append(
-                render_assistant_message(
-                    msg.content,
-                    timestamp=msg.timestamp if show_timestamps else None,
-                    show_timestamp=show_timestamps,
-                    actions=getattr(msg, "actions", None),
-                    thinking=getattr(msg, "thinking", None),
-                    thinking_expanded=getattr(msg, "thinking_expanded", False),
-                    thinking_elapsed=getattr(msg, "thinking_elapsed", None),
-                    thinking_tokens=getattr(msg, "thinking_tokens", None),
-                    model=getattr(msg, "model", None),
-                    inline_diffs=inline_diffs,
-                    show_header=show_hdr,
-                    avail_width=width or 80,
-                )
+            elem = render_assistant_message(
+                msg.content,
+                timestamp=msg.timestamp if show_timestamps else None,
+                show_timestamp=show_timestamps,
+                actions=getattr(msg, "actions", None),
+                thinking=getattr(msg, "thinking", None),
+                thinking_expanded=getattr(msg, "thinking_expanded", False),
+                thinking_elapsed=getattr(msg, "thinking_elapsed", None),
+                thinking_tokens=getattr(msg, "thinking_tokens", None),
+                model=getattr(msg, "model", None),
+                inline_diffs=inline_diffs,
+                show_header=show_hdr,
+                avail_width=width or 80,
             )
+            has_content = False
+            if isinstance(elem, Group):
+                has_content = len(elem.renderables) > 0
+            elif hasattr(elem, "plain"):
+                has_content = bool(elem.plain.strip())
+            elif elem is not None:
+                has_content = bool(str(elem).strip())
+
+            if has_content:
+                assistant_header_shown = True
+                elements.append(elem)
         elif role == "system":
             assistant_header_shown = False
             elements.append(

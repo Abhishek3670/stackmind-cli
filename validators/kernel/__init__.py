@@ -57,6 +57,16 @@ from .home import (
     touch_project,
     unregister_project,
 )
+from .incidents import (
+    format_incidents_for_prompt,
+    get_recent_incidents,
+    record_permission_incident,
+)
+from .permission_matrix import (
+    ARCHITECT_PERMISSION_DIRECTIVE,
+    PERMISSION_MATRIX_TABLE,
+    get_permission_matrix_prompt,
+)
 from .profile import (
     ExecutionProfile,
     ProfilePolicy,
@@ -147,16 +157,20 @@ __all__ = [
     "perform_web_fetch",
     "perform_web_search",
     "derive_verification_dimensions",
+    "format_incidents_for_prompt",
     "get_daemon_home_dir",
     "get_global_agent_skills_dir",
     "get_global_settings_path",
     "get_global_skills_dir",
     "get_global_tmp_dir",
+    "get_permission_matrix_prompt",
     "get_project_entry",
     "get_projects_registry_path",
+    "get_recent_incidents",
     "get_sessions_home_dir",
     "get_stackmind_home",
     "list_registered_projects",
+    "record_permission_incident",
     "register_project",
     "touch_project",
     "unregister_project",
