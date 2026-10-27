@@ -1615,6 +1615,14 @@ class SessionManager:
         state.recovery_wo_id = None
         state.recovery_decision_operation_id = None
         state.stall_ticks = 0
+        state.worker_retries.clear()
+        state.qa_reworks.clear()
+        state.gitops_retries = 0
+        state.planning_retries = 0
+        state.daemon_restarts = 0
+        state.budget_exhausted = False
+        if getattr(state, "global_turn_budget", 0) <= 10:
+            state.global_turn_budget = max(getattr(state, "initial_turn_budget", 0) or 38, 50)
         state.run_started_at = time.monotonic()
         state.turn_deadline = None
         state.waiting_for_human_entered_at = None
@@ -1656,7 +1664,7 @@ class SessionManager:
             op_wo = op.get("work_order_id")
             op_id = op.get("operation_id")
             op_status = str(op.get("status", "")).upper()
-            if op_id and (op_wo is None or op_wo not in completed_set):
+            if op_id and (op_status in ("FAILED", "BLOCKED", "CANCELLED") or op_wo is None or op_wo not in completed_set):
                 if op_status == "COMPLETED":
                     continue
                 if op_id not in state.ignored_operation_ids:
@@ -1841,7 +1849,7 @@ class SessionManager:
             op_wo = op.get("work_order_id")
             op_id = op.get("operation_id")
             op_status = str(op.get("status", "")).upper()
-            if op_id and (op_wo is None or op_wo not in completed_set):
+            if op_id and (op_status in ("FAILED", "BLOCKED", "CANCELLED") or op_wo is None or op_wo not in completed_set):
                 if op_status == "COMPLETED":
                     continue
                 if op_status not in _OPERATION_TERMINAL:
@@ -1942,18 +1950,23 @@ class SessionManager:
                     self.supervisor.save_run_state(state, ws)
                 except Exception:
                     pass
-            if state.phase in (Phase.FAILED, Phase.BLOCKED):
-                self._prepare_run_for_resume(state, session, ws)
-            elif state.phase == Phase.WAITING_FOR_HUMAN:
-                if hasattr(self.supervisor, "re_attest_run"):
-                    try:
-                        self.supervisor.re_attest_run(
-                            state,
-                            human_signature="operator",
-                            confirmed_budget=state.global_turn_budget or 50,
-                        )
-                    except Exception:
-                        pass
+            if hasattr(self.supervisor, "re_attest_run"):
+                try:
+                    self.supervisor.re_attest_run(
+                        state,
+                        human_signature="operator",
+                        confirmed_budget=state.global_turn_budget or 50,
+                    )
+                except Exception:
+                    pass
+            elif hasattr(self.supervisor, "state_manager") and self.supervisor.state_manager is not None:
+                try:
+                    self.supervisor.state_manager.register_state(state.run_id, state)
+                    self.supervisor.state_manager.re_attest_run(state.run_id, "Human re-attestation by operator")
+                except Exception:
+                    pass
+
+            if state.phase in (Phase.FAILED, Phase.BLOCKED, Phase.WAITING_FOR_HUMAN, Phase.EXECUTING, Phase.DISPATCHING):
                 self._prepare_run_for_resume(state, session, ws)
             else:
                 self._cleanup_orphaned_operations(state, session)

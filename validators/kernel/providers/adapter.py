@@ -7,6 +7,7 @@ import json
 import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -716,19 +717,24 @@ class OllamaAdapter(ProviderAdapter):
         headers = {"Content-Type": "application/json"}
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-        try:
-            return urllib.request.urlopen(req, timeout=actual_timeout)
-        except urllib.error.HTTPError as ex:
-            body = ex.read().decode("utf-8", errors="replace")
-            raise ProviderError(
-                f"Ollama HTTP error {ex.code}: {body}",
-                status_code=ex.code,
-                provider=self.provider_name,
-            ) from ex
-        except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
-            raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
-        except Exception as ex:
-            raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
+        max_429_retries = 3
+        for attempt in range(max_429_retries + 1):
+            try:
+                return urllib.request.urlopen(req, timeout=actual_timeout)
+            except urllib.error.HTTPError as ex:
+                body = ex.read().decode("utf-8", errors="replace")
+                if ex.code == 429 and attempt < max_429_retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise ProviderError(
+                    f"Ollama HTTP error {ex.code}: {body}",
+                    status_code=ex.code,
+                    provider=self.provider_name,
+                ) from ex
+            except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
+                raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
+            except Exception as ex:
+                raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
 
     def complete(
         self,

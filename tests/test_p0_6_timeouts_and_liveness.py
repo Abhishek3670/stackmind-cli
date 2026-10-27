@@ -959,3 +959,117 @@ def test_supervisor_unblock_in_flight_work_orders_restores_session(tmp_path: Pat
     assert state.stall_ticks == 0
     assert state.blocked_wo_ids == []
     assert mgr._sessions[session_id]["state"] == "RUNNING"
+
+def test_prepare_run_for_resume_clears_all_counters_and_replenishes_budget(tmp_path: Path):
+    """_prepare_run_for_resume clears worker retries, qa reworks, stall ticks, and replenishes depleted budget."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.supervisor import Phase
+
+    storage = DaemonStorage(tmp_path / "daemon-storage.json")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("claude", "test", {}, str(tmp_path))
+    session_id = session["session_id"]
+
+    session["journal"] = [
+        {"operation_id": "op-failed-1", "status": "FAILED", "work_order_id": "WO-004"},
+        {"operation_id": "op-blocked-2", "status": "BLOCKED", "work_order_id": "WO-003"},
+        {"operation_id": "op-comp-3", "status": "COMPLETED", "work_order_id": "WO-001"},
+    ]
+
+    state = mgr.supervisor.start_run("run-test-counters", "Goal", tmp_path, session_id)
+    state.phase = Phase.BLOCKED
+    state.worker_retries = {"WO-004": 2, "WO-001": 2}
+    state.qa_reworks = {"WO-004": 2}
+    state.gitops_retries = 2
+    state.planning_retries = 2
+    state.recovery_attempts = {"WO-004": 10}
+    state.recovery_wo_id = "WO-004"
+    state.recovery_decision_operation_id = "op-recovery-1"
+    state.daemon_restarts = 2
+    state.budget_exhausted = True
+    state.global_turn_budget = 0
+    state.initial_turn_budget = 38
+    state.stall_ticks = 3
+
+    mgr._prepare_run_for_resume(state, session, tmp_path)
+
+    assert state.worker_retries == {}
+    assert state.qa_reworks == {}
+    assert state.gitops_retries == 0
+    assert state.planning_retries == 0
+    assert state.recovery_attempts == {}
+    assert state.recovery_wo_id is None
+    assert state.recovery_decision_operation_id is None
+    assert state.daemon_restarts == 0
+    assert state.budget_exhausted is False
+    assert state.global_turn_budget >= 38
+    assert state.stall_ticks == 0
+    assert "op-failed-1" in state.ignored_operation_ids
+    assert "op-blocked-2" in state.ignored_operation_ids
+    assert "op-comp-3" not in state.ignored_operation_ids
+
+
+def test_resume_run_reattests_and_unblocks_restart_run(tmp_path: Path):
+    """resume_run re-attests the run with state_manager to prevent DAEMON_RESTART_FAIL_CLOSED."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.supervisor import Phase
+
+    storage = DaemonStorage(tmp_path / "daemon-storage.json")
+    mgr = SessionManager(storage)
+    session = mgr.create_session("claude", "test", {}, str(tmp_path))
+    session_id = session["session_id"]
+
+    state = mgr.supervisor.start_run("run-test-reattest", "Goal", tmp_path, session_id)
+    state.phase = Phase.BLOCKED
+    state.error = "Architect recovery decision for WO-004 could not be obtained"
+    mgr.supervisor.save_run_state(state, tmp_path)
+
+    # Simulate restart with fresh supervisor and un-attested run
+    fresh_mgr = SessionManager(storage)
+    resumed = fresh_mgr.resume_run(session_id, run_id="run-test-reattest")
+
+    assert resumed["run_id"] == "run-test-reattest"
+    # Ensure state_manager attested the run
+    assert fresh_mgr.supervisor.state_manager.is_run_attested("run-test-reattest")
+    # Advancing state does not trigger DAEMON_RESTART_FAIL_CLOSED
+    loaded_state = fresh_mgr._active_runs["run-test-reattest"]
+    assert "DAEMON_RESTART_FAIL_CLOSED" not in str(loaded_state.error or "")
+
+
+def test_ollama_adapter_retries_on_429(monkeypatch):
+    """OllamaAdapter retries with backoff when Ollama returns HTTP 429."""
+    import io
+    import urllib.error
+    from validators.kernel.providers.adapter import OllamaAdapter
+
+    adapter = OllamaAdapter(endpoint="http://localhost:11434", model="test-model")
+    call_count = 0
+
+    class MockHTTPError(urllib.error.HTTPError):
+        def __init__(self):
+            super().__init__("http://localhost:11434/api/chat", 429, "Too Many Requests", {}, io.BytesIO(b'{"error":"rate limited"}'))
+
+    class MockResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return b'{"message":{"role":"assistant","content":"hello"}}'
+
+    def mock_urlopen(req, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise MockHTTPError()
+        return MockResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    from validators.kernel.providers.models import Message
+    resp = adapter.complete([Message.user("hi")])
+    assert resp.message.content == "hello"
+    assert call_count == 3
