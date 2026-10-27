@@ -122,8 +122,12 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
 
     if any(k in norm for k in ("claude", "architecture", "architect")):
         ops = base_set | {
-            OperationType.WRITE_FILE.value,  # Governed artifacts only
-            OperationType.RUN_COMMAND.value,  # Read-only inspect
+            OperationType.WRITE_FILE.value,  # Governed artifacts and blocker fixes
+            OperationType.APPLY_PATCH.value,  # Direct blocker patches
+            OperationType.RUN_COMMAND.value,  # Read-only inspect and execution
+            OperationType.RUN_TESTS.value,  # Verify fixes against test suites
+            OperationType.RUN_LINT.value,  # Verify linting
+            OperationType.VERIFY_DELIVERABLE.value,  # Verify deliverable state
             OperationType.ASK_USER.value,
             OperationType.ENTER_PLAN_MODE.value,
             OperationType.EXIT_PLAN_MODE.value,

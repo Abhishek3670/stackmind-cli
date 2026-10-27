@@ -1195,6 +1195,8 @@ def run_arrow_navigation_settings_loop(
                         state.roles[display_name].backend = new_p
                         state.roles[display_name].model = new_m
                     state.settings_status_msg = f"Bound '{display_name}' to {new_p} ({new_m})."
+                    if prov_obj:
+                        prov_obj.enabled = True
                     save_settings(settings, workspace)
                     if client and hasattr(client, "settings_update"):
                         try:

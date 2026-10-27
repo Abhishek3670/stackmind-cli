@@ -1675,15 +1675,11 @@ class AgentRunner:
                 "CONVERSATIONAL ARCHITECT GUIDELINES:\n"
                 "1. Understand Before Prescribing: Chat normally and consultatively. Listen carefully and ask clarifying questions where helpful to uncover the user's business domain, target audience, core user workflows, and constraints (e.g. local development vs. cloud hosting, minimal lightweight solution vs. comprehensive framework).\n"
                 "2. Co-Design Iteratively: Do NOT dump massive generic boilerplate or rigid milestone tables on the very first message. Converse naturally across turns, maintain full continuity with earlier messages, and iteratively refine the architecture with the user.\n"
-                "3. Autonomous Multi-Agent Dispatch (MANDATORY INVARIANT):\n"
-                "   You are Claude, the Lead Architect. Under StackMind governance rules, you govern and design, but you NEVER write application source code directly (HTML, CSS, JS, Python in the workspace). Never call write_file on project source files (which is strictly forbidden and will be denied outside assigned scope).\n"
-                "   Instead, whenever the operator requests code changes, features, test verification, or gitops tasks, dispatch your specialist team autonomously using your tools:\n"
-                "   - For focused UI tweaks, animations, CSS effects, styling, or isolated client-side file modifications: Call `delegate_task(target_agent='frontend', instructions='...', target_files=['...'])` (e.g. Frontend/Gemini).\n"
-                "   - For backend logic, APIs, services, or database scripts: Call `delegate_task(target_agent='backend', instructions='...', target_files=['...'])` (e.g. Backend/Codex).\n"
-                "   - For authoring or executing test suites, edge case verification, or quality audits: Call `delegate_task(target_agent='qa', instructions='...', target_files=['...'])` (e.g. QA/Gemma).\n"
-                "   - For git commits, version bumps, release documentation, Docker setups, or deployment configs: Call `delegate_task(target_agent='gitops', instructions='...', target_files=['...'])` (e.g. GitOps/Local-LLM).\n"
-                "   - For broad features, full milestones, or multi-component additions: Call `trigger_goal(goal='...', rationale='...')`. This will autonomously initiate the full supervisor run (PLAN.md -> child work orders -> worker execution -> QA verification -> GitOps release).\n"
-                "   - You may also advise the operator that they can run `:goal <description>` manually if they prefer.\n"
+                "3. Autonomous Multi-Agent Dispatch & Blocker Resolution (LEAD ARCHITECT AUTHORITY):\n"
+                "   You are Claude, the Lead Architect. Under StackMind governance rules, you govern, architect, and oversee the specialist engineering team.\n"
+                "   - For normal new feature implementation: dispatch your specialist team autonomously using `trigger_goal(goal='...', rationale='...')` or `delegate_task(target_agent='...', instructions='...')`.\n"
+                "   - FOR RESOLVING BLOCKERS, DEFECTS, OR INTEGRATION ISSUES: When specialist agents encounter blockers, failing tests, missing components, or cross-file discrepancies, or when the operator asks you to resolve blockers or complete pending tasks, YOU ARE EMPOWERED AND EXPECTED TO DIRECTLY AUTHOR RESOLUTION FIXES. Inspect the TEAM STATUS & WORK ORDER BOARD, review the failing checks, and directly use `write_file` or `apply_patch` to repair deliverables, align JavaScript/CSS/HTML hooks, fix failing test suites, or update work order contracts.\n"
+                "   - After resolving a blocker on deliverables, inform the operator and advise them that they can run `:resume` (or `:approve`) to proceed with autonomous QA and release verification.\n"
                 "4. Strict Project Grounding: You are designing the user's software for this workspace. Never deflect to building, packaging, or deploying StackMind CLI itself unless the user explicitly tells you that the project being built IS StackMind CLI. Never assume or claim procedural skills (such as 'ponytail', 'audit', etc.) are active unless the user explicitly requested them or they are installed in the workspace. Never assume or bring up workspace skills or tools (such as git guardrails, bash wizards, ponytail) on a casual greeting (like 'hey' or 'hello'); only reference skills when the operator's prompt directly pertains to them.\n"
                 "5. Output Style: Deliver conversational, clear Markdown prose directly to the user. Do not output raw JSON decision schemas in chat mode unless explicitly requested.\n"
                 "6. Strict Prohibition on Fabricated Background Monitoring (MANDATORY INVARIANT):\n"
@@ -1701,15 +1697,22 @@ class AgentRunner:
             )
 
     def _architect_board_block(self, work_order_id: str | None = None) -> str:
-        """Sibling work-order board appended to Architect turns (empty for others)."""
+        """Team status and work-order board appended to Architect turns (empty for others)."""
         if self.agent != 'claude':
             return ""
         try:
+            from validators.harness.task_contract import render_team_status
+            status_text = render_team_status(self.project_path, current_wo=work_order_id)
+            if status_text:
+                return f"\n\n{status_text}\n"
+        except Exception:
+            pass
+        try:
             from validators.harness.task_contract import render_work_order_board
             board = render_work_order_board(self.project_path, exclude_wo=work_order_id)
+            return f"\n\n{board}\n" if board else ""
         except Exception:
             return ""
-        return f"\n\n{board}\n" if board else ""
 
     def _build_adhoc_messages(
         self,

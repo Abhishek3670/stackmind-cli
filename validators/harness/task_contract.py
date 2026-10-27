@@ -113,7 +113,7 @@ def render_work_order_board(
     """
     base = Path(workspace) / ".sync" / "work-orders"
     rows: list[str] = []
-    for bucket in ("ACTIVE", "BLOCKED", "PENDING"):
+    for bucket in ("ACTIVE", "BLOCKED", "COMPLETED", "FAILED", "PENDING"):
         directory = base / bucket
         if not directory.is_dir():
             continue
@@ -137,6 +137,9 @@ def render_work_order_board(
                 + (f" revision={revision}" if revision is not None else "")
             )
             lines = [header, f"  title: {_clip(data.get('title'), 120)}"]
+            err_msg = data.get("error") or data.get("blocked_reason")
+            if err_msg and isinstance(err_msg, str) and err_msg.strip():
+                lines.append(f"  blocker: {_clip(err_msg.strip(), 160)}")
             criteria = [
                 _clip(c, 120) for c in data.get("acceptance_criteria") or []
                 if isinstance(c, str) and c.strip()
@@ -167,6 +170,180 @@ def render_work_order_board(
         "ownership), to sharpen a peer's acceptance criteria, or to amend a peer's task "
         "through update_work_order with an explicit amendment reason."
     )
+
+
+def render_team_status(
+    workspace: Path | str,
+    *,
+    current_wo: str | None = None,
+    limit: int = 30,
+) -> str:
+    """Render comprehensive live team and work order status for Lead Architect context.
+
+    Provides the Lead Architect with complete situational awareness of:
+    1. Specialist engineering team status (Architecture, Frontend, Backend, QA, GitOps)
+    2. Active blockers, defect findings, and deliverable verification errors
+    3. Complete work order board across lifecycle states (COMPLETED, ACTIVE, BLOCKED)
+    """
+    ws = Path(workspace)
+    base = ws / ".sync" / "work-orders"
+    if not base.is_dir():
+        return ""
+
+    # 1. Parse all work orders across buckets
+    wo_map: dict[str, dict[str, Any]] = {}
+    for bucket in ("ACTIVE", "BLOCKED", "COMPLETED", "FAILED", "PENDING"):
+        b_dir = base / bucket
+        if not b_dir.is_dir():
+            continue
+        for wo_file in sorted(b_dir.glob("*.yaml")):
+            try:
+                data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    wo_id = str(data.get("id") or wo_file.stem)
+                    data["_bucket"] = bucket
+                    data["_file"] = wo_file
+                    wo_map[wo_id] = data
+            except Exception:
+                continue
+
+    if not wo_map:
+        return ""
+
+    # 2. Build Agent Team Status
+    roles_def = [
+        ("Architecture", "claude", "Lead Architect (system design & blocker resolution)"),
+        ("Frontend", "gemini", "Frontend Specialist (HTML/CSS/JS, UI, styling)"),
+        ("Backend", "codex", "Backend Specialist (APIs, services, logic)"),
+        ("QA", "gemma", "QA Specialist (tests, accessibility, verification)"),
+        ("GitOps", "local-llm", "GitOps Specialist (versioning, release manifests)"),
+    ]
+
+    agent_status_lines: list[str] = []
+    active_blockers: list[str] = []
+
+    for role_label, agent_id, role_desc in roles_def:
+        assigned = [
+            wid for wid, d in wo_map.items()
+            if agent_id in [str(a).lower() for a in (d.get("assigned_agents") or [])]
+        ]
+        if not assigned:
+            if role_label == "Architecture":
+                agent_status_lines.append(f"- {role_label} ({agent_id}): Active / Orchestrating & Resolving Blockers")
+            else:
+                agent_status_lines.append(f"- {role_label} ({agent_id}): Idle (no tasks currently assigned)")
+            continue
+
+        blocked = [wid for wid in assigned if wo_map[wid].get("_bucket") in ("BLOCKED", "FAILED")]
+        active = [wid for wid in assigned if wo_map[wid].get("_bucket") == "ACTIVE"]
+        completed = [wid for wid in assigned if wo_map[wid].get("_bucket") == "COMPLETED"]
+
+        if blocked:
+            reasons = []
+            for b_id in blocked:
+                b_data = wo_map[b_id]
+                err = b_data.get("error") or b_data.get("blocked_reason") or "execution blocked"
+                short_err = _clip(str(err).strip(), 120)
+                reasons.append(f"{b_id}: {short_err}")
+                active_blockers.append(f"[{b_id}] ({agent_id}): {short_err}")
+            agent_status_lines.append(
+                f"- {role_label} ({agent_id}): BLOCKED on {', '.join(reasons)}"
+            )
+        elif active:
+            titles = [f"{wid} ({_clip(wo_map[wid].get('title', ''), 60)})" for wid in active]
+            agent_status_lines.append(f"- {role_label} ({agent_id}): ACTIVE executing {', '.join(titles)}")
+        elif completed:
+            agent_status_lines.append(
+                f"- {role_label} ({agent_id}): COMPLETED all assigned tasks ({', '.join(completed)}) | Ready"
+            )
+        else:
+            agent_status_lines.append(f"- {role_label} ({agent_id}): Idle / Waiting")
+
+    # 3. Check for QA verdict defect reports in inbox
+    inbox_claude = ws / ".sync" / "inbox" / "claude"
+    if inbox_claude.is_dir():
+        for vf in sorted(inbox_claude.glob("*-qa-verdict.md")):
+            try:
+                v_text = vf.read_text(encoding="utf-8").strip()
+                v_first = next((ln.strip() for ln in v_text.splitlines() if ln.strip()), "")
+                if v_first and not any(vf.stem in b for b in active_blockers):
+                    active_blockers.append(f"QA Defect Finding ({vf.name}): {_clip(v_first, 140)}")
+            except Exception:
+                pass
+
+    # 4. Check supervisor run state for blockers if present
+    sup_dir = ws / ".sync" / "runtime" / "supervisor"
+    if sup_dir.is_dir():
+        for rf in sorted(sup_dir.glob("run-*.yaml")):
+            try:
+                rdata = yaml.safe_load(rf.read_text(encoding="utf-8"))
+                if isinstance(rdata, dict):
+                    ib = rdata.get("integration_blockers") or []
+                    for b in ib:
+                        b_str = _clip(str(b).strip(), 140)
+                        if b_str and not any(b_str in ab for ab in active_blockers):
+                            active_blockers.append(f"Integration Blocker: {b_str}")
+            except Exception:
+                pass
+
+    # 5. Build Work Orders Board rows
+    wo_rows: list[str] = []
+    sorted_wo_ids = sorted(
+        wo_map.keys(),
+        key=lambda x: (
+            0 if wo_map[x].get("_bucket") == "ACTIVE"
+            else 1 if wo_map[x].get("_bucket") in ("BLOCKED", "FAILED")
+            else 2 if wo_map[x].get("_bucket") == "COMPLETED"
+            else 3
+        ),
+    )
+    for wid in sorted_wo_ids[:limit]:
+        if wid == current_wo:
+            continue
+        data = wo_map[wid]
+        bucket = data.get("_bucket", "ACTIVE")
+        status = data.get("status") or bucket
+        agents = ", ".join(str(a) for a in data.get("assigned_agents") or []) or "unassigned"
+        deliverable = data.get("deliverable")
+        path_value = _norm(deliverable.get("path")) if isinstance(deliverable, dict) else ""
+        deps = ", ".join(str(d) for d in data.get("dependencies") or []) or "none"
+        header = f"- {wid} [{status}] owner={agents} deliverable={path_value or 'undeclared'} deps={deps}"
+        lines = [header, f"  title: {_clip(data.get('title'), 120)}"]
+        err_msg = data.get("error") or data.get("blocked_reason")
+        if err_msg and isinstance(err_msg, str) and err_msg.strip():
+            lines.append(f"  blocker: {_clip(err_msg.strip(), 160)}")
+        wo_rows.append("\n".join(lines))
+
+    # Assemble comprehensive Markdown block
+    parts: list[str] = [
+        "================================================================================",
+        "TEAM STATUS & WORK ORDER BOARD (Live Supervisor Overview):",
+        "",
+        "SPECIALIST AGENT TEAM STATUS:",
+        "\n".join(agent_status_lines),
+    ]
+
+    if active_blockers:
+        parts.extend([
+            "",
+            "ACTIVE BLOCKERS & DEFECT FINDINGS:",
+            "\n".join(f"- {b}" for b in active_blockers[:8]),
+        ])
+
+    parts.extend([
+        "",
+        "WORK ORDERS LIFECYCLE BOARD:",
+        "\n".join(wo_rows) if wo_rows else "- (no peer work orders)",
+        "",
+        "LEAD ARCHITECT DIRECTIVE:",
+        "As Lead Architect, you oversee this team and its deliverables.",
+        "When blockers occur or specialist agents are blocked, YOU ARE EMPOWERED TO DIRECTLY",
+        "AUTHOR RESOLUTION FIXES using write_file or apply_patch to repair deliverables,",
+        "align integration hooks, or fix broken tests and unblock the run.",
+        "================================================================================",
+    ])
+
+    return "\n".join(parts)
 
 
 def compile_worker_task_contract(

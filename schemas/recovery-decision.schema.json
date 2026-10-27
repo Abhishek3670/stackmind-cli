@@ -16,6 +16,8 @@
     "action": {
       "type": "string",
       "enum": [
+        "architect_fix",
+        "resolve_blocker",
         "retry_unchanged",
         "amend_contract",
         "split_work_order",

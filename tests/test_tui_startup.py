@@ -209,6 +209,23 @@ def test_provider_configuration_error_is_distinct_from_availability(tmp_path):
         startup.check_provider_configuration(tmp_path)
 
 
+def test_provider_auto_enables_when_role_is_bound_with_credentials(tmp_path):
+    from validators.kernel.settings import get_default_settings
+
+    settings = get_default_settings()
+    settings.providers["custom"].enabled = False
+    settings.providers["custom"].api_key = "test-key"
+    settings.providers["custom"].models = ["test-model"]
+    settings.roles["architecture"] = {"provider": "custom", "model": "test-model"}
+    path = tmp_path / ".sync" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(settings.to_dict()), encoding="utf-8")
+
+    startup.check_provider_configuration(tmp_path)
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    assert updated["providers"]["custom"]["enabled"] is True
+
+
 def test_provider_defaults_are_checked_without_creating_configuration(tmp_path):
     startup.check_provider_configuration(tmp_path)
     assert not (tmp_path / ".sync" / "settings.json").exists()

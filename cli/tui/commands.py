@@ -1828,6 +1828,8 @@ def dispatch_delivery_command(
                         "provider": backend_arg,
                         "model": m_to_save,
                     }
+                if backend_arg in s.providers:
+                    s.providers[backend_arg].enabled = True
                 save_settings(s, ws)
                 output_str = (
                     "[DEPRECATED] ':rebind' is deprecated and scheduled for removal. "
@@ -2620,6 +2622,8 @@ def dispatch_delivery_command(
                 from validators.kernel.settings import load_settings, save_settings
                 s = load_settings(ws)
                 s.govern_verbosity = clean_mode
+                if backend_arg in s.providers:
+                    s.providers[backend_arg].enabled = True
                 save_settings(s, ws)
             except Exception:
                 pass

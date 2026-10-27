@@ -1290,6 +1290,7 @@ AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
     "write_file",
+    "apply_patch",
     "list_directory",
     "query_graph",
     "find_symbol",
@@ -1300,6 +1301,9 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "git_log",
     "git_diff",
     "run_command",
+    "run_tests",
+    "run_lint",
+    "verify_deliverable",
     "trigger_goal",
     "delegate_task",
     "update_work_order",

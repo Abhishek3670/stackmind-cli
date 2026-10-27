@@ -365,7 +365,21 @@ def check_provider_configuration(workspace: Path) -> None:
             provider_name = str(role_config.get("provider") or "").strip()
             model = str(role_config.get("model") or "").strip()
             provider = settings.providers.get(provider_name)
-            if provider is None or not provider.enabled:
+            if provider is None:
+                missing.append(f"role {role} references an unconfigured provider '{provider_name}'")
+                continue
+
+            if not provider.enabled:
+                has_creds = provider_name == "ollama" or bool(provider.api_key.strip())
+                if has_creds and (provider.base_url or provider.models):
+                    provider.enabled = True
+                    try:
+                        from validators.kernel.settings import save_settings
+                        save_settings(settings, workspace)
+                    except Exception:
+                        pass
+
+            if not provider.enabled:
                 missing.append(f"role {role} references an unconfigured provider")
             elif not model:
                 missing.append(f"role {role} has no model configured")
