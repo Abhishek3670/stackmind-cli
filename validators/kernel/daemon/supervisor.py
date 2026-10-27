@@ -534,6 +534,9 @@ class LifecycleSupervisor:
             if ci_wait_timeout is not None
             else os.environ.get("SUPERVISOR_CI_WAIT_TIMEOUT", self.timeouts.get("ci_wait_timeout", 60.0))
         )
+        self._ci_run_timeout_explicit = (
+            ci_run_timeout is not None or "SUPERVISOR_CI_RUN_TIMEOUT" in os.environ
+        )
         self.ci_run_timeout = float(
             ci_run_timeout
             if ci_run_timeout is not None
@@ -658,7 +661,7 @@ class LifecycleSupervisor:
                 state.error = f"GITOPS_INVALID_OUTPUT: {error_type} (retry {state.gitops_retries}/{state.max_gitops_retries})"
             return AdvanceResult.TRANSITIONED
 
-        elif role_lower == "architecture" or state.phase in (Phase.PLANNING, Phase.AUTHORING, Phase.ARCHITECT_REPAIR):
+        elif role_lower in ("architecture", "architect", "lead_architect") or state.phase in (Phase.AUTHORING, Phase.ARCHITECT_REPAIR):
             state.authoring_repair_attempts += 1
             if state.authoring_repair_attempts >= state.max_authoring_repairs:
                 state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Architecture returned {error_type}"
@@ -667,6 +670,30 @@ class LifecycleSupervisor:
                 return AdvanceResult.WAITING_FOR_HUMAN
             else:
                 state.error = f"ARCHITECTURE_INVALID_OUTPUT: {error_type} in {state.phase.value}"
+            return AdvanceResult.TRANSITIONED
+
+        elif state.phase == Phase.PLANNING:
+            state.planning_retries += 1
+            if state.planning_retries >= state.max_planning_retries:
+                state.error = f"MAX_PLANNING_RETRIES_EXHAUSTED: Planning returned {error_type}"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"PLANNING_INVALID_OUTPUT: {error_type} (retry {state.planning_retries}/{state.max_planning_retries})"
+            return AdvanceResult.TRANSITIONED
+
+        elif state.phase == Phase.ARCHITECT_RECOVERY_DECISION:
+            wo_id = str(state.recovery_wo_id or "SYSTEM_UNIDENTIFIABLE")
+            attempts = state.recovery_attempts.get(wo_id, 0) + 1
+            state.recovery_attempts[wo_id] = attempts
+            if attempts >= state.max_retries:
+                state.error = f"MAX_RECOVERY_ATTEMPTS_EXHAUSTED: Recovery decision for {wo_id} returned {error_type}"
+                state.exit_code = EXIT_RETRIES_EXHAUSTED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            else:
+                state.error = f"RECOVERY_INVALID_OUTPUT: {error_type} in {wo_id} (attempt {attempts}/{state.max_retries})"
             return AdvanceResult.TRANSITIONED
 
         else:
@@ -915,10 +942,21 @@ class LifecycleSupervisor:
                 )
 
         # 2. Monotonic total run wall-clock timeout check
-        if self.headless and state.run_started_at is not None and (now_mono - state.run_started_at) > self.ci_run_timeout:
+        effective_ci_run_timeout = self.ci_run_timeout
+        if not getattr(self, "_ci_run_timeout_explicit", False):
+            # Derive from the actual budget x largest turn timeout, not a hard-coded 40
+            budget = getattr(state, "initial_turn_budget", None) or getattr(state, "global_turn_budget", None) or 50
+            turn_timeouts = [
+                v for k, v in self.timeouts.items()
+                if k not in ("ci_wait_timeout", "ci_run_timeout", "gate") and isinstance(v, (int, float))
+            ]
+            largest_turn_timeout = max(turn_timeouts) if turn_timeouts else 600.0
+            effective_ci_run_timeout = float(budget * largest_turn_timeout)
+
+        if self.headless and state.run_started_at is not None and (now_mono - state.run_started_at) > effective_ci_run_timeout:
             return self._handle_ci_timeout(
                 state,
-                reason=f"HEADLESS_RUN_TIMEOUT: Total run wall-clock time exceeded {self.ci_run_timeout}s.",
+                reason=f"HEADLESS_RUN_TIMEOUT: Total run wall-clock time exceeded {effective_ci_run_timeout}s.",
             )
 
         # 2. Monotonic turn deadline check
@@ -1528,6 +1566,23 @@ class LifecycleSupervisor:
                 state.architect_repair_operation_id = new_op.get("operation_id")
                 return AdvanceResult.WAITING_FOR_OPERATION
 
+            if source == "recovery" and action in ("architect_fix", "resolve_blocker"):
+                # Deliverable fix verified on disk — complete the work order and return to execution!
+                self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
+                if str(wo_id) not in state.completed_wo_ids:
+                    state.completed_wo_ids.append(str(wo_id))
+                if str(wo_id) in state.failed_wo_ids:
+                    state.failed_wo_ids.remove(str(wo_id))
+                if str(wo_id) in state.blocked_wo_ids:
+                    state.blocked_wo_ids.remove(str(wo_id))
+                state.repair_context = {}
+                state.error = None
+                state.architect_repair_operation_id = None
+                state.authoring_repair_attempts = 0
+                self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
+                self._transition(state, Phase.EXECUTING)
+                return AdvanceResult.WAITING_FOR_OPERATION
+
             # Revalidate the complete artifact set with the readiness gate.
             try:
                 from .authoring import reconcile_active_work_orders_with_plan
@@ -1569,6 +1624,18 @@ class LifecycleSupervisor:
             state.authoring_repair_attempts = 0
             if source == "recovery" and wo_id:
                 action = str(action or "")
+                if action in ("architect_fix", "resolve_blocker"):
+                    self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
+                    if str(wo_id) not in state.completed_wo_ids:
+                        state.completed_wo_ids.append(str(wo_id))
+                    if str(wo_id) in state.failed_wo_ids:
+                        state.failed_wo_ids.remove(str(wo_id))
+                    if str(wo_id) in state.blocked_wo_ids:
+                        state.blocked_wo_ids.remove(str(wo_id))
+                    state.repair_context = {}
+                    self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
+                    self._transition(state, Phase.EXECUTING)
+                    return AdvanceResult.WAITING_FOR_OPERATION
                 if action == "split_work_order":
                     # The blocked WO is superseded by its children; they join the
                     # normal execution loop instead of re-dispatching the original.
@@ -1594,6 +1661,17 @@ class LifecycleSupervisor:
 
         # Repair operation lost (crash/resume) — re-dispatch from stored evidence.
         ws = Path(state.workspace)
+        if not state.repair_context or not state.repair_context.get("work_order_id"):
+            if state.recovery_wo_id:
+                state.repair_context = {"work_order_id": state.recovery_wo_id}
+            elif state.worker_blockers:
+                state.repair_context = {"work_order_id": next(iter(state.worker_blockers.keys()))}
+            else:
+                blocked_dir = ws / ".sync" / "work-orders" / "BLOCKED"
+                if blocked_dir.exists():
+                    blocked_files = [f.stem for f in blocked_dir.glob("*.yaml") if f.stem.startswith("WO-")]
+                    if blocked_files:
+                        state.repair_context = {"work_order_id": sorted(blocked_files)[0]}
         new_op = self._dispatch_repair_turn(state, ws)
         if new_op is None:
             state.error = "Architect repair operation was lost and could not be re-dispatched"
@@ -1666,6 +1744,21 @@ class LifecycleSupervisor:
 
         # Decision operation lost (crash/resume) — check if decision file already exists on disk,
         # otherwise re-dispatch from stored evidence.
+        if not wo_id:
+            if state.repair_context and state.repair_context.get("work_order_id"):
+                wo_id = str(state.repair_context["work_order_id"])
+                state.recovery_wo_id = wo_id
+            elif state.worker_blockers:
+                wo_id = next(iter(state.worker_blockers.keys()))
+                state.recovery_wo_id = wo_id
+            else:
+                blocked_dir = ws / ".sync" / "work-orders" / "BLOCKED"
+                if blocked_dir.exists():
+                    blocked_files = [f.stem for f in blocked_dir.glob("*.yaml") if f.stem.startswith("WO-")]
+                    if blocked_files:
+                        wo_id = sorted(blocked_files)[0]
+                        state.recovery_wo_id = wo_id
+
         if wo_id:
             decision, decision_error = self._load_recovery_decision(ws, str(wo_id), {})
             if decision and decision_error is None:
@@ -2454,6 +2547,14 @@ class LifecycleSupervisor:
                 state.blocked_wo_ids.remove(target_id)
             if target_id in state.failed_wo_ids:
                 state.failed_wo_ids.remove(target_id)
+            rework_count = state.qa_reworks.get(target_id, 0) + 1
+            state.qa_reworks[target_id] = rework_count
+            if rework_count > 1:
+                # If worker already attempted rework once and QA is still failing,
+                # escalate to the Lead Architect for direct resolution fix!
+                self.escalate_wo_to_recovery(state, target_id, reason=f"QA defect unresolved after worker rework: {finding}")
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
             # Rework phase grants a fresh retry budget for fixing defects
             state.retry_counts[target_id] = 0
             target_op = self._find_latest_wo_operation(state, target_id)
@@ -3072,7 +3173,7 @@ class LifecycleSupervisor:
         """Collect all declared deliverable paths across completed work orders."""
         deliverables: list[str] = []
         for wo_id in state.completed_wo_ids:
-            for sub in ("ACTIVE", "COMPLETED"):
+            for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
                 wo_file = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
                 if wo_file.is_file():
                     try:
@@ -4105,6 +4206,13 @@ class LifecycleSupervisor:
             f"Post-repair validation error: {post_check_error or 'none yet (first application pass)'}\n\n"
             "Apply the decision by authoring governed artifacts with write_file:\n"
             + (
+                f"- architect_fix: You are Lead Architect directly resolving the blocker on {wo_id}.\n"
+                f"Blocker details:\n{yaml.safe_dump(ctx.get('evidence') or {}, sort_keys=False).strip()}\n"
+                f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\n"
+                "Directly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
+                if action in ("architect_fix", "resolve_blocker") else ""
+            )
+            + (
                 f"- amend_contract: write the amended contract to .sync/contracts/<WO-ID>.yaml "
                 f"conforming to schemas/contract.schema.json. The budget must be explicitly sized "
                 f"from the task's real file footprint (ensure max_files_touched is at least 5 or sized to accommodate all files touched plus test/db fixtures). "
@@ -4129,8 +4237,8 @@ class LifecycleSupervisor:
                 f"New prerequisite work orders:\n{children_lines}\n"
                 if action == "create_dependency_work_order" else ""
             )
-            + "\nDo not modify unrelated work orders, contracts, or application code.\n"
-            "Return the final HarnessDecision JSON with status 'completed' and modified_files "
+            + ("\nDo not modify unrelated work orders or contracts.\n" if action in ("architect_fix", "resolve_blocker") else "\nDo not modify unrelated work orders, contracts, or application code.\n")
+            + "Return the final HarnessDecision JSON with status 'completed' and modified_files "
             "listing every file you wrote."
         )
 
@@ -4246,6 +4354,15 @@ class LifecycleSupervisor:
         if not action or not wo_id:
             return None  # plain authoring repair — readiness gate is the arbiter
         wo_id = str(wo_id)
+        if action in ("architect_fix", "resolve_blocker"):
+            deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_id, ws)
+            if deliv_path:
+                target_file = ws / deliv_path
+                if not target_file.is_file():
+                    return f"architect_fix expected deliverable '{deliv_path}' to exist on disk"
+                if target_file.stat().st_size == 0:
+                    return f"architect_fix deliverable '{deliv_path}' is empty"
+            return None
         if action == "amend_contract":
             expected_revision = state.repair_context.get("decision", {}).get("contract_revision")
             current_hash = self._sha256_file(ws / ".sync" / "contracts" / f"{wo_id}.yaml")
@@ -4398,7 +4515,8 @@ class LifecycleSupervisor:
             f".sync/decisions/recovery/{wo_id}.decision.json conforming to "
             "schemas/recovery-decision.schema.json (fields: work_order, action, reason, plus "
             "failure_code/transient/replacement_work_orders/contract_revision as applicable).\n"
-            f"2. Permitted actions: retry_unchanged (ONLY for transient failures with an unchanged contract), "
+            "2. Permitted actions: architect_fix (RECOMMENDED for defects, failing deliverables, or broken tests — the Architect directly repairs the deliverable files in the follow-up repair turn), "
+            f"retry_unchanged (ONLY for transient failures with an unchanged contract), "
             f"amend_contract (set contract_revision to {current_rev + 1} or higher; current revision is {current_rev}; the amended contract is authored in the follow-up repair turn), "
             "split_work_order (list replacement_work_orders child IDs), create_dependency_work_order (list new prerequisite WO IDs), "
             "cancel_work_order (cancel invalid or orphaned work order), escalate_human, terminal_block.\n"
@@ -4486,6 +4604,30 @@ class LifecycleSupervisor:
             **{k: v for k, v in decision.items() if k not in ("work_order", "action", "reason")},
         }
         evidence = state.worker_blockers.get(wo_id, {})
+
+        if action in ("architect_fix", "resolve_blocker"):
+            original_contract: dict[str, Any] = {}
+            contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+            if contract_file.is_file():
+                try:
+                    loaded = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        original_contract = loaded
+                except Exception:
+                    pass
+            if not original_contract:
+                original_contract = self._find_latest_contract_for_wo(ws, state.run_id, wo_id)
+            deliv_path = self._get_wo_deliverable_path(wo_id, ws)
+            state.repair_context = {
+                "source": "recovery",
+                "action": action,
+                "work_order": wo_id,
+                "decision": decision,
+                "original_contract": original_contract,
+                "deliverable_path": deliv_path,
+                "evidence": evidence,
+            }
+            return self._enter_recovery_repair(state, ws, record)
 
         if action == "retry_unchanged":
             failure_code = evidence.get("failure_code") or decision.get("failure_code")
@@ -4808,6 +4950,11 @@ class LifecycleSupervisor:
         elif action in ("split_work_order", "create_dependency_work_order"):
             _ensure(".sync/work-orders/**")
             _ensure(".sync/contracts/**")
+        elif action in ("architect_fix", "resolve_blocker"):
+            _ensure(".sync/work-orders/**")
+            _ensure(".sync/contracts/**")
+            _ensure(".sync/decisions/**")
+            _ensure("**")
         deny = [r for r in deny if not (isinstance(r, dict) and "schemas" in str(r.get("module", "")))]
 
         # Also ensure work order's declared deliverable is allowed
@@ -4847,7 +4994,9 @@ class LifecycleSupervisor:
 
         evidence = (state.worker_blockers.get(wo_id) or {}) if state else {}
         observed_count = int(evidence.get("observed_file_count", 0)) if isinstance(evidence, dict) else 0
-        if action == "amend_contract" or (isinstance(evidence, dict) and evidence.get("failure_code") == "CONTRACT_FILE_BUDGET_EXCEEDED"):
+        if action in ("architect_fix", "resolve_blocker"):
+            repair_budget = {"max_files_touched": 25, "max_tokens": 150000}
+        elif action == "amend_contract" or (isinstance(evidence, dict) and evidence.get("failure_code") == "CONTRACT_FILE_BUDGET_EXCEEDED"):
             repair_budget = {"max_files_touched": max(10, observed_count + 5), "max_tokens": 50000}
         else:
             repair_budget = (
@@ -5495,8 +5644,8 @@ class LifecycleSupervisor:
         return True
 
     def _agent_for_wo(self, wo_id: str, ws: Path) -> str:
-        """Determine the primary agent for a work order (ACTIVE or COMPLETED)."""
-        for sub in ("ACTIVE", "COMPLETED"):
+        """Determine the primary agent for a work order (ACTIVE, BLOCKED, or COMPLETED)."""
+        for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
             wo_file = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
             if not wo_file.exists():
                 continue

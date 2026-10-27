@@ -1345,6 +1345,72 @@ sys.exit(0)
         reaper.reap_all()
 
 
+def test_service_child_cannot_attach_console_or_write_console_input(tmp_path: Path, monkeypatch):
+    """A persistent service in ServiceJobManager attempting AttachConsole + WriteConsoleInput cannot inject into daemon confirmation prompt."""
+    if sys.platform != "win32":
+        pytest.skip("Windows console injection test requires Windows substrate")
+
+    import time
+    from validators.kernel.process_reaper import ServiceJobManager
+    from validators.kernel.daemon.protocol import JsonRpcProtocol
+    service_mgr = ServiceJobManager()
+    parent_pid = os.getpid()
+
+    code = """
+import ctypes, os, sys, time
+from ctypes import wintypes
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+ppid = int(sys.argv[1])
+
+kernel32.FreeConsole()
+ret_attach = kernel32.AttachConsole(ppid)
+
+h_conin = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+class KEY_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [("bKeyDown", wintypes.BOOL), ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD), ("wVirtualScanCode", wintypes.WORD),
+                ("UnicodeChar", wintypes.WCHAR), ("dwControlKeyState", wintypes.DWORD)]
+
+class INPUT_RECORD(ctypes.Structure):
+    _fields_ = [("EventType", wintypes.WORD), ("KeyEvent", KEY_EVENT_RECORD)]
+
+rec = INPUT_RECORD()
+rec.EventType = 1
+rec.KeyEvent.bKeyDown = True
+rec.KeyEvent.UnicodeChar = "y"
+written = wintypes.DWORD()
+kernel32.WriteConsoleInputW(h_conin, ctypes.byref(rec), 1, ctypes.byref(written))
+time.sleep(2.0)
+sys.exit(0)
+"""
+    script = tmp_path / "service_injector.py"
+    script.write_text(code.strip(), encoding="utf-8")
+
+    class MockManager:
+        def __init__(self, svc_mgr):
+            self.service_manager = svc_mgr
+            self.reaper = svc_mgr.service_reaper
+
+    mgr = MockManager(service_mgr)
+    proto = JsonRpcProtocol(manager=mgr)
+
+    # Launch service child inside dedicated service Job Object
+    proc = service_mgr.launch_service([sys.executable, str(script), str(parent_pid)])
+    time.sleep(0.3)
+
+    try:
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.delenv("SUPERVISOR_HEADLESS", raising=False)
+        monkeypatch.delenv("CI", raising=False)
+
+        # Invariant: confirm_on_console suspends service job, detects service in GetConsoleProcessList, and fails closed!
+        confirmed = proto.confirm_on_console("Administrative action? (y/N): ")
+        assert confirmed is False, "CRITICAL: confirm_on_console accepted input while service child was attached to console!"
+    finally:
+        service_mgr.shutdown_services()
+
+
 def test_collected_tests_manifest_matches_suite():
     """CI check verifying that the generated collected_tests.txt manifest strictly matches the collected suite."""
     manifest_path = Path("collected_tests.txt")

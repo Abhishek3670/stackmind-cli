@@ -89,10 +89,11 @@ class JsonRpcProtocol:
         In headless mode (CI or non-interactive environment), interactive console confirmation
         is strictly disabled and fails closed immediately, rejecting the unauthenticated admin call.
 
-        Console Injection Defense (Item 7):
+        Console Injection Defense (P0-6 Items 7 & 8):
         On Windows, detects if any child process has attached to the console via AttachConsole.
-        Flushes the console input buffer prior to prompting, and checks GetConsoleProcessList.
-        If any untrusted process is attached to the console session, fails closed immediately.
+        Suspends the SERVICE job (not just the turn job) before prompting, checks GetConsoleProcessList
+        against both turn reaper PIDs and service job PIDs, flushes the console input buffer, and
+        resumes the service job in finally:. If any untrusted process is attached, fails closed immediately.
         """
         import os, sys
         if os.environ.get("SUPERVISOR_HEADLESS", os.environ.get("CI", "0")).lower() in ("1", "true"):
@@ -100,35 +101,58 @@ class JsonRpcProtocol:
         if not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
             return False
 
-        if sys.platform == "win32":
+        reaper = getattr(self.manager, "reaper", None)
+        service_mgr = getattr(self.manager, "service_manager", None) or getattr(self.manager, "service_job_manager", None)
+        
+        # Suspend persistent services during console prompt to prevent injection attempts
+        suspended_by_prompt = False
+        if service_mgr and hasattr(service_mgr, "suspend_all"):
             try:
-                import ctypes
-                from ctypes import wintypes
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                
-                # Check for unauthorized processes attached to daemon's console
-                pids = (wintypes.DWORD * 64)()
-                num_pids = kernel32.GetConsoleProcessList(pids, 64)
-                attached = set(pids[:num_pids])
-                
-                # If manager has reaper with active registered child PIDs, ensure none are attached
-                reaper = getattr(self.manager, "reaper", None)
-                if reaper and hasattr(reaper, "_registered_pids"):
-                    for child_pid in reaper._registered_pids:
-                        if child_pid in attached:
-                            return False  # Console intrusion detected: child attached to daemon console!
-
-                # Flush any keystrokes injected into console input buffer prior to prompt
-                h_in = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-                kernel32.FlushConsoleInputBuffer(h_in)
+                service_mgr.suspend_all()
+                suspended_by_prompt = True
             except Exception:
                 pass
 
         try:
-            ans = input(prompt_msg).strip().lower()
-            return ans in ("y", "yes")
-        except Exception:
-            return False
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    
+                    # Check for unauthorized processes attached to daemon's console
+                    pids = (wintypes.DWORD * 64)()
+                    num_pids = kernel32.GetConsoleProcessList(pids, 64)
+                    attached = set(pids[:num_pids])
+                    
+                    # Collect all suspect child PIDs from turn reaper AND service job manager
+                    suspect_pids = set()
+                    if reaper and hasattr(reaper, "_registered_pids"):
+                        suspect_pids.update(reaper._registered_pids)
+                    if service_mgr and hasattr(service_mgr, "_get_all_service_pids"):
+                        suspect_pids.update(service_mgr._get_all_service_pids())
+                    
+                    for child_pid in suspect_pids:
+                        if child_pid in attached:
+                            return False  # Console intrusion detected: child or service attached to daemon console!
+
+                    # Flush any keystrokes injected into console input buffer prior to prompt
+                    h_in = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+                    kernel32.FlushConsoleInputBuffer(h_in)
+                except Exception:
+                    pass
+
+            try:
+                ans = input(prompt_msg).strip().lower()
+                return ans in ("y", "yes")
+            except Exception:
+                return False
+        finally:
+            if suspended_by_prompt and service_mgr and hasattr(service_mgr, "resume_all"):
+                try:
+                    service_mgr.resume_all()
+                except Exception:
+                    pass
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method in self.ADMIN_METHODS:

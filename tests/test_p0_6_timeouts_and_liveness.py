@@ -659,6 +659,7 @@ STUB_BEHAVIORS = [
     "malformed",
     "hang",
     "out_of_scope_write",
+    "rejection_identifiable",
     "rejection_unidentifiable",
 ]
 
@@ -666,7 +667,7 @@ STUB_BEHAVIORS = [
 @pytest.mark.parametrize("agent_phase", AGENT_OWNED_PHASES)
 @pytest.mark.parametrize("stub_behavior", STUB_BEHAVIORS)
 def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase: Phase, stub_behavior: str):
-    """Every combination of agent-owned phase and stub behavior terminates in < 30 steps and < 3.0s."""
+    """Every combination of agent-owned phase and stub behavior asserts expected next phase and counter, and terminates < 30 steps and < 3.0s."""
     mgr = StubSessionManager()
     reaper = ProcessReaper()
     # Shrunk turn timeouts for fast test execution
@@ -693,20 +694,26 @@ def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase
         step_count += 1
 
         if stub_behavior == "hang":
-            time.sleep(0.045)  # Exceeds 0.04s timeout
+            state.turn_deadline = time.monotonic() - 1.0
         elif stub_behavior == "empty":
             sup.handle_invalid_turn_output(state, role="agent", error_type="EMPTY_OUTPUT")
         elif stub_behavior == "malformed":
             sup.handle_invalid_turn_output(state, role="agent", error_type="MALFORMED_OUTPUT")
         elif stub_behavior == "out_of_scope_write":
             state.global_turn_budget = 0
+        elif stub_behavior == "rejection_identifiable":
+            wid = state.executing_wo_id or "WO-001"
+            state.qa_reworks[wid] = state.qa_reworks.get(wid, 0) + 1
+            state.error = f"QA_REJECTED: Reworkable defect found in {wid}"
+            sup._transition(state, Phase.EXECUTING)
         elif stub_behavior == "rejection_unidentifiable":
             sup.handle_rejection_without_reworkable(state, rejecting_role="qa", reason="unidentified defect")
         elif stub_behavior == "blocked":
             state.blocked = True
             state.error = "Agent blocked on external dependency"
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
             sup._transition(state, Phase.WAITING_FOR_HUMAN)
-            break
+
         elif stub_behavior == "success":
             if state.phase == Phase.PLANNING:
                 state.proposed_plan = {"milestones": ["M1"]}
@@ -731,6 +738,42 @@ def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase
                 sup._transition(state, Phase.EXECUTING)
 
         res = sup.advance(state)
+
+        # Step 1 Exact Contract Assertions: next phase and counter consumed
+        if step_count == 1:
+            if stub_behavior == "blocked":
+                assert state.phase in (Phase.WAITING_FOR_HUMAN, Phase.BLOCKED)
+                assert state.blocked is True
+            elif stub_behavior == "rejection_identifiable":
+                assert state.qa_reworks.get("WO-001", 0) >= 1
+                assert state.phase in (Phase.EXECUTING, Phase.ARCHITECT_RECOVERY_DECISION)
+            elif stub_behavior == "rejection_unidentifiable":
+                assert state.phase in (Phase.ARCHITECT_RECOVERY_DECISION, Phase.WAITING_FOR_HUMAN)
+                assert state.recovery_attempts.get("SYSTEM_UNIDENTIFIABLE", 0) >= 1 or state.exit_code is not None
+            elif stub_behavior in ("hang", "empty", "malformed"):
+                if agent_phase == Phase.PLANNING:
+                    assert state.planning_retries >= 1
+                elif agent_phase == Phase.EXECUTING:
+                    assert state.worker_retries.get("WO-001", 0) >= 1
+                elif agent_phase in (Phase.QA_REVIEW, Phase.INTEGRATION_REVIEW):
+                    assert state.qa_reworks.get("WO-001", 0) >= 1
+                elif agent_phase == Phase.ARCHITECT_REPAIR:
+                    assert state.authoring_repair_attempts >= 1
+                elif agent_phase == Phase.ARCHITECT_RECOVERY_DECISION:
+                    assert state.recovery_attempts.get("WO-001", 0) >= 1
+                elif agent_phase == Phase.GITOPS:
+                    assert state.gitops_retries >= 1
+            elif stub_behavior == "out_of_scope_write":
+                assert state.phase in (Phase.WAITING_FOR_HUMAN, Phase.FAILED)
+            elif stub_behavior == "success":
+                if agent_phase == Phase.PLANNING:
+                    assert state.phase == Phase.AUTHORING
+                elif agent_phase == Phase.EXECUTING:
+                    assert state.phase == Phase.INTEGRATION_REVIEW
+                elif agent_phase in (Phase.QA_REVIEW, Phase.INTEGRATION_REVIEW):
+                    assert state.phase in (Phase.INTEGRATION_REVIEW, Phase.GITOPS)
+                elif agent_phase == Phase.GITOPS:
+                    assert state.phase == Phase.COMPLETE
 
         # Terminal conditions: COMPLETE, FAILED, WAITING_FOR_HUMAN, BLOCKED, or human gate in AWAITING_APPROVAL
         if (

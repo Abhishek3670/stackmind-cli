@@ -1,7 +1,19 @@
 """
 Model checker and reachability verification for WAITING_FOR_HUMAN states.
-Traverses all entry reasons, human actions, and headless timeouts, verifying
-that 100% of paths reach a deterministic terminal state (COMPLETE or FAILED).
+
+Evidence Label: [RAN IN MODEL]
+IMPORTANT: This script is a state-transition model checker executed within
+a simulated test environment (DummyManager). It is NOT empirical evidence
+about the live supervisor daemon or real-world process tree execution.
+
+Key Lifecycle Guarantees Verified:
+1. Idle Stall Exit Code: Stalled execution transitions to WAITING_FOR_HUMAN with
+   exit code 3 (EXIT_RETRIES_EXHAUSTED), strictly matching the published exit code table.
+2. Headless Timeout State: Headless CI wait/run timeouts transition strictly to
+   Phase.FAILED with exit code 137 (EXIT_HEADLESS_TIMEOUT). There is NO separate
+   ABORTED_HEADLESS enum state; Phase.FAILED with exit code 137 is the terminal state.
+3. 100% Reachability: Every path reaches either an active resumed state or a
+   deterministic terminal state (COMPLETE or FAILED). Resumable dead-ends are eliminated.
 """
 
 from __future__ import annotations
@@ -39,6 +51,7 @@ class DummyManager:
 
 def run_reachability_check() -> None:
     print("=== WAITING_FOR_HUMAN TRANSITION REACHABILITY MODEL CHECKER ===")
+    print("Evidence Label: [RAN IN MODEL] (Simulated state reachability; NOT empirical supervisor evidence)")
     mgr = DummyManager()
     sup = LifecycleSupervisor(manager=mgr)
 

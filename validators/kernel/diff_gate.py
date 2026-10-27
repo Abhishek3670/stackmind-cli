@@ -1169,6 +1169,9 @@ class DiffGate:
 
         push_env = {
             **self.base_env,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": self.null_dev,
+            "GIT_CONFIG_SYSTEM": self.null_dev,
             "GIT_CONFIG": self.null_dev,
         }
         ws_git = self.resolve_workspace_git_dir()
