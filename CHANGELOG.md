@@ -5,7 +5,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.0] - 2026-10-28
+
 ### Added
+- **Autonomous Multi-Agent Lifecycle & Supervisor Driver Integration**:
+  - Automatically attaches and spins up a background supervisor driver (`_drive_run`) upon operator plan approval in chat, seamlessly transitioning from plan proposal directly into autonomous multi-agent execution (`PLANNING → AUTHORING → DISPATCHING → EXECUTING`) without manual intervention.
+  - Implemented authoring task synthesizer fallback in `validators/harness/runner.py` for headless authoring turns when `work_order_id` (e.g. `WO-000`) is not pre-materialized on disk.
+  - Guarded non-report operation tracking with on-disk existence checks, preventing crashes on newly synthesized work orders.
+- **Authoring Readiness Compiler Companion Test Auto-Injection**:
+  - Automatic companion test planning injection in `validators/harness/authoring_compiler.py`: When a project has zero planned test artifacts (e.g. single-milestone builds or frontend landing sites), the compiler automatically injects deterministic companion test planning (`tests/test_{stem}.py`) into `test_plan` for uncovered code deliverables.
+  - Automatically updates `implementation_estimate.expected_files` and contract `scope.allow` to include `tests/**`, eliminating `TEST_COVERAGE_UNPLANNED` readiness failures on frontend deliverables like `index.html`.
+  - Enabled active work order compilation for work orders currently in `BLOCKED` status undergoing repair.
+- **AuthoringGate Smart Overwrite Safeguard & Auto-Bumping**:
+  - Resolved overwrite-conflict catch-22 in `validators/harness/authoring_gate.py`: Authorized authors (`claude`, `architecture`, `ceo`) can now repair active work orders and contracts in repair or blocked mode without triggering `Overwrite conflict`.
+  - Automatically increments revisions (`revision = existing_rev + 1`, `contract_revision = existing_rev + 1`) and appends audit amendment records if the model does not supply a higher revision number during repair.
+- **Governed Architect Repair Guidance & Schema Templates**:
+  - In `validators/kernel/daemon/supervisor.py`, `_enter_architect_repair` now monotonically increments `state.authoring_revision += 1` on each repair attempt.
+  - Injected explicit, copy-pasteable schema templates for `test_plan`, `implementation_estimate`, and contract `budget` into `_authoring_repair_prompt`, eliminating guesswork and schema violations during repair turns.
+- **Child Work Order Collision Preservation & Plan Reconciliation**:
+  - Fixed renumbering bug in `validators/kernel/daemon/authoring.py`: Preserved `proposed_wos = renumbered_wos` during child work order synthesis, preventing ID collisions and duplicate work order sets (`WO-001..WO-004` alongside `WO-005..WO-008`).
+  - Added plan reconciliation to `SessionManager.approve_plan` in `validators/kernel/daemon/manager.py` to automatically cancel and clean up orphaned active work orders when a new plan is approved.
+- **TUI State Optimistic Worker Desync Fix**:
+  - Fixed worker status rendering in `cli/tui/state.py`: Worker agent statuses (`Backend`, `Frontend`, `QA`, `GitOps`) now remain `WAITING` until operations actually start, eliminating misleading optimistic `implementing` status before dispatch.
 - **TUI Mouse Access, Scrollbar Navigation & Native Clipboard Integration**:
   - Native zero-dependency cross-platform clipboard utility (`cli/tui/clipboard.py`) leveraging Win32 `ctypes` (`OpenClipboard`, `GetClipboardData`, `SetClipboardData`), macOS `pbcopy`/`pbpaste`, and Linux `wl-clipboard`/`xclip`/`xsel`.
   - Full keyboard clipboard paste support via `Ctrl+V` (`\x16` or VK `0x56`) and `Shift+Insert` in `RawLineEditor`.
