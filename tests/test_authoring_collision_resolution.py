@@ -683,3 +683,134 @@ def test_recovery_decision_cancel_work_order(tmp_path: Path):
 
     wo2_disk = yaml.safe_load((act_dir / "WO-002.yaml").read_text(encoding="utf-8"))
     assert wo2_disk["status"] == "CANCELLED"
+
+def test_reconcile_active_work_orders_supersedes_duplicate_milestones_and_unblocks_gate(tmp_path: Path):
+    """Rule 1b/1c/1d: Reconcile supersedes older duplicate milestone work orders and unblocks canonical."""
+    from validators.kernel.daemon.authoring import reconcile_active_work_orders_with_plan
+    from validators.harness.authoring_readiness import validate_authoring_readiness
+    import yaml
+
+    plan_content = """# Plan: Test Project
+
+## Current Architecture
+Static landing site.
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Setup Dependencies (Agent: codex)
+  - [ ] Task 1.1: Author requirements.txt
+- [ ] Milestone 2: Build Landing Page (Agent: gemini)
+  - [ ] Task 2.1: Author index.html
+"""
+    (tmp_path / "PLAN.md").write_text(plan_content, encoding="utf-8")
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    runtime_dir = tmp_path / ".sync" / "runtime"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stale bootstrap WO-001 (Milestone 1) and WO-002 (Milestone 2, claims index.html)
+    (act_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "milestone_id": "Milestone 1",
+            "title": "Setup Dependencies",
+            "status": "BLOCKED",
+            "synthesized_by": "bootstrap",
+            "assigned_agents": ["codex"],
+            "deliverable": {"type": "config", "path": "requirements.txt"},
+            "error": "Authoring readiness gate still failing after repair (OVERLAPPING_FILE_OWNERSHIP)",
+        }),
+        encoding="utf-8",
+    )
+    (act_dir / "WO-002.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-002",
+            "milestone_id": "Milestone 2",
+            "title": "Build Landing Page",
+            "status": "BLOCKED",
+            "synthesized_by": "bootstrap",
+            "assigned_agents": ["gemini"],
+            "deliverable": {"type": "code", "path": "index.html"},
+            "error": "Authoring readiness gate still failing after repair (OVERLAPPING_FILE_OWNERSHIP)",
+        }),
+        encoding="utf-8",
+    )
+
+    # Authored WO-005 (Milestone 1) and WO-006 (Milestone 2, claims index.html, plan_ref: PLAN-002)
+    (act_dir / "WO-005.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-005",
+            "milestone_id": "Milestone 1",
+            "title": "Setup Dependencies",
+            "status": "BLOCKED",
+            "plan_ref": "PLAN-002",
+            "assigned_agents": ["codex"],
+            "deliverable": {"type": "config", "path": "requirements.txt"},
+            "error": "Authoring readiness gate still failing after repair (OVERLAPPING_FILE_OWNERSHIP)",
+        }),
+        encoding="utf-8",
+    )
+    (act_dir / "WO-006.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-006",
+            "milestone_id": "Milestone 2",
+            "title": "Build Landing Page",
+            "status": "BLOCKED",
+            "plan_ref": "PLAN-002",
+            "assigned_agents": ["gemini"],
+            "deliverable": {"type": "code", "path": "index.html"},
+            "error": "Authoring readiness gate still failing after repair (OVERLAPPING_FILE_OWNERSHIP)",
+        }),
+        encoding="utf-8",
+    )
+
+    # Contracts for canonical work orders
+    (contracts_dir / "WO-005.yaml").write_text(yaml.safe_dump({"agent_id": "codex", "work_order": "WO-005"}), encoding="utf-8")
+    (contracts_dir / "WO-006.yaml").write_text(yaml.safe_dump({"agent_id": "gemini", "work_order": "WO-006"}), encoding="utf-8")
+
+    index_file = tmp_path / ".sync" / "work-orders" / "INDEX.yaml"
+    index_file.write_text(
+        yaml.safe_dump({
+            "orders": [
+                {"id": "WO-001", "status": "BLOCKED"},
+                {"id": "WO-002", "status": "BLOCKED"},
+                {"id": "WO-005", "status": "BLOCKED"},
+                {"id": "WO-006", "status": "BLOCKED"},
+            ],
+            "total_active": 0,
+            "total_blocked": 4,
+        }),
+        encoding="utf-8",
+    )
+
+    reconciled = reconcile_active_work_orders_with_plan(tmp_path)
+
+    # Stale duplicates WO-001 and WO-002 must be cancelled
+    assert "WO-001" in reconciled
+    assert "WO-002" in reconciled
+    wo1 = yaml.safe_load((act_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    wo2 = yaml.safe_load((act_dir / "WO-002.yaml").read_text(encoding="utf-8"))
+    assert wo1["status"] == "CANCELLED"
+    assert "Superseded by WO-005" in wo1["error"]
+    assert wo2["status"] == "CANCELLED"
+    assert "Superseded by WO-006" in wo2["error"]
+
+    # Canonical work orders WO-005 and WO-006 must be restored to ACTIVE
+    assert "WO-005" in reconciled
+    assert "WO-006" in reconciled
+    wo5 = yaml.safe_load((act_dir / "WO-005.yaml").read_text(encoding="utf-8"))
+    wo6 = yaml.safe_load((act_dir / "WO-006.yaml").read_text(encoding="utf-8"))
+    assert wo5["status"] == "ACTIVE"
+    assert "error" not in wo5
+    assert wo6["status"] == "ACTIVE"
+    assert "error" not in wo6
+
+    # INDEX.yaml must be synchronized
+    idx_data = yaml.safe_load(index_file.read_text(encoding="utf-8"))
+    statuses = {o["id"]: o["status"] for o in idx_data["orders"]}
+    assert statuses["WO-001"] == "CANCELLED"
+    assert statuses["WO-002"] == "CANCELLED"
+    assert statuses["WO-005"] == "ACTIVE"
+    assert statuses["WO-006"] == "ACTIVE"
+
