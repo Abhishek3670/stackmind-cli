@@ -4142,6 +4142,7 @@ class LifecycleSupervisor:
         state.repair_context = {"source": "authoring"}
         ws = Path(state.workspace)
         self._transition(state, Phase.ARCHITECT_REPAIR)
+        state.authoring_revision += 1
         affected = self._archive_rejected_artifacts(state, ws) if archive_failed_artifacts else []
         state.repair_context["affected_artifacts"] = affected
         state.authoring_repair_attempts += 1
@@ -4324,19 +4325,42 @@ class LifecycleSupervisor:
             f"{milestone_table_block}"
             f"Readiness diagnostics (bounded):\n{issue_lines or '- (operation-level failure; no artifact diagnostics)'}\n\n"
             f"{affected_intro}\n{affected_lines}\n\n"
-            "Correct each diagnostic by following its required_action:\n"
-            "1. Re-write each affected Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
-            "conforming to schemas/work-order.schema.json (ensure `milestone_id` is set to the matching approved milestone ID).\n"
-            "2. Re-write each affected or missing Contract YAML to .sync/contracts/<WO-ID>.yaml "
-            "conforming to schemas/contract.schema.json.\n"
-            "3. Explicitly size every contract budget: declare implementation_estimate "
-            "(expected_files, max_files_touched) in the work order and set the contract "
-            "max_files_touched to cover it.\n"
-            "4. Every code deliverable must declare a `test_plan` mapping it to test "
-            "artifact(s) (e.g. tests/test_<stem>.py, or a consolidated suite listing "
-            "the sources it covers).\n"
-            "5. Return the final HarnessDecision JSON with status 'completed' and modified_files "
-            "listing the files you wrote."
+            f"CRITICAL REVISION & SCHEMA SHAPES (follow exactly):\n"
+            f"- Set `revision: {state.authoring_revision}` on every rewritten Work Order, and append an amendments entry:\n"
+            f"    revision: {state.authoring_revision}\n"
+            f"    amendments:\n"
+            f"      - revision: {state.authoring_revision}\n"
+            f"        reason: \"Address authoring readiness gate findings\"\n"
+            f"- Set `contract_revision: {state.authoring_revision}` on every rewritten Contract.\n"
+            f"- Work Order `test_plan` MUST be an array of objects mapping sources to tests:\n"
+            f"    test_plan:\n"
+            f"      - sources:\n"
+            f"          - <code_deliverable_path>\n"
+            f"        tests:\n"
+            f"          - tests/test_<stem>.py\n"
+            f"- Work Order `implementation_estimate` MUST declare expected_files and max_files_touched:\n"
+            f"    implementation_estimate:\n"
+            f"      expected_files:\n"
+            f"        - <file1>\n"
+            f"        - <file2>\n"
+            f"      max_files_touched: <int >= count of expected_files>\n"
+            f"- Contract `budget` MUST cover the estimate:\n"
+            f"    budget:\n"
+            f"      max_files_touched: <int >= implementation_estimate.max_files_touched>\n"
+            f"      max_tokens: 60000\n\n"
+            f"Correct each diagnostic by following its required_action:\n"
+            f"1. Re-write each affected Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+            f"conforming to schemas/work-order.schema.json (ensure `milestone_id` is set to the matching approved milestone ID and revision={state.authoring_revision}).\n"
+            f"2. Re-write each affected or missing Contract YAML to .sync/contracts/<WO-ID>.yaml "
+            f"conforming to schemas/contract.schema.json (ensure contract_revision={state.authoring_revision}).\n"
+            f"3. Explicitly size every contract budget: declare implementation_estimate "
+            f"(expected_files, max_files_touched) in the work order and set the contract "
+            f"max_files_touched to cover it.\n"
+            f"4. Every code deliverable must declare a `test_plan` mapping it to test "
+            f"artifact(s) (e.g. tests/test_<stem>.py, or a consolidated suite listing "
+            f"the sources it covers).\n"
+            f"5. Return the final HarnessDecision JSON with status 'completed' and modified_files "
+            f"listing the files you wrote."
         )
 
     def _architect_turn(

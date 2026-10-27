@@ -182,7 +182,7 @@ def compile_authoring_artifacts(
         if data is None:
             continue  # unreadable/invalid intent — reported by the readiness gate
         status = str(data.get("status", "")).upper()
-        if status in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+        if status in ("COMPLETED", "CANCELLED", "FAILED"):
             continue
         if p_idx is not None and (_parse_wo_index(data.get("id") or wo_id) or 0) <= p_idx:
             continue
@@ -328,7 +328,41 @@ def compile_authoring_artifacts(
             if planned not in planned_test_artifacts:
                 planned_test_artifacts.append(planned)
 
-    if len(planned_test_artifacts) == 1:
+    if len(planned_test_artifacts) == 0:
+        # Default companion test planning: when no test artifacts are planned across
+        # the authored set (e.g. single-milestone or frontend projects without a
+        # dedicated QA work order), inject default companion tests so code deliverables
+        # never dead-end authoring readiness on TEST_COVERAGE_UNPLANNED.
+        for rel, wo_path, data in wo_records:
+            if rel in malformed_test_plan_rels:
+                continue
+            deliverable = data.get("deliverable")
+            if not isinstance(deliverable, dict):
+                continue
+            deliv_path_str = _normalize_rel(deliverable.get("path"))
+            deliv_type_str = str(deliverable.get("type") or "").lower()
+            if not deliv_path_str or not _is_code_deliverable(deliv_type_str, deliv_path_str):
+                continue
+            if _is_test_artifact(deliv_path_str) or deliv_path_str in declared_coverage:
+                continue
+            if "test_plan" in data:
+                continue
+            stem = Path(deliv_path_str).stem.lower() or "app"
+            default_test = f"tests/test_{stem}.py"
+            data["test_plan"] = [{"sources": [deliv_path_str], "tests": [default_test]}]
+            declared_coverage.add(deliv_path_str)
+            if default_test not in planned_test_artifacts:
+                planned_test_artifacts.append(default_test)
+            estimate = data.get("implementation_estimate")
+            if isinstance(estimate, dict):
+                expected = estimate.setdefault("expected_files", [])
+                if isinstance(expected, list) and default_test not in expected:
+                    expected.append(default_test)
+                    max_files = estimate.get("max_files_touched")
+                    if isinstance(max_files, int) and max_files < len(expected):
+                        estimate["max_files_touched"] = len(expected) + 2
+            _mark(rel, f"+test_plan (companion default -> {default_test})", data, wo_path)
+    elif len(planned_test_artifacts) == 1:
         suite = planned_test_artifacts[0]
         for rel, wo_path, data in wo_records:
             if rel in malformed_test_plan_rels:
@@ -413,6 +447,17 @@ def compile_authoring_artifacts(
                 scope["allow"] = allow
             allow.append({"module": deliv_path})
             _mark(rel, f"+scope.allow: {deliv_path} (authorizes work order deliverable)", data, contract_path)
+
+        # Companion test authorization: ensure worker can author planned companion tests
+        allow_rules = scope.get("allow")
+        if isinstance(allow_rules, list):
+            has_tests_rule = any(
+                "tests" in str((r.get("module") or r.get("path") or r) if isinstance(r, dict) else r)
+                for r in allow_rules
+            )
+            if not has_tests_rule and planned_test_artifacts:
+                allow_rules.append({"module": "tests/**"})
+                _mark(rel, "+scope.allow: tests/** (authorizes companion test deliverables)", data, contract_path)
 
         # Root directory aliasing: if contract allows src/<dir>/** but src/<dir>
         # does not exist and <dir> exists at workspace root, alias it so workers

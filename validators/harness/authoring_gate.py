@@ -215,6 +215,11 @@ class AuthoringGate:
         passed = len(errors) == 0
         if passed:
             self._session_authored_paths.add(norm_path)
+            if isinstance(data, dict):
+                try:
+                    normalized_content = yaml.safe_dump(data, sort_keys=False)
+                except Exception:
+                    pass
 
         return AuthoringGateDecision(
             passed=passed,
@@ -300,18 +305,65 @@ class AuthoringGate:
             return
 
         # Scaffolding or repair artifacts: an authorized author (Architect/CEO)
-        # may supersede synthesized artifacts or amend contracts with incremented revision.
+        # may supersede synthesized artifacts or amend contracts/work orders.
         # Workers never reach this check (role gate runs first).
         if str(author or "").lower() in self.AUTHORIZED_AUTHORS and isinstance(existing_data, dict):
             existing_synth = str(existing_data.get("synthesized_by", "")).lower()
             new_synth = str(data.get("synthesized_by", "") if isinstance(data, dict) else "").lower()
-            if existing_synth in {"bootstrap", "recovery-repair"} or new_synth in {"bootstrap", "recovery-repair"}:
+            repair_markers = {"bootstrap", "recovery-repair", "architect-repair", "authoring-repair", "repair"}
+            is_repair = (
+                existing_synth in repair_markers
+                or new_synth in repair_markers
+                or str(existing_data.get("status", "")).upper() in {"BLOCKED", "REWORK"}
+                or bool(existing_data.get("error") or existing_data.get("blocked_reason"))
+            )
+            if not is_repair and is_contract:
+                wo_stem = Path(norm_path).stem
+                wo_cand = project_root / ".sync" / "work-orders" / "ACTIVE" / f"{wo_stem}.yaml"
+                if not wo_cand.exists():
+                    wo_cand = project_root / "work-orders" / "ACTIVE" / f"{wo_stem}.yaml"
+                if wo_cand.is_file():
+                    try:
+                        wo_data = yaml.safe_load(wo_cand.read_text(encoding="utf-8"))
+                        if isinstance(wo_data, dict):
+                            if (
+                                str(wo_data.get("status", "")).upper() in {"BLOCKED", "REWORK"}
+                                or bool(wo_data.get("error") or wo_data.get("blocked_reason"))
+                            ):
+                                is_repair = True
+                    except Exception:
+                        pass
+            if is_repair:
+                # During repair of blocked/failing/scaffold artifacts, an authorized author
+                # is explicitly authorized to replace or refine the artifact.
+                if is_active_wo and isinstance(data, dict):
+                    existing_rev = existing_data.get("revision", 1)
+                    new_rev = data.get("revision")
+                    if not (isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev):
+                        existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
+                        bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
+                        data["revision"] = bumped_rev
+                        amendments = data.setdefault("amendments", [])
+                        if isinstance(amendments, list):
+                            amendments.append({
+                                "revision": bumped_rev,
+                                "reason": "Authoring refinement and readiness repair",
+                            })
+                elif is_contract and isinstance(data, dict):
+                    existing_rev = existing_data.get("contract_revision", 1)
+                    new_rev = data.get("contract_revision")
+                    if not (isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev):
+                        existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
+                        bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
+                        data["contract_revision"] = bumped_rev
                 return
+
             if is_contract and isinstance(data, dict):
                 existing_rev = existing_data.get("contract_revision", 1)
                 new_rev = data.get("contract_revision")
                 if isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev:
                     return
+
             # Task amendment: an authorized author may sharpen a live work
             # order in place, but only behind a strictly increasing revision
             # (recorded with its amendment reason), never a silent clobber.

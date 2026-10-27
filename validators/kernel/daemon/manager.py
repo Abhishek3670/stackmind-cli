@@ -1362,10 +1362,11 @@ class SessionManager:
 
             if is_goal_plan and (workspace / ".sync").exists():
                 try:
-                    from .authoring import synthesize_child_work_orders
+                    from .authoring import synthesize_child_work_orders, reconcile_active_work_orders_with_plan
                     synthesized = synthesize_child_work_orders(workspace, plan, session_id=session_id)
                     if synthesized:
                         created_work_orders = synthesized
+                    reconcile_active_work_orders_with_plan(workspace)
                 except Exception:
                     pass
             else:

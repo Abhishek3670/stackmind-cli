@@ -1064,6 +1064,7 @@ def synthesize_child_work_orders(
             new_deps = [id_map.get(d, d) for d in w.get("dependencies", [])]
             w_copy["dependencies"] = new_deps
             renumbered_wos.append(w_copy)
+        proposed_wos = renumbered_wos
     # Anti-collision and parallel deliverable ownership check
     valid_ownership, ownership_errors = validate_work_orders_ownership(proposed_wos)
     if not valid_ownership:
