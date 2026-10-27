@@ -3616,6 +3616,15 @@ class LifecycleSupervisor:
                     state.release_commit_sha = sha
                 except Exception:
                     pass
+            try:
+                from validators.kernel.sync_git import commit_sync_governance
+                commit_sync_governance(
+                    ws,
+                    f"chore(governance): release goal '{state.product_goal}'",
+                    author="supervisor",
+                )
+            except Exception:
+                pass
             self._transition(state, Phase.COMPLETE)
             return AdvanceResult.COMPLETE
 
@@ -6590,6 +6599,17 @@ def archive_completed_work_orders(
         HarnessRunner._sync_index_and_tree_yaml(ws)
     except Exception:
         pass
+
+    if archived:
+        try:
+            from validators.kernel.sync_git import commit_sync_governance
+            commit_sync_governance(
+                ws,
+                f"chore(governance): archive completed work orders: {', '.join(archived)}",
+                author="supervisor",
+            )
+        except Exception:
+            pass
 
     return archived
 

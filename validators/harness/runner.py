@@ -744,6 +744,15 @@ class AgentRunner:
                             f'## Report\n{raw_report or raw_summary}\n'
                         )
                         out_path.write_text(report_content, encoding='utf-8')
+                        try:
+                            from validators.kernel.sync_git import commit_sync_governance
+                            commit_sync_governance(
+                                self.project_path,
+                                f"chore(governance): record adhoc turn by {self.agent} [{task.identifier[:8]}]",
+                                author=self.agent,
+                            )
+                        except Exception:
+                            pass
                         meta: dict[str, Any] = {
                             'summary': raw_summary or raw_report,
                             'report_markdown': raw_report or raw_summary,
@@ -1212,6 +1221,16 @@ class AgentRunner:
                 self._apply_ops(self.project_path, [final_report, events_write, exp_write])
             finally:
                 release_lock(self.sync_path, self.agent)
+
+            try:
+                from validators.kernel.sync_git import commit_sync_governance
+                commit_sync_governance(
+                    self.project_path,
+                    f"chore(governance): record {decision.status} turn by {self.agent} [{task.identifier[:8]}]",
+                    author=self.agent,
+                )
+            except Exception:
+                pass
 
             return HarnessRunResult(
                 status=decision.status,

@@ -911,12 +911,16 @@ def _stream_turn_execution(
                 thinking = None
                 response_events = {"operation.completed", "turn.completed"}
                 if ev_name in response_events:
-                    resp = extract_assistant_response(ev_payload, workspace=workspace)
-                    thinking = (
-                        extract_assistant_thinking(ev_payload, workspace=workspace)
-                        or getattr(state, "current_turn_thinking", None)
-                        or None
-                    )
+                    target_op = ev_payload.get("operation_id") or ev.get("operation_id")
+                    if op_id and op_id not in {"turn", "all"} and target_op and target_op != op_id:
+                        pass
+                    else:
+                        resp = extract_assistant_response(ev_payload, workspace=workspace)
+                        thinking = (
+                            extract_assistant_thinking(ev_payload, workspace=workspace)
+                            or getattr(state, "current_turn_thinking", None)
+                            or None
+                        )
                 if resp and not assistant_rendered and not streamed_chunks:
                     turn_acts = state.current_turn_actions
                     if turn_acts:
@@ -1158,16 +1162,20 @@ def _stream_turn_execution(
                         "turn.completed",
                     }
                     if ev.get("name") in response_events:
-                        resp = extract_assistant_response(
-                            ev.get("payload", {}), workspace=workspace
-                        )
-                        thinking = (
-                            extract_assistant_thinking(
+                        target_op = ev.get("payload", {}).get("operation_id") or ev.get("operation_id")
+                        if op_id and op_id not in {"turn", "all"} and target_op and target_op != op_id:
+                            pass
+                        else:
+                            resp = extract_assistant_response(
                                 ev.get("payload", {}), workspace=workspace
                             )
-                            or getattr(state, "current_turn_thinking", None)
-                            or None
-                        )
+                            thinking = (
+                                extract_assistant_thinking(
+                                    ev.get("payload", {}), workspace=workspace
+                                )
+                                or getattr(state, "current_turn_thinking", None)
+                                or None
+                            )
                     if resp and not assistant_rendered:
                         turn_acts = state.current_turn_actions
                         state.add_message(

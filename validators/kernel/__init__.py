@@ -67,6 +67,7 @@ from .permission_matrix import (
     PERMISSION_MATRIX_TABLE,
     get_permission_matrix_prompt,
 )
+from .sync_git import commit_sync_governance
 from .profile import (
     ExecutionProfile,
     ProfilePolicy,
@@ -102,6 +103,7 @@ __all__ = [
     "ContextLengthExceededError",
     "ContractEvaluator",
     "ContractNormalizer",
+    "commit_sync_governance",
     "DaemonStorage",
     "DaemonClient",
     "EligibilityDecision",
