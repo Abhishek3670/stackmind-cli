@@ -537,9 +537,9 @@ def tui(
                         )
                         conv_content = None
                         has_in_progress = (
-                            (hasattr(state, "current_turn_actions") and not state.current_turn_actions.is_empty)
+                            (getattr(state, "current_turn_segments", None) and any(s.get("kind") in ("text", "thinking", "action") for s in state.current_turn_segments))
+                            or (hasattr(state, "current_turn_actions") and not state.current_turn_actions.is_empty and any(getattr(a, "status", "").upper() == "RUNNING" for a in state.current_turn_actions.all_actions))
                             or bool(getattr(state, "current_turn_thinking", None))
-                            or bool(session.get("active_operation"))
                         )
                         if has_in_progress:
                             from cli.tui.commands import _build_in_progress_turn_content
@@ -719,9 +719,9 @@ def tui(
                     term_lines = term_size.lines
                     conv_content = None
                     has_in_progress = (
-                        (hasattr(state, "current_turn_actions") and not state.current_turn_actions.is_empty)
+                        (getattr(state, "current_turn_segments", None) and any(s.get("kind") in ("text", "thinking", "action") for s in state.current_turn_segments))
+                        or (hasattr(state, "current_turn_actions") and not state.current_turn_actions.is_empty and any(getattr(a, "status", "").upper() == "RUNNING" for a in state.current_turn_actions.all_actions))
                         or bool(getattr(state, "current_turn_thinking", None))
-                        or bool(session.get("active_operation"))
                     )
                     if has_in_progress:
                         from cli.tui.commands import _build_in_progress_turn_content

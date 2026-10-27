@@ -376,7 +376,14 @@ def _build_in_progress_turn_content(
             elif kind == "action":
                 act_list = []
                 while idx < len(segs) and segs[idx].get("kind") == "action":
-                    act_list.append(segs[idx]["action"])
+                    act = segs[idx]["action"]
+                    if getattr(act, "sub_actions", None):
+                        from dataclasses import replace
+                        try:
+                            act = replace(act, sub_actions=[])
+                        except Exception:
+                            pass
+                    act_list.append(act)
                     idx += 1
                 group = ActionsGroup(actions=act_list, verbosity=state.govern_verbosity)
                 act_str = render_actions_group_str(group, width=layout_width)
@@ -432,6 +439,8 @@ def _build_in_progress_turn_content(
                 parts.append(wrapped_text)
 
     in_progress = "\n\n".join(parts)
+    if len(parts) == 1 and not (streamed_chunks and "".join(streamed_chunks).strip()):
+        return transcript if transcript else ""
     return f"{transcript}\n\n{in_progress}" if transcript else in_progress
 
 
@@ -1442,9 +1451,18 @@ def _stream_turn_execution(
                         )
                     )
 
-    if hasattr(state, "current_turn_actions") and state.current_turn_actions:
-        state.current_turn_actions.complete_all()
+    if hasattr(state, "current_turn_actions"):
+        if state.current_turn_actions:
+            state.current_turn_actions.complete_all()
+        state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
+    state.current_turn_segments = []
+    state.current_turn_thinking = ""
+    state.current_turn_thinking_start_time = None
+    state.current_turn_thinking_elapsed = None
     state.reset_attempts_and_retries()
+    if session:
+        session.pop("active_operation", None)
+        session.pop("active_role", None)
 
     # Always repaint the final frame. When the turn completed via a full
     # response event (assistant_rendered is already True) there are no

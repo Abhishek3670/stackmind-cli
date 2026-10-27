@@ -222,9 +222,12 @@ class ActionsGroup:
         mode = (verbosity or self.verbosity or "tree").lower()
         items: list[tuple[TurnAction, int]] = []
         for a in self.actions:
-            if mode == "flat" and a.sub_actions:
-                for sa in a.sub_actions:
-                    items.append((sa, 0))
+            if mode == "flat":
+                if a.sub_actions:
+                    for sa in a.sub_actions:
+                        items.append((sa, 0))
+                else:
+                    items.append((a, 0))
             elif mode == "compact":
                 items.append((a, 0))
             else:  # "tree"
@@ -1280,10 +1283,6 @@ class AutonomousDeliveryState:
             output=output,
             parent_id=parent_id,
         )
-        if self.messages and self.messages[-1].role == "assistant":
-            if self.messages[-1].actions is None:
-                self.messages[-1].actions = self.current_turn_actions
-
         # Record into chronological turn segments
         if not hasattr(self, "current_turn_segments"):
             self.current_turn_segments = []
@@ -1301,15 +1300,27 @@ class AutonomousDeliveryState:
             elif seg.get("kind") == "action":
                 break
 
-        existing = next((s for s in self.current_turn_segments if s.get("kind") == "action" and s.get("action_id") == action_id), None)
-        if existing:
-            existing["action"] = action
-        else:
-            self.current_turn_segments.append({
-                "kind": "action",
-                "action_id": action_id,
-                "action": action,
-            })
+        # Filter out harness runner container actions and internal sync actions
+        # from the chronological turn segments so they do not duplicate concrete tools.
+        from cli.tui.chat import is_internal_sync_action
+        t_name = str(tool_name or getattr(action, "tool_name", "") or "").lower()
+        desc = str(description or getattr(action, "description", "") or "").lower()
+        is_harness = (
+            "harness" in t_name
+            or t_name in {"run_harness", "agent"}
+            or desc.startswith("agent (")
+            or desc == "agent"
+        )
+        if not is_harness and not is_internal_sync_action(action):
+            existing = next((s for s in self.current_turn_segments if s.get("kind") == "action" and s.get("action_id") == action_id), None)
+            if existing:
+                existing["action"] = action
+            else:
+                self.current_turn_segments.append({
+                    "kind": "action",
+                    "action_id": action_id,
+                    "action": action,
+                })
 
         return action
 
@@ -1335,14 +1346,12 @@ class AutonomousDeliveryState:
             diff=diff,
             code=code,
         )
-        if self.messages and self.messages[-1].role == "assistant":
-            if self.messages[-1].actions is None:
-                self.messages[-1].actions = self.current_turn_actions
 
         if getattr(self, "current_turn_segments", None):
             for seg in self.current_turn_segments:
                 if seg.get("kind") == "action" and seg.get("action_id") == action_id:
-                    seg["action"] = act
+                    if act is not None:
+                        seg["action"] = act
                     break
 
         return act

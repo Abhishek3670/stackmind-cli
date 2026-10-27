@@ -119,3 +119,79 @@ def test_intermediate_chatter_folded_into_thinking_on_completion():
     assert "Initial architectural analysis." in msg.thinking
     assert "> Let me inspect index.html first." in msg.thinking
     assert "> Let me update the styles now." in msg.thinking
+
+
+def test_harness_container_does_not_duplicate_subactions():
+    """Verify harness.run_once container does not duplicate child tools before and after commentary text."""
+    state = AutonomousDeliveryState()
+
+    # Daemon emits harness.run_once container at start of operation
+    state.record_turn_action("op-1", "Agent (Architecture)", tool_name="harness.run_once")
+
+    # Agent emits commentary text before invoking tools
+    state.record_turn_text("I'll take a look at the workspace to understand what's in the repo.")
+
+    # Agent runs tools under parent op-1
+    for i, path in enumerate(["README.md", "PLAN.md", "VERSION", "CHANGELOG.md"], start=1):
+        state.record_turn_action(f"read-{i}", f"Read({path})", tool_name="read_file", target=path, parent_id="op-1")
+        state.complete_turn_action(f"read-{i}", status="COMPLETED")
+
+    content = _build_in_progress_turn_content(
+        state,
+        model_name="stackmind-echo-v1",
+        streamed_chunks=[],
+        latest_act_desc="reading",
+        start_time=0,
+        max_wait=0,
+        layout_width=100,
+    )
+
+    # Commentary text must appear before Read(README.md)
+    pos_text = content.find("I'll take a look at the workspace")
+    pos_read = content.find("Read(README.md)")
+    assert pos_text != -1 and pos_read != -1
+    assert pos_text < pos_read, "Commentary text must appear above tool calls"
+
+    # Crucial: Each tool action must appear EXACTLY ONCE (count == 1)
+    assert content.count("Read(README.md)") == 1
+    assert content.count("Read(PLAN.md)") == 1
+    assert content.count("Read(VERSION)") == 1
+    assert content.count("Read(CHANGELOG.md)") == 1
+
+
+def test_new_turn_actions_do_not_attach_to_previous_assistant_message():
+    """Verify new turn actions are not retroactively attached to the previous completed assistant message."""
+    state = AutonomousDeliveryState()
+
+    # Turn 1 completes
+    state.add_message("assistant", "Done - I've dispatched the Frontend specialist.")
+    prev_msg = state.messages[-1]
+    assert prev_msg.actions is None
+
+    # Turn 2 starts with new tool actions
+    state.record_turn_action("call-fe-1", "Read(brand-kit.html)", tool_name="read_file", target="brand-kit.html")
+
+    # The previous completed message must still have actions=None (not mutated)
+    assert prev_msg.actions is None
+    # Current turn actions has the new tool
+    assert state.current_turn_actions.count == 1
+
+
+def test_idle_turn_content_does_not_render_orphaned_stream_header():
+    """Verify _build_in_progress_turn_content does not append an orphaned header when idle."""
+    state = AutonomousDeliveryState()
+    state.add_message("assistant", "Previous completed response.")
+
+    content = _build_in_progress_turn_content(
+        state,
+        model_name="Agent · daemon",
+        streamed_chunks=[],
+        latest_act_desc="",
+        start_time=0,
+        max_wait=0,
+        layout_width=100,
+    )
+
+    # Must contain only the transcript, not an appended orphaned header
+    assert "Previous completed response." in content
+    assert "✦ StackMind (Agent · daemon)" not in content
