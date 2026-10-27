@@ -443,6 +443,10 @@ def format_current_operation(
                 if len(short_err) > max_len:
                     short_err = short_err[:max_len - 1] + "…"
                 res_lines.append(Text(f"    {short_err}", style="dim #ef4444"))
+            if phase_val.upper() == "BLOCKED":
+                res_lines.append(Text("    Run :resume to retry", style="dim #fbbf24"))
+            elif phase_val.upper() == "FAILED":
+                res_lines.append(Text("    Run :resume to recover", style="dim #fbbf24"))
             return res_lines
 
         if state is not None:

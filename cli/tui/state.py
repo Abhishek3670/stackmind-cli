@@ -1682,8 +1682,9 @@ class AutonomousDeliveryState:
                     try:
                         data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
                         st = str(data.get("status", "ACTIVE")).upper()
-                        if data.get("error") or data.get("blocked_reason"):
-                            st = "BLOCKED"
+                        if st not in {"CANCELLED", "CANCELED", "COMPLETED"}:
+                            if data.get("error") or data.get("blocked_reason"):
+                                st = "BLOCKED"
                         disk_statuses[f.stem] = st
                         disk_orders[f.stem] = data
                     except Exception:

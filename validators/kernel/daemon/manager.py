@@ -2976,7 +2976,14 @@ class SessionManager:
             res_reason = getattr(result, "reason", None) or res_payload.get("reason")
             res_status = getattr(result, "status", None) or res_payload.get("status") or "completed"
             blocker_list = res_meta.get("blockers") or res_payload.get("blockers") or ([res_reason] if res_reason else [])
-            computed_err = res_reason or ("; ".join(str(b) for b in blocker_list) if blocker_list else None) or res_meta.get("summary") or res_payload.get("summary") or res_status
+            if res_status in {"completed", "idle"} and not res_reason and not blocker_list:
+                computed_err = None
+            else:
+                computed_err = (
+                    res_reason
+                    or ("; ".join(str(b) for b in blocker_list) if blocker_list else None)
+                    or (res_status if str(res_status).lower() not in {"completed", "idle"} else None)
+                )
             summary_text = (
                 res_meta.get("summary")
                 or res_payload.get("summary")

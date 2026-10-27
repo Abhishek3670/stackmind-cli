@@ -5,7 +5,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.10.0] - 2026-10-28
+## [3.10.1] - 2026-10-28
+
+### Added
+- **Architect Situational Awareness & Orchestration State Grounding**:
+  - Injected live supervisor run phase, blockers, and error telemetry (`run-*.yaml`) directly into `render_team_status` in `validators/harness/task_contract.py`.
+  - Added explicit instructions directing the Lead Architect to provide completely honest, diagnostic responses when the user asks "what happened", "is it working", or for run status, strictly prohibiting hallucinating that "the orchestration is working" or "nothing broke" when the supervisor is in `BLOCKED` or `FAILED` phase.
+  - Automatically halted specialist agent display statuses in `render_team_status` when the supervisor orchestration is blocked, preventing false reports of active specialist execution.
+- **Robust Authoring Overwrite Safeguard for Active Runs**:
+  - Updated `AuthoringGate` in `validators/harness/authoring_gate.py` to recognize active and blocked supervisor run states, allowing authorized authors (`claude`, `architecture`, `ceo`) to repair active work orders and contracts without triggering `Overwrite conflict` rejections.
+  - Automatically bumps `revision` and `contract_revision` with audit amendment records during repair turns.
+- **Automated Regression Suite for Orchestration Honesty & Readiness**:
+  - Added `tests/test_blocked_orchestration_honesty_and_asset_code_gate.py` verifying asset exclusion, truthful status reporting, and repair turn gating.
+
+### Fixed
+- **`CANCELLED` Work Order Status Validation in `ACTIVE` & `BLOCKED`**:
+  - Updated `WORK_ORDER_ALLOWED_STATUSES` and `_normalize_work_order_status` in `cli/validate.py` to allow `"CANCELLED"` (and `"CANCELED"`) work orders in `ACTIVE/` and `BLOCKED/` directories.
+  - Eliminated staged validation rejection errors that previously crashed Architect repair turns.
+- **Milestone Component Deliverable Deduplication**:
+  - Fixed Pass 2 of `reconcile_active_work_orders_with_plan` in `validators/kernel/daemon/authoring.py`: Only deduplicates work orders sharing the exact same deliverable path or identical title within a milestone, preserving distinct component tasks (`package.json`, `index.html`, `styles.css`, `main.js`, `tokens.css`).
+  - Added automatic reactivation of approved tasks in `PLAN.md` that were previously marked cancelled by deduplication bugs.
+- **Asset and Directory Classification in Companion Test Gate**:
+  - Updated `_is_code_deliverable` in `validators/harness/authoring_readiness.py`: Assets (`.png`, `.svg`, `.ico`), styles (`.css`), directories (paths ending in `/` or extensionless), and documents are explicitly excluded from code deliverable companion test requirements, eliminating false `TEST_COVERAGE_UNPLANNED` readiness failures on image/asset work orders.
+- **Automated QA Deliverable Normalization**:
+  - Guaranteed in `validators/kernel/daemon/authoring.py` that QA work orders delivering documentation (`.md` or `type: doc`) are automatically normalized to executable test suites (`tests/test_qa_verification.py` or `tests/verify_landing.py`), satisfying D024 gate requirements.
+- **Contract Synthesis & Scope Authorization**:
+  - Pass 3c in `authoring.py` automatically synthesizes missing contracts and ensures existing contracts allow the deliverable path and test suites.
+- **TUI Cancelled Work Order Status Rendering**:
+  - Fixed `cli/tui/state.py` so cancelled work orders with cancellation reasons are not mistakenly flipped to `BLOCKED` with exclamation mark `!`, rendering cleanly as `⊘` (cancelled).
+  - Enhanced `CURRENT OPERATION: Blocked` panel in `cli/tui/runtime_panel.py` with `Run :resume to retry` guidance.
 
 ### Added
 - **Autonomous Multi-Agent Lifecycle & Supervisor Driver Integration**:

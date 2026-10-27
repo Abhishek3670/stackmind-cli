@@ -220,8 +220,8 @@ def _repair_completion_notice(sync_path: Path, notice_file: Path) -> bool:
 
 WORK_ORDER_STATE_DIRS = ("ACTIVE", "BLOCKED", "COMPLETED")
 WORK_ORDER_ALLOWED_STATUSES = {
-    "ACTIVE": {"ACTIVE", "BLOCKED", "READY", "PENDING", "FAILED"},
-    "BLOCKED": {"BLOCKED", "FAILED"},
+    "ACTIVE": {"ACTIVE", "BLOCKED", "READY", "PENDING", "FAILED", "CANCELLED"},
+    "BLOCKED": {"BLOCKED", "FAILED", "CANCELLED"},
     "COMPLETED": {"COMPLETE", "COMPLETED"},
 }
 
@@ -255,6 +255,8 @@ def _normalize_work_order_status(status: str | None) -> str | None:
     status_upper = str(status).upper()
     if status_upper in ("COMPLETE", "COMPLETED"):
         return "COMPLETED"
+    if status_upper in ("CANCELED", "CANCELLED"):
+        return "CANCELLED"
     return status_upper
 
 

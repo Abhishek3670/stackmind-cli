@@ -219,8 +219,67 @@ def render_team_status(
         ("GitOps", "local-llm", "GitOps Specialist (versioning, release manifests)"),
     ]
 
-    agent_status_lines: list[str] = []
+    # 2. Check supervisor run state for orchestration phase and blockers first
+    sup_dir = ws / ".sync" / "runtime" / "supervisor"
+    supervisor_status_lines: list[str] = []
     active_blockers: list[str] = []
+    latest_phase: str | None = None
+    if sup_dir.is_dir():
+        run_files = sorted(
+            sup_dir.glob("run-*.yaml"),
+            key=lambda p: p.stat().st_mtime if p.is_file() else 0,
+            reverse=True,
+        )
+        for rf in run_files[:2]:
+            try:
+                rdata = yaml.safe_load(rf.read_text(encoding="utf-8"))
+                if isinstance(rdata, dict):
+                    r_id = rdata.get("run_id") or rf.stem
+                    r_phase = str(rdata.get("phase") or "UNKNOWN").upper()
+                    if latest_phase is None:
+                        latest_phase = r_phase
+                    r_err = rdata.get("error")
+                    r_issues = rdata.get("readiness_issues") or []
+                    supervisor_status_lines.append(f"- Run: {r_id} | Phase: {r_phase}")
+                    if r_err:
+                        err_clean = _clip(str(r_err).strip(), 240)
+                        supervisor_status_lines.append(f"  Error: {err_clean}")
+                        active_blockers.append(f"Supervisor [{r_id}] ({r_phase}): {err_clean}")
+                    for issue in r_issues:
+                        if isinstance(issue, dict):
+                            i_code = issue.get("code") or "ISSUE"
+                            i_msg = _clip(str(issue.get("message") or "").strip(), 160)
+                            active_blockers.append(f"Readiness Gate Blocker [{i_code}]: {i_msg}")
+                        elif isinstance(issue, str):
+                            active_blockers.append(f"Readiness Gate Blocker: {_clip(issue.strip(), 160)}")
+                    ib = rdata.get("integration_blockers") or []
+                    for b in ib:
+                        b_str = _clip(str(b).strip(), 140)
+                        if b_str and not any(b_str in ab for ab in active_blockers):
+                            active_blockers.append(f"Integration Blocker: {b_str}")
+                    for bwo in (rdata.get("blocked_wo_ids") or []):
+                        if not any(f"[{bwo}]" in ab for ab in active_blockers):
+                            active_blockers.append(f"Blocked Work Order: {bwo}")
+                    for fwo in (rdata.get("failed_wo_ids") or []):
+                        if not any(f"[{fwo}]" in ab for ab in active_blockers):
+                            active_blockers.append(f"Failed Work Order: {fwo}")
+            except Exception:
+                pass
+
+    # 3. Check for QA verdict defect reports in inbox
+    inbox_claude = ws / ".sync" / "inbox" / "claude"
+    if inbox_claude.is_dir():
+        for vf in sorted(inbox_claude.glob("*-qa-verdict.md")):
+            try:
+                v_text = vf.read_text(encoding="utf-8").strip()
+                v_first = next((ln.strip() for ln in v_text.splitlines() if ln.strip()), "")
+                if v_first and not any(vf.stem in b for b in active_blockers):
+                    active_blockers.append(f"QA Defect Finding ({vf.name}): {_clip(v_first, 140)}")
+            except Exception:
+                pass
+
+    # 4. Build specialist agent team status lines
+    agent_status_lines: list[str] = []
 
     for role_label, agent_id, role_desc in roles_def:
         assigned = [
@@ -234,9 +293,26 @@ def render_team_status(
                 agent_status_lines.append(f"- {role_label} ({agent_id}): Idle (no tasks currently assigned)")
             continue
 
-        blocked = [wid for wid in assigned if wo_map[wid].get("_bucket") in ("BLOCKED", "FAILED")]
-        active = [wid for wid in assigned if wo_map[wid].get("_bucket") == "ACTIVE"]
-        completed = [wid for wid in assigned if wo_map[wid].get("_bucket") == "COMPLETED"]
+        blocked = [
+            wid for wid in assigned
+            if (wo_map[wid].get("_bucket") in ("BLOCKED", "FAILED")
+                or str(wo_map[wid].get("status", "")).upper() in ("BLOCKED", "FAILED"))
+            and str(wo_map[wid].get("status", "")).upper() != "CANCELLED"
+        ]
+        active = [
+            wid for wid in assigned
+            if wo_map[wid].get("_bucket") == "ACTIVE"
+            and str(wo_map[wid].get("status", "")).upper() not in ("CANCELLED", "COMPLETED", "BLOCKED", "FAILED")
+        ]
+        completed = [
+            wid for wid in assigned
+            if wo_map[wid].get("_bucket") == "COMPLETED"
+            or str(wo_map[wid].get("status", "")).upper() == "COMPLETED"
+        ]
+        cancelled = [
+            wid for wid in assigned
+            if str(wo_map[wid].get("status", "")).upper() == "CANCELLED"
+        ]
 
         if blocked:
             reasons = []
@@ -251,40 +327,22 @@ def render_team_status(
             )
         elif active:
             titles = [f"{wid} ({_clip(wo_map[wid].get('title', ''), 60)})" for wid in active]
-            agent_status_lines.append(f"- {role_label} ({agent_id}): ACTIVE executing {', '.join(titles)}")
+            if latest_phase in ("BLOCKED", "FAILED"):
+                agent_status_lines.append(
+                    f"- {role_label} ({agent_id}): HALTED / WAITING (Supervisor is {latest_phase}; tasks on hold: {', '.join(titles)})"
+                )
+            else:
+                agent_status_lines.append(f"- {role_label} ({agent_id}): ACTIVE executing {', '.join(titles)}")
         elif completed:
             agent_status_lines.append(
                 f"- {role_label} ({agent_id}): COMPLETED all assigned tasks ({', '.join(completed)}) | Ready"
             )
+        elif cancelled:
+            agent_status_lines.append(
+                f"- {role_label} ({agent_id}): Idle (prior tasks superseded/cancelled: {', '.join(cancelled)})"
+            )
         else:
             agent_status_lines.append(f"- {role_label} ({agent_id}): Idle / Waiting")
-
-    # 3. Check for QA verdict defect reports in inbox
-    inbox_claude = ws / ".sync" / "inbox" / "claude"
-    if inbox_claude.is_dir():
-        for vf in sorted(inbox_claude.glob("*-qa-verdict.md")):
-            try:
-                v_text = vf.read_text(encoding="utf-8").strip()
-                v_first = next((ln.strip() for ln in v_text.splitlines() if ln.strip()), "")
-                if v_first and not any(vf.stem in b for b in active_blockers):
-                    active_blockers.append(f"QA Defect Finding ({vf.name}): {_clip(v_first, 140)}")
-            except Exception:
-                pass
-
-    # 4. Check supervisor run state for blockers if present
-    sup_dir = ws / ".sync" / "runtime" / "supervisor"
-    if sup_dir.is_dir():
-        for rf in sorted(sup_dir.glob("run-*.yaml")):
-            try:
-                rdata = yaml.safe_load(rf.read_text(encoding="utf-8"))
-                if isinstance(rdata, dict):
-                    ib = rdata.get("integration_blockers") or []
-                    for b in ib:
-                        b_str = _clip(str(b).strip(), 140)
-                        if b_str and not any(b_str in ab for ab in active_blockers):
-                            active_blockers.append(f"Integration Blocker: {b_str}")
-            except Exception:
-                pass
 
     # 5. Build Work Orders Board rows
     wo_rows: list[str] = []
@@ -318,16 +376,26 @@ def render_team_status(
     parts: list[str] = [
         "================================================================================",
         "TEAM STATUS & WORK ORDER BOARD (Live Supervisor Overview):",
+    ]
+
+    if supervisor_status_lines:
+        parts.extend([
+            "",
+            "SUPERVISOR ORCHESTRATION STATUS:",
+            "\n".join(supervisor_status_lines),
+        ])
+
+    parts.extend([
         "",
         "SPECIALIST AGENT TEAM STATUS:",
         "\n".join(agent_status_lines),
-    ]
+    ])
 
     if active_blockers:
         parts.extend([
             "",
             "ACTIVE BLOCKERS & DEFECT FINDINGS:",
-            "\n".join(f"- {b}" for b in active_blockers[:8]),
+            "\n".join(f"- {b}" for b in active_blockers[:10]),
         ])
 
     parts.extend([
@@ -336,7 +404,13 @@ def render_team_status(
         "\n".join(wo_rows) if wo_rows else "- (no peer work orders)",
         "",
         "LEAD ARCHITECT DIRECTIVE:",
-        "As Lead Architect, you oversee this team and its deliverables.",
+        "As Lead Architect, you oversee this team, the orchestration, and its deliverables.",
+        f"CRITICAL CURRENT STATE: Supervisor orchestration is {latest_phase}." if latest_phase else "Supervisor orchestration status: Active",
+        "When the user asks for status, 'what happened', 'is it working', or why the run is blocked or waiting:",
+        "- Provide a completely honest, accurate, grounded status read from SUPERVISOR ORCHESTRATION STATUS and ACTIVE BLOCKERS.",
+        "- NEVER claim 'the orchestration is working', 'nothing broke', or that specialists are actively building when supervisor is BLOCKED or FAILED.",
+        "- State clearly what phase the run is in, the exact readiness issues or errors that caused it to block, and what was affected.",
+        "- Advise the user on the next action: e.g. type :resume to retry orchestration, type :approve to authorize a plan, or report the fix.",
         "When blockers occur or specialist agents are blocked, YOU ARE EMPOWERED TO DIRECTLY",
         "AUTHOR RESOLUTION FIXES using write_file or apply_patch to repair deliverables,",
         "align integration hooks, or fix broken tests and unblock the run.",

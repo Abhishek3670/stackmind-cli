@@ -333,6 +333,21 @@ class AuthoringGate:
                                 is_repair = True
                     except Exception:
                         pass
+            if not is_repair:
+                # Also check if supervisor run state is currently in repair, authoring, or blocked phase
+                sup_dir = project_root / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    for rf in sup_dir.glob("run-*.yaml"):
+                        try:
+                            r_state = yaml.safe_load(rf.read_text(encoding="utf-8"))
+                            if isinstance(r_state, dict):
+                                r_ph = str(r_state.get("phase", "")).upper()
+                                if r_ph in ("ARCHITECT_REPAIR", "AUTHORING", "AUTHORING_READINESS_GATE", "BLOCKED") or bool(r_state.get("readiness_issues")):
+                                    is_repair = True
+                                    break
+                        except Exception:
+                            pass
+
             if is_repair:
                 # During repair of blocked/failing/scaffold artifacts, an authorized author
                 # is explicitly authorized to replace or refine the artifact.

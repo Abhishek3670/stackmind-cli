@@ -345,7 +345,7 @@ def compile_authoring_artifacts(
                 continue
             if _is_test_artifact(deliv_path_str) or deliv_path_str in declared_coverage:
                 continue
-            if "test_plan" in data:
+            if data.get("test_plan"):
                 continue
             stem = Path(deliv_path_str).stem.lower() or "app"
             default_test = f"tests/test_{stem}.py"
@@ -381,7 +381,7 @@ def compile_authoring_artifacts(
                 continue  # exempt stems are covered by any planned test
             if _covers_stem(suite, stem):
                 continue  # the suite already follows the per-stem convention
-            if "test_plan" in data:
+            if data.get("test_plan"):
                 continue  # author declared something; never overwrite intent
             data["test_plan"] = [{"sources": [deliv_path_str], "tests": [suite]}]
             _mark(rel, f"+test_plan (consolidated default -> {suite})", data, wo_path)

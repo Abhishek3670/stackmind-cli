@@ -363,8 +363,18 @@ def _path_matches_rule(norm_path: str, pattern: str) -> bool:
     )
 
 
-_CODE_EXTENSIONS = (".py", ".ts", ".js", ".go", ".rs", ".dart")
+_CODE_EXTENSIONS = (
+    ".py", ".ts", ".js", ".go", ".rs", ".dart", ".jsx", ".tsx", ".c", ".cpp", ".java", ".rb", ".php"
+)
 _DOC_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml")
+_NON_CODE_EXTENSIONS = (
+    ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp4", ".webm", ".mp3", ".wav",
+    ".css", ".scss", ".sass", ".less",
+    ".lock", ".map",
+)
 
 
 def _is_test_artifact(path: str) -> bool:
@@ -380,9 +390,15 @@ def _is_test_artifact(path: str) -> bool:
 
 def _is_code_deliverable(deliv_type: str, deliv_path: str) -> bool:
     """Mirror the D024 gate's code classification for companion-test planning."""
-    if deliv_type == "code" and not deliv_path.endswith(_DOC_EXTENSIONS):
+    norm = (deliv_path or "").replace("\\", "/").strip().lstrip("./")
+    if not norm or norm.endswith("/") or not Path(norm).suffix:
+        return False
+    lower = norm.lower()
+    if any(lower.endswith(ext) for ext in _NON_CODE_EXTENSIONS):
+        return False
+    if deliv_type == "code":
         return True
-    return deliv_path.endswith(_CODE_EXTENSIONS)
+    return any(lower.endswith(ext) for ext in _CODE_EXTENSIONS)
 
 
 _TEST_PATH_PATTERN = re.compile(r"(?:\b|[\s`\"'(\[])(?:tests?/)?[A-Za-z0-9_\-/]*test_[A-Za-z0-9_\-]+\.py")
