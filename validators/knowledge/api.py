@@ -665,6 +665,7 @@ class KnowledgeAPI:
         include_skills: bool = True,
         profile: Any | None = None,
         skills: Sequence[str] | None = None,
+        role: str | None = None,
     ) -> ContextBundle:
         """Assemble a bounded context bundle for agent prompts, including verified active procedural skills."""
         self._check_expiration(contract)
@@ -741,6 +742,7 @@ class KnowledgeAPI:
                     contract=contract,
                     policy=effective_policy,
                     explicit_skills=skills,
+                    role=role,
                 )
                 skill_diag_dict = skill_diag.to_dict()
                 for res in matched_skills:

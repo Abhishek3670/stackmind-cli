@@ -140,6 +140,10 @@
         "confidence_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
       }
     },
+    "role": {
+      "type": ["string", "null"],
+      "description": "Optional specialized agent role targeting this skill (e.g. frontend, backend, qa, gitops, architect). If null/omitted, skill is universal across all roles."
+    },
     "schema_version": {
       "type": "integer",
       "minimum": 1

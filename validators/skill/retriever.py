@@ -121,12 +121,14 @@ class SkillRetriever:
         # 2. Allow rules
         for allow_rule in contract.allow_rules:
             pattern = allow_rule.get("module")
-            if pattern and (
-                pattern in {"*", "**"}
-                or module_matches(clean_module, pattern)
-                or module_matches(module_pattern, pattern)
-                or clean_module.startswith(pattern.rstrip(".*"))
-            ):
+            if not pattern:
+                continue
+            if pattern in {"*", "**"}:
+                return True
+            if module_matches(clean_module, pattern) or module_matches(module_pattern, pattern):
+                return True
+            prefix = pattern.rstrip(".*")
+            if prefix and (clean_module == prefix or clean_module.startswith(prefix + ".")):
                 return True
 
         return False
@@ -142,6 +144,7 @@ class SkillRetriever:
         token_budget: int | None = None,
         min_relevance: float | None = None,
         explicit_skills: Sequence[str] | None = None,
+        role: str | None = None,
     ) -> tuple[list[SkillRetrievalResult], SkillRetrievalDiagnostics]:
         """Retrieve and progressively rank active skills returning full lifecycle diagnostics."""
         active_policy = policy or get_profile_policy(profile)
@@ -181,6 +184,13 @@ class SkillRetriever:
             else:
                 active_contract = AgentContract.load(contract, self.project_path)
 
+        # Resolve effective role: explicit argument takes precedence, then contract identity
+        active_role: str | None = role
+        if active_role is None and active_contract and hasattr(active_contract, "identity") and isinstance(active_contract.identity, dict):
+            active_role = active_contract.identity.get("role")
+        if active_role:
+            active_role = str(active_role).strip().lower()
+
         # Collect explicit skills chosen by Architect (from parameter or contract)
         chosen_skills: set[str] = set()
         if explicit_skills:
@@ -190,8 +200,8 @@ class SkillRetriever:
             for s in active_contract.skills:
                 chosen_skills.add(str(s).strip().lower())
 
-        # 3. Candidate Identification: only ACTIVE verified skills are eligible
-        active_skills = self.skill_store.list_skills(status=SkillStatus.ACTIVE)
+        # 3. Candidate Identification: only ACTIVE verified skills are eligible (scoped to active_role)
+        active_skills = self.skill_store.list_skills(status=SkillStatus.ACTIVE, role=active_role)
         considered_ids = tuple(s.skill_id for s in active_skills)
         if not active_skills:
             diag = SkillRetrievalDiagnostics(
@@ -245,6 +255,11 @@ class SkillRetriever:
             # Deduplicate by canonical skill name
             if skill.name in seen_skill_names:
                 exclusions.append({"skill_id": skill.skill_id, "reason": "duplicate_skill_name"})
+                continue
+
+            # Role boundary check: if skill specifies a role, it must match active_role
+            if skill.role and active_role and skill.role.strip().lower() != active_role:
+                exclusions.append({"skill_id": skill.skill_id, "reason": f"role_mismatch ({skill.role} != {active_role})"})
                 continue
 
             # Check if this skill was explicitly selected by the Architect

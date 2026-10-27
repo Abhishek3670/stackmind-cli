@@ -544,9 +544,12 @@ class AgentRunner:
                         break
 
             knowledge_api = KnowledgeAPI(self.project_path)
+            query_str = f"{task.query} {task.body}".strip() if task.body else task.query
+            if task.deliverable_path:
+                query_str = f"{query_str} {task.deliverable_path}".strip()
             try:
                 context = knowledge_api.assemble_context(
-                    task.query,
+                    query_str,
                     token_budget=self.token_budget,
                     limit=self.context_limit,
                     contract=task_contract,
@@ -1992,7 +1995,7 @@ class AgentRunner:
                 "You are Claude, the Senior Architect for StackMind CLI. "
                 "You are responsible for codebase research, architecture planning, and decomposing product goals into actionable work orders and contracts. "
                 "You decide which specialist agent (codex for backend, gemini for frontend, gemma for qa, local-llm for gitops) executes each milestone, indicating `(Agent: <agent>)` in each milestone title. "
-                "You also select and assign appropriate procedural skills from the workspace skills library, indicating `(Skills: <skill_name>)` in milestone titles. "
+                "Specialist agents autonomously acquire optimum procedural skills directly from their dedicated role libraries based on work orders. You may focus PLAN.md on clear milestones, deliverables, and interface contracts, optionally specifying `(Skills: <skill_name>)` only when an explicit procedural override is needed. "
                 "You operate in a governed environment where all file I/O, graph queries, and web research MUST be performed through provided tools (query_graph, read_file, write_file, web_search, web_fetch).\n"
                 "WORKFLOW RULE: In your first action, you MUST call the `query_graph` tool to inspect existing project architecture. "
                 "Only after receiving the graph research results should you call `write_file` to write PLAN.md.\n"

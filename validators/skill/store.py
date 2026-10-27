@@ -34,17 +34,25 @@ class SkillStore:
         self.manifests_dir = self.skills_dir / "manifests"
         self.active_dir = self.skills_dir / "active"
 
-        self.manifests_dir.mkdir(parents=True, exist_ok=True)
-        self.active_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.manifests_dir.mkdir(parents=True, exist_ok=True)
+            self.active_dir.mkdir(parents=True, exist_ok=True)
+            self.local_agent_skills_dir = self.skills_dir / "agents-skills"
+            self.local_agent_skills_dir.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            self.local_agent_skills_dir = self.skills_dir / "agents-skills"
 
         try:
-            from validators.kernel.home import get_global_skills_dir
+            from validators.kernel.home import get_global_agent_skills_dir, get_global_skills_dir
             self.global_skills_dir = get_global_skills_dir()
             self.global_active_dir = self.global_skills_dir / "global"
             self.global_active_dir.mkdir(parents=True, exist_ok=True)
+            self.global_agent_skills_dir = get_global_agent_skills_dir()
+            self.global_agent_skills_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             self.global_skills_dir = None
             self.global_active_dir = None
+            self.global_agent_skills_dir = None
 
     def _skill_manifest_dir(self, name: str) -> Path:
         slug = name.strip().lower()
@@ -87,9 +95,30 @@ class SkillStore:
 
         return manifest_path
 
-    def get_skill(self, name: str, version: int | None = None) -> SkillRecord | None:
-        """Load a skill by name and optional version. Defaults to active version."""
+    def get_skill(self, name: str, version: int | None = None, role: str | None = None) -> SkillRecord | None:
+        """Load a skill by name, optional version, and optional role."""
         slug = name.strip().lower()
+
+        if role:
+            clean_role = role.strip().lower()
+            # Check local role dir (.sync/skills/agents-skills/<role>/<slug>.json)
+            local_r = self.local_agent_skills_dir / clean_role / f"{slug}.json"
+            if local_r.is_file():
+                try:
+                    with open(local_r, "r", encoding="utf-8") as f:
+                        return SkillRecord.from_dict(json.load(f))
+                except Exception:
+                    pass
+            # Check global role dir (~/.stackmindcli/skills/agents-skills/<role>/<slug>.json)
+            if self.global_agent_skills_dir and self.global_agent_skills_dir.is_dir():
+                glob_r = self.global_agent_skills_dir / clean_role / f"{slug}.json"
+                if glob_r.is_file():
+                    try:
+                        with open(glob_r, "r", encoding="utf-8") as f:
+                            return SkillRecord.from_dict(json.load(f))
+                    except Exception:
+                        pass
+
         if version is not None:
             path = self._manifest_path(slug, version)
             if not path.exists():
@@ -118,6 +147,31 @@ class SkillStore:
                 except Exception:
                     pass
 
+        # Check all role dirs if role was not explicitly specified
+        if not role:
+            # Check local agent-skills/*/<slug>.json
+            if self.local_agent_skills_dir.is_dir():
+                for r_dir in self.local_agent_skills_dir.iterdir():
+                    if r_dir.is_dir():
+                        cand = r_dir / f"{slug}.json"
+                        if cand.is_file():
+                            try:
+                                with open(cand, "r", encoding="utf-8") as f:
+                                    return SkillRecord.from_dict(json.load(f))
+                            except Exception:
+                                pass
+            # Check global agent-skills/*/<slug>.json
+            if self.global_agent_skills_dir and self.global_agent_skills_dir.is_dir():
+                for r_dir in self.global_agent_skills_dir.iterdir():
+                    if r_dir.is_dir():
+                        cand = r_dir / f"{slug}.json"
+                        if cand.is_file():
+                            try:
+                                with open(cand, "r", encoding="utf-8") as f:
+                                    return SkillRecord.from_dict(json.load(f))
+                            except Exception:
+                                pass
+
         return None
 
     def get_latest_version_number(self, name: str) -> int:
@@ -139,15 +193,89 @@ class SkillStore:
         active_only: bool = False,
         include_all_versions: bool = False,
         include_global: bool = True,
+        role: str | None = None,
     ) -> list[SkillRecord]:
-        """List skills in the repository and global library."""
+        """List skills in the repository and global library, optionally filtered by agent role."""
         records: list[SkillRecord] = []
+        seen_slugs: set[str] = set()
 
+        if role:
+            clean_role = role.strip().lower()
+
+            # 1. Local role-specific skills (.sync/skills/agents-skills/<role>/*.json)
+            local_rdir = self.local_agent_skills_dir / clean_role
+            if local_rdir.is_dir():
+                for p in local_rdir.glob("*.json"):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            r = SkillRecord.from_dict(json.load(f))
+                            if status is None or r.status == status:
+                                records.append(r)
+                                seen_slugs.add(r.name.strip().lower())
+                    except Exception:
+                        continue
+
+            # 2. Global role-specific skills (~/.stackmindcli/skills/agents-skills/<role>/*.json)
+            if include_global and self.global_agent_skills_dir and self.global_agent_skills_dir.is_dir():
+                glob_rdir = self.global_agent_skills_dir / clean_role
+                if glob_rdir.is_dir():
+                    for p in glob_rdir.glob("*.json"):
+                        slug = p.stem.strip().lower()
+                        if slug in seen_slugs:
+                            continue
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                r = SkillRecord.from_dict(json.load(f))
+                                if status is None or r.status == status:
+                                    records.append(r)
+                                    seen_slugs.add(slug)
+                        except Exception:
+                            continue
+
+            # 3. Universal cross-cutting skills (role is None or role == clean_role)
+            # Local active
+            for p in self.active_dir.glob("*.json"):
+                slug = p.stem.strip().lower()
+                if slug in seen_slugs:
+                    continue
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        r = SkillRecord.from_dict(json.load(f))
+                        if r.role and r.role.strip().lower() != clean_role:
+                            continue
+                        if status is None or r.status == status:
+                            records.append(r)
+                            seen_slugs.add(slug)
+                except Exception:
+                    continue
+
+            # Global active
+            if include_global and self.global_active_dir and self.global_active_dir.is_dir():
+                for p in self.global_active_dir.glob("*.json"):
+                    slug = p.stem.strip().lower()
+                    if slug in seen_slugs:
+                        continue
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            r = SkillRecord.from_dict(json.load(f))
+                            if r.role and r.role.strip().lower() != clean_role:
+                                continue
+                            if status is None or r.status == status:
+                                records.append(r)
+                                seen_slugs.add(slug)
+                    except Exception:
+                        continue
+
+            return sorted(records, key=lambda s: s.name)
+
+        # When role is None, list all skills across standard active/manifests, global, and all role folders
         if active_only:
             for p in self.active_dir.glob("*.json"):
                 try:
                     with open(p, "r", encoding="utf-8") as f:
-                        records.append(SkillRecord.from_dict(json.load(f)))
+                        r = SkillRecord.from_dict(json.load(f))
+                        records.append(r)
+                        seen_slugs.add(r.name.strip().lower())
                 except Exception:
                     continue
         else:
@@ -162,27 +290,63 @@ class SkillStore:
                                 r = SkillRecord.from_dict(json.load(f))
                                 if status is None or r.status == status:
                                     records.append(r)
+                                    seen_slugs.add(r.name.strip().lower())
                         except Exception:
                             continue
                 else:
                     latest = self.get_skill(skill_dir.name)
                     if latest and (status is None or latest.status == status):
                         records.append(latest)
+                        seen_slugs.add(latest.name.strip().lower())
+
+        # Include local role-specific skills (.sync/skills/agents-skills/*/*.json)
+        if self.local_agent_skills_dir.is_dir():
+            for r_dir in self.local_agent_skills_dir.iterdir():
+                if r_dir.is_dir():
+                    for p in r_dir.glob("*.json"):
+                        slug = p.stem.strip().lower()
+                        if slug in seen_slugs:
+                            continue
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                r = SkillRecord.from_dict(json.load(f))
+                                if status is None or r.status == status:
+                                    records.append(r)
+                                    seen_slugs.add(slug)
+                        except Exception:
+                            continue
 
         # Merge in global skills from ~/.stackmindcli/skills/global
         if include_global and self.global_active_dir and self.global_active_dir.is_dir():
-            local_slugs = {s.name.strip().lower() for s in records}
             for p in self.global_active_dir.glob("*.json"):
                 slug = p.stem.strip().lower()
-                if slug in local_slugs:
+                if slug in seen_slugs:
                     continue
                 try:
                     with open(p, "r", encoding="utf-8") as f:
                         g_rec = SkillRecord.from_dict(json.load(f))
                         if status is None or g_rec.status == status:
                             records.append(g_rec)
+                            seen_slugs.add(slug)
                 except Exception:
                     continue
+
+        # Merge in global role skills from ~/.stackmindcli/skills/agents-skills/*/*.json
+        if include_global and self.global_agent_skills_dir and self.global_agent_skills_dir.is_dir():
+            for r_dir in self.global_agent_skills_dir.iterdir():
+                if r_dir.is_dir():
+                    for p in r_dir.glob("*.json"):
+                        slug = p.stem.strip().lower()
+                        if slug in seen_slugs:
+                            continue
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                g_rec = SkillRecord.from_dict(json.load(f))
+                                if status is None or g_rec.status == status:
+                                    records.append(g_rec)
+                                    seen_slugs.add(slug)
+                        except Exception:
+                            continue
 
         return sorted(records, key=lambda s: s.name)
 
@@ -195,6 +359,40 @@ class SkillStore:
             self.global_active_dir.mkdir(parents=True, exist_ok=True)
         slug = skill.name.strip().lower()
         target_path = self.global_active_dir / f"{slug}.json"
+        self._write_atomic(target_path, skill.to_dict())
+        return target_path
+
+    def save_agent_skill(self, skill: SkillRecord, role: str, is_global: bool = True) -> Path:
+        """Persist a procedural skill to the dedicated agent role library (~/.stackmindcli/skills/agents-skills/<role> or .sync/skills/agents-skills/<role>)."""
+        clean_role = role.strip().lower()
+        if skill.role != clean_role:
+            skill = SkillRecord(
+                skill_id=skill.skill_id,
+                name=skill.name,
+                version=skill.version,
+                status=skill.status,
+                risk_tier=skill.risk_tier,
+                description=skill.description,
+                applicability=skill.applicability,
+                steps=skill.steps,
+                provenance=skill.provenance,
+                metrics=skill.metrics,
+                constraints=skill.constraints,
+                fallback_procedure=skill.fallback_procedure,
+                role=clean_role,
+                schema_version=skill.schema_version,
+            )
+        slug = skill.name.strip().lower()
+        if is_global:
+            if not self.global_agent_skills_dir:
+                from validators.kernel.home import get_global_agent_skills_dir
+                self.global_agent_skills_dir = get_global_agent_skills_dir()
+            target_dir = self.global_agent_skills_dir / clean_role
+        else:
+            target_dir = self.local_agent_skills_dir / clean_role
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / f"{slug}.json"
         self._write_atomic(target_path, skill.to_dict())
         return target_path
 

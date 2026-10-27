@@ -170,6 +170,7 @@ class SkillRecord:
     metrics: SkillMetrics = field(default_factory=SkillMetrics)
     constraints: tuple[str, ...] = ()
     fallback_procedure: str | None = None
+    role: str | None = None
     schema_version: int = 1
 
     @classmethod
@@ -180,7 +181,7 @@ class SkillRecord:
         return f"SKILL-{digest}"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "applicability": self.applicability.to_dict(),
             "description": self.description,
             "metrics": self.metrics.to_dict(),
@@ -197,6 +198,9 @@ class SkillRecord:
             "status": self.status.value,
             "version": self.version,
         }
+        if self.role is not None:
+            payload["role"] = self.role
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SkillRecord:
@@ -218,6 +222,7 @@ class SkillRecord:
             fallback_procedure=fallback_procedure,
             provenance=SkillProvenance.from_dict(data.get("provenance", {})),
             metrics=SkillMetrics.from_dict(data.get("metrics", {})),
+            role=data.get("role"),
             schema_version=int(data.get("schema_version", 1)),
         )
 

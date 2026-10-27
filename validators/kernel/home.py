@@ -37,7 +37,20 @@ def get_stackmind_home() -> Path:
     try:
         home_path.mkdir(parents=True, exist_ok=True)
         # Subdirectories
-        for subdir in ("skills/global", "skills/cache", "daemon", "sessions", "tmp", "projects"):
+        for subdir in (
+            "skills/global",
+            "skills/cache",
+            "skills/agents-skills",
+            "skills/agents-skills/frontend",
+            "skills/agents-skills/backend",
+            "skills/agents-skills/qa",
+            "skills/agents-skills/gitops",
+            "skills/agents-skills/architect",
+            "daemon",
+            "sessions",
+            "tmp",
+            "projects",
+        ):
             (home_path / subdir).mkdir(parents=True, exist_ok=True)
         ensure_global_settings_file(home_path)
     except (PermissionError, OSError):
@@ -87,6 +100,20 @@ def get_projects_registry_path() -> Path:
 def get_global_skills_dir() -> Path:
     """Return directory containing global procedural skills (~/.stackmindcli/skills)."""
     return get_stackmind_home() / "skills"
+
+
+def get_global_agent_skills_dir(role: str | None = None) -> Path:
+    """Return directory containing role-specific global procedural skills (~/.stackmindcli/skills/agents-skills/[role])."""
+    base = get_global_skills_dir() / "agents-skills"
+    if role:
+        d = base / role.strip().lower()
+    else:
+        d = base
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError):
+        pass
+    return d
 
 
 def get_global_tmp_dir() -> Path:
@@ -367,6 +394,7 @@ __all__ = [
     "STACKMIND_HOME_ENV",
     "copy_approved_plan_to_workspace",
     "get_daemon_home_dir",
+    "get_global_agent_skills_dir",
     "get_global_settings_path",
     "get_global_skills_dir",
     "get_global_tmp_dir",

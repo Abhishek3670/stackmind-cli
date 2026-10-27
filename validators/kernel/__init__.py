@@ -44,6 +44,7 @@ from .providers import (
 )
 from .home import (
     get_daemon_home_dir,
+    get_global_agent_skills_dir,
     get_global_settings_path,
     get_global_skills_dir,
     get_global_tmp_dir,
@@ -147,6 +148,7 @@ __all__ = [
     "perform_web_search",
     "derive_verification_dimensions",
     "get_daemon_home_dir",
+    "get_global_agent_skills_dir",
     "get_global_settings_path",
     "get_global_skills_dir",
     "get_global_tmp_dir",

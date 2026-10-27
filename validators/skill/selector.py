@@ -15,11 +15,14 @@ from validators.skill.models import RiskTier, SkillRecord, SkillStatus
 from validators.skill.store import SkillStore
 
 
-def get_available_skills(project_path: Path | str | None = None) -> list[SkillRecord]:
-    """Retrieve all active verified procedural skills from global and local stores."""
+def get_available_skills(
+    project_path: Path | str | None = None,
+    role: str | None = None,
+) -> list[SkillRecord]:
+    """Retrieve all active verified procedural skills from global and local stores, optionally scoped by role."""
     try:
         store = SkillStore(project_path)
-        return store.list_skills(status=SkillStatus.ACTIVE, include_global=True)
+        return store.list_skills(status=SkillStatus.ACTIVE, include_global=True, role=role)
     except Exception:
         return []
 
@@ -43,9 +46,11 @@ def format_skills_for_architect_prompt(
             "### Verified Procedural Skills Library (Governed by Laya Decision Engine)\n"
             "No active procedural skills currently installed in ~/.stackmindcli/skills/global/ or .sync/skills/active/.\n"
             "(Skills can be imported into the workspace at any time via `:consume-skills <path>`).\n\n"
-            "SKILL ASSIGNMENT SYNTAX:\n"
-            "If procedural skills are requested or available:\n"
-            "Append `(Skills: <skill_name>)` to milestone titles in PLAN.md alongside `(Agent: <agent>)`.\n"
+            "AUTONOMOUS SKILL ACQUISITION:\n"
+            "Specialist agents (frontend, backend, qa, gitops) autonomously acquire optimum procedural skills "
+            "directly from their dedicated role repositories (e.g. ~/.stackmindcli/skills/agents-skills/<role>/) "
+            "and global quality standards based on work order deliverables. You do NOT need to assign skills in PLAN.md.\n"
+            "Optional override: append `(Skills: <skill_name>)` to milestone titles in PLAN.md only if mandating a procedure.\n"
         )
 
     # Pre-filter using Laya if available and library exceeds max_skills
@@ -81,8 +86,10 @@ def format_skills_for_architect_prompt(
     lines: list[str] = [
         "### Verified Procedural Skills Library (Governed by Laya Decision Engine)",
         intro_header,
-        "Skill selection is autonomously decided by the Laya Decision Engine (LayaDecisionAdapter) based on task domain, specialist role, and procedural rules.",
-        "As Senior Architect, you may optionally designate or recommend skills to guide implementation:\n",
+        "Specialist agents autonomously acquire optimum procedural skills from their dedicated role libraries "
+        "(e.g. ~/.stackmindcli/skills/agents-skills/<role>/) and global quality standards based on work order deliverables.",
+        "You do NOT need to assign or micro-manage skills in PLAN.md. Focus PLAN.md on architecture, milestones, deliverables, and interface contracts.",
+        "As Senior Architect, you may optionally designate an explicit procedural override using `(Skills: <skill_name>)` only if strictly necessary:\n",
     ]
 
     for s in skills:
@@ -92,21 +99,15 @@ def format_skills_for_architect_prompt(
         lines.append(f"- `{s.name}` (Risk: {s.risk_tier.value.upper()}, {len(s.steps)} steps): {desc_clean}")
 
     if shown_count < total_count:
-        lines.append(f"\n*(Note: {total_count - shown_count} other skills omitted from prompt to preserve token budget. You may still assign any installed skill by name in PLAN.md)*")
+        lines.append(f"\n*(Note: {total_count - shown_count} other skills omitted from prompt to preserve token budget. Specialists autonomously query their full dedicated role library)*")
 
+    example_skill = skills[0].name if skills else "ponytail"
     lines.extend([
-        "\nSKILL ASSIGNMENT SYNTAX:",
-        "1. In PLAN.md milestones: Append `(Skills: <skill_name>)` to each milestone title alongside `(Agent: <agent>)`.",
-        "   Example: `- [ ] Milestone 1: Implement TokenBucket Rate Limiter (Agent: codex) (Skills: ponytail)`",
-        "   Multiple skills can be comma-separated: `(Skills: ponytail, db_migration)`",
-        "2. In Work Order YAML (.sync/work-orders/ACTIVE/WO-xxx.yaml): Declare the `skills` list:",
-        "   ```yaml",
-        "   assigned_agents:",
-        "     - \"codex\"",
-        "   skills:",
-        "     - \"ponytail\"",
-        "   ```",
-        "The Laya Decision Engine automatically binds the assigned procedural runbook to the specialist agent's prompt.",
+        "\nAUTONOMOUS SPECIALIST SKILL ACQUISITION:",
+        "- Specialist agents (frontend, backend, qa, gitops) autonomously acquire optimum skills from their dedicated role folders.",
+        "- You do NOT need to assign skills in PLAN.md milestone titles. Keep milestones clean and declarative.",
+        f"- Optional procedural override syntax: `(Skills: {example_skill})` (e.g. `(Skills: <skill_name>)`) only if enforcing a specific procedure.",
+        "- Example milestone: `- [ ] Milestone 1: Implement responsive landing page (Agent: gemini)`",
     ])
 
     return "\n".join(lines)
@@ -138,7 +139,7 @@ def select_skills_for_task(
             mode = "active"
         laya_adapter = LayaDecisionAdapter(mode=mode)
 
-    active_skills = get_available_skills(project_path)
+    active_skills = get_available_skills(project_path, role=role)
     return laya_adapter.decide_skills_for_task(
         title=title,
         description=description,

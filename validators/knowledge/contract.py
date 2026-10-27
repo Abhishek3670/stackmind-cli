@@ -39,11 +39,10 @@ def module_matches(module_name: str, pattern: str) -> bool:
     p_dot = pattern.replace("/", ".").replace("\\", ".")
     p_mod = path_to_module(pattern)
     if "*" in pattern or "?" in pattern:
-        return (
-            fnmatch.fnmatch(module_name, pattern)
-            or fnmatch.fnmatch(module_name, p_dot)
-            or fnmatch.fnmatch(module_name, p_mod)
-        )
+        matches = fnmatch.fnmatch(module_name, pattern) or fnmatch.fnmatch(module_name, p_dot)
+        if p_mod != "*" or pattern == "*":
+            matches = matches or fnmatch.fnmatch(module_name, p_mod)
+        return matches
     return (
         module_name == pattern
         or module_name == p_dot

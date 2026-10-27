@@ -59,7 +59,20 @@ def skill_group():
     is_flag=True,
     help="Include all historical versions of each skill",
 )
-def list_command(project_path: str, status: str | None, active_only: bool, all_versions: bool):
+@click.option(
+    "--role",
+    "-r",
+    type=str,
+    default=None,
+    help="Filter by specialized agent role (e.g. frontend, backend, qa, gitops, architect)",
+)
+def list_command(
+    project_path: str,
+    status: str | None,
+    active_only: bool,
+    all_versions: bool,
+    role: str | None,
+):
     """List procedural skills and their lifecycle states."""
     console = Console()
     store = SkillStore(project_path)
@@ -68,6 +81,7 @@ def list_command(project_path: str, status: str | None, active_only: bool, all_v
         status=status_enum,
         active_only=active_only,
         include_all_versions=all_versions,
+        role=role,
     )
 
     if not skills:
@@ -78,6 +92,7 @@ def list_command(project_path: str, status: str | None, active_only: bool, all_v
     table.add_column("Skill ID", style="bold cyan", no_wrap=True)
     table.add_column("Name", style="bold green")
     table.add_column("Ver", justify="center", style="magenta")
+    table.add_column("Role", justify="center", style="yellow")
     table.add_column("Status", justify="center")
     table.add_column("Risk", justify="center")
     table.add_column("Confidence", justify="right", style="cyan")
@@ -101,10 +116,12 @@ def list_command(project_path: str, status: str | None, active_only: bool, all_v
             RiskTier.CRITICAL: "[bold magenta]CRIT[/bold magenta]",
         }.get(s.risk_tier, s.risk_tier.value)
 
+        role_display = f"[bold yellow]{s.role}[/bold yellow]" if s.role else "[dim]global[/dim]"
         table.add_row(
             s.skill_id,
             s.name,
             f"v{s.version}",
+            role_display,
             stat_styled,
             risk_styled,
             f"{s.metrics.confidence_score:.2f}",
@@ -157,6 +174,7 @@ def show_command(name: str, version: int | None, project_path: str, json_output:
         Panel(
             f"[bold]Skill ID:[/bold] {skill.skill_id}\n"
             f"[bold]Name:[/bold] {skill.name} (v{skill.version})\n"
+            f"[bold]Role:[/bold] {skill.role or 'Universal / Cross-cutting (Global)'}\n"
             f"[bold]Status:[/bold] {skill.status.value.upper()}\n"
             f"[bold]Risk Tier:[/bold] {skill.risk_tier.value.upper()}\n"
             f"[bold]Confidence:[/bold] {skill.metrics.confidence_score:.2f} (Success rate: {skill.metrics.success_rate * 100:.1f}% over {skill.metrics.success_count + skill.metrics.failure_count} runs)\n"
@@ -843,6 +861,13 @@ def feedback_command(name: str, is_success: bool, error: str | None, version: in
     help="Initial lifecycle status (default: active)",
 )
 @click.option(
+    "--role",
+    "-r",
+    type=str,
+    default=None,
+    help="Bind imported skills to specialized agent role library (e.g. frontend, backend)",
+)
+@click.option(
     "--project",
     "-p",
     "project_path",
@@ -850,11 +875,11 @@ def feedback_command(name: str, is_success: bool, error: str | None, version: in
     type=click.Path(exists=True),
     help="Project root directory",
 )
-def consume_command(source: str, local: bool, is_global_flag: bool, status: str, project_path: str):
+def consume_command(source: str, local: bool, is_global_flag: bool, status: str, role: str | None, project_path: str):
     """Consume and install procedural skills from file (SKILL.md, JSON, YAML) or directory."""
     console = Console()
     from validators.skill.consumer import consume_skills
-    from validators.kernel.home import get_global_skills_dir
+    from validators.kernel.home import get_global_agent_skills_dir, get_global_skills_dir
 
     is_global = not local  # Default to global unless --local is specified
 
@@ -865,16 +890,24 @@ def consume_command(source: str, local: bool, is_global_flag: bool, status: str,
             project_path=project_path,
             is_global=is_global,
             status=status_enum,
+            role=role,
         )
     except Exception as exc:
         console.print(f"[bold red]Error consuming skills:[/bold red] {exc}")
         return
 
-    dest_desc = (
-        f"Global Library ([dim]{get_global_skills_dir() / 'global'}[/dim])"
-        if is_global
-        else f"Local Project ([dim]{Path(project_path).resolve() / '.sync' / 'skills' / 'active'}[/dim])"
-    )
+    if role:
+        dest_desc = (
+            f"Global Agent Library ([dim]{get_global_agent_skills_dir(role)}[/dim])"
+            if is_global
+            else f"Local Agent Library ([dim]{Path(project_path).resolve() / '.sync' / 'skills' / 'agents-skills' / role.strip().lower()}[/dim])"
+        )
+    else:
+        dest_desc = (
+            f"Global Universal Library ([dim]{get_global_skills_dir() / 'global'}[/dim])"
+            if is_global
+            else f"Local Project ([dim]{Path(project_path).resolve() / '.sync' / 'skills' / 'active'}[/dim])"
+        )
 
     names_str = ", ".join(f"'{s.name}'" for s in records)
     console.print(
@@ -899,7 +932,7 @@ def consume_command(source: str, local: bool, is_global_flag: bool, status: str,
             s.status.value.upper(),
             s.risk_tier.value.upper(),
             str(len(s.steps)),
-            "GLOBAL" if is_global else "LOCAL",
+            f"GLOBAL ({s.role})" if (is_global and s.role) else (f"LOCAL ({s.role})" if s.role else ("GLOBAL" if is_global else "LOCAL")),
             s.description[:45] + ("..." if len(s.description) > 45 else ""),
         )
 
@@ -930,6 +963,13 @@ def consume_command(source: str, local: bool, is_global_flag: bool, status: str,
     help="Initial lifecycle status (default: active)",
 )
 @click.option(
+    "--role",
+    "-r",
+    type=str,
+    default=None,
+    help="Bind imported skills to specialized agent role library (e.g. frontend, backend)",
+)
+@click.option(
     "--project",
     "-p",
     "project_path",
@@ -938,7 +978,7 @@ def consume_command(source: str, local: bool, is_global_flag: bool, status: str,
     help="Project root directory",
 )
 @click.pass_context
-def install_command(ctx, source: str, local: bool, is_global_flag: bool, status: str, project_path: str):
+def install_command(ctx, source: str, local: bool, is_global_flag: bool, status: str, role: str | None, project_path: str):
     """Alias for `stackmind skill consume`."""
     ctx.invoke(
         consume_command,
@@ -946,6 +986,7 @@ def install_command(ctx, source: str, local: bool, is_global_flag: bool, status:
         local=local,
         is_global_flag=is_global_flag,
         status=status,
+        role=role,
         project_path=project_path,
     )
 

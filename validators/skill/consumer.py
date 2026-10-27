@@ -674,6 +674,7 @@ def consume_skills(
     project_path: Path | str | None = None,
     is_global: bool = True,
     status: SkillStatus = SkillStatus.ACTIVE,
+    role: str | None = None,
 ) -> list[SkillRecord]:
     """Ingest and register procedural skills into StackMind.
     
@@ -683,11 +684,13 @@ def consume_skills(
         is_global: If True, install into ~/.stackmindcli/skills/global/ (shared across all projects).
                    If False, install into project_path/.sync/skills/active/.
         status: Initial lifecycle state (defaults to SkillStatus.ACTIVE).
+        role: Optional specialist agent role to bind this skill to (e.g. frontend, backend, qa, gitops, architect).
 
     Returns:
         List of ingested and saved SkillRecord instances.
     """
     store = SkillStore(project_path)
+    clean_role = role.strip().lower() if role else None
     candidates: list[SkillRecord] = []
 
     src_str = str(source).strip()
@@ -722,8 +725,8 @@ def consume_skills(
 
     saved_records: list[SkillRecord] = []
     for cand in candidates:
-        # Update status if needed
-        if cand.status != status:
+        # Update status and role if needed
+        if cand.status != status or clean_role is not None:
             cand = SkillRecord(
                 skill_id=cand.skill_id,
                 name=cand.name,
@@ -737,6 +740,7 @@ def consume_skills(
                 metrics=cand.metrics,
                 constraints=cand.constraints,
                 fallback_procedure=cand.fallback_procedure,
+                role=clean_role if clean_role is not None else cand.role,
                 schema_version=cand.schema_version,
             )
 
@@ -748,7 +752,9 @@ def consume_skills(
             raise ValueError(f"Skill '{cand.name}' failed schema validation: {err_msg}")
 
         # Persist to destination
-        if is_global:
+        if clean_role:
+            store.save_agent_skill(cand, role=clean_role, is_global=is_global)
+        elif is_global:
             store.save_global_skill(cand)
         else:
             store.save_version(cand)
