@@ -752,15 +752,21 @@ def format_expanded_tool_output(
     if "\\n" in clean_text and "\n" not in clean_text:
         clean_text = clean_text.replace("\\n", "\n").replace("\\t", "    ")
 
+    t_name_check = str(getattr(act, "tool_name", "") or getattr(act, "action_id", "")).lower()
+    desc_check = str(getattr(act, "description", "")).lower()
+    is_read = t_name_check in {"read", "read_file", "read_many_files"} or desc_check.startswith("read")
+    effective_max_lines = 6 if is_read else max_lines
+
     lines: list[RenderableType] = []
     text_lines = clean_text.strip().splitlines()
-    preview = text_lines[:max_lines]
+    preview = text_lines[:effective_max_lines]
     for tl in preview:
         t = Text(f"{indent}│ ")
         t.append(tl, style="dim #cbd5e1")
         lines.append(t)
-    if len(text_lines) > max_lines:
-        lines.append(Text(f"{indent}│ ... (+{len(text_lines) - max_lines} more lines)", style="dim #64748b"))
+    if len(text_lines) > effective_max_lines:
+        hint_label = f"{len(text_lines)} total lines read, ctrl+o to collapse" if is_read else f"+{len(text_lines) - effective_max_lines} more lines"
+        lines.append(Text(f"{indent}│ ... ({hint_label})", style="dim #64748b"))
 
     return Group(*lines) if lines else None
 

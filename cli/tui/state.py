@@ -621,6 +621,8 @@ class AutonomousDeliveryState:
         self.govern_verbosity: str = "tree"  # "tree" | "flat" | "compact"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False, verbosity=self.govern_verbosity)
         self.current_turn_thinking: str = ""
+        self.current_turn_segments: list[dict[str, Any]] = []
+        self.intermediate_chatter: list[str] = []
         self.current_turn_thinking_start_time: float | None = None
         self.current_turn_thinking_elapsed: float | None = None
         self.thinking_expanded: bool = True
@@ -750,6 +752,33 @@ class AutonomousDeliveryState:
                 self.retry_count += 1
 
         return self.retry_status_display or ""
+
+    def record_turn_text(self, delta: str) -> None:
+        """Record live text stream chunk in the chronological turn segments."""
+        if not delta:
+            return
+        if not hasattr(self, "current_turn_segments"):
+            self.current_turn_segments = []
+        if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "text":
+            self.current_turn_segments[-1]["content"] += delta
+        else:
+            self.current_turn_segments.append({"kind": "text", "content": delta, "is_chatter": False})
+
+    def record_turn_thinking(self, text: str) -> None:
+        """Record live thinking chunk in the chronological turn segments."""
+        if not text:
+            return
+        if not hasattr(self, "current_turn_segments"):
+            self.current_turn_segments = []
+        if getattr(self, "current_turn_thinking", None):
+            self.current_turn_thinking += text
+        else:
+            self.current_turn_thinking = text
+        import time
+        if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "thinking":
+            self.current_turn_segments[-1]["content"] += text
+        else:
+            self.current_turn_segments.append({"kind": "thinking", "content": text, "start_time": time.monotonic()})
 
     def reset_attempts_and_retries(self) -> None:
         """Reset attempt and retry counters for a fresh session or completed task."""
@@ -1090,6 +1119,24 @@ class AutonomousDeliveryState:
             if msg_actions is self.current_turn_actions:
                 self.current_turn_actions = ActionsGroup(active=False, verbosity=self.govern_verbosity)
 
+        # Fold intermediate chatter into thinking if present
+        if getattr(self, "intermediate_chatter", None):
+            chatter_lines = [c.strip() for c in self.intermediate_chatter if c.strip()]
+            if chatter_lines:
+                chatter_block = "\n".join(f"> {line}" for line in chatter_lines)
+                if msg_thinking and msg_thinking.strip():
+                    msg_thinking = f"{msg_thinking.strip()}\n\n{chatter_block}"
+                else:
+                    msg_thinking = chatter_block
+
+            # Strip intermediate chatter from final message content if it was concatenated
+            for c_str in chatter_lines:
+                if c_str and c_str in msg_content:
+                    msg_content = msg_content.replace(c_str, "").strip()
+            self.intermediate_chatter = []
+
+        self.current_turn_segments = []
+
         if msg_actions and getattr(self, "actions_expanded", False):
             msg_actions.expanded = self.actions_expanded
 
@@ -1236,6 +1283,34 @@ class AutonomousDeliveryState:
         if self.messages and self.messages[-1].role == "assistant":
             if self.messages[-1].actions is None:
                 self.messages[-1].actions = self.current_turn_actions
+
+        # Record into chronological turn segments
+        if not hasattr(self, "current_turn_segments"):
+            self.current_turn_segments = []
+        if not hasattr(self, "intermediate_chatter"):
+            self.intermediate_chatter = []
+
+        for seg in reversed(self.current_turn_segments):
+            if seg.get("kind") == "text":
+                if not seg.get("is_chatter"):
+                    seg["is_chatter"] = True
+                    c_txt = seg.get("content", "").strip()
+                    if c_txt and c_txt not in self.intermediate_chatter:
+                        self.intermediate_chatter.append(c_txt)
+                break
+            elif seg.get("kind") == "action":
+                break
+
+        existing = next((s for s in self.current_turn_segments if s.get("kind") == "action" and s.get("action_id") == action_id), None)
+        if existing:
+            existing["action"] = action
+        else:
+            self.current_turn_segments.append({
+                "kind": "action",
+                "action_id": action_id,
+                "action": action,
+            })
+
         return action
 
     def complete_turn_action(
@@ -1263,6 +1338,13 @@ class AutonomousDeliveryState:
         if self.messages and self.messages[-1].role == "assistant":
             if self.messages[-1].actions is None:
                 self.messages[-1].actions = self.current_turn_actions
+
+        if getattr(self, "current_turn_segments", None):
+            for seg in self.current_turn_segments:
+                if seg.get("kind") == "action" and seg.get("action_id") == action_id:
+                    seg["action"] = act
+                    break
+
         return act
 
     def get_latest_actions_group(self) -> ActionsGroup | None:

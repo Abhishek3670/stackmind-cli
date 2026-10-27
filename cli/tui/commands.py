@@ -336,45 +336,100 @@ def _build_in_progress_turn_content(
     hdr = render_assistant_stream_header(model=model_name, width=layout_width)
     parts = [hdr]
 
-    # In-progress actions rendered as compact ● Tool(arg) lines (never expanded during streaming)
-    turn_acts = getattr(state, "current_turn_actions", None)
-    if turn_acts and not getattr(turn_acts, "is_empty", True):
-        act_str = render_actions_group_str(turn_acts, width=layout_width)
-        if act_str:
-            parts.append(act_str)
+    segs = getattr(state, "current_turn_segments", None)
+    if segs:
+        idx = 0
+        from cli.tui.chat import render_thinking_block_str, format_contract_payload
+        while idx < len(segs):
+            seg = segs[idx]
+            kind = seg.get("kind")
+            if kind == "thinking":
+                think_text = seg.get("content", "").strip()
+                if think_text:
+                    is_exp = getattr(state, "live_thinking_expanded", True)
+                    live_elapsed = None
+                    if getattr(state, "current_turn_thinking_start_time", None) is not None:
+                        import time
+                        live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
+                    elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
+                        live_elapsed = state.current_turn_thinking_elapsed
+                    tok_cnt = len(think_text.split())
+                    think_str = render_thinking_block_str(
+                        think_text,
+                        expanded=is_exp,
+                        in_progress=True,
+                        elapsed=live_elapsed,
+                        tokens=tok_cnt,
+                        width=layout_width,
+                    )
+                    if think_str:
+                        parts.append(think_str)
+                idx += 1
+            elif kind == "text":
+                content_text = seg.get("content", "").strip()
+                if content_text:
+                    formatted_text = format_contract_payload(content_text)
+                    wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
+                    if wrapped_text:
+                        parts.append(wrapped_text)
+                idx += 1
+            elif kind == "action":
+                act_list = []
+                while idx < len(segs) and segs[idx].get("kind") == "action":
+                    act_list.append(segs[idx]["action"])
+                    idx += 1
+                group = ActionsGroup(actions=act_list, verbosity=state.govern_verbosity)
+                act_str = render_actions_group_str(group, width=layout_width)
+                if act_str:
+                    parts.append(act_str)
+            else:
+                idx += 1
 
-    # In-progress thinking - shows live thinking stream before and during answer streaming
-    thinking = getattr(state, "current_turn_thinking", None)
-    if thinking and thinking.strip():
-        clean_think = thinking.strip()
-        from cli.tui.chat import render_thinking_block_str
-        is_exp = getattr(state, "live_thinking_expanded", True)
-        live_elapsed = None
-        if getattr(state, "current_turn_thinking_start_time", None) is not None:
-            import time
-            live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
-        elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
-            live_elapsed = state.current_turn_thinking_elapsed
-        tok_cnt = len(clean_think.split())
-        think_str = render_thinking_block_str(
-            clean_think,
-            expanded=is_exp,
-            in_progress=True,
-            elapsed=live_elapsed,
-            tokens=tok_cnt,
-            width=layout_width,
-        )
-        if think_str:
-            parts.append(think_str)
+        curr_text = "".join(streamed_chunks).strip()
+        all_seg_text = "".join(s.get("content", "") for s in segs if s.get("kind") == "text").strip()
+        if curr_text and not all_seg_text:
+            formatted_text = format_contract_payload(curr_text)
+            wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
+            if wrapped_text:
+                parts.append(wrapped_text)
+    else:
+        # Fallback to standard ordering when no explicit segments are recorded
+        turn_acts = getattr(state, "current_turn_actions", None)
+        if turn_acts and not getattr(turn_acts, "is_empty", True):
+            act_str = render_actions_group_str(turn_acts, width=layout_width)
+            if act_str:
+                parts.append(act_str)
 
-    # In-progress streamed response text (Working... progress sits at composer text box)
-    if streamed_chunks:
-        curr_text = "".join(streamed_chunks)
-        from cli.tui.chat import format_contract_payload
-        formatted_text = format_contract_payload(curr_text)
-        wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
-        if wrapped_text:
-            parts.append(wrapped_text)
+        thinking = getattr(state, "current_turn_thinking", None)
+        if thinking and thinking.strip():
+            clean_think = thinking.strip()
+            from cli.tui.chat import render_thinking_block_str
+            is_exp = getattr(state, "live_thinking_expanded", True)
+            live_elapsed = None
+            if getattr(state, "current_turn_thinking_start_time", None) is not None:
+                import time
+                live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
+            elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
+                live_elapsed = state.current_turn_thinking_elapsed
+            tok_cnt = len(clean_think.split())
+            think_str = render_thinking_block_str(
+                clean_think,
+                expanded=is_exp,
+                in_progress=True,
+                elapsed=live_elapsed,
+                tokens=tok_cnt,
+                width=layout_width,
+            )
+            if think_str:
+                parts.append(think_str)
+
+        if streamed_chunks:
+            curr_text = "".join(streamed_chunks)
+            from cli.tui.chat import format_contract_payload
+            formatted_text = format_contract_payload(curr_text)
+            wrapped_text = _wrap_text_to_width(formatted_text, layout_width)
+            if wrapped_text:
+                parts.append(wrapped_text)
 
     in_progress = "\n\n".join(parts)
     return f"{transcript}\n\n{in_progress}" if transcript else in_progress
@@ -736,6 +791,8 @@ def _stream_turn_execution(
             delta = extract_text_delta(ev)
             think_delta = extract_reasoning_delta(ev)
             if think_delta:
+                if hasattr(state, "record_turn_thinking"):
+                    state.record_turn_thinking(think_delta)
                 if getattr(state, "current_turn_thinking_start_time", None) is None:
                     state.current_turn_thinking_start_time = time.monotonic()
                 if not streaming_active:
@@ -787,6 +844,8 @@ def _stream_turn_execution(
                             model_name = session.get("model")
 
                 streamed_chunks.append(delta)
+                if hasattr(state, "record_turn_text"):
+                    state.record_turn_text(delta)
 
                 now_mono = time.monotonic()
                 if now_mono - last_redraw_time >= 0.1:
