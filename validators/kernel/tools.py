@@ -2343,6 +2343,8 @@ class ToolGateway:
             cmd.append(path)
         proc = self._run_git(cmd)
         diff_text = proc.stdout if proc.returncode == 0 else ""
+        if not diff_text or not diff_text.strip():
+            diff_text = "(no diff: working tree clean)"
         self.boundary.journal.complete(record.request.operation_id, f"{len(diff_text)} chars")
         return diff_text
 

@@ -123,7 +123,10 @@ class OpenAICompatibleAdapter(ProviderAdapter):
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model_name,
-            "messages": [m.to_dict() for m in messages],
+            "messages": [
+                (lambda d: d.update({"content": "(no output)"}) or d if d.get("role") == "tool" and not str(d.get("content", "")).strip() else d)(m.to_dict())
+                for m in messages
+            ],
             "stream": stream,
         }
         if stream and ("api.openai.com" in self.base_url or self.provider_name == "openai"):

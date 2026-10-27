@@ -1619,6 +1619,7 @@ class SessionManager:
         state.turn_deadline = None
         state.waiting_for_human_entered_at = None
         state.dependency_escalation_retries.clear()
+        state.integration_retries = 0
         state.worker_blockers.clear()
         if session.get("state") != "COMPLETED":
             session["state"] = "RUNNING"
@@ -1730,6 +1731,7 @@ class SessionManager:
         state.authoring_operation_failed = False
         if hasattr(state, "dependency_escalation_retries") and isinstance(state.dependency_escalation_retries, dict):
             state.dependency_escalation_retries.clear()
+        state.integration_retries = 0
         if state.error and ("exhausted" in state.error or "blocked" in state.error.lower() or "failed" in state.error.lower()):
             state.error = None
 

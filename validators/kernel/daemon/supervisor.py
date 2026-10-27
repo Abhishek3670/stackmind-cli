@@ -215,6 +215,8 @@ class RunState:
     # ── P0-5 Counters and Global Turn Budget ─────────────────────────────
     worker_retries: dict[str, int] = field(default_factory=dict)
     qa_reworks: dict[str, int] = field(default_factory=dict)
+    integration_retries: int = 0
+    max_integration_retries: int = 2
     gitops_retries: int = 0
     max_gitops_retries: int = 2
     max_worker_retries: int = 2
@@ -304,6 +306,8 @@ class RunState:
             "gitops_feedback": self.gitops_feedback,
             "worker_retries": dict(self.worker_retries),
             "qa_reworks": dict(self.qa_reworks),
+            "integration_retries": self.integration_retries,
+            "max_integration_retries": self.max_integration_retries,
             "gitops_retries": self.gitops_retries,
             "max_gitops_retries": self.max_gitops_retries,
             "max_worker_retries": self.max_worker_retries,
@@ -390,6 +394,8 @@ class RunState:
             gitops_feedback=data.get("gitops_feedback"),
             worker_retries=dict(data.get("worker_retries", {}) or {}),
             qa_reworks=dict(data.get("qa_reworks", {}) or {}),
+            integration_retries=int(data.get("integration_retries", 0)),
+            max_integration_retries=int(data.get("max_integration_retries", 2)),
             gitops_retries=int(data.get("gitops_retries", 0)),
             max_gitops_retries=int(data.get("max_gitops_retries", 2)),
             max_worker_retries=int(data.get("max_worker_retries", 2)),
@@ -2793,6 +2799,14 @@ class LifecycleSupervisor:
             result_status = str(op_result.get("status", "")).lower()
 
             if status == "FAILED":
+                retries = getattr(state, "integration_retries", 0)
+                max_retries = getattr(state, "max_integration_retries", 2)
+                if retries < max_retries:
+                    setattr(state, "integration_retries", retries + 1)
+                    if op.get("operation_id"):
+                        state.ignored_operation_ids.append(op["operation_id"])
+                    state.integration_operation_id = None
+                    return self._advance_integration_review(state)
                 state.error = f"Integration review failed: {op.get('result', {}).get('error', 'unknown')}"
                 self._transition(state, Phase.FAILED)
                 return AdvanceResult.FAILED

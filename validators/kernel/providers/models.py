@@ -121,9 +121,10 @@ class Message:
 
     @classmethod
     def tool(cls, content: str, tool_call_id: str, name: str | None = None) -> Message:
+        effective_content = str(content) if content is not None and str(content).strip() else "(no output)"
         return cls(
             role=MessageRole.TOOL.value,
-            content=content,
+            content=effective_content,
             tool_call_id=tool_call_id,
             name=name,
         )
@@ -131,7 +132,10 @@ class Message:
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"role": str(self.role)}
         if self.content is not None:
-            data["content"] = self.content
+            if str(self.role) == MessageRole.TOOL.value and not str(self.content).strip():
+                data["content"] = "(no output)"
+            else:
+                data["content"] = self.content
         if self.tool_calls:
             data["tool_calls"] = [
                 {
