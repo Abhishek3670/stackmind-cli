@@ -410,10 +410,14 @@ def render_team_status(
         "- Provide a completely honest, accurate, grounded status read from SUPERVISOR ORCHESTRATION STATUS and ACTIVE BLOCKERS.",
         "- NEVER claim 'the orchestration is working', 'nothing broke', or that specialists are actively building when supervisor is BLOCKED or FAILED.",
         "- State clearly what phase the run is in, the exact readiness issues or errors that caused it to block, and what was affected.",
-        "- Advise the user on the next action: e.g. type :resume to retry orchestration, type :approve to authorize a plan, or report the fix.",
+        "- When the run is stalled (IDLE_STALL), waiting (WAITING_FOR_HUMAN), or blocked by dependency/order issues:",
+        "  * DO NOT simply instruct the user to run :resume without fixing the underlying blocker.",
+        "  * If dependencies are circular, inverted (e.g. worker depending on GitOps), or referencing missing tasks, :resume will immediately re-stall.",
+        "  * YOU HAVE FULL AUTHORITY TO DIRECTLY REPAIR WORK ORDERS in .sync/work-orders/ACTIVE/ and .sync/work-orders/INDEX.yaml using write_file.",
+        "  * Fix the invalid dependencies, update the YAML, explain what was unblocked, and THEN instruct the operator to run :resume.",
         "When blockers occur or specialist agents are blocked, YOU ARE EMPOWERED TO DIRECTLY",
         "AUTHOR RESOLUTION FIXES using write_file or apply_patch to repair deliverables,",
-        "align integration hooks, or fix broken tests and unblock the run.",
+        "reconfigure work orders, align integration hooks, or fix broken tests and unblock the run.",
         "================================================================================",
     ])
 

@@ -5,6 +5,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.6] - 2026-10-28
+
+### Added
+- **Pre-Flight Dependency DAG Linter (`AuthoringGate` & `AuthoringReadinessGate`)**:
+  - Implemented automated topological sort and DAG validation in `validators/harness/authoring_gate.py` and `validators/harness/authoring_readiness.py`.
+  - Added deterministic failure checks for:
+    - `INVERTED_GITOPS_DEPENDENCY`: Rejects worker work orders (e.g. Frontend, Backend, QA) that depend on GitOps release tasks (`local-llm`), preventing mutual dependency deadlocks before execution starts.
+    - `SELF_DEPENDENCY`: Rejects work orders that list themselves in their dependencies list.
+    - `DEPENDENCY_CYCLE`: Detects dependency cycles across active work orders and `INDEX.yaml` using `graphlib.TopologicalSorter`.
+    - `DEPENDENCY_MISSING`: Prevents publishing work orders referencing non-existent prerequisites.
+  - Added canonical authoring policy rule `dependency.dag` in `validators/harness/authoring_policy.py`.
+- **Autonomous IDLE_STALL Escalation to ARCHITECT_RECOVERY_DECISION**:
+  - In `validators/kernel/daemon/supervisor.py`, when a run encounters an `IDLE_STALL` during `EXECUTING`, `DISPATCHING`, or `INTEGRATION_REVIEW` due to unmet dependencies or deadlocks, the supervisor now automatically escalates to `Phase.ARCHITECT_RECOVERY_DECISION` with structured dependency diagnostic context (`DEPENDENCY_DEADLOCK`) instead of abruptly surrendering to `WAITING_FOR_HUMAN`.
+  - Empowered the Lead Architect to autonomously execute `architect_fix` or `resolve_blocker` on stalled work orders: repairs active work orders on disk, clears blocker records, and directly re-dispatches the worker to execute its implementation task.
+- **Active Work Order Remediation in Chat Mode & Lead Architect Directive**:
+  - Instructed the Lead Architect in `render_team_status` ([`validators/harness/task_contract.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/harness/task_contract.py)), `runner.py`, and `permission_matrix.py` to actively inspect and repair work order configurations and dependencies in `.sync/work-orders/ACTIVE/` and `INDEX.yaml` using `write_file` when a run is stalled or blocked, rather than passively directing the user to run `:resume`.
+
 ## [3.10.5] - 2026-10-28
 
 ### Added

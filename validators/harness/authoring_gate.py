@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any
 import yaml
@@ -43,6 +44,38 @@ class AuthoringGateDecision:
 
 class AuthoringGate:
     """Fail-closed validation gate for model-authored Work Orders and Contracts."""
+
+    @staticmethod
+    def is_gitops_work_order(data: dict[str, Any]) -> bool:
+        """Check if a work order is designated for the GitOps release role."""
+        if not isinstance(data, dict):
+            return False
+        assigned = data.get("assigned_agents") or []
+        if isinstance(assigned, str):
+            assigned = [assigned]
+        assigned_norm = [str(a).lower().strip() for a in assigned]
+        if any(any(kw in a for kw in ("local-llm", "local_llm", "gitops", "release")) for a in assigned_norm):
+            return True
+        wo_title = str(data.get("title", "")).lower()
+        wo_type = str(data.get("type", "")).lower()
+        if any(kw in wo_title for kw in ("gitops", "release")) or wo_type in ("release", "gitops"):
+            return True
+        return False
+
+    def _is_gitops_dependency(self, dep_id: str, project_root: Path) -> bool:
+        """Check if a target dependency work order is a GitOps release order."""
+        for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+            cand = project_root / ".sync" / "work-orders" / sub / f"{dep_id}.yaml"
+            if not cand.exists():
+                cand = project_root / "work-orders" / sub / f"{dep_id}.yaml"
+            if cand.is_file():
+                try:
+                    loaded = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and self.is_gitops_work_order(loaded):
+                        return True
+                except Exception:
+                    pass
+        return False
 
     AUTHORIZED_AUTHORS = {"claude", "architecture", "architect", "ceo", "admin", "system", "test"}
     WORKER_ROLES = {"codex", "gemini", "local-llm", "gemma"}
@@ -439,6 +472,24 @@ class AuthoringGate:
                 elif not ref.startswith("R"):
                     errors.append(f"requirement_refs entry '{ref}' must start with 'R' (e.g., R001)")
 
+        # Validate dependencies
+        deps = data.get("dependencies")
+        if deps is not None:
+            if not isinstance(deps, list):
+                errors.append("Work Order dependencies must be a list of strings")
+            else:
+                is_gitops = self.is_gitops_work_order(data)
+                for dep in deps:
+                    dep_str = str(dep).strip()
+                    if dep_str == wo_id:
+                        errors.append(f"Work order '{wo_id}' cannot depend on itself")
+                    elif not is_gitops and self._project_root:
+                        if self._is_gitops_dependency(dep_str, self._project_root):
+                            errors.append(
+                                f"Work order '{wo_id}' has an inverted GitOps dependency: "
+                                f"cannot depend on GitOps release work order '{dep_str}'"
+                            )
+
     @staticmethod
     def repair_yaml_block_scalars(text: str) -> str:
         """Repair inconsistent indentation inside block scalars (e.g. description: > or |)."""
@@ -677,8 +728,55 @@ class AuthoringGate:
             errors.append("Contract requires 'budget' object")
 
     def _validate_index(self, norm_path: str, data: dict[str, Any], errors: list[str]) -> None:
-        if "orders" not in data or not isinstance(data["orders"], list):
+        orders = data.get("orders")
+        if orders is None or not isinstance(orders, list):
             errors.append(f"Work order index '{norm_path}' must contain an 'orders' list")
+            return
+        self._lint_index_dependencies(norm_path, orders, errors)
+
+    def _lint_index_dependencies(self, norm_path: str, orders: list[Any], errors: list[str]) -> None:
+        known_orders: dict[str, dict[str, Any]] = {}
+        for item in orders:
+            if isinstance(item, dict):
+                o_id = str(item.get("id") or "").strip()
+                if o_id:
+                    known_orders[o_id] = item
+
+        graph: dict[str, list[str]] = {}
+        for o_id, item in known_orders.items():
+            is_gitops = self.is_gitops_work_order(item)
+            deps = item.get("dependencies") or []
+            if not isinstance(deps, list):
+                errors.append(f"Work order '{o_id}' in index '{norm_path}' dependencies must be a list")
+                continue
+            dep_nodes: list[str] = []
+            for dep in deps:
+                dep_str = str(dep).strip()
+                if not dep_str:
+                    continue
+                if dep_str == o_id:
+                    errors.append(f"Work order '{o_id}' in index '{norm_path}' cannot depend on itself")
+                    continue
+                dep_data = known_orders.get(dep_str)
+                is_dep_gitops = False
+                if dep_data is not None:
+                    is_dep_gitops = self.is_gitops_work_order(dep_data)
+                elif self._project_root:
+                    is_dep_gitops = self._is_gitops_dependency(dep_str, self._project_root)
+                if not is_gitops and is_dep_gitops:
+                    errors.append(
+                        f"Work order '{o_id}' has an inverted GitOps dependency: "
+                        f"cannot depend on GitOps release work order '{dep_str}'"
+                    )
+                if dep_str in known_orders:
+                    dep_nodes.append(dep_str)
+            graph[o_id] = dep_nodes
+
+        try:
+            TopologicalSorter(graph).prepare()
+        except CycleError as exc:
+            cycle = list(exc.args[1])
+            errors.append(f"Work order index '{norm_path}' contains dependency cycle: {' -> '.join(cycle)}")
 
     def validate_staged_artifact(
         self,

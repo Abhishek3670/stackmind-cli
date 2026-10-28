@@ -1045,6 +1045,17 @@ class LifecycleSupervisor:
                 else:
                     state.stall_ticks += 1
                     if state.stall_ticks >= state.max_stall_ticks:
+                        # Attempt autonomous Architect recovery escalation if retry budget remains
+                        recovery_attempts = state.recovery_attempts.get("IDLE_STALL", 0)
+                        if (
+                            state.phase in (Phase.EXECUTING, Phase.DISPATCHING, Phase.INTEGRATION_REVIEW)
+                            and recovery_attempts < state.max_retries
+                            and state.global_turn_budget > 0
+                        ):
+                            stall_res = self._escalate_idle_stall_to_recovery(state)
+                            if stall_res is not None:
+                                return stall_res
+
                         state.error = (
                             f"IDLE_STALL (C_stall): Phase {state.phase.value} stalled for "
                             f"{state.stall_ticks} consecutive ticks with no active operations "
@@ -1573,6 +1584,19 @@ class LifecycleSupervisor:
                 return AdvanceResult.WAITING_FOR_OPERATION
 
             if source == "recovery" and action in ("architect_fix", "resolve_blocker"):
+                is_deadlock = (
+                    state.repair_context.get("is_dependency_deadlock")
+                    or (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code") == "DEPENDENCY_DEADLOCK"
+                )
+                if is_deadlock:
+                    state.repair_context = {}
+                    state.error = None
+                    state.architect_repair_operation_id = None
+                    state.authoring_repair_attempts = 0
+                    self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
+                    self._transition(state, Phase.EXECUTING)
+                    return AdvanceResult.WAITING_FOR_OPERATION
+
                 # Deliverable fix verified on disk — complete the work order and return to execution!
                 self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
                 if str(wo_id) not in state.completed_wo_ids:
@@ -1631,6 +1655,15 @@ class LifecycleSupervisor:
             if source == "recovery" and wo_id:
                 action = str(action or "")
                 if action in ("architect_fix", "resolve_blocker"):
+                    is_deadlock = (
+                        state.repair_context.get("is_dependency_deadlock")
+                        or (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code") == "DEPENDENCY_DEADLOCK"
+                    )
+                    if is_deadlock:
+                        state.repair_context = {}
+                        self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
+                        self._transition(state, Phase.EXECUTING)
+                        return AdvanceResult.WAITING_FOR_OPERATION
                     self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
                     if str(wo_id) not in state.completed_wo_ids:
                         state.completed_wo_ids.append(str(wo_id))
@@ -4287,8 +4320,13 @@ class LifecycleSupervisor:
             + (
                 f"- architect_fix: You are Lead Architect directly resolving the blocker on {wo_id}.\n"
                 f"Blocker details:\n{yaml.safe_dump(ctx.get('evidence') or {}, sort_keys=False).strip()}\n"
-                f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\n"
-                "Directly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
+                + (
+                    "CRITICAL: The blocker is a DEPENDENCY_DEADLOCK. Directly edit the work order YAML in "
+                    f".sync/work-orders/ACTIVE/{wo_id}.yaml and update .sync/work-orders/INDEX.yaml using write_file "
+                    "to remove or fix the deadlocked dependency, unblocking the worker execution.\n"
+                    if (ctx.get("is_dependency_deadlock") or (ctx.get("evidence") or {}).get("failure_code") == "DEPENDENCY_DEADLOCK")
+                    else f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\nDirectly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
+                )
                 if action in ("architect_fix", "resolve_blocker") else ""
             )
             + (
@@ -4457,6 +4495,15 @@ class LifecycleSupervisor:
             return None  # plain authoring repair — readiness gate is the arbiter
         wo_id = str(wo_id)
         if action in ("architect_fix", "resolve_blocker"):
+            is_deadlock = (
+                state.repair_context.get("is_dependency_deadlock")
+                or (state.worker_blockers.get(wo_id) or {}).get("failure_code") == "DEPENDENCY_DEADLOCK"
+            )
+            if is_deadlock:
+                wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                if not wo_file.is_file():
+                    return f"architect_fix expected work order '{wo_id}.yaml' to exist in .sync/work-orders/ACTIVE/"
+                return None
             deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_id, ws)
             if deliv_path:
                 target_file = ws / deliv_path
@@ -4600,9 +4647,19 @@ class LifecycleSupervisor:
             if len(observed) > len(preview) else ""
         )
         current_rev = state.contract_revisions.get(wo_id, 1)
+        is_deadlock = (evidence.get("failure_code") == "DEPENDENCY_DEADLOCK")
+        deadlock_note = (
+            "\nCRITICAL: A DEPENDENCY DEADLOCK occurred. As Senior Architect you can:\n"
+            "- architect_fix or resolve_blocker: Author repair to .sync/work-orders/ACTIVE/ (and INDEX.yaml) "
+            "to remove inverted or circular dependencies or update prerequisite references, unblocking the worker.\n"
+            "- cancel_work_order: Cancel an orphaned or obsolete work order.\n"
+            "- split_work_order: Decompose the blocked work order into independent tasks.\n\n"
+            if is_deadlock else ""
+        )
         return (
             f"ARCHITECT RECOVERY DECISION required for work order {wo_id}.\n\n"
-            "A governed worker execution was blocked. "
+            + deadlock_note
+            + "A governed worker execution was blocked. "
             "Bounded evidence packet:\n"
             f"- failure_code: {evidence.get('failure_code', 'UNKNOWN')}\n"
             f"- failure: {evidence.get('canonical_message') or evidence.get('raw_reason') or 'unspecified'}\n"
@@ -4728,6 +4785,7 @@ class LifecycleSupervisor:
                 "original_contract": original_contract,
                 "deliverable_path": deliv_path,
                 "evidence": evidence,
+                "is_dependency_deadlock": (evidence.get("failure_code") == "DEPENDENCY_DEADLOCK"),
             }
             return self._enter_recovery_repair(state, ws, record)
 
@@ -6378,6 +6436,82 @@ class LifecycleSupervisor:
             resume_phase = Phase.EXECUTING if state.worker_wo_ids else Phase.PLANNING
 
         self._transition(state, resume_phase)
+        return AdvanceResult.TRANSITIONED
+
+    def _escalate_idle_stall_to_recovery(self, state: RunState) -> AdvanceResult | None:
+        """Escalate an idle stall (due to dependency deadlock or blocked tasks) to the Architect."""
+        ws = Path(state.workspace)
+        incomplete_wos = [
+            wid for wid in state.worker_wo_ids
+            if wid not in state.completed_wo_ids and wid not in state.superseded_wo_ids
+        ]
+        if not incomplete_wos and state.gitops_wo_id and state.gitops_wo_id not in state.completed_wo_ids:
+            incomplete_wos = [state.gitops_wo_id]
+
+        if not incomplete_wos:
+            return None
+
+        # Determine unmet dependencies for each incomplete work order
+        unmet_map: dict[str, list[str]] = {}
+        for wid in incomplete_wos:
+            deps: list[str] = []
+            if wid in state.wo_dependencies:
+                deps.extend(state.wo_dependencies[wid])
+            wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wid}.yaml"
+            if wo_file.is_file():
+                try:
+                    data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        file_deps = data.get("dependencies") or []
+                        if isinstance(file_deps, list):
+                            for fd in file_deps:
+                                fd_str = str(fd).strip()
+                                if fd_str and fd_str not in deps:
+                                    deps.append(fd_str)
+                except Exception:
+                    pass
+            unmet = [
+                d for d in deps
+                if d not in state.completed_wo_ids
+                and d != state.planning_wo_id
+                and d != "WO-000"
+                and d != state.gitops_wo_id
+            ]
+            unmet_map[wid] = unmet
+
+        # Pick candidate stalled work order: prefer one with unmet dependencies, else first incomplete
+        candidates = [wid for wid in incomplete_wos if unmet_map.get(wid)]
+        target_wo = candidates[0] if candidates else incomplete_wos[0]
+
+        if not re.match(r"^WO-[0-9]{3,}$", target_wo):
+            return None
+
+        attempts = state.recovery_attempts.get("IDLE_STALL", 0) + 1
+        state.recovery_attempts["IDLE_STALL"] = attempts
+        state.recovery_wo_id = target_wo
+
+        unmet_detail = unmet_map.get(target_wo, [])
+        state.worker_blockers[target_wo] = {
+            "failure_code": "DEPENDENCY_DEADLOCK",
+            "canonical_message": (
+                f"Work order {target_wo} is stalled due to unmet dependencies ({unmet_detail}). "
+                f"Active incomplete work orders: {incomplete_wos}."
+            ),
+            "raw_reason": (
+                f"IDLE_STALL: Phase {state.phase.value} stalled for {state.stall_ticks} consecutive ticks. "
+                f"Incomplete work orders: {incomplete_wos}. Unmet dependencies map: {unmet_map}"
+            ),
+            "stalled_phase": state.phase.value,
+            "unmet_dependencies": unmet_detail,
+            "all_unmet_dependencies": unmet_map,
+        }
+        state.stall_ticks = 0
+        state.error = (
+            f"IDLE_STALL in phase {state.phase.value}: Work order {target_wo} stalled "
+            f"with unmet dependencies ({unmet_detail}). Escalating to Architect recovery decision "
+            f"(attempt {attempts}/{state.max_retries})."
+        )
+        self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
         return AdvanceResult.TRANSITIONED
 
     def escalate_wo_to_recovery(self, state: RunState, wo_id: str, reason: str = "") -> None:

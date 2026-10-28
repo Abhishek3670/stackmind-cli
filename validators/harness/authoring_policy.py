@@ -83,6 +83,16 @@ RULES: tuple[dict[str, str], ...] = (
             "declaring coverage up front prevents a deterministic dead-end."
         ),
     },
+    {
+        "id": "dependency.dag",
+        "requirement": (
+            "Work Order dependencies MUST form a strict directed acyclic graph (DAG) where worker tasks "
+            "never depend on GitOps release work orders or on themselves."
+        ),
+        "rationale": (
+            "GitOps runs after all workers finish; inverted dependencies cause execution deadlocks."
+        ),
+    },
 )
 
 _RULES_BY_ID = {rule["id"]: rule for rule in RULES}
@@ -131,6 +141,10 @@ def repair_action(rule_id: str) -> str:
             "Declare a `test_plan` entry mapping this deliverable to test "
             f"artifact(s) under `{TEST_DIR}/` (e.g. tests/test_<stem>.py, or a "
             "consolidated suite listing the sources it covers)."
+        ),
+        "dependency.dag": (
+            "Remove circular, self, or inverted dependencies from the work order. "
+            "Worker tasks must never list GitOps release work orders in dependencies."
         ),
     }
     return actions.get(rule_id, "Follow the canonical authoring policy for this rule.")

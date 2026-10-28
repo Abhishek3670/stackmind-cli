@@ -841,16 +841,70 @@ def validate_authoring_readiness(
                 "amend or authoring pass"
             )
 
-        # Dependencies exist
+        # Dependencies exist (DAG validation)
+        is_current_gitops = AuthoringGate.is_gitops_work_order(data)
         deps = data.get("dependencies")
         if isinstance(deps, list):
             for dep in deps:
                 dep_str = str(dep).strip()
                 if not dep_str:
                     continue
+                if dep_str == wo_id:
+                    _issue(
+                        issues,
+                        "SELF_DEPENDENCY",
+                        "dependency",
+                        f"Work order '{wo_id}' cannot depend on itself",
+                        why="A work order depending on itself causes an immediate cycle deadlock.",
+                        actual_state=f"work order '{wo_id}' lists itself in dependencies",
+                        expected_state="dependencies must reference distinct prerequisite work orders",
+                        required_action=policy_repair_action("dependency.dag"),
+                        canonical_rule="dependency.dag",
+                        work_order_id=wo_id,
+                        artifact_path=rel,
+                        affected_artifacts=(rel,),
+                    )
+                    continue
+
+                if not is_current_gitops:
+                    target_wo_data = None
+                    if dep_str in wo_files:
+                        target_wo_data = wo_files[dep_str][1]
+                    elif dep_str in completed_wo_files:
+                        target_wo_data = completed_wo_files[dep_str][1]
+
+                    if target_wo_data is not None and AuthoringGate.is_gitops_work_order(target_wo_data):
+                        _issue(
+                            issues,
+                            "INVERTED_GITOPS_DEPENDENCY",
+                            "dependency",
+                            f"Worker work order '{wo_id}' cannot depend on GitOps release work order '{dep_str}' (GitOps executes after workers; inverted dependencies cause mutual deadlock)",
+                            why="Workers must complete before GitOps. A worker depending on GitOps creates an inverted dependency deadlock.",
+                            actual_state=f"worker work order '{wo_id}' lists GitOps work order '{dep_str}' in dependencies",
+                            expected_state="worker dependencies only reference prerequisite feature or backend work orders, never GitOps",
+                            required_action=policy_repair_action("dependency.dag"),
+                            canonical_rule="dependency.dag",
+                            work_order_id=wo_id,
+                            artifact_path=rel,
+                            affected_artifacts=(rel,),
+                        )
+
                 if dep_str in wo_files or dep_str in completed_wo_files or dep_str in skip_ids:
                     continue
-                _issue(issues, "DEPENDENCY_MISSING", "dependency", f"Work order '{wo_id}' depends on '{dep_str}' which is not an authored " f"active work order", work_order_id=wo_id, artifact_path=rel)
+                _issue(
+                    issues,
+                    "DEPENDENCY_MISSING",
+                    "dependency",
+                    f"Work order '{wo_id}' depends on '{dep_str}' which is not an authored active or completed work order",
+                    why="Dispatched tasks cannot proceed when referencing non-existent prerequisite work orders.",
+                    actual_state=f"prerequisite work order '{dep_str}' does not exist",
+                    expected_state="all declared dependencies must exist in active or completed work orders",
+                    required_action=f"Author prerequisite '{dep_str}' or remove it from dependencies in {rel}.",
+                    canonical_rule="dependency.dag",
+                    work_order_id=wo_id,
+                    artifact_path=rel,
+                    affected_artifacts=(rel,),
+                )
         elif deps not in (None, []):
             _issue(issues, "DEPENDENCIES_MALFORMED", "dependency", f"Work order '{wo_id}' dependencies must be a list", work_order_id=wo_id, artifact_path=rel)
 
@@ -940,7 +994,20 @@ def validate_authoring_readiness(
     # ── 6. Dependency graph acyclicity ──────────────────────────────
     cycle = _find_dependency_cycle(wo_files, skip_ids)
     if cycle:
-        _issue(issues, "DEPENDENCY_CYCLE", "dependency", f"Work order dependency graph contains a cycle: {' -> '.join(cycle)}", artifact_path=", ".join(cycle))
+        cycle_str = " -> ".join(cycle)
+        _issue(
+            issues,
+            "DEPENDENCY_CYCLE",
+            "dependency",
+            f"Work order dependency graph contains a cycle: {cycle_str}",
+            why="Cycles in the dependency graph cause execution deadlocks where no task can ever become eligible.",
+            actual_state=f"dependency cycle detected: {cycle_str}",
+            expected_state="dependency graph must be a strict directed acyclic graph (DAG)",
+            required_action=policy_repair_action("dependency.dag"),
+            canonical_rule="dependency.dag",
+            artifact_path=", ".join(cycle),
+            affected_artifacts=tuple(cycle),
+        )
 
     # ── 7. Overlapping file ownership between parallel work orders ─────
     deps_map: dict[str, set[str]] = {
