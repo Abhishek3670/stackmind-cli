@@ -3788,6 +3788,8 @@ class LifecycleSupervisor:
             self._ensure_release_documentation(ws, state)
             # Before committing, archive completed work orders to .sync/work-orders/COMPLETED/
             to_archive = list(state.completed_wo_ids)
+            if state.planning_wo_id and state.planning_wo_id not in to_archive:
+                to_archive.append(state.planning_wo_id)
             if state.integration_wo_id and state.integration_wo_id not in to_archive:
                 to_archive.append(state.integration_wo_id)
             if state.gitops_wo_id and state.gitops_wo_id not in to_archive:

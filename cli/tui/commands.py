@@ -2501,7 +2501,11 @@ def dispatch_delivery_command(
         try:
             resumed_run = client.run_resume(session["session_id"], run_id=run_id_clean)
             if resumed_run:
-                run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {resumed_run.get('phase')}"
+                run_phase = str(resumed_run.get('phase', ''))
+                if run_phase == 'COMPLETE':
+                    run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' is already COMPLETE (goal delivered)"
+                else:
+                    run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {run_phase}"
                 state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
                 state.error = None
         except Exception as run_err:
