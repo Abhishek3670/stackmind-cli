@@ -278,8 +278,12 @@ def is_local_module(
         ]
 
         if current_file_path:
-            # Check sibling directory
+            # Check sibling directory and parent directories up to project root
             search_dirs.append(current_file_path.parent)
+            curr = current_file_path.parent
+            while curr and curr != project_root and curr != base:
+                search_dirs.append(curr)
+                curr = curr.parent
             try:
                 rel = current_file_path.relative_to(project_root)
                 search_dirs.append(base / rel.parent)
@@ -450,16 +454,22 @@ def read_project_dependencies(
 
         # 2. requirements*.txt (root and subdirectories excluding .venv, .git, etc.)
         candidate_req_files: list[Path] = []
-        for pattern in ("requirements*.txt", "*-requirements.txt", "requirements/*.txt"):
+        for pattern in (
+            "requirements*.txt",
+            "*-requirements.txt",
+            "requirements/*.txt",
+            "**/requirements*.txt",
+            "**/*-requirements.txt",
+        ):
             for p in root.glob(pattern):
                 if p.is_file() and not any(part in EXCLUDED_DIR_NAMES for part in p.parts):
                     candidate_req_files.append(p)
 
-        for req_file in sorted(candidate_req_files):
-            rel_name = req_file.name
-            if rel_name not in checked_manifest_names:
+        for req_file in sorted(set(candidate_req_files)):
+            file_key = str(req_file.resolve())
+            if file_key not in checked_manifest_names:
                 manifest_found = True
-                checked_manifest_names.add(rel_name)
+                checked_manifest_names.add(file_key)
                 try:
                     content = req_file.read_text(encoding="utf-8", errors="replace")
                     declared.update(parse_requirements_dependencies(content))

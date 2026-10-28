@@ -885,3 +885,38 @@ def test_format_contract_payload_streaming_and_single_quotes():
     assert "{" not in out
     assert "}" not in out
 
+
+
+def test_format_contract_payload_strips_harness_decision():
+    """Verify format_contract_payload strips internal HarnessDecision headers and JSON from user view."""
+    from cli.tui.chat import format_contract_payload
+
+    sample = (
+        "Remediation applied: Appended pydantic==2.10.4 to server/requirements.txt.\\n\\n"
+        "------------------------------------------------------------------------\\n\\n"
+        "HarnessDecision\\n\\n"
+        "{\\n"
+        '  "decision": "ACCEPTABLE",\\n'
+        '  "resolution": "requirements_txt_updated",\\n'
+        '  "dependencies_declared": {"pydantic": "==2.10.4"},\\n'
+        '  "dependencies_already_present": ["fastapi==0.115.6", "uvicorn==0.34.0"],\\n'
+        '  "report": "Declared pydantic==2.10.4."\\n'
+        "}\\n"
+        "```trailing commentary"
+    )
+    cleaned = format_contract_payload(sample)
+    assert "HarnessDecision" not in cleaned
+    assert "ACCEPTABLE" not in cleaned
+    assert "Remediation applied" in cleaned
+
+    # Pure HarnessDecision without leading commentary extracts clean report
+    pure_hd = (
+        "HarnessDecision\\n\\n"
+        "{\\n"
+        '  "decision": "ACCEPTABLE",\\n'
+        '  "report": "All dependencies resolved."\\n'
+        "}"
+    )
+    cleaned_pure = format_contract_payload(pure_hd)
+    assert "HarnessDecision" not in cleaned_pure
+    assert cleaned_pure == "All dependencies resolved."

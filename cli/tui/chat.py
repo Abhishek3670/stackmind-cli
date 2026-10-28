@@ -102,6 +102,73 @@ def _set_cached_render(cache_key: str, rendered: str) -> None:
 # ─── Message Rendering Helpers ──────────────────────────────────────────────
 
 
+def _find_matching_brace(text: str, start: int) -> int:
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+    return -1
+
+
+def _safe_json_parse(s: str) -> dict[str, Any] | None:
+    if not s or not isinstance(s, str):
+        return None
+    s_clean = s.strip()
+    if "\\n" in s_clean and "\n" not in s_clean:
+        s_clean = s_clean.replace("\\n", "\n").replace("\\t", "\t")
+    if not (s_clean.startswith("{") and s_clean.endswith("}")):
+        return None
+    try:
+        import json
+        obj = json.loads(s_clean, strict=False)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Healing pass for invalid JSON escapes (regexes like \s, \d, \w, \.)
+    try:
+        import json
+        healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
+        obj = json.loads(healed, strict=False)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Healing pass for single-quoted dict strings
+    try:
+        import ast
+        obj = ast.literal_eval(s_clean)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    try:
+        import json
+        obj, _ = json.JSONDecoder(strict=False).raw_decode(s_clean)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return None
+
+
 def format_contract_payload(content: str) -> str:
     """Detect and format raw task contract completion JSON into clean assistant text.
 
@@ -129,6 +196,36 @@ def format_contract_payload(content: str) -> str:
             clean_lines.append(line)
         text = "\n".join(clean_lines).strip()
 
+    # Strip internal HarnessDecision blocks and accompanying JSON from chat view
+    if "HarnessDecision" in text:
+        hd_idx = text.find("HarnessDecision")
+        sep_m = re.search(r"[-=~_]{3,}\s*$", text[:hd_idx])
+        start_cut = sep_m.start() if sep_m else hd_idx
+
+        brace_start = text.find("{", hd_idx)
+        if brace_start != -1:
+            brace_end = _find_matching_brace(text, brace_start)
+            if brace_end != -1:
+                end_cut = brace_end + 1
+                while end_cut < len(text) and text[end_cut] in " \t\r\n":
+                    end_cut += 1
+                if text[end_cut:].startswith("```"):
+                    end_cut = len(text)
+
+                before_hd = text[:start_cut].strip()
+                after_hd = text[end_cut:].strip()
+                if before_hd:
+                    text = before_hd if not after_hd else f"{before_hd}\n\n{after_hd}"
+                else:
+                    json_str = text[brace_start:brace_end+1]
+                    try:
+                        import json
+                        p = _safe_json_parse(json_str)
+                        report = p.get("report") or p.get("summary") or p.get("resolution")
+                        text = str(report).strip() if report else (after_hd or "Architectural decision recorded.")
+                    except Exception:
+                        text = after_hd or "Architectural decision recorded."
+
     # Check for markdown code fences wrapping JSON
     unfenced = text
     if unfenced.startswith("```"):
@@ -139,44 +236,7 @@ def format_contract_payload(content: str) -> str:
         else:
             unfenced = rest.strip()
 
-    def _safe_json_parse(s: str) -> dict[str, Any] | None:
-        if not s or not isinstance(s, str):
-            return None
-        s_clean = s.strip()
-        if not (s_clean.startswith("{") and s_clean.endswith("}")):
-            return None
-        try:
-            import json
-            obj = json.loads(s_clean, strict=False)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-        # Healing pass for invalid JSON escapes (regexes like \s, \d, \w, \.)
-        try:
-            import json
-            healed = re.sub(r'\\(?![/\\bfnrtu"\'\n\r\t]|u[0-9a-fA-F]{4})', r'\\\\', s_clean)
-            obj = json.loads(healed, strict=False)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-        # Healing pass for single-quoted dict strings
-        try:
-            import ast
-            obj = ast.literal_eval(s_clean)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-        try:
-            import json
-            obj, _ = json.JSONDecoder(strict=False).raw_decode(s_clean)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-        return None
+
 
     def _is_contract_dict(d: Any) -> bool:
         if not isinstance(d, dict):

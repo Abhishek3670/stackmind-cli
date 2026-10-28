@@ -955,3 +955,33 @@ def test_test_file_importing_pytest_passes(tmp_path: Path):
     assert "pytest" not in result.external_imports
     assert result.undeclared_imports == ()
 
+
+
+def test_subdirectory_requirements_manifest_satisfies_imports(tmp_path: Path):
+    """Manifests in subdirectories (like server/requirements.txt) satisfy imports in that service."""
+    project = tmp_path / "project"
+    project.mkdir()
+    server_dir = project / "server"
+    server_dir.mkdir()
+    (server_dir / "requirements.txt").write_text("fastapi>=0.115.0\npydantic>=2.0\nuvicorn>=0.30\n", encoding="utf-8")
+
+    app_dir = server_dir / "app"
+    app_dir.mkdir()
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
+    (app_dir / "tts.py").write_text("def speak(): pass\n", encoding="utf-8")
+    
+    main_py = app_dir / "main.py"
+    main_py.write_text(
+        "from fastapi import FastAPI\n"
+        "from pydantic import BaseModel\n"
+        "import uvicorn\n"
+        "from app.tts import speak\n"
+        "\n"
+        "app = FastAPI()\n",
+        encoding="utf-8",
+    )
+
+    result = check_import_satisfiability(main_py, project_root=project)
+    assert result.passed is True
+    assert result.manifest_found is True
+    assert result.undeclared_imports == ()
