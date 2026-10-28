@@ -254,49 +254,43 @@ class ContractEvaluator:
                     return True
                 return False
 
-            if not all(_denial_overridden(d) for d in matching_deny):
-                return False, "target is explicitly denied"
+            if operation_type in self._WRITE_OPERATIONS:
+                if not all(_denial_overridden(d) for d in matching_deny):
+                    return False, "target is explicitly denied"
+            else:
+                # For read operations, only deny if target is an explicit security pattern or credential
+                secret_patterns = (
+                    ".git/**", ".git", ".env", ".env.*", ".sync/runtime/**",
+                    ".sync/snapshots/**", "*secret*", "*credential*", "*token*", "*.key", "*.pem",
+                )
+                if any(self._matches(target, sp) for sp in secret_patterns):
+                    if not all(_denial_overridden(d) for d in matching_deny):
+                        return False, "target is explicitly denied"
+
         if is_protocol_target:
             return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
-            # For read-only reference documentation and directory enumeration, permit
-            # read-only access so specialists can consult requirements, specs, and brand assets
-            # without triggering spurious permission failures, provided the target is not write-denied.
+            # For read-only operations (reading code, docs, assets, or directory enumeration), permit
+            # read-only access so specialists can inspect existing deliverables, requirements, and brand assets
+            # without spurious permission failures, provided the target is not a security boundary or private channel.
             if operation_type not in self._WRITE_OPERATIONS:
                 import posixpath
                 norm_t = posixpath.normpath(target.replace("\\", "/").strip("/"))
                 norm_t_clean = norm_t[len("workspace/"):] if norm_t.startswith("workspace/") else norm_t
                 lower_t = norm_t_clean.lower()
+                role_str = str(getattr(contract, "role", "") or "").lower()
 
-                # Safe workspace reference files (read-only)
-                safe_reference_exact = {
-                    "plan.md", "readme.md", "agents.md", "architecture.md",
-                    "brand-kit.html", "brand-kit.md", "brand-kit.txt",
-                    "package.json", "pyproject.toml", "cargo.toml", "go.mod", "tsconfig.json",
-                    ".sync/system_context.md",
-                }
-                if (
-                    lower_t in safe_reference_exact
-                    or (lower_t.count("/") == 0 and lower_t.startswith("brand-kit"))
-                    or (lower_t.count("/") == 0 and lower_t.endswith(".md"))
-                ):
-                    return True, "authorized"
+                # Deny reading other agents' private inboxes or internal governance work orders/contracts
+                if lower_t.startswith(".sync/inbox/"):
+                    inbox_owner = lower_t.split(".sync/inbox/", 1)[1].split("/", 1)[0]
+                    agent_stem = contract.agent_id.lower()
+                    if inbox_owner not in (agent_stem, role_str):
+                        return False, "target is outside allowed scope"
+                if lower_t.startswith(".sync/work-orders/") or lower_t.startswith(".sync/contracts/"):
+                    return False, "target is outside allowed scope"
 
-                # Directory navigation (list_directory, glob, run_security_scan)
-                if operation_type in ("list_directory", "glob", "run_security_scan"):
-                    if norm_t in ("workspace", ".", ""):
-                        return True, "authorized"
-                    for a in contract.allow:
-                        norm_a = posixpath.normpath(a.replace("\\", "/").strip("/"))
-                        norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
-                        if norm_a_clean.startswith(norm_t_clean + "/") or norm_a.startswith(norm_t + "/"):
-                            return True, "authorized"
-                    # Safe workspace top-level resource folders
-                    first_seg = lower_t.split("/")[0]
-                    if first_seg in ("assets", "public", "static", "docs", "templates"):
-                        return True, "authorized"
-                    if operation_type == "run_security_scan":
-                        return True, "authorized"
+                # Permit reading workspace application code, assets, documentation, and directory listings
+                return True, "authorized"
 
             return False, "target is outside allowed scope"
         return True, "authorized"

@@ -420,6 +420,9 @@ class AgentRunner:
         self.on_thinking = on_thinking
         self._tree_cache: dict[str, Any] | None = None
 
+    def _is_architect_agent(self) -> bool:
+        return self.agent in ('claude', 'architecture', 'architect')
+
     @staticmethod
     def _is_cancelled(cancellation: Event | None) -> bool:
         return cancellation is not None and cancellation.is_set()
@@ -1700,7 +1703,7 @@ class AgentRunner:
         return payload if isinstance(payload, dict) else None
 
     def _build_adhoc_system_message(self) -> str:
-        if self.agent == 'claude':
+        if self._is_architect_agent():
             base_msg = (
                 "You are Claude, the Lead Architect in this project workspace (powered by StackMind CLI).\n"
                 "Your role in this interactive conversational phase is to consult with the operator, understand their vision and requirements, explore their needs, and co-design the project architecture before initiating autonomous development.\n\n"
@@ -1750,7 +1753,7 @@ class AgentRunner:
 
     def _architect_board_block(self, work_order_id: str | None = None) -> str:
         """Team status and work-order board appended to Architect turns (empty for others)."""
-        if self.agent != 'claude':
+        if not self._is_architect_agent():
             return ""
         try:
             from validators.harness.task_contract import render_team_status
@@ -1857,7 +1860,7 @@ class AgentRunner:
         attempt = Attempt(tool_runtime.workspace.attempt_id, kernel_contract)
         task_text = f'Task: {request.task.title}\n\n{request.task.body}\n\n'
         full_task_desc = f"{request.task.title}\n{request.task.body}"
-        is_architecture = (self.agent == 'claude')
+        is_architecture = self._is_architect_agent()
         is_authoring_task = (
             is_architecture
             and any(
@@ -2639,7 +2642,7 @@ class AgentRunner:
                         '.ruff_cache',
                     ),
                 )
-                if self.agent == 'claude':
+                if self._is_architect_agent():
                     for sub in ('work-orders', 'contracts'):
                         src_sub = source_root / '.sync' / sub
                         if src_sub.is_dir():
@@ -2651,7 +2654,7 @@ class AgentRunner:
                         if src_sub.is_dir():
                             dst_sub = staged_root / '.sync' / sub
                             shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
-                if self.agent == 'claude':
+                if self._is_architect_agent():
                     self._reconcile_staged_work_order_collisions(staged_root)
                 self._sync_index_and_tree_yaml(staged_root)
             self._apply_non_report_writes(stage_inputs, base_path=staged_root)

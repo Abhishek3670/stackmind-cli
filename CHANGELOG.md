@@ -5,6 +5,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.3] - 2026-10-28
+
+### Fixed
+- **Permission Denial Storm & Specialist Read Scoping**:
+  - Authorized all project specialists (`gemini`, `codex`, `gemma`, `local-llm`, etc.) to read workspace project files (HTML, CSS, JS, markdown documentation, project assets, configurations, and directory listings) without spurious permission denials.
+  - Restricted read denials exclusively to true security boundaries (`.git/**`, `.env*`, `.sync/runtime/**`, `.sync/snapshots/**`, secrets/tokens/keys) and private inter-agent inboxes.
+  - Sanitized contract compilation in `authoring_compiler.py` to prevent workspace deliverables (e.g. `index.html`) from being placed into `scope.deny`.
+- **Global Turn Budget Depletion Loop Guard**:
+  - Fixed turn budget deduction in `validators/kernel/daemon/supervisor.py`: budget is now only decremented after `start_turn` successfully instantiates an operation, preventing contention exceptions from burning through turn budgets in rapid loops.
+  - Added single-turn in-flight operation contention guards in `_advance_executing` to prevent concurrent turn dispatch collisions when running in single-operation mode.
+- **Daemon Boot Recovery & In-Memory Attestation Resilience**:
+  - Fixed workspace root resolution in `manager.py` during boot recovery when daemon storage is nested in test or custom directories.
+  - Guarded in-memory run attestation in `supervisor.advance()` so in-memory run states without prior disk checkpoints are registered seamlessly during execution.
+
 ## [3.10.2] - 2026-10-28
 
 ### Added

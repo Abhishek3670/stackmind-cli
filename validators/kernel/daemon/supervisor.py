@@ -825,9 +825,12 @@ class LifecycleSupervisor:
                     state.exit_code = EXIT_BUDGET_EXHAUSTED
                     self._transition(state, Phase.WAITING_FOR_HUMAN)
                     raise BudgetExhaustedError("Global turn budget exhausted.")
-                state.global_turn_budget -= 1
+
+            result = original_start_turn(*args, **kwargs)
+            if state is not None:
+                state.global_turn_budget = max(0, state.global_turn_budget - 1)
                 self._sync_budget_file(state)
-            return original_start_turn(*args, **kwargs)
+            return result
 
         self.manager.start_turn = hooked_start_turn
 
@@ -965,13 +968,16 @@ class LifecycleSupervisor:
 
         if hasattr(self, "state_manager") and self.state_manager is not None:
             if not self.state_manager.is_run_attested(state.run_id):
-                state.error = (
-                    "DAEMON_RESTART_FAIL_CLOSED: In-memory session key lost on daemon restart. "
-                    "Human re-attestation required."
-                )
-                state.exit_code = EXIT_INTEGRITY_VIOLATION
-                self._transition(state, Phase.WAITING_FOR_HUMAN)
-                return AdvanceResult.WAITING_FOR_HUMAN
+                if not state.transitions and state.run_id not in getattr(self.state_manager, "_in_memory_states", {}):
+                    self.state_manager.register_state(state.run_id, state)
+                else:
+                    state.error = (
+                        "DAEMON_RESTART_FAIL_CLOSED: In-memory session key lost on daemon restart. "
+                        "Human re-attestation required."
+                    )
+                    state.exit_code = EXIT_INTEGRITY_VIOLATION
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
 
         if state.global_turn_budget <= 0 and state.phase not in (Phase.COMPLETE, Phase.FAILED, Phase.WAITING_FOR_HUMAN):
             state.budget_exhausted = True
@@ -1900,7 +1906,8 @@ class LifecycleSupervisor:
             escalation = self._poll_dependency_escalation(state, ws)
             if escalation is not None:
                 return escalation
-            active_in_flight_ops += 1
+            if state.dependency_escalation_op_id:
+                active_in_flight_ops += 1
 
         if not state.worker_wo_ids:
             self._discover_worker_wos(state)
@@ -1966,6 +1973,9 @@ class LifecycleSupervisor:
                                 except Exception:
                                     pass
                     if wo_id not in state.blocked_wo_ids:
+                        if active_in_flight_ops > 0 and not state.batch_operation_id:
+                            all_done = False
+                            continue
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
                             self.manager.start_turn(

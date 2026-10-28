@@ -2215,6 +2215,7 @@ def test_integration_review_failed_operation_transitions_to_failed(tmp_path: Pat
     state = supervisor.start_run("run-ir4", "Build feature", tmp_path, "sess-ir4")
     state.phase = Phase.INTEGRATION_REVIEW
     state.completed_wo_ids = ["WO-001"]
+    state.max_integration_retries = 0
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)

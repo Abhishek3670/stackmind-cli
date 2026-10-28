@@ -777,7 +777,12 @@ class SessionManager:
         self._active_runs: dict[str, Any] = {}
         self._run_driver_threads: dict[str, Thread] = {}
         self._run_stop_events: dict[str, Event] = {}
-        daemon_ws = self.storage.root.parent.parent.parent.resolve() if self.storage.root.name == "daemon" else None
+        daemon_ws = None
+        if self.storage.root.name == "daemon":
+            if self.storage.root.parent.name == "runtime" and self.storage.root.parent.parent.name == ".sync":
+                daemon_ws = self.storage.root.parent.parent.parent.resolve()
+            else:
+                daemon_ws = self.storage.root.parent.resolve()
         seen_run_ids: set[str] = set()
         for session in self._sessions.values():
             ws_str = session.get("workspace")
@@ -2009,7 +2014,7 @@ class SessionManager:
                 except Exception:
                     pass
 
-            if state.phase in (Phase.FAILED, Phase.BLOCKED, Phase.WAITING_FOR_HUMAN, Phase.EXECUTING, Phase.DISPATCHING):
+            if state.phase != Phase.COMPLETE:
                 self._prepare_run_for_resume(state, session, ws)
             else:
                 self._cleanup_orphaned_operations(state, session)

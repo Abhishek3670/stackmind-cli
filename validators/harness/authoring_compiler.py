@@ -495,7 +495,18 @@ def compile_authoring_artifacts(
             for d_item in deny_list:
                 d_pat = (d_item.get("module") or d_item.get("target") or d_item.get("path")) if isinstance(d_item, dict) else d_item
                 d_str = str(d_pat or "")
-                if any(ContractEvaluator._matches(a.replace("\\", "/").rstrip("/*"), d_str) for a in allow_rules):
+                lower_d = d_str.lower().strip().lstrip("./")
+                is_deliverable_or_code = (
+                    lower_d in ("index.html", "main.js", "style.css", "app.py")
+                    or lower_d.endswith(".html")
+                    or lower_d.endswith(".css")
+                    or lower_d.endswith(".js")
+                    or lower_d.endswith(".py")
+                    or lower_d.startswith("assets/")
+                    or lower_d.startswith("src/")
+                ) and not any(k in lower_d for k in ("secret", "key", "token", "cred", "env"))
+
+                if any(ContractEvaluator._matches(a.replace("\\", "/").rstrip("/*"), d_str) for a in allow_rules) or is_deliverable_or_code:
                     removed_deny.append(d_str)
                 else:
                     filtered_deny.append(d_item)
