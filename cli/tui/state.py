@@ -985,6 +985,13 @@ class AutonomousDeliveryState:
 
         removed = self.messages[:-keep]
         retained = self.messages[-keep:]
+
+        orig_goal = ""
+        first_user = next((m for m in removed if m.role == "user" and m.content.strip()), None)
+        if first_user:
+            goal_snippet = " ".join(first_user.content.split())[:160]
+            orig_goal = f"Original user goal: '{goal_snippet}' | "
+
         milestones = [
             f"{message.role}: {' '.join(message.content.split())[:120]}"
             for message in removed
@@ -993,7 +1000,7 @@ class AutonomousDeliveryState:
         excerpt = " | ".join(milestones[-3:])
         summary = (
             f"[Transcript compacted: {len(removed)} earlier messages preserved as context. "
-            f"Recent milestones: {excerpt}]"
+            f"{orig_goal}Recent milestones: {excerpt}]"
         )
         summary_message = ChatMessage(role="system", content=summary, timestamp=self.now_str())
         self.messages = [summary_message, *retained]

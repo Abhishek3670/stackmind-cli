@@ -289,8 +289,25 @@ class ContractEvaluator:
                 if lower_t.startswith(".sync/work-orders/") or lower_t.startswith(".sync/contracts/"):
                     return False, "target is outside allowed scope"
 
-                # Permit reading workspace application code, assets, documentation, and directory listings
-                return True, "authorized"
+                if operation_type in ("list_directory", "glob"):
+                    if norm_t in ("workspace", ".", ""):
+                        return True, "authorized"
+                    first_seg = lower_t.split("/")[0]
+                    if first_seg in ("assets", "public", "static", "docs", "templates"):
+                        return True, "authorized"
+                    for a in contract.allow:
+                        norm_a = posixpath.normpath(a.replace("\\", "/").strip("/"))
+                        norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
+                        if (
+                            norm_a_clean.startswith(norm_t_clean + "/")
+                            or norm_a.startswith(norm_t + "/")
+                            or norm_t_clean.startswith(norm_a_clean.rstrip("/*") + "/")
+                        ):
+                            return True, "authorized"
+                    return False, "target is outside allowed scope"
+
+                # Permit reading workspace application code, assets, documentation
+                return True, "authorized" 
 
             return False, "target is outside allowed scope"
         return True, "authorized"

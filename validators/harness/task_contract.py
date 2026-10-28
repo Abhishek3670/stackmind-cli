@@ -461,10 +461,10 @@ def compile_worker_task_contract(
     acceptance = [
         str(c) for c in (wo_data or {}).get("acceptance_criteria") or []
         if isinstance(c, str) and c.strip()
-    ][:10]
+    ][:15]
     description = str((wo_data or {}).get("description") or getattr(task, "body", "") or "").strip()
-    if len(description) > 1500:
-        description = description[:1500] + " …"
+    if len(description) > 2500:
+        description = description[:2500] + " …"
 
     turn_instructions = ""
     task_body = getattr(task, "body", "") or ""
@@ -550,6 +550,21 @@ def compile_worker_task_contract(
     assigned_skills = list((wo_data or {}).get("skills") or (contract_data or {}).get("skills") or [])
     if assigned_skills:
         result["assigned_skills"] = assigned_skills
+
+    plan_file = Path(workspace) / "PLAN.md"
+    if plan_file.is_file():
+        try:
+            plan_text = plan_file.read_text(encoding="utf-8").strip()
+            if plan_text:
+                if len(plan_text) > 600:
+                    plan_text = plan_text[:600] + " …"
+                result["project_plan_overview"] = plan_text
+        except Exception:
+            pass
+
+    brand_file = Path(workspace) / "brand-kit.html"
+    if brand_file.is_file():
+        result["brand_reference"] = "brand-kit.html exists in workspace root; inspect with read_file for brand tokens, fonts, and colors." 
     if turn_instructions:
         result["critical_turn_instructions"] = turn_instructions
     return result
@@ -598,7 +613,7 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     workflow_steps = (
         f"\nWORKFLOW INSTRUCTIONS:\n"
         f"1. In your first action, use `read_file` to inspect existing workspace files "
-        f"(e.g. index.html) and learn the markup, element IDs, classes, and naming your "
+        f"(e.g. index.html, PLAN.md, brand-kit.html) and ground your deliverable in the project architecture, brand tokens, and required DOM contract hooks. "
         f"deliverable must integrate with.\n"
         f"2. Call `write_file(path='{deliverable}', content='...')` to author your deliverable as complete final content.\n"
         f"3. Verify integration: IDs, classes, and functions your deliverable references must exist in the "

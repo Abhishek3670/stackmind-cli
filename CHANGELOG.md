@@ -5,6 +5,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.5] - 2026-10-28
+
+### Added
+- **Project Grounding & Plan Context Auto-Injection**:
+  - Automatically injects `project_plan_overview` from `PLAN.md` and `brand_reference` from `brand-kit.html` into the compiled task contract block (`TASK CONTRACT JSON`), guaranteeing all specialist workers possess foundational project constraints, brand tokens, and architecture from turn 1.
+  - Expanded worker contract task `description` truncation threshold from 1,500 to 2,500 characters and increased `acceptance_criteria` capacity from 10 to 15 items.
+  - Enhanced worker workflow instructions to explicitly mandate inspecting `PLAN.md` and `brand-kit.html` alongside `index.html` during initial exploratory turns.
+- **Pinned Original User Goal in Transcript Compaction**:
+  - Pinned the initial user prompt in the TUI transcript compaction summary (`Original user goal: '...'`), ensuring high-level user directives and requirements are never dropped after multiple compaction cycles.
+
+### Fixed
+- **Multi-Turn Tool Output Context Retention**:
+  - Relaxed premature tool output truncation in `GovernedToolRuntime` (`_compact_messages_for_context`): doubled recent tool retention window (`keep_recent = 4` for cloud providers) and raised retention cap from 600 to 1,200 characters so multi-file inspections aren't wiped out before implementation.
+- **Contract Directory Listing & Resource Folder Scoping**:
+  - Refined `list_directory` in `validators/kernel/contract.py` to seamlessly authorize standard workspace resource folders (`assets/`, `public/`, `static/`, `docs/`, `templates/`) and allowed rule ancestors while strictly rejecting out-of-scope directories.
+
 ## [3.10.4] - 2026-10-28
 
 ### Fixed

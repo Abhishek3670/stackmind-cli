@@ -1659,16 +1659,16 @@ class ProviderGateway:
         if not tool_indices:
             return
 
-        keep_recent = 2
+        keep_recent = 2 if is_local else 4
         older_indices = tool_indices[:-keep_recent] if len(tool_indices) > keep_recent else []
 
         for idx in older_indices:
             m = messages[idx]
             content = m.content or ""
-            max_retain = 250 if is_local else 600
+            max_retain = 250 if is_local else 1200
             if len(content) > max_retain:
-                head = content[:150]
-                tail = content[-80:]
+                head = content[:150] if is_local else content[:250]
+                tail = content[-80:] if is_local else content[-150:]
                 compacted = (
                     f"{head}\n"
                     f"... [Earlier tool output truncated to preserve context window: {len(content)} chars omitted] ...\n"
