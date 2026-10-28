@@ -153,3 +153,34 @@ Stack & Dependencies:
     # After reconciliation: Milestone 3 is covered, no MILESTONE_UNCOVERED issue remains
     r_after = validate_authoring_readiness(ws, expected_milestones=plan_milestones)
     assert not any(i.code == "MILESTONE_UNCOVERED" for i in r_after.issues)
+
+
+def test_start_turn_resolves_work_order_agent_when_omitted(tmp_path: Path):
+    storage = DaemonStorage(tmp_path / "daemon_storage")
+    manager = SessionManager(storage)
+    session = manager.create_session("claude", "test", {}, str(tmp_path))
+    session_id = session["session_id"]
+
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    c1 = {"agent_id": "codex", "work_order": "WO-001", "identity": {"role": "backend"}}
+    (contracts_dir / "WO-001.yaml").write_text(yaml.safe_dump(c1), encoding="utf-8")
+
+    # Start turn targeting WO-001 without role or agent_id (resolved from contract)
+    op = manager.start_turn(session_id, "Execute WO-001", work_order_id="WO-001")
+    op_rec = manager.get_operation(op["operation_id"])
+    assert op_rec["role"] == "backend"
+    assert op_rec["agent_id"] == "codex"
+    manager.complete_operation(session_id, op["operation_id"], {"status": "completed"})
+
+    # Test WO-002 resolved from ACTIVE work order file (no contract file)
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    wo2 = {"id": "WO-002", "assigned_agents": ["gemini"]}
+    (act_dir / "WO-002.yaml").write_text(yaml.safe_dump(wo2), encoding="utf-8")
+
+    op2 = manager.start_turn(session_id, "Execute WO-002", work_order_id="WO-002")
+    op_rec2 = manager.get_operation(op2["operation_id"])
+    assert op_rec2["role"] == "frontend"
+    assert op_rec2["agent_id"] == "gemini"
+    manager.complete_operation(session_id, op2["operation_id"], {"status": "completed"})

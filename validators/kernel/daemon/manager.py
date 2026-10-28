@@ -2216,6 +2216,27 @@ class SessionManager:
                         if isinstance(loaded_contract, dict):
                             session["contract"] = loaded_contract
                             self.events.publish("contract.loaded", session_id, contract=loaded_contract)
+                            if not role and not agent_id:
+                                c_agent = loaded_contract.get("agent_id")
+                                c_role = loaded_contract.get("identity", {}).get("role")
+                                if c_agent:
+                                    effective_agent_id = str(c_agent).lower().strip()
+                                    effective_role = self._canonical_role(c_role or effective_agent_id)
+                                    record["role"] = effective_role
+                                    record["agent_id"] = effective_agent_id
+                    if not role and not agent_id and effective_agent_id in {session.get("agent"), "claude", "architecture"}:
+                        for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                            wo_file = ws_dir / ".sync" / "work-orders" / sub / f"{work_order_id}.yaml"
+                            if wo_file.exists():
+                                wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                                if isinstance(wo_data, dict):
+                                    assigned = wo_data.get("assigned_agents", [])
+                                    if isinstance(assigned, list) and assigned:
+                                        effective_agent_id = str(assigned[0]).lower().strip()
+                                        effective_role = self._canonical_role(effective_agent_id)
+                                        record["role"] = effective_role
+                                        record["agent_id"] = effective_agent_id
+                                        break
                 except Exception:
                     pass
 
@@ -2519,6 +2540,37 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
+            wo_id = params.get("work_order_id")
+            if wo_id and not params.get("role") and not params.get("agent_id"):
+                ws_path = Path(session.get("workspace", "."))
+                c_path = ws_path / ".sync" / "contracts" / f"{wo_id}.yaml"
+                resolved_agent = None
+                resolved_role = None
+                if c_path.exists():
+                    try:
+                        c_data = yaml.safe_load(c_path.read_text(encoding="utf-8"))
+                        if isinstance(c_data, dict):
+                            resolved_agent = c_data.get("agent_id")
+                            resolved_role = c_data.get("identity", {}).get("role")
+                    except Exception:
+                        pass
+                if not resolved_agent:
+                    for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+                        wo_file = ws_path / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+                        if wo_file.exists():
+                            try:
+                                wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                                if isinstance(wo_data, dict):
+                                    assigned = wo_data.get("assigned_agents", [])
+                                    if isinstance(assigned, list) and assigned:
+                                        resolved_agent = str(assigned[0]).lower().strip()
+                                        break
+                            except Exception:
+                                pass
+                if resolved_agent:
+                    params["agent_id"] = str(resolved_agent).lower().strip()
+                    params["role"] = str(resolved_role).lower().strip() if resolved_role else self._canonical_role(resolved_agent)
+
             role_param = str(params.get("role") or params.get("agent_id") or session.get("agent") or "").lower().strip()
             if self._canonical_role(role_param) == "gitops" and params.get("work_order_id"):
                 ws_path = Path(session["workspace"])

@@ -1048,6 +1048,8 @@ def validate_authoring_readiness(
                 for j in range(i + 1, len(claiming)):
                     wo_a, rel_a = claiming[i]
                     wo_b, rel_b = claiming[j]
+                    if wo_a == wo_b:
+                        continue
                     if not (_is_descendant(wo_b, wo_a) or _is_descendant(wo_a, wo_b)):
                         _issue(
                             issues,

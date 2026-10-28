@@ -578,6 +578,38 @@ class AuthoringGate:
                 except (ValueError, TypeError):
                     pass
 
+        # Normalize execution_log -> log, and coerce log items to schema-valid shape
+        if "execution_log" in data and "log" not in data:
+            data["log"] = data.pop("execution_log")
+        if isinstance(data.get("log"), list):
+            norm_log = []
+            for item in data["log"]:
+                if isinstance(item, dict):
+                    date_val = str(item.get("date") or item.get("timestamp") or item.get("time") or "")
+                    agent_val = str(item.get("agent") or item.get("by") or item.get("author") or "architect")
+                    action_val = str(item.get("action") or item.get("event") or item.get("message") or "updated")
+                    if date_val and agent_val and action_val:
+                        norm_log.append({"date": date_val, "agent": agent_val, "action": action_val})
+                    else:
+                        norm_log.append(f"{date_val} {action_val} by {agent_val}".strip())
+                elif isinstance(item, str):
+                    norm_log.append(item)
+            data["log"] = norm_log
+
+        # Normalize api_contract_ref -> contract_ref
+        if "api_contract_ref" in data and "contract_ref" not in data:
+            data["contract_ref"] = str(data.pop("api_contract_ref"))
+
+        # Normalize deliverable if only deliverables (list of paths) was declared
+        if "deliverable" not in data and isinstance(data.get("deliverables"), list) and data["deliverables"]:
+            first_deliv = str(data["deliverables"][0])
+            deliv_type = "doc" if first_deliv.endswith((".md", ".txt")) else "code"
+            data["deliverable"] = {
+                "type": deliv_type,
+                "path": first_deliv,
+                "description": str(data.get("title", f"Deliverable for {first_deliv}")),
+            }
+
         return data
 
     @staticmethod
