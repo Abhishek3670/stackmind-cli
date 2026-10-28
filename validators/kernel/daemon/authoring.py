@@ -607,6 +607,8 @@ def build_child_contract(
             {"module": "*.webp"},
             {"module": "*.gif"},
             {"module": "*.ico"},
+            {"module": "tests/**"},
+            {"module": "test/**"},
         ])
     elif role_norm in ("qa", "gemma"):
         allow_rules.extend([

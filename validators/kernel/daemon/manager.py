@@ -221,6 +221,8 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                 {"module": "public/**"},
                 {"module": "templates/**"},
                 {"module": "src/**"},
+                {"module": "tests/**"},
+                {"module": "test/**"},
                 {"module": f".sync/inbox/{agent}/**"},
             ]
             default_role = "frontend"
@@ -1509,9 +1511,11 @@ class SessionManager:
                         f"(e.g. {example_id}.yaml) conforming to schemas/work-order.schema.json.\n"
                         f"3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
                         f"(e.g. {example_id}.yaml) conforming to schemas/contract.schema.json.\n"
-                        "4. QA/verification Work Orders (assigned to gemma) MUST declare an executable code deliverable under tests/ "
-                        "— the test suite the QA worker will author and execute end-to-end — and every code deliverable needs a "
-                        "planned companion test (e.g. tests/test_<stem>.py).\n"
+                        "4. Do NOT explicitly specify or force TDD companion test deliverables on Backend or Frontend work orders. "
+                        "Let Backend and Frontend focus on their assigned deliverables according to their work orders (they are permitted to author "
+                        "unit tests if they wish to self-verify). QA/verification Work Orders (assigned to gemma) MUST declare an "
+                        "executable code deliverable under tests/ — when QA's turn arrives, QA will inspect the deliverables and any "
+                        "existing unit tests, then author an independent end-to-end test suite for comprehensive code quality and verification.\n"
                         "5. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
                         "and modified_files listing all authored files."
                     )

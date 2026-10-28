@@ -968,7 +968,7 @@ def validate_authoring_readiness(
         if declared_source_map.get(deliv_path_str):
             continue  # explicitly declared coverage (per-file or consolidated)
         stem = Path(deliv_path_str).stem.lower()
-        if stem in ("app", "main", "index", "__init__"):
+        if stem in ("app", "main", "index", "__init__") or bool(planned_tests):
             covered = bool(planned_tests)
         else:
             covered = any(_covers_stem(t, stem) for t in planned_tests)

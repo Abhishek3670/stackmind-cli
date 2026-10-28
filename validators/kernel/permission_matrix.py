@@ -53,15 +53,27 @@ def get_permission_matrix_prompt(role: str | None = None) -> str:
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: BACKEND SPECIALIST\n"
             "You own server-side logic, APIs, endpoints, and database models under `src/`. "
+            "You may optionally author unit tests under `tests/` to self-verify your deliverables. "
             "Do NOT modify frontend templates or governance work orders directly."
+        )
+    elif clean_role in ("gemini", "frontend"):
+        blocks.append(
+            "### 🟢 ROLE DIRECTIVE: FRONTEND SPECIALIST\n"
+            "You own client-side interface, HTML/CSS/JS, and assets under `index.html` and `src/`. "
+            "You may optionally author unit tests under `tests/` to self-verify your deliverables. "
+            "Do NOT modify server-side backend logic or governance work orders directly."
         )
     elif clean_role in ("gemma", "qa"):
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: QA LEAD\n"
-            "You own test suites under `tests/` and verification reports under `.sync/inbox/claude/`.\n"
+            "You own end-to-end and integration test suites under `tests/` and verification reports under `.sync/inbox/claude/`.\n"
             "READ ACCESSIBILITY: You have complete read-only access to all application code and directories "
             "(e.g. `src/`, `server/`, `css/`, `index.html`) via `read_file` and `list_directory` "
             "to inspect implementation details and author accurate verification assertions.\n"
+            "VERIFICATION METHODOLOGY: First examine existing application deliverables and any unit tests authored by "
+            "Backend/Frontend specialists. Then author an independent end-to-end integration test suite under `tests/` "
+            "to verify cross-layer integration, API contracts, security hardening, and comprehensive code quality. "
+            "Execute your test suite and sign off with a formal QA verdict.\n"
             "Do NOT modify production source code or governance work orders directly."
         )
     elif clean_role in ("local-llm", "gitops"):
