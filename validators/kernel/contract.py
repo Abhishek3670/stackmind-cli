@@ -259,23 +259,44 @@ class ContractEvaluator:
         if is_protocol_target:
             return True, "authorized"
         if not any(self._matches(target, rule) for rule in contract.allow):
-            # For read-only directory enumeration (list_directory, glob) and security scans (run_security_scan),
-            # permit scanning/enumerating the workspace root or any directory that is an ancestor of
-            # an explicitly allowed rule (so the agent can navigate to its deliverables).
-            if operation_type in ("list_directory", "glob", "run_security_scan"):
+            # For read-only reference documentation and directory enumeration, permit
+            # read-only access so specialists can consult requirements, specs, and brand assets
+            # without triggering spurious permission failures, provided the target is not write-denied.
+            if operation_type not in self._WRITE_OPERATIONS:
                 import posixpath
                 norm_t = posixpath.normpath(target.replace("\\", "/").strip("/"))
-                if norm_t in ("workspace", ".", ""):
-                    return True, "authorized"
                 norm_t_clean = norm_t[len("workspace/"):] if norm_t.startswith("workspace/") else norm_t
-                for a in contract.allow:
-                    norm_a = posixpath.normpath(a.replace("\\", "/").strip("/"))
-                    norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
-                    if norm_a_clean.startswith(norm_t_clean + "/") or norm_a.startswith(norm_t + "/"):
-                        return True, "authorized"
-                # run_security_scan is a read-only static analysis tool; if target is within workspace
-                # and not explicitly denied above, authorize it.
-                if operation_type == "run_security_scan":
+                lower_t = norm_t_clean.lower()
+
+                # Safe workspace reference files (read-only)
+                safe_reference_exact = {
+                    "plan.md", "readme.md", "agents.md", "architecture.md",
+                    "brand-kit.html", "brand-kit.md", "brand-kit.txt",
+                    "package.json", "pyproject.toml", "cargo.toml", "go.mod", "tsconfig.json",
+                    ".sync/system_context.md",
+                }
+                if (
+                    lower_t in safe_reference_exact
+                    or (lower_t.count("/") == 0 and lower_t.startswith("brand-kit"))
+                    or (lower_t.count("/") == 0 and lower_t.endswith(".md"))
+                ):
                     return True, "authorized"
+
+                # Directory navigation (list_directory, glob, run_security_scan)
+                if operation_type in ("list_directory", "glob", "run_security_scan"):
+                    if norm_t in ("workspace", ".", ""):
+                        return True, "authorized"
+                    for a in contract.allow:
+                        norm_a = posixpath.normpath(a.replace("\\", "/").strip("/"))
+                        norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
+                        if norm_a_clean.startswith(norm_t_clean + "/") or norm_a.startswith(norm_t + "/"):
+                            return True, "authorized"
+                    # Safe workspace top-level resource folders
+                    first_seg = lower_t.split("/")[0]
+                    if first_seg in ("assets", "public", "static", "docs", "templates"):
+                        return True, "authorized"
+                    if operation_type == "run_security_scan":
+                        return True, "authorized"
+
             return False, "target is outside allowed scope"
         return True, "authorized"
