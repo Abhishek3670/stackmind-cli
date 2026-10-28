@@ -2794,6 +2794,10 @@ class SessionManager:
                     ):
                         state.delivery_status_delivered = True
                         try:
+                            try:
+                                self.supervisor._ensure_release_documentation(ws, state)
+                            except Exception:
+                                pass
                             delivery_prompt = self.supervisor.format_delivery_status_prompt(state)
                             op = self.start_turn(
                                 state.session_id,

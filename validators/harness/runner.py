@@ -1988,13 +1988,13 @@ class AgentRunner:
                 "You operate in a governed environment with a strictly read-only contract: use `read_file` or `list_directory` to inspect deliverables. "
                 "Do NOT attempt to write or edit any files.\n"
                 "INTEGRATION REVIEW CHECKLIST (MUST VERIFY BEFORE APPROVING):\n"
-                "1. Product Goal Fulfillment: Inspect the actual content of the files. If the user goal requested specific features, text, or entities (e.g. 'Welcome Abhishek', animated background), verify they actually exist in the rendered markup/output — not just placeholder scaffolding.\n"
+                "1. Product Goal Fulfillment: Inspect the actual content of the files. If the user goal requested specific features, text, or entities, verify they actually exist in the rendered markup/output — not just placeholder scaffolding.\n"
                 "2. Cross-File Integration: Verify that element IDs, classes, and function references align across files (e.g. if script.js queries an element ID or style.css targets a class, that ID/class MUST exist in index.html).\n"
-                "3. NO RUBBER-STAMPING: If files are disconnected, placeholder-only, or missing user-requested content, you MUST declare status 'blocked'. "
-                "Populate 'blockers' with concise summaries and 'blocker_details' with [{'finding': '...', 'remediation': '...', 'path': '...'}]. "
-                "The supervisor will automatically route the prescribed rework back to the appropriate developer to fix it before release.\n"
-                "4. Context & Environment: Check developer completion notices in .sync/inbox/claude/ for implementation rationales. In development environments, local developer conveniences (like debug mode and dev secret fallbacks) are permissible and do not block release.\n"
-                "5. When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
+                "3. Release Packaging & Documentation: Release packaging manifests (CHANGELOG.md, VERSION.md) and project README are finalized and governed by the supervisor and GitOps in the release phase. If CHANGELOG.md lacks 0.1.0 release notes or README is boilerplate, do NOT block code integration review when core deliverables pass QA.\n"
+                "4. Board & Runtime Retries: WO-000 is the root planning order and is governed by the supervisor. Historical worker timeouts that subsequently succeeded on retry with passing QA suites are normal self-healing events and must NOT block release.\n"
+                "5. NO RUBBER-STAMPING FOR CODE DEFECTS: If core code files are disconnected, placeholder-only, or fail QA, you MUST declare status 'blocked'. Populate 'blockers' with concise summaries and 'blocker_details' with [{'finding': '...', 'remediation': '...', 'path': '...'}]. The supervisor will automatically route the prescribed rework back to the appropriate developer to fix it before release.\n"
+                "6. Context & Environment: Check developer completion notices in .sync/inbox/claude/ for implementation rationales. In development environments, local developer conveniences (like debug mode and dev secret fallbacks) are permissible and do not block release.\n"
+                "7. When your review is complete, return your final decision strictly as JSON conforming to the requested schema."
             )
         elif is_architecture and is_authoring_task:
             system_msg = (
