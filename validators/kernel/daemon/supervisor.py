@@ -5725,7 +5725,7 @@ class LifecycleSupervisor:
         for dep in state.wo_dependencies.get(wo_id, []):
             dep_str = str(dep).strip()
             if dep_str and dep_str not in state.completed_wo_ids:
-                if dep_str != state.planning_wo_id and dep_str != "WO-000":
+                if dep_str != state.planning_wo_id and dep_str != "WO-000" and dep_str != state.gitops_wo_id:
                     return False
         wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if not wo_file.exists():
@@ -5740,8 +5740,8 @@ class LifecycleSupervisor:
             for dep in deps:
                 dep_str = str(dep).strip()
                 if dep_str and dep_str not in state.completed_wo_ids:
-                    # Also check if the dep is the planning WO (always considered met)
-                    if dep_str != state.planning_wo_id and dep_str != "WO-000":
+                    # Also check if the dep is the planning WO or GitOps WO (GitOps runs at milestone end, never blocks worker)
+                    if dep_str != state.planning_wo_id and dep_str != "WO-000" and dep_str != state.gitops_wo_id:
                         return False
         except Exception:
             pass

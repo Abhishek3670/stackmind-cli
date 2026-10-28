@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pinned the initial user prompt in the TUI transcript compaction summary (`Original user goal: '...'`), ensuring high-level user directives and requirements are never dropped after multiple compaction cycles.
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Multi-Turn Tool Output Context Retention**:
   - Relaxed premature tool output truncation in `GovernedToolRuntime` (`_compact_messages_for_context`): doubled recent tool retention window (`keep_recent = 4` for cloud providers) and raised retention cap from 600 to 1,200 characters so multi-file inspections aren't wiped out before implementation.
 - **Contract Directory Listing & Resource Folder Scoping**:
@@ -24,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.10.4] - 2026-10-28
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Deliverable-First QA Defect Ownership Resolution**:
   - Prioritized canonical deliverable ownership via `_reworkable_wo_for_path` over raw regex matches (`WO-\d+`) in review filenames or text bodies in `_find_qa_defect_verdicts`.
   - Prevented LLM misattributions (e.g. QA blaming `WO-006` for defects in `index.html` owned by `WO-002`) from locking developers in contracts where modifying the defective file is forbidden.
@@ -37,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.10.3] - 2026-10-28
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Permission Denial Storm & Specialist Read Scoping**:
   - Authorized all project specialists (`gemini`, `codex`, `gemma`, `local-llm`, etc.) to read workspace project files (HTML, CSS, JS, markdown documentation, project assets, configurations, and directory listings) without spurious permission denials.
   - Restricted read denials exclusively to true security boundaries (`.git/**`, `.env*`, `.sync/runtime/**`, `.sync/snapshots/**`, secrets/tokens/keys) and private inter-agent inboxes.
@@ -59,6 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added test coverage in `tests/test_blocked_orchestration_honesty_and_asset_code_gate.py` verifying `cancellation_reason` schema acceptance, compatible status handling in `work-orders/BLOCKED/`, historical contract retention for blocked orders, and authoring revision auto-bumping.
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Status Protocol Synchronization for Archived/Cancelled Work Orders**:
   - Fixed `INDEX.yaml` synchronization in `validators/harness/runner.py` and `validators/kernel/daemon/supervisor.py` to preserve the work order's actual status (`CANCELLED` or `BLOCKED`) rather than overwriting `status: "BLOCKED"` in `INDEX.yaml`.
   - Updated `cli/validate.py` (`_validate_work_orders_against_index`) to recognize `CANCELLED`, `FAILED`, and `BLOCKED` as compatible non-executable states in the `work-orders/BLOCKED/` directory, preventing false protocol desync errors from blocking staged validation during planning turns.
@@ -81,6 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `tests/test_blocked_orchestration_honesty_and_asset_code_gate.py` verifying asset exclusion, truthful status reporting, and repair turn gating.
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **`CANCELLED` Work Order Status Validation in `ACTIVE` & `BLOCKED`**:
   - Updated `WORK_ORDER_ALLOWED_STATUSES` and `_normalize_work_order_status` in `cli/validate.py` to allow `"CANCELLED"` (and `"CANCELED"`) work orders in `ACTIVE/` and `BLOCKED/` directories.
   - Eliminated staged validation rejection errors that previously crashed Architect repair turns.
@@ -136,6 +146,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Full test coverage with 7 automated unit tests in `tests/test_ingest_attachments.py`.
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Win32 `Ctrl+O` Thinking Toggle and Control Key Parsing**:
   - Resolved an issue in `cli/tui/keyboard.py` where Windows console / Windows Terminal sends `UnicodeChar == '\x00'` when `Ctrl` is held, causing `Win32ConsoleReader.parse_input_record` to drop `Ctrl+O` (`vk=0x4F`), `Ctrl+K` (`vk=0x4B`), and `Ctrl+L` (`vk=0x4C`).
   - Added dedicated `is_ctrl` virtual key code resolution for `Ctrl+O`, `Ctrl+K`, `Ctrl+L`, `Ctrl+C`, `Ctrl+D`, and `Ctrl+V`.
@@ -286,6 +298,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.5.1] - 2026-09-26
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Full-stretched TUI Layout Restoration (WO-022)**:
   - Eliminated centered conversation deck side gutters on wide screens, restoring full-stretched 2-column layout.
   - Normalized composer input positioning to column 0 with proper cursor repositioning.
@@ -329,6 +343,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Preserved legacy `msvcrt.getwch()` reading path as an explicit fallback via `STACKMIND_LEGACY_INPUT=1`.
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **Windows Terminal Mouse Wheel Collapse**:
   - Resolved issue where mouse wheel events collapsed into Up/Down Arrow scan codes (`0xE0 0x48` / `0x50` via `msvcrt.getwch()`), causing stray navigation jumps.
 - **Composer Escape Character Leakage**:
@@ -363,5 +379,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Restores active composer (`Type a message...`, highlighted blue border, active cursor) seamlessly once turn finishes.
 
 ### Fixed
+- **Inverted GitOps Dependency Deadlock Guard**:
+  - In `_dependencies_met` ([`validators/kernel/daemon/supervisor.py`](file:///W:/Aatish/Stuff/stackmind-cli/validators/kernel/daemon/supervisor.py)), ensured worker work orders cannot be deadlocked by accidental dependencies on `state.gitops_wo_id`. Since GitOps is a terminal milestone release stage that only executes *after* all workers complete, worker execution is never blocked by a GitOps order.
 - **ANSI Escape Styling in Workspace Layout (WO-012)**:
   - Preserved full ANSI styling (user message backgrounds, assistant model badges, markdown syntax highlighting) across the entire conversation viewport by enabling truecolor capture console in `render_workspace_layout_str`.
