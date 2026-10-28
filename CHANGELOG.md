@@ -5,6 +5,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.4] - 2026-10-28
+
+### Fixed
+- **Deliverable-First QA Defect Ownership Resolution**:
+  - Prioritized canonical deliverable ownership via `_reworkable_wo_for_path` over raw regex matches (`WO-\d+`) in review filenames or text bodies in `_find_qa_defect_verdicts`.
+  - Prevented LLM misattributions (e.g. QA blaming `WO-006` for defects in `index.html` owned by `WO-002`) from locking developers in contracts where modifying the defective file is forbidden.
+  - Enhanced deliverable extraction in `_reworkable_wo_for_path` to resolve paths across both single and plural `deliverable`/`deliverables` definitions and companion contract `scope.allow` modules.
+- **Supervisor Operation Contention Resilience**:
+  - Handled `OperationContentionError` explicitly in `_handle_qa_evidence_gap`, `_worker_dispatch`, `_integration_rework`, and GitOps dispatch in `validators/kernel/daemon/supervisor.py`.
+  - Rolled back retry and attempt counts and yielded `AdvanceResult.WAITING_FOR_OPERATION` when a session is busy with an in-flight operation, preventing temporary session concurrency locks from falsely marking work orders as failed or terminating runs into `Phase.FAILED`.
+- **QA Rework Bound Alignment**:
+  - Aligned worker rework escalation in `_route_qa_defect_to_developers` with `state.max_qa_reworks`.
+
 ## [3.10.3] - 2026-10-28
 
 ### Fixed

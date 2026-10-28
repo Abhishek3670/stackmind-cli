@@ -1854,6 +1854,9 @@ class LifecycleSupervisor:
                     parent_operation_id=parent_op_id,
                 )
                 dispatched_any = True
+            except OperationContentionError:
+                # Session is currently occupied by another turn. Let advance() wait.
+                pass
             except Exception as exc:
                 # D024 gate or other pre-check might block — record and continue
                 if wo_id not in state.blocked_wo_ids:
@@ -2661,21 +2664,11 @@ class LifecycleSupervisor:
                     continue
                 if "NEEDS_CHANGES" not in text.upper() and "NEEDS CHANGES" not in text.upper():
                     continue
-                # 1. Target named in filename (e.g. WO-001-qa-verdict.md)
-                found_target = None
-                for target in self._WO_ID_RE.findall(name):
-                    if target != qa_wo_id and target != "WO-000":
-                        found_target = target
-                        break
-                # 2. Target named in text body (e.g. file named WO-004-qa-verdict.md
-                # but text discusses WO-001)
-                if not found_target:
-                    for target in self._WO_ID_RE.findall(text):
-                        if target != qa_wo_id and target != "WO-000":
-                            found_target = target
-                            break
-                # 3. Deliverable path named in text body (e.g. Deliverable: index.html)
-                if not found_target and state is not None:
+                # 1. Check for deliverable path references in the verdict first.
+                # Concrete deliverable ownership takes precedence over LLM-hallucinated
+                # work order IDs in the review text or filename.
+                deliverable_targets: list[str] = []
+                if state is not None:
                     seen_refs: set[str] = set()
                     for ref in self._PATH_TOKEN_RE.findall(text):
                         ref = ref.rstrip(".,;:)'\"").replace("\\", "/")
@@ -2683,10 +2676,36 @@ class LifecycleSupervisor:
                             continue
                         seen_refs.add(ref)
                         owner = self._reworkable_wo_for_path(state, ws, qa_wo_id, ref)
-                        if owner is not None:
-                            found_target = owner
+                        if owner is not None and owner not in deliverable_targets:
+                            deliverable_targets.append(owner)
+
+                # 2. Target named in filename (e.g. WO-001-qa-verdict.md)
+                named_target = None
+                for target in self._WO_ID_RE.findall(name):
+                    if target != qa_wo_id and target != "WO-000":
+                        named_target = target
+                        break
+                # 3. Target named in text body (e.g. file named WO-004-qa-verdict.md
+                # but text discusses WO-001)
+                if not named_target:
+                    for target in self._WO_ID_RE.findall(text):
+                        if target != qa_wo_id and target != "WO-000":
+                            named_target = target
                             break
-                if found_target:
+
+                found_targets: list[str] = []
+                if deliverable_targets:
+                    # If the named target owns one of the failing deliverables, honor it.
+                    if named_target and named_target in deliverable_targets:
+                        found_targets.append(named_target)
+                    else:
+                        # The named target does NOT own the deliverable (LLM misattribution);
+                        # route to the true deliverable owner(s).
+                        found_targets.extend(deliverable_targets)
+                elif named_target:
+                    found_targets.append(named_target)
+
+                for found_target in found_targets:
                     hits.append((found_target, text.strip(), f))
         return hits
 
@@ -2805,11 +2824,40 @@ class LifecycleSupervisor:
             if not isinstance(data, dict):
                 continue
             deliv = data.get("deliverable")
+            delivs = data.get("deliverables")
             deliv_paths: list[str] = []
             if isinstance(deliv, dict) and deliv.get("path"):
                 deliv_paths.append(str(deliv["path"]))
             elif isinstance(deliv, str) and deliv:
                 deliv_paths.append(deliv)
+            elif isinstance(deliv, list):
+                for item in deliv:
+                    if isinstance(item, dict) and item.get("path"):
+                        deliv_paths.append(str(item["path"]))
+                    elif isinstance(item, str) and item:
+                        deliv_paths.append(item)
+            if isinstance(delivs, list):
+                for item in delivs:
+                    if isinstance(item, dict) and item.get("path"):
+                        deliv_paths.append(str(item["path"]))
+                    elif isinstance(item, str) and item:
+                        deliv_paths.append(item)
+            elif isinstance(delivs, dict) and delivs.get("path"):
+                deliv_paths.append(str(delivs["path"]))
+            contract_file = ws / ".sync" / "contracts" / f"{cand}.yaml"
+            if contract_file.is_file():
+                try:
+                    cdata = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                    if isinstance(cdata, dict):
+                        for entry in cdata.get("scope", {}).get("allow", []):
+                            if isinstance(entry, dict) and entry.get("module"):
+                                m = str(entry["module"])
+                                if not m.endswith("*"):
+                                    deliv_paths.append(m)
+                            elif isinstance(entry, str) and not entry.endswith("*"):
+                                deliv_paths.append(entry)
+                except Exception:
+                    pass
             for p in deliv_paths:
                 p_norm = str(p).replace("\\", "/").strip("./").lower()
                 if not p_norm:
@@ -3104,6 +3152,8 @@ class LifecycleSupervisor:
                                 work_order_id=wo_id,
                                 parent_operation_id=parent_op_id,
                             )
+                        except OperationContentionError:
+                            pass
                         except Exception:
                             state.failed_wo_ids.append(wo_id)
                     state.error = None
@@ -3703,6 +3753,8 @@ class LifecycleSupervisor:
             )
             state.gitops_operation_id = op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
+        except OperationContentionError:
+            return AdvanceResult.WAITING_FOR_OPERATION
         except Exception as exc:
             # D024 gate may block GitOps — this is expected if QA verdicts
             # aren't present in the correct inbox location
@@ -3940,6 +3992,13 @@ class LifecycleSupervisor:
                     agent_id="gemma",
                     work_order_id=wo_id,
                 )
+                return AdvanceResult.WAITING_FOR_OPERATION
+            except OperationContentionError:
+                # Parallel sibling turn (e.g. developer rework) is active on the session.
+                # Roll back retry count and ignored op so advance() waits without consuming a retry.
+                state.retry_counts[wo_id] = retries
+                if op_id and str(op_id) in state.ignored_operation_ids:
+                    state.ignored_operation_ids.remove(str(op_id))
                 return AdvanceResult.WAITING_FOR_OPERATION
             except Exception as exc:
                 logger.error(f"Failed to retry QA work order {wo_id}: {exc}", exc_info=True)
@@ -5192,6 +5251,8 @@ class LifecycleSupervisor:
                     agent_id=agent,
                     work_order_id=wo_id,
                 )
+            except OperationContentionError:
+                return AdvanceResult.WAITING_FOR_OPERATION
             except Exception as exc:
                 state.blocked_wo_ids.append(wo_id)
                 state.error = f"Failed to re-dispatch {wo_id} after recovery: {exc}"

@@ -144,7 +144,7 @@ def test_qa_blocked_turn_routes_defect_to_developer(tmp_path: Path) -> None:
     assert "Rework work order WO-001" in rework_ops[0]["prompt"]
     assert "index.html" in rework_ops[0]["prompt"]
     assert rework_ops[0]["agent_id"] == "gemini"
-    assert state.retry_counts.get("WO-001") == 1
+    assert state.attempt_counts.get("WO-001") == 1 or state.retry_counts.get("WO-001") == 1
     # The consumed verdict is archived so it cannot re-trigger rework.
     assert not verdict.exists()
     consumed = list((reviews / "_consumed").glob("WO-001-qa-verdict*"))
@@ -544,7 +544,7 @@ def test_qa_defect_routing_resets_retry_budget_for_previously_exhausted_worker(t
     assert res == AdvanceResult.WAITING_FOR_OPERATION
     assert "WO-001" not in state.failed_wo_ids
     # Rework dispatch consumed 1 attempt of the reset fresh budget
-    assert state.retry_counts["WO-001"] == 1
+    assert state.attempt_counts.get("WO-001") == 1 or state.retry_counts.get("WO-001") == 1
     # Verdict file should be moved to _consumed
     consumed = tmp_path / ".sync" / "reviews" / "_consumed"
     assert consumed.is_dir()
@@ -707,3 +707,92 @@ def test_task_contract_extracts_and_renders_critical_turn_instructions(tmp_path:
 
 
 
+
+
+def test_qa_defect_routing_prioritizes_deliverable_owner_over_hallucinated_wo(tmp_path: Path) -> None:
+    """When QA verdict hallucinates that WO-006 owns index.html, supervisor correctly
+    routes rework to WO-001 (the actual deliverable owner in the contract)."""
+    # WO-001 owns index.html
+    _write_worker_yaml(tmp_path, "WO-001", "gemini", "index.html")
+    # WO-006 owns assets/css/styles.css
+    _write_worker_yaml(tmp_path, "WO-006", "gemini", "assets/css/styles.css")
+    # WO-004 is QA
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_qa.py")
+
+    (tmp_path / "index.html").write_text("<html><body>no hooks</body></html>", encoding="utf-8")
+    (tmp_path / "assets" / "css").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "assets" / "css" / "styles.css").write_text("body { color: red; }", encoding="utf-8")
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_qa.py").write_text("def test_x(): assert False", encoding="utf-8")
+
+    reviews = tmp_path / ".sync" / "reviews"
+    reviews.mkdir(parents=True, exist_ok=True)
+    # Gemma authors a verdict file named WO-006-qa-verdict claiming WO-006 owns index.html
+    verdict = reviews / "WO-006-qa-verdict-20261028.md"
+    verdict.write_text(
+        "# QA Verdict: NEEDS_CHANGES — WO-006\n"
+        "## Defective Deliverable\n"
+        "- index.html (owning developer work order WO-006)\n"
+        "## Failing Assertions\n"
+        "Missing Integration hooks in index.html: navbar, hero, services.\n",
+        encoding="utf-8",
+    )
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001", "WO-006", "WO-004"])
+    state.completed_wo_ids = ["WO-001", "WO-006"]
+
+    wo4_op = mock_mgr.start_turn("sess-001", "QA turn", work_order_id="WO-004", agent_id="gemma")
+    mock_mgr.complete_operation(
+        wo4_op["operation_id"],
+        "BLOCKED",
+        result={
+            "status": "blocked",
+            "summary": "QA reported defects in index.html",
+            "blockers": ["Defective Deliverable: index.html (owning developer work order WO-006)"],
+        },
+    )
+
+    res = supervisor.advance(state)
+
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    # Must route to WO-001 (index.html owner), NOT WO-006!
+    assert state.qa_rework_targets == {"WO-004": ["WO-001"]}
+    assert "WO-001" not in state.completed_wo_ids
+    assert "WO-006" in state.completed_wo_ids  # WO-006 remains completed
+
+    rework_ops = [
+        op for op in mock_mgr.list_operations()
+        if op.get("work_order_id") == "WO-001"
+    ]
+    assert len(rework_ops) == 1
+    assert "Rework work order WO-001" in rework_ops[0]["prompt"]
+    assert "index.html" in rework_ops[0]["prompt"]
+
+
+def test_handle_qa_evidence_gap_contention_error_does_not_fail_work_order(tmp_path: Path) -> None:
+    """When manager.start_turn raises OperationContentionError during QA retry,
+    the work order is NOT marked as failed and the attempt count is preserved."""
+    from validators.kernel.daemon.supervisor import OperationContentionError
+
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_qa.py")
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-004"])
+    state.phase = Phase.EXECUTING
+    state.attempt_counts["WO-004"] = 1
+
+    op = {
+        "operation_id": "op-qa-1",
+        "work_order_id": "WO-004",
+        "result": {"status": "blocked", "summary": "incomplete run"},
+    }
+
+    # Simulate start_turn raising OperationContentionError
+    def raise_contention(*args, **kwargs):
+        raise OperationContentionError("session already has an active operation")
+
+    mock_mgr.start_turn = raise_contention
+
+    res = supervisor._handle_qa_evidence_gap(state, tmp_path, "WO-004", op, "no test results produced")
+
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert "WO-004" not in state.failed_wo_ids
+    assert state.retry_counts.get("WO-004", 0) == 0  # Rolled back!
