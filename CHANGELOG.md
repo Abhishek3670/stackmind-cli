@@ -5,6 +5,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.2] - 2026-10-28
+
+### Added
+- **Work Order Schema `cancellation_reason` Support**:
+  - Added `"cancellation_reason"` property to `schemas/work-order.schema.json` to natively support cancellation and supersession audit reasons written by authoring reconciliation.
+- **Robust Work Order Shorthand Normalization**:
+  - Enhanced `AuthoringGate.normalize_work_order_data` to automatically coerce LLM variations for `test_plan` (strings or lists of strings coerced to canonical `{"sources": [...], "tests": [...]}` mappings), `acceptance_criteria` (single strings to lists), `priority_override` shorthand, and `implementation_estimate` numeric fields.
+- **Regression Test Suite Expansion**:
+  - Added test coverage in `tests/test_blocked_orchestration_honesty_and_asset_code_gate.py` verifying `cancellation_reason` schema acceptance, compatible status handling in `work-orders/BLOCKED/`, historical contract retention for blocked orders, and authoring revision auto-bumping.
+
+### Fixed
+- **Status Protocol Synchronization for Archived/Cancelled Work Orders**:
+  - Fixed `INDEX.yaml` synchronization in `validators/harness/runner.py` and `validators/kernel/daemon/supervisor.py` to preserve the work order's actual status (`CANCELLED` or `BLOCKED`) rather than overwriting `status: "BLOCKED"` in `INDEX.yaml`.
+  - Updated `cli/validate.py` (`_validate_work_orders_against_index`) to recognize `CANCELLED`, `FAILED`, and `BLOCKED` as compatible non-executable states in the `work-orders/BLOCKED/` directory, preventing false protocol desync errors from blocking staged validation during planning turns.
+- **Authoring Readiness Orphan Contract False Positives**:
+  - Updated `validate_authoring_readiness` in `validators/harness/authoring_readiness.py` to recognize contracts belonging to work orders in `work-orders/BLOCKED/` and `work-orders/COMPLETED/`, eliminating bogus `ORPHAN_CONTRACT` errors on archived historical tasks.
+- **AuthoringGate Overwrite Safeguard Auto-Bumping in All Active Supervisor Phases**:
+  - Extended the repair/authoring safeguard in `validators/harness/authoring_gate.py` to cover all active orchestrator phases (`PLANNING`, `AWAITING_APPROVAL`, `AUTHORING`, `AUTHORING_READINESS_GATE`, `ARCHITECT_REPAIR`, `ARCHITECT_RECOVERY_DECISION`, `BLOCKED`), ensuring authorized authors (`claude`, `architecture`, `ceo`) automatically bump revisions with audit amendment records rather than being rejected with `Overwrite conflict` when refining tasks.
+
 ## [3.10.1] - 2026-10-28
 
 ### Added

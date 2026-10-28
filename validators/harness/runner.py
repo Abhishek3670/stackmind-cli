@@ -3802,10 +3802,11 @@ class AgentRunner:
                     b_data = yaml.safe_load(b_file.read_text(encoding="utf-8")) or {}
                     b_id = b_data.get("id") or b_file.stem
                     b_rel = f"work-orders/BLOCKED/{b_file.name}"
+                    b_status = str(b_data.get("status") or "BLOCKED").upper()
                     if b_id in existing_orders:
                         b_entry = existing_orders[b_id]
-                        if b_entry.get("status") != "BLOCKED":
-                            b_entry["status"] = "BLOCKED"
+                        if b_entry.get("status") != b_status:
+                            b_entry["status"] = b_status
                             updated_index = True
                         if b_entry.get("file") != b_rel:
                             b_entry["file"] = b_rel
@@ -3815,7 +3816,7 @@ class AgentRunner:
                             "id": b_id,
                             "type": b_data.get("type", "FEATURE"),
                             "title": b_data.get("title", f"Work order {b_id}"),
-                            "status": "BLOCKED",
+                            "status": b_status,
                             "priority": b_data.get("priority", "P0"),
                             "assigned_agents": b_data.get("assigned_agents", ["codex"]),
                             "dependencies": b_data.get("dependencies", []),

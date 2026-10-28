@@ -1191,15 +1191,19 @@ def _validate_work_order_state_files(sync_path: Path, result: ValidationResult) 
                 continue
 
             if normalized_file_status != index_status:
-                result.issues.append(Issue(
-                    layer="Protocol",
-                    severity=Severity.ERROR,
-                    message=(
-                        f"{file_rel} status '{file_status}' does not match INDEX.yaml "
-                        f"status '{index_order.get('status')}' for '{work_order_id}'"
-                    ),
-                    path=file_rel,
-                ))
+                # In BLOCKED directory, both BLOCKED, CANCELLED, and FAILED denote non-executable archived states
+                if state_dir == "BLOCKED" and normalized_file_status in {"BLOCKED", "FAILED", "CANCELLED"} and index_status in {"BLOCKED", "FAILED", "CANCELLED"}:
+                    pass
+                else:
+                    result.issues.append(Issue(
+                        layer="Protocol",
+                        severity=Severity.ERROR,
+                        message=(
+                            f"{file_rel} status '{file_status}' does not match INDEX.yaml "
+                            f"status '{index_order.get('status')}' for '{work_order_id}'"
+                        ),
+                        path=file_rel,
+                    ))
 
 
 # Default rework budget for actionable work order types

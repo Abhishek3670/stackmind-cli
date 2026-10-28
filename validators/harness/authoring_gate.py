@@ -310,7 +310,7 @@ class AuthoringGate:
         if str(author or "").lower() in self.AUTHORIZED_AUTHORS and isinstance(existing_data, dict):
             existing_synth = str(existing_data.get("synthesized_by", "")).lower()
             new_synth = str(data.get("synthesized_by", "") if isinstance(data, dict) else "").lower()
-            repair_markers = {"bootstrap", "recovery-repair", "architect-repair", "authoring-repair", "repair"}
+            repair_markers = {"bootstrap", "recovery-repair", "architect-repair", "authoring-repair", "repair", "reconcile"}
             is_repair = (
                 existing_synth in repair_markers
                 or new_synth in repair_markers
@@ -334,7 +334,7 @@ class AuthoringGate:
                     except Exception:
                         pass
             if not is_repair:
-                # Also check if supervisor run state is currently in repair, authoring, or blocked phase
+                # Also check if supervisor run state is currently in planning, repair, authoring, or blocked phase
                 sup_dir = project_root / ".sync" / "runtime" / "supervisor"
                 if sup_dir.is_dir():
                     for rf in sup_dir.glob("run-*.yaml"):
@@ -342,19 +342,27 @@ class AuthoringGate:
                             r_state = yaml.safe_load(rf.read_text(encoding="utf-8"))
                             if isinstance(r_state, dict):
                                 r_ph = str(r_state.get("phase", "")).upper()
-                                if r_ph in ("ARCHITECT_REPAIR", "AUTHORING", "AUTHORING_READINESS_GATE", "BLOCKED") or bool(r_state.get("readiness_issues")):
+                                if r_ph in (
+                                    "PLANNING",
+                                    "AWAITING_APPROVAL",
+                                    "AUTHORING",
+                                    "AUTHORING_READINESS_GATE",
+                                    "ARCHITECT_REPAIR",
+                                    "ARCHITECT_RECOVERY_DECISION",
+                                    "BLOCKED",
+                                ) or bool(r_state.get("readiness_issues")):
                                     is_repair = True
                                     break
                         except Exception:
                             pass
 
             if is_repair:
-                # During repair of blocked/failing/scaffold artifacts, an authorized author
-                # is explicitly authorized to replace or refine the artifact.
+                # During repair of blocked/failing/scaffold artifacts or active supervisor runs,
+                # an authorized author is explicitly authorized to replace or refine the artifact.
                 if is_active_wo and isinstance(data, dict):
                     existing_rev = existing_data.get("revision", 1)
                     new_rev = data.get("revision")
-                    if not (isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev):
+                    if not (isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev):
                         existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
                         bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
                         data["revision"] = bumped_rev
@@ -362,12 +370,12 @@ class AuthoringGate:
                         if isinstance(amendments, list):
                             amendments.append({
                                 "revision": bumped_rev,
-                                "reason": "Authoring refinement and readiness repair",
+                                "reason": "Authoring refinement and governance amendment",
                             })
                 elif is_contract and isinstance(data, dict):
                     existing_rev = existing_data.get("contract_revision", 1)
                     new_rev = data.get("contract_revision")
-                    if not (isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev):
+                    if not (isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev):
                         existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
                         bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
                         data["contract_revision"] = bumped_rev
@@ -376,7 +384,7 @@ class AuthoringGate:
             if is_contract and isinstance(data, dict):
                 existing_rev = existing_data.get("contract_revision", 1)
                 new_rev = data.get("contract_revision")
-                if isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev:
+                if isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev:
                     return
 
             # Task amendment: an authorized author may sharpen a live work
@@ -385,7 +393,7 @@ class AuthoringGate:
             if is_active_wo and isinstance(data, dict):
                 existing_rev = existing_data.get("revision", 1)
                 new_rev = data.get("revision")
-                if isinstance(new_rev, int) and isinstance(existing_rev, int) and new_rev > existing_rev:
+                if isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev:
                     return
 
         # Conflict: attempting to overwrite an active artifact from another task or unauthorized update
@@ -477,6 +485,48 @@ class AuthoringGate:
             crit = deliverable.pop("acceptance_criteria")
             if "acceptance_criteria" not in data or not data["acceptance_criteria"]:
                 data["acceptance_criteria"] = crit
+
+        # Normalize acceptance_criteria if single string
+        ac = data.get("acceptance_criteria")
+        if isinstance(ac, str) and ac.strip():
+            data["acceptance_criteria"] = [ac.strip()]
+
+        # Normalize priority_override shorthand
+        po = data.pop("priority_override", None)
+        if po and ("priority" not in data or not data["priority"]):
+            data["priority"] = str(po)
+
+        # Normalize test_plan shorthand
+        tp = data.get("test_plan")
+        if tp is not None:
+            if isinstance(tp, str):
+                data["test_plan"] = [{"tests": [tp]}]
+            elif isinstance(tp, dict):
+                data["test_plan"] = [tp]
+            elif isinstance(tp, list):
+                norm_tp = []
+                for item in tp:
+                    if isinstance(item, str):
+                        norm_tp.append({"tests": [item]})
+                    elif isinstance(item, dict):
+                        t_val = item.get("tests")
+                        if isinstance(t_val, str):
+                            item["tests"] = [t_val]
+                        norm_tp.append(item)
+                data["test_plan"] = norm_tp
+
+        # Normalize implementation_estimate shorthand
+        ie = data.get("implementation_estimate")
+        if isinstance(ie, dict):
+            ef = ie.get("expected_files")
+            if isinstance(ef, str):
+                ie["expected_files"] = [ef]
+            if "max_files_touched" in ie:
+                try:
+                    ie["max_files_touched"] = int(ie["max_files_touched"])
+                except (ValueError, TypeError):
+                    pass
+
         return data
 
     @staticmethod

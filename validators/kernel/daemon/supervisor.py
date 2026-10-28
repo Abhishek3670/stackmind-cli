@@ -6662,6 +6662,7 @@ def archive_blocked_work_orders(
     archived: list[str] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    archived_status_map: dict[str, str] = {}
     for wo_file in sorted(active_dir.glob("*.yaml")):
         wo_id = wo_file.stem
         try:
@@ -6679,6 +6680,7 @@ def archive_blocked_work_orders(
 
         if not wo_data.get("status") or str(wo_data.get("status", "")).upper() == "ACTIVE":
             wo_data["status"] = "BLOCKED"
+        archived_status_map[wo_id] = str(wo_data.get("status") or "BLOCKED").upper()
         wo_data["updated"] = now_iso
         target_file = blocked_dir / wo_file.name
         from validators.kernel.io import durable_write_yaml
@@ -6690,8 +6692,16 @@ def archive_blocked_work_orders(
         archived.append(wo_id)
 
     for target_id in target_ids:
-        if (blocked_dir / f"{target_id}.yaml").is_file() and target_id not in archived:
-            archived.append(target_id)
+        b_target = blocked_dir / f"{target_id}.yaml"
+        if b_target.is_file():
+            if target_id not in archived:
+                archived.append(target_id)
+            if target_id not in archived_status_map:
+                try:
+                    b_data = yaml.safe_load(b_target.read_text(encoding="utf-8")) or {}
+                    archived_status_map[target_id] = str(b_data.get("status") or "BLOCKED").upper()
+                except Exception:
+                    archived_status_map[target_id] = "BLOCKED"
 
     if not archived:
         return []
@@ -6704,7 +6714,7 @@ def archive_blocked_work_orders(
             orders = index_data.get("orders", [])
             for o in orders:
                 if isinstance(o, dict) and o.get("id") in archived:
-                    o["status"] = "BLOCKED"
+                    o["status"] = archived_status_map.get(o.get("id"), "BLOCKED")
                     o["file"] = f"work-orders/BLOCKED/{o.get('id')}.yaml"
                     o["updated"] = now_iso
             index_data["total_active"] = sum(

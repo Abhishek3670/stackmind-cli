@@ -629,14 +629,20 @@ def validate_authoring_readiness(
             continue
         if _is_meta_work_order(contract.data) or str(contract.data.get("agent_id") or "").lower() in ("claude", "architecture"):
             continue
-        cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
-        if cand.is_file():
-            try:
-                c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
-                if str(c_data.get("status", "")).upper() in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
-                    continue
-            except Exception:
-                pass
+        is_archived_or_terminal = False
+        for folder in ("BLOCKED", "COMPLETED", "ACTIVE"):
+            cand = ws / ".sync" / "work-orders" / folder / f"{wo_ref}.yaml"
+            if cand.is_file():
+                try:
+                    c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
+                    st = str(c_data.get("status", "")).upper()
+                    if folder in ("BLOCKED", "COMPLETED") or st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                        is_archived_or_terminal = True
+                        break
+                except Exception:
+                    pass
+        if is_archived_or_terminal:
+            continue
         _issue(issues, "ORPHAN_CONTRACT", "coverage", f"Contract '{contract.path}' references work order '{wo_ref}' " f"which is not an active authored work order", work_order_id=wo_ref, artifact_path=contract.path)
 
     # ── 4. Milestone coverage ───────────────────────────────────────

@@ -150,3 +150,132 @@ def test_authoring_gate_permits_architect_repair_during_supervisor_run(tmp_path:
     # Auto-bumped revision
     data = yaml.safe_load(decision.normalized_content)
     assert data["revision"] >= 2
+
+
+def test_work_order_schema_allows_cancellation_reason(tmp_path: Path):
+    """Work order schema must allow cancellation_reason property without validation errors."""
+    gate = AuthoringGate(project_root=tmp_path)
+    wo_yaml = yaml.safe_dump({
+        "id": "WO-015",
+        "milestone_id": "Milestone 2",
+        "type": "FEATURE",
+        "priority": "P1",
+        "title": "Cancelled Task",
+        "status": "CANCELLED",
+        "description": "Cancelled task description.",
+        "assigned_agents": ["gemini"],
+        "dependencies": [],
+        "acceptance_criteria": ["Cancelled criteria"],
+        "deliverable": {
+            "type": "code",
+            "path": "index.html",
+            "description": "Landing page deliverable",
+        },
+        "error": "Superseded by WO-007",
+        "cancellation_reason": "Superseded by WO-007 for milestone Milestone 2",
+    })
+
+    decision = gate.validate_artifact_content(
+        ".sync/work-orders/BLOCKED/WO-015.yaml",
+        wo_yaml,
+        agent="claude",
+    )
+    assert decision.passed is True
+    assert not any("cancellation_reason" in e for e in decision.errors)
+
+
+def test_cli_validate_permits_compatible_statuses_in_blocked_dir(tmp_path: Path):
+    """cli/validate.py accepts CANCELLED and BLOCKED as compatible non-executable states."""
+    from cli.validate import _validate_work_order_state_files, ValidationResult
+
+    sync_dir = tmp_path / ".sync"
+    blocked_dir = sync_dir / "work-orders" / "BLOCKED"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+
+    wo_file = blocked_dir / "WO-001.yaml"
+    wo_file.write_text(yaml.safe_dump({
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Cancelled Order",
+        "status": "CANCELLED",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "app.py", "description": "app"},
+        "description": "desc",
+    }), encoding="utf-8")
+
+    index_file = sync_dir / "work-orders" / "INDEX.yaml"
+    index_file.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "orders": [{
+            "id": "WO-001",
+            "status": "BLOCKED",
+            "file": "work-orders/BLOCKED/WO-001.yaml",
+        }]
+    }), encoding="utf-8")
+
+    result = ValidationResult()
+    _validate_work_order_state_files(sync_dir, result)
+    protocol_errors = [i for i in result.issues if i.layer == "Protocol" and "status 'CANCELLED' does not match" in i.message]
+    assert len(protocol_errors) == 0
+
+
+def test_authoring_readiness_ignores_contracts_for_blocked_work_orders(tmp_path: Path):
+    """Contracts whose corresponding work orders are archived in BLOCKED are not orphan contracts."""
+    sync_dir = tmp_path / ".sync"
+    blocked_dir = sync_dir / "work-orders" / "BLOCKED"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    contracts_dir = sync_dir / "contracts"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    active_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Active work order and contract
+    (active_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "id": "WO-002",
+        "milestone_id": "Milestone 1",
+        "type": "FEATURE",
+        "title": "Active Task",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["gemini"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "index.html", "description": "desc"},
+        "description": "Active task description",
+        "test_plan": [{"sources": ["index.html"], "tests": ["tests/test_index.py"]}],
+    }), encoding="utf-8")
+    (contracts_dir / "WO-002.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "work_order": "WO-002",
+        "agent_id": "gemini",
+        "scope": {"allow": [{"module": "index.html"}], "deny": [], "write": "read-write"},
+        "budget": {"max_files_touched": 5, "max_tokens": 10000},
+    }), encoding="utf-8")
+
+    # Archived/cancelled work order and its historical contract
+    (blocked_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Cancelled Task",
+        "status": "CANCELLED",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "pkg.json", "description": "desc"},
+        "description": "Cancelled task",
+    }), encoding="utf-8")
+    (contracts_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "work_order": "WO-001",
+        "agent_id": "codex",
+        "scope": {"allow": [{"module": "pkg.json"}], "deny": [], "write": "read-write"},
+        "budget": {"max_files_touched": 2, "max_tokens": 5000},
+    }), encoding="utf-8")
+
+    result = validate_authoring_readiness(
+        tmp_path,
+        plan_id="PLAN-001",
+        expected_milestones=[{"id": "Milestone 1", "title": "Active Task", "agent": "gemini"}],
+    )
+    assert not any(issue.code == "ORPHAN_CONTRACT" and "WO-001" in issue.message for issue in result.issues)
