@@ -251,6 +251,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             default_allow = [
                 {"module": "VERSION*"},
                 {"module": "CHANGELOG*"},
+                {"module": "README*"},
                 {"module": "package.json"},
                 {"module": "pyproject.toml"},
                 {"module": f".sync/inbox/{agent}/**"},
@@ -3181,6 +3182,36 @@ class SessionManager:
                             if files_str
                             else target_instr
                         )
+                        # Ensure target files are explicitly authorized in the agent's contract
+                        delegated_scope = None
+                        if target_files:
+                            ws_path = Path(session["workspace"])
+                            agent_contract_file = ws_path / ".sync" / "agents" / f"{target_agent}.contract.yaml"
+                            if agent_contract_file.is_file():
+                                try:
+                                    c_data = yaml.safe_load(agent_contract_file.read_text(encoding="utf-8"))
+                                    if isinstance(c_data, dict) and "scope" in c_data:
+                                        s_allow = c_data["scope"].setdefault("allow", [])
+                                        existing_mods = {r.get("module") for r in s_allow if isinstance(r, dict)}
+                                        c_updated = False
+                                        for tf in target_files:
+                                            norm_tf = str(tf).replace("\\", "/").strip().lstrip("/")
+                                            if norm_tf not in existing_mods:
+                                                s_allow.append({"module": norm_tf})
+                                                c_updated = True
+                                        c_budget = c_data.setdefault("budget", {})
+                                        needed_budget = max(int(c_budget.get("max_files_touched") or 5), len(target_files) + 5)
+                                        if c_budget.get("max_files_touched") != needed_budget:
+                                            c_budget["max_files_touched"] = needed_budget
+                                            c_updated = True
+                                        if c_updated:
+                                            agent_contract_file.write_text(yaml.safe_dump(c_data, sort_keys=False), encoding="utf-8")
+                                except Exception:
+                                    pass
+                            delegated_scope = {
+                                "allow": [{"module": str(f).replace("\\", "/").strip().lstrip("/")} for f in target_files],
+                                "write": "read-write",
+                            }
                         try:
                             self.start_turn(
                                 session_id,
@@ -3188,6 +3219,7 @@ class SessionManager:
                                 role=target_role,
                                 agent_id=target_agent,
                                 delegated_from=operation_id,
+                                contract_scope=delegated_scope,
                             )
                         except Exception as e:
                             self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")

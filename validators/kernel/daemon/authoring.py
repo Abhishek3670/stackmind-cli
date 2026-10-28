@@ -647,6 +647,8 @@ def build_child_contract(
         allow_rules.extend([
             {"module": "VERSION.md"},
             {"module": "CHANGELOG.md"},
+            {"module": "README.md"},
+            {"module": "README*"},
             {"module": "Makefile"},
             {"module": "pyproject.toml"},
             {"module": "package.json"},

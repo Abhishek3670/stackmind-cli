@@ -19,7 +19,7 @@ PERMISSION_MATRIX_TABLE = """### 🛡️ MULTI-AGENT PERMISSION & BOUNDARY MATRI
 | **Frontend** (`gemini`) | 🔴 **READ-ONLY** | 🟢 **ALLOWED** (`*.html`, `*.css`, UI `*.js`, `assets/**`) | 🟢 **ALLOWED** | 🟡 **SCOPED** (Dev server / preview only) | 🔴 **DENIED** |
 | **Backend** (`codex`) | 🔴 **READ-ONLY** | 🟢 **ALLOWED** (`src/**`, APIs, DB schemas, server code) | 🟢 **ALLOWED** | 🟡 **SCOPED** (Unit tests / package build) | 🔴 **DENIED** |
 | **QA** (`gemma`) | 🔴 **READ-ONLY** | 🟡 **TEST FILES ONLY** (`tests/**`, test fixtures) | 🟢 **ALLOWED** | 🟢 **ALLOWED** (Test runners: `pytest`, etc.) | 🔴 **DENIED** |
-| **GitOps** (`local-llm`) | 🔴 **READ-ONLY** | 🟡 **RELEASE ONLY** (`VERSION.md`, `CHANGELOG.md`)| 🟢 **ALLOWED** | 🟢 **ALLOWED** (Git plumbing via supervisor) | 🟢 **SUPERVISED** |
+| **GitOps** (`local-llm`) | 🔴 **READ-ONLY** | 🟡 **RELEASE ONLY** (`VERSION.md`, `CHANGELOG.md`, `README.md`)| 🟢 **ALLOWED** | 🟢 **ALLOWED** (Git plumbing via supervisor) | 🟢 **SUPERVISED** |
 """
 
 ARCHITECT_PERMISSION_DIRECTIVE = """
@@ -32,7 +32,7 @@ You are the **Lead Architect**. Under StackMind governance rules:
 2. 🔴 **DO NOT RUN SHELL COMMANDS**: Tools like `bash`, `mkdir`, `grep`, and `ls` are strictly DENIED for the Architect.
    - To inspect file contents, ALWAYS use `read_file(target='...')`.
    - To inspect directory structure, use `list_directory(target='...')` or `query_graph(query='...')`.
-3. 🟢 **YOUR AUTHORIZED DELIVERABLES**: `PLAN.md`, `.sync/work-orders/ACTIVE/WO-xxx.yaml`, `.sync/contracts/WO-xxx.yaml`, and architectural decision records in `.sync/decisions/`. You are authorized and expected to directly inspect and repair work order configurations and dependency DAGs in `.sync/work-orders/` when runs stall or are blocked.
+3. 🟢 **YOUR AUTHORIZED DELIVERABLES**: `PLAN.md`, `README.md`, `ARCHITECTURE.md`, `.sync/work-orders/ACTIVE/WO-xxx.yaml`, `.sync/contracts/WO-xxx.yaml`, and architectural decision records in `.sync/decisions/`. You are authorized and expected to directly inspect and repair work order configurations and dependency DAGs in `.sync/work-orders/` when runs stall or are blocked.
 """
 
 
@@ -67,7 +67,7 @@ def get_permission_matrix_prompt(role: str | None = None) -> str:
     elif clean_role in ("local-llm", "gitops"):
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: GITOPS LEAD\n"
-            "You own release manifests (`VERSION.md`, `CHANGELOG.md`) and supervisor-mediated Git commits."
+            "You own release manifests and documentation (`VERSION.md`, `CHANGELOG.md`, `README.md`) and supervisor-mediated Git commits."
         )
 
     import sys

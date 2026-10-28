@@ -269,6 +269,24 @@ class ContractEvaluator:
 
         if is_protocol_target:
             return True, "authorized"
+
+        # Explicit release documentation write authorization for GitOps and Architect
+        if operation_type in self._WRITE_OPERATIONS and contract.write_mode == "read-write":
+            norm_target = target.replace("\\", "/").strip("/").lower()
+            if "workspace/" in norm_target:
+                norm_target = norm_target.split("workspace/", 1)[1]
+
+            is_gitops = str(getattr(contract, "agent_id", "")).lower() in {"local-llm", "gitops"} or str(getattr(contract, "role", "")).lower() in {"gitops", "release"}
+            if is_gitops:
+                release_doc_names = ("readme.md", "readme", "readme.txt", "changelog.md", "changelog", "version.md", "version", "package.json", "pyproject.toml")
+                if norm_target in release_doc_names:
+                    return True, "authorized"
+
+            if is_architect:
+                doc_names = ("plan.md", "readme.md", "architecture.md", "version", "version.md", "changelog.md")
+                if norm_target in doc_names or norm_target.startswith((".sync/decisions/", ".sync/work-orders/", ".sync/contracts/")):
+                    return True, "authorized"
+
         if not any(self._matches(target, rule) for rule in contract.allow):
             # For read-only operations (reading code, docs, assets, or directory enumeration), permit
             # read-only access so specialists can inspect existing deliverables, requirements, and brand assets

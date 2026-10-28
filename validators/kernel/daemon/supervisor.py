@@ -3837,7 +3837,7 @@ class LifecycleSupervisor:
                             scope_dict = c_data.setdefault("scope", {})
                             allow_list = scope_dict.setdefault("allow", [])
                             existing_mods = {r.get("module") for r in allow_list if isinstance(r, dict)}
-                            needed = ["tests/**", "test/**", "src/**", "app/**", "*.py", "VERSION.md", "CHANGELOG.md"]
+                            needed = ["tests/**", "test/**", "src/**", "app/**", "*.py", "VERSION.md", "CHANGELOG.md", "README.md", "README*"]
                             updated = False
                             for n in needed:
                                 if n not in existing_mods:
