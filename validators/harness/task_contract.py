@@ -569,6 +569,21 @@ def compile_worker_task_contract(
     brand_file = Path(workspace) / "brand-kit.html"
     if brand_file.is_file():
         result["brand_reference"] = "brand-kit.html exists in workspace root; inspect with read_file for brand tokens, fonts, and colors." 
+    import sys
+    host_os = "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
+    result["host_operating_system"] = host_os
+    result["host_shell_environment"] = "powershell / cmd.exe" if sys.platform == "win32" else "posix / bash"
+
+    role_str = str(getattr(task, "role", "") or (contract_data or {}).get("identity", {}).get("role", "")).lower()
+    agent_id = str(getattr(task, "agent_id", "") or (contract_data or {}).get("agent_id", "")).lower()
+    if agent_id in ("gemma", "qa") or role_str in ("qa", "quality"):
+        result["qa_read_accessibility"] = (
+            "You have full read-only access to all workspace application code and directories "
+            "(e.g. src/, server/, css/, index.html) via read_file and list_directory "
+            "to inspect implementation details and craft accurate test assertions. "
+            "Write access remains strictly scoped to tests/."
+        )
+
     if turn_instructions:
         result["critical_turn_instructions"] = turn_instructions
     return result
@@ -585,7 +600,18 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     )
     env = contract.get("project_environment") or "development"
     env_line = f" Project environment is '{env}'."
+    import sys
+    host_os = "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
+    os_line = (
+        f" Host OS: {host_os}. "
+        + (
+            "Unix commands (ls, cat, touch) are not native Windows binaries. "
+            "Use StackMind built-in tools (list_directory, read_file, grep, write_file) or native Windows executables (pytest, python, git)."
+            if sys.platform == "win32" else ""
+        )
+    )
     has_critical = bool(contract.get("critical_turn_instructions"))
+    env_line = env_line + os_line
     critical_rule = (
         " CRITICAL DIRECTIVE: Satisfy all instructions in 'critical_turn_instructions' "
         "(e.g. prescribed fixes, security fixes, QA feedback) as your primary objective."

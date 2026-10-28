@@ -116,7 +116,7 @@ class ContractEvaluator:
     """Fail-closed target and operation authorization evaluator."""
 
     _WRITE_OPERATIONS = {
-        "write_file", "apply_patch", "move_file", "delete_file", "format_file",
+        "write_file", "apply_patch", "patch_file", "move_file", "delete_file", "format_file",
         "run_command", "process_start", "git_stage", "git_restore", "git_create_branch",
         "git_commit", "git_tag", "git_push", "create_release", "rollback_release",
         "create_work_order", "update_work_order", "reopen_work_order",
@@ -293,6 +293,11 @@ class ContractEvaluator:
                     if norm_t in ("workspace", ".", ""):
                         return True, "authorized"
                     first_seg = lower_t.split("/")[0]
+                    is_qa_agent = (contract.agent_id.lower() in ("gemma", "qa") or role_str in ("qa", "quality"))
+                    if is_qa_agent:
+                        # QA verifiers require full read visibility across workspace code and resource folders
+                        # (server/, src/, css/, etc.) to inspect deliverables under test and craft accurate assertions.
+                        return True, "authorized"
                     if first_seg in ("assets", "public", "static", "docs", "templates"):
                         return True, "authorized"
                     for a in contract.allow:

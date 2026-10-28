@@ -58,7 +58,10 @@ def get_permission_matrix_prompt(role: str | None = None) -> str:
     elif clean_role in ("gemma", "qa"):
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: QA LEAD\n"
-            "You own test suites under `tests/` and verification reports under `.sync/reviews/`. "
+            "You own test suites under `tests/` and verification reports under `.sync/inbox/claude/`.\n"
+            "READ ACCESSIBILITY: You have complete read-only access to all application code and directories "
+            "(e.g. `src/`, `server/`, `css/`, `index.html`) via `read_file` and `list_directory` "
+            "to inspect implementation details and author accurate verification assertions.\n"
             "Do NOT modify production source code or governance work orders directly."
         )
     elif clean_role in ("local-llm", "gitops"):
@@ -67,6 +70,21 @@ def get_permission_matrix_prompt(role: str | None = None) -> str:
             "You own release manifests (`VERSION.md`, `CHANGELOG.md`) and supervisor-mediated Git commits."
         )
 
+    import sys
+    host_os = "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
+    host_guidance = (
+        "On Windows, Unix shell commands (like `ls -la`, `cat`, `touch`) are NOT native executable binaries. "
+        "ALWAYS use StackMind built-in tools: `list_directory` instead of `ls`, `read_file` instead of `cat`, "
+        "`grep` instead of shell grep, and `write_file` instead of `touch`."
+        if sys.platform == "win32"
+        else "Use StackMind built-in tools for safe file operations."
+    )
+    blocks.append(
+        f"### 💻 HOST ENVIRONMENT & OPERATING SYSTEM\n"
+        f"- Host Operating System: **{host_os}**\n"
+        f"- Primary Shell: **{'powershell / cmd.exe' if sys.platform == 'win32' else 'bash / sh'}**\n"
+        f"- Shell Guidance: {host_guidance}"
+    )
     return "\n\n".join(blocks)
 
 

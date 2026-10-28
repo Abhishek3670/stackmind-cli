@@ -5,6 +5,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.7] - 2026-10-28
+
+### Added
+- **Host OS Awareness & Cross-Platform Tooling**:
+  - Injected Host Operating System (`Windows`, `macOS`, or `Linux`) and primary shell environment (`powershell / cmd.exe` vs `posix / bash`) into compiled task contracts (`TASK CONTRACT JSON`), system prompt directives (`render_worker_system`), and `permission_matrix.py`.
+  - Added OS-specific tool guidance informing models that Unix commands (e.g. `ls -la`, `cat`, `touch`) are not native Windows executables and instructing them to use StackMind built-in tools (`list_directory`, `read_file`, `grep`, `write_file`).
+  - Added native Windows command emulation in `ToolGateway.run_command`: commands such as `ls`, `ls -la`, `dir`, and `pwd` are handled natively on Windows rather than failing with executable-not-found errors.
+  - Added graceful `FileNotFoundError` handling in `ProcessSandbox.run()`: catching missing binary invocations and returning exit code 127 with helpful OS-aware guidance instead of crashing or tripping consecutive tool failure circuit breakers.
+- **QA Read Accessibility for Test Authoring**:
+  - In `validators/kernel/contract.py` (`ContractEvaluator.authorize`), authorized QA agents (`gemma`, `qa`) for read-only `list_directory` and `glob` across all workspace code and resource folders (`src/`, `server/`, `css/`, etc.).
+  - Preserved fail-closed write isolation: QA agents remain strictly blocked from modifying application source files (`write_file`, `apply_patch`, `patch_file`), confining write permissions to `tests/**` and inbox review artifacts.
+  - Updated QA worker dispatch instructions in `LifecycleSupervisor` to guide inspecting `server/`, `src/`, `index.html` via `read_file` and `list_directory` to author accurate verification assertions.
+
 ## [3.10.6] - 2026-10-28
 
 ### Added

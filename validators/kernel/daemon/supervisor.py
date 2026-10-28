@@ -3897,11 +3897,18 @@ class LifecycleSupervisor:
         agent = self._agent_for_wo(wo_id, ws)
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         if agent == "gemma" and deliv_path:
+            import sys
+            os_note = (
+                "\nHost OS: Windows. Use list_directory and read_file to inspect application deliverables (server/, src/, index.html); "
+                "do NOT run Unix shell commands like 'ls -la'."
+                if sys.platform == "win32" else ""
+            )
             return (
                 f"Execute work order {wo_id} as the QA worker.\n"
-                f"1. Author the declared test suite '{deliv_path}' with write_file — thorough "
+                f"1. Inspect existing workspace deliverables (e.g. server/, src/, index.html) with read_file and list_directory to ground your test assertions.{os_note}\n"
+                f"2. Author the declared test suite '{deliv_path}' with write_file — thorough "
                 f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.\n"
-                f"2. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
+                f"3. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
                 f"3. Run the run_security_scan tool over the deliverables and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
                 f"4. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"

@@ -307,6 +307,10 @@ class CommandResult:
     stderr: str
 
     @property
+    def exit_code(self) -> int:
+        return self.returncode
+
+    @property
     def is_resource_limit_failure(self) -> bool:
         """Check whether the command execution failed due to memory or CPU limits."""
         if "MemoryError" in self.stderr or "out of memory" in self.stderr.lower():
@@ -418,17 +422,30 @@ class ProcessSandbox:
 
         proc = None
         try:
-            proc = subprocess.Popen(
-                argv,
-                cwd=self.workspace.root,
-                env=limit_env,
-                shell=False,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=(sys.platform != "win32"),
-                creationflags=creationflags,
-            )
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=self.workspace.root,
+                    env=limit_env,
+                    shell=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=(sys.platform != "win32"),
+                    creationflags=creationflags,
+                )
+            except FileNotFoundError:
+                exe = argv[0] if argv else "command"
+                if sys.platform == "win32":
+                    msg = (
+                        f"Command execution '{exe}' failed: executable or file not found. "
+                        f"Host OS is Windows (win32). '{exe}' is not a native Windows binary. "
+                        "Use StackMind built-in tools (list_directory, read_file, grep, write_file) "
+                        "or native Windows executables (pytest, python, git)."
+                    )
+                else:
+                    msg = f"Command execution '{exe}' failed: executable or file not found."
+                return CommandResult(127, "", msg)
             if job is not None and not _assign_windows_job(job, proc):
                 # Fail closed: never execute a command whose limits could not
                 # be attached before its first instruction.

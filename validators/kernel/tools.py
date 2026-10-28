@@ -22,7 +22,7 @@ from .identity import AuthorizationPolicy
 from .interpreter_denylist import check_command, is_gitops_role
 from .operations import OperationRequest, OperationType
 from .process import ProcessManager
-from .sandbox import ProcessSandbox
+from .sandbox import CommandResult, ProcessSandbox
 from .workspace import ScratchWorkspace
 from .work_order_ops import (
     append_audit,
@@ -242,6 +242,42 @@ class ToolGateway:
         denial_reason = check_command(command, role=role)
         if denial_reason is not None:
             raise PermissionError(denial_reason)
+
+        # Host OS awareness (Windows): handle common Unix file-inspection utilities natively
+        # so agents calling 'ls', 'ls -la', or 'pwd' receive clean output rather than tripping
+        # consecutive tool failures due to missing Windows binaries.
+        if sys.platform == "win32" and command:
+            cmd0 = str(command[0]).lower().strip()
+            if cmd0 in ("ls", "dir"):
+                target_arg = "."
+                for arg in command[1:]:
+                    if not str(arg).startswith("-"):
+                        target_arg = str(arg)
+                        break
+                target_path = self.workspace.path_for(target_arg)
+                if not target_path.exists():
+                    res = CommandResult(1, "", f"ls: {target_arg}: No such file or directory\n")
+                elif target_path.is_file():
+                    res = CommandResult(0, f"{target_path.name}\n", "")
+                else:
+                    lines = []
+                    try:
+                        for item in sorted(target_path.iterdir()):
+                            rel_parts = item.relative_to(self.workspace.root).parts
+                            if any(p.startswith(".") and p not in (".sync",) for p in rel_parts) or "__pycache__" in rel_parts:
+                                continue
+                            kind = "<DIR> " if item.is_dir() else f"{item.stat().st_size:>8} "
+                            lines.append(f"{kind} {item.name}")
+                    except Exception as e:
+                        lines.append(f"Error reading directory: {e}")
+                    res = CommandResult(0, "\n".join(lines) + "\n", "")
+                self.boundary.journal.complete(record.request.operation_id, res)
+                return res
+
+            if cmd0 == "pwd":
+                res = CommandResult(0, f"{self.workspace.root}\n", "")
+                self.boundary.journal.complete(record.request.operation_id, res)
+                return res
         env_extra = {}
         if not is_gitops_role(role):
             import tempfile
