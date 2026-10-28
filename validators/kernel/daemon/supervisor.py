@@ -715,6 +715,21 @@ class LifecycleSupervisor:
         state.turn_deadline = None
         state.turn_started_at = None
 
+        if hasattr(self, "manager") and self.manager is not None:
+            try:
+                session = self.manager.get_session(state.session_id)
+                active_op = session.get("active_operation")
+                if active_op:
+                    try:
+                        self.manager.cancel_operation(active_op)
+                    except Exception:
+                        pass
+                    if hasattr(self.manager, "_active"):
+                        self.manager._active.pop(active_op, None)
+                    session["active_operation"] = None
+            except Exception:
+                pass
+
         # Note: self._wrap_manager_for_budget already decrements global_turn_budget upon turn dispatch.
         # No duplicate decrement here to avoid double-charging (Item 4).
 
@@ -1810,6 +1825,24 @@ class LifecycleSupervisor:
             if new_op is not None:
                 state.recovery_decision_operation_id = new_op.get("operation_id")
                 return AdvanceResult.WAITING_FOR_OPERATION
+            # Clean contention fallback: clear session active_operation and retry once before failing
+            try:
+                session = self.manager.get_session(state.session_id)
+                active_op = session.get("active_operation")
+                if active_op:
+                    try:
+                        self.manager.cancel_operation(active_op)
+                    except Exception:
+                        pass
+                    if hasattr(self.manager, "_active"):
+                        self.manager._active.pop(active_op, None)
+                session["active_operation"] = None
+                new_op = self._dispatch_recovery_decision(state, ws, str(wo_id), None)
+                if new_op is not None:
+                    state.recovery_decision_operation_id = new_op.get("operation_id")
+                    return AdvanceResult.WAITING_FOR_OPERATION
+            except Exception:
+                pass
         state.error = "Recovery decision operation was lost and could not be re-dispatched"
         self._transition(state, Phase.BLOCKED)
         return AdvanceResult.BLOCKED
@@ -4492,6 +4525,29 @@ class LifecycleSupervisor:
                 **flags,
             )
         except Exception:
+            # Operation contention or session lock - clear any orphaned/stale active operation and retry once
+            try:
+                session = self.manager.get_session(state.session_id)
+                active_op = session.get("active_operation")
+                if active_op:
+                    try:
+                        self.manager.cancel_operation(active_op)
+                    except Exception:
+                        pass
+                    if hasattr(self.manager, "_active"):
+                        self.manager._active.pop(active_op, None)
+                    session["active_operation"] = None
+                    return self.manager.start_turn(
+                        state.session_id,
+                        prompt,
+                        role="architecture",
+                        agent_id="claude",
+                        work_order_id=wo_id,
+                        is_authoring=True,
+                        **flags,
+                    )
+            except Exception:
+                pass
             return None
 
     def _verify_repair_outcome(

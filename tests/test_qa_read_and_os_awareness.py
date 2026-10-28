@@ -204,3 +204,89 @@ def test_task_contract_and_system_prompt_os_awareness(tmp_path: Path):
     perm_matrix = get_permission_matrix_prompt("qa")
     assert "### 💻 HOST ENVIRONMENT & OPERATING SYSTEM" in perm_matrix
     assert "READ ACCESSIBILITY: You have complete read-only access" in perm_matrix
+
+
+def test_standard_test_modules_allow_yaml_and_httpx(tmp_path: Path):
+    """Test files in tests/ are permitted to import standard test utilities (yaml, httpx, mock)
+
+    even if not declared in requirements.txt, while production files fail closed.
+    """
+    from validators.harness.dependency_gate import check_import_satisfiability
+
+    # Create empty requirements.txt with only pytest
+    (tmp_path / "requirements.txt").write_text("pytest==8.0.0\n", encoding="utf-8")
+
+    # 1. Test file importing yaml, pytest, httpx
+    test_file = tmp_path / "tests" / "test_api.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_code = """
+import pytest
+import yaml
+import httpx
+
+def test_config():
+    data = yaml.safe_load("a: 1")
+    assert data["a"] == 1
+"""
+    test_file.write_text(test_code, encoding="utf-8")
+
+    res_test = check_import_satisfiability(test_file, tmp_path)
+    assert res_test.passed is True
+    assert len(res_test.undeclared_imports) == 0
+
+    # 2. Production file importing yaml without declaration must fail closed
+    src_file = tmp_path / "src" / "server.py"
+    src_file.parent.mkdir(parents=True, exist_ok=True)
+    src_code = """
+import yaml
+
+def parse():
+    return yaml.safe_load("{}")
+"""
+    src_file.write_text(src_code, encoding="utf-8")
+
+    res_src = check_import_satisfiability(src_file, tmp_path)
+    assert res_src.passed is False
+    assert "yaml" in res_src.undeclared_imports
+
+
+def test_architect_recovery_dispatch_recovers_from_operation_contention(tmp_path: Path):
+    """_architect_turn clears stale active_operation on contention and succeeds on retry."""
+    from validators.kernel.daemon.supervisor import LifecycleSupervisor, RunState
+
+    state = RunState(
+        run_id="run-test",
+        session_id="sess-test",
+        workspace=str(tmp_path),
+        product_goal="test",
+    )
+
+    class MockManager:
+        def __init__(self):
+            self.session = {"session_id": "sess-test", "active_operation": "op-stale-worker"}
+            self._active = {"op-stale-worker": object()}
+            self.start_turn_attempts = 0
+
+        def get_session(self, session_id):
+            return self.session
+
+        def cancel_operation(self, op_id):
+            if self.session.get("active_operation") == op_id:
+                self.session["active_operation"] = None
+
+        def start_turn(self, session_id, prompt, **kwargs):
+            self.start_turn_attempts += 1
+            if self.session.get("active_operation"):
+                raise RuntimeError("OperationContentionError: session already has active operation")
+            return {"operation_id": "op-new-architect", "status": "RUNNING"}
+
+    mock_mgr = MockManager()
+    sup = LifecycleSupervisor(manager=mock_mgr)
+
+    # Dispatch architect turn
+    result = sup._architect_turn(state, "Recovery prompt", "WO-035")
+
+    assert result is not None
+    assert result["operation_id"] == "op-new-architect"
+    assert mock_mgr.start_turn_attempts == 2
+    assert mock_mgr.session["active_operation"] is None

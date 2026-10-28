@@ -42,6 +42,13 @@ FALLBACK_STDLIB_MODULES: frozenset[str] = frozenset(
 STANDARD_TEST_MODULES: frozenset[str] = frozenset({
     "pytest",
     "_pytest",
+    "yaml",
+    "pyyaml",
+    "mock",
+    "httpx",
+    "requests",
+    "responses",
+    "pytest_mock",
 })
 
 

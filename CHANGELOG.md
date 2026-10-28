@@ -5,6 +5,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.8] - 2026-10-28
+
+### Added
+- **Resilient Architect Recovery Turn Dispatch**:
+  - In `validators/kernel/daemon/supervisor.py` (`_handle_turn_timeout`), automatically cancels and clears timed-out operations from `session["active_operation"]` upon monotonic deadline expiration.
+  - In `_architect_turn`, added defensive contention recovery: if `start_turn` raises due to a lingering or timed-out worker operation, clears `session["active_operation"]` and retries dispatch.
+  - In `_advance_recovery_decision`, added a clean contention retry before marking a recovery decision lost and halting in `Phase.BLOCKED`.
+- **Standard Test Module Allowlist in Dependency Gate**:
+  - In `validators/harness/dependency_gate.py` (`STANDARD_TEST_MODULES`), expanded allowed test imports to include `"yaml"`, `"pyyaml"`, `"mock"`, `"httpx"`, `"requests"`, `"responses"`, and `"pytest_mock"`.
+  - Ensures QA verification suites authoring tests against Docker compose manifests or HTTP endpoints are not blocked by false-positive undeclared dependency checks, while production code remains strictly verified against project manifests.
+
 ## [3.10.7] - 2026-10-28
 
 ### Added
