@@ -105,7 +105,7 @@ def compute_command_dialog_height(state: Any | None, height: int | None = None) 
     content_lines = len(lines)
 
     term_height = height or 24
-    max_content_height = max(2, min(14, (term_height - 8) // 2))
+    max_content_height = max(2, min(8, max(3, (term_height - 10) // 2)))
     visible_content = min(content_lines, max_content_height)
     return visible_content + 2
 
@@ -124,7 +124,7 @@ def render_command_dialog(
     total_lines = len(lines)
 
     term_height = height or 24
-    max_content = max(2, min(14, (term_height - 8) // 2))
+    max_content = max(2, min(8, max(3, (term_height - 10) // 2)))
 
     if total_lines > max_content:
         max_scroll = total_lines - max_content

@@ -463,18 +463,21 @@ def render_consumed_skills_summary(
     records: Sequence[Any],
     is_global: bool,
     dest_path: str,
-) -> Panel:
+    width: int | None = None,
+    as_panel: bool = True,
+) -> RenderableType:
     """Render summary table of consumed procedural skills."""
-    title = Text(" CONSUMED PROCEDURAL SKILLS (:consume-skills) ", style="bold green")
     table = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
     table.add_column("Skill ID", style="bold cyan", no_wrap=True)
     table.add_column("Name", style="bold white", no_wrap=True)
-    table.add_column("Ver", justify="right", style="dim")
-    table.add_column("Status", style="bold green")
-    table.add_column("Risk", style="bold")
-    table.add_column("Steps", justify="right", style="cyan")
-    table.add_column("Scope", justify="center", style="yellow")
-    table.add_column("Description", style="dim")
+    if width is None or width >= 105:
+        table.add_column("Ver", justify="right", style="dim")
+    table.add_column("Status", style="bold green", no_wrap=True)
+    if width is None or width >= 105:
+        table.add_column("Risk", style="bold", no_wrap=True)
+        table.add_column("Steps", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Scope", justify="center", style="yellow", no_wrap=True)
+    table.add_column("Description", style="dim", overflow="ellipsis")
 
     for s in records:
         risk_style = (
@@ -482,16 +485,21 @@ def render_consumed_skills_summary(
             if s.risk_tier.value in ("high", "critical")
             else ("yellow" if s.risk_tier.value == "medium" else "green")
         )
-        table.add_row(
+        row: list[Any] = [
             s.skill_id,
             s.name,
-            f"v{s.version}",
-            s.status.value.upper(),
-            Text(s.risk_tier.value.upper(), style=risk_style),
-            str(len(s.steps)),
-            "GLOBAL" if is_global else "LOCAL",
-            s.description[:40] + ("..." if len(s.description) > 40 else ""),
-        )
+        ]
+        if width is None or width >= 105:
+            row.append(f"v{s.version}")
+        row.append(s.status.value.upper())
+        if width is None or width >= 105:
+            row.append(Text(s.risk_tier.value.upper(), style=risk_style))
+            row.append(str(len(s.steps)))
+            row.append("GLOBAL" if is_global else "LOCAL")
+        desc_len = 50 if (width is not None and width < 105) else 75
+        desc_text = s.description[:desc_len] + ("..." if len(s.description) > desc_len else "")
+        row.append(desc_text)
+        table.add_row(*row)
 
     summary = Text()
     names_str = ", ".join(f"'{s.name}'" for s in records)
@@ -499,6 +507,10 @@ def render_consumed_skills_summary(
     summary.append(f"{dest_path}\n", style="bold white")
     summary.append("Run ':skills' to view all active skills, or ':skill <name>' for detailed steps.", style="dim")
 
+    if not as_panel:
+        return Group(table, summary)
+
+    title = Text(" CONSUMED PROCEDURAL SKILLS (:consume-skills) ", style="bold green")
     return Panel(
         Group(table, summary),
         title=title,
@@ -513,11 +525,12 @@ def render_consumed_skills_summary_str(
     records: Sequence[Any],
     is_global: bool,
     dest_path: str,
-    width: int = 80,
+    width: int = 120,
+    as_panel: bool = False,
 ) -> str:
     buf = io.StringIO()
     console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
-    console.print(render_consumed_skills_summary(records, is_global, dest_path))
+    console.print(render_consumed_skills_summary(records, is_global, dest_path, width=width, as_panel=as_panel))
     return console.export_text().rstrip()
 
 

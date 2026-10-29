@@ -926,8 +926,10 @@ def render_full_screen_workspace(
     )
     show_footer = True
 
+    dialog_open = getattr(state, "command_dialog_open", False) if state is not None else False
+
     # 1. Bottom Status Bar (1 line, placed below composer, matches composer text box width / WO-018)
-    status_width = layout.conversation_width if layout.show_runtime else width
+    status_width = width if dialog_open else (layout.conversation_width if layout.show_runtime else width)
     status_bar_str = render_top_header_bar_str(
         session or {},
         width=status_width,
@@ -941,7 +943,7 @@ def render_full_screen_workspace(
     # Use the same width as the composer so multi-line input wraps identically
     # in the height calculation and in the rendered box. A mismatch here makes
     # the composer jump vertically between frames and leaves ghost borders.
-    comp_width = layout.conversation_width if layout.show_runtime else width
+    comp_width = width if dialog_open else (layout.conversation_width if layout.show_runtime else width)
     viewport_height = compute_viewport_height(
         height,
         state=state,
@@ -991,12 +993,12 @@ def render_full_screen_workspace(
         )
 
     # 4b. System command dialog anchored just above the text area
-    dialog_open = getattr(state, "command_dialog_open", False) if state is not None else False
     dialog_str = ""
     if dialog_open:
         from cli.tui.command_dialog import render_command_dialog_str
 
-        dialog_width = layout.conversation_width if layout.show_runtime else width
+        # Full terminal width so the command dialog spans the workspace cleanly without vacating right space
+        dialog_width = width
         dialog_str = render_command_dialog_str(
             state, width=dialog_width, height=height, force_color=force_color, no_color=no_color
         )

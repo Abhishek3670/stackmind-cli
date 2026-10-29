@@ -2205,7 +2205,8 @@ def dispatch_delivery_command(
                         if is_global
                         else str(Path(ws_path or ".").resolve() / ".sync" / "skills" / "active")
                     )
-                    output_str = render_consumed_skills_summary_str(records, is_global, dest_desc)
+                    term_w = shutil.get_terminal_size(fallback=(120, 24)).columns
+                    output_str = render_consumed_skills_summary_str(records, is_global, dest_desc, width=term_w, as_panel=False)
                 except Exception as exc:
                     output_str = f"[Error consuming skills] {exc}"
 

@@ -220,3 +220,26 @@ def test_page_up_and_down_scrolls_dialog():
     editor.handle_key(Key.PAGE_UP)
     assert state.command_dialog_scroll == 0
 
+def test_command_dialog_full_width_and_no_vacated_space():
+    """Verify dialog spans full terminal width and does not vacate right side."""
+    session = {"session_id": "sess-test", "workspace": "."}
+    state = AutonomousDeliveryState(session_id="sess-test")
+    state.roles["Backend"] = RoleStatus("Backend", "Codex", state="ACTIVE")
+    state.show_command_dialog(":status", "Session: sess-test\nStatus: ACTIVE")
+
+    frame = render_full_screen_workspace(
+        session=session,
+        state=state,
+        width=120,
+        height=30,
+        no_color=True,
+    )
+
+    lines = frame.split("\n")
+    # Every line must match terminal width (no short vacated lines on the right)
+    for idx, l in enumerate(lines):
+        assert len(l) == 120, f"Line {idx} had length {len(l)} != 120 (vacated right space detected)"
+
+    # Dialog title and composer must be present
+    assert "Status" in frame
+    assert "Type a message..." in frame
