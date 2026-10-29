@@ -145,9 +145,6 @@ def compute_viewport_height(
     chrome = comp_h + (STATUS_BAR_HEIGHT if show_footer else 0)
     if state is not None and getattr(state, "settings_panel_open", False):
         chrome += SETTINGS_PANEL_HEIGHT
-    if state is not None and getattr(state, "command_dialog_open", False):
-        from cli.tui.command_dialog import compute_command_dialog_height
-        chrome += compute_command_dialog_height(state, height=lines)
     return max(MIN_VIEWPORT_HEIGHT, lines - chrome)
 
 
@@ -812,6 +809,7 @@ def render_workspace_layout_str(
     height: int | None = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
+    dialog_str: str | None = None,
 ) -> str:
     """Render the full workspace layout as plain or ANSI-styled text."""
     if conversation_content is not None:
@@ -836,13 +834,26 @@ def render_workspace_layout_str(
         if active_scroll is not None and getattr(active_scroll, "has_new_activity", False):
             effective_vp_height = max(1, effective_vp_height - 2)
         conv_w = layout.conversation_width if layout.show_runtime else width
-        conversation_text = slice_conversation_viewport(
-            conversation_text,
-            viewport_height=effective_vp_height,
-            scroll=active_scroll,
-            pad=True,
-            avail_width=conv_w,
-        )
+        if dialog_str:
+            d_lines = dialog_str.split("\n")
+            d_h = len(d_lines)
+            chat_vp_height = max(1, effective_vp_height - d_h)
+            conversation_text = slice_conversation_viewport(
+                conversation_text,
+                viewport_height=chat_vp_height,
+                scroll=active_scroll,
+                pad=True,
+                avail_width=conv_w,
+            )
+            conversation_text = f"{conversation_text}\n{dialog_str}"
+        else:
+            conversation_text = slice_conversation_viewport(
+                conversation_text,
+                viewport_height=effective_vp_height,
+                scroll=active_scroll,
+                pad=True,
+                avail_width=conv_w,
+            )
 
     console, use_ansi = _make_capture_console(
         width=width,
@@ -929,7 +940,7 @@ def render_full_screen_workspace(
     dialog_open = getattr(state, "command_dialog_open", False) if state is not None else False
 
     # 1. Bottom Status Bar (1 line, placed below composer, matches composer text box width / WO-018)
-    status_width = width if dialog_open else (layout.conversation_width if layout.show_runtime else width)
+    status_width = layout.conversation_width if layout.show_runtime else width
     status_bar_str = render_top_header_bar_str(
         session or {},
         width=status_width,
@@ -940,10 +951,7 @@ def render_full_screen_workspace(
     )
 
     # 2. Viewport height (reserved 1 line for bottom status bar, dynamic composer box height, and settings panel if open)
-    # Use the same width as the composer so multi-line input wraps identically
-    # in the height calculation and in the rendered box. A mismatch here makes
-    # the composer jump vertically between frames and leaves ghost borders.
-    comp_width = width if dialog_open else (layout.conversation_width if layout.show_runtime else width)
+    comp_width = layout.conversation_width if layout.show_runtime else width
     viewport_height = compute_viewport_height(
         height,
         state=state,
@@ -970,7 +978,17 @@ def render_full_screen_workspace(
             height=min(height, viewport_height) if height is not None else None,
         )
 
-    # 4. Workspace layout with sliced conversation and persistent runtime panel
+    # 4. System command dialog docked cleanly at the bottom of the conversation column
+    dialog_str = ""
+    if dialog_open:
+        from cli.tui.command_dialog import render_command_dialog_str
+
+        dialog_width = layout.conversation_width if layout.show_runtime else width
+        dialog_str = render_command_dialog_str(
+            state, width=dialog_width, height=viewport_height, force_color=force_color, no_color=no_color
+        )
+
+    # 4b. Workspace layout with docked command dialog and persistent runtime panel
     workspace_str = render_workspace_layout_str(
         conv_text,
         width=width,
@@ -980,6 +998,7 @@ def render_full_screen_workspace(
         height=viewport_height,
         force_color=force_color,
         no_color=no_color,
+        dialog_str=dialog_str if dialog_open else None,
     )
 
     settings_open = getattr(state, "settings_panel_open", False) if state is not None else False
@@ -992,21 +1011,8 @@ def render_full_screen_workspace(
             state, width=settings_width, height=SETTINGS_PANEL_HEIGHT
         )
 
-    # 4b. System command dialog anchored just above the text area
-    dialog_str = ""
-    if dialog_open:
-        from cli.tui.command_dialog import render_command_dialog_str
-
-        # Full terminal width so the command dialog spans the workspace cleanly without vacating right space
-        dialog_width = width
-        dialog_str = render_command_dialog_str(
-            state, width=dialog_width, height=height, force_color=force_color, no_color=no_color
-        )
-
     if not include_composer:
         blocks = [workspace_str]
-        if dialog_str:
-            blocks.append(dialog_str)
         if settings_open and settings_panel_str:
             blocks.append(settings_panel_str)
         if status_bar_str:
@@ -1046,8 +1052,6 @@ def render_full_screen_workspace(
     )
 
     blocks = [workspace_str]
-    if dialog_str:
-        blocks.append(dialog_str)
     blocks.append(composer_str)
     if settings_open and settings_panel_str:
         blocks.append(settings_panel_str)

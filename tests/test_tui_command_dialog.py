@@ -220,8 +220,8 @@ def test_page_up_and_down_scrolls_dialog():
     editor.handle_key(Key.PAGE_UP)
     assert state.command_dialog_scroll == 0
 
-def test_command_dialog_full_width_and_no_vacated_space():
-    """Verify dialog spans full terminal width and does not vacate right side."""
+def test_command_dialog_docked_layout_and_no_vacated_space():
+    """Verify dialog is docked inside conversation column, side panel retains full height, and composer preserves text area layout."""
     session = {"session_id": "sess-test", "workspace": "."}
     state = AutonomousDeliveryState(session_id="sess-test")
     state.roles["Backend"] = RoleStatus("Backend", "Codex", state="ACTIVE")
@@ -236,10 +236,17 @@ def test_command_dialog_full_width_and_no_vacated_space():
     )
 
     lines = frame.split("\n")
-    # Every line must match terminal width (no short vacated lines on the right)
-    for idx, l in enumerate(lines):
-        assert len(l) == 120, f"Line {idx} had length {len(l)} != 120 (vacated right space detected)"
+    assert len(lines) == 30
 
-    # Dialog title and composer must be present
+    # Workspace rows (0-25) span full 120 width: left has chat/dialog, right has runtime side panel
+    for idx in range(26):
+        assert len(lines[idx]) == 120, f"Workspace line {idx} had length {len(lines[idx])} != 120 (vacated right space detected)"
+
+    # Composer rows (26-28) and status bar (29) are strictly aligned with conversation column (width 86)
+    for idx in range(26, 30):
+        assert len(lines[idx]) == 86, f"Bottom line {idx} had length {len(lines[idx])} != 86 (text area layout distorted)"
+
+    # Dialog title, side panel, and composer must be present
     assert "Status" in frame
+    assert "Backend" in frame
     assert "Type a message..." in frame
