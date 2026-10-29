@@ -216,7 +216,11 @@ class ContractEvaluator:
             normalized == p.strip("/") or normalized.startswith(p.strip("/") + "/")
             for p in self._PROTOCOL_TARGET_PREFIXES
         )
-        is_architect = str(getattr(contract, "agent_id", "")).lower() in {"claude", "architecture", "architect"}
+        role_str = str(getattr(contract, "role", "") or "").lower()
+        is_architect = (
+            str(getattr(contract, "agent_id", "")).lower() in {"claude", "architecture", "architect"}
+            or role_str in {"claude", "architecture", "architect"}
+        )
         is_read_operation = operation_type not in self._WRITE_OPERATIONS
         if is_architect and is_read_operation:
             security_deny_patterns = (
@@ -304,10 +308,15 @@ class ContractEvaluator:
                     agent_stem = contract.agent_id.lower()
                     if inbox_owner not in (agent_stem, role_str):
                         return False, "target is outside allowed scope"
-                if lower_t.startswith(".sync/work-orders/") or lower_t.startswith(".sync/contracts/"):
+                if (lower_t.startswith(".sync/work-orders/") or lower_t.startswith(".sync/contracts/")) and not is_architect:
                     return False, "target is outside allowed scope"
 
                 if operation_type in ("list_directory", "glob"):
+                    if is_architect and (
+                        lower_t in (".sync", ".sync/work-orders", ".sync/contracts", ".sync/decisions")
+                        or lower_t.startswith((".sync/work-orders/", ".sync/contracts/", ".sync/decisions/"))
+                    ):
+                        return True, "authorized"
                     if norm_t in ("workspace", ".", ""):
                         return True, "authorized"
                     first_seg = lower_t.split("/")[0]

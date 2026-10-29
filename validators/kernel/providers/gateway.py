@@ -2124,9 +2124,8 @@ class ProviderGateway:
                     cmd_str = " ".join(str(c) for c in cmd_val) if isinstance(cmd_val, list) else str(cmd_val)
                     target_str = cmd_str
                     res = (
-                        f"Error: PermissionError: Command execution '{cmd_str}' was denied: "
-                        f"command execution is not permitted for this role's contract. "
-                        f"Retrying will not help. Use 'read_file' to read files and return your decision."
+                        f"Error: PermissionError: Command execution '{cmd_str}' was denied: {ex}. "
+                        f"CRITICAL: Do NOT retry this command. Follow the actionable remedy below."
                     )
                     if any(k in actor_str for k in ("claude", "architect", "architecture")):
                         res += (
@@ -2155,7 +2154,8 @@ class ProviderGateway:
                                 "2. Call `trigger_goal(goal=...)` for full multi-agent feature implementation."
                             )
 
-                # Record incident to .sync/state/incidents.jsonl
+                # Record incident to .sync/state/incidents.jsonl and extract actionable remedy
+                remedy_text = ""
                 try:
                     from validators.kernel.incidents import record_permission_incident
                     proj_path = (
@@ -2163,7 +2163,7 @@ class ProviderGateway:
                         or getattr(getattr(self.tool_gateway, "workspace", None), "root", None)
                     )
                     actor_id = getattr(self.tool_gateway, "actor_id", "agent")
-                    record_permission_incident(
+                    inc_rec = record_permission_incident(
                         project_path=proj_path,
                         agent=actor_id,
                         role=actor_str,
@@ -2171,8 +2171,28 @@ class ProviderGateway:
                         target=target_str,
                         reason=str(ex),
                     )
+                    if inc_rec and inc_rec.get("remedy"):
+                        remedy_text = inc_rec["remedy"]
                 except Exception:
                     pass
+
+                # Inject the actionable remedy directly into the tool response
+                if remedy_text:
+                    res += f"\nACTIONABLE REMEDY: {remedy_text}"
+
+                # In-turn repetition guard: alert if agent retries similar blocked action
+                if not hasattr(self, "_denial_history"):
+                    self._denial_history = []
+                is_repeated = any(
+                    prev_tool == name and (prev_target == target_str or (target_str and prev_target in target_str))
+                    for prev_tool, prev_target in self._denial_history
+                )
+                self._denial_history.append((name, target_str))
+                if is_repeated:
+                    res += (
+                        f"\n⚠️ REPETITION ALERT: You have already attempted a denied '{name}' operation in this turn. "
+                        f"DO NOT retry this operation. Comply with the actionable remedy above or conclude your turn."
+                    )
             else:
                 res = f"Error executing {name}: {type(ex).__name__}: {ex}"
 

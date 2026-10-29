@@ -187,3 +187,83 @@ def test_tui_stream_header_cleans_agent_daemon_label() -> None:
     hdr_arch = render_assistant_stream_header(model="Architecture · claude")
     assert "StackMind" in hdr_arch
     assert "Architecture · claude" in hdr_arch
+
+def test_compute_actionable_remedy_patterns() -> None:
+    """Verify intelligent, pattern-specific remedy generation."""
+    from validators.kernel.incidents import compute_actionable_remedy
+
+    # 1. Interpreter -c code-string flag
+    rem1 = compute_actionable_remedy(
+        role="backend",
+        tool="run_command",
+        target="python -c import fastapi",
+        reason="interpreter 'python' invoked with code-string flag '-c' is denied at the agent boundary",
+    )
+    assert "Inline interpreter code flags" in rem1
+    assert "tests/" in rem1 or "server/" in rem1
+
+    # 2. Worker trying to read work order
+    rem2 = compute_actionable_remedy(
+        role="backend",
+        tool="read_file",
+        target=".sync/work-orders/ACTIVE/WO-001.yaml",
+        reason="target is outside allowed scope",
+    )
+    assert "Task Contract" in rem2
+    assert "Direct access to '.sync/work-orders/' is restricted" in rem2
+
+    # 3. Schema validation failure
+    rem3 = compute_actionable_remedy(
+        role="architect",
+        tool="write_file",
+        target=".sync/work-orders/ACTIVE/WO-001.yaml",
+        reason="Authoring validation failed for WO-001.yaml: unexpected property",
+    )
+    assert "schema" in rem3.lower()
+
+
+def test_incident_alias_retrieval(tmp_path: Path) -> None:
+    """Verify get_recent_incidents resolves agent aliases (backend <-> codex)."""
+    record_permission_incident(
+        project_path=tmp_path,
+        agent="codex",
+        role="backend",
+        tool="run_command",
+        target="python -c import foo",
+        reason="interpreter 'python' invoked with code-string flag '-c' is denied at the agent boundary",
+    )
+
+    # Querying by 'backend' role matches 'codex' agent
+    incidents_backend = get_recent_incidents(tmp_path, agent="backend")
+    assert len(incidents_backend) == 1
+    assert "Inline interpreter code flags" in incidents_backend[0]["remedy"]
+
+    # Querying by 'codex' also matches
+    incidents_codex = get_recent_incidents(tmp_path, agent="codex")
+    assert len(incidents_codex) == 1
+
+
+def test_contract_architect_read_sync_access() -> None:
+    """Verify Architect can read and list .sync/work-orders and .sync/decisions."""
+    from validators.kernel.contract import AgentContract, ContractEvaluator
+
+    contract = AgentContract(
+        agent_id="claude",
+        work_order="WO-000",
+        allow=("PLAN.md", ".sync/work-orders/**", ".sync/decisions/**"),
+        deny=(".git/**",),
+        write_mode="read-write",
+    )
+    evaluator = ContractEvaluator()
+
+    # Reading work orders
+    ok_read, _ = evaluator.authorize(contract, "read_file", "workspace/.sync/work-orders/ACTIVE/WO-001.yaml")
+    assert ok_read is True
+
+    # Listing work orders directory
+    ok_list, _ = evaluator.authorize(contract, "list_directory", "workspace/.sync/work-orders")
+    assert ok_list is True
+
+    # Listing decisions directory
+    ok_list_dec, _ = evaluator.authorize(contract, "list_directory", "workspace/.sync/decisions")
+    assert ok_list_dec is True

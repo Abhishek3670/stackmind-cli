@@ -2069,6 +2069,17 @@ class AgentRunner:
                 pass
         elif self.agent in ('gemma', 'qa'):
             system_msg = QA_SYSTEM_PROMPT
+            try:
+                from validators.kernel.permission_matrix import get_permission_matrix_prompt
+                from validators.kernel.incidents import format_incidents_for_prompt
+                perm_prompt = get_permission_matrix_prompt(self.agent)
+                if perm_prompt:
+                    system_msg = f"{system_msg}\n\n{perm_prompt}"
+                incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
+                if incidents_prompt:
+                    system_msg = f"{system_msg}\n\n{incidents_prompt}"
+            except Exception:
+                pass
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = raw_context
         elif self.agent in ('local-llm', 'gitops'):
@@ -2081,6 +2092,17 @@ class AgentRunner:
                 "2. If CHANGELOG.md does not exist, use `write_file` to write CHANGELOG.md documenting the release deliverables.\n"
                 "3. Immediately return the final HarnessDecision JSON declaring status 'completed'."
             )
+            try:
+                from validators.kernel.permission_matrix import get_permission_matrix_prompt
+                from validators.kernel.incidents import format_incidents_for_prompt
+                perm_prompt = get_permission_matrix_prompt(self.agent)
+                if perm_prompt:
+                    system_msg = f"{system_msg}\n\n{perm_prompt}"
+                incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
+                if incidents_prompt:
+                    system_msg = f"{system_msg}\n\n{incidents_prompt}"
+            except Exception:
+                pass
             raw_context = getattr(request.context, 'text', '') if request.context else ''
             full_context = raw_context
         else:
@@ -2108,6 +2130,17 @@ class AgentRunner:
                 request.task, wo_data, contract_data, self.project_path,
             )
             system_msg = render_worker_system(task_contract_json)
+            try:
+                from validators.kernel.permission_matrix import get_permission_matrix_prompt
+                from validators.kernel.incidents import format_incidents_for_prompt
+                perm_prompt = get_permission_matrix_prompt(self.agent)
+                if perm_prompt:
+                    system_msg = f"{system_msg}\n\n{perm_prompt}"
+                incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
+                if incidents_prompt:
+                    system_msg = f"{system_msg}\n\n{incidents_prompt}"
+            except Exception:
+                pass
             task_text = render_task_block(task_contract_json) + '\n'
             uses_task_contract = True
             if tool_runtime is not None:
