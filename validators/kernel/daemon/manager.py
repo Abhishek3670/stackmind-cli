@@ -892,6 +892,13 @@ class SessionManager:
                 if model_name:
                     backend.model = model_name
                     backend.model_name = model_name
+            elif backend_id and backend_id != "echo-agent":
+                from validators.harness.backend import ModelExecutionBackend
+                backend = ModelExecutionBackend(
+                    backend_id=backend_id,
+                    model=model_name or "default",
+                    available=True,
+                )
 
             provider_adapter = None
             prov_cfg = (app_settings.providers.get(backend_id) if app_settings else None) or load_settings().providers.get(backend_id)
@@ -2183,6 +2190,10 @@ class SessionManager:
                 role or agent_id or (session.get("agent") if parent_operation_id is None else "backend")
             )
             effective_agent_id = agent_id or role or effective_role
+            canonical_for_rec = self._canonical_role(effective_role)
+            role_cfg_for_rec = self._roles.get(canonical_for_rec, {})
+            b_id_for_rec = (metadata or {}).get("backend") or (metadata or {}).get("provider") or role_cfg_for_rec.get("backend") or session.get("provider")
+            m_id_for_rec = (metadata or {}).get("model") or role_cfg_for_rec.get("model") or session.get("model")
             record = {
                 "operation_id": operation_id,
                 "parent_operation_id": parent_operation_id,
@@ -2194,6 +2205,9 @@ class SessionManager:
                 "contract_scope": contract_scope,
                 "role": effective_role,
                 "agent_id": effective_agent_id,
+                "backend": b_id_for_rec,
+                "backend_id": b_id_for_rec,
+                "model": m_id_for_rec,
                 "status": "RUNNING",
                 "started_at": now,
                 "transitions": [
@@ -2977,10 +2991,10 @@ class SessionManager:
                 try:
                     _, op_rec = self._operation(operation_id)
                     b_id = getattr(runner, "backend_id", None)
-                    if isinstance(b_id, str):
+                    if isinstance(b_id, str) and b_id != "echo":
                         op_rec["backend_id"] = b_id
                     b_mod = getattr(runner, "backend_model", None)
-                    if isinstance(b_mod, str):
+                    if isinstance(b_mod, str) and b_mod != "stackmind-echo-v1":
                         op_rec["model"] = b_mod
                 except KeyError:
                     pass

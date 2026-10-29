@@ -894,7 +894,9 @@ class OperationalEventManager:
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
                 acts = self.current_actions if not self.current_actions.is_empty else None
-                state.add_message("assistant", assistant_response, deduplicate=True, actions=acts, thinking=assistant_thinking)
+                from cli.tui.commands import resolve_turn_model_attribution
+                ev_model = resolve_turn_model_attribution(state, op_rec=payload, role=payload.get("role"))
+                state.add_message("assistant", assistant_response, deduplicate=True, actions=acts, thinking=assistant_thinking, model=ev_model)
 
             return render_tool_activity(activity), assistant_response
 
@@ -905,7 +907,9 @@ class OperationalEventManager:
             assistant_thinking = extract_assistant_thinking(payload, workspace=self.workspace)
             if assistant_response and state is not None:
                 acts = self.current_actions if not self.current_actions.is_empty else None
-                state.add_message("assistant", assistant_response, deduplicate=True, actions=acts, thinking=assistant_thinking)
+                from cli.tui.commands import resolve_turn_model_attribution
+                ev_model = resolve_turn_model_attribution(state, op_rec=payload, role=payload.get("role"))
+                state.add_message("assistant", assistant_response, deduplicate=True, actions=acts, thinking=assistant_thinking, model=ev_model)
 
         return render_operational_event(event), assistant_response
 

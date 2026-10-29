@@ -395,6 +395,13 @@ class AgentRunner:
             from validators.kernel.providers.adapter import ProviderAdapter
             if isinstance(self.llm_provider, ProviderAdapter):
                 self.provider_adapter = self.llm_provider
+        if self.provider_adapter is not None:
+            p_name = getattr(self.provider_adapter, 'provider_name', None) or getattr(self.provider_adapter, 'backend_id', None)
+            p_model = getattr(self.provider_adapter, 'model', None) or getattr(self.provider_adapter, 'model_name', None)
+            if p_name:
+                self.backend_id = p_name
+            if p_model:
+                self.backend_model = p_model
         self.search_tool = SessionSearchTool(search_provider, policy=retrieval_policy)
         self.token_budget = token_budget
         self.context_limit = context_limit

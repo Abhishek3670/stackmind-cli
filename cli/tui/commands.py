@@ -429,6 +429,69 @@ def _build_in_progress_turn_content(
     return f"{transcript}\n\n{in_progress}" if transcript else in_progress
 
 
+def resolve_turn_model_attribution(
+    state: Any,
+    session: dict[str, Any] | None = None,
+    op_rec: dict[str, Any] | None = None,
+    role: str | None = None,
+) -> str | None:
+    """Resolve user-facing provider/model attribution badge for a turn without echo fallback."""
+    from cli.tui.runtime_panel import format_model_badge
+
+    # 1. Check op_rec if it contains real provider and model
+    if op_rec and isinstance(op_rec, dict):
+        rec_b = op_rec.get("backend_id") or op_rec.get("backend")
+        rec_m = op_rec.get("model")
+        if rec_m and str(rec_m).lower() not in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+            return format_model_badge(rec_b, rec_m)
+
+    # 2. Check active role from state.roles
+    cur_op = state.get_current_operation() if hasattr(state, "get_current_operation") else {}
+    target_role = (
+        role
+        or (cur_op.get("role") if cur_op else None)
+        or (session.get("active_role") if session else None)
+        or "Architecture"
+    )
+    role_st = None
+    if hasattr(state, "roles") and state.roles:
+        role_st = (
+            state.roles.get(target_role)
+            or state.roles.get(target_role.capitalize())
+            or state.roles.get(target_role.title())
+            or state.roles.get("Architecture")
+        )
+
+    if role_st:
+        b = getattr(role_st, "backend", None)
+        m = getattr(role_st, "model", None)
+        q = getattr(role_st, "quantization", None)
+        if m and str(m).lower() not in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+            return format_model_badge(b, m, q)
+        if b and str(b).lower() not in ("echo", "echo-agent", "daemon"):
+            return str(b)
+
+    # 3. Check cur_op
+    if cur_op:
+        b = cur_op.get("backend")
+        m = cur_op.get("model")
+        if m and str(m).lower() not in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+            return format_model_badge(b, m)
+        if b and str(b).lower() not in ("echo", "echo-agent", "daemon"):
+            return str(b)
+
+    # 4. Check session
+    if session and isinstance(session, dict):
+        b = session.get("provider")
+        m = session.get("model")
+        if m and str(m).lower() not in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+            return format_model_badge(b, m)
+        if b and str(b).lower() not in ("echo", "echo-agent", "daemon"):
+            return str(b)
+
+    return None
+
+
 def _stream_turn_execution(
     adapter: StackMindTuiAdapter,
     client: DaemonClient,
@@ -444,6 +507,8 @@ def _stream_turn_execution(
     model_name: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Synchronously await turn completion while consuming events via native SSE."""
+    if not model_name or str(model_name).lower() in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+        model_name = resolve_turn_model_attribution(state, session)
     workspace = Path(session["workspace"]) if session.get("workspace") else None
     max_wait = effective_timeout
     start_time = time.time()
@@ -791,11 +856,8 @@ def _stream_turn_execution(
                     state.current_turn_thinking_start_time = time.monotonic()
                 if not streaming_active:
                     streaming_active = True
-                    if model_name is None:
-                        if op_rec and isinstance(op_rec, dict):
-                            model_name = op_rec.get("model")
-                        elif session and isinstance(session, dict):
-                            model_name = session.get("model")
+                    if not model_name or str(model_name).lower() in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+                        model_name = resolve_turn_model_attribution(state, session, op_rec)
                 now_mono = time.monotonic()
                 if now_mono - last_redraw_time >= 0.1:
                     layout = compute_layout(shutil.get_terminal_size().columns)
@@ -831,11 +893,8 @@ def _stream_turn_execution(
                     )
                 if not streaming_active:
                     streaming_active = True
-                    if model_name is None:
-                        if op_rec and isinstance(op_rec, dict):
-                            model_name = op_rec.get("model")
-                        elif session and isinstance(session, dict):
-                            model_name = session.get("model")
+                    if not model_name or str(model_name).lower() in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+                        model_name = resolve_turn_model_attribution(state, session, op_rec)
 
                 streamed_chunks.append(delta)
                 if hasattr(state, "record_turn_text"):
@@ -978,7 +1037,7 @@ def _stream_turn_execution(
                     turn_acts = state.current_turn_actions
                     if turn_acts:
                         turn_acts.expanded = False
-                    state.add_message("assistant", resp, actions=turn_acts, thinking=thinking)
+                    state.add_message("assistant", resp, actions=turn_acts, thinking=thinking, model=model_name)
                     if is_tty:
                         redraw_full_screen(
                             session,
@@ -1131,7 +1190,7 @@ def _stream_turn_execution(
         if turn_acts:
             turn_acts.expanded = False
         thinking = getattr(state, "current_turn_thinking", None) or None
-        state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking)
+        state.add_message("assistant", full_resp, actions=turn_acts, thinking=thinking, model=model_name)
         assistant_rendered = True
         streamed_chunks = []
         if not is_tty:
@@ -1232,7 +1291,7 @@ def _stream_turn_execution(
                     if resp and not assistant_rendered:
                         turn_acts = state.current_turn_actions
                         state.add_message(
-                            "assistant", resp, actions=turn_acts, thinking=thinking
+                            "assistant", resp, actions=turn_acts, thinking=thinking, model=model_name
                         )
                         if is_tty:
                             redraw_full_screen(
@@ -1334,7 +1393,7 @@ def _stream_turn_execution(
                 from cli.tui.chat import format_contract_payload
                 summary = format_contract_payload(summary)
                 turn_acts = state.current_turn_actions
-                state.add_message("assistant", summary, actions=turn_acts, thinking=thinking)
+                state.add_message("assistant", summary, actions=turn_acts, thinking=thinking, model=model_name)
                 if is_tty:
                     redraw_full_screen(
                         session,
@@ -2357,6 +2416,7 @@ def dispatch_delivery_command(
                 if not is_tty:
                     click.echo(feedback_msg)
                     return session, False
+                model_label = resolve_turn_model_attribution(state, session)
                 return _stream_turn_execution(
                     adapter,
                     client,
@@ -2367,6 +2427,7 @@ def dispatch_delivery_command(
                     effective_timeout=effective_timeout,
                     is_tty=is_tty,
                     live_manager=live_manager,
+                    model_name=model_label,
                     initial_activity_desc="Authoring work orders and contracts",
                 )
             except Exception as e:
@@ -2383,6 +2444,7 @@ def dispatch_delivery_command(
         if not is_tty:
             click.echo("Approval recorded.")
             return session, False
+        model_label = resolve_turn_model_attribution(state, session)
         return _stream_turn_execution(
             adapter,
             client,
@@ -2393,6 +2455,7 @@ def dispatch_delivery_command(
             effective_timeout=effective_timeout,
             is_tty=is_tty,
             live_manager=live_manager,
+            model_name=model_label,
             initial_activity_desc="Execution resumed after HITL approval",
         )
 
@@ -2907,6 +2970,10 @@ def dispatch_delivery_command(
             status_line = Text(msg, style="dim cyan")
             click.echo(status_line)
 
+        cur_op = state.get_current_operation() or {}
+        active_role = cur_op.get("role") or "Architecture"
+        model_label = resolve_turn_model_attribution(state, session, role=active_role)
+
         return _stream_turn_execution(
             adapter,
             client,
@@ -2917,6 +2984,7 @@ def dispatch_delivery_command(
             effective_timeout=effective_timeout,
             is_tty=is_tty,
             live_manager=live_manager,
+            model_name=model_label,
             initial_activity_desc="Routing goal to Architecture" if is_goal else "Turn submitted",
         )
     except KeyboardInterrupt:

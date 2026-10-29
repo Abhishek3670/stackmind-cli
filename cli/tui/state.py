@@ -112,6 +112,7 @@ class OperationNode:
     status: str = "RUNNING"
     parent_id: str | None = None
     children: list[str] = field(default_factory=list)
+    model: str | None = None
 
 
 @dataclass
@@ -477,6 +478,7 @@ class ChatMessage:
     is_command: bool = False
     thinking_elapsed: float | None = None
     thinking_tokens: int | None = None
+    model: str | None = None
 
 
 @dataclass
@@ -1039,6 +1041,7 @@ class AutonomousDeliveryState:
         is_command: bool = False,
         thinking_elapsed: float | None = None,
         thinking_tokens: int | None = None,
+        model: str | None = None,
     ) -> ChatMessage:
         clean = content.strip()
         if not is_command and role == "user" and clean.startswith(":"):
@@ -1161,6 +1164,7 @@ class AutonomousDeliveryState:
             is_command=is_command,
             thinking_elapsed=msg_thinking_elapsed,
             thinking_tokens=msg_thinking_tokens,
+            model=model,
         )
         self.messages.append(msg)
 

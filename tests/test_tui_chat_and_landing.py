@@ -920,3 +920,47 @@ def test_format_contract_payload_strips_harness_decision():
     cleaned_pure = format_contract_payload(pure_hd)
     assert "HarnessDecision" not in cleaned_pure
     assert cleaned_pure == "All dependencies resolved."
+
+def test_model_attribution_resolution_and_suppression():
+    """Verify real agent provider/model is resolved and stackmind-echo-v1 is suppressed."""
+    from cli.tui.chat import clean_model_attribution, build_assistant_header
+    from cli.tui.commands import resolve_turn_model_attribution
+    from cli.tui.state import AutonomousDeliveryState, RoleStatus
+
+    # 1. Echo strings are cleanly suppressed
+    assert clean_model_attribution("stackmind-echo-v1") is None
+    assert clean_model_attribution("echo-agent") is None
+    assert clean_model_attribution("echo") is None
+    assert clean_model_attribution("Architecture · stackmind-echo-v1") == "Architecture"
+
+    # 2. Real provider/model strings are preserved
+    assert clean_model_attribution("custom/inception/mercury-3") == "custom/inception/mercury-3"
+    assert clean_model_attribution("ollama/gemma4:31b-cloud") == "ollama/gemma4:31b-cloud"
+
+    # 3. Header formatting
+    echo_hdr = build_assistant_header("stackmind-echo-v1")
+    assert echo_hdr.plain == "✦ StackMind"
+    real_hdr = build_assistant_header("custom/inception/mercury-3")
+    assert real_hdr.plain == "✦ StackMind (custom/inception/mercury-3)"
+
+    # 4. State resolution from configured roles
+    state = AutonomousDeliveryState(session_id="test-attr")
+    state.roles["Architecture"] = RoleStatus(
+        role="Architecture",
+        backend="custom",
+        model="inception/mercury-3",
+        state="RUNNING",
+    )
+    resolved = resolve_turn_model_attribution(state)
+    assert resolved == "custom/inception/mercury-3"
+
+    # 5. AgentRunner provider_adapter reflection
+    from unittest.mock import MagicMock
+    from validators.harness.runner import AgentRunner
+    from pathlib import Path
+    mock_adapter = MagicMock()
+    mock_adapter.provider_name = "custom"
+    mock_adapter.model = "inception/mercury-3"
+    runner = AgentRunner(Path("."), "claude", provider_adapter=mock_adapter)
+    assert runner.backend_id == "custom"
+    assert runner.backend_model == "inception/mercury-3"

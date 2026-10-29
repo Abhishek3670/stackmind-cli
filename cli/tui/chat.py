@@ -1395,11 +1395,14 @@ def is_stray_command_bar(content: str) -> bool:
 
 
 def clean_model_attribution(model: str | None) -> str | None:
-    """Strip internal daemon/agent plumbing labels from model attribution string."""
+    """Strip internal daemon/agent plumbing labels and echo fallbacks from model attribution string."""
     if not model:
         return None
-    parts = [p.strip() for p in str(model).split("·") if p.strip()]
-    cleaned = [p for p in parts if p.lower() not in ("daemon", "agent")]
+    raw = str(model).strip()
+    if raw.lower() in ("stackmind-echo-v1", "echo-agent", "echo", "daemon", "agent", "default"):
+        return None
+    parts = [p.strip() for p in raw.split("·") if p.strip()]
+    cleaned = [p for p in parts if p.lower() not in ("daemon", "agent", "stackmind-echo-v1", "echo-agent", "echo", "default")]
     return " · ".join(cleaned) if cleaned else None
 
 
@@ -1433,7 +1436,9 @@ def render_assistant_message(
     if not model_val and working_content:
         m = re.match(r"^\s*#*\s*Response from\s+([^\n\r]+?)\s*:?\s*(?:\n+|$)", working_content, flags=re.IGNORECASE)
         if m:
-            model_val = m.group(1).strip()
+            matched = m.group(1).strip()
+            if matched.lower() not in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
+                model_val = matched
             working_content = working_content[m.end():]
 
     hdr = build_assistant_header(model_val)

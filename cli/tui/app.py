@@ -491,11 +491,10 @@ def tui(
 
                 active_op = session.get("active_operation")
                 if active_op:
-                    from cli.tui.commands import _stream_turn_execution
+                    from cli.tui.commands import _stream_turn_execution, resolve_turn_model_attribution
                     cur_op = state.get_current_operation() or {}
                     active_role = cur_op.get("role") or session.get("active_role") or "Agent"
-                    active_backend = cur_op.get("backend") or session.get("provider") or ""
-                    model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                    model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
                     session, should_exit = _stream_turn_execution(
                         adapter,
                         client,
@@ -538,12 +537,11 @@ def tui(
                         conv_content = None
                         has_in_progress = getattr(state, "has_in_progress_turn", False)
                         if has_in_progress:
-                            from cli.tui.commands import _build_in_progress_turn_content
+                            from cli.tui.commands import _build_in_progress_turn_content, resolve_turn_model_attribution
                             layout_info = compute_layout(current_cols, state=state)
                             cur_op = state.get_current_operation() or {}
                             active_role = cur_op.get("role") or session.get("active_role") or "Agent"
-                            active_backend = cur_op.get("backend") or session.get("provider") or ""
-                            model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                            model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
                             conv_content = _build_in_progress_turn_content(
                                 state,
                                 model_name=model_label,
@@ -716,12 +714,11 @@ def tui(
                     conv_content = None
                     has_in_progress = getattr(state, "has_in_progress_turn", False)
                     if has_in_progress:
-                        from cli.tui.commands import _build_in_progress_turn_content
+                        from cli.tui.commands import _build_in_progress_turn_content, resolve_turn_model_attribution
                         layout_info = compute_layout(term_cols, state=state)
                         cur_op = state.get_current_operation() or {}
                         active_role = cur_op.get("role") or session.get("active_role") or "Agent"
-                        active_backend = cur_op.get("backend") or session.get("provider") or ""
-                        model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                        model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
                         conv_content = _build_in_progress_turn_content(
                             state,
                             model_name=model_label,
@@ -1028,11 +1025,10 @@ def tui(
                     full_screen=is_tty,
                 )
             except _ActiveOperationDetected as aod:
-                from cli.tui.commands import _stream_turn_execution
+                from cli.tui.commands import _stream_turn_execution, resolve_turn_model_attribution
                 cur_op = state.get_current_operation() or {}
                 active_role = cur_op.get("role") or session.get("active_role") or "Agent"
-                active_backend = cur_op.get("backend") or session.get("provider") or ""
-                model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
+                model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
                 session, should_exit = _stream_turn_execution(
                     adapter,
                     client,
