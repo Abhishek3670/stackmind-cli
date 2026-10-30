@@ -2127,6 +2127,14 @@ class ProviderGateway:
                         pass
                     files_hint = f" Existing workspace files: {', '.join(sorted(existing_files)[:25])}." if existing_files else ""
                     res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace.{files_hint}"
+            elif isinstance(ex, NotADirectoryError):
+                target_str = args.get("path") or args.get("target") or args.get("file") or "."
+                res = (
+                    f"Error: Directory '{target_str}' does not exist or is not a directory. "
+                    "In a fresh scaffold, directories are created automatically when writing files with write_file."
+                )
+                if name in ("list_directory", "glob"):
+                    self.consecutive_failures = max(0, self.consecutive_failures - 1)
             elif isinstance(ex, PermissionError):
                 actor_str = str(getattr(getattr(self, "tool_gateway", None), "actor_id", "")).lower()
                 target_str = (

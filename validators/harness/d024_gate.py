@@ -302,7 +302,8 @@ class D024Gate:
             return None
 
         def _norm(value: Any) -> str:
-            return str(value or "").replace("\\", "/").strip().lstrip("/").lstrip("./")
+            v = str(value or "").replace("\\", "/").strip().lstrip("/")
+            return v[2:] if v.startswith("./") else v
 
         norm_deliv = _norm(deliverable_path)
         for entry in raw:
@@ -365,7 +366,9 @@ class D024Gate:
                             deliv_paths.append(d_extra.strip())
 
                     for dp in deliv_paths:
-                        dp_norm = dp.replace("\\", "/").strip().lstrip("./")
+                        dp_norm = dp.replace("\\", "/").strip().lstrip("/")
+                        if dp_norm.startswith("./"):
+                            dp_norm = dp_norm[2:]
                         if (
                             dp_norm.startswith("tests/")
                             or dp_norm.startswith("test/")

@@ -427,7 +427,9 @@ _NON_CODE_EXTENSIONS = (
 
 
 def _is_test_artifact(path: str) -> bool:
-    norm = str(path).replace("\\", "/").strip().lstrip("./")
+    norm = str(path).replace("\\", "/").strip().lstrip("/")
+    if norm.startswith("./"):
+        norm = norm[2:]
     if not norm:
         return False
     parts = norm.lower().split("/")
@@ -439,7 +441,9 @@ def _is_test_artifact(path: str) -> bool:
 
 def _is_code_deliverable(deliv_type: str, deliv_path: str) -> bool:
     """Mirror the D024 gate's code classification for companion-test planning."""
-    norm = (deliv_path or "").replace("\\", "/").strip().lstrip("./")
+    norm = (deliv_path or "").replace("\\", "/").strip().lstrip("/")
+    if norm.startswith("./"):
+        norm = norm[2:]
     if not norm or norm.endswith("/") or not Path(norm).suffix:
         return False
     lower = norm.lower()
@@ -532,7 +536,8 @@ def _declared_test_plan_entries(data: dict[str, Any]) -> tuple[list[dict[str, An
 
 
 def _normalize_rel_path(path_str: Any) -> str:
-    return str(path_str or "").replace("\\", "/").strip().lstrip("/").lstrip("./")
+    v = str(path_str or "").replace("\\", "/").strip().lstrip("/")
+    return v[2:] if v.startswith("./") else v
 
 
 def _covers_stem(test_path: str, stem: str) -> bool:

@@ -1314,7 +1314,16 @@ class _RecoveryMixin:
             _ensure(".sync/contracts/**")
             _ensure(".sync/decisions/**")
             _ensure("**")
-        deny = [r for r in deny if not (isinstance(r, dict) and "schemas" in str(r.get("module", "")))]
+        deny = [
+            r for r in deny
+            if not (
+                isinstance(r, dict)
+                and any(
+                    k in str(r.get("module") or r.get("path") or "")
+                    for k in (".sync", "schemas")
+                )
+            )
+        ]
 
         # Also ensure work order's declared deliverable is allowed
         for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
@@ -1343,6 +1352,16 @@ class _RecoveryMixin:
                     for module in (".sync/work-orders/**", ".sync/contracts/**", ".sync/decisions/**"):
                         if module not in existing:
                             allow_list.append({"module": module})
+                    scope["deny"] = [
+                        r for r in scope.get("deny", [])
+                        if not (
+                            isinstance(r, dict)
+                            and any(
+                                k in str(r.get("module") or r.get("path") or "")
+                                for k in (".sync", "schemas")
+                            )
+                        )
+                    ]
                     data["normalized_by"] = "recovery-repair"
                     contract_file.write_text(
                         yaml.safe_dump(data, sort_keys=False), encoding="utf-8"

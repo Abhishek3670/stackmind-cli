@@ -356,15 +356,19 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
         dir_path = self.workspace.path_for(path)
+        if not dir_path.exists():
+            return []
         if not dir_path.is_dir():
             raise NotADirectoryError(f"'{path}' is not a directory")
 
         entries = []
         iterator = dir_path.rglob("*") if recursive else dir_path.iterdir()
+        actor_str = str(getattr(self, "actor_id", "") or "").lower()
+        is_gov_agent = any(k in actor_str for k in ("claude", "architect", "architecture", "ceo"))
         for item in iterator:
             rel_parts = item.relative_to(self.workspace.root).parts
-            # Ignore hidden VCS/cache artifacts
-            if any(p.startswith(".") and p not in (".sync",) for p in rel_parts) or "__pycache__" in rel_parts:
+            # Ignore hidden VCS/cache artifacts, and hide .sync from workers (permit only for architect/governance)
+            if any(p.startswith(".") and (p != ".sync" or not is_gov_agent) for p in rel_parts) or "__pycache__" in rel_parts:
                 continue
             rel_str = item.relative_to(self.workspace.root).as_posix()
             entries.append({

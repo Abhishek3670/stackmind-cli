@@ -338,7 +338,9 @@ def verify_post_execution(
                     for allow_rule in contract.allow_rules:
                         a_pat = allow_rule.get("module") or allow_rule.get("path") or allow_rule.get("target")
                         if a_pat:
-                            a_norm = a_pat.replace("\\", "/").lstrip("./")
+                            a_norm = a_pat.replace("\\", "/")
+                            if a_norm.startswith("./"):
+                                a_norm = a_norm[2:]
                             a_clean = a_norm.rstrip("/*").rstrip("/")
                             if (norm_fp == a_norm or norm_fp.startswith(a_clean + "/") or fnmatch.fnmatch(norm_fp, a_norm)) and (
                                 (a_clean.startswith(p_clean + "/") or fnmatch.fnmatch(a_clean, p_norm))

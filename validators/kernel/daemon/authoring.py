@@ -23,7 +23,9 @@ from validators.clock import now as _now
 
 def _is_test_path(path: str) -> bool:
     """True when a path denotes a test artifact (tests/ dir or test_ naming)."""
-    norm = str(path).replace("\\", "/").strip().strip("`\"'").lstrip("./")
+    norm = str(path).replace("\\", "/").strip().strip("`\"'").lstrip("/")
+    if norm.startswith("./"):
+        norm = norm[2:]
     if not norm:
         return False
     parts = norm.lower().split("/")
