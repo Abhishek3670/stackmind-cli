@@ -83,6 +83,83 @@ def create_gitops_commit(
     ).stdout.strip()
     return sha
 
+def _declared_deliverable_paths(wo_data: Any) -> list[str]:
+    """Declared deliverable paths from the authoritative work-order record."""
+    if not isinstance(wo_data, dict):
+        return []
+    entries: list[Any] = [wo_data.get("deliverable")]
+    extra = wo_data.get("deliverables")
+    if isinstance(extra, list):
+        entries.extend(extra)
+    paths: list[str] = []
+    for entry in entries:
+        raw = entry.get("path") if isinstance(entry, dict) else entry
+        if not isinstance(raw, str):
+            continue
+        rel = raw.strip().replace("\\", "/")
+        if rel and rel not in paths:
+            paths.append(rel)
+    return paths
+
+
+def _contained_deliverable_file(ws: Path, rel_path: str) -> Path | None:
+    """Resolve *rel_path* inside *ws*, refusing traversal outside the workspace."""
+    try:
+        candidate = (ws / rel_path).resolve()
+        candidate.relative_to(ws)
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _current_contract_revision(ws: Path, wo_id: str) -> int:
+    """Authoritative contract revision bound to *wo_id* (0 when none exists)."""
+    contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+    if not contract_file.is_file():
+        return 0
+    try:
+        data = yaml.safe_load(contract_file.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return 0
+    rev = data.get("contract_revision") if isinstance(data, dict) else None
+    return rev if isinstance(rev, int) else 0
+
+
+def completion_record_for(
+    ws: Path, wo_id: str, wo_data: Any, timestamp: str,
+) -> dict[str, Any]:
+    """Build the authoritative completion record written at the archive boundary.
+
+    The supervisor owns this record: it binds the completion to the exact work
+    order revision and contract revision that ran, and records the trusted hash
+    of every declared deliverable as it exists at completion time. A worker can
+    never author this record, so downstream dependency evaluation can trust it.
+    """
+    existing = wo_data.get("completion") if isinstance(wo_data, dict) else None
+    record: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {
+        "work_order_id": wo_id,
+    }
+
+    from validators.kernel.work_order_ops import sha256_file
+
+    revision = wo_data.get("revision") if isinstance(wo_data, dict) else None
+    record["work_order_id"] = wo_id
+    record["verified_at_revision"] = revision if isinstance(revision, int) else 1
+    record["verified_at_contract_revision"] = _current_contract_revision(ws, wo_id)
+
+    hashes: dict[str, str] = {}
+    for rel_path in _declared_deliverable_paths(wo_data):
+        resolved = _contained_deliverable_file(ws, rel_path)
+        if resolved is None:
+            continue
+        digest = sha256_file(resolved)
+        if digest:
+            hashes[rel_path] = digest
+    record["deliverable_hashes"] = hashes
+    record["completed_at"] = timestamp
+    return record
+
+
 def archive_completed_work_orders(
     workspace: Path | str,
     completed_wo_ids: list[str] | None = None,
@@ -179,6 +256,15 @@ def archive_completed_work_orders(
                     **stale,
                     "revalidation_blocked_reason": unresolved_reason,
                 }
+        # Mandatory authoritative completion evidence: bound to this revision
+        # and to the current deliverable bytes. Dependents are only satisfied
+        # by a completion record carrying both.
+        if not isinstance(wo_data.get("revision"), int):
+            # The archive boundary is authoritative for the revision it
+            # verified; a completion must never be bound to an absent revision.
+            wo_data["revision"] = 1
+        wo_data["completion"] = completion_record_for(ws, wo_id, wo_data, now_iso)
+
         target_file = completed_dir / wo_file.name
         from validators.kernel.io import durable_write_yaml
         durable_write_yaml(target_file, wo_data)

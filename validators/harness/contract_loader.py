@@ -32,7 +32,11 @@ def load_harness_contract(
 
             path = find_contract(work_order_id, project_path)
             if path is not None and path.exists():
-                return AgentContract.load(path, project_path)
+                c = AgentContract.load(path, project_path)
+                norm_agent = str(agent or "").lower().strip()
+                c_agent = str(getattr(c, "agent_id", "") or "").lower().strip()
+                if not norm_agent or not c_agent or norm_agent == c_agent:
+                    return c
         except (FileNotFoundError, Exception):
             pass
 

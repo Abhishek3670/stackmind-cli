@@ -291,16 +291,24 @@ class LifecycleSupervisor(
 
         if hasattr(self, "manager") and self.manager is not None:
             try:
-                session = self.manager.get_session(state.session_id)
-                active_op = session.get("active_operation")
-                if active_op:
-                    try:
-                        self.manager.cancel_operation(active_op)
-                    except Exception:
-                        pass
-                    if hasattr(self.manager, "_active"):
-                        self.manager._active.pop(active_op, None)
-                    session["active_operation"] = None
+                if hasattr(self.manager, "force_clear_active_operation"):
+                    self.manager.force_clear_active_operation(
+                        state.session_id,
+                        status="CANCELLED",
+                        reason=f"Turn timed out after {timeout_val:.1f}s",
+                    )
+                else:
+                    sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+                    if sess:
+                        active_op = sess.get("active_operation")
+                        if active_op:
+                            try:
+                                self.manager.cancel_operation(active_op)
+                            except Exception:
+                                pass
+                            if hasattr(self.manager, "_active"):
+                                self.manager._active.pop(active_op, None)
+                            sess["active_operation"] = None
             except Exception:
                 pass
 

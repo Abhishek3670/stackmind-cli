@@ -51,6 +51,7 @@ def build_contract_failure_evidence(
     observed_files: Any | None = None,
     decision: Any | None = None,
     operation_id: str | None = None,
+    contract: AgentContract | None = None,
 ) -> dict[str, Any]:
     """Build the durable worker-blocker evidence packet for a contract failure.
 
@@ -75,7 +76,8 @@ def build_contract_failure_evidence(
         failure_code = "CONTRACT_VALIDATION_ERROR"
 
     work_order_id = getattr(task, "work_order_id", None)
-    contract = load_harness_contract(project_path, agent, work_order_id)
+    if contract is None:
+        contract = load_harness_contract(project_path, agent, work_order_id)
     file_budget: int | None = None
     contract_hash = _contract_file_sha256(project_path, work_order_id)
     contract_revision = 1
@@ -150,7 +152,11 @@ def load_harness_contract(project_path: Path, agent: str, work_order_id: str | N
             from cli.contract import find_contract
             path = find_contract(work_order_id, project_path)
             if path.exists():
-                return AgentContract.load(path, project_path)
+                c = AgentContract.load(path, project_path)
+                norm_agent = str(agent or "").lower().strip()
+                c_agent = str(getattr(c, "agent_id", "") or "").lower().strip()
+                if not norm_agent or not c_agent or norm_agent == c_agent:
+                    return c
         except (FileNotFoundError, Exception):
             pass
             
@@ -173,6 +179,7 @@ def verify_pre_execution(
     agent: str,
     task: Any,  # HarnessTask
     context: ContextBundle,
+    contract: AgentContract | None = None,
 ) -> None:
     """Pre-execution validation: verify contract is valid, not expired, and D024 compliant for GitOps."""
     # D024 QA Gate: Programmatic enforcement preventing GitOps progression without QA approval
@@ -180,7 +187,8 @@ def verify_pre_execution(
         from validators.harness.d024_gate import D024Gate
         D024Gate().verify_gitops_preconditions(project_path, task.work_order_id)
 
-    contract = load_harness_contract(project_path, agent, task.work_order_id)
+    if contract is None:
+        contract = load_harness_contract(project_path, agent, task.work_order_id)
     if contract is None:
         return
         
@@ -207,6 +215,8 @@ def _collect_peer_owned_deliverables(
     if not base.is_dir():
         return owned
     norm_agent = str(current_agent or "").lower().strip()
+    if norm_agent in ("claude", "architecture"):
+        return owned
     import yaml
     for bucket in ("ACTIVE", "COMPLETED"):
         b_dir = base / bucket
@@ -253,9 +263,11 @@ def verify_post_execution(
     task: Any,  # HarnessTask
     decision: Any,  # HarnessDecision
     observed_files: Any | None = None,  # Sequence[str] | None
+    contract: AgentContract | None = None,
 ) -> None:
     """Post-execution validation: verify decision output and observed changes against contract."""
-    contract = load_harness_contract(project_path, agent, task.work_order_id)
+    if contract is None:
+        contract = load_harness_contract(project_path, agent, task.work_order_id)
     if contract is None:
         return
         

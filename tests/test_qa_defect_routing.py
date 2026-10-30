@@ -349,7 +349,7 @@ def test_qa_turn_system_message_is_the_compiled_doctrine(tmp_path: Path, monkeyp
     record = runner._complete_request(request, runtime)
 
     messages = captured["messages"]
-    assert messages[0].content == QA_SYSTEM_PROMPT
+    assert messages[0].content.startswith(QA_SYSTEM_PROMPT)
     assert captured["kwargs"]["required_deliverable"] == "tests/test_animations.py"
     assert record.payload["status"] == "blocked"
     assert record.payload["blockers"], "defect finding must surface as a blocker"

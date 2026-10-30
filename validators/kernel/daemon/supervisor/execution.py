@@ -16,11 +16,18 @@ import yaml
 
 from validators.clock import now as _now
 
+from .dependencies import (
+    DependencyResult,
+    DependencyStatus,
+    evaluate_dependencies,
+)
 from .models import (
     _OPERATION_TERMINAL,
+    EXIT_RETRIES_EXHAUSTED,
     GOVERNANCE_FAILURE_CODES,
     TRANSIENT_RETRYABLE_CODES,
     AdvanceResult,
+    BudgetExhaustedError,
     OperationContentionError,
     Phase,
     RunState,
@@ -30,6 +37,25 @@ from .release import (
 )
 
 logger = logging.getLogger("stackmind.supervisor")
+
+# Exception types whose failed dispatch is a transient provider/network problem:
+# the same input may succeed once the previous operation is terminal.
+_TRANSIENT_DISPATCH_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    TimeoutError,
+    InterruptedError,
+)
+
+
+def _is_schema_validation_error(exc: BaseException) -> bool:
+    """True for contract/schema validation failures (jsonschema or pydantic)."""
+    for cls in type(exc).__mro__:
+        if cls.__name__ == "ValidationError" and cls.__module__.split(".")[0] in {
+            "jsonschema",
+            "pydantic",
+        }:
+            return True
+    return False
 
 class _ExecutionMixin:
     """Work-order dispatch, worker retry, QA gate handling and operation tracking during EXECUTING."""
@@ -377,6 +403,142 @@ class _ExecutionMixin:
         self._transition(state, Phase.BLOCKED)
         return AdvanceResult.BLOCKED
 
+    def _dispatch_block_reason(self, state: RunState, wo_id: str) -> str | None:
+        """Authoritative reason a work order must not be dispatched right now.
+
+        Recovery *history* (``recovery_attempts``) is deliberately not
+        consulted: it bounds the recovery budget, it never decides dispatch
+        eligibility.  Only live state — durable blockers, in-flight operations,
+        escalation/QA waits — can hold a work order back.
+        """
+        if wo_id in state.blocked_by_escalation:
+            return f"BLOCKED_BY_ESCALATION:{state.blocked_by_escalation[wo_id]}"
+        if wo_id in state.blocked_wo_ids:
+            return "WORK_ORDER_BLOCKED"
+        terminal, reason = self._dispatch_failure_is_terminal(state, wo_id)
+        if terminal:
+            return reason or "DISPATCH_FAILED"
+        if self._is_wo_running(state, wo_id):
+            return "OPERATION_ACTIVE"
+        if state.recovery_wo_id == wo_id:
+            # Recovery is unresolved for this work order.  Every resolution path
+            # (retry_unchanged, architect_fix repair, cancel, split) clears
+            # `recovery_wo_id` through `_clear_worker_blocker`, so this is a
+            # live blocker rather than a permanent one.
+            return "RECOVERY_IN_PROGRESS"
+        return None
+
+    def _classify_dispatch_failure(self, exc: BaseException) -> dict[str, Any]:
+        """Classify a dispatch exception by *type* into a required behaviour.
+
+        Dispatch happens before an operation exists, so harness evidence
+        packets are unavailable.  ``retryable`` is derived from exception type
+        only — never from error-message substring matching.
+        """
+        code = "DISPATCH_FAILED_UNKNOWN"
+        retryable = False
+        human_required = True
+        resolution = (
+            "Inspect the recorded diagnostic evidence, correct the dispatch "
+            "precondition, then resume with an explicit human decision"
+        )
+
+        if isinstance(exc, OperationContentionError):
+            code = "OPERATION_CONTENTION"
+            retryable = True
+            human_required = False
+            resolution = (
+                "Wait for the existing active operation to reach a terminal "
+                "state, then redispatch (consumes no retry)"
+            )
+        elif isinstance(exc, BudgetExhaustedError):
+            code = "BUDGET_EXHAUSTED"
+            resolution = "Grant additional turn budget through an authorized human resume"
+        elif isinstance(exc, PermissionError):
+            code = "PERMISSION_DENIED"
+            resolution = (
+                "Obtain authorization for the denied resource; never retry under "
+                "the same unauthorized conditions"
+            )
+        elif isinstance(exc, (FileNotFoundError, KeyError)):
+            code = "PROVIDER_CONFIG_MISSING"
+            resolution = "Configure the missing provider/agent/contract artifact, then resume"
+        elif _is_schema_validation_error(exc):
+            code = "CONTRACT_INVALID"
+            resolution = "Route to contract repair; an unchanged contract cannot succeed"
+        elif isinstance(exc, _TRANSIENT_DISPATCH_ERRORS):
+            code = "TRANSIENT_PROVIDER_FAILURE"
+            retryable = True
+            human_required = False
+            resolution = "Bounded retry once the previous operation is terminal"
+        elif isinstance(exc, (ValueError, TypeError)):
+            code = "INVALID_DISPATCH_INPUT"
+            resolution = "Route to input/contract repair; the same input cannot succeed"
+
+        return {
+            "code": code,
+            "retryable": retryable,
+            "human_required": human_required,
+            "resolution": resolution,
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        }
+
+    def _record_dispatch_failure(
+        self, state: RunState, wo_id: str, exc: BaseException, *, phase: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Persist the classified dispatch failure before any state transition.
+
+        Returns ``(record, classification)``.  The record keeps the exception
+        type, message, phase, attempt count and a bounded history so the
+        failure stays auditable across restart.
+        """
+        info = self._classify_dispatch_failure(exc)
+        rec = dict(state.dispatch_failures.get(wo_id) or {})
+        rec["attempts"] = int(rec.get("attempts", 0)) + 1
+        rec["failure_class"] = info["code"]
+        rec["exception_type"] = info["exception_type"]
+        rec["last_message"] = info["message"]
+        rec["last_phase"] = phase
+        rec["last_attempt_at"] = _now()
+        rec["work_order_id"] = wo_id
+        rec["retryable"] = bool(info["retryable"])
+        rec["human_required"] = bool(info["human_required"])
+        rec["resolution"] = info["resolution"]
+        history = list(rec.get("history") or [])
+        history.append(
+            {
+                "failure_class": info["code"],
+                "exception_type": info["exception_type"],
+                "message": info["message"],
+                "phase": phase,
+                "at": rec["last_attempt_at"],
+            }
+        )
+        rec["history"] = history[-10:]
+        state.dispatch_failures[wo_id] = rec
+        return rec, info
+
+    def _dispatch_failure_is_terminal(
+        self, state: RunState, wo_id: str,
+    ) -> tuple[bool, str | None]:
+        """Whether recorded dispatch failures have exhausted their route."""
+        rec = state.dispatch_failures.get(wo_id) or {}
+        if not rec:
+            return False, None
+        label = f"{rec.get('failure_class') or 'DISPATCH_FAILED'} for {wo_id}"
+        if rec.get("human_required"):
+            return True, f"{label}: {rec.get('last_message')} — {rec.get('resolution')}"
+        if not rec.get("retryable"):
+            return True, f"{label}: {rec.get('last_message')} — {rec.get('resolution')}"
+        attempts = int(rec.get("attempts", 0))
+        if attempts >= state.max_dispatch_attempts:
+            return True, (
+                f"{label}: dispatch attempts exhausted "
+                f"({attempts}/{state.max_dispatch_attempts}) — {rec.get('resolution')}"
+            )
+        return False, None
+
     def _retry_worker(
         self, state: RunState, ws: Path, wo_id: str, make_prompt: Callable[[int, str], str],
     ) -> bool:
@@ -605,8 +767,31 @@ class _ExecutionMixin:
                 return AdvanceResult.WAITING_FOR_OPERATION
             except Exception as exc:
                 logger.error(f"Failed to retry QA work order {wo_id}: {exc}", exc_info=True)
-                state.failed_wo_ids.append(wo_id)
-                return AdvanceResult.WAITING_FOR_OPERATION
+                # The retry turn never ran: roll back the consumed retry and
+                # classify instead of silently failing the work order.  No
+                # operation exists, so WAITING_FOR_OPERATION would be a lie.
+                state.retry_counts[wo_id] = retries
+                _rec, info = self._record_dispatch_failure(
+                    state, wo_id, exc, phase="QA_EVIDENCE_RETRY"
+                )
+                state.worker_blockers[wo_id] = {
+                    "failure_code": "QA_DISPATCH_FAILED",
+                    "work_order_id": wo_id,
+                    "operation_id": None,
+                    "canonical_message": (
+                        f"QA_DISPATCH_FAILED: {info['code']} while retrying QA "
+                        f"{wo_id}: {info['message']}"
+                    ),
+                    "dispatch_failure_class": info["code"],
+                    "dispatch_attempts": _rec.get("attempts"),
+                    "resolution": info["resolution"],
+                    "retryable": bool(info["retryable"]),
+                    "timestamp": _now(),
+                }
+                state.error = state.worker_blockers[wo_id]["canonical_message"]
+                self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
         # Retries exhausted — route to the Architect with durable evidence.
         state.worker_blockers[wo_id] = {
             "failure_code": "QA_EVIDENCE_MISSING",
@@ -912,35 +1097,266 @@ class _ExecutionMixin:
         if wo_ids or not state.worker_wo_ids:
             state.worker_wo_ids = wo_ids
 
+    def _dependency_result(self, state: RunState, wo_id: str, ws: Path) -> DependencyResult:
+        """Authoritative, fail-closed dependency evaluation for one work order."""
+        return evaluate_dependencies(
+            ws,
+            wo_id,
+            completed_ids=state.completed_wo_ids,
+            blocked_ids=state.blocked_wo_ids,
+            failed_ids=state.failed_wo_ids,
+            superseded_ids=state.superseded_wo_ids,
+            plan_id=state.plan_id,
+            evaluated_at=_now(),
+        )
+
     def _dependencies_met(self, state: RunState, wo_id: str, ws: Path) -> bool:
-        """Check that all dependencies of a WO are in completed_wo_ids."""
-        if wo_id in state.blocked_by_escalation:
+        """Compatibility view of the dependency result: True only for SATISFIED.
+
+        Kept as a thin projection so no caller can reintroduce a boolean
+        fail-open path; dispatch decisions use `_dependency_result` directly.
+        """
+        return self._dependency_result(state, wo_id, ws).status is DependencyStatus.SATISFIED
+
+    def _record_dependency_wait(
+        self, state: RunState, wo_id: str, result: DependencyResult,
+    ) -> None:
+        """Persist the WAITING/INVALID dependency record with its resolution route."""
+        record = result.to_wait_record(timestamp=result.evaluated_at or _now())
+        state.dependency_waits[wo_id] = record
+        state.dependency_graph_fingerprint = result.fingerprint
+
+    def _reevaluate_dependency_waits(
+        self, state: RunState, ws: Path, published: set[str], superseded: set[str],
+    ) -> None:
+        """Reevaluate all persisted dependency waits against current authoritative state.
+
+        Wait lifecycle:
+        - RESOLVED: prerequisite is COMPLETED_VALID with fresh evidence -> remove wait, allow dispatch
+        - ACTIONABLE: prerequisite is actively progressing (ACTIVE operation, recovery in flight) -> keep wait
+        - DORMANT_VALID: prerequisite is not executing but has authorized next action (eligible upstream awaiting dispatch) -> keep wait
+        - INVALID_ABANDONED: prerequisite is MISSING, INVALID, SUPERSEDED without replacement, FAILED without recovery -> invalidate wait, route to blocker/recovery
+        """
+        from validators.kernel.daemon.supervisor.dependencies import PrerequisiteState
+
+        to_remove: list[str] = []
+        to_invalidate: list[str] = []
+
+        for wo_id, wait_record in state.dependency_waits.items():
+            if wo_id in superseded:
+                to_remove.append(wo_id)
+                continue
+            if published and wo_id not in published:
+                continue  # pending authoring revision
+
+            # Reevaluate the dependency against current state
+            dependency = self._dependency_result(state, wo_id, ws)
+
+            if dependency.status is DependencyStatus.SATISFIED:
+                # Prerequisite completed with fresh evidence -- wait is resolved
+                to_remove.append(wo_id)
+                continue
+
+            if dependency.status is DependencyStatus.INVALID:
+                # Dependency became invalid -- wait is abandoned, route to blocker/recovery
+                to_invalidate.append(wo_id)
+                continue
+
+            # WAITING: check if the wait is still valid (has a resolution path)
+            blocking = [obs for obs in dependency.prerequisites if not obs.state.satisfies]
+            if not blocking:
+                # No blocking prerequisites but still WAITING -- should not happen, but treat as resolved
+                to_remove.append(wo_id)
+                continue
+
+            # Check each blocking prerequisite for a live resolution path
+            has_resolution_path = False
+            for obs in blocking:
+                if obs.state in (PrerequisiteState.ACTIVE, PrerequisiteState.BLOCKED):
+                    # Prerequisite has an active operation or is blocked with recovery path
+                    has_resolution_path = True
+                    break
+                if obs.state == PrerequisiteState.COMPLETED_STALE:
+                    # Stale completion may be revalidated -- Architect recovery can resolve
+                    has_resolution_path = True
+                    break
+                if obs.state == PrerequisiteState.REOPENED:
+                    # Reopened prerequisite is being worked on
+                    has_resolution_path = True
+                    break
+                if obs.state == PrerequisiteState.MISSING:
+                    # Missing prerequisite -- check if an eligible upstream WO exists
+                    # that could author it (handled by graph validation as INVALID)
+                    # This wait is invalid/abandoned
+                    pass
+
+            if not has_resolution_path:
+                # No observable resolution path -- invalidate the wait
+                to_invalidate.append(wo_id)
+            # else: valid wait (ACTIONABLE or DORMANT_VALID), keep it
+
+        for wo_id in to_remove:
+            state.dependency_waits.pop(wo_id, None)
+
+        for wo_id in to_invalidate:
+            wait_record = state.dependency_waits.pop(wo_id, None)
+            if wait_record:
+                # Convert to explicit blocker for recovery routing
+                blocking_ids = wait_record.get("blocking_dependency_ids", [])
+                state.worker_blockers[wo_id] = {
+                    "failure_code": "DEPENDENCY_WAIT_INVALIDATED",
+                    "work_order_id": wo_id,
+                    "canonical_message": (
+                        f"Dependency wait invalidated for {wo_id}: "
+                        f"no resolution path for {blocking_ids}"
+                    ),
+                    "resolution_owner": "architect",
+                    "expected_action": "repair the dependency declaration or prerequisite",
+                    "graph_fingerprint": wait_record.get("graph_fingerprint", ""),
+                    "detected_at": _now(),
+                }
+                if wo_id not in state.blocked_wo_ids:
+                    state.blocked_wo_ids.append(wo_id)
+
+    def _has_valid_dependency_wait(self, state: RunState) -> bool:
+        """Check if any dependency wait has a valid resolution path (ACTIONABLE or DORMANT_VALID).
+
+        A mere record in ``dependency_waits`` does *not* constitute a valid wait:
+        the prerequisite state, its revision, and the current graph fingerprint must
+        all still describe a live resolution path.
+        """
+        from validators.kernel.daemon.supervisor.dependencies import DependencyStatus
+
+        if not state.dependency_waits:
             return False
-        # Check explicit dependencies in state
-        for dep in state.wo_dependencies.get(wo_id, []):
-            dep_str = str(dep).strip()
-            if dep_str and dep_str not in state.completed_wo_ids:
-                if dep_str != state.planning_wo_id and dep_str != "WO-000" and dep_str != state.gitops_wo_id:
-                    return False
-        wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
-        if not wo_file.exists():
-            return True  # No file means no declared dependencies
-        try:
-            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
+
+        ws = Path(state.workspace)
+
+        for wo_id, wait_record in state.dependency_waits.items():
+            # A wait recorded against a different graph revision is stale metadata:
+            # ``_reevaluate_dependency_waits`` refreshes it, so it is not a wait
+            # condition that can keep the supervisor idling on its own.
+            fingerprint = wait_record.get("graph_fingerprint") or ""
+            if (
+                state.dependency_graph_fingerprint
+                and fingerprint
+                and fingerprint != state.dependency_graph_fingerprint
+            ):
+                continue
+
+            dependency = self._dependency_result(state, wo_id, ws)
+            if dependency.status is DependencyStatus.SATISFIED:
                 return True
-            deps = data.get("dependencies", [])
-            if not isinstance(deps, list):
+            if dependency.status is DependencyStatus.INVALID:
+                continue
+
+            blocking = [obs for obs in dependency.prerequisites if not obs.state.satisfies]
+            if not blocking:
                 return True
-            for dep in deps:
-                dep_str = str(dep).strip()
-                if dep_str and dep_str not in state.completed_wo_ids:
-                    # Also check if the dep is the planning WO or GitOps WO (GitOps runs at milestone end, never blocks worker)
-                    if dep_str != state.planning_wo_id and dep_str != "WO-000" and dep_str != state.gitops_wo_id:
-                        return False
-        except Exception:
-            pass
-        return True
+
+            if self._dependency_wait_has_resolution(wo_id, wait_record, blocking, dependency):
+                return True
+
+        return False
+
+    def _dependency_wait_has_resolution(
+        self,
+        wo_id: str,
+        wait_record: dict[str, Any],
+        blocking: list[Any],
+        dependency: DependencyResult,
+    ) -> bool:
+        """True when a dependency wait has an identifiable, authorized resolution path.
+
+        Distinguishes ACTIONABLE and DORMANT_VALID waits from INVALID or indefinite
+        waits that would otherwise be mistaken for ``DISPATCH_NO_EXECUTABLE_WORK``.
+        """
+        from validators.kernel.daemon.supervisor.dependencies import (
+            PrerequisiteState,
+        )
+
+        for obs in blocking:
+            if obs.state in (PrerequisiteState.ACTIVE, PrerequisiteState.BLOCKED):
+                return True
+            if obs.state == PrerequisiteState.COMPLETED_STALE:
+                return True
+            if obs.state == PrerequisiteState.REOPENED:
+                return True
+            if obs.state == PrerequisiteState.MISSING:
+                pass
+
+        return False
+
+
+
+    def _handle_invalid_dependency(
+        self, state: RunState, ws: Path, wo_id: str, result: DependencyResult,
+    ) -> AdvanceResult | None:
+        """Block the dependent and route the defect to authorized repair.
+
+        Returns the advance result for the caller, or None when the dependency
+        escalation is already in flight and the caller should just stop
+        dispatching this work order (no duplicate recovery turn, no retry burn).
+        """
+        state.dependency_waits.pop(wo_id, None)
+        blocking = [obs for obs in result.prerequisites if not obs.state.satisfies]
+        record = result.to_wait_record(timestamp=result.evaluated_at or _now())
+        state.dependency_waits[wo_id] = record
+        state.dependency_graph_fingerprint = result.fingerprint
+
+        missing_ids = [obs.wo_id for obs in blocking if obs.state.value == "MISSING"]
+        failed_ids = [obs.wo_id for obs in blocking]
+
+        state.worker_blockers[wo_id] = {
+            "failure_code": "INVALID_DEPENDENCY",
+            "work_order_id": wo_id,
+            "dependency_code": result.code,
+            "canonical_message": f"INVALID_DEPENDENCY: {result.reason_text}",
+            "missing_dependencies": missing_ids,
+            "failed_dependencies": failed_ids,
+            "dependency_states": {obs.wo_id: obs.state.value for obs in blocking},
+            "dependency_revisions": {obs.wo_id: obs.revision for obs in blocking},
+            "dependency_contract_revisions": {
+                obs.wo_id: obs.contract_revision for obs in blocking
+            },
+            "graph_issues": [issue.to_dict() for issue in result.graph_issues],
+            "plan_id": state.plan_id,
+            "run_id": state.run_id,
+            "work_order_revision": result.revision,
+            "contract_revision": result.contract_revision,
+            "detected_at": _now(),
+            "resolution_owner": (
+                blocking[0].resolution_owner if blocking else "architect"
+            ),
+            "expected_action": (
+                blocking[0].expected_action
+                if blocking
+                else "repair the dependency declaration or prerequisite"
+            ),
+            "graph_fingerprint": result.fingerprint,
+        }
+        if wo_id not in state.blocked_wo_ids:
+            state.blocked_wo_ids.append(wo_id)
+        state.error = f"INVALID_DEPENDENCY for {wo_id}: {result.reason_text}"
+
+        # A repair decision is already in flight for this work order: wait for
+        # it instead of dispatching another one over an unchanged graph.
+        if state.recovery_wo_id == wo_id and (
+            state.recovery_decision_operation_id or state.architect_repair_operation_id
+        ):
+            self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            return AdvanceResult.WAITING_FOR_OPERATION
+        if state.recovery_attempts.get(wo_id, 0) >= state.max_retries:
+            state.exit_code = EXIT_RETRIES_EXHAUSTED
+            state.error = (
+                f"INVALID_DEPENDENCY for {wo_id} — recovery attempts exhausted: "
+                f"{result.reason_text}"
+            )
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+        self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+        self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+        return AdvanceResult.TRANSITIONED
 
     def _agent_for_wo(self, wo_id: str, ws: Path) -> str:
         """Determine the primary agent for a work order (ACTIVE, BLOCKED, or COMPLETED)."""
@@ -1371,7 +1787,8 @@ class _ExecutionMixin:
                     return None
 
         # No usable verdict yet → dispatch an independent QA review turn.
-        state.qa_review_attempts[wo_id] = state.qa_review_attempts.get(wo_id, 0) + 1
+        prior_attempts = state.qa_review_attempts.get(wo_id, 0)
+        state.qa_review_attempts[wo_id] = prior_attempts + 1
         if state.qa_review_attempts[wo_id] > state.max_qa_review_attempts + state.max_qa_reworks:
             state.error = f"QA review for {wo_id} exhausted its bounded review attempts"
             state.exit_code = 3
@@ -1395,8 +1812,40 @@ class _ExecutionMixin:
                 state.qa_review_operations[wo_id] = str(op_id)
             state.error = None
         except OperationContentionError:
+            # An operation *is* active (that is why the session is busy): wait
+            # for it without consuming a QA review attempt and without ever
+            # creating a duplicate QA operation.
+            state.qa_review_attempts[wo_id] = prior_attempts
+            state.error = None
             return None
         except Exception as exc:
-            state.error = f"QA review dispatch failed for {wo_id}: {exc}"
-            state.blocked_wo_ids.append(wo_id) if wo_id not in state.blocked_wo_ids else None
+            _rec, info = self._record_dispatch_failure(
+                state, wo_id, exc, phase="QA_REVIEW"
+            )
+            state.worker_blockers[wo_id] = {
+                "failure_code": "QA_DISPATCH_FAILED",
+                "work_order_id": wo_id,
+                "operation_id": None,
+                "canonical_message": (
+                    f"QA_DISPATCH_FAILED: {info['code']} while dispatching QA "
+                    f"review for {wo_id}: {info['message']}"
+                ),
+                "dispatch_failure_class": info["code"],
+                "dispatch_attempts": _rec.get("attempts"),
+                "resolution": info["resolution"],
+                "retryable": bool(info["retryable"]),
+                "timestamp": _now(),
+            }
+            state.error = state.worker_blockers[wo_id]["canonical_message"]
+            terminal, _reason = self._dispatch_failure_is_terminal(state, wo_id)
+            if info["retryable"] and not terminal:
+                # Bounded retry on a later tick; nothing was dispatched, so the
+                # caller must not be told an operation is pending.
+                state.qa_review_attempts[wo_id] = prior_attempts
+                return None
+            # Deterministic QA dispatch failure: record it and escalate through
+            # the Architect recovery route instead of stranding the work order.
+            self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+            self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            return AdvanceResult.TRANSITIONED
         return None

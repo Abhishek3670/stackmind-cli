@@ -482,6 +482,7 @@ class _ExecutionMixin:
                     task,
                     decision,
                     observed_files=observed_files_for_gate,
+                    contract=task_contract,
                 )
             except D024ViolationError as d024_exc:
                 return HarnessRunResult(
@@ -504,6 +505,7 @@ class _ExecutionMixin:
                     task,
                     exc,
                     observed_files=observed_files_for_gate,
+                    contract=task_contract,
                     decision=decision,
                     operation_id=operation_id,
                 )

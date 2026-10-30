@@ -122,6 +122,10 @@ class TestSupervisorIdleStallRecovery:
         # Set up active work orders where WO-002 has unmet dependency on WO-001
         wo2 = _make_wo("WO-002", "Frontend", "gemini", deps=["WO-001"])
         _write_yaml(tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml", wo2)
+        # A real, still-incomplete prerequisite: the dependency is WAITING (not
+        # invalid), which is what the idle-stall deadlock path must detect.
+        wo1 = _make_wo("WO-001", "Backend", "codex")
+        _write_yaml(tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-001.yaml", wo1)
 
         state = RunState(
             run_id="run-test",
@@ -153,6 +157,10 @@ class TestSupervisorIdleStallRecovery:
 
         wo2 = _make_wo("WO-002", "Frontend", "gemini", deps=["WO-001"])
         _write_yaml(tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-002.yaml", wo2)
+        # A real, still-incomplete prerequisite: the dependency is WAITING (not
+        # invalid), which is what the idle-stall deadlock path must detect.
+        wo1 = _make_wo("WO-001", "Backend", "codex")
+        _write_yaml(tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-001.yaml", wo1)
 
         state = RunState(
             run_id="run-test",

@@ -338,16 +338,24 @@ class _RecoveryMixin:
                 return AdvanceResult.WAITING_FOR_OPERATION
             # Clean contention fallback: clear session active_operation and retry once before failing
             try:
-                session = self.manager.get_session(state.session_id)
-                active_op = session.get("active_operation")
-                if active_op:
-                    try:
-                        self.manager.cancel_operation(active_op)
-                    except Exception:
-                        pass
-                    if hasattr(self.manager, "_active"):
-                        self.manager._active.pop(active_op, None)
-                session["active_operation"] = None
+                if hasattr(self.manager, "force_clear_active_operation"):
+                    self.manager.force_clear_active_operation(
+                        state.session_id,
+                        status="CANCELLED",
+                        reason="Recovery decision contention cleanup",
+                    )
+                else:
+                    sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+                    if sess:
+                        act_op = sess.get("active_operation")
+                        if act_op:
+                            try:
+                                self.manager.cancel_operation(act_op)
+                            except Exception:
+                                pass
+                            if hasattr(self.manager, "_active"):
+                                self.manager._active.pop(act_op, None)
+                            sess["active_operation"] = None
                 new_op = self._dispatch_recovery_decision(state, ws, str(wo_id), None)
                 if new_op is not None:
                     state.recovery_decision_operation_id = new_op.get("operation_id")
@@ -648,19 +656,27 @@ class _RecoveryMixin:
             first_reason = f"{type(first_exc).__name__}: {first_exc}"
             # Operation contention or session lock - clear any orphaned/stale active operation and retry once
             try:
-                session = self.manager.get_session(state.session_id)
-                if session and session.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
-                    session["state"] = "RUNNING"
-                    session["updated_at"] = _now()
-                active_op = session.get("active_operation")
-                if active_op:
-                    try:
-                        self.manager.cancel_operation(active_op)
-                    except Exception:
-                        pass
-                    if hasattr(self.manager, "_active"):
-                        self.manager._active.pop(active_op, None)
-                    session["active_operation"] = None
+                sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+                if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
+                    sess["state"] = "RUNNING"
+                    sess["updated_at"] = _now()
+                if hasattr(self.manager, "force_clear_active_operation"):
+                    self.manager.force_clear_active_operation(
+                        state.session_id,
+                        status="CANCELLED",
+                        reason="Architect turn contention cleanup",
+                    )
+                else:
+                    if sess:
+                        act_op = sess.get("active_operation")
+                        if act_op:
+                            try:
+                                self.manager.cancel_operation(act_op)
+                            except Exception:
+                                pass
+                            if hasattr(self.manager, "_active"):
+                                self.manager._active.pop(act_op, None)
+                            sess["active_operation"] = None
                 return self.manager.start_turn(
                     state.session_id,
                     prompt,
@@ -1515,6 +1531,16 @@ class _RecoveryMixin:
         if wo_id in state.failed_wo_ids:
             state.failed_wo_ids.remove(wo_id)
         state.retry_counts[wo_id] = 0
+        # The blocker is resolved, so recovery bookkeeping must stop suppressing
+        # dispatch.  Recovery *history* (recovery_attempts) is intentionally
+        # preserved: it bounds the recovery budget, not execution eligibility.
+        if state.recovery_wo_id == wo_id:
+            state.recovery_wo_id = None
+        state.dispatch_failures.pop(wo_id, None)
+        if state.recovery_decision_operation_id:
+            prior_decision_op = self._get_operation(state.recovery_decision_operation_id)
+            if prior_decision_op is None or str(prior_decision_op.get("status", "")).upper() in _OPERATION_TERMINAL:
+                state.recovery_decision_operation_id = None
         self._archive_verdicts_for_wo(wo_id, ws)
         self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         if redispatch:

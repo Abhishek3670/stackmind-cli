@@ -2197,6 +2197,7 @@ class SessionManager:
                     if (
                         active_rec is None
                         or active_rec.get("status") in _OPERATION_TERMINAL
+                        or active_rec.get("status") == "CANCEL_REQUESTED"
                         or not is_thread_alive
                     ):
                         if active_rec and active_rec.get("status") not in _OPERATION_TERMINAL:
@@ -2557,6 +2558,43 @@ class SessionManager:
             self._operation_event.set()
             return dict(record)
 
+    def force_clear_active_operation(
+        self,
+        session_id: str,
+        status: str = "CANCELLED",
+        reason: str = "Operation cleared by supervisor",
+    ) -> dict[str, Any] | None:
+        """Forcibly cancel and clean up any in-flight active operation on a session.
+
+        Guarantees that session['active_operation'] is cleared, the operation
+        record is marked terminal, and any background cancellation token is set.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            active_op_id = session.get("active_operation")
+            if not active_op_id:
+                return None
+            cancel = self._active.pop(active_op_id, None)
+            if cancel:
+                cancel.set()
+            active_rec = None
+            for r in session.get("journal", []):
+                if r.get("operation_id") == active_op_id:
+                    active_rec = r
+                    break
+            if active_rec and active_rec.get("status") not in _OPERATION_TERMINAL:
+                self.complete_operation(
+                    session_id,
+                    active_op_id,
+                    {"reason": reason},
+                    status=status,
+                )
+            session["active_operation"] = None
+            self._save()
+            return active_rec
+
     def cancel_session(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -2567,7 +2605,8 @@ class SessionManager:
                 self.cancel_operation(operation_id)
                 try:
                     _, record = self._operation(operation_id)
-                    if record.get("status") in _OPERATION_TERMINAL:
+                    if record.get("status") not in _OPERATION_TERMINAL:
+                        self.complete_operation(session_id, operation_id, {"reason": "Session cancelled"}, status="CANCELLED")
                         session["active_operation"] = None
                 except KeyError:
                     session["active_operation"] = None

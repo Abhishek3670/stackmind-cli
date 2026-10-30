@@ -349,10 +349,13 @@ def test_unverified_predecessor_prevents_downstream_execution(tmp_path: Path):
 
     assert supervisor._check_deliverable_exists("WO-001", tmp_path) is True
 
-    # When supervisor marks WO-001 completed
+    # An in-memory completion claim alone never satisfies a dependency
+    # (SDP-FIX-008B: completion evidence must be authoritative on disk).
     state.completed_wo_ids.append("WO-001")
+    assert supervisor._dependencies_met(state, "WO-002", tmp_path) is False
 
-    # Now WO-002 dependencies are satisfied
+    # Once the work order is authoritatively completed, WO-002 is satisfied
+    supervisor._mark_wo_status_on_disk(tmp_path, "WO-001", "COMPLETED")
     assert supervisor._dependencies_met(state, "WO-002", tmp_path) is True
 
 

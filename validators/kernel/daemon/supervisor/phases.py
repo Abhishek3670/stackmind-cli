@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from validators.clock import now as _now
 
+from .dependencies import DependencyStatus
 from .models import (
     _OPERATION_TERMINAL,
     AdvanceResult,
+    BudgetExhaustedError,
     OperationContentionError,
     Phase,
     RunState,
@@ -399,8 +402,17 @@ class _PhasesMixin:
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
+        # 0. Refresh persisted dependency waits before deciding what is dispatchable:
+        # a wait whose prerequisite has since completed must not keep its dependent
+        # out of this dispatch pass, and a wait with no resolution path must be
+        # converted into an explicit blocker here.
+        self._reevaluate_dependency_waits(state, ws, published, superseded)
+
         # 1. Discover all eligible work orders whose dependencies are satisfied
+        # Dependency evaluation is fail-closed: only SATISFIED is dispatchable,
+        # INVALID is routed to authorized repair, WAITING is recorded and held.
         eligible_wos = []
+        invalid_dependencies: list[tuple[str, Any]] = []
         for wo_id in state.worker_wo_ids:
             if wo_id in superseded:
                 continue
@@ -412,8 +424,14 @@ class _PhasesMixin:
                 continue
             if wo_id in state.completed_wo_ids or wo_id in state.failed_wo_ids:
                 continue
-            if not self._dependencies_met(state, wo_id, ws):
+            dependency = self._dependency_result(state, wo_id, ws)
+            if dependency.status is DependencyStatus.INVALID:
+                invalid_dependencies.append((wo_id, dependency))
                 continue
+            if dependency.status is DependencyStatus.WAITING:
+                self._record_dependency_wait(state, wo_id, dependency)
+                continue
+            state.dependency_waits.pop(wo_id, None)
             if self._is_wo_running(state, wo_id):
                 dispatched_any = True
                 continue
@@ -445,6 +463,8 @@ class _PhasesMixin:
                         self.manager._save()
                     except Exception:
                         pass
+        contention_waited = False
+        transient_waited = False
         for wo_id in eligible_wos:
             agent = self._agent_for_wo(wo_id, ws)
             try:
@@ -457,23 +477,85 @@ class _PhasesMixin:
                     parent_operation_id=parent_op_id,
                 )
                 dispatched_any = True
+                # A successful dispatch resolves any prior dispatch failure.
+                state.dispatch_failures.pop(wo_id, None)
             except OperationContentionError:
-                # Session is currently occupied by another turn. Let advance() wait.
-                pass
+                # Session is occupied by an existing operation: wait for it.
+                # Contention is not a work-order failure and consumes no retry.
+                contention_waited = True
+            except BudgetExhaustedError:
+                raise
             except Exception as exc:
-                # D024 gate or other pre-check might block — record and continue
-                if wo_id not in state.blocked_wo_ids:
-                    state.blocked_wo_ids.append(wo_id)
-                state.error = f"Dispatch failed for {wo_id}: {exc}"
+                # Classify the failure instead of treating every dispatch
+                # exception as an equivalent permanent work-order blocker.
+                _rec, info = self._record_dispatch_failure(
+                    state, wo_id, exc, phase=Phase.DISPATCHING.value
+                )
+                terminal, reason = self._dispatch_failure_is_terminal(state, wo_id)
+                if terminal or not info["retryable"]:
+                    if wo_id not in state.blocked_wo_ids:
+                        state.blocked_wo_ids.append(wo_id)
+                    state.error = reason or f"Dispatch failed for {wo_id}: {exc}"
+                else:
+                    # Transient: remain eligible for a bounded redispatch.
+                    state.error = (
+                        f"Transient dispatch failure for {wo_id} "
+                        f"({info['code']}): {exc}"
+                    )
+                    transient_waited = True
 
-        self._transition(state, Phase.EXECUTING)
-        if dispatched_any:
+        if invalid_dependencies:
+            wo_id, dependency = invalid_dependencies[0]
+            outcome = self._handle_invalid_dependency(state, ws, wo_id, dependency)
+            if outcome is not None:
+                return outcome
+
+        pending = self._pending_worker_wos(state, ws, published, superseded)
+
+        # Valid wait conditions include active dependency waits with a live resolution path
+        valid_dependency_wait = self._has_valid_dependency_wait(state)
+        valid_wait = bool(
+            contention_waited
+            or transient_waited
+            or state.batch_operation_id
+            or state.dependency_escalation_op_id
+            or state.recovery_decision_operation_id
+            or state.architect_repair_operation_id
+            or self._has_active_operations(state)
+            or valid_dependency_wait
+        )
+        if not pending:
+            # Nothing left to execute here; EXECUTING drives completion.
+            self._transition(state, Phase.EXECUTING)
+            return AdvanceResult.TRANSITIONED
+        if dispatched_any or valid_wait:
+            self._transition(state, Phase.EXECUTING)
             return AdvanceResult.WAITING_FOR_OPERATION
-        if state.blocked_wo_ids and not state.completed_wo_ids:
-            state.error = f"All worker WOs are blocked: {state.blocked_wo_ids}"
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED
-        return AdvanceResult.TRANSITIONED
+        # No worker was dispatched, no operation is awaiting, and work remains:
+        # entering EXECUTING would falsely claim that work is underway.
+        self._transition(state, Phase.BLOCKED)
+        state.error = (
+            "DISPATCH_NO_EXECUTABLE_WORK: no worker operation is active and no "
+            f"valid wait condition exists for pending work orders {pending}"
+        )
+        return AdvanceResult.BLOCKED
+
+    def _pending_worker_wos(
+        self, state: RunState, ws: Path, published: set[str], superseded: set[str],
+    ) -> list[str]:
+        """Work orders that still require execution (mirrors dispatch filters)."""
+        pending: list[str] = []
+        for wo_id in state.worker_wo_ids:
+            if wo_id in superseded:
+                continue
+            if published and wo_id not in published:
+                continue
+            if wo_id == state.gitops_wo_id or self._role_for_agent(self._agent_for_wo(wo_id, ws)) == "gitops":
+                continue
+            if wo_id in state.completed_wo_ids or wo_id in state.failed_wo_ids:
+                continue
+            pending.append(wo_id)
+        return pending
 
     def _advance_executing(self, state: RunState) -> AdvanceResult:
         """EXECUTING: monitor worker operations and QA flow."""
@@ -532,6 +614,9 @@ class _PhasesMixin:
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
+        # Reevaluate dependency waits: resolve satisfied, invalidate stale/obsolete
+        self._reevaluate_dependency_waits(state, ws, published, superseded)
+
         for wo_id in state.worker_wo_ids:
             if wo_id in superseded:
                 continue
@@ -548,12 +633,10 @@ class _PhasesMixin:
             op = self._find_latest_wo_operation(state, wo_id)
             if op is None:
                 # Not dispatched yet — check deps and dispatch
-                if (
-                    wo_id in state.blocked_by_escalation
-                    or wo_id in state.blocked_wo_ids
-                    or wo_id == state.recovery_wo_id
-                    or state.recovery_attempts.get(wo_id, 0) > 0
-                ):
+                # Dispatch eligibility is decided from authoritative blocker /
+                # operation / recovery state.  Recovery *history* never
+                # suppresses dispatch of a work order whose blockers resolved.
+                if self._dispatch_block_reason(state, wo_id) is not None:
                     all_done = False
                     continue
                 pending_rework = state.qa_rework_targets.get(wo_id)
@@ -567,7 +650,19 @@ class _PhasesMixin:
                         # the unfixed deliverables would just re-find the bug.
                         all_done = False
                         continue
-                if self._dependencies_met(state, wo_id, ws):
+                dependency = self._dependency_result(state, wo_id, ws)
+                if dependency.status is DependencyStatus.INVALID:
+                    all_done = False
+                    outcome = self._handle_invalid_dependency(state, ws, wo_id, dependency)
+                    if outcome is not None:
+                        return outcome
+                    continue
+                if dependency.status is DependencyStatus.WAITING:
+                    self._record_dependency_wait(state, wo_id, dependency)
+                    all_done = False
+                    continue
+                state.dependency_waits.pop(wo_id, None)
+                if dependency.status is DependencyStatus.SATISFIED:
                     if hasattr(self.manager, "_sessions"):
                         sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
                         if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
@@ -593,11 +688,24 @@ class _PhasesMixin:
                                 parent_operation_id=state.batch_operation_id,
                             )
                             turns_dispatched += 1
+                            state.dispatch_failures.pop(wo_id, None)
                         except OperationContentionError:
                             all_done = False
                             continue
-                        except Exception:
-                            state.blocked_wo_ids.append(wo_id)
+                        except Exception as exc:
+                            _rec, info = self._record_dispatch_failure(
+                                state, wo_id, exc, phase=Phase.EXECUTING.value
+                            )
+                            terminal, reason = self._dispatch_failure_is_terminal(state, wo_id)
+                            if terminal or not info["retryable"]:
+                                if wo_id not in state.blocked_wo_ids:
+                                    state.blocked_wo_ids.append(wo_id)
+                                state.error = reason or f"Dispatch failed for {wo_id}: {exc}"
+                            else:
+                                state.error = (
+                                    f"Transient dispatch failure for {wo_id} "
+                                    f"({info['code']}): {exc}"
+                                )
                 all_done = False
                 continue
 

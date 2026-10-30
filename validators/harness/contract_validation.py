@@ -52,6 +52,7 @@ def verify_pre_execution(
     agent: str,
     task: Any,  # HarnessTask
     context: ContextBundle,
+    contract: Any | None = None,
 ) -> None:
     """Pre-execution validation: verify contract is valid, not expired, and D024 compliant for GitOps.
 
@@ -63,7 +64,8 @@ def verify_pre_execution(
 
         D024Gate().verify_gitops_preconditions(project_path, task.work_order_id)
 
-    contract = load_harness_contract(project_path, agent, task.work_order_id)
+    if contract is None:
+        contract = load_harness_contract(project_path, agent, task.work_order_id)
     if contract is None:
         return
 
@@ -88,6 +90,7 @@ def verify_post_execution(
     task: Any,  # HarnessTask
     decision: Any,  # HarnessDecision
     observed_files: Any | None = None,  # Sequence[str] | None
+    contract: Any | None = None,
 ) -> None:
     """Post-execution validation: verify decision output and observed changes against contract.
 
@@ -99,7 +102,8 @@ def verify_post_execution(
     5. D025 Destructive Operations in commands
     6. D024 QA Gate for GitOps progression
     """
-    contract = load_harness_contract(project_path, agent, task.work_order_id)
+    if contract is None:
+        contract = load_harness_contract(project_path, agent, task.work_order_id)
     if contract is None:
         return
 

@@ -371,6 +371,19 @@ class _ControlsMixin:
         """Resolve Architect recovery for a work order, updating contracts and unblocking dependents."""
         if state.recovery_wo_id == wo_id:
             state.recovery_wo_id = None
+        # An amended contract is new input, so the recovery budget for this work
+        # order is renewed — but the prior attempts stay auditable instead of
+        # being silently erased.
+        prior_attempts = state.recovery_attempts.get(wo_id, 0)
         state.recovery_attempts[wo_id] = 0
+        if prior_attempts:
+            state.recovery_decisions.append({
+                "work_order": wo_id,
+                "action": "recovery_budget_renewed",
+                "reason": "contract amended after successful recovery resolution",
+                "prior_recovery_attempts": prior_attempts,
+                "decided_at": _now(),
+            })
         state.worker_retries[wo_id] = 0
+        state.dispatch_failures.pop(wo_id, None)
         self.evaluate_blocked_by_escalation(state)

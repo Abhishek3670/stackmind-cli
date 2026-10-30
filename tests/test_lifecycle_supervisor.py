@@ -43,6 +43,32 @@ from validators.kernel.daemon.supervisor import (
     format_release_commit_message,
 )
 from tests.review_helpers import final_pass, qa_pass
+from validators.kernel.work_order_ops import sha256_file
+
+
+def _completed_wo_yaml(wo_id: str, deliverable_path: str, tmp_path: Path, contract_revision: int = 1) -> str:
+    """Generate YAML for a COMPLETED work order with authoritative completion record (HF1-A)."""
+    deliverable_hashes: dict[str, str] = {}
+    deliverable_file = tmp_path / deliverable_path
+    if deliverable_file.is_file():
+        deliverable_hashes[deliverable_path] = sha256_file(deliverable_file) or ""
+    data = {
+        "id": wo_id,
+        "title": f"Task {wo_id}",
+        "revision": 1,
+        "status": "COMPLETED",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": deliverable_path},
+        "completed_at": "2026-01-01T00:00:00Z",
+        "completion": {
+            "work_order_id": wo_id,
+            "verified_at_revision": 1,
+            "verified_at_contract_revision": contract_revision,
+            "deliverable_hashes": deliverable_hashes,
+        },
+    }
+    return yaml.safe_dump(data, sort_keys=False)
 
 
 # ─── Mock SessionManager for unit testing state transitions ───────────
@@ -436,6 +462,15 @@ def test_supervisor_dependency_resolution(tmp_path: Path) -> None:
     op_wo1 = next(op for op in mock_mgr.list_operations() if op["work_order_id"] == "WO-001")
     mock_mgr.complete_operation(op_wo1["operation_id"], "COMPLETED")
     qa_pass(tmp_path, "WO-001")  # mandatory QA gate
+
+
+    # Move WO-001 to COMPLETED with authoritative completion record
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
+    (completed_dir / "WO-001.yaml").write_text(
+        _completed_wo_yaml("WO-001", "requirements.txt", tmp_path), encoding="utf-8"
+    )
 
     # Advance again: WO-001 becomes completed, WO-002 is now eligible and dispatched!
     res2 = supervisor.advance(state)
@@ -1006,7 +1041,7 @@ def test_s6_dispatch_ordering_enforces_scaffolding_before_dependent_workers(tmp_
     ops = mock_mgr.list_operations()
     dispatched_wos = [o.get("work_order_id") for o in ops]
     assert "WO-001" in dispatched_wos
-    assert "WO-002" not in dispatched_wos
+    assert "WO-002" not in dispatched_wos  # dependency not satisfied yet
 
     (tmp_path / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
     mock_mgr.complete_operation(ops[0]["operation_id"], status="COMPLETED")
@@ -1075,15 +1110,16 @@ def test_s8_supervisor_resumes_from_persisted_state_without_reexecuting_complete
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
-    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
-        "id": "WO-001", "assigned_agents": ["codex"], "dependencies": [],
-        "deliverable": {"type": "config", "path": "requirements.txt"},
-    }), encoding="utf-8")
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
+    (completed_dir / "WO-001.yaml").write_text(
+        _completed_wo_yaml("WO-001", "requirements.txt", tmp_path), encoding="utf-8"
+    )
     (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
         "id": "WO-002", "assigned_agents": ["codex"], "dependencies": ["WO-001"],
         "deliverable": {"type": "code", "path": "src/api/login.py"},
     }), encoding="utf-8")
-    (tmp_path / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
 
     initial_state = RunState(
         run_id="run-s8-resume",
@@ -1230,11 +1266,13 @@ def test_s6_parallel_worker_dispatch_concurrent_execution(tmp_path: Path) -> Non
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
-    # WO-001 is already completed scaffolding
-    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
-        "id": "WO-001", "assigned_agents": ["codex"], "dependencies": [],
-        "deliverable": {"type": "config", "path": "requirements.txt"},
-    }), encoding="utf-8")
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    # WO-001 is already completed scaffolding with authoritative completion record
+    (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (completed_dir / "WO-001.yaml").write_text(
+        _completed_wo_yaml("WO-001", "requirements.txt", tmp_path), encoding="utf-8"
+    )
     # WO-002 (backend) and WO-003 (frontend) both depend on WO-001
     (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
         "id": "WO-002", "assigned_agents": ["codex"], "dependencies": ["WO-001"],
@@ -1244,7 +1282,6 @@ def test_s6_parallel_worker_dispatch_concurrent_execution(tmp_path: Path) -> Non
         "id": "WO-003", "assigned_agents": ["gemini"], "dependencies": ["WO-001"],
         "deliverable": {"type": "code", "path": "src/frontend.html"},
     }), encoding="utf-8")
-    (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
 
     state.worker_wo_ids = ["WO-001", "WO-002", "WO-003"]
     state.completed_wo_ids = ["WO-001"]
@@ -1300,10 +1337,12 @@ def test_s6_real_session_manager_concurrent_worker_dispatch(tmp_path: Path) -> N
 
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
-    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
-        "id": "WO-001", "assigned_agents": ["codex"], "dependencies": [],
-        "deliverable": {"type": "config", "path": "requirements.txt"},
-    }), encoding="utf-8")
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (completed_dir / "WO-001.yaml").write_text(
+        _completed_wo_yaml("WO-001", "requirements.txt", tmp_path), encoding="utf-8"
+    )
     (wo_dir / "WO-002.yaml").write_text(yaml.safe_dump({
         "id": "WO-002", "assigned_agents": ["codex"], "dependencies": ["WO-001"],
         "deliverable": {"type": "code", "path": "src/backend.py"},
@@ -1312,7 +1351,6 @@ def test_s6_real_session_manager_concurrent_worker_dispatch(tmp_path: Path) -> N
         "id": "WO-003", "assigned_agents": ["gemini"], "dependencies": ["WO-001"],
         "deliverable": {"type": "code", "path": "src/frontend.html"},
     }), encoding="utf-8")
-    (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
 
     supervisor = LifecycleSupervisor(manager)
     state = supervisor.start_run("run-real-s6", "Real parallel goals", tmp_path, sid)
@@ -1687,6 +1725,18 @@ def test_manager_resume_run_recovers_failed_run(tmp_path: Path):
     mgr = SessionManager(storage)
     session = mgr.create_session("codex", "daemon", {"write_mode": "governed"}, str(tmp_path))
     sid = session["session_id"]
+
+    # The resumed run's work order must exist authoritatively: dependency
+    # evaluation is fail-closed and never infers "no record = no dependencies".
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump(
+            {"id": "WO-001", "assigned_agents": ["codex"], "dependencies": []},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
 
     run_id = "run-testresume"
     sup_dir = tmp_path / ".sync" / "runtime" / "supervisor"
@@ -2927,6 +2977,7 @@ def test_manager_resume_run_invalidates_stale_operations_and_unblocks_work_order
             "id": "WO-001",
             "title": "Configure Dependencies",
             "status": "BLOCKED",
+            "dependencies": [],
             "error": "timed out",
             "blocked_reason": "timed out",
         }),

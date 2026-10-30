@@ -223,6 +223,18 @@ class RunState:
     waiting_for_human_entered_at: float | None = None
     # Last dispatch failure diagnostic (set by _architect_turn on failure)
     last_dispatch_error: str | None = None
+    # ── Dispatch failure classification (SDP-FIX-008A) ───────────────────
+    # Durable, auditable per-work-order dispatch failure record: failure class,
+    # diagnostics, attempts consumed and the resolution route.  It bounds
+    # redispatch of transient failures and is cleared only by a successful
+    # dispatch or a resolved recovery — never by an unrelated counter reset.
+    dispatch_failures: dict[str, dict[str, Any]] = field(default_factory=dict)
+    max_dispatch_attempts: int = 3
+    # ── Dependency integrity (SDP-FIX-008B) ──────────────────────────────
+    # Durable WAITING/INVALID dependency records with the blocking prerequisite,
+    # its observed state/revision, the expected resolution and its owner.
+    dependency_waits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    dependency_graph_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -317,6 +329,11 @@ class RunState:
             "delivery_status_delivered": bool(self.delivery_status_delivered),
             "delivery_status_summary": self.delivery_status_summary,
             "delivery_status_operation_id": self.delivery_status_operation_id,
+            "last_dispatch_error": self.last_dispatch_error,
+            "dispatch_failures": {k: dict(v) for k, v in self.dispatch_failures.items()},
+            "max_dispatch_attempts": self.max_dispatch_attempts,
+            "dependency_waits": {k: dict(v) for k, v in self.dependency_waits.items()},
+            "dependency_graph_fingerprint": self.dependency_graph_fingerprint,
         }
 
     @classmethod
@@ -413,6 +430,11 @@ class RunState:
             delivery_status_delivered=bool(data.get("delivery_status_delivered", False)),
             delivery_status_summary=data.get("delivery_status_summary"),
             delivery_status_operation_id=data.get("delivery_status_operation_id"),
+            last_dispatch_error=data.get("last_dispatch_error"),
+            dispatch_failures=dict(data.get("dispatch_failures", {}) or {}),
+            max_dispatch_attempts=int(data.get("max_dispatch_attempts", 3)),
+            dependency_waits=dict(data.get("dependency_waits", {}) or {}),
+            dependency_graph_fingerprint=data.get("dependency_graph_fingerprint"),
         )
 
 _OPERATION_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}

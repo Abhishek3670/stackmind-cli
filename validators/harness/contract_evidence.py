@@ -54,6 +54,7 @@ def build_contract_failure_evidence(
     observed_files: Any | None = None,
     decision: Any | None = None,
     operation_id: str | None = None,
+    contract: AgentContract | None = None,
 ) -> dict[str, Any]:
     """Build the durable worker-blocker evidence packet for a contract failure.
 
@@ -78,7 +79,8 @@ def build_contract_failure_evidence(
         failure_code = "CONTRACT_VALIDATION_ERROR"
 
     work_order_id = getattr(task, "work_order_id", None)
-    contract = load_harness_contract(project_path, agent, work_order_id)
+    if contract is None:
+        contract = load_harness_contract(project_path, agent, work_order_id)
     file_budget: int | None = None
     contract_hash = _contract_file_sha256(project_path, work_order_id)
     contract_revision = 1

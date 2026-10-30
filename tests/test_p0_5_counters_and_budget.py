@@ -642,6 +642,7 @@ def test_idle_stall_transitions_to_waiting_for_human(tmp_path: Path):
 
     # WO-001 is in recovery (blocked by escalation)
     state.recovery_attempts["WO-001"] = 1
+    state.recovery_attempts["IDLE_STALL"] = state.max_retries
     state.recovery_wo_id = "WO-001"
     sup.set_wo_dependencies(state, "WO-002", ["WO-001"])
     sup.evaluate_blocked_by_escalation(state)
@@ -1230,6 +1231,17 @@ def test_every_turn_path_decrements_budget_full_stub_run(tmp_path: Path):
     # 3. Real supervisor path: Worker dispatch turn
     state.phase = Phase.DISPATCHING
     state.worker_wo_ids = ["WO-001"]
+    # Fail-closed dependency evaluation (008B) requires an authoritative record.
+    import yaml as _yaml
+    _wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    _wo_dir.mkdir(parents=True, exist_ok=True)
+    (_wo_dir / "WO-001.yaml").write_text(
+        _yaml.safe_dump(
+            {"id": "WO-001", "assigned_agents": ["codex"], "dependencies": []},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
     sup._advance_dispatching(state)
     turns_count += 1
     assert state.global_turn_budget == initial_budget - turns_count
