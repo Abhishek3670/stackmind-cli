@@ -5,6 +5,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.10] - 2026-10-30
+
+### Changed
+- **Modularized the Lifecycle Supervisor and Agent Runner**: split the runtime's two largest modules into focused packages. Method bodies moved verbatim and each package re-exports the previous module-level surface, so existing imports (`from validators.kernel.daemon.supervisor import Phase`, `from validators.harness.runner import HarnessRunner`) are unchanged.
+  - `validators/kernel/daemon/supervisor.py` (7,856 lines) → `validators/kernel/daemon/supervisor/`: `models` (phases, results, exit codes, `RunState`), `core` (`LifecycleSupervisor` composed from phase-focused mixins), `phases`, `execution`, `review`, `recovery`, `gitops`, `controls`, `status`, `release`.
+  - `validators/harness/runner.py` (4,134 lines) → `validators/harness/runner/`: `models` (dataclasses, output schema, prompts), `core` (`AgentRunner` composed from turn-focused mixins), `execution`, `completion`, `discovery`, `decisions`, `prompts`, `commands`, `staging`, `verification`, `reconciliation`, `workspace`.
+  - Verified with method-by-method AST parity (113/113 supervisor and 36/36 runner methods identical), 1,674 targeted tests, and a full-suite comparison that shows the same 92 pre-existing failures before and after.
+
 ## [3.10.9] - 2026-10-29
 
 ### Added

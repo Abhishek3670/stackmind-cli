@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.10.3` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.10.10` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -98,7 +98,7 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Harness
 
-`AgentRunner` (`validators/harness/runner.py`) executes one contracted turn: inbox/WO discovery → contract + citizenship checks → `assemble_context` → scratch workspace → provider tool loop (`read_file`/`write_file`/`run_command`/`query_graph`/`web_search`/`image_search`/`web_fetch` via `validators/kernel/tools.py` + `providers/gateway.py`) → staged-diff verification (incl. no-op, `D024` QA gates, and `DeliverableVerifier` HTML media asset integrity checks) → validated write-back. Default provider is `EchoLLMProvider`; gateway also supports real backends (Ollama etc.).
+`AgentRunner` (`validators/harness/runner/`) executes one contracted turn: inbox/WO discovery → contract + citizenship checks → `assemble_context` → scratch workspace → provider tool loop (`read_file`/`write_file`/`run_command`/`query_graph`/`web_search`/`image_search`/`web_fetch` via `validators/kernel/tools.py` + `providers/gateway.py`) → staged-diff verification (incl. no-op, `D024` QA gates, and `DeliverableVerifier` HTML media asset integrity checks) → validated write-back. Default provider is `EchoLLMProvider`; gateway also supports real backends (Ollama etc.).
 
 ## Docs
 
@@ -109,6 +109,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.9.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.10.10`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect
