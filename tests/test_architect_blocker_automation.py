@@ -188,9 +188,9 @@ class TestArchitectBlockerAutomation:
         }
 
         res = sup._advance_integration_review(state)
-        # Should autonomously resolve all 4 non-code blockers and transition to PRODUCT_READY
+        # Should autonomously resolve all 4 non-code blockers and transition to FINAL_REVIEW
         assert res == AdvanceResult.TRANSITIONED
-        assert state.phase == Phase.PRODUCT_READY
+        assert state.phase == Phase.FINAL_REVIEW
         assert len(state.integration_blockers) == 0
 
         # Verify WO-000 was moved to COMPLETED

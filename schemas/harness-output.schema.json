@@ -37,7 +37,10 @@
       }
     },
     "release_target": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "retrieval_queries": {
       "type": "array",

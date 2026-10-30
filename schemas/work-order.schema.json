@@ -43,7 +43,8 @@
         "COMPLETE",
         "COMPLETED",
         "FAILED",
-        "CANCELLED"
+        "CANCELLED",
+        "SUPERSEDED"
       ]
     },
     "priority": {
@@ -857,6 +858,10 @@
     },
     "qa_verdict": {
       "type": "string"
+    },
+    "superseded_by": {
+      "type": "string",
+      "description": "Identifier of the successor work order that supersedes this work order."
     }
   },
   "additionalProperties": false

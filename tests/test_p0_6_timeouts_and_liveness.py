@@ -686,6 +686,15 @@ def test_stub_matrix_agent_phase_bounded_termination(tmp_path: Path, agent_phase
     state.integration_wo_id = "WO-001"
     state.recovery_wo_id = "WO-001"
 
+    # Success runs must carry valid Architect final-acceptance evidence: the
+    # COMPLETE state now fails closed without it.
+    if stub_behavior == "success":
+        from tests.review_helpers import final_pass
+        (tmp_path / "PLAN.md").write_text("# Approved Plan\n\nGoal.\n", encoding="utf-8")
+        state.plan_id = "PLAN-001"
+        state.integration_evidence = {"passed": True}
+        final_pass(tmp_path, state.run_id, "PLAN-001", [])
+
     start_mono = time.monotonic()
     max_steps = 30
     step_count = 0

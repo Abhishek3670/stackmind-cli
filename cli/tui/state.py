@@ -550,9 +550,11 @@ class AutonomousDeliveryState:
         context_window_tokens: int = 32_768,
         compaction_threshold: float = 0.85,
         compaction_keep_recent: int = 6,
+        workspace: Path | str | None = None,
     ) -> None:
         self.project_name = project_name
         self.session_id = session_id
+        self.workspace = Path(workspace).resolve() if workspace else None
         self.phase: ProjectPhase = ProjectPhase.INITIALIZING
         self.mouse_reporting_enabled: bool = True
         self.error: str | None = None
@@ -1563,9 +1565,11 @@ class AutonomousDeliveryState:
 
         if run_phase:
             rp_str = str(run_phase).upper()
-            if rp_str in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
-                          "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION",
-                          "PRODUCT_READY", "GITOPS"):
+            if rp_str in (
+                "DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
+                "FINAL_REVIEW", "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR",
+                "ARCHITECT_RECOVERY_DECISION", "PRODUCT_READY", "GITOPS",
+            ):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
                 if not run_error:
                     self.error = None
@@ -1590,6 +1594,7 @@ class AutonomousDeliveryState:
 
         ws_session = session.get("workspace")
         if ws_session:
+            self.workspace = Path(ws_session).resolve()
             self.sync_work_orders_from_disk(ws_session)
         journal = session.get("journal")
         if isinstance(journal, list):
@@ -2083,7 +2088,8 @@ class AutonomousDeliveryState:
 
         if workspace is not None:
             try:
-                ws_path = Path(workspace)
+                ws_path = Path(workspace).resolve()
+                self.workspace = ws_path
                 self.sync_work_orders_from_disk(ws_path)
 
                 plan_file = ws_path / ".sync" / "PLAN.md"
@@ -2220,6 +2226,31 @@ class AutonomousDeliveryState:
                 self.plan_revisions[-1].state = "REJECTED"
                 self.plan_revisions[-1].feedback = feedback
             self.add_activity("Operator", f"plan rejected: {feedback or 'Needs revision'}")
+
+        elif name == "task.auto_delegated":
+            target_agent = str(payload.get("agent_id") or "").lower().strip()
+            target_role = str(payload.get("role") or self._infer_role_from_op(target_agent)).strip()
+            norm_lower = target_role.lower()
+            if norm_lower in ("qa", "q/a"):
+                normalized_role = "Q/A"
+            elif norm_lower == "gitops":
+                normalized_role = "GitOps"
+            elif norm_lower in ("architecture", "arch"):
+                normalized_role = "Architecture"
+            else:
+                normalized_role = target_role.title()
+
+            wo_id = payload.get("work_order_id")
+            if normalized_role in self.roles:
+                self.roles[normalized_role].state = "WAITING"
+                if wo_id:
+                    self.roles[normalized_role].work_order_id = wo_id
+
+            ws_val = getattr(self, "workspace", None)
+            if ws_val:
+                self.sync_work_orders_from_disk(ws_val)
+            self.reconcile_roles_from_work_orders()
+            self.add_activity("Architecture", f"delegated to {normalized_role}", wo_id or "")
 
         elif name in {"event.agentSpawned", "agent.spawned"}:
             agent_id = payload.get("agent_id") or payload.get("agentId") or "agent-sub"
@@ -2512,6 +2543,11 @@ class AutonomousDeliveryState:
                 call_id, status=norm_status, error=err,
                 tool_name=tool_name, output=tool_output, diff=tool_diff,
             )
+            if tool_name == "delegate_task":
+                ws_val = getattr(self, "workspace", None)
+                if ws_val:
+                    self.sync_work_orders_from_disk(ws_val)
+                self.reconcile_roles_from_work_orders()
             self.last_tool_name = self.active_tool_name or tool_name
             self.last_tool_target = self.active_tool_target
             self.last_tool_code = self.active_tool_code
@@ -2608,9 +2644,11 @@ class AutonomousDeliveryState:
                         op.status = "COMPLETED"
                 self.add_activity("StackMind", "project complete")
                 self.reconcile_roles_from_work_orders()
-            elif phase_val in ("DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
-                               "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR", "ARCHITECT_RECOVERY_DECISION",
-                               "PRODUCT_READY", "GITOPS"):
+            elif phase_val in (
+                "DISPATCHING", "EXECUTING", "AUTHORING", "INTEGRATION_REVIEW",
+                "FINAL_REVIEW", "AUTHORING_READINESS_GATE", "ARCHITECT_REPAIR",
+                "ARCHITECT_RECOVERY_DECISION", "PRODUCT_READY", "GITOPS",
+            ):
                 self.phase = ProjectPhase.AUTONOMOUS_EXECUTION
                 self.error = None
             elif phase_val == "AWAITING_APPROVAL":

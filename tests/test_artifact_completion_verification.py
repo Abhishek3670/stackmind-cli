@@ -32,6 +32,7 @@ from validators.kernel.daemon.supervisor import (
     RunState,
     Phase,
 )
+from tests import review_helpers
 from tests.test_lifecycle_supervisor import MockSessionManager
 
 
@@ -584,6 +585,9 @@ def test_successful_retry_clears_stale_worker_blocker(tmp_path: Path):
     # Turn 2 (retry): worker now writes the valid deliverable to disk
     (tmp_path / "src").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "app.py").write_text("def app():\n    return 'clean'\n", encoding="utf-8")
+    # WO-001 produces code, so completion also requires the mandatory QA gate;
+    # record the independent QA verdict for this revision (as the QA role does).
+    review_helpers.qa_pass(tmp_path, "WO-001")
 
     retries = [o for o in mock_mgr.list_operations() if o.get("work_order_id") == "WO-001" and o != op1]
     assert len(retries) == 1

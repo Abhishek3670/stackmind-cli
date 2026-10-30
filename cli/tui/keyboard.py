@@ -963,6 +963,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":contract", "Display Contract Boundary HUD & permissions", False),
     (":diff", "Display Unified Diff viewer", False),
     (":matrix", "Display 6-Dimensional Verification Matrix", False),
+    (":reviews", "Display QA and Architect final-acceptance gate state", False),
     (":events", "Stream incremental sequenced events", False),
     (":reconnect", "Reconnect to daemon & replay missed events", False),
     (":chat", "Display conversation transcript", False),
@@ -2440,6 +2441,36 @@ def raw_prompt_input(
             history.append(result)
 
     return result
+
+
+def poll_stream_key() -> str | None:
+    """Non-blocking poll for any key during streaming.
+
+    Returns decoded Key constant, printable character, or None if no key is pending.
+    Does not consume/discard non-scroll keys.
+    """
+    if os.name == "nt":
+        import msvcrt
+        if not msvcrt.kbhit():
+            return None
+        return _read_raw_key_windows(timeout=0.01)
+    else:
+        import select
+        fd = sys.stdin.fileno()
+        r, _, _ = select.select([fd], [], [], 0.0)
+        if not r:
+            return None
+        ch = os.read(fd, 1).decode("utf-8", errors="replace")
+        if ch == "\x1b":
+            seq = _read_escape_sequence_posix(fd)
+            if seq:
+                return _parse_escape_sequence(seq)
+            return Key.ESCAPE
+        if ch in ("\r", "\n"):
+            return Key.ENTER
+        if ch in ("\x7f", "\x08"):
+            return Key.BACKSPACE
+        return ch
 
 
 def poll_scroll_key() -> str | None:

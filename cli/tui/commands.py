@@ -45,6 +45,7 @@ from cli.tui.governance import (
     render_contract_hud_str,
     render_plan_panel_str,
     render_projects_panel_str,
+    render_review_panel_str,
     render_skills_panel_str,
     render_verification_matrix_str,
 )
@@ -295,6 +296,7 @@ def get_help_str() -> str:
         "  :cancel [target]  Cancel in-flight session turn, agent, or operation\n"
         "  :diff             Display Unified Diff viewer for staged changes\n"
         "  :matrix           Display 6-Dimensional Verification Matrix\n"
+        "  :reviews          Display QA and Architect final-acceptance gate state\n"
         "  :events           Stream incremental sequenced events from daemon\n"
         "  :pause            Pause active session turn\n"
         "  :resume           Resume active session\n"
@@ -691,20 +693,44 @@ def _stream_turn_execution(
                         live_manager=live_manager,
                     )
 
-            # Poll for scroll keys (PgUp/PgDn/Wheel) so users can scroll during streaming
+            # Poll for keyboard input (scrolling, typing, Enter to halt) during streaming
             if is_tty:
-                from cli.tui.keyboard import poll_scroll_key, Key as _Key
-                _scroll_key = poll_scroll_key()
-                if _scroll_key is not None:
-                    term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
-                    vp_h = compute_viewport_height(term_lines, state=state)
-                    if _scroll_key in (_Key.PAGE_UP, _Key.MOUSE_WHEEL_UP):
-                        step = max(1, vp_h // 2) if _scroll_key == _Key.PAGE_UP else 3
-                        state.scroll_conversation_up(step)
-                    elif _scroll_key in (_Key.PAGE_DOWN, _Key.MOUSE_WHEEL_DOWN):
-                        step = max(1, vp_h // 2) if _scroll_key == _Key.PAGE_DOWN else 3
-                        state.scroll_conversation_down(step)
-                    # Immediate redraw after scroll
+                from cli.tui.keyboard import poll_stream_key, Key as _Key
+                _polled_key = poll_stream_key()
+                if _polled_key is not None:
+                    if _polled_key == _Key.CTRL_C:
+                        raise KeyboardInterrupt()
+                    elif _polled_key in (_Key.PAGE_UP, _Key.MOUSE_WHEEL_UP):
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        vp_h = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_up(max(1, vp_h // 2) if _polled_key == _Key.PAGE_UP else 3)
+                    elif _polled_key in (_Key.PAGE_DOWN, _Key.MOUSE_WHEEL_DOWN):
+                        term_lines = shutil.get_terminal_size(fallback=(80, current_lines)).lines
+                        vp_h = compute_viewport_height(term_lines, state=state)
+                        state.scroll_conversation_down(max(1, vp_h // 2) if _polled_key == _Key.PAGE_DOWN else 3)
+                    elif _polled_key == _Key.ENTER:
+                        # User pressed Enter while stream is in flight: Halt upcoming/running message!
+                        try:
+                            if op_id and op_id != "turn" and hasattr(client, "operation_cancel"):
+                                client.operation_cancel(op_id, cascade=True)
+                            elif hasattr(client, "cancel"):
+                                client.cancel(session["session_id"])
+                        except Exception:
+                            pass
+                        buf = getattr(state, "composer_buffer", "")
+                        state.pending_submitted_input = buf or ":cancel"
+                        state.composer_buffer = ""
+                        completed = True
+                        break
+                    elif _polled_key == _Key.BACKSPACE:
+                        curr_buf = getattr(state, "composer_buffer", "")
+                        if curr_buf:
+                            state.composer_buffer = curr_buf[:-1]
+                    elif len(_polled_key) == 1 and _polled_key.isprintable():
+                        curr_buf = getattr(state, "composer_buffer", "")
+                        state.composer_buffer = curr_buf + _polled_key
+
+                    # Immediate redraw with active composer and user buffer
                     _s_layout = compute_layout(shutil.get_terminal_size().columns)
                     _s_content = _build_in_progress_turn_content(
                         state, model_name, streamed_chunks,
@@ -715,7 +741,8 @@ def _stream_turn_execution(
                         session, state,
                         clear=False,
                         include_composer=True,
-                        composer_is_active=False,
+                        composer_is_active=True,
+                        composer_content=getattr(state, "composer_buffer", ""),
                         composer_placeholder=_get_working_placeholder(),
                         conversation_content=_s_content,
                         live_manager=live_manager,
@@ -2373,8 +2400,14 @@ def dispatch_delivery_command(
         _, _, reason = normalized.partition(" ")
         clean_reason = reason.strip() or "Approved by operator"
         # Check if plan is awaiting approval
+        active_run = None
+        needs_remote_sync = (
+            not (state.plan.get("plan_id") or state.plan.get("id"))
+            or state.phase != ProjectPhase.AWAITING_APPROVAL
+            or state.plan.get("state") != "AWAITING_APPROVAL"
+        )
         plan_id = state.plan.get("plan_id") or state.plan.get("id")
-        if not plan_id:
+        if needs_remote_sync:
             try:
                 sid = session.get("session_id", "")
                 remote_plan = client.plan_get(sid)
@@ -2384,10 +2417,10 @@ def dispatch_delivery_command(
                     state.phase = ProjectPhase.AWAITING_APPROVAL
             except Exception:
                 pass
-        if not plan_id:
+        if needs_remote_sync:
             try:
                 active_run = client.run_get(session.get("session_id", ""))
-                if active_run and active_run.get("phase") == "AWAITING_APPROVAL":
+                if active_run and active_run.get("phase") in ("AWAITING_APPROVAL", "INIT", "PLANNING", "planning", "awaiting_approval"):
                     plan_id = active_run.get("plan_id") or "PLAN-001"
                     state.phase = ProjectPhase.AWAITING_APPROVAL
             except Exception:
@@ -2395,9 +2428,16 @@ def dispatch_delivery_command(
         if (
             state.phase == ProjectPhase.AWAITING_APPROVAL
             or state.plan.get("state") == "AWAITING_APPROVAL"
+            or active_run is not None
         ) and plan_id:
             try:
-                client.plan_approve(session["session_id"], plan_id, reason=clean_reason)
+                sid = session.get("session_id", "")
+                if hasattr(client, "run_approve"):
+                    try:
+                        client.run_approve(sid, reason=clean_reason)
+                    except Exception:
+                        pass
+                client.plan_approve(sid, plan_id, reason=clean_reason)
                 # Fetch and process events to sync state with daemon (e.g., plan.approved, operation.started)
                 sid = session.get("session_id")
                 if sid:
@@ -2462,13 +2502,21 @@ def dispatch_delivery_command(
     if normalized.startswith(":reject"):
         _, _, reason = normalized.partition(" ")
         clean_feedback = reason.strip() or "Operator requested revision"
+        active_run = None
         plan_id = state.plan.get("plan_id") or state.plan.get("id")
         if (
             state.phase == ProjectPhase.AWAITING_APPROVAL
             or state.plan.get("state") == "AWAITING_APPROVAL"
+            or active_run is not None
         ) and plan_id:
             try:
-                client.plan_reject(session["session_id"], plan_id, reason=clean_feedback)
+                sid = session.get("session_id", "")
+                if hasattr(client, "run_reject"):
+                    try:
+                        client.run_reject(sid, reason=clean_feedback)
+                    except Exception:
+                        pass
+                client.plan_reject(sid, plan_id, reason=clean_feedback)
                 state.phase = ProjectPhase.PLAN_REJECTED
                 if state.plan:
                     state.plan["state"] = "REJECTED"
@@ -2606,6 +2654,23 @@ def dispatch_delivery_command(
     if normalized == ":matrix":
         dims = state.verification_dimensions if state is not None else None
         output_str = render_verification_matrix_str(dims)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized.startswith(":reviews"):
+        output_str = ""
+        try:
+            reviews = adapter.command(":reviews", session_id=session["session_id"])
+            output_str = render_review_panel_str(reviews)
+        except Exception as err:
+            output_str = render_error_box_str(
+                f"Unable to read authoritative review state: {err}",
+                title="REVIEW STATE UNAVAILABLE",
+                hint="The daemon must be reachable; review state is never synthesized client-side.",
+            )
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:
@@ -2895,23 +2960,21 @@ def dispatch_delivery_command(
                 pass
 
         if active_op:
-            cur_op = state.get_current_operation() or {}
-            active_role = cur_op.get("role") or session.get("active_role") or "Agent"
-            active_backend = cur_op.get("backend") or session.get("provider") or ""
-            model_label = f"{active_role} · {active_backend}" if active_backend else str(active_role)
-            return _stream_turn_execution(
-                adapter,
-                client,
-                session,
-                state,
-                op_id=active_op,
-                placeholder=f"⚡ {active_role} is working... (:cancel to abort)",
-                effective_timeout=effective_timeout,
-                is_tty=is_tty,
-                live_manager=live_manager,
-                model_name=model_label,
-                initial_activity_desc=f"{active_role} running",
-            )
+            # Halt the in-flight/upcoming operation immediately so user's message executes
+            try:
+                if hasattr(client, "operation_cancel") and active_op != "turn":
+                    client.operation_cancel(active_op, cascade=True)
+                elif hasattr(client, "cancel"):
+                    client.cancel(session["session_id"])
+                elif hasattr(adapter, "command"):
+                    adapter.command(f":cancel {active_op}", session_id=session["session_id"])
+            except Exception:
+                pass
+            if active_op in state.operations:
+                state.operations[active_op].status = "CANCELLED"
+            session.pop("active_operation", None)
+            active_op = None
+            state.active_working_status = None
 
         turn_kwargs: dict[str, Any] = {}
         if not is_goal and hasattr(state, "messages") and state.messages:

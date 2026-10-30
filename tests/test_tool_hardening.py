@@ -1166,3 +1166,29 @@ def test_validate_decision_defaults_release_target_from_deliverable(tmp_path: Pa
 
 
 
+
+
+def test_validate_decision_null_release_target_on_adhoc_task(tmp_path: Path) -> None:
+    from validators.harness.runner import HarnessTask
+    init(tmp_path)
+    runner = AgentRunner(tmp_path, "gemini")
+    task = HarnessTask(
+        kind="adhoc",
+        identifier="ADHOC-001",
+        path=tmp_path / "ADHOC-001.yaml",
+        title="Adhoc Chat Turn",
+        body="Chat Body",
+        query="Chat Query",
+        work_order_id=None,
+        deliverable_path=None,
+    )
+    decision = runner._validate_decision(task, {
+        "status": "completed",
+        "summary": "Completed adhoc response",
+        "report_markdown": "Handled user request",
+        "modified_files": [],
+        "release_target": None,
+        "blockers": [],
+    })
+    assert decision.status == "completed"
+    assert decision.release_target is None

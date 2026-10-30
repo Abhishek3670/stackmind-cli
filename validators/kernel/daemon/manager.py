@@ -246,6 +246,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                 {"module": "*.test.*"},
                 {"module": "*.spec.*"},
                 {"module": ".sync/qa/**"},
+                {"module": ".sync/reviews/qa/**"},
                 {"module": f".sync/inbox/{agent}/**"},
             ]
             default_role = "qa"
@@ -306,6 +307,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             {"module": ".sync/contracts/**"},
             {"module": ".sync/inbox/local-llm/**"},
             {"module": ".sync/inbox/claude/**"},
+            {"module": ".sync/reviews/**"},
         ]
         if not claude_contract.exists():
             claude_contract.parent.mkdir(parents=True, exist_ok=True)
@@ -375,6 +377,30 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                             dirty = True
                     if dirty:
                         claude_contract.write_text(yaml.safe_dump(cdata, sort_keys=False), encoding="utf-8")
+            except Exception:
+                pass
+
+    # Review verdicts are written under .sync/reviews/. The reviewer's agent
+    # contract must authorise that channel, while worker work-order contracts
+    # deliberately do not — this is what prevents a worker self-approving.
+    review_scope = {"claude": ".sync/reviews/**", "gemma": ".sync/reviews/qa/**"}.get(agent)
+    if review_scope:
+        contract_file = sync_dir / "agents" / f"{agent}.contract.yaml"
+        if contract_file.exists():
+            try:
+                cdata = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                scope = cdata.get("scope") if isinstance(cdata, dict) else None
+                if isinstance(scope, dict):
+                    allow = scope.setdefault("allow", [])
+                    modules = {
+                        item.get("module") if isinstance(item, dict) else str(item)
+                        for item in allow
+                    }
+                    if review_scope not in modules and ".sync/reviews/**" not in modules:
+                        allow.append({"module": review_scope})
+                        contract_file.write_text(
+                            yaml.safe_dump(cdata, sort_keys=False), encoding="utf-8"
+                        )
             except Exception:
                 pass
 
@@ -628,8 +654,10 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
 
     if phase == Phase.GITOPS:
         state.gitops_operation_id = None
-    elif phase == Phase.INTEGRATION_REVIEW:
+    elif phase in (Phase.INTEGRATION_REVIEW, Phase.FINAL_REVIEW):
         state.integration_operation_id = None
+        if phase == Phase.FINAL_REVIEW:
+            state.final_review_operation_id = None
     elif phase == Phase.PLANNING:
         state.planning_operation_id = None
         if getattr(state, "planning_wo_id", None) in getattr(state, "completed_wo_ids", []):
@@ -1163,6 +1191,7 @@ class SessionManager:
             return self._view(session)
 
     def get_session(self, session_id: str) -> dict[str, Any]:
+        self._reconcile_stopped_operations(session_id)
         with self._lock:
             try:
                 view = self._view(self._sessions[session_id])
@@ -1175,6 +1204,10 @@ class SessionManager:
                 raise KeyError("unknown session") from error
 
     def list_sessions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            s_ids = list(self._sessions.keys())
+        for s_id in s_ids:
+            self._reconcile_stopped_operations(s_id)
         with self._lock:
             return [self._view(session) for session in self._sessions.values()]
 
@@ -1351,6 +1384,13 @@ class SessionManager:
 
             plan = plans[plan_id]
             if plan.get("state") != "AWAITING_APPROVAL":
+                from validators.kernel.daemon.supervisor import Phase
+                has_active_post_approval_run = any(
+                    r.session_id == session_id and r.phase not in (Phase.INIT, Phase.PLANNING, Phase.AWAITING_APPROVAL)
+                    for r in self._active_runs.values()
+                )
+                if str(plan.get("state", "")).upper() == "APPROVED" and not has_active_post_approval_run:
+                    return plan.get("created_work_orders", [])
                 raise ValueError("Plan is not in AWAITING_APPROVAL state")
 
             now = _now()
@@ -1625,8 +1665,18 @@ class SessionManager:
                 raise KeyError("no active supervisor run for session")
 
             # Route through approve_plan to unify the approval path
+            if not active_run.plan_id:
+                session_obj = self._sessions.get(session_id, {})
+                for p_id, p_obj in reversed(list(session_obj.get("plans", {}).items())):
+                    if str(p_obj.get("state", "")).upper() in ("AWAITING_APPROVAL", "PROPOSED", "DRAFT"):
+                        active_run.plan_id = p_id
+                        break
+
             if active_run.plan_id:
-                self.approve_plan(session_id, active_run.plan_id, reason=reason)
+                try:
+                    self.approve_plan(session_id, active_run.plan_id, reason=reason)
+                except Exception:
+                    pass
 
             self.events.publish(
                 "run.approved",
@@ -1950,28 +2000,6 @@ class SessionManager:
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""
         with self._lock:
-            import importlib
-            import sys
-            if "validators.kernel.daemon.supervisor" in sys.modules:
-                try:
-                    reloaded_mod = importlib.reload(sys.modules["validators.kernel.daemon.supervisor"])
-                    if hasattr(self, "supervisor") and self.supervisor is not None:
-                        self.supervisor.__class__ = reloaded_mod.LifecycleSupervisor
-                except Exception:
-                    pass
-            for mod_name in (
-                "validators.harness.authoring_compiler",
-                "validators.harness.authoring_readiness",
-                "validators.harness.integration_gate",
-                "validators.harness.runner",
-                "validators.harness.d024_gate",
-            ):
-                if mod_name in sys.modules:
-                    try:
-                        importlib.reload(sys.modules[mod_name])
-                    except Exception:
-                        pass
-
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("unknown session")
@@ -2946,6 +2974,39 @@ class SessionManager:
                         return persisted.to_dict()
         return None
 
+    def get_run_reviews(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+        """Authoritative review state (QA gate + Architect final acceptance).
+
+        Reads persisted verdicts on disk, so the answer is identical before and
+        after a daemon restart and never depends on TUI-local state.
+        """
+        from validators.harness import review_gate
+
+        state = self._active_runs.get(run_id) if run_id else None
+        if state is None:
+            for candidate in self._active_runs.values():
+                if candidate.session_id == session_id:
+                    state = candidate
+                    break
+        if state is None:
+            session = self._sessions.get(session_id)
+            if session:
+                ws = Path(session.get("workspace", ""))
+                sup_dir = ws / ".sync" / "runtime" / "supervisor"
+                if sup_dir.is_dir():
+                    run_files = sorted(
+                        sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True
+                    )
+                    for rf in run_files:
+                        persisted = self.supervisor.load_run_state(rf.stem, ws)
+                        if persisted and persisted.session_id == session_id:
+                            state = persisted
+                            self._active_runs[rf.stem] = persisted
+                            break
+        if state is None:
+            raise KeyError(f"no run for session {session_id}")
+        return review_gate.review_status(state, Path(state.workspace))
+
     def _run_turn(
         self, session_id: str, operation_id: str, cancel_event: Event, prompt: str
     ) -> None:
@@ -3237,6 +3298,7 @@ class SessionManager:
                         target_role = str(d_task.get("role") or self._canonical_role(target_agent))
                         target_instr = str(d_task["instructions"]).strip()
                         target_files = d_task.get("target_files") or []
+                        target_wo_id = d_task.get("work_order_id")
                         self.events.publish(
                             "task.auto_delegated",
                             session_id,
@@ -3244,6 +3306,7 @@ class SessionManager:
                             role=target_role,
                             instructions=target_instr,
                             target_files=target_files,
+                            work_order_id=target_wo_id,
                             parent_operation_id=operation_id,
                         )
                         files_str = "\n".join(f"- {f}" for f in target_files) if target_files else ""
@@ -3278,10 +3341,11 @@ class SessionManager:
                                             agent_contract_file.write_text(yaml.safe_dump(c_data, sort_keys=False), encoding="utf-8")
                                 except Exception:
                                     pass
-                            delegated_scope = {
-                                "allow": [{"module": str(f).replace("\\", "/").strip().lstrip("/")} for f in target_files],
-                                "write": "read-write",
-                            }
+                            if not target_wo_id:
+                                delegated_scope = {
+                                    "allow": [{"module": str(f).replace("\\", "/").strip().lstrip("/")} for f in target_files],
+                                    "write": "read-write",
+                                }
                         try:
                             self.start_turn(
                                 session_id,
@@ -3290,6 +3354,7 @@ class SessionManager:
                                 agent_id=target_agent,
                                 delegated_from=operation_id,
                                 contract_scope=delegated_scope,
+                                work_order_id=target_wo_id,
                             )
                         except Exception as e:
                             self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")
@@ -3319,6 +3384,11 @@ class SessionManager:
                         f"- [ ] Milestone 2: <Description>\n\n"
                         f"Write the valid PLAN.md file now."
                     )
+                    self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
+                    self.events.tool_result(
+                        session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                        result=result_data, role=op_role, agent_id=agent,
+                    )
                     try:
                         self.start_turn(
                             session_id,
@@ -3331,12 +3401,13 @@ class SessionManager:
                         return
                     except Exception as repair_exc:
                         self.events.publish("error", session_id, message=f"Failed to auto-revert plan to architect: {repair_exc}")
-
-                self.events.tool_result(
-                    session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
-                    result=result_data, role=op_role, agent_id=agent,
-                )
-                self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
+                        return
+                else:
+                    self.events.tool_result(
+                        session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                        result=result_data, role=op_role, agent_id=agent,
+                    )
+                    self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
             else:
                 self.events.tool_result(
                     session_id, tool_name, operation_id, "failure", operation_id=operation_id,

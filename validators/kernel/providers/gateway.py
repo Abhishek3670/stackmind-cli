@@ -1914,6 +1914,24 @@ class ProviderGateway:
                     return "Error: command must be a list of strings or string"
 
                 result = self.tool_gateway.run_command(cmd)
+                if result.returncode != 0:
+                    self.consecutive_failures += 1
+                    raw_res = (
+                        f"Process finished with returncode {result.returncode}.\n"
+                        f"STDOUT: {result.stdout}\n"
+                        f"STDERR: {result.stderr}"
+                    )
+                    if self.consecutive_failures == DEFAULT_MAX_CONSECUTIVE_FAILURES - 1:
+                        raw_res += (
+                            f"\nWarning: {self.consecutive_failures} consecutive tool failures; "
+                            f"the next will end this run; change approach or finish now."
+                        )
+                    if self.consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_FAILURES:
+                        raise ConsecutiveToolFailureError(
+                            f"Multiple consecutive tool failures ({self.consecutive_failures}): command exited with returncode {result.returncode}",
+                            failures=self.consecutive_failures,
+                        )
+                    return truncate_tool_output(raw_res, max_chars=self.max_tool_output_chars)
                 self.consecutive_failures = 0
                 raw_res = (
                     f"Process finished with returncode {result.returncode}.\n"

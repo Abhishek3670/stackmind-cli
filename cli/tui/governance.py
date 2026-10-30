@@ -108,6 +108,112 @@ def render_verification_matrix_str(
     return console.export_text().rstrip()
 
 
+def render_review_panel(status: Mapping[str, Any]) -> Panel:
+    """Render authoritative QA + Architect final-acceptance review state.
+
+    Everything shown here comes from persisted verdicts returned by the daemon,
+    so the panel is identical after a restart and never reflects TUI-only state.
+    """
+    final = status.get("final_review") or {}
+    acceptable = bool(status.get("acceptable"))
+    lines: list[RenderableType] = []
+
+    header = Text("Run: ", style="bold white")
+    header.append(str(status.get("run_id") or "-"), style="cyan")
+    header.append("   Phase: ", style="bold white")
+    header.append(str(status.get("phase") or "-"), style="yellow")
+    header.append("   Plan: ", style="bold white")
+    header.append(
+        str(status.get("plan_id") or "missing"),
+        style="green" if status.get("plan_id") else "red",
+    )
+    lines.append(header)
+
+    qa_rows = status.get("qa_reviews") or []
+    lines.append(Text(""))
+    lines.append(Text("MANDATORY QA REVIEWS", style="bold cyan"))
+    if not qa_rows:
+        lines.append(Text("  no work order currently requires QA", style="dim"))
+    for row in qa_rows:
+        passed = bool(row.get("passed"))
+        verdict = row.get("verdict") or ("PENDING" if passed is False else "PASS")
+        mark = "✔" if passed else "✖"
+        style = "green" if passed else "red"
+        line = Text(f"  {mark} {row.get('work_order_id')}  ", style=style)
+        line.append(f"verdict={verdict}", style="white")
+        if row.get("reviewer"):
+            line.append(f"  reviewer={row.get('reviewer')}", style="dim")
+        if row.get("rework_attempt") is not None:
+            line.append(
+                f"  rework={row.get('rework_attempt')}/{row.get('rework_budget')}", style="dim"
+            )
+        lines.append(line)
+        if not passed and row.get("reason"):
+            lines.append(Text(f"      reason: {row.get('reason')}", style="yellow"))
+        for finding in (row.get("findings") or [])[:3]:
+            lines.append(Text(f"      finding: {finding}", style="yellow"))
+        for action in (row.get("required_actions") or [])[:3]:
+            lines.append(Text(f"      required: {action}", style="red"))
+
+    lines.append(Text(""))
+    lines.append(Text("ARCHITECT FINAL ACCEPTANCE", style="bold cyan"))
+    verdict_view = final.get("verdict") or {}
+    if final.get("pending"):
+        lines.append(Text("  PENDING — the run cannot be accepted yet", style="yellow"))
+    else:
+        lines.append(Text("  PASSED — final-review evidence is fresh", style="green"))
+    if final.get("operation_id"):
+        lines.append(Text(f"  review operation: {final.get('operation_id')}", style="dim"))
+    lines.append(
+        Text(
+            f"  rounds: {final.get('rounds', 0)}/{final.get('max_rounds', 0)}",
+            style="white",
+        )
+    )
+    if verdict_view:
+        lines.append(
+            Text(
+                f"  verdict={verdict_view.get('status')} reviewer={verdict_view.get('reviewer')} "
+                f"fresh={verdict_view.get('fresh')}",
+                style="green" if verdict_view.get("fresh") else "red",
+            )
+        )
+        for finding in (verdict_view.get("findings") or [])[:3]:
+            lines.append(Text(f"      finding: {finding}", style="yellow"))
+        for action in (verdict_view.get("required_actions") or [])[:3]:
+            lines.append(Text(f"      required: {action}", style="red"))
+    for reason in final.get("blocking_reasons") or []:
+        lines.append(Text(f"  blocked: {reason}", style="red"))
+
+    if status.get("stale_qa"):
+        lines.append(Text(""))
+        lines.append(
+            Text(f"STALE QA EVIDENCE: {', '.join(status.get('stale_qa') or [])}", style="bold red")
+        )
+
+    lines.append(Text(""))
+    lines.append(
+        Text(
+            "RUN ACCEPTABLE" if acceptable else "RUN NOT ACCEPTABLE",
+            style="bold green" if acceptable else "bold red",
+        )
+    )
+    return Panel(
+        Group(*lines),
+        title="REVIEW & ACCEPTANCE GATES",
+        border_style="green" if acceptable else "red",
+        padding=(0, 1),
+    )
+
+
+def render_review_panel_str(status: Mapping[str, Any], width: int = 80) -> str:
+    """Plain-string capture of :func:`render_review_panel`."""
+    buf = io.StringIO()
+    console = Console(file=buf, record=True, width=width, force_terminal=False, color_system=None)
+    console.print(render_review_panel(status))
+    return console.export_text().rstrip()
+
+
 def render_contract_hud(
     contract: Mapping[str, Any], title: str = "CONTRACT BOUNDARY HUD"
 ) -> Panel:
@@ -592,6 +698,8 @@ __all__ = [
     "render_plan_panel_str",
     "render_projects_panel",
     "render_projects_panel_str",
+    "render_review_panel",
+    "render_review_panel_str",
     "render_skills_panel",
     "render_skills_panel_str",
     "render_verification_matrix",

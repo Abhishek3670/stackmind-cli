@@ -14,7 +14,7 @@ class PlanValidationError(ValueError):
 
 
 # Trailing "(Agent: <id>)" annotation on a milestone title — metadata, not title text.
-_MILESTONE_AGENT_ANNOTATION_RE = re.compile(r"\(\s*(?:Agent|agent)\s*:\s*([^)]+)\)\s*$")
+_MILESTONE_AGENT_ANNOTATION_RE = re.compile(r"\(\s*(?:Agent|agent)\s*:\s*([^)]+)\)")
 _MILESTONE_SKILLS_ANNOTATION_RE = re.compile(r"\(\s*(?:Skills?|skills?)\s*:\s*([^)]+)\)")
 
 

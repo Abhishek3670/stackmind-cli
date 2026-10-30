@@ -152,6 +152,13 @@ class DaemonClient:
     def run_get(self, session_id: str) -> dict[str, Any] | None:
         return self.call("run.get", session_id=session_id)
 
+    def run_reviews(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
+        """Authoritative QA + final-acceptance review state for a run."""
+        params: dict[str, Any] = {"session_id": session_id}
+        if run_id is not None:
+            params["run_id"] = run_id
+        return self.call("run.reviews", **params)
+
     def run_approve(
         self, session_id: str, reason: str = "", auth_token: str | None = None
     ) -> dict[str, Any]:

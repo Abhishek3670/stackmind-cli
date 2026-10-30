@@ -199,7 +199,7 @@ def test_happy_path_reaches_complete_within_default_budget(tmp_path: Path):
     state.global_turn_budget = expected_budget
     state.initial_turn_budget = expected_budget
 
-    # Simulate happy path steps: PLANNING -> AWAITING_APPROVAL -> AUTHORING -> GATE -> DISPATCHING -> EXECUTING -> INTEGRATION -> GITOPS -> COMPLETE
+    # Simulate happy path steps: PLANNING -> AWAITING_APPROVAL -> AUTHORING -> GATE -> DISPATCHING -> EXECUTING -> INTEGRATION -> FINAL_REVIEW -> GITOPS -> COMPLETE
     # 1. Planning ready
     state.phase = Phase.PLANNING
     state.planning_operation_id = "op-plan"
@@ -222,7 +222,12 @@ def test_happy_path_reaches_complete_within_default_budget(tmp_path: Path):
     state.phase = Phase.AUTHORING_READINESS_GATE
     sup.advance(state)
 
-    # 5. Fast-forward to GitOps completed
+    # 5. Fast-forward to GitOps completed (final acceptance evidence required)
+    from tests.review_helpers import final_pass
+    (tmp_path / "PLAN.md").write_text("# Approved Plan\n\nGoal.\n", encoding="utf-8")
+    state.plan_id = "PLAN-001"
+    state.integration_evidence = {"passed": True}
+    final_pass(tmp_path, "run-test-happy", "PLAN-001", [])
     state.phase = Phase.GITOPS
     state.gitops_operation_id = "op-gitops"
     mgr.operations["op-gitops"] = {"operation_id": "op-gitops", "status": "COMPLETED", "result": {"status": "completed"}}

@@ -199,6 +199,8 @@ def test_qa_redispatch_waits_for_rework_completion(tmp_path: Path) -> None:
         rework_op["operation_id"], "COMPLETED",
         result={"status": "completed", "summary": "fixed index.html", "modified_files": ["index.html"]},
     )
+    from tests.review_helpers import qa_pass
+    qa_pass(tmp_path, "WO-001")  # mandatory QA gate
     supervisor.advance(state)
     assert "WO-001" in state.completed_wo_ids
 

@@ -44,6 +44,7 @@ COMMAND_NAMES: dict[str, str] = {
     ":contract": "Contract Boundary",
     ":diff": "Unified Diff",
     ":matrix": "Verification Matrix",
+    ":reviews": "Review Gates",
     ":events": "Event Stream",
     ":reconnect": "Reconnect",
     ":chat": "Conversation",

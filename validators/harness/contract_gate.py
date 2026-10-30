@@ -198,6 +198,55 @@ def verify_pre_execution(
                 f"Task work order {task.work_order_id} does not match contract work order {contract.work_order}"
             )
 
+def _collect_peer_owned_deliverables(
+    project_path: Path, own_wo_id: str | None, current_agent: str
+) -> dict[str, tuple[str, str]]:
+    """Map normalized file path -> (work_order_id, assigned_agent) for files owned by other workers."""
+    owned: dict[str, tuple[str, str]] = {}
+    base = Path(project_path) / ".sync" / "work-orders"
+    if not base.is_dir():
+        return owned
+    norm_agent = str(current_agent or "").lower().strip()
+    import yaml
+    for bucket in ("ACTIVE", "COMPLETED"):
+        b_dir = base / bucket
+        if not b_dir.is_dir():
+            continue
+        for wo_file in b_dir.glob("*.yaml"):
+            if wo_file.stem == own_wo_id or wo_file.stem in ("WO-000", ".gitkeep"):
+                continue
+            try:
+                data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("status", "")).upper() in ("CANCELLED", "FAILED"):
+                continue
+            assigned = data.get("assigned_agents") or []
+            if isinstance(assigned, str):
+                assigned = [assigned]
+            assigned_norm = [str(a).lower().strip() for a in assigned]
+            if norm_agent and norm_agent in assigned_norm:
+                continue
+            peer_agent = assigned_norm[0] if assigned_norm else "unknown"
+            deliv = data.get("deliverable")
+            if isinstance(deliv, dict) and deliv.get("path"):
+                p = str(deliv["path"]).replace("\\", "/").strip().lstrip("/")
+                if p:
+                    owned[p] = (wo_file.stem, peer_agent)
+            for extra in data.get("deliverables") or []:
+                if isinstance(extra, dict) and extra.get("path"):
+                    p = str(extra["path"]).replace("\\", "/").strip().lstrip("/")
+                    if p:
+                        owned[p] = (wo_file.stem, peer_agent)
+                elif isinstance(extra, str) and extra.strip():
+                    p = extra.replace("\\", "/").strip().lstrip("/")
+                    if p:
+                        owned[p] = (wo_file.stem, peer_agent)
+    return owned
+
+
 def verify_post_execution(
     project_path: Path,
     agent: str,
@@ -241,7 +290,22 @@ def verify_post_execution(
         
     # 3. Check scope allowed/denied for each modified file
     api = KnowledgeAPI(project_path)
+    peer_owned = _collect_peer_owned_deliverables(project_path, getattr(task, "work_order_id", None), agent)
     for file_path in files_to_check:
+        norm_fp = file_path.replace("\\", "/").lstrip("/")
+        if norm_fp.startswith("./"):
+            norm_fp = norm_fp[2:]
+        if any(norm_fp.startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")):
+            continue
+
+        # Cross-worker modification guard: workers cannot modify each other's work
+        if norm_fp in peer_owned:
+            peer_wo, peer_agent = peer_owned[norm_fp]
+            raise ContractAccessDenied(
+                f"Modification to file '{file_path}' is rejected: owned by another work order "
+                f"('{peer_wo}' assigned to '{peer_agent}'). Workers cannot modify each other's work; "
+                "inter-worker needs must be coordinated through Architecture."
+            )
         # Normalize file path for comparison
         norm_fp = file_path.replace("\\", "/").lstrip("/")
         if norm_fp.startswith("./"):
@@ -292,7 +356,10 @@ def verify_post_execution(
         module_nodes = [s for s in api.ir.symbols if path_to_module(s.path) == mod]
         if module_nodes:
             allowed = any(contract.is_node_in_scope(s.node_id, api.ir) for s in module_nodes)
-        if not allowed:
+        if not contract.allow_rules:
+            # Specialized workers are free to write own files without microscopic scope.allow
+            allowed = True
+        elif not allowed:
             # File might be new or not resolved in IR, check module pattern match directly
             for allow_rule in contract.allow_rules:
                 pattern = allow_rule.get("module") or allow_rule.get("path") or allow_rule.get("target")

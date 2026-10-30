@@ -181,15 +181,16 @@ def test_invalid_plan_state_raises_value_error_and_rpc_policy_denied(tmp_path):
     rpc_res_reject = protocol.handle(_request("plan.reject", {"session_id": session_id, "plan_id": "p-test"}))
     assert rpc_res_reject["error"]["code"] == -32003
 
-    # Revise back to AWAITING_APPROVAL, approve, then test error on APPROVED plan
+    # Revise back to AWAITING_APPROVAL and approve. Re-approving an APPROVED plan is
+    # idempotent (required by the SDP-FIX-006 approval invariant) and returns the
+    # work orders created by the original approval instead of raising.
     manager.propose_plan(session_id, "p-test", "Revised Plan")
-    manager.approve_plan(session_id, "p-test")
-
-    with pytest.raises(ValueError, match="Plan is not in AWAITING_APPROVAL state"):
-        manager.approve_plan(session_id, "p-test")
+    created = manager.approve_plan(session_id, "p-test")
+    assert manager.approve_plan(session_id, "p-test") == created
 
     rpc_res_approved = protocol.handle(_request("plan.approve", {"session_id": session_id, "plan_id": "p-test"}))
-    assert rpc_res_approved["error"]["code"] == -32003
+    assert "error" not in rpc_res_approved
+    assert rpc_res_approved["result"] == created
 
 
 def test_rejection_revision_resubmission_loop(tmp_path):

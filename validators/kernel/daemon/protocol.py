@@ -256,6 +256,13 @@ class JsonRpcProtocol:
                 raise _RpcError(-32003, str(error)) from error
         if method == "run.get":
             return self.manager.get_active_run(params["session_id"])
+        if method == "run.reviews":
+            try:
+                return self.manager.get_run_reviews(
+                    params["session_id"], run_id=params.get("run_id")
+                )
+            except KeyError as error:
+                raise _RpcError(-32002, str(error)) from error
         if method == "run.approve":
             try:
                 return self.manager.approve_run(

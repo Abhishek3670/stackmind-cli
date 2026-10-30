@@ -10,7 +10,10 @@
   ],
   "properties": {
     "schema_version": {
-      "type": ["integer", "number"]
+      "type": [
+        "integer",
+        "number"
+      ]
     },
     "synthesized_by": {
       "type": "string",
@@ -28,11 +31,17 @@
       "pattern": "^WO-[0-9]{3}$"
     },
     "contract_revision": {
-      "type": ["integer", "number"],
+      "type": [
+        "integer",
+        "number"
+      ],
       "minimum": 1
     },
     "guidelines": {
-      "type": ["string", "array"]
+      "type": [
+        "string",
+        "array"
+      ]
     },
     "skills": {
       "type": "array",
@@ -51,17 +60,16 @@
           "type": "string"
         },
         "guidelines": {
-          "type": ["string", "array"]
+          "type": [
+            "string",
+            "array"
+          ]
         }
       },
       "additionalProperties": false
     },
     "scope": {
       "type": "object",
-      "required": [
-        "allow",
-        "deny"
-      ],
       "properties": {
         "allow": {
           "type": "array",

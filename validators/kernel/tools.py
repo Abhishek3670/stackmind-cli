@@ -13,7 +13,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 import yaml
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from .boundary import RuntimeBoundary
@@ -125,8 +125,19 @@ class ToolGateway:
             raise PermissionError(record.reason)
         path = self.workspace.path_for(target)
         if not path.is_file():
-            # Fallback for bundled schemas when workspace does not have a local schemas/ copy
             norm_target = target.replace("\\", "/").strip().lstrip("/")
+            candidate = PurePath(norm_target)
+            if not candidate.is_absolute() and ".." not in candidate.parts:
+                auth_path = (self.workspace.authoritative_root / Path(candidate)).resolve()
+                try:
+                    auth_path.relative_to(self.workspace.authoritative_root)
+                    if auth_path.is_file():
+                        value = auth_path.read_text(encoding="utf-8")
+                        self.boundary.journal.complete(record.request.operation_id, "read")
+                        return value
+                except ValueError:
+                    pass
+            # Fallback for bundled schemas when workspace does not have a local schemas/ copy
             if norm_target.startswith("schemas/") or norm_target.startswith(".sync/schemas/"):
                 schema_name = norm_target.split("schemas/", 1)[1]
                 bundled_schemas_dir = Path(__file__).resolve().parents[2] / "schemas"
@@ -3254,17 +3265,7 @@ class ToolGateway:
         else:
             clean_files = []
 
-        task_payload = {
-            "agent": canonical_agent,
-            "role": canonical_role,
-            "instructions": str(instructions).strip(),
-            "target_files": clean_files,
-            "delegated_by": self.actor_id,
-        }
-        if not hasattr(self, "_delegated_tasks"):
-            self._delegated_tasks = []
-        self._delegated_tasks.append(task_payload)
-
+        # 1. Write ad-hoc delegation notice to agent inbox
         try:
             inbox_dir = self.workspace.root / ".sync" / "inbox" / canonical_agent
             inbox_dir.mkdir(parents=True, exist_ok=True)
@@ -3282,17 +3283,170 @@ class ToolGateway:
         except Exception:
             pass
 
-        self.boundary.journal.complete(record.request.operation_id, f"Delegated to {canonical_agent}")
+        # 2. Author schema-conforming Work Order and Contract in .sync/work-orders/ACTIVE/ and .sync/contracts/
+        wo_id: str | None = None
+        rel_wo_file: str | None = None
+        try:
+            from validators.kernel.daemon.authoring import (
+                get_next_work_order_int,
+                build_child_work_order,
+                build_child_contract,
+            )
+            auth_root = getattr(self.workspace, "authoritative_root", None)
+            ws_roots = [self.workspace.root]
+            if auth_root and auth_root != self.workspace.root and auth_root.is_dir():
+                ws_roots.append(auth_root)
+
+            scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
+            next_idx = get_next_work_order_int(scan_root)
+            wo_id = f"WO-{next_idx:03d}"
+
+            if clean_files:
+                primary_deliv = clean_files[0]
+                deliv_type = "test" if (canonical_role == "qa" or "test" in primary_deliv.lower()) else "code"
+                deliv_spec = {
+                    "path": primary_deliv,
+                    "type": deliv_type,
+                    "description": f"Deliverables for {canonical_role}: {', '.join(clean_files)}",
+                }
+                deliv_list = [
+                    {"path": f, "type": ("test" if "test" in f.lower() else "code")}
+                    for f in clean_files
+                ]
+            else:
+                primary_deliv = None
+                deliv_type = "test" if canonical_role == "qa" else "code"
+                deliv_spec = {
+                    "type": deliv_type,
+                    "description": str(instructions).strip()[:120] or f"{canonical_role.title()} task deliverable",
+                }
+                deliv_list = None
+
+            first_line = str(instructions).strip().splitlines()[0] if str(instructions).strip() else ""
+            first_line_clean = re.sub(r"^[#\s\-*>`]+", "", first_line).strip()
+            if not first_line_clean:
+                first_line_clean = f"{canonical_role.title()} task"
+            if len(first_line_clean) > 80:
+                first_line_clean = first_line_clean[:77] + "..."
+            wo_title = f"{canonical_role.title()}: {first_line_clean}"
+
+            if canonical_role == "qa":
+                wo_type = "QA"
+            elif canonical_role == "gitops":
+                wo_type = "RELEASE"
+            else:
+                wo_type = "FEATURE"
+
+            wo_rec = build_child_work_order(
+                wo_id=wo_id,
+                title=wo_title,
+                description=str(instructions).strip() or wo_title,
+                assigned_agents=[canonical_agent],
+                dependencies=[],
+                priority="P1",
+                deliverable=deliv_spec,
+                deliverables=deliv_list,
+            )
+            wo_rec["type"] = wo_type
+            wo_rec["status"] = "ACTIVE"
+            wo_rec["synthesized_by"] = "architect_delegation"
+
+            contract_rec = build_child_contract(
+                wo_id=wo_id,
+                agent_id=canonical_agent,
+                role=canonical_role,
+                deliverable_path=primary_deliv,
+                candidate_paths=clean_files if clean_files else None,
+                title=wo_title,
+                description=str(instructions).strip(),
+            )
+            contract_rec["synthesized_by"] = "architect_delegation"
+            contract_rec.pop("title", None)
+            contract_rec.pop("version", None)
+
+            wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
+            contract_yaml = yaml.safe_dump(contract_rec, sort_keys=False)
+            rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+
+            for target_ws in ws_roots:
+                try:
+                    wo_target = target_ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                    wo_target.parent.mkdir(parents=True, exist_ok=True)
+                    wo_target.write_text(wo_yaml, encoding="utf-8")
+
+                    contract_target = target_ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+                    contract_target.parent.mkdir(parents=True, exist_ok=True)
+                    contract_target.write_text(contract_yaml, encoding="utf-8")
+
+                    idx_file = target_ws / ".sync" / "work-orders" / "INDEX.yaml"
+                    idx_data: dict[str, Any] = {"schema_version": 1, "next_id": next_idx + 1, "orders": []}
+                    if idx_file.is_file():
+                        try:
+                            loaded_idx = yaml.safe_load(idx_file.read_text(encoding="utf-8"))
+                            if isinstance(loaded_idx, dict) and "orders" in loaded_idx:
+                                idx_data = loaded_idx
+                        except Exception:
+                            pass
+
+                    order_entry: dict[str, Any] = {
+                        "id": wo_id,
+                        "type": wo_rec["type"],
+                        "title": wo_rec["title"],
+                        "status": wo_rec["status"],
+                        "priority": wo_rec["priority"],
+                        "assigned_agents": wo_rec["assigned_agents"],
+                        "dependencies": wo_rec["dependencies"],
+                        "deliverable": wo_rec["deliverable"],
+                        "created": wo_rec["created"],
+                        "updated": wo_rec["updated"],
+                        "file": f"work-orders/ACTIVE/{wo_id}.yaml",
+                    }
+                    if wo_rec.get("deliverables"):
+                        order_entry["deliverables"] = wo_rec["deliverables"]
+
+                    orders = idx_data.setdefault("orders", [])
+                    if not any(isinstance(o, dict) and o.get("id") == wo_id for o in orders):
+                        orders.append(order_entry)
+                    idx_data["next_id"] = max(idx_data.get("next_id", 1), next_idx + 1)
+                    idx_file.parent.mkdir(parents=True, exist_ok=True)
+                    idx_file.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
+                except Exception as ws_err:
+                    import logging
+                    logging.getLogger(__name__).debug("Failed to write work order to %s: %s", target_ws, ws_err)
+        except Exception as wo_err:
+            import logging
+            logging.getLogger(__name__).warning("Failed to author child work order: %s", wo_err, exc_info=True)
+
+        task_payload = {
+            "agent": canonical_agent,
+            "role": canonical_role,
+            "instructions": str(instructions).strip(),
+            "target_files": clean_files,
+            "delegated_by": self.actor_id,
+        }
+        if wo_id:
+            task_payload["work_order_id"] = wo_id
+        if not hasattr(self, "_delegated_tasks"):
+            self._delegated_tasks = []
+        self._delegated_tasks.append(task_payload)
+
+        self.boundary.journal.complete(record.request.operation_id, f"Delegated {wo_id or canonical_agent}")
+        msg = (
+            f"Successfully delegated task to {canonical_role.title()} ({canonical_agent}). Work Order {wo_id} authored to .sync/work-orders/ACTIVE/{wo_id}.yaml and registered in INDEX.yaml. "
+            f"Deliverable: {clean_files if clean_files else 'General'}. "
+            f"Work order written to .sync/work-orders/ACTIVE/{wo_id}.yaml and registered in INDEX.yaml."
+            if wo_id else
+            f"Successfully delegated task to {canonical_role.title()} ({canonical_agent}). "
+            f"Target files: {clean_files if clean_files else 'General'}."
+        )
         return {
             "status": "delegated",
+            "work_order_id": wo_id,
+            "work_order_file": rel_wo_file,
             "agent": canonical_agent,
             "role": canonical_role,
             "target_files": clean_files,
-            "message": (
-                f"Successfully delegated task to {canonical_role.title()} ({canonical_agent}). "
-                f"Target files: {clean_files if clean_files else 'General'}. "
-                "The specialist agent will execute with write permissions for the specified files."
-            ),
+            "message": msg,
         }
 
     def web_search(self, query: str, limit: int = 5, media_type: str | None = None) -> list[dict[str, Any]]:

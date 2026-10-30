@@ -260,7 +260,12 @@ def load_expected_milestones(workspace: Path | str) -> list[str] | None:
     refs = load_plan_milestones(workspace)
     if refs is None:
         return None
-    titles = [ref["title"] for ref in refs if ref["title"]]
+    titles = [
+        ref["title"] for ref in refs
+        if ref["title"]
+        and not _is_architecture_or_meta_milestone(ref)
+        and str(ref.get("status") or "").upper() != "COMPLETED"
+    ]
     return titles or None
 
 
@@ -285,7 +290,12 @@ def load_plan_milestones(workspace: Path | str) -> list[dict[str, Any]] | None:
         parsed = parse_plan(content)
         for m in parsed.milestones:
             if m.title:
-                refs.append({"id": m.id, "title": m.title, "agent": m.agent})
+                refs.append({
+                    "id": m.id,
+                    "title": m.title,
+                    "agent": m.agent,
+                    "status": getattr(m, "status", "PENDING"),
+                })
     except Exception:
         return None
     return refs or None
@@ -301,7 +311,16 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
     wo_mid = str(data.get(MILESTONE_ID_FIELD) or "").strip()
     ref_id = str(ref.get("id") or "").strip()
     if wo_mid and ref_id:
-        return wo_mid.lower() == ref_id.lower()
+        if wo_mid.lower() == ref_id.lower():
+            return True
+        m_wo = re.search(r"(\d+)", wo_mid)
+        m_ref = re.search(r"(\d+)", ref_id)
+        if m_wo and m_ref:
+            if m_wo.group(1) == m_ref.group(1):
+                return True
+            # Explicit distinct milestone numbers (e.g. Milestone 2 vs Milestone 1)
+            # must NEVER match each other via token fallback!
+            return False
 
     if milestone_matches(str(ref.get("title") or ""), str(data.get("title", ""))):
         return True
@@ -344,6 +363,36 @@ def _is_meta_work_order(data: dict[str, Any]) -> bool:
     if wo_type == "VALIDATION" and "integration review" in title:
         return True
     if wo_type == "RESEARCH" and "system architecture" in title:
+        return True
+    return False
+
+
+def _is_architecture_or_meta_milestone(ref: dict[str, Any] | Any) -> bool:
+    """Identify architecture / planning / meta milestones not subject to worker work orders.
+
+    Milestone 0 or milestones assigned to the Lead Architect ('claude' or 'architecture')
+    are governance/scaffolding deliverables already produced by the Lead Architect via
+    WO-000 and PLAN.md. They must not require a worker work order or be synthesized
+    as worker tasks.
+    """
+    if hasattr(ref, "id") and hasattr(ref, "agent"):
+        m_id = str(getattr(ref, "id", "") or "").strip().lower()
+        agent = str(getattr(ref, "agent", "") or "").strip().lower()
+        title = str(getattr(ref, "title", "") or "").strip().lower()
+    elif isinstance(ref, dict):
+        m_id = str(ref.get("id") or "").strip().lower()
+        agent = str(ref.get("agent") or "").strip().lower()
+        title = str(ref.get("title") or "").strip().lower()
+    else:
+        m_id = ""
+        agent = ""
+        title = str(ref).strip().lower()
+
+    if m_id in ("m0", "milestone 0", "0"):
+        return True
+    if agent in ("claude", "architecture"):
+        return True
+    if "architecture" in title and ("scaffolding" in title or "work-order" in title or "wo-000" in title):
         return True
     return False
 
@@ -404,10 +453,25 @@ def _is_code_deliverable(deliv_type: str, deliv_path: str) -> bool:
 _TEST_PATH_PATTERN = re.compile(r"(?:\b|[\s`\"'(\[])(?:tests?/)?[A-Za-z0-9_\-/]*test_[A-Za-z0-9_\-]+\.py")
 
 
+def _extract_deliverable(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract primary deliverable spec, falling back to first item of deliverables list."""
+    deliv = data.get("deliverable")
+    if isinstance(deliv, dict) and deliv.get("type"):
+        return deliv
+    delivs = data.get("deliverables")
+    if isinstance(delivs, list) and delivs:
+        first = delivs[0]
+        if isinstance(first, dict) and first.get("type"):
+            return first
+    if isinstance(deliv, dict):
+        return deliv
+    return None
+
+
 def _planned_test_paths(data: dict[str, Any]) -> list[str]:
     """Collect the test artifact paths a work order plans to produce."""
     planned: list[str] = []
-    deliverable = data.get("deliverable")
+    deliverable = _extract_deliverable(data)
     if isinstance(deliverable, dict):
         p = str(deliverable.get("path") or "").replace("\\", "/").strip().lstrip("/")
         if p and _is_test_artifact(p):
@@ -480,8 +544,17 @@ def _scope_allows(contract_data: dict[str, Any], rel_path: str) -> bool:
     scope = contract_data.get("scope")
     if not isinstance(scope, dict):
         return False
+    allow_rules = scope.get("allow")
     norm = rel_path.replace("\\", "/").lstrip("/")
-    for rule in scope.get("allow", []) or []:
+    # Check explicit deny rules first
+    for rule in scope.get("deny", []) or []:
+        pat = rule.get("module") or rule.get("path") if isinstance(rule, dict) else str(rule)
+        if pat and _path_matches_rule(norm, str(pat)):
+            return False
+    # If allow rules are omitted or empty, specialized workers are free to write own files
+    if not allow_rules:
+        return True
+    for rule in allow_rules:
         if isinstance(rule, dict):
             pattern = rule.get("module") or rule.get("path") or rule.get("target")
         elif isinstance(rule, str):
@@ -675,6 +748,8 @@ def validate_authoring_readiness(
             else:
                 refs.append({"id": "", "title": str(entry), "agent": None})
         for ref in refs:
+            if _is_architecture_or_meta_milestone(ref) or str(ref.get("status") or "").upper() == "COMPLETED":
+                continue
             matched = [
                 wo_id for wo_id, (_rel, data) in all_known_wos.items()
                 if _wo_matches_milestone(data, ref)
@@ -768,7 +843,7 @@ def validate_authoring_readiness(
                             _issue(issues, "BUDGET_UNDER_ESTIMATE", "budget", f"Contract '{contract.path}' budget max_files_touched=" f"{max_files} is smaller than the work order's " f"implementation_estimate of {len(expected_files)} expected files; " f"split the work order instead of under-budgeting it", work_order_id=wo_id, artifact_path=contract.path)
 
         # Deliverable path/type
-        deliverable = data.get("deliverable")
+        deliverable = _extract_deliverable(data)
         deliv_path: str | None = None
         if not isinstance(deliverable, dict) or not deliverable.get("type"):
             _issue(issues, "DELIVERABLE_INCOMPLETE", "coverage", f"Work order '{wo_id}' must declare a deliverable type", work_order_id=wo_id, artifact_path=rel)
@@ -955,7 +1030,7 @@ def validate_authoring_readiness(
             if planned not in planned_tests:
                 planned_tests.append(planned)
     for _wo_id, (_rel, data) in wo_files.items():
-        deliverable = data.get("deliverable")
+        deliverable = _extract_deliverable(data)
         deliv_path_str = ""
         deliv_type_str = ""
         if isinstance(deliverable, dict):
@@ -1030,7 +1105,7 @@ def validate_authoring_readiness(
 
     file_to_wos: dict[str, list[tuple[str, str]]] = {}
     for wo_id, (rel, data) in sorted(wo_files.items()):
-        deliv = data.get("deliverable")
+        deliv = _extract_deliverable(data)
         if isinstance(deliv, dict) and deliv.get("path"):
             norm = str(deliv["path"]).replace("\\", "/").strip().lstrip("/")
             file_to_wos.setdefault(norm, []).append((wo_id, rel))

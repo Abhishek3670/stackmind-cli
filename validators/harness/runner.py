@@ -57,6 +57,9 @@ HARNESS_SNAPSHOT_IGNORED = frozenset({
     '.sync/experience',
     '.sync/knowledge',
     '.sync/agents',
+    '.venv',
+    'venv',
+    'env',
     '__pycache__',
     '.pytest_cache',
     '.ruff_cache',
@@ -64,11 +67,19 @@ HARNESS_SNAPSHOT_IGNORED = frozenset({
     '.vscode',
     '.windsurf',
     '.claude',
+    '.idea',
     'node_modules',
     '.next',
     '.turbo',
     'dist',
     'build',
+    '.cache',
+    'cache',
+    'dataset',
+    'datasets',
+    'checkpoints',
+    'weights',
+    'runs',
 })
 
 
@@ -835,8 +846,10 @@ class AgentRunner:
                             if retry_payload and isinstance(retry_payload, dict):
                                 if 'report_markdown' not in retry_payload and 'summary' in retry_payload:
                                     retry_payload['report_markdown'] = retry_payload['summary']
-                                if task.work_order_id and retry_payload.get('status') == 'completed' and not retry_payload.get('release_target'):
+                                if task.work_order_id and retry_payload.get('status') == 'completed' and not str(retry_payload.get('release_target') or '').strip():
                                     retry_payload['release_target'] = task.deliverable_path or 'patch'
+                                elif not retry_payload.get('release_target') or str(retry_payload.get('release_target')).strip().lower() in ('none', 'null', ''):
+                                    retry_payload.pop('release_target', None)
                                 current_payload = retry_payload
                                 continue
                         except Exception:
@@ -1488,8 +1501,12 @@ class AgentRunner:
         }
         filtered_payload = {k: v for k, v in cleaned_payload.items() if k in allowed_keys}
         status = str(filtered_payload.get('status', ''))
-        if task.work_order_id and status == 'completed' and not str(filtered_payload.get('release_target') or '').strip():
-            filtered_payload['release_target'] = task.deliverable_path or 'patch'
+        rt = filtered_payload.get('release_target')
+        if rt is None or str(rt).strip().lower() in ('none', 'null', ''):
+            if task.work_order_id and status == 'completed':
+                filtered_payload['release_target'] = task.deliverable_path or 'patch'
+            else:
+                filtered_payload.pop('release_target', None)
 
         errors = [
             f"{'.'.join(str(part) for part in error.absolute_path) or '(root)'}: {error.message}"
@@ -2528,8 +2545,10 @@ class AgentRunner:
                 pruned_mods.append(p)
             payload['modified_files'] = pruned_mods
 
-        if request.task.work_order_id and payload.get('status') == 'completed' and not payload.get('release_target'):
+        if request.task.work_order_id and payload.get('status') == 'completed' and not str(payload.get('release_target') or '').strip():
             payload['release_target'] = request.task.deliverable_path or 'patch'
+        elif not payload.get('release_target') or str(payload.get('release_target')).strip().lower() in ('none', 'null', ''):
+            payload.pop('release_target', None)
 
         allowed_keys = {
             'status',
@@ -3431,6 +3450,9 @@ class AgentRunner:
                     outcome_verified = False
                     for err in deliv_errors:
                         staged_errors.append(f"Deliverable verification failed: {err}")
+                elif task.deliverable_path and not deliverable_touched:
+                    outcome_verified = False
+                    staged_errors.append(f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn")
                 else:
                     outcome_verified = (
                         decision.status == 'completed'
@@ -3777,6 +3799,12 @@ class AgentRunner:
                         if c_entry.get("file") != c_file:
                             c_entry["file"] = c_file
                             updated_index = True
+                        if not c_entry.get("priority"):
+                            c_entry["priority"] = comp_data.get("priority", "P0")
+                            updated_index = True
+                        if c_entry.get("dependencies") is None:
+                            c_entry["dependencies"] = list(comp_data.get("dependencies") or [])
+                            updated_index = True
                     else:
                         c_entry = {
                             "id": c_id,
@@ -3839,6 +3867,18 @@ class AgentRunner:
                     if entry.get("file") != target_file:
                         entry["file"] = target_file
                         updated_index = True
+                    if not entry.get("priority"):
+                        entry["priority"] = wo_data.get("priority", "P1")
+                        updated_index = True
+                    if entry.get("dependencies") is None:
+                        entry["dependencies"] = list(wo_data.get("dependencies") or [])
+                        updated_index = True
+                    if not entry.get("type") and wo_data.get("type"):
+                        entry["type"] = wo_data["type"]
+                        updated_index = True
+                    if not entry.get("assigned_agents") and wo_data.get("assigned_agents"):
+                        entry["assigned_agents"] = wo_data["assigned_agents"]
+                        updated_index = True
 
             blocked_dir = sync_dir / "work-orders" / "BLOCKED"
             if blocked_dir.is_dir():
@@ -3854,6 +3894,12 @@ class AgentRunner:
                             updated_index = True
                         if b_entry.get("file") != b_rel:
                             b_entry["file"] = b_rel
+                            updated_index = True
+                        if not b_entry.get("priority"):
+                            b_entry["priority"] = b_data.get("priority", "P1")
+                            updated_index = True
+                        if b_entry.get("dependencies") is None:
+                            b_entry["dependencies"] = list(b_data.get("dependencies") or [])
                             updated_index = True
                     else:
                         b_entry = {
@@ -3892,6 +3938,36 @@ class AgentRunner:
             if index_data.get("total_blocked") != tot_blocked:
                 index_data["total_blocked"] = tot_blocked
                 updated_index = True
+
+            for o in orders:
+                if isinstance(o, dict):
+                    if not o.get("priority"):
+                        o["priority"] = "P1"
+                        updated_index = True
+                    if o.get("dependencies") is None:
+                        o["dependencies"] = []
+                        updated_index = True
+                    if not o.get("file") and o.get("path"):
+                        clean_path = str(o["path"]).replace("\\", "/")
+                        if clean_path.startswith(".sync/"):
+                            clean_path = clean_path.replace(".sync/", "", 1)
+                        o["file"] = clean_path
+                        updated_index = True
+
+            numeric_ids = []
+            for o in orders:
+                if isinstance(o, dict):
+                    oid = o.get("id", "")
+                    if isinstance(oid, str) and oid.startswith("WO-"):
+                        try:
+                            numeric_ids.append(int(oid.split("-")[1]))
+                        except (ValueError, IndexError):
+                            pass
+            if numeric_ids:
+                max_id = max(numeric_ids)
+                if index_data.get("next_id", 0) <= max_id:
+                    index_data["next_id"] = max_id + 1
+                    updated_index = True
 
             if updated_index:
                 index_data["last_updated"] = now_iso

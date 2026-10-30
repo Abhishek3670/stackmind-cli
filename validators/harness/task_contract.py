@@ -727,7 +727,8 @@ class TaskOwnership:
         if path in self.read_only_files or any(path.startswith(p) for p in self.read_only_prefixes):
             owner_hint = (
                 f"'{path}' is owned by another work order (read_only_files); "
-                f"your deliverable is '{self.deliverable or 'unassigned'}' — write that instead."
+                f"workers cannot modify each other's work — if you need changes, declare this in your blockers for Architecture to coordinate. "
+                f"Your deliverable is '{self.deliverable or 'unassigned'}' — write that instead."
             )
             return owner_hint
         if path not in self._written:

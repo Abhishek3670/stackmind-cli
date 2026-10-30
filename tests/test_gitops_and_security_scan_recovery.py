@@ -148,7 +148,13 @@ def test_gitops_security_verified_block_retries_with_actionable_feedback(tmp_pat
     assert "CRITICAL FIX REQUIRED (Attempt 2)" in retry_prompt
     assert "credential leak detected in docker-compose.yml" in retry_prompt
 
-    # 4. GitOps succeeds on retry
+    # 4. GitOps succeeds on retry. Completion now requires the mandatory
+    # Architect final-acceptance evidence against the approved plan.
+    from tests.review_helpers import final_pass
+    (tmp_path / "PLAN.md").write_text("# Approved Plan\n\nBuild App.\n", encoding="utf-8")
+    state.plan_id = "PLAN-001"
+    state.integration_evidence = {"passed": True}
+    final_pass(tmp_path, "run-gitops-sec", "PLAN-001", [])
     mock_mgr.operations[gitops_op2]["status"] = "COMPLETED"
     mock_mgr.operations[gitops_op2]["result"] = {"status": "completed"}
 

@@ -59,6 +59,13 @@ class StackMindTuiAdapter:
                 "security": True, "outcome": True,
             })
             return verification_matrix(dims)
+        if command == ":reviews":
+            target = argument or params.get("session_id")
+            if not target:
+                raise ValueError("session_id required for :reviews")
+            if not hasattr(self.client, "run_reviews"):
+                raise ValueError("daemon does not expose review state")
+            return self.client.run_reviews(target)
         if command == ":events":
             target = argument or params.get("session_id")
             if not target:
@@ -88,7 +95,7 @@ class StackMindTuiAdapter:
             if hasattr(self.client, "plan_get") and hasattr(self.client, "plan_approve"):
                 try:
                     plan = self.client.plan_get(target)
-                    if isinstance(plan, dict) and plan.get("state") == "AWAITING_APPROVAL":
+                    if isinstance(plan, dict) and (str(plan.get("state", "")).upper() in ("AWAITING_APPROVAL", "PROPOSED", "DRAFT") or plan.get("plan_id")):
                         plan_id = plan.get("plan_id", "PLAN-001")
                         return self.client.plan_approve(target, plan_id, reason=clean_reason)
                 except Exception:
@@ -111,7 +118,7 @@ class StackMindTuiAdapter:
             if hasattr(self.client, "plan_get") and hasattr(self.client, "plan_reject"):
                 try:
                     plan = self.client.plan_get(target)
-                    if isinstance(plan, dict) and plan.get("state") == "AWAITING_APPROVAL":
+                    if isinstance(plan, dict) and (str(plan.get("state", "")).upper() in ("AWAITING_APPROVAL", "PROPOSED", "DRAFT") or plan.get("plan_id")):
                         plan_id = plan.get("plan_id", "PLAN-001")
                         return self.client.plan_reject(target, plan_id, reason=clean_reason)
                 except Exception:

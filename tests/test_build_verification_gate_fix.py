@@ -98,7 +98,7 @@ def test_integration_gate_skips_build_when_node_modules_absent(tmp_path: Path) -
 
 def test_supervisor_waives_unfulfillable_build_blocker(tmp_path: Path) -> None:
     """When an LLM reviewer blocks solely due to missing build record on an uninstalled project,
-    the supervisor waives the unfulfillable blocker and transitions to PRODUCT_READY."""
+    the supervisor waives the unfulfillable blocker and the integration review passes."""
     _setup_clean_workspace(tmp_path)
     pkg_json = tmp_path / "package.json"
     pkg_json.write_text(json.dumps({
@@ -165,9 +165,10 @@ def test_supervisor_waives_unfulfillable_build_blocker(tmp_path: Path) -> None:
     res = supervisor.advance(state)
 
     # Because all components are valid and node_modules is absent, the supervisor waives
-    # the unfulfillable build blocker and transitions to PRODUCT_READY!
+    # the unfulfillable build blocker and the integration review passes. The run then
+    # moves to FINAL_REVIEW: a clean integration review alone is not final acceptance.
     assert res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.PRODUCT_READY
+    assert state.phase == Phase.FINAL_REVIEW
     assert state.integration_blockers == []
 
 

@@ -5,7 +5,8 @@ Verifies deterministic, inspectable evidence-based integration gating:
 2. Missing mandatory test evidence blocks approval when test suite exists on disk.
 3. Stale evidence from earlier artifact revision (hash mismatch) blocks approval.
 4. Route contract mismatch (frontend calls undeclared endpoint) blocks approval.
-5. Valid inspectable evidence allows approval path to transition to PRODUCT_READY.
+5. Valid inspectable evidence allows approval path to transition to FINAL_REVIEW
+   (the mandatory Architect final-acceptance gate follows).
 6. Inapplicable checks are explicitly reported as skipped with rationale.
 7. Retries remain bounded and fail closed to BLOCKED when exhausted.
 """
@@ -309,7 +310,7 @@ def test_valid_evidence_allows_approval_to_product_ready(tmp_path: Path) -> None
 
     res = supervisor.advance(state)
     assert res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.PRODUCT_READY
+    assert state.phase == Phase.FINAL_REVIEW
     ev = state.integration_evidence
     assert ev["passed"] is True
     assert len(ev["issues"]) == 0
@@ -469,10 +470,10 @@ def test_telemetry_scoped_to_valid_operations_and_supersedes_historical_failures
         "blockers": [],
     }
 
-    # Historical failure does not poison; distinct suites pass -> PRODUCT_READY
+    # Historical failure does not poison; distinct suites pass -> FINAL_REVIEW
     res = supervisor.advance(state)
     assert res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.PRODUCT_READY
+    assert state.phase == Phase.FINAL_REVIEW
 
     # Now verify that if one current suite fails, it remains blocking
     state.phase = Phase.INTEGRATION_REVIEW
@@ -618,7 +619,7 @@ def test_route_method_mismatch_blocks_approval(tmp_path: Path) -> None:
 
 def test_clean_transition_clears_integration_blockers(tmp_path: Path) -> None:
     """Finding 4: Retain blockers while blocked/reworking, and clear state.integration_blockers
-    to [] upon successful transition to Phase.PRODUCT_READY."""
+    to [] upon successful transition to Phase.FINAL_REVIEW."""
     _setup_base_workspace(tmp_path)
     mock_mgr = MockSessionManager(tmp_path)
     supervisor = LifecycleSupervisor(mock_mgr)
@@ -674,7 +675,7 @@ def test_clean_transition_clears_integration_blockers(tmp_path: Path) -> None:
 
     res = supervisor.advance(state)
     assert res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.PRODUCT_READY
+    assert state.phase == Phase.FINAL_REVIEW
     # Obsolete blockers MUST be cleared
     assert state.integration_blockers == []
 

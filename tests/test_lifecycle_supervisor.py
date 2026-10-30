@@ -42,6 +42,7 @@ from validators.kernel.daemon.supervisor import (
     create_gitops_commit,
     format_release_commit_message,
 )
+from tests.review_helpers import final_pass, qa_pass
 
 
 # ─── Mock SessionManager for unit testing state transitions ───────────
@@ -434,6 +435,7 @@ def test_supervisor_dependency_resolution(tmp_path: Path) -> None:
 
     op_wo1 = next(op for op in mock_mgr.list_operations() if op["work_order_id"] == "WO-001")
     mock_mgr.complete_operation(op_wo1["operation_id"], "COMPLETED")
+    qa_pass(tmp_path, "WO-001")  # mandatory QA gate
 
     # Advance again: WO-001 becomes completed, WO-002 is now eligible and dispatched!
     res2 = supervisor.advance(state)
@@ -506,6 +508,11 @@ def test_supervisor_full_progression_to_complete(tmp_path: Path) -> None:
     reviews_dir.mkdir(parents=True, exist_ok=True)
     (reviews_dir / "gemma_WO-001_verdict.md").write_text("Verdict: APPROVED\n", encoding="utf-8")
 
+    # Mandatory QA + approved plan are acceptance prerequisites.
+    qa_pass(tmp_path, "WO-001")
+    (tmp_path / "PLAN.md").write_text("# Approved Plan\n\nLogin page.\n", encoding="utf-8")
+    state.plan_id = "PLAN-001"
+
     # Advance: EXECUTING → INTEGRATION_REVIEW
     res1 = supervisor.advance(state)
     assert res1 == AdvanceResult.TRANSITIONED
@@ -519,27 +526,38 @@ def test_supervisor_full_progression_to_complete(tmp_path: Path) -> None:
     # Complete integration review
     mock_mgr.complete_operation(state.integration_operation_id, "COMPLETED")
 
-    # Advance: INTEGRATION_REVIEW → PRODUCT_READY
+    # Advance: INTEGRATION_REVIEW → FINAL_REVIEW (mandatory Architect audit)
     res3 = supervisor.advance(state)
     assert res3 == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.FINAL_REVIEW
+
+    # Advance in FINAL_REVIEW: dispatches the Architect's plan audit
+    res4 = supervisor.advance(state)
+    assert res4 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.final_review_operation_id is not None
+    final_pass(tmp_path, "run-001", "PLAN-001", ["WO-001"])
+
+    # Advance: FINAL_REVIEW → PRODUCT_READY only with a fresh PASS verdict
+    res5 = supervisor.advance(state)
+    assert res5 == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.PRODUCT_READY
 
     # Advance: PRODUCT_READY → GITOPS
-    res4 = supervisor.advance(state)
-    assert res4 == AdvanceResult.TRANSITIONED
+    res6 = supervisor.advance(state)
+    assert res6 == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.GITOPS
 
     # Advance in GITOPS: dispatches GitOps turn
-    res5 = supervisor.advance(state)
-    assert res5 == AdvanceResult.WAITING_FOR_OPERATION
+    res7 = supervisor.advance(state)
+    assert res7 == AdvanceResult.WAITING_FOR_OPERATION
     assert state.gitops_operation_id is not None
 
     # Complete GitOps turn
     mock_mgr.complete_operation(state.gitops_operation_id, "COMPLETED")
 
-    # Advance: GITOPS → COMPLETE!
-    res6 = supervisor.advance(state)
-    assert res6 == AdvanceResult.COMPLETE
+    # Advance: GITOPS → COMPLETE! (final-review evidence is still fresh)
+    res8 = supervisor.advance(state)
+    assert res8 == AdvanceResult.COMPLETE
     assert state.phase == Phase.COMPLETE
 
 
@@ -715,7 +733,11 @@ def test_supervisor_gitops_phase_creates_release_commit(git_repo: Path) -> None:
         phase=Phase.GITOPS,
         completed_wo_ids=["WO-001", "WO-002"],
         gitops_wo_id="WO-004",
+        plan_id="PLAN-001",
     )
+    (git_repo / "PLAN.md").write_text("# Approved Plan\n\nLogin page.\n", encoding="utf-8")
+    state.integration_evidence = {"passed": True}
+    final_pass(git_repo, "run-gitops-commit-01", "PLAN-001", [])
 
     # 1. First advance dispatches GitOps turn
     res1 = supervisor.advance(state)
@@ -886,6 +908,7 @@ def test_s3_advance_checks_real_deliverable_on_disk_before_completion(tmp_path: 
 
     latest_op = mock_mgr.list_operations()[-1]
     mock_mgr.complete_operation(latest_op["operation_id"], status="COMPLETED")
+    qa_pass(tmp_path, "WO-001")
 
     res2 = supervisor.advance(state)
     assert "WO-001" in state.completed_wo_ids
@@ -987,6 +1010,7 @@ def test_s6_dispatch_ordering_enforces_scaffolding_before_dependent_workers(tmp_
 
     (tmp_path / "requirements.txt").write_text("flask==3.0.0\n", encoding="utf-8")
     mock_mgr.complete_operation(ops[0]["operation_id"], status="COMPLETED")
+    qa_pass(tmp_path, "WO-001")
 
     supervisor.advance(state)
     assert "WO-001" in state.completed_wo_ids
@@ -1863,6 +1887,7 @@ def test_supervisor_separates_gitops_and_transitions_executing_to_integration_re
     # Simulate WO-001 completed
     op1 = mock_mgr.start_turn("sess-001", "Execute WO-001", role="backend", agent_id="codex", work_order_id="WO-001")
     mock_mgr.complete_operation(op1["operation_id"], status="COMPLETED")
+    qa_pass(tmp_path, "WO-001")
 
     # Advance: should complete WO-001 and dispatch WO-002
     res = supervisor.advance(state)
@@ -2189,6 +2214,7 @@ def test_integration_review_blocked_routes_to_bounded_rework(tmp_path: Path) -> 
 
     # Rework turn completes; WO-001 returns to completed; review re-runs fresh
     mock_mgr.complete_operation(rework_ops[0]["operation_id"], "COMPLETED")
+    qa_pass(tmp_path, "WO-001")
     supervisor.advance(state)  # WO-001 completes again -> INTEGRATION_REVIEW
     assert state.phase == Phase.INTEGRATION_REVIEW
     supervisor.advance(state)  # dispatches the fresh review turn
@@ -2205,7 +2231,7 @@ def test_integration_review_blocked_routes_to_bounded_rework(tmp_path: Path) -> 
     }
     result = supervisor.advance(state)
     assert result == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.PRODUCT_READY
+    assert state.phase == Phase.FINAL_REVIEW  # mandatory Architect audit next
 
 
 def test_integration_review_failed_operation_transitions_to_failed(tmp_path: Path) -> None:
@@ -2301,8 +2327,8 @@ def test_integration_review_archives_review_wo_in_gitops(tmp_path: Path) -> None
     assert review_wo_id is not None
 
     mock_mgr.complete_operation(state.integration_operation_id, "COMPLETED")
-    supervisor.advance(state)  # → PRODUCT_READY
-    assert state.phase == Phase.PRODUCT_READY
+    supervisor.advance(state)  # → FINAL_REVIEW (mandatory Architect audit)
+    assert state.phase == Phase.FINAL_REVIEW
 
     # Verify the review WO ID would be in the archive list
     # by checking state still carries it
@@ -3128,6 +3154,7 @@ def test_undeclared_dependency_escalates_to_architecture_and_resumes(tmp_path: P
     )
 
     # 6. Final advance: WO-002 completes and lifecycle advances to INTEGRATION_REVIEW
+    qa_pass(tmp_path, "WO-002")
     res3 = supervisor.advance(state)
     assert res3 == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.INTEGRATION_REVIEW

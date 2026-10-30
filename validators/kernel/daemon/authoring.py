@@ -62,14 +62,41 @@ def extract_candidate_paths(text: str) -> list[str]:
                 candidate_paths.append(clean)
                 seen.add(clean)
 
-    # Check for dependency manifests mentioned by name without explicit quotes
+    # Check for dependency manifests and release files mentioned by name without explicit quotes
     text_lower = text.lower()
-    for mf in ("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod"):
-        if mf in text_lower and mf not in seen:
-            candidate_paths.append(mf)
-            seen.add(mf)
+    for mf in ("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod", "version", "version.md", "changelog.md"):
+        if mf in text_lower:
+            # Map canonical case
+            canonical = (
+                "package.json" if mf == "package.json"
+                else "requirements.txt" if mf == "requirements.txt"
+                else "pyproject.toml" if mf == "pyproject.toml"
+                else "Cargo.toml" if mf == "cargo.toml"
+                else "go.mod" if mf == "go.mod"
+                else "VERSION" if mf == "version"
+                else "VERSION.md" if mf == "version.md"
+                else "CHANGELOG.md"
+            )
+            if canonical not in seen:
+                candidate_paths.append(canonical)
+                seen.add(canonical)
 
     return candidate_paths
+
+
+def _extract_deliverable(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract primary deliverable spec, falling back to first item of deliverables list."""
+    deliv = data.get("deliverable")
+    if isinstance(deliv, dict) and deliv.get("type"):
+        return deliv
+    delivs = data.get("deliverables")
+    if isinstance(delivs, list) and delivs:
+        first = delivs[0]
+        if isinstance(first, dict) and first.get("type"):
+            return first
+    if isinstance(deliv, dict):
+        return deliv
+    return None
 
 
 def extract_deliverable_spec(
@@ -108,7 +135,9 @@ def extract_deliverable_spec(
         or p.endswith(("/package.json", "/requirements.txt", "/pyproject.toml", "/Cargo.toml", "/go.mod"))
     ]
 
-    if (is_scaffold_task or manifest_candidates) and role_norm in ("backend", "codex", "gitops", "local-llm"):
+    # Note: Scaffolding manifests are only for backend/codex setup tasks,
+    # NOT gitops / local-llm documentation or version reconciliation.
+    if (is_scaffold_task and role_norm in ("backend", "codex")) or (manifest_candidates and role_norm in ("backend", "codex")):
         if manifest_candidates:
             return {
                 "type": "config",
@@ -220,9 +249,14 @@ def extract_deliverable_spec(
     # ── GitOps (Local-LLM) ──
     if role_norm in ("local-llm", "gitops"):
         target_path = next(
-            (p for p in candidate_paths if p in ("VERSION.md", "CHANGELOG.md", "package.json")),
-            "VERSION.md",
+            (p for p in candidate_paths if p in ("VERSION.md", "VERSION", "CHANGELOG.md")),
+            None,
         )
+        if not target_path:
+            target_path = next(
+                (p for p in candidate_paths if p in ("package.json",)),
+                "VERSION.md",
+            )
         return {
             "type": "doc",
             "path": target_path,
@@ -523,7 +557,11 @@ def build_child_contract(
         or any(s in ("test", "build", "diagnosing-bugs", "exec", "pr") for s in (skills or []))
         or any(
             kw in f"{title or ''} {description or ''} {wo_id}".lower()
-            for kw in ("build", "test", "install", "setup", "dependency", "dependencies", "compile", "exec", "npm", "pip", "pytest", "vite")
+            for kw in (
+                "build", "test", "install", "setup", "dependency", "dependencies",
+                "compile", "exec", "npm", "pip", "pytest", "vite", "node", "script",
+                "run", "python", "bash", "sh", "cmd",
+            )
         )
     )
     if needs_commands:
@@ -913,7 +951,11 @@ def decompose_plan_milestones(
     current_idx = start_idx
     prev_wo_id: str | None = None
 
+    from validators.harness.authoring_readiness import _is_architecture_or_meta_milestone
+
     for m in milestones:
+        if _is_architecture_or_meta_milestone(m) or getattr(m, "status", "") == "COMPLETED":
+            continue
         child_wos, last_id = decompose_milestone(
             m,
             start_idx=current_idx,
@@ -1092,6 +1134,8 @@ def synthesize_child_work_orders(
         deps = wo.get("dependencies", [])
         prio = wo.get("priority", "P1")
         deliv = wo.get("deliverable") or {}
+        if isinstance(deliv, str):
+            deliv = {"path": deliv}
 
         # Refine agent assignment only if not explicitly designated by the plan
         if not has_explicit_assigned:
@@ -1338,6 +1382,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         load_plan_milestones,
         _wo_matches_milestone,
         _is_meta_work_order,
+        _is_architecture_or_meta_milestone,
         _parse_wo_index,
     )
     from validators.kernel.io import durable_write_yaml
@@ -1346,6 +1391,14 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     plan_milestones = load_plan_milestones(ws)
     if not plan_milestones:
         return []
+
+    plan_file = ws / "PLAN.md"
+    plan_raw_text = ""
+    if plan_file.is_file():
+        try:
+            plan_raw_text = plan_file.read_text(encoding="utf-8")
+        except Exception:
+            pass
 
     reconciled_ids: list[str] = []
     superseded_map: dict[str, str | None] = {}
@@ -1436,8 +1489,13 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 is_in_plan = (
                     bool(plan_raw_text and f"({wo_id})" in plan_raw_text)
                     or any(wo_id == r.get("id") for r in plan_milestones)
+                    or any(_wo_matches_milestone(wo_data, r) for r in plan_milestones)
                 )
-                if is_in_plan:
+                is_dedup_cancel = any(
+                    kw in str(wo_data.get("cancellation_reason") or wo_data.get("error") or "").lower()
+                    for kw in ("duplicate deliverable", "superseded by", "parallel deliverable")
+                )
+                if is_in_plan and (is_dedup_cancel or not wo_data.get("cancellation_reason")):
                     current_status = "ACTIVE"
                     wo_data["status"] = "ACTIVE"
                     wo_data.pop("error", None)
@@ -1497,6 +1555,48 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     # Pass 3: Parallel Deliverable Collision Resolution (Rule 1c)
     # If surviving parallel work orders claim the same deliverable path without dependency,
     # keep the higher precedence one and cancel the colliding predecessor.
+    # Note: Sequential work orders (e.g. across ordered milestones in PLAN.md or with
+    # transitive dependency paths) are pipeline stages, NOT parallel collisions!
+    milestone_order_map: dict[str, int] = {}
+    for idx, m in enumerate(plan_milestones):
+        m_id = str(m.get("id") or m.get("title") or "")
+        milestone_order_map[m_id] = idx
+
+    dep_graph: dict[str, set[str]] = {}
+    for entry in surviving_entries:
+        e_id = entry[1]
+        e_deps = entry[2].get("dependencies") or []
+        dep_graph[e_id] = {str(d).strip() for d in e_deps if str(d).strip()}
+
+    def _has_transitive_dep(src: str, target: str) -> bool:
+        visited = set()
+        q = [src]
+        while q:
+            curr = q.pop(0)
+            if curr == target:
+                return True
+            if curr in visited:
+                continue
+            visited.add(curr)
+            for d in dep_graph.get(curr, set()):
+                if d not in visited:
+                    q.append(d)
+        return False
+
+    def _are_sequential(entry_a: tuple[Path, str, dict[str, Any], Any], entry_b: tuple[Path, str, dict[str, Any], Any]) -> bool:
+        id_a, id_b = entry_a[1], entry_b[1]
+        if _has_transitive_dep(id_a, id_b) or _has_transitive_dep(id_b, id_a):
+            return True
+        ref_a, ref_b = entry_a[3], entry_b[3]
+        m_a = str(ref_a.get("id") or ref_a.get("title") or "") if isinstance(ref_a, dict) else ""
+        m_b = str(ref_b.get("id") or ref_b.get("title") or "") if isinstance(ref_b, dict) else ""
+        if m_a and m_b and m_a != m_b:
+            order_a = milestone_order_map.get(m_a)
+            order_b = milestone_order_map.get(m_b)
+            if order_a is not None and order_b is not None and order_a != order_b:
+                return True
+        return False
+
     deliv_buckets: dict[str, list[tuple[Path, str, dict[str, Any], Any]]] = {}
     for entry in surviving_entries:
         d_spec = entry[2].get("deliverable")
@@ -1515,20 +1615,57 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         )
         bucket = deliv_buckets.get(norm_p, [])
         if len(bucket) > 1:
-            bucket.sort(key=_wo_precedence, reverse=True)
-            if entry != bucket[0]:
-                _cancel_wo(entry[0], entry[2], entry[1], f"Superseded by {bucket[0][1]} (duplicate deliverable '{norm_p}')")
-                superseded_map[entry[1]] = bucket[0][1]
+            bucket_sorted = sorted(bucket, key=_wo_precedence, reverse=True)
+            collided_with = None
+            for other in bucket_sorted:
+                if other[1] == entry[1]:
+                    continue
+                # If they are sequential, they do not collide
+                if _are_sequential(entry, other):
+                    continue
+                # Truly parallel collision: the higher precedence one survives
+                if _wo_precedence(other) > _wo_precedence(entry):
+                    collided_with = other
+                    break
+            if collided_with is not None:
+                _cancel_wo(entry[0], entry[2], entry[1], f"Superseded by {collided_with[1]} (duplicate deliverable '{norm_p}')")
+                superseded_map[entry[1]] = collided_with[1]
                 continue
         final_survivors.append(entry)
 
     # Pass 3b: Reconcile dependencies among surviving work orders
     surviving_ids = {entry[1] for entry in final_survivors}
+    surviving_map = {entry[1]: entry for entry in final_survivors}
+
+    current_deps: dict[str, list[str]] = {}
+    for _, w_id, w_data, _ in final_survivors:
+        current_deps[w_id] = [str(d).strip() for d in (w_data.get("dependencies") or []) if str(d).strip()]
+
+    def _would_create_cycle(src: str, candidate: str) -> bool:
+        if src == candidate:
+            return True
+        visited = set()
+        q = [candidate]
+        while q:
+            curr = q.pop(0)
+            if curr == src:
+                return True
+            if curr in visited:
+                continue
+            visited.add(curr)
+            for d in current_deps.get(curr, []):
+                if d not in visited:
+                    q.append(d)
+        return False
+
     for wo_file, wo_id, wo_data, _ in final_survivors:
         deps = wo_data.get("dependencies")
         if isinstance(deps, list) and deps:
             new_deps: list[str] = []
             deps_changed = False
+            wo_agents = [str(a).lower() for a in (wo_data.get("assigned_agents") or [])]
+            is_worker = not any(a in ("local-llm", "gitops") for a in wo_agents)
+
             for d in deps:
                 d_str = str(d).strip()
                 target_d = superseded_map.get(d_str, d_str)
@@ -1536,6 +1673,18 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     deps_changed = True
                     continue
                 if target_d in surviving_ids:
+                    # Inverted GitOps check: worker cannot depend on GitOps
+                    target_entry = surviving_map.get(target_d)
+                    target_agents = [str(a).lower() for a in (target_entry[2].get("assigned_agents") or [])] if target_entry else []
+                    is_target_gitops = any(a in ("local-llm", "gitops") for a in target_agents)
+                    if is_worker and is_target_gitops:
+                        deps_changed = True
+                        continue
+                    # Cycle check
+                    if _would_create_cycle(wo_id, target_d):
+                        deps_changed = True
+                        continue
+
                     if target_d not in new_deps:
                         new_deps.append(target_d)
                     if target_d != d_str:
@@ -1545,6 +1694,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if deps_changed:
                 wo_data["dependencies"] = new_deps
                 durable_write_yaml(wo_file, wo_data)
+                current_deps[wo_id] = new_deps
                 if wo_id not in reconciled_ids:
                     reconciled_ids.append(wo_id)
 
@@ -1556,15 +1706,19 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         c_agents = wo_data.get("assigned_agents") or []
         c_agent = str(c_agents[0]) if c_agents else "backend"
         c_role = "QA" if c_agent == "gemma" else ("Frontend" if c_agent == "gemini" else ("GitOps" if c_agent == "local-llm" else "Backend"))
-        c_deliv = wo_data.get("deliverable") or {}
+        c_deliv = _extract_deliverable(wo_data) or {}
         c_deliv_path = c_deliv.get("path") if isinstance(c_deliv, dict) else None
+        candidate_paths = [c_deliv_path] if c_deliv_path else []
+        for extra in wo_data.get("deliverables") or []:
+            if isinstance(extra, dict) and extra.get("path"):
+                candidate_paths.append(extra["path"])
         if not c_file.is_file():
             c_rec = build_child_contract(
                 wo_id=wo_id,
                 agent_id=c_agent,
                 role=c_role,
                 deliverable_path=c_deliv_path,
-                candidate_paths=[c_deliv_path] if c_deliv_path else None,
+                candidate_paths=candidate_paths if candidate_paths else None,
                 max_files_touched=wo_data.get("implementation_estimate", {}).get("max_files_touched") if isinstance(wo_data.get("implementation_estimate"), dict) else 5,
                 skills=wo_data.get("skills"),
                 title=wo_data.get("title", ""),
@@ -1579,8 +1733,26 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     scope = c_data.setdefault("scope", {})
                     allow = scope.setdefault("allow", [])
                     c_changed = False
-                    if c_deliv_path and not any((r.get("module") == c_deliv_path if isinstance(r, dict) else r == c_deliv_path) for r in allow):
-                        allow.append({"module": c_deliv_path})
+                    if scope.get("write") != "read-write":
+                        scope["write"] = "read-write"
+                        c_changed = True
+                    for cp in candidate_paths:
+                        if cp and not any((r.get("module") == cp if isinstance(r, dict) else r == cp) for r in allow):
+                            allow.append({"module": cp})
+                            c_changed = True
+                    if not allow:
+                        full_rec = build_child_contract(
+                            wo_id=wo_id,
+                            agent_id=c_agent,
+                            role=c_role,
+                            deliverable_path=c_deliv_path,
+                            candidate_paths=candidate_paths if candidate_paths else None,
+                            max_files_touched=wo_data.get("implementation_estimate", {}).get("max_files_touched") if isinstance(wo_data.get("implementation_estimate"), dict) else 5,
+                            skills=wo_data.get("skills"),
+                            title=wo_data.get("title", ""),
+                            description=wo_data.get("description", ""),
+                        )
+                        c_data["scope"] = full_rec["scope"]
                         c_changed = True
                     if c_agent == "gemma" and not any(("tests" in str(r.get("module") if isinstance(r, dict) else r)) for r in allow):
                         allow.append({"module": "tests/**"})
@@ -1750,7 +1922,11 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
         uncovered_milestones = [
             m for m in plan_milestones
-            if not any(_wo_matches_milestone(w, m) for w in existing_wos)
+            if not (
+                _is_architecture_or_meta_milestone(m)
+                or str(m.get("status") or "").strip().upper() == "COMPLETED"
+                or any(_wo_matches_milestone(w, m) for w in existing_wos)
+            )
         ]
 
         if uncovered_milestones:

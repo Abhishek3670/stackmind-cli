@@ -8,7 +8,7 @@ completes and dispatches the next valid action.
 State Machine
 ─────────────
 INIT → PLANNING → AWAITING_APPROVAL → AUTHORING → DISPATCHING
-→ EXECUTING → INTEGRATION_REVIEW → PRODUCT_READY → GITOPS → COMPLETE
+→ EXECUTING → INTEGRATION_REVIEW → FINAL_REVIEW → PRODUCT_READY → GITOPS → COMPLETE
 
 Constraints honoured:
  • Agents run through existing governed Harness/AgentRunner
@@ -82,6 +82,7 @@ class Phase(StrEnum):
     QA_REVIEW = "QA_REVIEW"
     ARCHITECT_RECOVERY_DECISION = "ARCHITECT_RECOVERY_DECISION"
     INTEGRATION_REVIEW = "INTEGRATION_REVIEW"
+    FINAL_REVIEW = "FINAL_REVIEW"
     PRODUCT_READY = "PRODUCT_READY"
     GITOPS = "GITOPS"
     WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
@@ -127,6 +128,7 @@ DEFAULT_TIMEOUTS: dict[Any, float] = {
     Phase.EXECUTING: 180.0,
     Phase.QA_REVIEW: 180.0,
     Phase.INTEGRATION_REVIEW: 180.0,
+    Phase.FINAL_REVIEW: 180.0,
     Phase.ARCHITECT_REPAIR: 180.0,
     Phase.ARCHITECT_RECOVERY_DECISION: 300.0,
     Phase.GITOPS: 60.0,
@@ -210,6 +212,18 @@ class RunState:
     # QA defect routing: QA work order → developer work order IDs whose
     # rework must re-complete before the QA work order may be re-dispatched.
     qa_rework_targets: dict[str, list[str]] = field(default_factory=dict)
+    # Mandatory QA review gate: work order ID → in-flight QA review operation ID.
+    qa_review_operations: dict[str, str] = field(default_factory=dict)
+    qa_review_attempts: dict[str, int] = field(default_factory=dict)
+    max_qa_review_attempts: int = 2
+    # Architect final acceptance gate (runs against the approved plan).
+    final_review_operation_id: str | None = None
+    final_review_rounds: int = 0
+    max_final_review_rounds: int = 2
+    final_review_history: list[dict[str, Any]] = field(default_factory=list)
+    # Bounds the prerequisite bounce between FINAL_REVIEW and EXECUTING so a
+    # permanently unsatisfiable prerequisite cannot loop forever.
+    final_prerequisite_rounds: int = 0
     execution_profile: str = "medium"
     gitops_feedback: str | None = None
     # ── P0-5 Counters and Global Turn Budget ─────────────────────────────
@@ -246,6 +260,8 @@ class RunState:
     turn_started_at: float | None = None
     run_started_at: float | None = None
     waiting_for_human_entered_at: float | None = None
+    # Last dispatch failure diagnostic (set by _architect_turn on failure)
+    last_dispatch_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -302,6 +318,14 @@ class RunState:
             "contract_revisions": dict(self.contract_revisions),
             "integration_rework_rounds": self.integration_rework_rounds,
             "qa_rework_targets": dict(self.qa_rework_targets),
+            "qa_review_operations": dict(self.qa_review_operations),
+            "qa_review_attempts": dict(self.qa_review_attempts),
+            "max_qa_review_attempts": self.max_qa_review_attempts,
+            "final_review_operation_id": self.final_review_operation_id,
+            "final_review_rounds": self.final_review_rounds,
+            "max_final_review_rounds": self.max_final_review_rounds,
+            "final_review_history": list(self.final_review_history),
+            "final_prerequisite_rounds": self.final_prerequisite_rounds,
             "execution_profile": self.execution_profile,
             "gitops_feedback": self.gitops_feedback,
             "worker_retries": dict(self.worker_retries),
@@ -390,6 +414,14 @@ class RunState:
             contract_revisions=dict(data.get("contract_revisions", {}) or {}),
             integration_rework_rounds=int(data.get("integration_rework_rounds", 0)),
             qa_rework_targets=dict(data.get("qa_rework_targets", {}) or {}),
+            qa_review_operations=dict(data.get("qa_review_operations", {}) or {}),
+            qa_review_attempts=dict(data.get("qa_review_attempts", {}) or {}),
+            max_qa_review_attempts=int(data.get("max_qa_review_attempts", 2)),
+            final_review_operation_id=data.get("final_review_operation_id"),
+            final_review_rounds=int(data.get("final_review_rounds", 0)),
+            max_final_review_rounds=int(data.get("max_final_review_rounds", 2)),
+            final_review_history=list(data.get("final_review_history", []) or []),
+            final_prerequisite_rounds=int(data.get("final_prerequisite_rounds", 0)),
             execution_profile=str(data.get("execution_profile", "medium")),
             gitops_feedback=data.get("gitops_feedback"),
             worker_retries=dict(data.get("worker_retries", {}) or {}),
@@ -639,7 +671,9 @@ class LifecycleSupervisor:
                 state.error = f"WORKER_INVALID_OUTPUT: {error_type} on {wid} (retry {retries}/{state.max_worker_retries})"
             return AdvanceResult.TRANSITIONED
 
-        elif role_lower == "qa" or state.phase in (Phase.INTEGRATION_REVIEW, Phase.QA_REVIEW):
+        elif role_lower == "qa" or state.phase in (
+            Phase.INTEGRATION_REVIEW, Phase.QA_REVIEW, Phase.FINAL_REVIEW
+        ):
             wid = wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             reworks = state.qa_reworks.get(wid, 0) + 1
             state.qa_reworks[wid] = reworks
@@ -744,7 +778,7 @@ class LifecycleSupervisor:
                 state.error = f"WORKER_TIMEOUT: Turn timed out after {timeout_val:.1f}s (retry {retries}/{state.max_worker_retries})"
             return AdvanceResult.TRANSITIONED
 
-        elif timeout_phase in (Phase.INTEGRATION_REVIEW, Phase.QA_REVIEW):
+        elif timeout_phase in (Phase.INTEGRATION_REVIEW, Phase.QA_REVIEW, Phase.FINAL_REVIEW):
             wo_id = state.integration_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             reworks = state.qa_reworks.get(wo_id, 0) + 1
             state.qa_reworks[wo_id] = reworks
@@ -1025,10 +1059,11 @@ class LifecycleSupervisor:
             Phase.ARCHITECT_RECOVERY_DECISION: self._advance_recovery_decision,
             Phase.QA_REVIEW: self._advance_integration_review,
             Phase.INTEGRATION_REVIEW: self._advance_integration_review,
+            Phase.FINAL_REVIEW: self._advance_final_review,
             Phase.PRODUCT_READY: self._advance_product_ready,
             Phase.GITOPS: self._advance_gitops,
             Phase.WAITING_FOR_HUMAN: lambda _s: AdvanceResult.WAITING_FOR_HUMAN,
-            Phase.COMPLETE: lambda _s: AdvanceResult.COMPLETE,
+            Phase.COMPLETE: self._advance_complete,
             Phase.FAILED: lambda _s: AdvanceResult.FAILED,
             Phase.BLOCKED: lambda _s: AdvanceResult.BLOCKED,
         }.get(state.phase)
@@ -1063,7 +1098,12 @@ class LifecycleSupervisor:
                         # Attempt autonomous Architect recovery escalation if retry budget remains
                         recovery_attempts = state.recovery_attempts.get("IDLE_STALL", 0)
                         if (
-                            state.phase in (Phase.EXECUTING, Phase.DISPATCHING, Phase.INTEGRATION_REVIEW)
+                            state.phase in (
+                                Phase.EXECUTING,
+                                Phase.DISPATCHING,
+                                Phase.INTEGRATION_REVIEW,
+                                Phase.FINAL_REVIEW,
+                            )
                             and recovery_attempts < state.max_retries
                             and state.global_turn_budget > 0
                         ):
@@ -1579,7 +1619,10 @@ class LifecycleSupervisor:
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:
-                    state.error = "Architect repair turn could not be re-dispatched"
+                    state.error = (
+                        f"Architect repair turn could not be re-dispatched: "
+                        f"{getattr(state, 'last_dispatch_error', None) or 'unknown precondition failure'}"
+                    )
                     self._transition(state, Phase.BLOCKED)
                     return AdvanceResult.BLOCKED
                 state.architect_repair_operation_id = new_op.get("operation_id")
@@ -1600,7 +1643,10 @@ class LifecycleSupervisor:
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:
-                    state.error = f"Architect repair turn could not be re-dispatched: {post_check_error}"
+                    state.error = (
+                        f"Architect repair turn could not be re-dispatched: {post_check_error} "
+                        f"(dispatch: {getattr(state, 'last_dispatch_error', None) or 'unknown'})"
+                    )
                     self._transition(state, Phase.BLOCKED)
                     return AdvanceResult.BLOCKED
                 state.architect_repair_operation_id = new_op.get("operation_id")
@@ -1661,7 +1707,10 @@ class LifecycleSupervisor:
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:
-                    state.error = f"Readiness still failing ({issue_summary}) and repair could not be re-dispatched"
+                    state.error = (
+                        f"Readiness still failing ({issue_summary}) and repair could not be re-dispatched: "
+                        f"{getattr(state, 'last_dispatch_error', None) or 'unknown'}"
+                    )
                     self._transition(state, Phase.BLOCKED)
                     return AdvanceResult.BLOCKED
                 state.architect_repair_operation_id = new_op.get("operation_id")
@@ -1736,7 +1785,10 @@ class LifecycleSupervisor:
                         state.repair_context = {"work_order_id": sorted(blocked_files)[0]}
         new_op = self._dispatch_repair_turn(state, ws)
         if new_op is None:
-            state.error = "Architect repair operation was lost and could not be re-dispatched"
+            state.error = (
+                f"Architect repair operation was lost and could not be re-dispatched: "
+                f"{getattr(state, 'last_dispatch_error', None) or 'unknown precondition failure'}"
+            )
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
         state.architect_repair_operation_id = new_op.get("operation_id")
@@ -2181,11 +2233,31 @@ class LifecycleSupervisor:
                     all_done = False
                 continue
 
-            # APPROVED, or no verdict yet: a deliverable verified on disk completes
-            # the work order (code, doc, config, research and QA alike).
+            # ── Mandatory QA review gate ──────────────────────────────────
+            # A backend/frontend deliverable that produces application code or
+            # user-facing behaviour is NEVER accepted on the worker's completion
+            # claim alone.  The persisted, revision-bound QA verdict is
+            # authoritative; the worker cannot write it (its contract does not
+            # authorise the review channel).
+            from validators.harness import review_gate as _review_gate
+            if (
+                _review_gate.requires_qa(ws, wo_id)
+                and self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
+            ):
+                qa_decision = _review_gate.evaluate_qa_gate(ws, wo_id)
+                if not qa_decision.passed:
+                    qa_outcome = self._handle_qa_gate_pending(state, ws, wo_id, qa_decision)
+                    if qa_outcome is not None:
+                        return qa_outcome
+                    all_done = False
+                    continue
+
+            # QA gate passed (or not applicable): the verified deliverable
+            # completes the work order.
             if wo_id not in state.completed_wo_ids:
                 state.completed_wo_ids.append(wo_id)
                 self._mark_wo_status_on_disk(ws, wo_id, "COMPLETED")
+            state.qa_review_operations.pop(wo_id, None)
             state.worker_blockers.pop(wo_id, None)
 
         # Check for fatal failures among worker WOs
@@ -3135,7 +3207,8 @@ class LifecycleSupervisor:
 
                     if not blockers:
                         state.integration_blockers = []
-                        self._transition(state, Phase.PRODUCT_READY)
+                        state.integration_evidence = gate_decision.to_dict()
+                        self._transition(state, Phase.FINAL_REVIEW)
                         return AdvanceResult.TRANSITIONED
                 else:
                     # When the review claimed completion but deterministic checks failed,
@@ -3187,7 +3260,8 @@ class LifecycleSupervisor:
 
                 if not blockers:
                     state.integration_blockers = []
-                    self._transition(state, Phase.PRODUCT_READY)
+                    state.integration_evidence = gate_decision.to_dict()
+                    self._transition(state, Phase.FINAL_REVIEW)
                     return AdvanceResult.TRANSITIONED
 
                 state.integration_blockers = list(blockers)
@@ -3291,7 +3365,8 @@ class LifecycleSupervisor:
 
             # Both deterministic checks and review completed cleanly
             state.integration_blockers = []
-            self._transition(state, Phase.PRODUCT_READY)
+            state.integration_evidence = gate_decision.to_dict()
+            self._transition(state, Phase.FINAL_REVIEW)
             return AdvanceResult.TRANSITIONED
 
         if not state.integration_wo_id:
@@ -3676,6 +3751,316 @@ class LifecycleSupervisor:
                     pass
         return False
 
+    # ── Architect final acceptance (mandatory, plan-bound) ────────────
+
+    def _final_acceptance_status(self, state: RunState, ws: Path) -> tuple[bool, Any, str]:
+        """Deterministic + persisted evidence check at the run-completion boundary."""
+        from validators.harness import review_gate
+
+        report = review_gate.evaluate_final_acceptance(state, ws)
+        if not report.passed:
+            return False, report, "; ".join(report.reasons)
+        verdict = review_gate.load_final_verdict(ws, state.run_id)
+        ok, why = review_gate.validate_final_verdict(
+            verdict,
+            ws,
+            run_id=state.run_id,
+            plan_id=state.plan_id,
+            required_wo_ids=review_gate.required_wo_ids_for_run(state, ws),
+        )
+        if not ok:
+            return False, report, why
+        return True, report, "final acceptance evidence is valid"
+
+    def _advance_complete(self, state: RunState) -> AdvanceResult:
+        """COMPLETE is a terminal state only while the acceptance invariant holds.
+
+        Enforced at the authoritative completion boundary rather than in a
+        reporting layer: if a completed run's plan, deliverables, QA verdicts or
+        final-review evidence are missing or stale, the run is not successful.
+        """
+        ws = Path(state.workspace)
+        ok, _report, why = self._final_acceptance_status(state, ws)
+        if ok:
+            return AdvanceResult.COMPLETE
+        state.error = f"FINAL_ACCEPTANCE_INVARIANT_VIOLATION: {why}"
+        state.final_review_history.append(
+            {
+                "event": "complete_invariant_violation",
+                "reason": why,
+                "phase": Phase.COMPLETE.value,
+                "timestamp": _now(),
+            }
+        )
+        self._transition(state, Phase.FINAL_REVIEW)
+        return AdvanceResult.TRANSITIONED
+
+    def _advance_final_review(self, state: RunState) -> AdvanceResult:
+        """FINAL_REVIEW: Architect audits the implementation against PLAN.md."""
+        ws = Path(state.workspace)
+        from validators.harness import review_gate
+
+        report = review_gate.evaluate_final_acceptance(state, ws)
+        if not report.passed:
+            state.error = "FINAL_ACCEPTANCE_BLOCKED: " + "; ".join(report.reasons)
+            state.final_review_history.append(
+                {
+                    "event": "prerequisites_unmet",
+                    "attempt": state.final_review_rounds,
+                    "reasons": list(report.reasons),
+                    "timestamp": _now(),
+                }
+            )
+            actionable = bool(
+                report.missing_wo_ids or report.blocked_wo_ids or state.qa_rework_targets
+            )
+            if actionable and state.final_prerequisite_rounds < state.max_final_review_rounds + 2:
+                state.final_prerequisite_rounds += 1
+                self._transition(state, Phase.EXECUTING)
+                return AdvanceResult.TRANSITIONED
+            if actionable:
+                state.error = (
+                    "FINAL_ACCEPTANCE_BLOCKED: prerequisites remained unmet after "
+                    f"{state.final_prerequisite_rounds} execution rounds: "
+                    + "; ".join(report.reasons)
+                )
+                state.exit_code = 3
+            self._transition(state, Phase.BLOCKED)
+            return AdvanceResult.BLOCKED
+
+        required = review_gate.required_wo_ids_for_run(state, ws)
+        verdict = review_gate.load_final_verdict(ws, state.run_id)
+        ok, why = review_gate.validate_final_verdict(
+            verdict, ws, run_id=state.run_id, plan_id=state.plan_id, required_wo_ids=required,
+        )
+        if ok:
+            state.error = None
+            state.final_review_operation_id = None
+            self._transition(state, Phase.PRODUCT_READY)
+            return AdvanceResult.TRANSITIONED
+
+        if state.final_review_operation_id:
+            op = self._get_operation(state.final_review_operation_id)
+            if op is not None and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                return AdvanceResult.WAITING_FOR_OPERATION
+            state.final_review_operation_id = None
+            verdict = review_gate.load_final_verdict(ws, state.run_id)
+            ok, why = review_gate.validate_final_verdict(
+                verdict, ws, run_id=state.run_id, plan_id=state.plan_id, required_wo_ids=required,
+            )
+            if ok:
+                state.error = None
+                self._transition(state, Phase.PRODUCT_READY)
+                return AdvanceResult.TRANSITIONED
+
+        if verdict is not None:
+            # A rejected (or stale) final review routes bounded corrective work
+            # through the existing rework mechanisms; it is never ignored.
+            outcome = self._route_final_review_failure(state, ws, verdict, why)
+            if outcome is not None:
+                return outcome
+
+        return self._dispatch_final_review(state, ws, required, report)
+
+    def _route_final_review_failure(
+        self, state: RunState, ws: Path, verdict: dict[str, Any], why: str,
+    ) -> AdvanceResult | None:
+        """Route Architect rejection through authorized, bounded corrective work."""
+        from validators.harness import review_gate
+
+        findings = list(review_gate._findings_of(verdict))
+        actions = list(review_gate._actions_of(verdict))
+        blockers = findings + actions or [why]
+        state.final_review_history.append(
+            {
+                "event": "rejected",
+                "attempt": state.final_review_rounds,
+                "status": verdict.get("status"),
+                "reason": why,
+                "findings": findings,
+                "required_actions": actions,
+                "timestamp": _now(),
+            }
+        )
+        review_gate.archive_final_verdict(ws, state.run_id, suffix="rejected")
+        state.error = "FINAL_REVIEW_REJECTED: " + ("; ".join(blockers) or why)
+
+        if state.final_review_rounds >= state.max_final_review_rounds:
+            state.error = (
+                f"FINAL_REVIEW_BUDGET_EXHAUSTED: {state.final_review_rounds}/"
+                f"{state.max_final_review_rounds} corrective rounds used: {state.error}"
+            )
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+        state.final_review_rounds += 1
+
+        reworkable = self._reworkable_integration_wos(state, ws, blockers)
+        reworkable = [
+            w for w in reworkable
+            if w not in (state.integration_wo_id, state.gitops_wo_id)
+        ]
+        if not reworkable:
+            state.error += " (no authorized work order could be linked to the findings)"
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
+        feedback = "\n".join(f"- {b}" for b in blockers)
+        parent_op_id = None
+        if len(reworkable) > 1 and hasattr(self.manager, "begin_operation"):
+            try:
+                _, parent_op_id = self.manager.begin_operation(
+                    state.session_id,
+                    "parallel_dispatch",
+                    {"work_orders": reworkable, "final_review_round": state.final_review_rounds},
+                    role="supervisor",
+                )
+                state.batch_operation_id = parent_op_id
+            except Exception:
+                parent_op_id = None
+        for wo_id in reworkable:
+            # Any prior QA verdict for a corrected deliverable must be invalidated;
+            # the fresh review is the only thing that can re-authorise acceptance.
+            review_gate.archive_qa_verdict(ws, wo_id, suffix="invalidated-final-review")
+            self._unarchive_work_order(ws, wo_id)
+            if wo_id not in state.worker_wo_ids:
+                state.worker_wo_ids.append(wo_id)
+            if state.published_wo_ids and wo_id not in state.published_wo_ids:
+                state.published_wo_ids.append(wo_id)
+            for bucket in (state.completed_wo_ids, state.failed_wo_ids, state.blocked_wo_ids):
+                if wo_id in bucket:
+                    bucket.remove(wo_id)
+            state.retry_counts[wo_id] = 0
+            agent = self._agent_for_wo(wo_id, ws)
+            role = self._role_for_agent(agent)
+            prompt = (
+                f"Corrective work for work order {wo_id} (Architect final review round "
+                f"{state.final_review_rounds}/{state.max_final_review_rounds}).\n"
+                f"The Architect rejected the completed implementation with these findings "
+                f"and required corrections:\n{feedback}\n"
+                "Apply each correction to the deliverables, then resubmit. The deliverables "
+                "must pass deterministic verification and mandatory QA again."
+            )
+            if role == "qa":
+                prompt += (
+                    "\n\nYou are the QA agent: re-verify with your assigned suite and "
+                    "write a fresh "
+                    "structured verdict; do not modify application code."
+                )
+            try:
+                self.manager.start_turn(
+                    state.session_id,
+                    prompt,
+                    role=role,
+                    agent_id=agent,
+                    work_order_id=wo_id,
+                    parent_operation_id=parent_op_id,
+                )
+            except OperationContentionError:
+                pass
+            except Exception:
+                if wo_id not in state.failed_wo_ids:
+                    state.failed_wo_ids.append(wo_id)
+        self._transition(state, Phase.EXECUTING)
+        return AdvanceResult.WAITING_FOR_OPERATION
+
+    def _dispatch_final_review(
+        self, state: RunState, ws: Path, required: list[str], report: Any,
+    ) -> AdvanceResult:
+        """Dispatch the Architect's plan-to-implementation acceptance audit."""
+        from validators.harness import review_gate
+
+        if state.final_review_rounds > state.max_final_review_rounds:
+            state.error = "FINAL_REVIEW_BUDGET_EXHAUSTED: no final-review rounds remain"
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
+        verdict_path = review_gate.final_verdict_path(ws, state.run_id)
+        try:
+            rel_verdict = verdict_path.relative_to(ws).as_posix()
+        except Exception:
+            rel_verdict = str(verdict_path)
+        plan_digest = report.plan_hash_value or ""
+        reviewed = ",\n".join(
+            f'    {{"id": "{wo_id}", "subject_hash": "{review_gate.subject_hash(ws, wo_id)}"}}'
+            for wo_id in required
+        )
+        prompt = (
+            "Architect final acceptance review.\n\n"
+            f"The approved plan is `PLAN.md` (plan id {state.plan_id!r}, sha256 {plan_digest}).\n"
+            "All required work orders are complete, deterministically verified and QA-approved. "
+            "Audit the actual implementation against the authoritative approved plan before the "
+            "run may be declared successful.\n\n"
+            "Evaluate:\n"
+            "1. Coverage of every required milestone and acceptance criterion in PLAN.md.\n"
+            "2. Completion and verification of every required work order listed below.\n"
+            "3. QA verdicts for all applicable work orders.\n"
+            "4. Existence and validity of the required deliverables.\n"
+            "5. Backend/frontend integration and end-to-end behaviour.\n"
+            "6. Test, build and dependency evidence (inspect the recorded evidence; "
+            "do not assume).\n"
+            "7. Unresolved blockers, defects and known limitations.\n"
+            "8. Scope deviations or conflicting implementations.\n"
+            "9. Consistency between the declared result and the repository state.\n\n"
+            "Derive requirements from PLAN.md and the work-order contracts only. If any mandatory "
+            "criterion is unmet, set status FAIL with reproducible findings and "
+            "required corrections.\n\n"
+            f"Persist the verdict as JSON to `${rel_verdict}` using write_file, "
+            "in exactly this shape:\n"
+            "{\n"
+            f'  "schema": "{review_gate.FINAL_REVIEW_SCHEMA}",\n'
+            f'  "run_id": "{state.run_id}",\n'
+            f'  "plan_id": "{state.plan_id}",\n'
+            f'  "plan_hash": "{plan_digest}",\n'
+            '  "status": "PASS" | "FAIL",\n'
+            '  "reviewer": "claude",\n'
+            '  "reviewer_role": "architecture",\n'
+            '  "timestamp": "<ISO-8601 UTC>",\n'
+            '  "reviewed_work_orders": [\n'
+            f"{reviewed}\n"
+            '  ],\n'
+            '  "acceptance_criteria": [{"id": "...", "description": "...", '
+            '"outcome": "PASS|FAIL", "evidence": "..."}],\n'
+            '  "evidence": [{"kind": "test|build|inspection", "command": "...", '
+            '"result": "...", "passed": true}],\n'
+            '  "findings": [{"severity": "critical|major|minor", '
+            '"detail": "..."}],\n'
+            '  "required_actions": ["..."],\n'
+            f'  "attempt": {state.final_review_rounds + 1}\n'
+            "}\n\n"
+            "Do not modify application code or work-order state during this audit. Finish by "
+            "declaring status 'completed' after writing the verdict."
+        )
+        try:
+            # Reviewers run under their agent contract, not a work-order
+            # contract, so the review channel is authorized independently of
+            # the deliverables being audited.
+            op = self.manager.start_turn(
+                state.session_id,
+                prompt,
+                role="architecture",
+                agent_id="claude",
+            )
+            state.final_review_operation_id = (op or {}).get("operation_id")
+            state.error = None
+            try:
+                self.save_run_state(state, ws)
+            except Exception:
+                pass
+            return AdvanceResult.WAITING_FOR_OPERATION
+        except OperationContentionError:
+            return AdvanceResult.WAITING_FOR_OPERATION
+        except Exception as exc:
+            state.error = f"Final review dispatch failed: {exc}"
+            state.final_review_rounds += 1
+            if state.final_review_rounds > state.max_final_review_rounds:
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            return AdvanceResult.TRANSITIONED
+
     def _advance_product_ready(self, state: RunState) -> AdvanceResult:
         """PRODUCT_READY: discover or create GitOps WO and dispatch."""
         ws = Path(state.workspace)
@@ -3784,8 +4169,27 @@ class LifecycleSupervisor:
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
                 return AdvanceResult.WAITING_FOR_HUMAN
 
-            # GitOps completed — if workspace has a git repository, perform governed release commit
+            # GitOps completed — mandatory run-completion invariant. A successful
+            # release requires a valid plan, completed+QA-passed work orders and a
+            # fresh Architect final-review PASS. Work-order COMPLETED status alone
+            # is explicitly insufficient.
             ws = Path(state.workspace)
+            (
+                acceptance_ok,
+                _acceptance_report,
+                acceptance_why,
+            ) = self._final_acceptance_status(state, ws)
+            if not acceptance_ok:
+                state.error = f"FINAL_ACCEPTANCE_INVARIANT_VIOLATION: {acceptance_why}"
+                state.final_review_history.append(
+                    {
+                        "event": "gitops_completion_blocked",
+                        "reason": acceptance_why,
+                        "timestamp": _now(),
+                    }
+                )
+                self._transition(state, Phase.FINAL_REVIEW)
+                return AdvanceResult.TRANSITIONED
             self._ensure_release_documentation(ws, state)
             # Before committing, archive completed work orders to .sync/work-orders/COMPLETED/
             to_archive = list(state.completed_wo_ids)
@@ -4150,7 +4554,10 @@ class LifecycleSupervisor:
             return None  # sign-off style QA work order — nothing executable declared
         target = ws / deliv_path
         try:
-            if not target.is_file() or target.stat().st_size == 0:
+            if target.is_dir():
+                if not any(f.is_file() for f in target.rglob("*")):
+                    return f"declared test suite '{deliv_path}' was not authored"
+            elif not target.is_file() or target.stat().st_size == 0:
                 return f"declared test suite '{deliv_path}' was not authored"
         except OSError:
             return f"declared test suite '{deliv_path}' was not authored"
@@ -4462,7 +4869,10 @@ class LifecycleSupervisor:
         state.authoring_repair_attempts += 1
         op = self._dispatch_repair_turn(state, ws)
         if op is None:
-            state.error = f"{reason} — failed to dispatch the Architect repair turn"
+            state.error = (
+                f"{reason} — failed to dispatch the Architect repair turn: "
+                f"{getattr(state, 'last_dispatch_error', None) or 'unknown'}"
+            )
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
         state.architect_repair_operation_id = op.get("operation_id")
@@ -4685,7 +5095,22 @@ class LifecycleSupervisor:
     def _architect_turn(
         self, state: RunState, prompt: str, wo_id: str, **flags: Any,
     ) -> dict[str, Any] | None:
-        """Start a governed Architect authoring turn; None when it cannot start."""
+        """Start a governed Architect authoring turn; None when it cannot start.
+
+        Records the concrete dispatch failure reason on *state* so that callers
+        can surface an actionable diagnostic instead of a generic "could not be
+        dispatched" message.
+        """
+        if hasattr(self.manager, "_sessions"):
+            sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
+            if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
+                sess["state"] = "RUNNING"
+                sess["updated_at"] = _now()
+                if hasattr(self.manager, "_save"):
+                    try:
+                        self.manager._save()
+                    except Exception:
+                        pass
         try:
             return self.manager.start_turn(
                 state.session_id,
@@ -4696,10 +5121,14 @@ class LifecycleSupervisor:
                 is_authoring=True,
                 **flags,
             )
-        except Exception:
+        except Exception as first_exc:
+            first_reason = f"{type(first_exc).__name__}: {first_exc}"
             # Operation contention or session lock - clear any orphaned/stale active operation and retry once
             try:
                 session = self.manager.get_session(state.session_id)
+                if session and session.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
+                    session["state"] = "RUNNING"
+                    session["updated_at"] = _now()
                 active_op = session.get("active_operation")
                 if active_op:
                     try:
@@ -4709,17 +5138,22 @@ class LifecycleSupervisor:
                     if hasattr(self.manager, "_active"):
                         self.manager._active.pop(active_op, None)
                     session["active_operation"] = None
-                    return self.manager.start_turn(
-                        state.session_id,
-                        prompt,
-                        role="architecture",
-                        agent_id="claude",
-                        work_order_id=wo_id,
-                        is_authoring=True,
-                        **flags,
-                    )
-            except Exception:
-                pass
+                return self.manager.start_turn(
+                    state.session_id,
+                    prompt,
+                    role="architecture",
+                    agent_id="claude",
+                    work_order_id=wo_id,
+                    is_authoring=True,
+                    **flags,
+                )
+            except Exception as retry_exc:
+                first_reason = (
+                    f"{type(first_exc).__name__}: {first_exc}; "
+                    f"retry failed: {type(retry_exc).__name__}: {retry_exc}"
+                )
+            # Preserve actionable diagnostic on state for the caller
+            state.last_dispatch_error = first_reason
             return None
 
     def _verify_repair_outcome(
@@ -4742,9 +5176,12 @@ class LifecycleSupervisor:
             deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_id, ws)
             if deliv_path:
                 target_file = ws / deliv_path
-                if not target_file.is_file():
+                if target_file.is_dir():
+                    if not any(f.is_file() for f in target_file.rglob("*")):
+                        return f"architect_fix expected deliverable directory '{deliv_path}' to contain files"
+                elif not target_file.is_file():
                     return f"architect_fix expected deliverable '{deliv_path}' to exist on disk"
-                if target_file.stat().st_size == 0:
+                elif target_file.stat().st_size == 0:
                     return f"architect_fix deliverable '{deliv_path}' is empty"
             return None
         if action == "amend_contract":
@@ -5254,7 +5691,10 @@ class LifecycleSupervisor:
         state.authoring_repair_attempts += 1
         op = self._dispatch_repair_turn(state, ws)
         if op is None:
-            state.error = "Recovery repair turn could not be dispatched"
+            state.error = (
+                f"Recovery repair turn could not be dispatched: "
+                f"{getattr(state, 'last_dispatch_error', None) or 'unknown precondition failure'}"
+            )
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED, None
         state.architect_repair_operation_id = op.get("operation_id")
@@ -5707,62 +6147,91 @@ class LifecycleSupervisor:
         _WO_TERMINAL = {"COMPLETED", "CANCELLED", "FAILED"}
         wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if not wo_file.is_file():
-            return False
-        try:
-            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return False
-            current = str(data.get("status", "")).upper()
-            if current in _WO_TERMINAL and target_status != "ACTIVE":
-                return False  # Already terminal — don't overwrite
-            data["status"] = target_status
-            data["updated"] = _now()
-            if error:
-                data["error"] = str(error)
-                data["blocked_reason"] = str(error)
-            elif clear_error:
-                data.pop("error", None)
-                data.pop("blocked_reason", None)
-            from validators.kernel.io import durable_write_yaml
-            durable_write_yaml(wo_file, data, default_flow_style=False)
-            # Also keep INDEX.yaml synchronized if present
-            index_file = ws / ".sync" / "work-orders" / "INDEX.yaml"
-            if index_file.is_file():
-                try:
-                    idx_data = yaml.safe_load(index_file.read_text(encoding="utf-8")) or {}
-                    orders = idx_data.get("orders", [])
-                    for o in orders:
-                        if isinstance(o, dict) and o.get("id") == wo_id:
-                            o["status"] = target_status
-                            o["file"] = f"work-orders/ACTIVE/{wo_id}.yaml"
-                            o["updated"] = data["updated"]
-                    idx_data["total_active"] = sum(
-                        1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
-                    )
-                    idx_data["total_completed"] = sum(
-                        1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
-                    )
-                    idx_data["total_blocked"] = sum(
-                        1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
-                    )
-                    idx_data["last_updated"] = data["updated"]
-                    durable_write_yaml(index_file, idx_data)
-                    tree_file = ws / ".sync" / "runtime" / "TREE.yaml"
+            if target_status == "ACTIVE":
+                blocked_cand = ws / ".sync" / "work-orders" / "BLOCKED" / f"{wo_id}.yaml"
+                if blocked_cand.is_file():
                     try:
-                        from cli.init import ensure_canonical_tree
-                        tree_data = ensure_canonical_tree(ws)
-                        if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
-                            tree_data["work_orders"]["total_active"] = idx_data.get("total_active", 0)
-                            tree_data["work_orders"]["total_completed"] = idx_data.get("total_completed", 0)
-                            tree_data["work_orders"]["total_blocked"] = idx_data.get("total_blocked", 0)
-                            durable_write_yaml(tree_file, tree_data)
+                        b_data = yaml.safe_load(blocked_cand.read_text(encoding="utf-8"))
+                        if not isinstance(b_data, dict):
+                            return False
+                        b_data["status"] = "ACTIVE"
+                        b_data["updated"] = _now()
+                        if clear_error:
+                            b_data.pop("error", None)
+                            b_data.pop("blocked_reason", None)
+                        elif error:
+                            b_data["error"] = str(error)
+                        wo_file.parent.mkdir(parents=True, exist_ok=True)
+                        from validators.kernel.io import durable_write_yaml
+                        durable_write_yaml(wo_file, b_data, default_flow_style=False)
+                        try:
+                            blocked_cand.unlink()
+                        except OSError:
+                            pass
+                        data = b_data
                     except Exception:
-                        pass
+                        return False
+                else:
+                    return False
+            else:
+                return False
+        else:
+            try:
+                data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    return False
+                current = str(data.get("status", "")).upper()
+                if current in _WO_TERMINAL and target_status != "ACTIVE":
+                    return False  # Already terminal — don't overwrite
+                data["status"] = target_status
+                data["updated"] = _now()
+                if error:
+                    data["error"] = str(error)
+                    data["blocked_reason"] = str(error)
+                elif clear_error:
+                    data.pop("error", None)
+                    data.pop("blocked_reason", None)
+                from validators.kernel.io import durable_write_yaml
+                durable_write_yaml(wo_file, data, default_flow_style=False)
+            except Exception:
+                return False
+
+        # Also keep INDEX.yaml synchronized if present
+        index_file = ws / ".sync" / "work-orders" / "INDEX.yaml"
+        if index_file.is_file():
+            try:
+                idx_data = yaml.safe_load(index_file.read_text(encoding="utf-8")) or {}
+                orders = idx_data.get("orders", [])
+                for o in orders:
+                    if isinstance(o, dict) and o.get("id") == wo_id:
+                        o["status"] = target_status
+                        o["file"] = f"work-orders/ACTIVE/{wo_id}.yaml"
+                        o["updated"] = data["updated"]
+                idx_data["total_active"] = sum(
+                    1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
+                )
+                idx_data["total_completed"] = sum(
+                    1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "COMPLETED"
+                )
+                idx_data["total_blocked"] = sum(
+                    1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "BLOCKED"
+                )
+                idx_data["last_updated"] = data["updated"]
+                durable_write_yaml(index_file, idx_data)
+                tree_file = ws / ".sync" / "runtime" / "TREE.yaml"
+                try:
+                    from cli.init import ensure_canonical_tree
+                    tree_data = ensure_canonical_tree(ws)
+                    if "work_orders" in tree_data and isinstance(tree_data["work_orders"], dict):
+                        tree_data["work_orders"]["total_active"] = idx_data.get("total_active", 0)
+                        tree_data["work_orders"]["total_completed"] = idx_data.get("total_completed", 0)
+                        tree_data["work_orders"]["total_blocked"] = idx_data.get("total_blocked", 0)
+                        durable_write_yaml(tree_file, tree_data)
                 except Exception:
                     pass
-            return True
-        except Exception:
-            return False
+            except Exception:
+                pass
+        return True
 
     def _finalize_in_flight_work_orders(
         self, state: RunState, target_status: str,
@@ -5895,6 +6364,8 @@ class LifecycleSupervisor:
             and op.get("operation_id") != state.integration_operation_id
             and op.get("operation_id") != state.batch_operation_id
             and op.get("operation_id") != getattr(state, "dependency_escalation_op_id", None)
+            and op.get("operation_id") not in set(getattr(state, "qa_review_operations", {}).values())
+            and op.get("operation_id") != getattr(state, "final_review_operation_id", None)
             and not (
                 expected_agent != "claude"
                 and (
@@ -6328,6 +6799,176 @@ class LifecycleSupervisor:
                 if "NEEDS_CHANGES" in text.upper() or "NEEDS CHANGES" in text.upper():
                     return text.strip()
         return ""
+
+    # ── Mandatory QA review gate ──────────────────────────────────────
+
+    def _qa_review_prompt(self, state: RunState, ws: Path, wo_id: str) -> str:
+        """Dispatch prompt for an independent QA review of one deliverable."""
+        from validators.harness import review_gate
+
+        data = review_gate.load_wo(ws, wo_id)
+        deliverables = review_gate.wo_deliverable_paths(data)
+        criteria = data.get("acceptance_criteria") or data.get("test_plan") or []
+        criteria_text = (
+            "\n".join(f"- {c}" for c in criteria)
+            or "- (derive from the approved PLAN.md scope and contract)"
+        )
+        deliv_text = "\n".join(f"- {p}" for p in deliverables) or "- (no declared deliverable)"
+        current_hash = review_gate.subject_hash(ws, wo_id)
+        verdict_path = review_gate.qa_verdict_path(ws, wo_id)
+        try:
+            rel_verdict = verdict_path.relative_to(ws).as_posix()
+        except Exception:
+            rel_verdict = str(verdict_path)
+        attempt = state.qa_review_attempts.get(wo_id, 0)
+        budget = state.max_qa_reworks
+
+        return (
+            f"Mandatory QA review for work order {wo_id}.\n\n"
+            "The worker declared completion, but completion claims are not evidence. "
+            "Independently verify the deliverables against the approved plan, the "
+            "work-order acceptance criteria "
+            f"and the contract:\n{deliv_text}\n\n"
+            f"Acceptance criteria:\n{criteria_text}\n\n"
+            "Required checks (use the real tools, do not infer):\n"
+            "1. Read the deliverable files and confirm they implement the declared behaviour.\n"
+            "2. Run the relevant test suite with run_tests; run the build/static check when the "
+            "project defines one.\n"
+            "3. Confirm error handling, input validation and integration points required "
+            "by the plan.\n"
+            "4. Treat an unavailable tool or missing test as an explicit limitation, "
+            "never as a pass.\n\n"
+            f"Then persist the structured verdict as JSON to `${rel_verdict}` using write_file. "
+            "The verdict MUST be exactly this shape:\n"
+            "{\n"
+            f'  "schema": "{review_gate.QA_VERDICT_SCHEMA}",\n'
+            f'  "work_order_id": "{wo_id}",\n'
+            f'  "revision": {attempt + 1},\n'
+            '  "reviewer": "gemma",\n'
+            '  "reviewer_role": "qa",\n'
+            f'  "timestamp": "<ISO-8601 UTC>",\n'
+            '  "verdict": "PASS" | "FAIL",\n'
+            f'  "subject_hash": "{current_hash}",\n'
+            '  "criteria": [{"id": "...", "description": "...", '
+            '"outcome": "PASS|FAIL", "evidence": "..."}],\n'
+            '  "evidence": [{"kind": "test|build|inspection", "command": "...", '
+            '"result": "...", "passed": true}],\n'
+            '  "findings": [{"severity": "critical|major|minor", '
+            '"detail": "...", "reproduce": "..."}],\n'
+            '  "required_actions": ["..."],\n'
+            f'  "rework_attempt": {attempt},\n'
+            f'  "rework_budget": {budget}\n'
+            "}\n\n"
+            "Rules: if any mandatory check fails, set verdict FAIL, list reproducible "
+            "findings and the corrective actions the owning worker must perform. Do NOT "
+            "modify application code or the work-order state; you are an independent "
+            "reviewer. Do not claim PASS without test/build "
+            "evidence. Finish your turn by declaring status 'completed' after writing the verdict."
+        )
+
+    def _handle_qa_gate_pending(
+        self,
+        state: RunState,
+        ws: Path,
+        wo_id: str,
+        decision: Any,
+    ) -> AdvanceResult | None:
+        """Drive the QA gate for one work order. Returns a result only when the
+        whole run must stop; ``None`` means keep executing on the next tick."""
+        from validators.harness import review_gate
+
+        op_id = state.qa_review_operations.get(wo_id)
+        if op_id:
+            op = self._get_operation(op_id)
+            if op is not None and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                return None  # review in flight
+            state.qa_review_operations.pop(wo_id, None)
+            # Re-evaluate: a terminal review must have produced a verdict.
+            decision = review_gate.evaluate_qa_gate(ws, wo_id)
+            if decision.passed:
+                return None
+            if decision.verdict is None:
+                state.qa_review_attempts[wo_id] = state.qa_review_attempts.get(wo_id, 0) + 1
+                if state.qa_review_attempts[wo_id] >= state.max_qa_review_attempts:
+                    state.error = (
+                        f"QA review for {wo_id} produced no verdict after "
+                        f"{state.qa_review_attempts[wo_id]} attempt(s): {decision.detail}"
+                    )
+                    state.exit_code = 3
+                    self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+                    self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                    return AdvanceResult.TRANSITIONED
+
+        verdict = decision.verdict
+        stale = "stale" in str(decision.detail or "")
+        if verdict is not None and (stale or str(verdict.get("verdict", "")).upper() == "FAIL"):
+            # A failed or stale verdict can never authorise acceptance: archive it
+            # so repair is followed by a genuinely fresh review.
+            review_gate.archive_qa_verdict(
+                ws, wo_id, suffix="stale" if stale else "rejected"
+            )
+            if not stale:
+                reworks = state.qa_reworks.get(wo_id, 0)
+                if reworks >= state.max_qa_reworks:
+                    state.error = (
+                        f"Work order {wo_id} exceeded QA rework limit "
+                        f"({reworks}/{state.max_qa_reworks}); findings: "
+                        + "; ".join(decision.findings or (decision.detail or "",))
+                    )
+                    state.exit_code = 3
+                    self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+                    self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                    return AdvanceResult.TRANSITIONED
+                state.qa_reworks[wo_id] = reworks + 1
+                correction = "\n".join(f"- {a}" for a in decision.required_actions)
+                findings = "\n".join(f"- {f}" for f in decision.findings)
+
+                def _qa_rework_prompt(n: int, agent: str) -> str:
+                    return (
+                        f"Rework work order {wo_id} after mandatory QA review (attempt {n}).\n"
+                        f"QA findings:\n"
+                        f"{findings or '- deliverable did not satisfy the acceptance criteria'}\n"
+                        + (f"Required corrective actions:\n{correction}\n" if correction else "")
+                        + "Restrict your changes to the identified defects. When you finish, the "
+                        "deliverable must be re-verified and re-reviewed by QA before it "
+                        "can be accepted."
+                    )
+
+                if wo_id in state.completed_wo_ids:
+                    state.completed_wo_ids.remove(wo_id)
+                if self._retry_worker(state, ws, wo_id, _qa_rework_prompt):
+                    return None
+
+        # No usable verdict yet → dispatch an independent QA review turn.
+        state.qa_review_attempts[wo_id] = state.qa_review_attempts.get(wo_id, 0) + 1
+        if state.qa_review_attempts[wo_id] > state.max_qa_review_attempts + state.max_qa_reworks:
+            state.error = f"QA review for {wo_id} exhausted its bounded review attempts"
+            state.exit_code = 3
+            self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+            self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            return AdvanceResult.TRANSITIONED
+        try:
+            # No work_order_id: the reviewer runs under the QA agent contract
+            # (.sync/agents/gemma.contract.yaml), never under the reviewed
+            # work order's contract. The worker therefore cannot inherit the
+            # QA write channel and self-approve.
+            op = self.manager.start_turn(
+                state.session_id,
+                self._qa_review_prompt(state, ws, wo_id),
+                role="qa",
+                agent_id="gemma",
+                parent_operation_id=state.batch_operation_id,
+            )
+            op_id = op.get("operation_id") if isinstance(op, dict) else None
+            if op_id:
+                state.qa_review_operations[wo_id] = str(op_id)
+            state.error = None
+        except OperationContentionError:
+            return None
+        except Exception as exc:
+            state.error = f"QA review dispatch failed for {wo_id}: {exc}"
+            state.blocked_wo_ids.append(wo_id) if wo_id not in state.blocked_wo_ids else None
+        return None
 
     def _find_gitops_wo(self, ws: Path, state: RunState) -> str | None:
         """Find a GitOps work order from disk."""

@@ -281,7 +281,7 @@ def is_local_module(
             # Check sibling directory and parent directories up to project root
             search_dirs.append(current_file_path.parent)
             curr = current_file_path.parent
-            while curr and curr != project_root and curr != base:
+            while curr and curr != project_root and curr != base and curr.parent != curr:
                 search_dirs.append(curr)
                 curr = curr.parent
             try:
@@ -486,6 +486,24 @@ def read_project_dependencies(
                 declared.update(parse_setup_cfg_dependencies(content))
             except OSError:
                 pass
+
+        # 4. Project-local virtual environments (.venv, venv, env)
+        for venv_name in (".venv", "venv", "env"):
+            venv_dir = root / venv_name
+            if venv_dir.is_dir():
+                site_pkgs: list[Path] = []
+                win_sp = venv_dir / "Lib" / "site-packages"
+                if win_sp.is_dir():
+                    site_pkgs.append(win_sp)
+                for unix_sp in venv_dir.glob("lib/python*/site-packages"):
+                    if unix_sp.is_dir():
+                        site_pkgs.append(unix_sp)
+                for sp in site_pkgs:
+                    for dist_info in sp.glob("*.dist-info"):
+                        d_name = dist_info.name.split("-")[0]
+                        if d_name:
+                            manifest_found = True
+                            declared.add(normalize_distribution_name(d_name))
 
     return declared, manifest_found
 

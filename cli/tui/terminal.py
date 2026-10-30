@@ -688,12 +688,15 @@ def redraw_full_screen(
             # survive to the right of them. Custom streams (tests/capture)
             # receive the unpadded frame for byte-exact assertions.
             payload = _pad_frame_to_width(frame, cols) if stream is None else frame
-            if not include_composer:
-                # Leave the cursor on the row where the raw prompt editor will
-                # draw its input line.
-                target.write(f"{prefix}{payload}\n")
-            else:
-                target.write(f"{prefix}{payload}")
+            full_frame = f"{prefix}{payload}\n" if not include_composer else f"{prefix}{payload}"
+            try:
+                target.write(full_frame)
+            except UnicodeEncodeError:
+                if hasattr(target, "buffer"):
+                    target.buffer.write(full_frame.encode("utf-8", errors="replace"))
+                else:
+                    enc = getattr(target, "encoding", None) or "utf-8"
+                    target.write(full_frame.encode(enc, errors="replace").decode(enc, errors="replace"))
             target.flush()
     except Exception:
         pass

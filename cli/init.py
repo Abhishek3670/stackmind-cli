@@ -360,18 +360,20 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                     tmp_idx.write_text(yaml.safe_dump(idx_data, sort_keys=False), encoding="utf-8")
                     tmp_idx.replace(idx_file)
 
-        # 5. Mirror bundled schemas into .sync/schemas/ directory (not workspace root)
+        # 5. Mirror bundled schemas into .sync/schemas/ and workspace schemas/ directories
         sync_schemas_dir = sync_path / "schemas"
-        sync_schemas_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            bundled_schemas = Path(__file__).resolve().parents[1] / "schemas"
-            if bundled_schemas.is_dir():
-                for s_file in bundled_schemas.glob("*.json"):
-                    dest_file = sync_schemas_dir / s_file.name
-                    if not dest_file.exists():
-                        shutil.copy2(s_file, dest_file)
-        except Exception:
-            pass
+        ws_schemas_dir = ws_path / "schemas"
+        for s_target_dir in (sync_schemas_dir, ws_schemas_dir):
+            s_target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                bundled_schemas = Path(__file__).resolve().parents[1] / "schemas"
+                if bundled_schemas.is_dir():
+                    for s_file in bundled_schemas.glob("*.json"):
+                        dest_file = s_target_dir / s_file.name
+                        if not dest_file.exists():
+                            shutil.copy2(s_file, dest_file)
+            except Exception:
+                pass
 
         # 6. Ensure canonical runtime/TREE.yaml exists and complies with tree schema
         ensure_canonical_tree(ws_path)

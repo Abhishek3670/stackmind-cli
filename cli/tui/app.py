@@ -303,6 +303,16 @@ def tui(
     target_session_id: str | None = None,
 ) -> None:
     """Start the governed Python-native terminal control plane."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     temporary_state: tempfile.TemporaryDirectory[str] | None = None
     daemon: LocalDaemon | None = None
     is_attached = daemon_url is not None
@@ -367,6 +377,7 @@ def tui(
             project_name=workspace.resolve().name,
             session_id=session["session_id"],
             work_orders=[],
+            workspace=workspace.resolve(),
         )
         state.client_timeout = client_timeout
         state.update_from_session(session)
@@ -471,6 +482,26 @@ def tui(
                             composer_content=getattr(state, "composer_buffer", ""),
                             live_manager=live_ws,
                         )
+                pending_input = getattr(state, "pending_submitted_input", None)
+                if pending_input is not None:
+                    state.pending_submitted_input = None
+                    session.pop("active_operation", None)
+                    state.scroll_conversation_to_bottom()
+                    session, should_exit = dispatch_delivery_command(
+                        adapter,
+                        client,
+                        session,
+                        pending_input,
+                        state,
+                        client_timeout=effective_timeout,
+                        live_manager=live_ws,
+                    )
+                    if should_exit:
+                        if live_ws is not None:
+                            live_ws.stop()
+                        break
+                    continue
+
                 term_cols = current_cols
                 layout_info = compute_layout(term_cols, state=state)
                 conv_width = (
@@ -910,9 +941,13 @@ def tui(
                                     session.update(fresh_sess)
                                     active_op_cand = fresh_sess.get("active_operation")
                                     if active_op_cand:
-                                        if editor is not None and hasattr(editor, "buffer"):
-                                            preserve_composer_buffer(state, "".join(editor.buffer))
-                                        raise _ActiveOperationDetected(active_op_cand)
+                                        if editor is not None and hasattr(editor, "buffer") and editor.buffer:
+                                            # User is actively typing into the composer! Do not pause/interrupt the text box
+                                            pass
+                                        else:
+                                            if editor is not None and hasattr(editor, "buffer"):
+                                                preserve_composer_buffer(state, "".join(editor.buffer))
+                                            raise _ActiveOperationDetected(active_op_cand)
                             except _ActiveOperationDetected:
                                 raise
                             except Exception:

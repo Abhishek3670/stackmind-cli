@@ -29,4 +29,5 @@ daemon-state.json
 PHASE*.md
 STREAMING*.md
 THINKING*.md
-test-memory-project
+test-memory-project/
+workspace/

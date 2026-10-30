@@ -20,19 +20,52 @@ from typing import Any, Sequence
 DEFAULT_IGNORED_PATTERNS = frozenset({
     ".git",
     ".sync",
+    ".venv",
+    "venv",
+    "env",
     "__pycache__",
     ".pytest_cache",
     ".ruff_cache",
+    ".mypy_cache",
     ".coverage",
     ".vscode",
     ".windsurf",
     ".claude",
+    ".idea",
     "node_modules",
     ".next",
     ".turbo",
     "dist",
     "build",
+    ".cache",
+    "cache",
+    "dataset",
+    "datasets",
+    "checkpoints",
+    "weights",
+    "runs",
 })
+
+HEAVY_BINARY_EXTS = frozenset({
+    ".pt", ".pth", ".bin", ".onnx", ".safetensors", ".h5", ".hdf5", ".ckpt", ".tflite", ".weights", ".pb",
+    ".tar", ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".iso",
+    ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
+    ".mp3", ".wav", ".flac", ".ogg",
+    ".parquet", ".arrow", ".feather",
+})
+
+
+def _is_dataset_dir(p: Path) -> bool:
+    name_l = p.name.lower()
+    if any(k in name_l for k in ("dataset", "detection", "sentinel")):
+        return True
+    if (p / "data.yaml").is_file():
+        return True
+    if (p / "images").is_dir() and (p / "labels").is_dir():
+        return True
+    if any((p / sub).is_dir() for sub in ("train", "valid", "val", "test")):
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -131,7 +164,9 @@ class WorkspaceSnapshot:
             # Prune ignored directories
             dirnames[:] = [
                 d for d in dirnames
-                if d not in ignored and not any((rel_dir + "/" + d).startswith(p) for p in ignored)
+                if d not in ignored
+                and not any((rel_dir + "/" + d).startswith(p) for p in ignored)
+                and not _is_dataset_dir(Path(dirpath) / d)
             ]
 
             if rel_dir != "." and (rel_dir in ignored or any(rel_dir.startswith(p) for p in ignored)):
@@ -141,6 +176,8 @@ class WorkspaceSnapshot:
                 if fname in ignored:
                     continue
                 file_full_path = Path(dirpath) / fname
+                if file_full_path.suffix.lower() in HEAVY_BINARY_EXTS:
+                    continue
                 rel_file_path = file_full_path.relative_to(root_path).as_posix()
 
                 if scope_paths and not any(
@@ -150,6 +187,8 @@ class WorkspaceSnapshot:
 
                 try:
                     stat = file_full_path.stat()
+                    if stat.st_size > 5 * 1024 * 1024:
+                        continue
                     content = file_full_path.read_bytes()
                     content_hash = hashlib.sha256(content).hexdigest()
                     files[rel_file_path] = FileSnapshot(

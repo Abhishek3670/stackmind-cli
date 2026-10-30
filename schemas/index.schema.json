@@ -33,9 +33,7 @@
         "required": [
           "id",
           "title",
-          "status",
-          "priority",
-          "dependencies"
+          "status"
         ],
         "properties": {
           "id": {
