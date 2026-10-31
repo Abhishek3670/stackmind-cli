@@ -625,6 +625,10 @@ class AutonomousDeliveryState:
         self.seen_message_keys: set[tuple[str, str]] = set()
         self.seen_harness_reports: set[str] = set()
         self.connection_status: str = "online"  # "online", "reconnecting", "offline"
+        # SDP-FIX-009A-HF1: typed cancellation outcomes per operation. The
+        # authoritative OperationNode.status is preserved untouched when the
+        # cancellation channel fails; this map records what is actually known.
+        self.cancel_outcomes: dict[str, dict[str, Any]] = {}
         self.govern_verbosity: str = "tree"  # "tree" | "flat" | "compact"
         self.current_turn_actions: ActionsGroup = ActionsGroup(active=False, verbosity=self.govern_verbosity)
         self.current_turn_thinking: str = ""

@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -110,6 +111,326 @@ from cli.tui.views import (
 from validators.kernel.tui import DaemonClient, StackMindTuiAdapter
 
 
+# ---------------------------------------------------------------------------
+# SDP-FIX-009A-HF1 — authoritative cancellation outcome semantics.
+#
+# A failed or timed-out cancellation request is a communication failure. It is
+# NOT evidence that the operation failed, stopped, or succeeded. The operation's
+# authoritative status is therefore preserved (or refreshed from the daemon);
+# the cancellation result is recorded as a separate typed outcome.
+# ---------------------------------------------------------------------------
+CANCEL_REQUESTED = "CANCEL_REQUESTED"
+CANCEL_OUTCOME_UNKNOWN = "CANCEL_OUTCOME_UNKNOWN"
+
+# Daemon-confirmed terminal operation states.
+_AUTHORITATIVE_TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"})
+# Daemon-confirmed non-terminal states.
+_AUTHORITATIVE_RUNNING_STATUSES = frozenset({"RUNNING", "ACTIVE", "IN_PROGRESS", "PENDING"})
+# Outcomes that mean the operator must reconcile before dispatching a new turn.
+_UNRESOLVED_CANCEL_OUTCOMES = frozenset({CANCEL_REQUESTED, CANCEL_OUTCOME_UNKNOWN, "RUNNING"})
+
+
+@dataclass(frozen=True)
+class CancellationOutcome:
+    """Typed result of one cancellation attempt.
+
+    ``outcome`` describes the *cancellation*, while ``authoritative_status``
+    carries the last daemon-confirmed operation status. They are deliberately
+    separate so a communication failure can never fabricate a FAILED operation.
+    """
+
+    operation_id: str
+    outcome: str
+    authoritative_status: str | None = None
+    accepted: bool = False
+    confirmed: bool = False
+    reconciled: bool = False
+    error: str | None = None
+
+    @property
+    def unresolved(self) -> bool:
+        return self.outcome in _UNRESOLVED_CANCEL_OUTCOMES
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "outcome": self.outcome,
+            "authoritative_status": self.authoritative_status,
+            "accepted": self.accepted,
+            "confirmed": self.confirmed,
+            "reconciled": self.reconciled,
+            "error": self.error,
+        }
+
+
+def _extract_operation_status(record: Any) -> str | None:
+    """Read a status from a daemon operation record (flat or nested), if any."""
+    if not isinstance(record, Mapping):
+        return None
+    raw = record.get("status")
+    if raw is None and isinstance(record.get("operation"), Mapping):
+        raw = record["operation"].get("status")
+    if raw is None:
+        return None
+    status = str(raw).upper().strip()
+    return status or None
+
+
+def _classify_cancel_status(status: str | None) -> str | None:
+    """Map a daemon status onto the cancellation outcome vocabulary."""
+    if not status:
+        return None
+    s = str(status).upper().strip()
+    if s in ("CANCELLED", "CANCELED"):
+        return "CANCELLED"
+    if s == CANCEL_REQUESTED:
+        return CANCEL_REQUESTED
+    if s in _AUTHORITATIVE_TERMINAL_STATUSES:
+        return s
+    if s in _AUTHORITATIVE_RUNNING_STATUSES:
+        return "RUNNING"
+    return None
+
+
+def _reconcile_operation_record(client: Any, operation_id: str) -> Any:
+    """Query the daemon for the authoritative operation record (or None)."""
+    if not operation_id or operation_id == "turn":
+        return None
+    if not hasattr(client, "operation_get"):
+        return None
+    try:
+        record = client.operation_get(operation_id)
+    except Exception:
+        return None
+    return record if isinstance(record, Mapping) else None
+
+
+def resolve_cancellation_outcome(
+    client: Any,
+    state: AutonomousDeliveryState,
+    operation_id: str | None,
+    *,
+    cancel_resp: Any = None,
+    cancel_err: BaseException | None = None,
+) -> CancellationOutcome:
+    """Resolve what is actually known about a cancellation attempt.
+
+    Rules:
+    - A communication failure never implies operation failure. The daemon is
+      queried; if that also fails the outcome is CANCEL_OUTCOME_UNKNOWN and the
+      last authoritative operation status is preserved.
+    - CANCELLED / COMPLETED / FAILED are only reported when the daemon says so.
+    - An accepted request is reported as CANCEL_REQUESTED, never CANCELLED.
+    """
+    op_key = str(operation_id or "turn")
+    node = state.operations.get(op_key)
+    last_authoritative = None
+    if node is not None:
+        last_authoritative = str(getattr(node, "status", "") or "").upper().strip() or None
+
+    def _outcome(
+        classified: str,
+        status: str | None,
+        *,
+        accepted: bool,
+        confirmed: bool,
+        reconciled: bool,
+        error: str | None = None,
+    ) -> CancellationOutcome:
+        return CancellationOutcome(
+            operation_id=op_key,
+            outcome=classified,
+            authoritative_status=status,
+            accepted=accepted,
+            confirmed=confirmed,
+            reconciled=reconciled,
+            error=error,
+        )
+
+    # 1. The cancellation channel failed. Never infer operation failure.
+    if cancel_err is not None:
+        record = _reconcile_operation_record(client, op_key)
+        rec_status = _extract_operation_status(record)
+        classified = _classify_cancel_status(rec_status)
+        if classified:
+            return _outcome(
+                classified,
+                rec_status,
+                accepted=classified == CANCEL_REQUESTED,
+                confirmed=classified in _AUTHORITATIVE_TERMINAL_STATUSES,
+                reconciled=True,
+                error=str(cancel_err),
+            )
+        return _outcome(
+            CANCEL_OUTCOME_UNKNOWN,
+            last_authoritative,
+            accepted=False,
+            confirmed=False,
+            reconciled=False,
+            error=str(cancel_err),
+        )
+
+    # 2. The daemon answered the cancellation request.
+    resp_status = _extract_operation_status(cancel_resp)
+    classified = _classify_cancel_status(resp_status)
+    if classified in _AUTHORITATIVE_TERMINAL_STATUSES:
+        return _outcome(
+            classified, resp_status, accepted=True, confirmed=True, reconciled=False
+        )
+    if classified == CANCEL_REQUESTED:
+        return _outcome(
+            CANCEL_REQUESTED,
+            resp_status or last_authoritative,
+            accepted=True,
+            confirmed=False,
+            reconciled=False,
+        )
+    if classified == "RUNNING":
+        # Daemon confirms the operation is still running: preserve RUNNING.
+        return _outcome(
+            "RUNNING", resp_status, accepted=False, confirmed=False, reconciled=False
+        )
+
+    # 3. Ambiguous or empty acknowledgement. Reconcile; never claim success.
+    record = _reconcile_operation_record(client, op_key)
+    rec_status = _extract_operation_status(record)
+    understood = _classify_cancel_status(rec_status)
+    if understood:
+        return _outcome(
+            understood,
+            rec_status,
+            accepted=understood == CANCEL_REQUESTED,
+            confirmed=understood in _AUTHORITATIVE_TERMINAL_STATUSES,
+            reconciled=True,
+        )
+    return _outcome(
+        CANCEL_OUTCOME_UNKNOWN,
+        last_authoritative,
+        accepted=False,
+        confirmed=False,
+        reconciled=False,
+    )
+
+
+def apply_cancellation_outcome(
+    state: AutonomousDeliveryState, outcome: CancellationOutcome
+) -> None:
+    """Record a typed cancellation outcome without fabricating terminal state."""
+    if not hasattr(state, "cancel_outcomes"):
+        state.cancel_outcomes = {}
+    state.cancel_outcomes[outcome.operation_id] = outcome.to_dict()
+
+    node = state.operations.get(outcome.operation_id)
+    if outcome.outcome in _AUTHORITATIVE_TERMINAL_STATUSES:
+        # Only daemon-confirmed terminal states are applied.
+        if node is not None:
+            node.status = outcome.outcome
+        for role_obj in state.roles.values():
+            if str(getattr(role_obj, "state", "")).upper() in {"RUNNING", "ACTIVE"}:
+                role_obj.state = outcome.outcome
+        return
+
+    if outcome.outcome == CANCEL_REQUESTED:
+        if node is not None:
+            node.status = CANCEL_REQUESTED
+        for role_obj in state.roles.values():
+            if str(getattr(role_obj, "state", "")).upper() in {"RUNNING", "ACTIVE"}:
+                role_obj.state = CANCEL_REQUESTED
+        return
+
+    # RUNNING / CANCEL_OUTCOME_UNKNOWN: preserve the last authoritative state.
+    if node is not None and outcome.authoritative_status:
+        node.status = outcome.authoritative_status
+
+
+def cancellation_message(outcome: CancellationOutcome) -> str:
+    """Operator-facing message that never overstates what is known."""
+    op = outcome.operation_id
+    state_txt = outcome.authoritative_status or "unknown"
+    if outcome.outcome == "CANCELLED":
+        return f"Turn operation {op} cancelled by operator (Ctrl+C)."
+    if outcome.outcome == CANCEL_REQUESTED:
+        return (
+            f"Cancellation requested for operation {op} (Ctrl+C). "
+            f"Awaiting authoritative daemon termination..."
+        )
+    if outcome.outcome == "FAILED":
+        reason = f" Reason: {outcome.error}" if outcome.error else ""
+        return f"Daemon confirmed execution failure for operation {op}.{reason}"
+    if outcome.outcome == "COMPLETED":
+        return (
+            f"Operation {op} completed before cancellation was processed; "
+            f"the completed result is preserved."
+        )
+    if outcome.outcome == "BLOCKED":
+        return f"Daemon reports operation {op} is BLOCKED; no cancellation applied."
+    if outcome.outcome == "RUNNING":
+        return (
+            f"Cancellation was not confirmed: operation {op} is still RUNNING on the "
+            f"daemon. Reconcile with :status before dispatching a new turn."
+        )
+    detail = f" ({outcome.error})" if outcome.error else ""
+    return (
+        f"Cancellation outcome unknown for operation {op}{detail}. "
+        f"Last authoritative state preserved as {state_txt}; the operation may still "
+        f"be active. Reconcile with the daemon before dispatching a new turn."
+    )
+
+
+def reconcile_pending_cancellations(
+    client: Any, state: AutonomousDeliveryState
+) -> list[CancellationOutcome]:
+    """Reconcile unresolved cancellation outcomes against the daemon.
+
+    Used on reconnect/restart and before a new turn is dispatched, so recovery
+    reconstructs the authoritative state instead of trusting client memory.
+    """
+    resolved: list[CancellationOutcome] = []
+    for op_key, record in list(getattr(state, "cancel_outcomes", {}).items()):
+        if not isinstance(record, Mapping):
+            continue
+        if record.get("outcome") not in _UNRESOLVED_CANCEL_OUTCOMES:
+            continue
+        previous_outcome = str(record.get("outcome") or "")
+        previous_status = record.get("authoritative_status")
+        outcome = resolve_cancellation_outcome(client, state, op_key)
+        if (
+            not outcome.reconciled
+            and previous_outcome == CANCEL_REQUESTED
+            and outcome.outcome == CANCEL_OUTCOME_UNKNOWN
+        ):
+            # The daemon accepted the request earlier; an unreachable daemon is
+            # not evidence that the acknowledgement was lost. Preserve it.
+            outcome = CancellationOutcome(
+                operation_id=outcome.operation_id,
+                outcome=CANCEL_REQUESTED,
+                authoritative_status=previous_status or CANCEL_REQUESTED,
+                accepted=True,
+                confirmed=False,
+                reconciled=False,
+                error=outcome.error,
+            )
+        apply_cancellation_outcome(state, outcome)
+        resolved.append(outcome)
+    return resolved
+
+
+def unresolved_cancellation_operations(state: AutonomousDeliveryState) -> list[str]:
+    """Operations whose cancellation outcome is still unresolved."""
+    pending: list[str] = []
+    for op_key, record in getattr(state, "cancel_outcomes", {}).items():
+        if not isinstance(record, Mapping):
+            continue
+        if record.get("outcome") not in _UNRESOLVED_CANCEL_OUTCOMES:
+            continue
+        node = state.operations.get(op_key)
+        node_status = str(getattr(node, "status", "") or "").upper()
+        if node_status in _AUTHORITATIVE_TERMINAL_STATUSES:
+            continue  # daemon already resolved it; a new turn is safe
+        pending.append(op_key)
+    return pending
+
+
 def reconnect_and_sync(
     client: DaemonClient,
     adapter: StackMindTuiAdapter,
@@ -133,6 +454,12 @@ def reconnect_and_sync(
         if sid:
             missed = client.events(sid, after=state.last_sequence)
             recover_transcript_from_events(missed, state, workspace=workspace)
+        # Restart/reconnect recovery: reconcile cancellations that were left
+        # unresolved when the client lost the daemon.
+        try:
+            reconcile_pending_cancellations(client, state)
+        except Exception:
+            pass
         return True, missed
     except Exception:
         state.connection_status = "offline"
@@ -1153,29 +1480,36 @@ def _stream_turn_execution(
                 except Exception:
                     pass
     except KeyboardInterrupt:
+        cancel_resp = None
+        cancel_err = None
         try:
             if op_id and op_id != "turn" and hasattr(client, "operation_cancel"):
-                client.operation_cancel(op_id, cascade=True)
+                cancel_resp = client.operation_cancel(op_id, cascade=True)
             elif hasattr(client, "cancel"):
-                client.cancel(session["session_id"])
-        except Exception:
+                cancel_resp = client.cancel(session["session_id"])
+        except Exception as e:
+            cancel_err = e
+            # Best-effort fallback over the adapter transport. Its result is not
+            # authoritative either; the typed outcome below still reconciles.
             try:
                 adapter.command(f":cancel {op_id}", session_id=session["session_id"])
             except Exception:
                 pass
 
-        if op_id in state.operations:
-            state.operations[op_id].status = "CANCELLED"
-        for role_obj in state.roles.values():
-            if getattr(role_obj, "state", "").upper() in {"RUNNING", "ACTIVE"}:
-                role_obj.state = "CANCELLED"
-        state.add_activity("User", "interrupted turn", op_id)
+        # Communication failure is not operation failure: resolve what the daemon
+        # actually reports and preserve the authoritative operation state.
+        outcome = resolve_cancellation_outcome(
+            client, state, op_id, cancel_resp=cancel_resp, cancel_err=cancel_err
+        )
+        apply_cancellation_outcome(state, outcome)
+        state.add_activity("User", "interrupted turn", f"{op_id} [{outcome.outcome}]")
 
         if streaming_active and not is_tty:
             click.echo("")
 
         state.active_working_status = None
-        cancel_msg = f"Turn operation {op_id} cancelled by operator (Ctrl+C)."
+        cancel_msg = cancellation_message(outcome)
+
         turn_acts = state.current_turn_actions
         state.add_message("assistant", cancel_msg, actions=turn_acts)
         if is_tty:
@@ -1188,15 +1522,25 @@ def _stream_turn_execution(
                 live_manager=live_manager,
             )
         else:
-            click.echo(
-                render_error_box_str(
-                    cancel_msg,
-                    title="TURN INTERRUPTED",
-                    hint="In-flight turn operation was cancelled. Daemon process remains running.",
+            try:
+                click.echo(
+                    render_error_box_str(
+                        cancel_msg,
+                        title="TURN INTERRUPTED",
+                        hint="In-flight turn operation cancellation was processed. Daemon process remains running.",
+                    )
                 )
-            )
+            except Exception:
+                try:
+                    click.echo(f"[{cancel_msg}]")
+                except Exception:
+                    pass
         if hasattr(state, "current_turn_actions") and state.current_turn_actions:
             state.current_turn_actions.complete_all()
+        if outcome.unresolved:
+            # The original operation may still be active; never let a follow-up
+            # action reuse it as if it had terminated.
+            state.active_working_status = None
         if live_manager is not None and not getattr(live_manager, "is_active", False):
             live_manager.start(include_composer=False)
         restore_composer_focus(state)
@@ -2931,6 +3275,25 @@ def dispatch_delivery_command(
     else:
         prompt_text = normalized
         placeholder = "Generating response... (Ctrl+C to cancel)"
+
+    # SDP-FIX-009A-HF1: never dispatch a duplicate operation while a prior
+    # cancellation outcome is unresolved. Reconcile first, then refuse if the
+    # original may still be running.
+    pending_cancels = unresolved_cancellation_operations(state)
+    if pending_cancels:
+        reconcile_pending_cancellations(client, state)
+        pending_cancels = unresolved_cancellation_operations(state)
+    if pending_cancels:
+        pending_msg = (
+            "[CANCEL PENDING] Unresolved cancellation outcome for operation(s) "
+            f"{', '.join(pending_cancels)}. The original operation may still be active; "
+            "no duplicate turn was dispatched. Reconcile with the daemon and retry."
+        )
+        state.add_message("system", pending_msg)
+        if not is_tty:
+            click.echo(pending_msg)
+        return session, False
+
     state.add_message("user", prompt_text)
     # Redraw at prompt submission time; reuse is_tty from top of function
     if is_tty:

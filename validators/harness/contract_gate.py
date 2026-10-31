@@ -15,6 +15,10 @@ from validators.knowledge.contract import (
     module_matches,
 )
 from validators.knowledge.api import KnowledgeAPI, ContextBundle
+from validators.harness.authoring_role import (
+    architecture_contract_repair_exempt,
+    is_sync_deny_pattern,
+)
 
 # Stable failure codes for governed post-execution blocks.  These codes travel
 # in the durable evidence packet and drive the supervisor's recovery routing.
@@ -337,6 +341,14 @@ def verify_post_execution(
                 p_norm = pattern.replace("\\", "/")
                 if p_norm.startswith("./"):
                     p_norm = p_norm[2:]
+                # SDP-FIX-009A-HF1: the `.sync/**` deny exemption requires trusted
+                # Architecture role authorization, an authorized contract-repair
+                # task with supervisor provenance, and an exact `.sync/contracts/`
+                # path. Authoring flags and agent-name strings are never enough.
+                if is_sync_deny_pattern(p_norm) and architecture_contract_repair_exempt(
+                    project_path, agent, task, contract, norm_fp
+                ):
+                    continue
                 if (
                     module_matches(mod, pattern)
                     or fnmatch.fnmatch(norm_fp, p_norm)
