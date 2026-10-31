@@ -19,6 +19,13 @@ import yaml
 
 from validators.clock import now as _now
 
+from .attempts import (
+    BudgetKey,
+    FailureClass,
+    RetryContext,
+    RetryOutcome,
+    evaluate_retry_budget,
+)
 from .models import (
     _OPERATION_TERMINAL,
     TRANSIENT_RETRYABLE_CODES,
@@ -114,7 +121,7 @@ class _RecoveryMixin:
                     state.architect_repair_operation_id = None
                     state.authoring_repair_attempts = 0
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
-                    self._transition(state, Phase.EXECUTING)
+                    self._transition(state, Phase.EXECUTING, authorized_override=True)
                     return AdvanceResult.WAITING_FOR_OPERATION
 
                 # Deliverable fix verified on disk — complete the work order and return to execution!
@@ -130,8 +137,9 @@ class _RecoveryMixin:
                 state.architect_repair_operation_id = None
                 state.authoring_repair_attempts = 0
                 self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                self._transition(state, Phase.EXECUTING)
-                return AdvanceResult.WAITING_FOR_OPERATION
+                dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                self._transition(state, dest, authorized_override=True)
+                return AdvanceResult.TRANSITIONED
 
             # Revalidate the complete artifact set with the readiness gate.
             try:
@@ -185,7 +193,7 @@ class _RecoveryMixin:
                     if is_deadlock:
                         state.repair_context = {}
                         self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
-                        self._transition(state, Phase.EXECUTING)
+                        self._transition(state, Phase.EXECUTING, authorized_override=True)
                         return AdvanceResult.WAITING_FOR_OPERATION
                     self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
                     if str(wo_id) not in state.completed_wo_ids:
@@ -196,8 +204,9 @@ class _RecoveryMixin:
                         state.blocked_wo_ids.remove(str(wo_id))
                     state.repair_context = {}
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                    self._transition(state, Phase.EXECUTING)
-                    return AdvanceResult.WAITING_FOR_OPERATION
+                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    self._transition(state, dest, authorized_override=True)
+                    return AdvanceResult.TRANSITIONED
                 if action == "split_work_order":
                     # The blocked WO is superseded by its children; they join the
                     # normal execution loop instead of re-dispatching the original.
@@ -208,8 +217,9 @@ class _RecoveryMixin:
                     )
                     state.repair_context = {}
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                    self._transition(state, Phase.EXECUTING)
-                    return AdvanceResult.WAITING_FOR_OPERATION
+                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    self._transition(state, dest, authorized_override=True)
+                    return AdvanceResult.TRANSITIONED
                 if action == "create_dependency_work_order":
                     for dep in state.repair_context.get("replacement_work_orders") or []:
                         self._add_work_order_dependency(ws, str(wo_id), str(dep))
@@ -287,7 +297,16 @@ class _RecoveryMixin:
 
             # Invalid/failed decision — bounded re-dispatch with corrective feedback.
             attempts = state.recovery_attempts.get(str(wo_id), 0)
-            if attempts >= state.max_retries:
+            re_dispatch_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.ARCHITECT_RECOVERY,
+                    scope=str(wo_id),
+                    failure_class=FailureClass.RECOVERY_REQUIRED,
+                    failure_code="RECOVERY_DECISION_INVALID",
+                ),
+            )
+            if attempts >= state.max_retries or re_dispatch_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = (
                     f"Architect recovery decision for {wo_id} could not be obtained "
                     f"({decision_error}); recovery attempts exhausted with evidence retained"
@@ -1183,7 +1202,8 @@ class _RecoveryMixin:
                 state.ignored_operation_ids.append(str(old_op_id))
             state.recovery_decisions.append({**record, "applied": True})
             state.error = None
-            self._transition(state, Phase.EXECUTING)
+            dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            self._transition(state, dest, authorized_override=True)
             return AdvanceResult.TRANSITIONED, None
 
         if action == "escalate_human":
@@ -1333,11 +1353,8 @@ class _RecoveryMixin:
         deny = [
             r for r in deny
             if not (
-                isinstance(r, dict)
-                and any(
-                    k in str(r.get("module") or r.get("path") or "")
-                    for k in (".sync", "schemas")
-                )
+                (isinstance(r, dict) and any(k in str(r.get("module") or r.get("path") or "") for k in (".sync", "schemas")))
+                or (isinstance(r, str) and any(k in r for k in (".sync", "schemas")))
             )
         ]
 
@@ -1371,11 +1388,8 @@ class _RecoveryMixin:
                     scope["deny"] = [
                         r for r in scope.get("deny", [])
                         if not (
-                            isinstance(r, dict)
-                            and any(
-                                k in str(r.get("module") or r.get("path") or "")
-                                for k in (".sync", "schemas")
-                            )
+                            (isinstance(r, dict) and any(k in str(r.get("module") or r.get("path") or "") for k in (".sync", "schemas")))
+                            or (isinstance(r, str) and any(k in r for k in (".sync", "schemas")))
                         )
                     ]
                     data["normalized_by"] = "recovery-repair"
@@ -1534,6 +1548,23 @@ class _RecoveryMixin:
         # The blocker is resolved, so recovery bookkeeping must stop suppressing
         # dispatch.  Recovery *history* (recovery_attempts) is intentionally
         # preserved: it bounds the recovery budget, not execution eligibility.
+        # The execution-budget reset is recorded as an explicit, auditable
+        # budget renewal rather than a silent counter clear (008C-D).  The
+        # authorized recovery decision is the renewal's new input, and the
+        # renewal is scoped to this work order's execution budget only.
+        try:
+            from .attempts import renew_budget as _renew_budget
+
+            _renew_budget(
+                state,
+                BudgetKey.WORKER_TASK,
+                wo_id,
+                reason="authorized recovery decision cleared the worker blocker",
+                renewal_kind="recovery_decision_clear",
+                allow_unchanged_input=True,
+            )
+        except Exception:
+            state.retry_counts[wo_id] = 0
         if state.recovery_wo_id == wo_id:
             state.recovery_wo_id = None
         state.dispatch_failures.pop(wo_id, None)
@@ -1562,8 +1593,13 @@ class _RecoveryMixin:
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
         state.error = None
-        self._transition(state, Phase.EXECUTING)
-        return AdvanceResult.WAITING_FOR_OPERATION
+        if redispatch:
+            self._transition(state, Phase.EXECUTING, authorized_override=True)
+            return AdvanceResult.WAITING_FOR_OPERATION
+        else:
+            dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            self._transition(state, dest, authorized_override=True)
+            return AdvanceResult.TRANSITIONED
 
     def _add_work_order_dependency(self, ws: Path, wo_id: str, dep_id: str) -> None:
         """Deterministically append a prerequisite dependency to a work order file."""

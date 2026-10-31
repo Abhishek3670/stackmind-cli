@@ -17,6 +17,15 @@ import yaml
 
 from validators.clock import now as _now
 
+from .attempts import (
+    AttemptStatus,
+    BudgetKey,
+    FailureClass,
+    RetryContext,
+    RetryOutcome,
+    evaluate_retry_budget,
+    start_attempt,
+)
 from .controls import _ControlsMixin
 from .execution import _ExecutionMixin
 from .gitops import _GitopsMixin
@@ -204,7 +213,16 @@ class LifecycleSupervisor(
             wid = wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             retries = state.worker_retries.get(wid, 0) + 1
             state.worker_retries[wid] = retries
-            if retries >= state.max_worker_retries:
+            worker_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.WORKER_TASK,
+                    scope=wid,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=f"WORKER_INVALID_OUTPUT:{error_type}",
+                ),
+            )
+            if retries >= state.max_worker_retries or worker_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 self.escalate_wo_to_recovery(state, wid, reason=f"Worker returned {error_type}")
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
             else:
@@ -217,7 +235,16 @@ class LifecycleSupervisor(
             wid = wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             reworks = state.qa_reworks.get(wid, 0) + 1
             state.qa_reworks[wid] = reworks
-            if reworks >= state.max_qa_reworks:
+            qa_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.QA_REWORK,
+                    scope=wid,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=f"QA_INVALID_OUTPUT:{error_type}",
+                ),
+            )
+            if reworks >= state.max_qa_reworks or qa_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 self.escalate_wo_to_recovery(state, wid, reason=f"QA returned {error_type}")
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
             else:
@@ -226,7 +253,16 @@ class LifecycleSupervisor(
 
         elif role_lower == "gitops" or state.phase == Phase.GITOPS:
             state.gitops_retries += 1
-            if state.gitops_retries >= state.max_gitops_retries:
+            gitops_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.GITOPS,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=f"GITOPS_INVALID_OUTPUT:{error_type}",
+                ),
+            )
+            if state.gitops_retries >= state.max_gitops_retries or gitops_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_GITOPS_RETRIES_EXHAUSTED: GitOps returned {error_type}"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -237,7 +273,16 @@ class LifecycleSupervisor(
 
         elif role_lower in ("architecture", "architect", "lead_architect") or state.phase in (Phase.AUTHORING, Phase.ARCHITECT_REPAIR):
             state.authoring_repair_attempts += 1
-            if state.authoring_repair_attempts >= state.max_authoring_repairs:
+            authoring_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.AUTHORING_REPAIR,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=f"ARCHITECTURE_INVALID_OUTPUT:{error_type}",
+                ),
+            )
+            if state.authoring_repair_attempts >= state.max_authoring_repairs or authoring_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Architecture returned {error_type}"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -248,7 +293,16 @@ class LifecycleSupervisor(
 
         elif state.phase == Phase.PLANNING:
             state.planning_retries += 1
-            if state.planning_retries >= state.max_planning_retries:
+            planning_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.PLANNING_REPAIR,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=f"PLANNING_INVALID_OUTPUT:{error_type}",
+                ),
+            )
+            if state.planning_retries >= state.max_planning_retries or planning_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_PLANNING_RETRIES_EXHAUSTED: Planning returned {error_type}"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -261,7 +315,16 @@ class LifecycleSupervisor(
             wo_id = str(state.recovery_wo_id or "SYSTEM_UNIDENTIFIABLE")
             attempts = state.recovery_attempts.get(wo_id, 0) + 1
             state.recovery_attempts[wo_id] = attempts
-            if attempts >= state.max_retries:
+            recovery_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.ARCHITECT_RECOVERY,
+                    scope=wo_id,
+                    failure_class=FailureClass.RECOVERY_REQUIRED,
+                    failure_code=f"RECOVERY_INVALID_OUTPUT:{error_type}",
+                ),
+            )
+            if attempts >= state.max_retries or recovery_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_RECOVERY_ATTEMPTS_EXHAUSTED: Recovery decision for {wo_id} returned {error_type}"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -319,7 +382,16 @@ class LifecycleSupervisor(
             wo_id = state.executing_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             retries = state.worker_retries.get(wo_id, 0) + 1
             state.worker_retries[wo_id] = retries
-            if retries >= state.max_worker_retries:
+            timeout_worker_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.WORKER_TASK,
+                    scope=wo_id,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="WORKER_TIMEOUT",
+                ),
+            )
+            if retries >= state.max_worker_retries or timeout_worker_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 self.escalate_wo_to_recovery(state, wo_id, reason=f"Worker turn timed out after {timeout_val:.1f}s")
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
             else:
@@ -330,7 +402,16 @@ class LifecycleSupervisor(
             wo_id = state.integration_wo_id or (state.worker_wo_ids[0] if state.worker_wo_ids else "WO-001")
             reworks = state.qa_reworks.get(wo_id, 0) + 1
             state.qa_reworks[wo_id] = reworks
-            if reworks >= state.max_qa_reworks:
+            timeout_qa_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.QA_REWORK,
+                    scope=wo_id,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="QA_TIMEOUT",
+                ),
+            )
+            if reworks >= state.max_qa_reworks or timeout_qa_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 self.escalate_wo_to_recovery(state, wo_id, reason=f"QA review timed out after {timeout_val:.1f}s")
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
             else:
@@ -339,7 +420,16 @@ class LifecycleSupervisor(
 
         elif timeout_phase == Phase.GITOPS:
             state.gitops_retries += 1
-            if state.gitops_retries >= state.max_gitops_retries:
+            timeout_gitops_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.GITOPS,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="GITOPS_TIMEOUT",
+                ),
+            )
+            if state.gitops_retries >= state.max_gitops_retries or timeout_gitops_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_GITOPS_RETRIES_EXHAUSTED: GitOps release timed out after {timeout_val:.1f}s"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -350,7 +440,16 @@ class LifecycleSupervisor(
 
         elif timeout_phase == Phase.PLANNING:
             state.planning_retries += 1
-            if state.planning_retries >= state.max_planning_retries:
+            timeout_planning_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.PLANNING_REPAIR,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="PLANNING_TIMEOUT",
+                ),
+            )
+            if state.planning_retries >= state.max_planning_retries or timeout_planning_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_PLANNING_RETRIES_EXHAUSTED: Planning turn timed out after {timeout_val:.1f}s"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -361,7 +460,16 @@ class LifecycleSupervisor(
 
         elif timeout_phase in (Phase.AUTHORING, Phase.ARCHITECT_REPAIR):
             state.authoring_repair_attempts += 1
-            if state.authoring_repair_attempts >= state.max_authoring_repairs:
+            timeout_authoring_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.AUTHORING_REPAIR,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="ARCHITECTURE_TIMEOUT",
+                ),
+            )
+            if state.authoring_repair_attempts >= state.max_authoring_repairs or timeout_authoring_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_AUTHORING_REPAIRS_EXHAUSTED: Authoring state {timeout_phase.value} timed out after {timeout_val:.1f}s"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -374,7 +482,16 @@ class LifecycleSupervisor(
             wo_id = str(state.recovery_wo_id or "SYSTEM_UNIDENTIFIABLE")
             attempts = state.recovery_attempts.get(wo_id, 0) + 1
             state.recovery_attempts[wo_id] = attempts
-            if attempts >= state.max_retries:
+            timeout_recovery_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.ARCHITECT_RECOVERY,
+                    scope=wo_id,
+                    failure_class=FailureClass.RECOVERY_REQUIRED,
+                    failure_code="RECOVERY_TIMEOUT",
+                ),
+            )
+            if attempts >= state.max_retries or timeout_recovery_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = f"MAX_RECOVERY_ATTEMPTS_EXHAUSTED: Recovery decision for {wo_id} timed out after {timeout_val:.1f}s"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -530,6 +647,15 @@ class LifecycleSupervisor(
         """
         self._current_state = state
         now_mono = time.monotonic()
+
+        # 0. Attempt-ledger reconciliation: close STARTED records whose
+        # operations reached terminal state (or were lost) after restart.
+        # Idempotent per record; creates no usage and no new attempts.
+        try:
+            from .attempts import reconcile_attempts_after_restart
+            reconcile_attempts_after_restart(state, self._get_operation)
+        except Exception:
+            pass
 
         # 1. Monotonic human wait timeout for headless runs
         if self.headless and state.phase == Phase.WAITING_FOR_HUMAN:
@@ -773,8 +899,90 @@ class LifecycleSupervisor(
         state.error = f"Exceeded max advance steps ({max_steps})"
         return AdvanceResult.BLOCKED
 
-    def _transition(self, state: RunState, new_phase: Phase) -> None:
-        """Record a phase transition in the run state."""
+    def _transition(
+        self,
+        state: RunState,
+        new_phase: Phase,
+        authorized_override: bool = False,
+        auth_context: Any = None,
+    ) -> None:
+        """Record a phase transition in the run state, governed by 008D/HF2 evaluator."""
+        from ..state_store import StateIntegrityError
+        from .control_plane import (
+            BlockerSubsystem,
+            BlockerType,
+            WaitType,
+            create_blocker,
+            create_wait,
+            evaluate_supervisor_state,
+            record_lifecycle_event,
+        )
+
+        # Stage 1: Authoritative invariant evaluation BEFORE ANY SIDE EFFECTS (HF2-F)
+        decision = evaluate_supervisor_state(
+            state=state,
+            requested_phase=new_phase,
+            manager=getattr(self, "manager", None),
+            ws=Path(state.workspace) if state.workspace else None,
+            authorized_override=authorized_override,
+            auth_context=auth_context,
+        )
+
+        # Stage 2: Reject immediately without mutating state or creating blockers/waits
+        if not decision.is_valid:
+            record_lifecycle_event(
+                state=state,
+                event_type="STATE_TRANSITION_REJECTED",
+                entity_id=state.run_id,
+                actor="supervisor",
+                previous_state=state.phase.value,
+                new_state=new_phase.value,
+                reason_code=decision.decision_reason,
+                evidence_refs={"violations": decision.violations},
+            )
+            raise StateIntegrityError(
+                f"Supervisor transition rejected ({state.phase.value} -> {new_phase.value}): "
+                f"{decision.decision_reason}"
+            )
+
+        # Stage 3: Transition is authorized and valid - commit lifecycle records
+        if new_phase == Phase.BLOCKED:
+            if not getattr(state, "blocker_registry", None):
+                state.blocker_registry = {}
+            if not state.blocker_registry and (state.error or state.blocked_wo_ids):
+                wo_id = state.blocked_wo_ids[0] if state.blocked_wo_ids else None
+                create_blocker(
+                    state=state,
+                    blocker_type=BlockerType.WORKER_FAILURE,
+                    owner_subsystem=BlockerSubsystem.EXECUTION,
+                    work_order_id=wo_id,
+                    failure_code="SUPERVISOR_BLOCKED",
+                    resolution_condition=state.error or "Blocker requires resolution",
+                )
+        elif new_phase in (Phase.AWAITING_APPROVAL, Phase.WAITING_FOR_HUMAN):
+            if not getattr(state, "wait_registry", None):
+                state.wait_registry = {}
+            w_type = WaitType.HUMAN_APPROVAL
+            create_wait(
+                state=state,
+                wait_type=w_type,
+                owner_subsystem=BlockerSubsystem.APPROVAL,
+                subject_entity=state.run_id,
+                resolution_predicate="Human approval or operator resume required",
+            )
+
+        # Record accepted transition in lifecycle audit events
+        record_lifecycle_event(
+            state=state,
+            event_type="STATE_TRANSITION_COMMITTED",
+            entity_id=state.run_id,
+            actor="supervisor",
+            previous_state=state.phase.value,
+            new_state=new_phase.value,
+            reason_code=decision.decision_reason,
+            evidence_refs={"fingerprint": decision.state_fingerprint},
+        )
+
         state.turn_deadline = None
         state.turn_started_at = None
         now = _now()

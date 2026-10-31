@@ -235,6 +235,37 @@ class RunState:
     # its observed state/revision, the expected resolution and its owner.
     dependency_waits: dict[str, dict[str, Any]] = field(default_factory=dict)
     dependency_graph_fingerprint: str | None = None
+    # ── Unified attempt accounting (SDP-FIX-008C) ────────────────────────
+    # Append-only attempt ledger with stable per-run identities, scoped
+    # budget-usage map governed by the authoritative retry-policy engine,
+    # and explicit budget-renewal history.  Legacy counters above keep their
+    # validated semantics; the engine reconciles usage from them (monotone).
+    attempt_ledger: list[dict[str, Any]] = field(default_factory=list)
+    attempt_ledger_seq: int = 0
+    ledger_truncated: int = 0
+    attempt_op_index: dict[str, str] = field(default_factory=dict)
+    budget_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    budget_renewals: list[dict[str, Any]] = field(default_factory=list)
+    budget_renewal_fingerprints: dict[str, str] = field(default_factory=dict)
+    # ── Unified control plane, blocker & wait registry (SDP-FIX-008D) ────
+    blocker_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    blocker_history: list[dict[str, Any]] = field(default_factory=list)
+    wait_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    wait_history: list[dict[str, Any]] = field(default_factory=list)
+    lifecycle_events: list[dict[str, Any]] = field(default_factory=list)
+    lifecycle_event_seq: int = 0
+    last_progress_fingerprint: str | None = None
+    consecutive_no_progress_ticks: int = 0
+    deadlock_reports: list[dict[str, Any]] = field(default_factory=list)
+    reconciliation_history: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def blockers(self) -> dict[str, dict[str, Any]]:
+        return self.blocker_registry
+
+    @property
+    def wait_conditions(self) -> dict[str, dict[str, Any]]:
+        return self.wait_registry
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -334,11 +365,28 @@ class RunState:
             "max_dispatch_attempts": self.max_dispatch_attempts,
             "dependency_waits": {k: dict(v) for k, v in self.dependency_waits.items()},
             "dependency_graph_fingerprint": self.dependency_graph_fingerprint,
+            "attempt_ledger": [dict(r) for r in self.attempt_ledger],
+            "attempt_ledger_seq": self.attempt_ledger_seq,
+            "ledger_truncated": self.ledger_truncated,
+            "attempt_op_index": dict(self.attempt_op_index),
+            "budget_usage": {k: dict(v) for k, v in self.budget_usage.items()},
+            "budget_renewals": [dict(r) for r in self.budget_renewals],
+            "budget_renewal_fingerprints": dict(self.budget_renewal_fingerprints),
+            "blocker_registry": {k: dict(v) for k, v in self.blocker_registry.items()},
+            "blocker_history": [dict(r) for r in self.blocker_history],
+            "wait_registry": {k: dict(v) for k, v in self.wait_registry.items()},
+            "wait_history": [dict(r) for r in self.wait_history],
+            "lifecycle_events": [dict(e) for e in self.lifecycle_events],
+            "lifecycle_event_seq": self.lifecycle_event_seq,
+            "last_progress_fingerprint": self.last_progress_fingerprint,
+            "consecutive_no_progress_ticks": self.consecutive_no_progress_ticks,
+            "deadlock_reports": [dict(d) for d in self.deadlock_reports],
+            "reconciliation_history": [dict(rh) for rh in self.reconciliation_history],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunState":
-        return cls(
+        state = cls(
             run_id=data["run_id"],
             product_goal=data["product_goal"],
             workspace=data["workspace"],
@@ -435,7 +483,45 @@ class RunState:
             max_dispatch_attempts=int(data.get("max_dispatch_attempts", 3)),
             dependency_waits=dict(data.get("dependency_waits", {}) or {}),
             dependency_graph_fingerprint=data.get("dependency_graph_fingerprint"),
+            attempt_ledger=list(data.get("attempt_ledger", []) or []),
+            attempt_ledger_seq=int(data.get("attempt_ledger_seq", 0) or 0),
+            ledger_truncated=int(data.get("ledger_truncated", 0) or 0),
+            attempt_op_index=dict(data.get("attempt_op_index", {}) or {}),
+            budget_usage={
+                str(k): {str(sk): int(sv) for sk, sv in scopes.items()}
+                for k, scopes in (data.get("budget_usage", {}) or {}).items()
+            },
+            budget_renewals=list(data.get("budget_renewals", []) or []),
+            budget_renewal_fingerprints=dict(data.get("budget_renewal_fingerprints", {}) or {}),
+            blocker_registry=dict(data.get("blocker_registry", {}) or {}),
+            blocker_history=list(data.get("blocker_history", []) or []),
+            wait_registry=dict(data.get("wait_registry", {}) or {}),
+            wait_history=list(data.get("wait_history", []) or []),
+            lifecycle_events=list(data.get("lifecycle_events", []) or []),
+            lifecycle_event_seq=int(data.get("lifecycle_event_seq", 0) or 0),
+            last_progress_fingerprint=data.get("last_progress_fingerprint"),
+            consecutive_no_progress_ticks=int(data.get("consecutive_no_progress_ticks", 0) or 0),
+            deadlock_reports=list(data.get("deadlock_reports", []) or []),
+            reconciliation_history=list(data.get("reconciliation_history", []) or []),
         )
+        # SDP-FIX-008C: fail closed on corrupted authoritative accounting
+        # state, and migrate pre-008C counters deterministically/idempotently
+        # with explicit legacy provenance.
+        from .attempts import migrate_legacy_run_state, validate_ledger
+
+        migrated_ledger, migrated_usage, migrated_renewals = migrate_legacy_run_state(data)
+        if not state.attempt_ledger:
+            state.attempt_ledger = migrated_ledger
+        if not state.budget_usage:
+            state.budget_usage = migrated_usage
+        if not state.budget_renewals:
+            state.budget_renewals = migrated_renewals
+        validate_ledger(state)
+        # SDP-FIX-008D: migrate legacy blockers and waits if missing
+        from .control_plane import migrate_legacy_blockers_and_waits
+
+        migrate_legacy_blockers_and_waits(state)
+        return state
 
 _OPERATION_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
 

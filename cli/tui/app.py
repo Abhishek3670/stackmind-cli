@@ -268,6 +268,14 @@ def _run_demo(client: DaemonClient, session: dict[str, Any]) -> None:
     click.echo("\n" + render_project_delivery_view(state))
 
 
+class _ActiveOperationDetected(Exception):
+    """Internal control-flow exception raised when an active operation is detected on session sync."""
+
+    def __init__(self, operation_id: str) -> None:
+        self.operation_id = operation_id
+        super().__init__(operation_id)
+
+
 @click.command("tui")
 @click.option("--daemon-url", default=None, help="URL of an existing local daemon.")
 @click.option("--agent", "-a", "agent", default="claude", show_default=True)
@@ -288,12 +296,6 @@ def _run_demo(client: DaemonClient, session: dict[str, Any]) -> None:
     show_default=True,
     help="Turn operation wait timeout in seconds (0=no timeout).",
 )
-class _ActiveOperationDetected(Exception):
-    def __init__(self, operation_id: str) -> None:
-        self.operation_id = operation_id
-        super().__init__(operation_id)
-
-
 def tui(
     daemon_url: str | None,
     agent: str,
@@ -941,7 +943,21 @@ def tui(
                                     session.update(fresh_sess)
                                     active_op_cand = fresh_sess.get("active_operation")
                                     if active_op_cand:
-                                        if editor is not None and hasattr(editor, "buffer") and editor.buffer:
+                                        is_truly_active = True
+                                        if hasattr(client, "operation_get"):
+                                            try:
+                                                op_rec = client.operation_get(active_op_cand)
+                                                if isinstance(op_rec, Mapping):
+                                                    st = str(op_rec.get("status", "")).upper()
+                                                    if st in ("COMPLETED", "FAILED", "CANCELLED", "BLOCKED"):
+                                                        is_truly_active = False
+                                                else:
+                                                    is_truly_active = False
+                                            except Exception:
+                                                is_truly_active = False
+                                        if not is_truly_active:
+                                            session["active_operation"] = None
+                                        elif editor is not None and hasattr(editor, "buffer") and editor.buffer:
                                             # User is actively typing into the composer! Do not pause/interrupt the text box
                                             pass
                                         else:
@@ -1117,15 +1133,36 @@ def tui(
                 sys.stdout.write(f"\x1b[{c_row};5H")
                 sys.stdout.flush()
     finally:
-        disable_mouse_reporting()
+        try:
+            disable_mouse_reporting()
+        except Exception:
+            pass
         if live_ws is not None:
-            live_ws.stop()
-        restore_terminal_state()
+            try:
+                live_ws.stop()
+            except Exception:
+                pass
+            live_ws = None
+        try:
+            restore_terminal_state()
+        except Exception:
+            pass
         if daemon is not None and not is_attached:
-            daemon.stop()
-            clear_daemon_pid(workspace.resolve(), os.getpid())
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+            try:
+                clear_daemon_pid(workspace.resolve(), os.getpid())
+            except Exception:
+                pass
+            daemon = None
         if temporary_state is not None:
-            temporary_state.cleanup()
+            try:
+                temporary_state.cleanup()
+            except Exception:
+                pass
+            temporary_state = None
 
 
 __all__ = [
@@ -1189,4 +1226,5 @@ __all__ = [
     "restore_composer_focus",
     "restore_terminal_state",
     "tui",
+    "_ActiveOperationDetected",
 ]

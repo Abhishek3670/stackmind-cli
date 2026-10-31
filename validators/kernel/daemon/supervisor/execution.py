@@ -16,6 +16,18 @@ import yaml
 
 from validators.clock import now as _now
 
+from .attempts import (
+    AttemptStatus,
+    BudgetKey,
+    FailureClass,
+    RetryContext,
+    RetryOutcome,
+    classify_failure,
+    compute_input_fingerprint,
+    evaluate_retry_budget,
+    record_deferral,
+    start_attempt,
+)
 from .dependencies import (
     DependencyResult,
     DependencyStatus,
@@ -201,7 +213,16 @@ class _ExecutionMixin:
         )
         if failure_code in GOVERNANCE_FAILURE_CODES or transient_exhausted:
             attempts = state.recovery_attempts.get(wo_id, 0)
-            if attempts >= state.max_retries:
+            decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.ARCHITECT_RECOVERY,
+                    scope=wo_id,
+                    failure_class=FailureClass.RECOVERY_REQUIRED,
+                    failure_code=failure_code or None,
+                ),
+            )
+            if decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
                 state.error = (
                     f"Work order {wo_id} blocked: {err_msg} — recovery decision "
                     f"attempts exhausted ({attempts}/{state.max_retries})"
@@ -209,6 +230,19 @@ class _ExecutionMixin:
                 self._transition(state, Phase.BLOCKED)
                 return AdvanceResult.BLOCKED
             state.recovery_attempts[wo_id] = attempts + 1
+            start_attempt(
+                state,
+                subsystem="recovery",
+                action="escalate_recovery",
+                budget_key=BudgetKey.ARCHITECT_RECOVERY,
+                scope=wo_id,
+                work_order_id=wo_id,
+                status=AttemptStatus.ESCALATED,
+                failure_class=FailureClass.RECOVERY_REQUIRED,
+                failure_code=failure_code or None,
+                attempt_number=attempts + 1,
+                consume=False,
+            )
             state.recovery_wo_id = wo_id
             recovery_op = self._dispatch_recovery_decision(state, ws, wo_id)
             if recovery_op is not None:
@@ -256,7 +290,16 @@ class _ExecutionMixin:
         scope_evidence = result.get("scope_evidence") if isinstance(result.get("scope_evidence"), dict) else None
         if scope_evidence and scope_evidence.get("observed") == []:
             retries = state.retry_counts.get(wo_id, 0)
-            if retries < state.max_retries:
+            retry_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.WORKER_TASK,
+                    scope=wo_id,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=failure_code or None,
+                ),
+            )
+            if retries < state.max_retries and retry_decision.allowed:
                 state.retry_counts[wo_id] = retries + 1
                 op_id = op.get("operation_id")
                 if op_id and op_id not in state.ignored_operation_ids:
@@ -301,6 +344,17 @@ class _ExecutionMixin:
                     # stays ACTIVE and is re-dispatched once the session frees,
                     # without consuming retry budget on a turn that never ran.
                     state.retry_counts[wo_id] = retries
+                    record_deferral(
+                        state,
+                        subsystem="dispatch",
+                        action="nudge_retry",
+                        deferral=FailureClass.CONTENTION,
+                        budget_key=BudgetKey.WORKER_TASK,
+                        scope=wo_id,
+                        operation_id=op.get("operation_id"),
+                        work_order_id=wo_id,
+                        reason="sibling turn active; retry budget rolled back, not consumed",
+                    )
                     raise
                 except Exception as e:
                     logger.error(f"Failed to nudge-retry {wo_id}: {e}", exc_info=True)
@@ -335,8 +389,31 @@ class _ExecutionMixin:
         )
         if is_transient_blockage:
             retries = state.retry_counts.get(wo_id, 0)
-            if retries < state.max_retries:
+            retry_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.WORKER_TASK,
+                    scope=wo_id,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=failure_code or None,
+                ),
+            )
+            if retries < state.max_retries and retry_decision.allowed:
                 state.retry_counts[wo_id] = retries + 1
+                start_attempt(
+                    state,
+                    subsystem="worker",
+                    action="transient_retry",
+                    budget_key=BudgetKey.WORKER_TASK,
+                    scope=wo_id,
+                    work_order_id=wo_id,
+                    operation_id=op.get("operation_id"),
+                    attempt_number=retries + 1,
+                    status=AttemptStatus.STARTED,
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code=failure_code or None,
+                    consume=False,
+                )
                 op_id = op.get("operation_id")
                 if op_id and op_id not in state.ignored_operation_ids:
                     state.ignored_operation_ids.append(str(op_id))
@@ -393,6 +470,17 @@ class _ExecutionMixin:
                     # budget back and let advance() wait — the work order stays
                     # ACTIVE and is re-dispatched once the session frees.
                     state.retry_counts[wo_id] = retries
+                    record_deferral(
+                        state,
+                        subsystem="worker",
+                        action="transient_retry",
+                        deferral=FailureClass.CONTENTION,
+                        budget_key=BudgetKey.WORKER_TASK,
+                        scope=wo_id,
+                        operation_id=op.get("operation_id"),
+                        work_order_id=wo_id,
+                        reason="sibling turn active; retry budget rolled back, not consumed",
+                    )
                     raise
                 except Exception as e:
                     logger.error(f"Failed to retry {wo_id}: {e}", exc_info=True)
@@ -482,6 +570,7 @@ class _ExecutionMixin:
             "resolution": resolution,
             "exception_type": type(exc).__name__,
             "message": str(exc),
+            "failure_class": classify_failure(code).value,
         }
 
     def _record_dispatch_failure(
@@ -494,6 +583,7 @@ class _ExecutionMixin:
         failure stays auditable across restart.
         """
         info = self._classify_dispatch_failure(exc)
+        canonical_class = classify_failure(info["code"])
         rec = dict(state.dispatch_failures.get(wo_id) or {})
         rec["attempts"] = int(rec.get("attempts", 0)) + 1
         rec["failure_class"] = info["code"]
@@ -516,7 +606,30 @@ class _ExecutionMixin:
             }
         )
         rec["history"] = history[-10:]
+        rec["canonical_failure_class"] = canonical_class.value
+        rec["input_fingerprint"] = compute_input_fingerprint(
+            state, scope_kind="dispatch", wo_id=wo_id
+        )
         state.dispatch_failures[wo_id] = rec
+        # Ledger: this dispatch attempt failed with a canonical class.
+        start_attempt(
+            state,
+            subsystem="dispatch",
+            action="dispatch",
+            budget_key=BudgetKey.DISPATCH,
+            scope=wo_id,
+            work_order_id=wo_id,
+            status=AttemptStatus.FAILED,
+            failure_class=canonical_class,
+            failure_code=info["code"],
+            input_fingerprint=rec["input_fingerprint"],
+            metadata={
+                "phase": phase,
+                "exception_type": info["exception_type"],
+                "attempts": rec["attempts"],
+            },
+            consume=False,
+        )
         return rec, info
 
     def _dispatch_failure_is_terminal(
@@ -551,6 +664,21 @@ class _ExecutionMixin:
         attempts = state.attempt_counts.get(wo_id, 0) + 1
         retries = state.retry_counts.get(wo_id, 0)
 
+        # Authoritative policy consult before starting the next governed
+        # worker attempt (SDP-FIX-008C-C).  The engine reads the same legacy
+        # two-tier counters, so nothing is double-counted.
+        policy_decision = evaluate_retry_budget(
+            state,
+            RetryContext(
+                budget=BudgetKey.WORKER_TASK,
+                scope=wo_id,
+                failure_class=FailureClass.TRANSIENT,
+            ),
+        )
+        if policy_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
+            state.failed_wo_ids.append(wo_id)
+            return False
+
         if retries >= state.max_retries:
             state.failed_wo_ids.append(wo_id)
             return False
@@ -570,7 +698,7 @@ class _ExecutionMixin:
 
         agent = self._agent_for_wo(wo_id, ws)
         try:
-            self.manager.start_turn(
+            op = self.manager.start_turn(
                 state.session_id,
                 make_prompt(attempts + 1, agent),
                 role=self._role_for_agent(agent),
@@ -582,8 +710,32 @@ class _ExecutionMixin:
                 retry=retries,
                 max_retries=state.max_retries,
             )
+            # Attempt boundary reached: the worker turn actually started.
+            op_id = op.get("operation_id") if isinstance(op, dict) else None
+            start_attempt(
+                state,
+                subsystem="worker",
+                action="execute",
+                budget_key=BudgetKey.WORKER_TASK,
+                scope=wo_id,
+                work_order_id=wo_id,
+                operation_id=str(op_id) if op_id else None,
+                attempt_number=attempts,
+                metadata={"retry_round": retries},
+                consume=False,
+            )
         except OperationContentionError:
             state.attempt_counts[wo_id] = max(0, attempts - 1)
+            record_deferral(
+                state,
+                subsystem="worker",
+                action="execute",
+                deferral=FailureClass.CONTENTION,
+                budget_key=BudgetKey.WORKER_TASK,
+                scope=wo_id,
+                work_order_id=wo_id,
+                reason="sibling turn active; attempt rolled back, not consumed",
+            )
             raise
         except Exception:
             state.failed_wo_ids.append(wo_id)
@@ -728,8 +880,30 @@ class _ExecutionMixin:
     ) -> AdvanceResult | None:
         """Bounded retry for a QA evidence gap; exhaustion routes to the Architect."""
         retries = state.retry_counts.get(wo_id, 0)
-        if retries < state.max_retries:
+        gap_decision = evaluate_retry_budget(
+            state,
+            RetryContext(
+                budget=BudgetKey.WORKER_TASK,
+                scope=wo_id,
+                failure_class=FailureClass.TRANSIENT,
+                failure_code="QA_EVIDENCE_MISSING",
+            ),
+        )
+        if retries < state.max_retries and gap_decision.allowed:
             state.retry_counts[wo_id] = retries + 1
+            start_attempt(
+                state,
+                subsystem="qa",
+                action="evidence_gap_retry",
+                budget_key=BudgetKey.WORKER_TASK,
+                scope=wo_id,
+                work_order_id=wo_id,
+                operation_id=op.get("operation_id"),
+                attempt_number=retries + 1,
+                failure_class=FailureClass.TRANSIENT,
+                failure_code="QA_EVIDENCE_MISSING",
+                consume=False,
+            )
             op_id = op.get("operation_id")
             if op_id and op_id not in state.ignored_operation_ids:
                 state.ignored_operation_ids.append(str(op_id))
@@ -764,6 +938,17 @@ class _ExecutionMixin:
                 state.retry_counts[wo_id] = retries
                 if op_id and str(op_id) in state.ignored_operation_ids:
                     state.ignored_operation_ids.remove(str(op_id))
+                record_deferral(
+                    state,
+                    subsystem="qa",
+                    action="evidence_gap_retry",
+                    deferral=FailureClass.CONTENTION,
+                    budget_key=BudgetKey.WORKER_TASK,
+                    scope=wo_id,
+                    operation_id=op.get("operation_id"),
+                    work_order_id=wo_id,
+                    reason="sibling turn active; retry budget rolled back, not consumed",
+                )
                 return AdvanceResult.WAITING_FOR_OPERATION
             except Exception as exc:
                 logger.error(f"Failed to retry QA work order {wo_id}: {exc}", exc_info=True)
@@ -793,6 +978,19 @@ class _ExecutionMixin:
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
                 return AdvanceResult.TRANSITIONED
         # Retries exhausted — route to the Architect with durable evidence.
+        start_attempt(
+            state,
+            subsystem="qa",
+            action="evidence_gap_retry",
+            budget_key=BudgetKey.WORKER_TASK,
+            scope=wo_id,
+            work_order_id=wo_id,
+            operation_id=op.get("operation_id"),
+            status=AttemptStatus.ESCALATED,
+            failure_class=FailureClass.RECOVERY_REQUIRED,
+            failure_code="QA_EVIDENCE_MISSING",
+            consume=False,
+        )
         state.worker_blockers[wo_id] = {
             "failure_code": "QA_EVIDENCE_MISSING",
             "canonical_message": f"QA_EVIDENCE_MISSING: work order {wo_id}: {gap}",
@@ -1123,8 +1321,24 @@ class _ExecutionMixin:
     ) -> None:
         """Persist the WAITING/INVALID dependency record with its resolution route."""
         record = result.to_wait_record(timestamp=result.evaluated_at or _now())
+        new_wait = wo_id not in state.dependency_waits or (
+            state.dependency_waits[wo_id].get("graph_fingerprint") != record.get("graph_fingerprint")
+        )
         state.dependency_waits[wo_id] = record
         state.dependency_graph_fingerprint = result.fingerprint
+        if new_wait:
+            # A dependency wait is a deferral, never a consumption (008C-C/E).
+            record_deferral(
+                state,
+                subsystem="dependencies",
+                action="dependency_wait",
+                deferral=FailureClass.DEPENDENCY_WAIT,
+                budget_key=BudgetKey.WORKER_TASK,
+                scope=wo_id,
+                work_order_id=wo_id,
+                failure_code=result.code or "WAITING_FOR_DEPENDENCY",
+                reason=record.get("expected_resolution_actions") or result.detail,
+            )
 
     def _reevaluate_dependency_waits(
         self, state: RunState, ws: Path, published: set[str], superseded: set[str],
@@ -1726,8 +1940,20 @@ class _ExecutionMixin:
 
         op_id = state.qa_review_operations.get(wo_id)
         if op_id:
-            op = self._get_operation(op_id)
-            if op is not None and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+            ongoing = self._get_operation(op_id)
+            if ongoing is not None and str(ongoing.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                # Repeated observation of the same active review operation:
+                # never a new attempt, never budget consumption (008C-F/008C-C).
+                record_deferral(
+                    state,
+                    subsystem="qa_review",
+                    action="review",
+                    deferral=FailureClass.CONTENTION,
+                    budget_key=BudgetKey.QA_REVIEW,
+                    scope=wo_id,
+                    operation_id=op_id,
+                    reason="review operation still in flight",
+                )
                 return None  # review in flight
             state.qa_review_operations.pop(wo_id, None)
             # Re-evaluate: a terminal review must have produced a verdict.
@@ -1786,8 +2012,36 @@ class _ExecutionMixin:
                 if self._retry_worker(state, ws, wo_id, _qa_rework_prompt):
                     return None
 
-        # No usable verdict yet → dispatch an independent QA review turn.
+        # No usable verdict yet → dispatch an independent QA review turn,
+        # gated by the authoritative QA_REVIEW budget (008C-C).
         prior_attempts = state.qa_review_attempts.get(wo_id, 0)
+        review_decision = evaluate_retry_budget(
+            state,
+            RetryContext(
+                budget=BudgetKey.QA_REVIEW,
+                scope=wo_id,
+                failure_class=FailureClass.TRANSIENT,
+                failure_code="QA_REVIEW_DISPATCH",
+            ),
+        )
+        if review_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
+            state.error = f"QA review for {wo_id} exhausted its bounded review attempts"
+            state.exit_code = 3
+            start_attempt(
+                state,
+                subsystem="qa_review",
+                action="review",
+                budget_key=BudgetKey.QA_REVIEW,
+                scope=wo_id,
+                work_order_id=wo_id,
+                status=AttemptStatus.ESCALATED,
+                failure_class=FailureClass.BUDGET_EXHAUSTED,
+                failure_code="QA_REVIEW_BUDGET_EXHAUSTED",
+                consume=False,
+            )
+            self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+            self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            return AdvanceResult.TRANSITIONED
         state.qa_review_attempts[wo_id] = prior_attempts + 1
         if state.qa_review_attempts[wo_id] > state.max_qa_review_attempts + state.max_qa_reworks:
             state.error = f"QA review for {wo_id} exhausted its bounded review attempts"
@@ -1816,6 +2070,16 @@ class _ExecutionMixin:
             # for it without consuming a QA review attempt and without ever
             # creating a duplicate QA operation.
             state.qa_review_attempts[wo_id] = prior_attempts
+            record_deferral(
+                state,
+                subsystem="qa_review",
+                action="review",
+                deferral=FailureClass.CONTENTION,
+                budget_key=BudgetKey.QA_REVIEW,
+                scope=wo_id,
+                work_order_id=wo_id,
+                reason="review dispatch blocked by session contention; attempt not consumed",
+            )
             state.error = None
             return None
         except Exception as exc:

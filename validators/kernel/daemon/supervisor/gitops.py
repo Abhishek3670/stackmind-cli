@@ -14,6 +14,15 @@ import yaml
 
 from validators.clock import now as _now
 
+from .attempts import (
+    BudgetKey,
+    FailureClass,
+    RetryContext,
+    RetryOutcome,
+    classify_failure,
+    evaluate_retry_budget,
+    start_attempt,
+)
 from .models import (
     _OPERATION_TERMINAL,
     AdvanceResult,
@@ -27,6 +36,16 @@ from .release import (
 )
 
 logger = logging.getLogger("stackmind.supervisor")
+
+def _gt_ctx(state: RunState, wo_id: str, failure_code: str) -> RetryContext:
+    """Budget context for a GitOps release retry (008C policy consult)."""
+    return RetryContext(
+        budget=BudgetKey.GITOPS,
+        scope="RUN",
+        failure_class=classify_failure(failure_code),
+        failure_code=failure_code,
+        run_id=state.run_id,
+    )
 
 class _GitopsMixin:
     """Release-phase orchestration (GITOPS) and release documentation."""
@@ -61,7 +80,11 @@ class _GitopsMixin:
                 observed_count = int(failure.get("observed_file_count") or 0) if failure else 0
                 if failure_code == "CONTRACT_FILE_BUDGET_EXCEEDED":
                     retries = state.retry_counts.get(wo_id, 0)
-                    if retries < state.max_retries:
+                    budget_decision = evaluate_retry_budget(
+                        state,
+                        _gt_ctx(state, wo_id, "CONTRACT_FILE_BUDGET_EXCEEDED"),
+                    )
+                    if retries < state.max_retries and budget_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED:
                         state.retry_counts[wo_id] = retries + 1
                         contract_file = Path(state.workspace) / ".sync" / "contracts" / f"{state.gitops_wo_id}.yaml"
                         if contract_file.is_file():
@@ -89,9 +112,24 @@ class _GitopsMixin:
                     return AdvanceResult.BLOCKED
 
                 # Bounded retry for GitOps blockers (verification gate failures, scope, budget, etc.)
-                if state.gitops_retries < state.max_gitops_retries:
+                blocker_decision = evaluate_retry_budget(
+                    state, _gt_ctx(state, wo_id, failure_code or "GITOPS_BLOCKED"),
+                )
+                if state.gitops_retries < state.max_gitops_retries and blocker_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED:
                     state.gitops_retries += 1
                     state.retry_counts[wo_id] = state.gitops_retries
+                    start_attempt(
+                        state,
+                        subsystem="gitops",
+                        action="blocker_retry",
+                        budget_key=BudgetKey.GITOPS,
+                        scope="RUN",
+                        work_order_id=state.gitops_wo_id,
+                        operation_id=op.get("operation_id"),
+                        attempt_number=state.gitops_retries,
+                        failure_code=failure_code or None,
+                        consume=False,
+                    )
                     op_id = op.get("operation_id")
                     if op_id and op_id not in state.ignored_operation_ids:
                         state.ignored_operation_ids.append(str(op_id))
@@ -107,9 +145,24 @@ class _GitopsMixin:
 
             if status == "FAILED" or result_status == "failed":
                 wo_id = state.gitops_wo_id or "WO-GITOPS"
-                if state.gitops_retries < state.max_gitops_retries:
+                failed_decision = evaluate_retry_budget(
+                    state, _gt_ctx(state, wo_id, "GITOPS_FAILED"),
+                )
+                if state.gitops_retries < state.max_gitops_retries and failed_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED:
                     state.gitops_retries += 1
                     state.retry_counts[wo_id] = state.gitops_retries
+                    start_attempt(
+                        state,
+                        subsystem="gitops",
+                        action="failure_retry",
+                        budget_key=BudgetKey.GITOPS,
+                        scope="RUN",
+                        work_order_id=state.gitops_wo_id,
+                        operation_id=op.get("operation_id"),
+                        attempt_number=state.gitops_retries,
+                        failure_code="GITOPS_FAILED",
+                        consume=False,
+                    )
                     op_id = op.get("operation_id")
                     if op_id and op_id not in state.ignored_operation_ids:
                         state.ignored_operation_ids.append(str(op_id))

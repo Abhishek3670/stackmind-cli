@@ -12,6 +12,7 @@ from typing import Any
 from validators.clock import now as _now
 
 from .dependencies import DependencyStatus
+from .attempts import AttemptStatus, BudgetKey, start_attempt
 from .models import (
     _OPERATION_TERMINAL,
     AdvanceResult,
@@ -468,7 +469,7 @@ class _PhasesMixin:
         for wo_id in eligible_wos:
             agent = self._agent_for_wo(wo_id, ws)
             try:
-                self.manager.start_turn(
+                op = self.manager.start_turn(
                     state.session_id,
                     self._worker_dispatch_prompt(state, wo_id, ws),
                     role=self._role_for_agent(agent),
@@ -477,6 +478,21 @@ class _PhasesMixin:
                     parent_operation_id=parent_op_id,
                 )
                 dispatched_any = True
+                # Ledger: the dispatch attempt completed at the moment the
+                # worker turn started; bind it to the operation so restart
+                # reconciliation maps attempt→operation (008C-F).
+                op_id = op.get("operation_id") if isinstance(op, dict) else None
+                start_attempt(
+                    state,
+                    subsystem="dispatch",
+                    action="dispatch",
+                    budget_key=BudgetKey.DISPATCH,
+                    scope=wo_id,
+                    work_order_id=wo_id,
+                    operation_id=str(op_id) if op_id else None,
+                    status=AttemptStatus.SUCCEEDED,
+                    consume=False,
+                )
                 # A successful dispatch resolves any prior dispatch failure.
                 state.dispatch_failures.pop(wo_id, None)
             except OperationContentionError:
@@ -679,7 +695,7 @@ class _PhasesMixin:
                             continue
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
-                            self.manager.start_turn(
+                            op = self.manager.start_turn(
                                 state.session_id,
                                 self._worker_dispatch_prompt(state, wo_id, ws),
                                 role=self._role_for_agent(agent),
@@ -688,6 +704,20 @@ class _PhasesMixin:
                                 parent_operation_id=state.batch_operation_id,
                             )
                             turns_dispatched += 1
+                            # Ledger: bind the completed dispatch attempt to the
+                            # operation for restart reconciliation (008C-F).
+                            op_id = op.get("operation_id") if isinstance(op, dict) else None
+                            start_attempt(
+                                state,
+                                subsystem="dispatch",
+                                action="dispatch",
+                                budget_key=BudgetKey.DISPATCH,
+                                scope=wo_id,
+                                work_order_id=wo_id,
+                                operation_id=str(op_id) if op_id else None,
+                                status=AttemptStatus.SUCCEEDED,
+                                consume=False,
+                            )
                             state.dispatch_failures.pop(wo_id, None)
                         except OperationContentionError:
                             all_done = False

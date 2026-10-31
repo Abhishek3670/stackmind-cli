@@ -219,7 +219,20 @@ class _ControlsMixin:
                 dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
         else:
             dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
-        self._transition(state, dest_phase)
+        if dest_phase == Phase.EXECUTING:
+            has_live_op = False
+            if hasattr(self, "manager") and self.manager and hasattr(self.manager, "get_operation"):
+                for op_attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id"):
+                    op_val = getattr(state, op_attr, None)
+                    if op_val:
+                        rec = self.manager.get_operation(op_val)
+                        if rec and str(rec.get("status", "")).upper() not in ("COMPLETED", "FAILED", "CANCELLED"):
+                            has_live_op = True
+                            break
+            if not has_live_op:
+                dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+
+        self._transition(state, dest_phase, authorized_override=True)
         return AdvanceResult.TRANSITIONED
 
     human_resume = resume_run_with_human_override
@@ -327,9 +340,22 @@ class _ControlsMixin:
                 resume_phase = None
 
         if resume_phase is None or resume_phase == Phase.WAITING_FOR_HUMAN:
-            resume_phase = Phase.EXECUTING if state.worker_wo_ids else Phase.PLANNING
+            resume_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
 
-        self._transition(state, resume_phase)
+        if resume_phase == Phase.EXECUTING:
+            has_live_op = False
+            if hasattr(self, "manager") and self.manager and hasattr(self.manager, "get_operation"):
+                for op_attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id"):
+                    op_val = getattr(state, op_attr, None)
+                    if op_val:
+                        rec = self.manager.get_operation(op_val)
+                        if rec and str(rec.get("status", "")).upper() not in ("COMPLETED", "FAILED", "CANCELLED"):
+                            has_live_op = True
+                            break
+            if not has_live_op:
+                resume_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+
+        self._transition(state, resume_phase, authorized_override=True)
         return AdvanceResult.TRANSITIONED
 
     def escalate_wo_to_recovery(self, state: RunState, wo_id: str, reason: str = "") -> None:

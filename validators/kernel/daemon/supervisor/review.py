@@ -16,6 +16,15 @@ import yaml
 
 from validators.clock import now as _now
 
+from .attempts import (
+    AttemptStatus,
+    BudgetKey,
+    FailureClass,
+    RetryContext,
+    RetryOutcome,
+    evaluate_retry_budget,
+    start_attempt,
+)
 from .models import (
     _OPERATION_TERMINAL,
     AdvanceResult,
@@ -451,8 +460,30 @@ class _ReviewMixin:
             if status == "FAILED":
                 retries = getattr(state, "integration_retries", 0)
                 max_retries = getattr(state, "max_integration_retries", 2)
-                if retries < max_retries:
+                integ_decision = evaluate_retry_budget(
+                    state,
+                    RetryContext(
+                        budget=BudgetKey.INTEGRATION_REVIEW,
+                        scope=state.integration_wo_id or "RUN",
+                        failure_class=FailureClass.TRANSIENT,
+                        failure_code="INTEGRATION_REVIEW_FAILED",
+                    ),
+                )
+                if retries < max_retries and integ_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED:
                     setattr(state, "integration_retries", retries + 1)
+                    start_attempt(
+                        state,
+                        subsystem="integration",
+                        action="review_retry",
+                        budget_key=BudgetKey.INTEGRATION_REVIEW,
+                        scope=state.integration_wo_id or "RUN",
+                        work_order_id=state.integration_wo_id,
+                        operation_id=op.get("operation_id"),
+                        attempt_number=retries + 1,
+                        failure_class=FailureClass.TRANSIENT,
+                        failure_code="INTEGRATION_REVIEW_FAILED",
+                        consume=False,
+                    )
                     if op.get("operation_id"):
                         state.ignored_operation_ids.append(op["operation_id"])
                     state.integration_operation_id = None
@@ -1122,7 +1153,20 @@ class _ReviewMixin:
             actionable = bool(
                 report.missing_wo_ids or report.blocked_wo_ids or state.qa_rework_targets
             )
-            if actionable and state.final_prerequisite_rounds < state.max_final_review_rounds + 2:
+            actionable_decision = evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.FINAL_REVIEW,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="FINAL_REVIEW_PREREQUISITES",
+                ),
+            )
+            if (
+                actionable
+                and state.final_prerequisite_rounds < state.max_final_review_rounds + 2
+                and actionable_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED
+            ):
                 state.final_prerequisite_rounds += 1
                 self._transition(state, Phase.EXECUTING)
                 return AdvanceResult.TRANSITIONED
@@ -1193,7 +1237,18 @@ class _ReviewMixin:
         review_gate.archive_final_verdict(ws, state.run_id, suffix="rejected")
         state.error = "FINAL_REVIEW_REJECTED: " + ("; ".join(blockers) or why)
 
-        if state.final_review_rounds >= state.max_final_review_rounds:
+        if state.final_review_rounds >= state.max_final_review_rounds or (
+            evaluate_retry_budget(
+                state,
+                RetryContext(
+                    budget=BudgetKey.FINAL_REVIEW,
+                    scope="RUN",
+                    failure_class=FailureClass.TRANSIENT,
+                    failure_code="FINAL_REVIEW_REJECTED",
+                ),
+            ).outcome
+            is RetryOutcome.BUDGET_EXHAUSTED
+        ):
             state.error = (
                 f"FINAL_REVIEW_BUDGET_EXHAUSTED: {state.final_review_rounds}/"
                 f"{state.max_final_review_rounds} corrective rounds used: {state.error}"

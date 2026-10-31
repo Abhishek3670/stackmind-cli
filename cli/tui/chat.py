@@ -891,7 +891,7 @@ def render_actions_group(
 
     # Pass 2: Suppress duplicate consecutive Agent headers and render flat lines
     # If there are NO concrete tool actions (only 'Agent' headers), suppress the entire group.
-    has_concrete_actions = any(item[2] != 'Agent' for item in collapsed)
+    has_concrete_actions = any(item[2] != 'Agent' or item[3] for item in collapsed)
     if not has_concrete_actions:
         return Text('')
 

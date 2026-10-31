@@ -1946,7 +1946,7 @@ class SessionManager:
             )
         state.error = None
         _reset_phase_operation_id(state, target_phase)
-        self.supervisor._transition(state, target_phase)
+        self.supervisor._transition(state, target_phase, authorized_override=True)
         return target_phase
 
     def _cleanup_orphaned_operations(self, state: Any, session: dict[str, Any]) -> None:
