@@ -274,16 +274,8 @@ class ToolGateway:
             except Exception as exc:
                 errors.append(f"File '{path}': {exc}")
 
-        if errors and not written_paths:
-            raise PermissionError(f"Batch write failed ({len(errors)} error(s)): {'; '.join(errors)}")
         if errors:
-            return {
-                "status": "partial_success",
-                "written_count": len(written_paths),
-                "files": written_paths,
-                "failed_count": len(errors),
-                "errors": errors,
-            }
+            raise PermissionError(f"Batch write failed ({len(errors)} error(s)): {'; '.join(errors)}")
         return {
             "status": "success",
             "written_count": len(written_paths),
