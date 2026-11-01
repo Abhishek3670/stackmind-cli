@@ -689,7 +689,9 @@ class LifecycleSupervisor(
             return self._handle_turn_timeout(state)
 
         if hasattr(self, "state_manager") and self.state_manager is not None:
-            if not self.state_manager.is_run_attested(state.run_id):
+            if not self.state_manager.is_run_attested(state.run_id) and state.phase not in (
+                Phase.COMPLETE, Phase.FAILED, Phase.BLOCKED, Phase.WAITING_FOR_HUMAN
+            ):
                 if not state.transitions and state.run_id not in getattr(self.state_manager, "_in_memory_states", {}):
                     self.state_manager.register_state(state.run_id, state)
                 else:

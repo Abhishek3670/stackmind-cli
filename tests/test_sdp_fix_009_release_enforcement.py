@@ -254,6 +254,39 @@ def test_gitops_advances_and_commits_when_all_delivery_checks_pass(tmp_path: Pat
     assert state.release_commit_sha == "commit-sha-009"
 
 
+def test_repeated_gitops_advance_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    """Repeated release attempts must not duplicate commits or produce duplicate blockers."""
+    setup_clean_workspace(tmp_path)
+    patch_integration(monkeypatch, passed=True)
+
+    (tmp_path / ".git").mkdir(parents=True, exist_ok=True)
+    commit_calls = []
+    monkeypatch.setattr(
+        "validators.kernel.daemon.supervisor.gitops.create_gitops_commit",
+        lambda **kwargs: commit_calls.append(kwargs) or "commit-sha-009",
+    )
+    monkeypatch.setattr("validators.kernel.sync_git.commit_sync_governance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(LifecycleSupervisor, "_final_acceptance_status", lambda self, state, ws: (True, {}, "ok"))
+
+    supervisor = make_supervisor()
+    state = make_run_state(tmp_path, Phase.GITOPS)
+
+    # First advance: completes release and creates commit
+    result1 = supervisor._advance_gitops(state)
+    assert result1 == AdvanceResult.COMPLETE
+    assert state.phase == Phase.COMPLETE
+    assert len(commit_calls) == 1
+    assert state.release_commit_sha == "commit-sha-009"
+
+    # Second advance: supervisor advance() routes Phase.COMPLETE to _advance_complete
+    result2 = supervisor.advance(state)
+    assert result2 == AdvanceResult.COMPLETE
+    assert state.phase == Phase.COMPLETE
+    assert len(commit_calls) == 1  # No duplicate commit
+    assert state.delivery_decision_passed is True
+    assert len(state.delivery_blockers) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. TOCTOU & Evidence Freshness Tests
 # ─────────────────────────────────────────────────────────────────────────────

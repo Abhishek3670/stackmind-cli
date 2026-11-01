@@ -980,6 +980,8 @@ class _PhasesMixin:
         never implicitly revived: a violation fails closed and is surfaced for
         an explicitly authorized human resume instead of re-entering FINAL_REVIEW.
         """
+        if state.phase == Phase.COMPLETE and state.delivery_decision_passed:
+            return AdvanceResult.COMPLETE
         ws = Path(state.workspace)
         from validators.harness.delivery_integrity import (
             evaluate_release_readiness,

@@ -52,6 +52,8 @@ class _GitopsMixin:
 
     def _advance_gitops(self, state: RunState, *, integration_op: dict[str, Any] | None = None) -> AdvanceResult:
         """GITOPS: dispatch GitOps release turn and wait for completion."""
+        if state.phase == Phase.COMPLETE:
+            return AdvanceResult.COMPLETE
         # SDP-FIX-009-FINAL: caller-supplied integration evidence binds the
         # release gate to the exact evidence that produced it.  The supervisor
         # always re-evaluates release readiness from source at the release
