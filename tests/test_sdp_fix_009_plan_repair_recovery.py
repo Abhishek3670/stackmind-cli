@@ -264,3 +264,37 @@ def test_plan_repair_attempt_persists_across_restart() -> None:
     assert recovered_state.plan_id == "PLAN-009"
     assert recovered_state.plan_repair_attempt is None
 
+
+def test_sequential_plan_repairs_adopt_latest_successful_plan() -> None:
+    """Sequential plan repairs: an in-flight second repair waits, then adopts when complete."""
+    supervisor, mgr, state, planning_op = _start_planning_run()
+    mgr.complete_operation(planning_op, "BLOCKED", {"error": _GATE_ERROR})
+
+    # First repair turn is dispatched, but also fails
+    repair_op_1 = _dispatch_repair(mgr, attempt=1)
+    mgr.complete_operation(repair_op_1, "BLOCKED", {"error": "Still invalid"})
+
+    # Second repair turn is dispatched and is currently in flight
+    repair_op_2 = _dispatch_repair(mgr, attempt=2)
+
+    # Supervisor must detect the in-flight second repair and wait
+    res1 = supervisor.advance(state)
+    assert res1 == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.plan_repair_attempt == 2
+
+    # Second repair completes and proposes the valid plan
+    mgr.complete_operation(repair_op_2, "COMPLETED")
+    mgr.propose_plan(
+        "sess-009",
+        "PLAN-009-V2",
+        "Valid Task App Plan",
+        metadata={"operation_id": repair_op_2},
+    )
+
+    # Supervisor must now adopt the second plan and transition to AWAITING_APPROVAL
+    res2 = supervisor.advance(state)
+    assert res2 == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.AWAITING_APPROVAL
+    assert state.plan_id == "PLAN-009-V2"
+    assert state.plan_repair_attempt is None
+

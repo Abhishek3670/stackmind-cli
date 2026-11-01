@@ -53,7 +53,9 @@ def repair_yaml_block_scalars(text: str) -> str:
     return "\n".join(repaired_lines)
 
 
-def normalize_work_order_data(data: dict[str, Any]) -> dict[str, Any]:
+def normalize_work_order_data(
+    data: dict[str, Any], project_root: Path | None = None
+) -> dict[str, Any]:
     """Normalize common LLM shorthand/structure issues in work order dictionaries."""
     if not isinstance(data, dict):
         return data
@@ -68,6 +70,29 @@ def normalize_work_order_data(data: dict[str, Any]) -> dict[str, Any]:
     ac = data.get("acceptance_criteria")
     if isinstance(ac, str) and ac.strip():
         data["acceptance_criteria"] = ac.strip()
+
+    # If deliverable is omitted when amending an existing work order on disk,
+    # preserve the deliverable from the previous revision.
+    wo_id = data.get("id")
+    if (
+        project_root
+        and wo_id
+        and not data.get("deliverable")
+        and not data.get("deliverables")
+        and not data.get("files_created")
+    ):
+        for sub in ("ACTIVE", "BLOCKED", "COMPLETED"):
+            cand = Path(project_root) / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
+            if not cand.is_file():
+                cand = Path(project_root) / "work-orders" / sub / f"{wo_id}.yaml"
+            if cand.is_file():
+                try:
+                    prior = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                    if isinstance(prior, dict) and prior.get("deliverable"):
+                        data["deliverable"] = prior["deliverable"]
+                        break
+                except Exception:
+                    pass
 
     return data
 

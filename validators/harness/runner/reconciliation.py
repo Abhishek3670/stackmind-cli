@@ -287,6 +287,9 @@ class _ReconciliationMixin:
                     if not entry.get("assigned_agents") and wo_data.get("assigned_agents"):
                         entry["assigned_agents"] = wo_data["assigned_agents"]
                         updated_index = True
+                    if wo_data.get("deliverable") and entry.get("deliverable") != wo_data.get("deliverable"):
+                        entry["deliverable"] = wo_data["deliverable"]
+                        updated_index = True
 
             blocked_dir = sync_dir / "work-orders" / "BLOCKED"
             if blocked_dir.is_dir():

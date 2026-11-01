@@ -216,8 +216,11 @@ class AuthoringGate:
             )
 
         # 3. Schema & Semantic Validation by Artifact Type
+        effective_root = (
+            Path(project_root).resolve() if project_root is not None else self._project_root
+        )
         if artifact_type == "work_order":
-            data = normalize_work_order_data(data)
+            data = normalize_work_order_data(data, project_root=effective_root)
             self._validate_work_order(norm_path, data, errors)
             if not errors:
                 try:
@@ -239,9 +242,6 @@ class AuthoringGate:
             pass
 
         # 4. Overwrite Conflict Check for Active Work Orders and Contracts
-        effective_root = (
-            Path(project_root).resolve() if project_root is not None else self._project_root
-        )
         if effective_root is not None:
             _check_overwrite_conflict(
                 norm_path, content, data, effective_root, errors, author=author
@@ -285,6 +285,12 @@ class AuthoringGate:
             errors.append(f"Work Order id '{wo_id}' does not match filename stem '{file_stem}'")
 
         deliverable = data.get("deliverable")
+        wo_type = str(data.get("type", "")).upper().strip()
+        if wo_type in {"FEATURE", "BUGFIX", "HOTFIX", "REFACTOR", "FIX"}:
+            if not deliverable and not data.get("deliverables") and not data.get("files_created"):
+                errors.append(
+                    f"Work order '{wo_id}' (type={wo_type}) requires a deliverable field with type ('code', 'doc', 'config', 'module') and description"
+                )
         if isinstance(deliverable, dict):
             deliv_type = deliverable.get("type")
             if deliv_type not in ("code", "doc", "config", "module"):
