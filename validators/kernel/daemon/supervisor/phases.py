@@ -38,6 +38,36 @@ class _PhasesMixin:
         self._transition(state, Phase.PLANNING)
         return self._advance_planning(state)
 
+    def _find_plan_repair_op(self, state: RunState) -> dict[str, Any] | None:
+        """Find the plan-repair continuation op spawned after a plan-gate failure.
+
+        The user_turn handler in the manager responds to a failed plan-gate turn
+        by dispatching an Architecture repair turn with
+        ``metadata['plan_repair_attempt']`` (no work_order_id). Return the newest
+        such op so _advance_planning can wait for it instead of stranding the
+        run in FAILED while the honest re-authoring of PLAN.md is still in
+        flight.
+        """
+        ignored = set(getattr(state, "ignored_operation_ids", []))
+        planning_op = state.planning_operation_id
+        try:
+            ops = self.manager.list_operations(state.session_id)
+        except Exception:
+            return None
+        repair: dict[str, Any] | None = None
+        for op in ops:
+            op_id = op.get("operation_id")
+            if not op_id or op_id in ignored or op_id == planning_op:
+                continue
+            if (op.get("metadata") or {}).get("plan_repair_attempt") is None:
+                continue
+            if str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                # In-flight repair continuation: wait for it regardless of how
+                # many earlier repair attempts already terminated.
+                return op
+            repair = op
+        return repair
+
     def _advance_planning(self, state: RunState) -> AdvanceResult:
         """PLANNING: dispatch Architecture planning turn if not already running."""
         if not state.planning_operation_id:
@@ -64,9 +94,30 @@ class _PhasesMixin:
                 state.planning_operation_id = None
                 return self._advance_planning(state)
             status = str(op.get("status", "")).upper()
+            planning_op_id = state.planning_operation_id
             if status not in _OPERATION_TERMINAL:
                 return AdvanceResult.WAITING_FOR_OPERATION
             if status in ("FAILED", "BLOCKED", "CANCELLED"):
+                # A failed plan-gate attempt is not necessarily fatal: the
+                # user_turn handler responds by dispatching an Architecture
+                # repair turn (is_authoring with
+                # metadata['plan_repair_attempt']). The supervisor must wait for
+                # that continuation instead of stranding the run in FAILED
+                # while the honest re-authoring of PLAN.md is still in flight.
+                repair = self._find_plan_repair_op(state)
+                if repair is not None:
+                    repair_status = str(repair.get("status", "")).upper()
+                    if repair_status not in _OPERATION_TERMINAL:
+                        return AdvanceResult.WAITING_FOR_OPERATION
+                    if repair_status == "COMPLETED":
+                        # Recovery succeeded: evaluate the plan written by the
+                        # repair turn on the next advance, through the normal
+                        # plan-match path (never fabricate a plan here).
+                        state.ignored_operation_ids.append(planning_op_id)
+                        state.planning_operation_id = repair.get("operation_id")
+                        return self._advance_planning(state)
+                    # Repair itself terminated non-successfully: fail the run
+                    # with the original planning error evidence.
                 err_detail = _extract_op_error(op) or op.get("error") or "unknown"
                 state.error = f"Planning turn failed ({status.lower()}): {err_detail}"
                 self._transition(state, Phase.FAILED)
@@ -907,33 +958,83 @@ class _PhasesMixin:
 
         return AdvanceResult.WAITING_FOR_OPERATION
 
-    def _advance_complete(self, state: RunState) -> AdvanceResult:
-        """COMPLETE is a terminal state only while the acceptance invariant holds.
+    def _advance_complete(self, state: RunState, *, integration_op: dict[str, Any] | None = None) -> AdvanceResult:
+        """COMPLETE is a terminal state only while the full delivery invariant holds.
 
         Enforced at the authoritative completion boundary rather than in a
-        reporting layer: if a completed run's plan, deliverables, QA verdicts or
-        final-review evidence are missing or stale, the run is not successful.
+        reporting layer: final acceptance plus the complete delivery-integrity
+        evidence set (planning, artifacts, revision-bound QA, integration,
+        blockers, documentation) is re-evaluated from source. A terminal run is
+        never implicitly revived: a violation fails closed and is surfaced for
+        an explicitly authorized human resume instead of re-entering FINAL_REVIEW.
         """
         ws = Path(state.workspace)
+        from validators.harness.delivery_integrity import (
+            evaluate_release_readiness,
+            persist_release_decision,
+            structured_blockers,
+        )
+
         ok, _report, why = self._final_acceptance_status(state, ws)
-        if ok:
+        release = evaluate_release_readiness(
+            ws, state, require_documentation=True, integration_op=integration_op
+        )
+        persist_release_decision(
+            ws,
+            release,
+            run_id=state.run_id,
+            phase=state.phase.value,
+            source="complete_boundary",
+        )
+        state.delivery_blockers = structured_blockers(release)
+        state.delivery_evidence_sha256 = release.evidence.get("evidence_sha256")
+        state.delivery_decision_passed = bool(ok and release.passed)
+        state.delivery_evaluated_at = _now()
+        events = getattr(self, "events", getattr(getattr(self, "manager", None), "events", None))
+        if events is not None:
+            events.publish(
+                "delivery.readiness_evaluated",
+                state.session_id,
+                run_id=state.run_id,
+                passed=state.delivery_decision_passed,
+                evidence_sha256=state.delivery_evidence_sha256,
+                blockers=state.delivery_blockers,
+                issues=list(release.issues),
+                phase=state.phase.value,
+            )
+        if ok and release.passed:
             return AdvanceResult.COMPLETE
-        state.error = f"FINAL_ACCEPTANCE_INVARIANT_VIOLATION: {why}"
+
+        reasons = ([why] if not ok else []) + list(release.issues)
+        state.error = "DELIVERY_INTEGRITY_VIOLATION: " + "; ".join(reasons[:6])
         state.final_review_history.append(
             {
                 "event": "complete_invariant_violation",
-                "reason": why,
+                "reason": "; ".join(reasons),
+                "evidence_sha256": release.evidence.get("evidence_sha256"),
+                "blocker_codes": [b["code"] for b in structured_blockers(release)],
                 "phase": Phase.COMPLETE.value,
                 "timestamp": _now(),
             }
         )
-        self._transition(state, Phase.FINAL_REVIEW)
-        return AdvanceResult.TRANSITIONED
+        # Terminal-state invariant: no ordinary scheduling exit from COMPLETE.
+        # Mark the run failed closed rather than silently reviving it.
+        try:
+            self._transition(state, Phase.FAILED)
+        except Exception:
+            pass
+        return AdvanceResult.FAILED
 
     def _advance_product_ready(self, state: RunState) -> AdvanceResult:
         """PRODUCT_READY: discover or create GitOps WO and dispatch."""
         ws = Path(state.workspace)
         self._ensure_release_documentation(ws, state)
+
+        ok, _report, why = self._final_acceptance_status(state, ws)
+        if not ok:
+            state.error = f"FINAL_ACCEPTANCE_NOT_PASSED: {why}"
+            self._transition(state, Phase.FINAL_REVIEW)
+            return AdvanceResult.TRANSITIONED
 
         # Find the GitOps WO
         gitops_wo = self._find_gitops_wo(ws, state)

@@ -1,0 +1,28 @@
+# Work Order Template: VALIDATION
+# Use for: Independent validation and verification of system deliverables
+# Triggered by: Architecture plan or verification gate
+
+id: "WO-001"  # Required: sequential 3-digit number (WO-001, WO-002, etc. - regex ^WO-[0-9]{3}$)
+type: VALIDATION
+title: ""
+status: ACTIVE
+priority: P1
+assigned_agents:
+  - "gemma"
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Validation Fields ───────────────────────────────────────
+description: ""
+acceptance_criteria: []
+deliverable:
+  type: "code"
+  path: "tests/test_verification.py"
+  description: "Automated verification test suite and quality assertions"
+verdict: ""
+tests_passing: false
+
+# ─── Execution Log ───────────────────────────────────────────
+log: []

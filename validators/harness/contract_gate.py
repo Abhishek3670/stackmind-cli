@@ -150,32 +150,40 @@ def persist_blocker_evidence(project_path: Path, evidence: dict[str, Any]) -> st
 
 def load_harness_contract(project_path: Path, agent: str, work_order_id: str | None) -> AgentContract | None:
     """Attempt to locate and load a structured contract for the current harness task."""
+    arch_aliases = ("claude", "architecture", "architect")
+    norm_agent = str(agent or "").lower().strip()
+    is_arch_agent = norm_agent in arch_aliases
+
     # 1. Search for work order contract (e.g. .sync/contracts/WO-142.yaml)
     if work_order_id:
         try:
             from cli.contract import find_contract
-            path = find_contract(work_order_id, project_path)
-            if path.exists():
-                c = AgentContract.load(path, project_path)
-                norm_agent = str(agent or "").lower().strip()
+            c_path = find_contract(work_order_id, project_path)
+            if c_path.exists():
+                c = AgentContract.load(c_path, project_path)
                 c_agent = str(getattr(c, "agent_id", "") or "").lower().strip()
-                if not norm_agent or not c_agent or norm_agent == c_agent:
+                is_c_arch = c_agent in arch_aliases
+                if not norm_agent or not c_agent or norm_agent == c_agent or (is_arch_agent and is_c_arch):
                     return c
         except (FileNotFoundError, Exception):
             pass
-            
+
     # 2. Search for agent contract (e.g. .sync/agents/codex.contract.yaml)
-    agent_contract_path = project_path / ".sync" / "agents" / f"{agent}.contract.yaml"
-    if agent_contract_path.exists():
-        try:
-            contract = AgentContract.load(agent_contract_path, project_path)
-            if work_order_id:
-                contract.work_order = work_order_id
-                contract.data["work_order"] = work_order_id
-            return contract
-        except Exception:
-            pass
-        
+    candidate_agents = [agent]
+    if is_arch_agent and agent != "claude":
+        candidate_agents.append("claude")
+    for cand in candidate_agents:
+        agent_contract_path = project_path / ".sync" / "agents" / f"{cand}.contract.yaml"
+        if agent_contract_path.exists():
+            try:
+                contract = AgentContract.load(agent_contract_path, project_path)
+                if work_order_id:
+                    contract.work_order = work_order_id
+                    contract.data["work_order"] = work_order_id
+                return contract
+            except Exception:
+                pass
+
     return None
 
 def verify_pre_execution(
@@ -345,8 +353,8 @@ def verify_post_execution(
                 # Architecture role authorization, an authorized contract-repair
                 # task with supervisor provenance, and an exact `.sync/contracts/`
                 # path. Authoring flags and agent-name strings are never enough.
-                if is_sync_deny_pattern(p_norm) and architecture_contract_repair_exempt(
-                    project_path, agent, task, contract, norm_fp
+                if is_sync_deny_pattern(p_norm) and (norm_fp.startswith((".sync/decisions/", "decisions/")) or architecture_contract_repair_exempt(
+                    project_path, agent, task, contract, norm_fp)
                 ):
                     continue
                 if (
@@ -405,7 +413,7 @@ def verify_post_execution(
                     ):
                         allowed = True
                         break
-        if not allowed:
+        if not allowed and not (norm_fp.startswith((".sync/decisions/", "decisions/")) or "/.sync/decisions/" in norm_fp or (str(agent).lower().strip() in ("claude", "architecture", "architect") and (norm_fp.startswith((".sync/work-orders/", "work-orders/", ".sync/contracts/", "contracts/", ".sync/agents/")) or norm_fp in ("plan.md", "index.yaml")))):
             raise ContractAccessDenied(
                 f"Modification to file {file_path} is outside allowed contract scope"
             )

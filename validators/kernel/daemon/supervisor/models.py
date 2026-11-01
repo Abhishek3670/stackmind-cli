@@ -216,6 +216,10 @@ class RunState:
     delivery_status_delivered: bool = False
     delivery_status_summary: str | None = None
     delivery_status_operation_id: str | None = None
+    delivery_blockers: list[dict[str, Any]] = field(default_factory=list)
+    delivery_evidence_sha256: str | None = None
+    delivery_decision_passed: bool | None = None
+    delivery_evaluated_at: str | None = None
     # In-memory only monotonic deadlines for state timeouts (never persisted to disk)
     turn_deadline: float | None = None
     turn_started_at: float | None = None
@@ -360,6 +364,10 @@ class RunState:
             "delivery_status_delivered": bool(self.delivery_status_delivered),
             "delivery_status_summary": self.delivery_status_summary,
             "delivery_status_operation_id": self.delivery_status_operation_id,
+            "delivery_blockers": [dict(b) for b in self.delivery_blockers],
+            "delivery_evidence_sha256": self.delivery_evidence_sha256,
+            "delivery_decision_passed": self.delivery_decision_passed,
+            "delivery_evaluated_at": self.delivery_evaluated_at,
             "last_dispatch_error": self.last_dispatch_error,
             "dispatch_failures": {k: dict(v) for k, v in self.dispatch_failures.items()},
             "max_dispatch_attempts": self.max_dispatch_attempts,
@@ -478,6 +486,10 @@ class RunState:
             delivery_status_delivered=bool(data.get("delivery_status_delivered", False)),
             delivery_status_summary=data.get("delivery_status_summary"),
             delivery_status_operation_id=data.get("delivery_status_operation_id"),
+            delivery_blockers=list(data.get("delivery_blockers", []) or []),
+            delivery_evidence_sha256=data.get("delivery_evidence_sha256"),
+            delivery_decision_passed=data.get("delivery_decision_passed"),
+            delivery_evaluated_at=data.get("delivery_evaluated_at"),
             last_dispatch_error=data.get("last_dispatch_error"),
             dispatch_failures=dict(data.get("dispatch_failures", {}) or {}),
             max_dispatch_attempts=int(data.get("max_dispatch_attempts", 3)),

@@ -360,7 +360,7 @@ def _is_meta_work_order(data: dict[str, Any]) -> bool:
         return True
     wo_type = str(data.get("type") or "").upper()
     title = str(data.get("title") or "").lower()
-    if wo_type == "VALIDATION" and "integration review" in title:
+    if wo_type in ("VALIDATION", "QA", "TEST") and "integration review" in title:
         return True
     if wo_type == "RESEARCH" and "system architecture" in title:
         return True

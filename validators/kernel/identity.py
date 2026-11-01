@@ -122,7 +122,9 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
 
     if any(k in norm for k in ("claude", "architecture", "architect")):
         ops = base_set | {
-            OperationType.WRITE_FILE.value,  # Governed artifacts and blocker fixes
+            OperationType.WRITE_FILE.value,
+            OperationType.BATCH_WRITE_FILES.value,  # Governed artifacts and blocker fixes
+            OperationType.BATCH_WRITE_FILES.value,  # Atomic multi-artifact authoring
             OperationType.APPLY_PATCH.value,  # Direct blocker patches
             OperationType.RUN_COMMAND.value,  # Read-only inspect and execution
             OperationType.RUN_TESTS.value,  # Verify fixes against test suites
@@ -153,6 +155,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         ops = base_set | {
             OperationType.APPLY_PATCH.value,
             OperationType.WRITE_FILE.value,
+            OperationType.BATCH_WRITE_FILES.value,
             OperationType.MOVE_FILE.value,
             OperationType.DELETE_FILE.value,
             OperationType.FORMAT_FILE.value,
@@ -185,6 +188,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         ops = base_set | {
             OperationType.APPLY_PATCH.value,
             OperationType.WRITE_FILE.value,
+            OperationType.BATCH_WRITE_FILES.value,
             OperationType.MOVE_FILE.value,
             OperationType.DELETE_FILE.value,
             OperationType.FORMAT_FILE.value,
@@ -227,6 +231,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         # withheld (apply_patch/delete_file/move_file/git_* mutations).
         ops = base_set | {
             OperationType.WRITE_FILE.value,
+            OperationType.BATCH_WRITE_FILES.value,
             OperationType.RUN_COMMAND.value,
             OperationType.PROCESS_START.value,
             OperationType.PROCESS_STATUS.value,
@@ -266,7 +271,8 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         # Exclusively holds all Git mutations and release management
         ops = base_set | {
             OperationType.APPLY_PATCH.value,  # Version/changelog metadata only
-            OperationType.WRITE_FILE.value,   # Version/changelog metadata only
+            OperationType.WRITE_FILE.value,
+            OperationType.BATCH_WRITE_FILES.value,   # Version/changelog metadata only
             OperationType.MOVE_FILE.value,
             OperationType.DELETE_FILE.value,
             OperationType.FORMAT_FILE.value,

@@ -2,7 +2,7 @@
 # Use for: Major product phases (Phase 7, Phase 8, etc.)
 # Triggered by: CEO directive or PLAN.md progression
 
-id: "WO-XXX"
+id: "WO-001"  # Required: sequential 3-digit number (WO-001, WO-002, etc. - regex ^WO-[0-9]{3}$)
 type: PHASE
 title: ""
 status: ACTIVE

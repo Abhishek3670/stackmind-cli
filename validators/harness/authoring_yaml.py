@@ -1,4 +1,8 @@
-"""YAML parsing and repair for authored artifacts.\n\nHandles YAML parsing, scalar block repair, and normalization of work order/contract\ndata structures. Fail-closed on parse errors.\n"""
+"""YAML parsing and repair for authored artifacts.
+
+Handles YAML parsing, scalar block repair, and normalization of work order/contract
+data structures. Fail-closed on parse errors.
+"""
 
 from __future__ import annotations
 
@@ -73,9 +77,33 @@ def normalize_contract_data(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         return data
 
-    # Strip unexpected fields that violate contract.schema.json
-    data.pop("title", None)
-    data.pop("version", None)
+    # Map aliases for work order linkage
+    if "wo_id" in data and "work_order" not in data:
+        data["work_order"] = data.pop("wo_id")
+    elif "work_order_id" in data and "work_order" not in data:
+        data["work_order"] = data.pop("work_order_id")
+
+    # Map agent aliases
+    if "agent" in data and "agent_id" not in data:
+        data["agent_id"] = data.pop("agent")
+
+    # Strip unexpected fields that violate contract.schema.json (which has additionalProperties: false)
+    ALLOWED_CONTRACT_KEYS = {
+        "schema_version",
+        "synthesized_by",
+        "normalized_by",
+        "agent_id",
+        "work_order",
+        "contract_revision",
+        "guidelines",
+        "skills",
+        "identity",
+        "scope",
+        "budget",
+    }
+    for k in list(data.keys()):
+        if k not in ALLOWED_CONTRACT_KEYS:
+            data.pop(k, None)
 
     # schema_version must be integer
     if "schema_version" in data:
@@ -157,10 +185,11 @@ def validate_artifact_content(
     errors: list[str] = []
     author = agent or "unknown"
     norm_path = rel_path.replace("\\", "/").strip().lstrip("/")
-    artifact_type = classify_artifact(norm_path)
 
     # 1. Role Authorization Check
-    from .authoring_role import is_authorized, classify_artifact as _classify
+    from .authoring_role import is_authorized, classify_artifact
+
+    artifact_type = classify_artifact(norm_path)
 
     auth_ok, reason = is_authorized(agent)
     if not auth_ok and reason:
@@ -224,7 +253,6 @@ def validate_artifact_content(
     # 3. Schema & Semantic Validation by Artifact Type
     if artifact_type == "work_order":
         data = normalize_work_order_data(data)
-        # Schema validation would be called separately
         if not errors:
             try:
                 normalized_content = yaml.safe_dump(data, sort_keys=False)
@@ -238,9 +266,8 @@ def validate_artifact_content(
             except Exception:
                 pass
     elif artifact_type == "index":
-        pass  # Index validation handled elsewhere
+        pass
     else:
-        # Not a governed work-order or contract
         pass
 
     # 4. Overwrite Conflict Check
@@ -248,6 +275,7 @@ def validate_artifact_content(
         Path(project_root).resolve() if project_root is not None else None
     )
     if effective_root is not None:
+        from .authoring_conflict import _check_overwrite_conflict
         _check_overwrite_conflict(
             norm_path, content, data, effective_root, errors, author=author
         )
@@ -259,10 +287,8 @@ def validate_artifact_content(
                 normalized_content = yaml.safe_dump(data, sort_keys=False)
             except Exception:
                 pass
-        # Track that we authored this path in the current session
-        from .authoring_conflict import _session_authored_paths  # type: ignore
-
-        # We can't easily import here, but the conflict module tracks this
+        from .authoring_conflict import _session_authored_paths
+        _session_authored_paths.add(norm_path)
 
     return {
         "passed": passed,

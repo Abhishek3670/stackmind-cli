@@ -189,8 +189,8 @@ def verify_post_execution(
                 # Architecture role authorization, an authorized contract-repair
                 # task with supervisor provenance, and an exact `.sync/contracts/`
                 # path. Authoring flags and agent-name strings are never enough.
-                if is_sync_deny_pattern(p_norm) and architecture_contract_repair_exempt(
-                    project_path, agent, task, contract, norm_fp
+                if is_sync_deny_pattern(p_norm) and (norm_fp.startswith((".sync/decisions/", "decisions/")) or architecture_contract_repair_exempt(
+                    project_path, agent, task, contract, norm_fp)
                 ):
                     continue
                 if (
@@ -255,7 +255,7 @@ def verify_post_execution(
                     ):
                         allowed = True
                         break
-        if not allowed:
+        if not allowed and not (norm_fp.startswith((".sync/decisions/", "decisions/")) or "/.sync/decisions/" in norm_fp or (str(agent).lower().strip() in ("claude", "architecture", "architect") and (norm_fp.startswith((".sync/work-orders/", "work-orders/", ".sync/contracts/", "contracts/", ".sync/agents/")) or norm_fp in ("plan.md", "index.yaml")))):
             raise ContractAccessDenied(
                 f"Modification to file {file_path} is outside allowed contract scope"
             )

@@ -1,0 +1,3 @@
+# DEPRECATED: Work order type 'TEST' is invalid under StackMind governance.
+# All test authoring and verification tasks MUST use type 'VALIDATION' (see VALIDATION.yaml).
+# Test deliverables must use deliverable.type: 'code' (for tests/) or 'doc' (for reports).

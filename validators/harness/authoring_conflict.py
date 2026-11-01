@@ -98,12 +98,17 @@ def _check_overwrite_conflict(
             "recovery-repair",
             "architect-repair",
             "authoring-repair",
+            "architect_delegation",
             "repair",
             "reconcile",
         }
+
+
+
         is_repair = (
             existing_synth in repair_markers
             or new_synth in repair_markers
+
             or str(existing_data.get("status", "")).upper() in {"BLOCKED", "REWORK"}
             or bool(existing_data.get("error") or existing_data.get("blocked_reason"))
         )

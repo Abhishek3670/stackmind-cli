@@ -90,13 +90,23 @@ class _CompletionMixin:
         is_architecture = self._is_architect_agent()
         is_authoring_task = (
             is_architecture
-            and any(
-                kw in full_task_desc.lower()
-                for kw in (
-                    "author the implementation work orders",
-                    "author child work orders",
-                    "has been approved by the operator",
-                    "authoring work orders and contracts",
+            and (
+                getattr(request.task, "is_authoring", False)
+                or getattr(request, "is_authoring", False)
+                or any(
+                    kw in full_task_desc.lower()
+                    for kw in (
+                        "author the implementation work orders",
+                        "author child work orders",
+                        "has been approved by the operator",
+                        "authoring work orders and contracts",
+                        "work order",
+                        "work-order",
+                        "delegate",
+                        "verify",
+                        "test",
+                        "qa",
+                    )
                 )
             )
         )
@@ -163,6 +173,7 @@ class _CompletionMixin:
             on_token=getattr(self, 'on_token', None),
             on_usage=getattr(self, 'on_usage', None),
         )
+        gateway.is_authoring = is_authoring_task
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
             task_text += f"\nImportant PLAN.md formatting requirement:\n{PLAN_GENERATION_INSTRUCTIONS}\n"
@@ -224,12 +235,16 @@ class _CompletionMixin:
             )
         elif is_architecture and is_authoring_task:
             system_msg = (
-                "You are Claude, the Senior Architect for StackMind CLI. "
-                "The operator has approved the architecture plan in PLAN.md. "
-                "Your task now is to author the implementation Work Orders and Contracts for the tasks in PLAN.md. "
-                "You operate in a governed environment where all file I/O MUST be performed through provided tools (read_file, write_file).\n"
-                "WORKFLOW RULE: Call `write_file` to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
-                "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas.\n"
+                "You are Claude, the Senior Architect for StackMind CLI.\n"
+                "Your role is to author or delegate Work Orders and Contracts to worker agents based on the operator's prompt and plan.\n"
+                "You operate in a governed environment where all file I/O MUST be performed through provided tools (delegate_task, write_file, batch_write_files).\n\n"
+                "CANONICAL GOVERNANCE RULES FOR WORK ORDERS:\n"
+                "1. QA and Verification: All QA, testing, and verification tasks MUST use `type: 'VALIDATION'`. 'QA' is an assigned agent/role ('gemma'), NEVER a work-order type!\n"
+                "2. Allowed Work Order Types: ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']. Values 'QA' and 'TEST' are INVALID and strictly rejected.\n"
+                "3. Allowed Deliverable Types: ['code', 'doc', 'config', 'module']. Test files (under tests/) MUST use `deliverable.type: 'code'`. Test reports/docs use `deliverable.type: 'doc'`. Values 'test' and 'report' are INVALID.\n\n"
+                "DELEGATION & AUTHORING WORKFLOWS:\n"
+                "- AD-HOC DELEGATION: When the operator asks to delegate a verification or implementation task (e.g. delegate verification to the QA agent), invoke `delegate_task(target_agent='qa', instructions='...', target_files=['tests/...'])`. This immediately authors the canonical VALIDATION work order in .sync/work-orders/ACTIVE/ and its contract in .sync/contracts/.\n"
+                "- BATCH / PLAN-BASED AUTHORING: Call `write_file` or `batch_write_files` to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas.\n\n"
                 "INTEGRATION CONTRACT RULE: When decomposing a feature across multiple files (e.g. HTML, CSS, JS), "
                 "the parent Work Order (e.g. index.html) MUST explicitly declare the exact markup, container classes, and "
                 "element IDs (e.g. #animated-name) in its deliverable description and acceptance criteria so downstream "
@@ -478,10 +493,17 @@ class _CompletionMixin:
                 raise
 
             # Exactly one tool-less finalization turn
+            written_str = ", ".join(sorted(written_files_so_far)) if written_files_so_far else "none"
+            task_title = getattr(request.task, "title", "") or ""
+            deliv = getattr(request.task, "deliverable_path", "") or "none"
             fin_prompt = (
-                f"Execution guard '{guard_trip}' was triggered: {exc}. "
-                "Tool execution is now closed. Based on the files you have written, "
-                "please output your final HarnessDecision JSON now."
+                f"Execution guard '{guard_trip}' was triggered: {exc}.\n"
+                f"Tool execution is now closed.\n"
+                f"Current Task: {task_title}\n"
+                f"Assigned Deliverable: {deliv}\n"
+                f"Files successfully written in this session: {written_str}\n\n"
+                "Please output your final HarnessDecision JSON now. Include all written files in 'modified_files'. "
+                "If your assigned deliverable was written, declare status 'completed'; otherwise declare status 'blocked' with specific blocker details."
             )
             messages.append(Message.user(fin_prompt))
             try:
@@ -659,7 +681,7 @@ class _CompletionMixin:
 
             wo_type_upper = str(getattr(request.task, 'work_order_type', '') or '').upper()
             is_validation_or_review = (
-                wo_type_upper == 'VALIDATION'
+                wo_type_upper in ('VALIDATION', 'QA', 'TEST')
                 or request.task.kind == 'validation'
                 or (wo_type_upper not in ('RESEARCH', 'AUDIT') and (
                     'integration review' in (request.task.title or '').lower()

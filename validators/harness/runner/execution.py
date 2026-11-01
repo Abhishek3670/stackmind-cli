@@ -531,12 +531,17 @@ class _ExecutionMixin:
             # failing the declaration gate, and claimed-but-never-written files
             # stay a declaration failure.
             auto_added_files: list[str] = []
-            journal = getattr(tool_runtime, "boundary", None) and tool_runtime.boundary.journal
+            boundary = (
+                getattr(tool_runtime, "boundary", None)
+                or getattr(getattr(tool_runtime, "gateway", None), "boundary", None)
+            )
+            journal = getattr(boundary, "journal", None) if boundary is not None else None
             if decision is not None and journal is not None:
                 written_paths = [
-                    rec.request.target.replace('workspace/', '', 1).replace('\\', '/')
+                    Path(rec.request.target.replace('workspace/', '', 1)).as_posix().lstrip('/')
                     for rec in journal.records
-                    if rec.request.operation_type.value == 'write_file' and rec.result == 'written'
+                    if getattr(getattr(rec.request, 'operation_type', None), 'value', None) in ('write_file', 'batch_write_files', 'delegate_task')
+                    and rec.result in ('written', 'delegated')
                 ]
                 decision, auto_added_files = reconcile_modified_files(decision, written_paths)
 
@@ -659,12 +664,16 @@ class _ExecutionMixin:
                     dec_norm = {Path(p).as_posix().lstrip('/') for p in decision.modified_files if p}
                     tool_written: set[str] = set()
                     if tool_runtime is not None:
-                        journal = getattr(tool_runtime, "boundary", None) and tool_runtime.boundary.journal
+                        boundary = (
+                            getattr(tool_runtime, "boundary", None)
+                            or getattr(getattr(tool_runtime, "gateway", None), "boundary", None)
+                        )
+                        journal = getattr(boundary, "journal", None) if boundary is not None else None
                         if journal is not None:
                             tool_written.update(
                                 Path(rec.request.target.replace('workspace/', '', 1)).as_posix().lstrip('/')
                                 for rec in journal.records
-                                if rec.request.operation_type.value == 'write_file' and rec.result == 'written'
+                                if getattr(getattr(rec.request, 'operation_type', None), 'value', None) in ('write_file', 'batch_write_files') and rec.result == 'written'
                             )
                         if hasattr(tool_runtime, "gateway") and hasattr(tool_runtime.gateway, "written_files"):
                             tool_written.update(Path(p).as_posix().lstrip('/') for p in tool_runtime.gateway.written_files)

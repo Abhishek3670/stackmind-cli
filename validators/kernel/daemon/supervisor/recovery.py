@@ -771,41 +771,42 @@ class _RecoveryMixin:
         Deterministic supervisor bookkeeping so the Architect can persist the
         machine-readable decision file; never a worker-performed edit.
         """
-        contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
-        if not contract_file.is_file():
-            return
-        try:
-            data = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return
-            scope = data.setdefault("scope", {})
-            allow_list = scope.setdefault("allow", [])
-            existing = {
-                r.get("module") for r in allow_list if isinstance(r, dict)
-            }
-            needed = [".sync/decisions/**", ".sync/decisions/*"]
-            updated = False
-            for n in needed:
-                if n not in existing:
-                    allow_list.append({"module": n})
+        target_files = [ws / ".sync" / "contracts" / f"{wo_id}.yaml", ws / ".sync" / "agents" / "claude.contract.yaml"]
+        for contract_file in target_files:
+            if not contract_file.is_file():
+                continue
+            try:
+                data = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                scope = data.setdefault("scope", {})
+                allow_list = scope.setdefault("allow", [])
+                existing = {
+                    r.get("module") for r in allow_list if isinstance(r, dict)
+                }
+                needed = [".sync/decisions/**", ".sync/decisions/*"]
+                updated = False
+                for n in needed:
+                    if n not in existing:
+                        allow_list.append({"module": n})
+                        updated = True
+                deny_list = scope.get("deny") or []
+                filtered_deny = [
+                    r for r in deny_list
+                    if not (
+                        (isinstance(r, dict) and r.get("module") in (".sync/**", ".sync/*", ".sync", ".sync/decisions/**", ".sync/decisions/*"))
+                        or (isinstance(r, str) and r in (".sync/**", ".sync/*", ".sync", ".sync/decisions/**", ".sync/decisions/*"))
+                    )
+                ]
+                if len(filtered_deny) != len(deny_list):
+                    scope["deny"] = filtered_deny
                     updated = True
-            deny_list = scope.get("deny") or []
-            filtered_deny = [
-                r for r in deny_list
-                if not (
-                    (isinstance(r, dict) and r.get("module") in (".sync/**", ".sync/*", ".sync", ".sync/decisions/**", ".sync/decisions/*"))
-                    or (isinstance(r, str) and r in (".sync/**", ".sync/*", ".sync", ".sync/decisions/**", ".sync/decisions/*"))
-                )
-            ]
-            if len(filtered_deny) != len(deny_list):
-                scope["deny"] = filtered_deny
-                updated = True
-            if updated:
-                contract_file.write_text(
-                    yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
-                )
-        except Exception:
-            pass
+                if updated:
+                    contract_file.write_text(
+                        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+                    )
+            except Exception:
+                pass
 
     def _ensure_dependency_escalation_channel(self, ws: Path, wo_id: str) -> None:
         """Grant dependency manifest and inbox channels on the contract for architecture escalation.

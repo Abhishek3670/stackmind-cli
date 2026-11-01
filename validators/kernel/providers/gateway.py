@@ -64,6 +64,28 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
         },
     ),
     ToolDefinition(
+        name="batch_write_files",
+        description="Write multiple files in a single batch operation within the scratch workspace. Each file is independently validated and governed.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative file path inside workspace"},
+                            "content": {"type": "string", "description": "Text content to write"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                    "description": "List of files to write in this batch",
+                }
+            },
+            "required": ["files"],
+        },
+    ),
+    ToolDefinition(
         name="apply_patch",
         description="Apply a unified diff patch to modify an existing file.",
         parameters={
@@ -1285,11 +1307,12 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
 
 
-PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "web_search", "image_search", "web_fetch")
-AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "list_directory")
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "batch_write_files", "delegate_task", "web_search", "image_search", "web_fetch")
+AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "batch_write_files", "delegate_task", "list_directory")
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
     "write_file",
+    "batch_write_files",
     "apply_patch",
     "list_directory",
     "query_graph",
@@ -1315,6 +1338,7 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
 WORKER_CODE_CORE_TOOL_NAMES = (
     "read_file",
     "write_file",
+    "batch_write_files",
     "apply_patch",
     "list_directory",
     "glob",
@@ -1324,6 +1348,7 @@ WORKER_CODE_CORE_TOOL_NAMES = (
 WORKER_QA_CORE_TOOL_NAMES = (
     "read_file",
     "write_file",
+    "batch_write_files",
     "list_directory",
     "glob",
     "run_tests",
@@ -1334,6 +1359,7 @@ WORKER_QA_CORE_TOOL_NAMES = (
 WORKER_GITOPS_CORE_TOOL_NAMES = (
     "read_file",
     "write_file",
+    "batch_write_files",
     "list_directory",
     "git_status",
     "git_diff",
@@ -1394,7 +1420,7 @@ def get_curated_tools_for_phase(
         all_permitted.append(request_tools_def)
     return all_permitted
 
-DEFAULT_MAX_TURNS: int = 20
+DEFAULT_MAX_TURNS: int = 35
 DEFAULT_MAX_TOOL_CALLS: int = 35
 DEFAULT_MAX_TOOL_CALLS_PER_TURN: int = 10
 DEFAULT_MAX_TOOL_OUTPUT_CHARS: int = 16_000
@@ -1631,6 +1657,7 @@ class ProviderGateway:
         self.written_files: list[str] = []
         self.required_deliverable: str | None = None
         self.read_counts: dict[str, int] = {}
+        self._static_read_cache: dict[str, str] = {}
         self._step_count: int = 0
         self._file_write_count: int = 0
         self.budget_status: dict[str, Any] = {"tokens_used": 0, "max_tokens": None, "tool_calls_used": 0, "max_tool_calls": None, "steps": 0}
@@ -1796,11 +1823,24 @@ class ProviderGateway:
                         )
                     return res
 
+                norm_t = target.replace("\\", "/").strip().lstrip("/")
+                is_static = norm_t.endswith(".schema.json") or norm_t.startswith(("schemas/", ".sync/schemas/", "templates/", ".sync/work-orders/TEMPLATES/"))
+                if is_static and norm_t in self._static_read_cache:
+                    self.total_tool_calls = max(0, self.total_tool_calls - 1)
+                    r_count = self.read_counts.get(target, 0) + 1
+                    self.read_counts[target] = r_count
+                    return (
+                        f"{self._static_read_cache[norm_t]}\n\n"
+                        f"[CACHE HIT: Reused verified static context for '{target}'. Tool call budget was NOT charged. Proceed with writing deliverables.]"
+                    )
+
                 result = self.tool_gateway.read_file(target)
+                if is_static:
+                    self._static_read_cache[norm_t] = result
                 self.consecutive_failures = 0
                 r_count = self.read_counts.get(target, 0) + 1
                 self.read_counts[target] = r_count
-                out = truncate_tool_output(result, max_chars=self.max_tool_output_chars)
+                out = result if is_static else truncate_tool_output(result, max_chars=self.max_tool_output_chars)
                 if r_count > 1:
                     out += (
                         f"\n\n[NOTICE: You have already read '{target}' in this session ({r_count} times). "
@@ -1894,6 +1934,26 @@ class ProviderGateway:
                 if diff_str.strip():
                     return f"Successfully wrote {len(content)} characters to {target}\n{diff_str}"
                 return f"Successfully wrote {len(content)} characters to {target}"
+
+            if name == "batch_write_files":
+                files = args.get("files") or []
+                if not files:
+                    self.consecutive_failures += 1
+                    return "Error: 'batch_write_files' requires a non-empty 'files' array."
+                res = self.tool_gateway.batch_write_files(files)
+                self.consecutive_failures = 0
+                for f in res.get("files", []):
+                    if f not in self.written_files:
+                        self.written_files.append(f)
+                if res.get("status") == "partial_success":
+                    return (
+                        f"Partially succeeded: successfully wrote {res['written_count']} file(s): {', '.join(res['files'])}.\n"
+                        f"However, {res['failed_count']} file(s) failed validation:\n" +
+                        "\n".join(f"- {e}" for e in res.get("errors", [])) +
+                        "\nACTIONABLE NEXT STEP: Do NOT re-read schemas or re-write already successful files. "
+                        "Fix only the failed file(s) and submit them with write_file or batch_write_files."
+                    )
+                return f"Successfully wrote {res.get('written_count', len(files))} file(s) in batch: {', '.join(res.get('files', []))}"
 
             if name == "run_command":
                 cmd = args.get("command") or args.get("cmd") or args.get("args")
@@ -2070,6 +2130,13 @@ class ProviderGateway:
 
                 result = method(**kwargs)
                 self.consecutive_failures = 0
+                if name == "delegate_task" and isinstance(result, dict):
+                    wo_f = result.get("work_order_file")
+                    if wo_f and wo_f not in self.written_files:
+                        self.written_files.append(str(wo_f))
+                    c_f = result.get("contract_file") or (f".sync/contracts/{result['work_order_id']}.yaml" if result.get("work_order_id") else None)
+                    if c_f and c_f not in self.written_files:
+                        self.written_files.append(str(c_f))
                 if name == "apply_patch":
                     p_content = kwargs.get("patch_content") or ""
                     tgt = kwargs.get("target") or "file"
@@ -2561,29 +2628,49 @@ class ProviderGateway:
                 norm_del = Path(required_deliverable).as_posix().lstrip("/") if required_deliverable else None
                 norm_written = {Path(p).as_posix().lstrip("/") for p in self.written_files}
                 has_unwritten_deliverable = bool(norm_del and norm_del not in norm_written)
-                has_write_tool = any(t.name == "write_file" for t in active_tools)
+                has_write_tool = any(t.name in ("write_file", "batch_write_files", "delegate_task") for t in active_tools)
+
+                actor_str = str(getattr(self.tool_gateway, "actor_id", "") or "").lower()
+                is_arch = any(k in actor_str for k in ("claude", "architect", "architecture"))
+                has_work_orders = any(p.startswith((".sync/work-orders/ACTIVE/", ".sync/contracts/")) for p in norm_written)
 
                 should_nudge = bool(
-                    required_deliverable
+                    (required_deliverable or getattr(self, "is_authoring", False) or is_arch)
                     and has_write_tool
                     and empty_tool_nudges < max_empty_tool_nudges
-                    and (self.total_tool_calls == 0 or has_unwritten_deliverable)
+                    and (self.total_tool_calls == 0 or has_unwritten_deliverable or (is_arch and not has_work_orders))
                 )
 
                 if should_nudge:
                     empty_tool_nudges += 1
-                    target_hint = f" '{required_deliverable}'" if required_deliverable else ""
-                    nudge_content = (
-                        f"You responded with text without calling tools or authoring required deliverable{target_hint}.\n"
-                        f"You MUST invoke `write_file` now to author your required deliverable{target_hint}.\n"
-                        "Note: Code execution, virtual environments, and tests are managed externally by the harness and QA lead. "
-                        "Do not wait or look for a virtual environment (.venv) or shell execution.\n"
-                        "To call write_file, invoke the tool or emit:\n"
-                        "<tool_call>\n"
-                        f'{{"name": "write_file", "arguments": {{"path": "{required_deliverable or "<file_path>"}", "content": "<file_content>"}}}}\n'
-                        "</tool_call>\n"
-                        "Please call `write_file` now."
-                    )
+                    target_hint = f" '{required_deliverable}'" if required_deliverable else " (work orders and contracts)"
+                    can_delegate = any(t.name == "delegate_task" for t in active_tools)
+                    if is_arch and not has_work_orders:
+                        nudge_content = (
+                            "CRITICAL: You are the Lead Architect. You have not yet authored or saved any Work Orders "
+                            "in `.sync/work-orders/ACTIVE/` or Contracts in `.sync/contracts/` for this request. "
+                            "You must author the work orders and contracts (using `batch_write_files` or `write_file`) "
+                            "or invoke `delegate_task(target_agent=..., instructions=..., target_files=[...])` "
+                            "so the worker agents (Backend, Frontend, QA) can implement the requested application. "
+                            "Do NOT conclude your turn until work orders and contracts are created."
+                        )
+                    else:
+                        del_hint = (
+                            "If delegating a task to QA or a worker, invoke `delegate_task(target_agent='qa', instructions='...', target_files=['...'])` now.\n"
+                            if can_delegate else ""
+                        )
+                        nudge_content = (
+                            f"You responded with text without calling tools or authoring required deliverable{target_hint}.\n"
+                            f"{del_hint}"
+                            f"You MUST invoke `write_file` or `delegate_task` now to author your required deliverable{target_hint}.\n"
+                            "Note: Code execution, virtual environments, and tests are managed externally by the harness and QA lead. "
+                            "Do not wait or look for a virtual environment (.venv) or shell execution.\n"
+                            "To call write_file, invoke the tool or emit:\n"
+                            "<tool_call>\n"
+                            f'{{"name": "write_file", "arguments": {{"path": "{required_deliverable or "<file_path>"}", "content": "<file_content>"}}}}\n'
+                            "</tool_call>\n"
+                            "Please call `delegate_task` or `write_file` now."
+                        )
                     messages.append(Message.user(nudge_content))
                     continue
                 return messages
@@ -2597,6 +2684,14 @@ class ProviderGateway:
                     tool_calls=self.total_tool_calls,
                     max_tool_calls=effective_max_tool_calls,
                 )
+
+            remaining_calls = effective_max_tool_calls - self.total_tool_calls
+            if 0 < remaining_calls <= 3:
+                warning_text = (
+                    f"[BUDGET WARNING: You have {remaining_calls} tool call(s) remaining in your operational budget. "
+                    "Conclude any pending authoring and generate your final deliverables and HarnessDecision JSON now.]"
+                )
+                messages.append(Message.user(warning_text))
 
             # Record signatures for repetition/cycle detection
             for tc in (response.message.tool_calls or () if response.message else ()):
@@ -2615,7 +2710,7 @@ class ProviderGateway:
                 if all(s == last_sig for s in recent_signatures[-DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:]):
                     if (
                         last_sig[0] in ("read_file", "list_directory", "glob", "grep")
-                        and required_deliverable
+                        and (required_deliverable or getattr(self, "is_authoring", False) or loop_nudges < max_loop_nudges)
                         and loop_nudges < max_loop_nudges
                     ):
                         loop_nudges += 1
@@ -2648,7 +2743,7 @@ class ProviderGateway:
             if triggered_sig is not None:
                 if (
                     triggered_sig[0] in ("read_file", "list_directory", "glob", "grep")
-                    and required_deliverable
+                    and (required_deliverable or getattr(self, "is_authoring", False) or loop_nudges < max_loop_nudges)
                     and loop_nudges < max_loop_nudges
                 ):
                     loop_nudges += 1
@@ -2656,8 +2751,8 @@ class ProviderGateway:
                     recent_signatures = [s for s in recent_signatures if s != triggered_sig] + [triggered_sig]
                     target_hint = (
                         f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
-                        if not self.has_written_deliverable(required_deliverable)
-                        else " Proceed immediately with your work."
+                        if required_deliverable and not self.has_written_deliverable(required_deliverable)
+                        else " You have already inspected this file. Call delegate_task or write_file now to author the required work order."
                     )
                     messages.append(Message.user(
                         f"[SYSTEM WARNING: You have called '{triggered_sig[0]}' with identical arguments {triggered_count} times without making progress. "

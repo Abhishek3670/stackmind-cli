@@ -113,6 +113,11 @@ class GovernedToolRuntime:
     workspace: Any
     gateway: Any
 
+    @property
+    def boundary(self) -> Any:
+        """Authoritative runtime boundary accessed via the gateway."""
+        return getattr(self.gateway, "boundary", None)
+
 class LLMProvider(Protocol):
     """Provider contract for the governed agent loop."""
 

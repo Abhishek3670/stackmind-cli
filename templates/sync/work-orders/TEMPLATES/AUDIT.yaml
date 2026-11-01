@@ -2,7 +2,7 @@
 # Use for: Code quality, security, performance, or compliance audits
 # Triggered by: CEO request, phase gate, or scheduled review
 
-id: "WO-XXX"
+id: "WO-001"  # Required: sequential 3-digit number (WO-001, WO-002, etc. - regex ^WO-[0-9]{3}$)
 type: AUDIT
 title: ""
 status: ACTIVE

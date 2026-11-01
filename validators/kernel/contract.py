@@ -116,7 +116,7 @@ class ContractEvaluator:
     """Fail-closed target and operation authorization evaluator."""
 
     _WRITE_OPERATIONS = {
-        "write_file", "apply_patch", "patch_file", "move_file", "delete_file", "format_file",
+        "write_file", "batch_write_files", "apply_patch", "patch_file", "move_file", "delete_file", "format_file",
         "run_command", "process_start", "git_stage", "git_restore", "git_create_branch",
         "git_commit", "git_tag", "git_push", "create_release", "rollback_release",
         "create_work_order", "update_work_order", "reopen_work_order",

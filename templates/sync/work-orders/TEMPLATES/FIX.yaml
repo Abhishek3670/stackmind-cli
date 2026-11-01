@@ -1,0 +1,25 @@
+# Work Order Template: FIX
+# Use for: Direct bug fix or defect repair
+# Triggered by: QA verdict FAIL or test failure
+
+id: "WO-001"  # Required: sequential 3-digit number (WO-001, WO-002, etc. - regex ^WO-[0-9]{3}$)
+type: FIX
+title: ""
+status: ACTIVE
+priority: P1
+assigned_agents: []
+dependencies: []
+plan_ref: ""
+created: ""
+updated: ""
+
+# ─── Fix Fields ──────────────────────────────────────────────
+description: ""
+acceptance_criteria: []
+deliverable:
+  type: "code"
+  path: ""
+  description: "Bug fix implementation"
+
+# ─── Execution Log ───────────────────────────────────────────
+log: []

@@ -364,9 +364,16 @@ class AuthoringGate:
     def _validate_index(
         self, norm_path: str, data: dict[str, Any], errors: list[str]
     ) -> None:
-        """Validate index semantic constraints: cycle detection and inverted GitOps dependencies."""
+        """Validate index semantic constraints: schema, cycle detection, and inverted GitOps dependencies."""
         if not isinstance(data, dict):
             return
+        schema = self.get_schema("index.schema.json")
+        if schema:
+            validator = Draft7Validator(schema)
+            for err in validator.iter_errors(data):
+                field_path = ".".join(str(p) for p in err.path) or "root"
+                errors.append(f"Work Order Index schema error at '{field_path}': {err.message}")
+
         orders = data.get("orders")
         if not isinstance(orders, list):
             return

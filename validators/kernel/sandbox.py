@@ -358,6 +358,18 @@ class ProcessSandbox:
                 seen.add(marker)
         for key, value in (extra or {}).items():
             env[key] = value
+
+        # Ensure venv Scripts directory is at the front of PATH so python and pytest resolve correctly
+        if sys.executable:
+            venv_bin = os.path.dirname(sys.executable)
+            path_key = "PATH"
+            for k in env:
+                if k.upper() == "PATH":
+                    path_key = k
+                    break
+            existing_path = env.get(path_key, "")
+            if venv_bin.lower() not in existing_path.lower():
+                env[path_key] = f"{venv_bin}{os.pathsep}{existing_path}"
         return env
 
     @staticmethod
@@ -423,6 +435,8 @@ class ProcessSandbox:
         proc = None
         try:
             try:
+                if argv and argv[0] in ("python", "python3") and sys.executable:
+                    argv = [sys.executable] + list(argv[1:])
                 proc = subprocess.Popen(
                     argv,
                     cwd=self.workspace.root,

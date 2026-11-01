@@ -24,6 +24,7 @@ class OperationType(str, Enum):
     # Editing
     APPLY_PATCH = "apply_patch"
     WRITE_FILE = "write_file"
+    BATCH_WRITE_FILES = "batch_write_files"
     MOVE_FILE = "move_file"
     DELETE_FILE = "delete_file"
     FORMAT_FILE = "format_file"

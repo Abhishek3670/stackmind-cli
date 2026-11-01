@@ -112,6 +112,27 @@ class ToolGateway:
     def delegated_tasks(self) -> list[dict[str, Any]]:
         return list(getattr(self, "_delegated_tasks", []))
 
+    @property
+    def written_files(self) -> list[str]:
+        """Authoritative list of relative workspace paths successfully written in this gateway attempt."""
+        if not getattr(self, "boundary", None) or not getattr(self.boundary, "journal", None):
+            return []
+        journal = self.boundary.journal
+        result: list[str] = []
+        for rec in journal.records:
+            op_val = getattr(getattr(rec.request, "operation_type", None), "value", None)
+            if op_val in ("write_file", "batch_write_files") and rec.result == "written":
+                target = getattr(rec.request, "target", "") or ""
+                clean = target.replace("\\", "/")
+                if clean.startswith("workspace/"):
+                    clean = clean[len("workspace/"):]
+                elif clean.startswith("./"):
+                    clean = clean[2:]
+                clean = clean.lstrip("/")
+                if clean and clean not in result:
+                    result.append(clean)
+        return result
+
     def _request(self, operation_type: OperationType, target: str) -> OperationRequest:
         return OperationRequest(operation_type, target, self.session_id, self.attempt_id,
                                 self.actor_id, self.provider_id)
@@ -204,6 +225,9 @@ class ToolGateway:
 
         # Fail-closed authoring gate for governed artifacts (.sync/contracts and .sync/work-orders)
         normalized_target = target.replace("\\", "/").strip().lstrip("/")
+        if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/"):
+            normalized_target = f".sync/{normalized_target}"
+            target = normalized_target
         if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):
             from validators.harness.authoring_gate import AuthoringGate
             gate = getattr(self, "_authoring_gate", None)
@@ -226,6 +250,45 @@ class ToolGateway:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "written")
+
+    def batch_write_files(self, files: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """Write multiple files within the scratch workspace.
+
+        Each file is independently validated through AuthoringGate and authorized
+        against the contract boundary.
+        """
+        if not isinstance(files, (list, tuple)) or not files:
+            raise ValueError("batch_write_files requires a non-empty list of file specifications")
+
+        written_paths = []
+        errors = []
+        for idx, entry in enumerate(files):
+            if not isinstance(entry, dict) or "path" not in entry or "content" not in entry:
+                errors.append(f"Entry {idx}: missing required 'path' or 'content' field")
+                continue
+            path = str(entry["path"])
+            content = str(entry["content"])
+            try:
+                self.write_file(path, content)
+                written_paths.append(path)
+            except Exception as exc:
+                errors.append(f"File '{path}': {exc}")
+
+        if errors and not written_paths:
+            raise PermissionError(f"Batch write failed ({len(errors)} error(s)): {'; '.join(errors)}")
+        if errors:
+            return {
+                "status": "partial_success",
+                "written_count": len(written_paths),
+                "files": written_paths,
+                "failed_count": len(errors),
+                "errors": errors,
+            }
+        return {
+            "status": "success",
+            "written_count": len(written_paths),
+            "files": written_paths,
+        }
 
     def run_command(self, command: Sequence[str] | str):
         record = self._authorize(OperationType.RUN_COMMAND, "workspace/command")
@@ -507,6 +570,9 @@ class ToolGateway:
 
         # Enforce fail-closed authoring gate if patching contracts or work orders
         normalized_target = target.replace("\\", "/").strip().lstrip("/")
+        if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/"):
+            normalized_target = f".sync/{normalized_target}"
+            target = normalized_target
         if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):
             from validators.harness.authoring_gate import AuthoringGate
             gate = getattr(self, "_authoring_gate", None)
@@ -3307,19 +3373,19 @@ class ToolGateway:
 
             if clean_files:
                 primary_deliv = clean_files[0]
-                deliv_type = "test" if (canonical_role == "qa" or "test" in primary_deliv.lower()) else "code"
+                deliv_type = "doc" if primary_deliv.endswith(".md") else "code"
                 deliv_spec = {
                     "path": primary_deliv,
                     "type": deliv_type,
                     "description": f"Deliverables for {canonical_role}: {', '.join(clean_files)}",
                 }
                 deliv_list = [
-                    {"path": f, "type": ("test" if "test" in f.lower() else "code")}
+                    {"path": f, "type": ("doc" if f.endswith(".md") else "code")}
                     for f in clean_files
                 ]
             else:
                 primary_deliv = None
-                deliv_type = "test" if canonical_role == "qa" else "code"
+                deliv_type = "code"
                 deliv_spec = {
                     "type": deliv_type,
                     "description": str(instructions).strip()[:120] or f"{canonical_role.title()} task deliverable",
@@ -3335,9 +3401,9 @@ class ToolGateway:
             wo_title = f"{canonical_role.title()}: {first_line_clean}"
 
             if canonical_role == "qa":
-                wo_type = "QA"
+                wo_type = "VALIDATION"
             elif canonical_role == "gitops":
-                wo_type = "RELEASE"
+                wo_type = "PHASE"
             else:
                 wo_type = "FEATURE"
 
@@ -3371,6 +3437,7 @@ class ToolGateway:
             wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
             contract_yaml = yaml.safe_dump(contract_rec, sort_keys=False)
             rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+            rel_contract_file = f".sync/contracts/{wo_id}.yaml"
 
             for target_ws in ws_roots:
                 try:
@@ -3447,6 +3514,7 @@ class ToolGateway:
             "status": "delegated",
             "work_order_id": wo_id,
             "work_order_file": rel_wo_file,
+            "contract_file": rel_contract_file if wo_id else None,
             "agent": canonical_agent,
             "role": canonical_role,
             "target_files": clean_files,

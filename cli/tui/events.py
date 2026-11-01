@@ -524,6 +524,15 @@ def extract_assistant_response(
         if output and isinstance(output, str) and output.strip():
             return clean_response(output)
 
+        if summary == "Completed task via tools":
+            audit = result.get("tool_calls_audit") or []
+            has_writes = any(isinstance(t, dict) and t.get("tool") in ("write_file", "batch_write_files", "delegate_task") for t in audit)
+            if not has_writes:
+                return clean_response(
+                    "Architecture turn completed without authoring Work Orders or deliverables. "
+                    "You can prompt the Architect again (e.g. 'Proceed with creating work orders WO-001 through WO-004') or call `delegate_task` to dispatch workers."
+                )
+
         mods = result.get("modified_files")
         if isinstance(mods, list) and mods:
             user_mods = [f for f in mods if not str(f).startswith((".sync", ".sync/"))]

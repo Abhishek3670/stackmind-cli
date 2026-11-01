@@ -1797,7 +1797,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             # so QA_DELIVERABLE_NOT_EXECUTABLE cannot fail the gate.
             is_qa_wo = (
                 primary_agent in ("gemma", "qa", "q/a")
-                or str(wo_data.get("type", "")).upper() in ("VALIDATION", "TEST")
+                or str(wo_data.get("type", "")).upper() == "VALIDATION"
                 or bool(matched_ref and str(matched_ref.get("agent", "")).lower() == "gemma")
             )
             if is_qa_wo:

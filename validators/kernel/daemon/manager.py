@@ -305,6 +305,8 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
             {"module": "go.mod"},
             {"module": ".sync/work-orders/**"},
             {"module": ".sync/contracts/**"},
+
+            {"module": ".sync/decisions/**"},
             {"module": ".sync/inbox/local-llm/**"},
             {"module": ".sync/inbox/claude/**"},
             {"module": ".sync/reviews/**"},
@@ -358,7 +360,7 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
                             existing_modules.add(item)
                     essential_docs = [
                         "README.md", "AGENTS.md", "ARCHITECTURE.md", "VERSION", "*.md",
-                        "package.json", "pyproject.toml", "Cargo.toml", "go.mod"
+                        "package.json", "pyproject.toml", "Cargo.toml", "go.mod", ".sync/decisions/**", ".sync/work-orders/**", ".sync/contracts/**"
                     ]
                     dirty = False
                     for doc in essential_docs:
@@ -498,8 +500,10 @@ def synthesize_bootstrap_planning(
                 {"module": "go.mod"},
                 {"module": ".sync/work-orders/**"},
                 {"module": ".sync/contracts/**"},
+
+    
                 {"module": ".sync/decisions/**"},
-                {"module": ".sync/inbox/local-llm/**"},
+            {"module": ".sync/inbox/local-llm/**"},
                 {"module": ".sync/inbox/claude/**"},
             ],
             "deny": [
@@ -3229,12 +3233,13 @@ class SessionManager:
                 self.complete_operation(session_id, operation_id, result_data, status="CANCELLED")
             elif res_status in {"completed", "idle"}:
                 # Check if this was a Turn 1 planning turn that generated a valid PLAN.md
-                is_goal_turn = bool(op_rec.get("metadata", {}).get("is_goal"))
-                is_authoring_turn = bool(op_rec.get("metadata", {}).get("is_authoring"))
+                is_goal_turn = bool((op_rec.get("metadata") or {}).get("is_goal"))
+                is_authoring_turn = bool((op_rec.get("metadata") or {}).get("is_authoring"))
+                plan_repair_turn = bool((op_rec.get("metadata") or {}).get("plan_repair_attempt"))
                 plan_file = ws_path / "PLAN.md"
                 mod_files = [str(f).replace("\\", "/").strip().lstrip("/") for f in (res_meta.get("modified_files") or [])]
                 plan_written_this_turn = any(f.endswith("PLAN.md") for f in mod_files)
-                if (is_goal_turn or plan_written_this_turn) and not is_authoring_turn and plan_file.is_file():
+                if (is_goal_turn or plan_written_this_turn) and (not is_authoring_turn or plan_repair_turn) and plan_file.is_file():
                     try:
                         from validators.harness.plan import validate_plan_structure, parse_plan
                         plan_content = plan_file.read_text(encoding="utf-8")
@@ -3401,6 +3406,11 @@ class SessionManager:
                 err_text = str(computed_err or "")
                 is_plan_gate_failure = "PLAN.md" in err_text and "verification gate failed" in err_text.lower()
                 retry_count = int((op_rec.get("metadata") or {}).get("plan_repair_attempt", 0))
+                is_wo_gate_failure = (
+                    any(k in err_text.lower() for k in ("work-orders", "contracts", "index.yaml"))
+                    and any(k in err_text.lower() for k in ("staged stackmind validate failed", "authoring validation failed", "schema error", "is not one of"))
+                )
+                wo_retry_count = int((op_rec.get("metadata") or {}).get("wo_repair_attempt", 0))
                 if is_plan_gate_failure and retry_count < 2:
                     self.events.publish(
                         "plan.auto_repair_requested",
@@ -3440,6 +3450,49 @@ class SessionManager:
                         return
                     except Exception as repair_exc:
                         self.events.publish("error", session_id, message=f"Failed to auto-revert plan to architect: {repair_exc}")
+                        return
+                elif is_wo_gate_failure and wo_retry_count < 2:
+                    self.events.publish(
+                        "work_order.auto_repair_requested",
+                        session_id,
+                        attempt=wo_retry_count + 1,
+                        errors=computed_err,
+                        operation_id=operation_id,
+                    )
+                    wo_repair_prompt = (
+                        f"CRITICAL ARCHITECTURE INSTRUCTION: Your authored Work Order, Contract, or Index YAML was REJECTED by StackMind runtime validation with the following errors:\n"
+                        f"{computed_err}\n\n"
+                        f"Please immediately repair and re-author the offending YAML file(s) in .sync/work-orders/ or .sync/contracts/ using write_file conforming to StackMind schemas:\n"
+                        f"1. Allowed 'type' enums for Work Orders and INDEX.yaml:\n"
+                        f"   ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']\n"
+                        f"   *GUIDANCE: For QA/verification tasks, declare type: 'VALIDATION' (NEVER 'QA' or 'TEST'). QA is an assigned agent/role, not a work-order type.*\n"
+                        f"2. Allowed 'deliverable.type' enums for Work Orders:\n"
+                        f"   ['code', 'doc', 'config', 'module']\n"
+                        f"   *GUIDANCE: For test suites use deliverable.type: 'code' (with path under tests/); for reviews/reports use deliverable.type: 'doc' (NEVER 'test' or 'report').*\n"
+                        f"3. Priorities and Statuses:\n"
+                        f"   - priority must be 'P0', 'P1', 'P2', or 'P3'\n"
+                        f"   - status must be 'ACTIVE', 'PENDING', 'READY', 'BLOCKED', or 'COMPLETED'\n"
+                        f"4. Dependencies: list of existing WO IDs, e.g. ['WO-001'] or []\n"
+                        f"5. All entries in .sync/work-orders/INDEX.yaml must match the corresponding .sync/work-orders/ACTIVE/<WO-ID>.yaml files.\n\n"
+                        f"Re-author the valid YAML file(s) now."
+                    )
+                    self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
+                    self.events.tool_result(
+                        session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                        result=result_data, role=op_role, agent_id=agent,
+                    )
+                    try:
+                        self.start_turn(
+                            session_id,
+                            wo_repair_prompt,
+                            role="architecture",
+                            agent_id="claude",
+                            is_authoring=True,
+                            wo_repair_attempt=wo_retry_count + 1,
+                        )
+                        return
+                    except Exception as repair_exc:
+                        self.events.publish("error", session_id, message=f"Failed to auto-revert work order repair to architect: {repair_exc}")
                         return
                 else:
                     self.events.tool_result(

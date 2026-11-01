@@ -580,6 +580,21 @@ def get_status_str(
         # Next action
         parts.append(f"Next: {next_action}")
 
+    # Delivery integrity readiness summary
+    if session.get("workspace"):
+        try:
+            from validators.harness.delivery_integrity import load_release_decision
+            snap = load_release_decision(Path(session["workspace"]))
+            if snap is not None:
+                passed = snap.get("passed")
+                b_count = len(snap.get("blockers") or [])
+                if passed:
+                    parts.append("Delivery: READY")
+                else:
+                    parts.append(f"Delivery: BLOCKED ({b_count} open blocker{'s' if b_count != 1 else ''})")
+        except Exception:
+            pass
+
     return "\n".join(parts)
 
 
@@ -598,7 +613,9 @@ def get_help_str() -> str:
     return (
         "Available commands:\n"
         "  :status           Display current Session, Contract HUD, and Project Delivery View\n"
+        "  :delivery         Display authoritative release decision + structured blockers (read-only)\n"
         "  :delivery-status  Display official Lead Architect Product Delivery Status report\n"
+        "  :delivery-integrity  Alias for :delivery\n"
         "  :contract         Display Contract Boundary HUD and write permissions\n"
         "  :reconnect        Reconnect to daemon and replay missed events\n"
         "  :roles            Interactive Agent Roles & Execution Backend bindings panel (preferred)\n"
@@ -2139,7 +2156,7 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
-    if normalized in {":delivery-status", ":delivery", ":deliverystatus"}:
+    if normalized in {":delivery-status", ":deliverystatus", ":product-delivery-status"}:
         report = None
         sid = session.get("session_id")
         ws = Path(session["workspace"]) if session.get("workspace") else None
@@ -2175,6 +2192,24 @@ def dispatch_delivery_command(
         output_str = report or "No Product Delivery Status recorded yet."
         state.add_message("user", normalized)
         state.add_message("assistant", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized in {":delivery", ":delivery-integrity", ":delivery-check", ":release-readiness"}:
+        # Read-only projection of the supervisor-persisted release decision.
+        # This deliberately does NOT evaluate readiness: the TUI must never be a
+        # second source of truth, and inspection must not mutate lifecycle state.
+        from validators.harness.delivery_integrity import (
+            format_delivery_integrity,
+            load_release_decision,
+        )
+
+        ws = Path(session["workspace"]) if session.get("workspace") else None
+        snapshot = load_release_decision(ws)
+        output_str = format_delivery_integrity(snapshot)
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
         if not is_tty:
             click.echo(output_str)
         return session, False

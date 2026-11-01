@@ -187,9 +187,9 @@ def classify_artifact(path: str) -> str:
         return "index"
     if ".sync/contracts" in norm or norm.startswith("contracts/"):
         return "contract"
-    if (".sync/work-orders" in norm or norm.startswith("work-orders/")) and re.search(r"WO-[0-9]{3}\.ya?ml$", norm):
+    if (".sync/work-orders" in norm or norm.startswith("work-orders/")) and norm.endswith((".yaml", ".yml")) and not norm.endswith(".gitkeep"):
         return "work_order"
-    if re.search(r"^WO-[0-9]{3}\.ya?ml$", norm):
+    if re.search(r"^WO-.*\.ya?ml$", norm):
         if "contract" in norm:
             return "contract"
         return "work_order"

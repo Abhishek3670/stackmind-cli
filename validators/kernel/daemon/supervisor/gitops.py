@@ -50,8 +50,14 @@ def _gt_ctx(state: RunState, wo_id: str, failure_code: str) -> RetryContext:
 class _GitopsMixin:
     """Release-phase orchestration (GITOPS) and release documentation."""
 
-    def _advance_gitops(self, state: RunState) -> AdvanceResult:
+    def _advance_gitops(self, state: RunState, *, integration_op: dict[str, Any] | None = None) -> AdvanceResult:
         """GITOPS: dispatch GitOps release turn and wait for completion."""
+        # SDP-FIX-009-FINAL: caller-supplied integration evidence binds the
+        # release gate to the exact evidence that produced it.  The supervisor
+        # always re-evaluates release readiness from source at the release
+        # boundary, but this argument lets tests (and a real release pipeline)
+        # pass the accumulated test/integration evidence through the same path
+        # the evaluator consumes.
         if state.gitops_operation_id:
             op = self._get_operation(state.gitops_operation_id)
             if op is None:
@@ -185,18 +191,105 @@ class _GitopsMixin:
                 _acceptance_report,
                 acceptance_why,
             ) = self._final_acceptance_status(state, ws)
-            if not acceptance_ok:
-                state.error = f"FINAL_ACCEPTANCE_INVARIANT_VIOLATION: {acceptance_why}"
+
+            self._ensure_release_documentation(ws, state)
+
+            # ── Authoritative delivery-integrity release gate (SDP-FIX-009) ──
+            # Final acceptance is necessary but not sufficient. Planning
+            # completeness, artifact integrity, revision-bound QA, combined
+            # integration evidence, stale/contradictory evidence, blockers,
+            # contract identity and documentation are re-evaluated from source
+            # at the actual release boundary, and the exact decision snapshot is
+            # persisted so later claims are bound to it.  Imported lazily to keep
+            # the supervisor package free of a harness/kernel import cycle.
+            from validators.harness.delivery_integrity import (
+                decision_is_current,
+                evaluate_release_readiness,
+                persist_release_decision,
+                structured_blockers,
+            )
+
+            release_decision = evaluate_release_readiness(
+                ws, state, require_documentation=True, integration_op=integration_op
+            )
+            persist_release_decision(
+                ws,
+                release_decision,
+                run_id=state.run_id,
+                phase=state.phase.value,
+                source="gitops_completion",
+            )
+            state.delivery_blockers = structured_blockers(release_decision)
+            state.delivery_evidence_sha256 = release_decision.evidence.get("evidence_sha256")
+            state.delivery_decision_passed = release_decision.passed
+            state.delivery_evaluated_at = _now()
+            events = getattr(self, "events", getattr(getattr(self, "manager", None), "events", None))
+            if events is not None:
+                events.publish(
+                    "delivery.readiness_evaluated",
+                    state.session_id,
+                    run_id=state.run_id,
+                    passed=release_decision.passed,
+                    evidence_sha256=state.delivery_evidence_sha256,
+                    blockers=state.delivery_blockers,
+                    issues=list(release_decision.issues),
+                    phase=state.phase.value,
+                )
+            if not release_decision.passed:
+                state.error = "DELIVERY_INTEGRITY_BLOCKED: " + "; ".join(
+                    release_decision.issues[:5]
+                )
                 state.final_review_history.append(
                     {
-                        "event": "gitops_completion_blocked",
-                        "reason": acceptance_why,
+                        "event": "release_integrity_blocked",
+                        "evidence_sha256": release_decision.evidence.get("evidence_sha256"),
+                        "blocker_codes": [
+                            blocker["code"]
+                            for blocker in structured_blockers(release_decision)
+                        ],
+                        "reasons": list(release_decision.issues),
+                        "source": "gitops_completion",
+                        "timestamp": _now(),
+                    }
+                )
+                # Do not advance past the final-review boundary when delivery
+                # integrity is not green: the run is not released, and the
+                # failure record (blocker codes, evidence sha256, reasons) is
+                # persisted so remediation can be resumed after a restart.
+                self._transition(state, Phase.FINAL_REVIEW)
+                return AdvanceResult.TRANSITIONED
+
+            # Guard against a time-of-check/time-of-use gap: the evidence that
+            # authorized release must still be the evidence on disk now.
+            current, why = decision_is_current(
+                ws, state, release_decision, require_documentation=True, integration_op=integration_op
+            )
+            if not current:
+                state.delivery_decision_passed = False
+                state.delivery_blockers = [
+                    {
+                        "code": "STALE_EVIDENCE",
+                        "phase": state.phase.value,
+                        "affected_target": "evidence",
+                        "requirement": "Release decision must remain current at release boundary",
+                        "evidence": why,
+                        "is_blocking": True,
+                        "evidence_defect": "stale",
+                        "remediation": "Re-evaluate release readiness against current workspace evidence",
+                        "reevaluation_required": True,
+                    }
+                ]
+                state.error = f"RELEASE_EVIDENCE_CHANGED: {why}"
+                state.final_review_history.append(
+                    {
+                        "event": "release_integrity_stale",
+                        "reason": why,
                         "timestamp": _now(),
                     }
                 )
                 self._transition(state, Phase.FINAL_REVIEW)
                 return AdvanceResult.TRANSITIONED
-            self._ensure_release_documentation(ws, state)
+
             # Before committing, archive completed work orders to .sync/work-orders/COMPLETED/
             to_archive = list(state.completed_wo_ids)
             if state.planning_wo_id and state.planning_wo_id not in to_archive:
@@ -234,6 +327,7 @@ class _GitopsMixin:
                 pass
             self._transition(state, Phase.COMPLETE)
             return AdvanceResult.COMPLETE
+        # Dispatch GitOps turn
 
         # Dispatch GitOps turn
         try:

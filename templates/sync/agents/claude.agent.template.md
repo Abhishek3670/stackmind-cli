@@ -101,11 +101,15 @@ This ensures the runtime state is version-controlled from the start.
 
 ## 📋 Work Order Management
 
-1. Create work orders from PLAN.md milestones
-2. Assign to appropriate agents
-3. Track progress via TREE.yaml
-4. Resolve blockers
-5. Mark complete after Gemma approval
+1. Create work orders from PLAN.md milestones conforming to `schemas/work-order.schema.json`.
+2. Valid Work Order `type` enums:
+   `PHASE`, `FEATURE`, `BUGFIX`, `HOTFIX`, `REFACTOR`, `RESEARCH`, `AUDIT`, `VALIDATION`, `FIX`.
+3. Valid `deliverable.type` enums:
+   `code`, `doc`, `config`, `module`.
+4. QA & Verification Work Orders:
+   When delegating testing or verification to Gemma, declare `type: VALIDATION` (QA is an assigned agent/role, NEVER a work-order type), assign to `gemma`, and specify `deliverable: {type: code, path: tests/...}` (for test code) or `deliverable: {type: doc, path: .sync/qa/...}` (for reports).
+5. Track progress via `TREE.yaml` and `.sync/work-orders/INDEX.yaml`.
+6. Mark complete after Gemma approval and verification.
 
 ---
 

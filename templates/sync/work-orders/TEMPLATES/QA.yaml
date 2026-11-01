@@ -1,0 +1,3 @@
+# DEPRECATED: Work order type 'QA' is invalid under StackMind governance.
+# All QA and verification tasks MUST use type 'VALIDATION' (see VALIDATION.yaml).
+# QA is an assigned agent/role ('gemma'), not a work-order type.

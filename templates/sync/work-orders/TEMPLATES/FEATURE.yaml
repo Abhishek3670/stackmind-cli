@@ -2,7 +2,7 @@
 # Use for: New feature implementation within a phase
 # Triggered by: CEO request, PLAN.md scope, or phase decomposition
 
-id: "WO-XXX"
+id: "WO-001"  # Required: sequential 3-digit number (WO-001, WO-002, etc. - regex ^WO-[0-9]{3}$)
 type: FEATURE
 title: ""
 status: ACTIVE
