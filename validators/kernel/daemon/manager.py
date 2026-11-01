@@ -3447,6 +3447,10 @@ class SessionManager:
                             is_authoring=True,
                             plan_repair_attempt=retry_count + 1,
                         )
+                        for r in self._active_runs.values():
+                            if getattr(r, "session_id", None) == session_id:
+                                r.plan_repair_attempt = retry_count + 1
+                                break
                         return
                     except Exception as repair_exc:
                         self.events.publish("error", session_id, message=f"Failed to auto-revert plan to architect: {repair_exc}")

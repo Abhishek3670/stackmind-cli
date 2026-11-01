@@ -121,6 +121,7 @@ class RunState:
     planning_operation_id: str | None = None
     authoring_operation_id: str | None = None
     plan_id: str | None = None
+    plan_repair_attempt: int | None = None
     worker_wo_ids: list[str] = field(default_factory=list)
     completed_wo_ids: list[str] = field(default_factory=list)
     failed_wo_ids: list[str] = field(default_factory=list)
@@ -282,6 +283,7 @@ class RunState:
             "planning_operation_id": self.planning_operation_id,
             "authoring_operation_id": self.authoring_operation_id,
             "plan_id": self.plan_id,
+            "plan_repair_attempt": self.plan_repair_attempt,
             "worker_wo_ids": list(self.worker_wo_ids),
             "completed_wo_ids": list(self.completed_wo_ids),
             "failed_wo_ids": list(self.failed_wo_ids),
@@ -404,6 +406,7 @@ class RunState:
             planning_operation_id=data.get("planning_operation_id"),
             authoring_operation_id=data.get("authoring_operation_id"),
             plan_id=data.get("plan_id"),
+            plan_repair_attempt=data.get("plan_repair_attempt"),
             worker_wo_ids=data.get("worker_wo_ids", []),
             completed_wo_ids=data.get("completed_wo_ids", []),
             failed_wo_ids=data.get("failed_wo_ids", []),

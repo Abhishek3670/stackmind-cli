@@ -225,3 +225,42 @@ def test_repair_without_plan_still_fails_run() -> None:
 
     assert res == AdvanceResult.FAILED
     assert state.phase == Phase.FAILED
+
+
+def test_plan_repair_attempt_persists_across_restart() -> None:
+    """Serialization idempotency: plan_repair_attempt persists across RunState roundtrip."""
+    from validators.kernel.daemon.supervisor.models import RunState
+
+    supervisor, mgr, state, planning_op = _start_planning_run()
+    mgr.complete_operation(planning_op, "BLOCKED", {"error": _GATE_ERROR})
+    repair_op = _dispatch_repair(mgr, attempt=1)
+
+    assert supervisor.advance(state) == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.plan_repair_attempt == 1
+
+    # Simulate supervisor/daemon crash and serialization round-trip
+    serialized = state.to_dict()
+    assert serialized.get("plan_repair_attempt") == 1
+
+    recovered_state = RunState.from_dict(serialized)
+    assert recovered_state.plan_repair_attempt == 1
+
+    # Verify advance on recovered state still halts at WAITING_FOR_OPERATION
+    assert supervisor.advance(recovered_state) == AdvanceResult.WAITING_FOR_OPERATION
+    assert recovered_state.plan_repair_attempt == 1
+
+    # Repair completes and manager proposes the plan
+    mgr.complete_operation(repair_op, "COMPLETED")
+    mgr.propose_plan(
+        "sess-009",
+        "PLAN-009",
+        "Task App Plan",
+        metadata={"operation_id": repair_op},
+    )
+
+    res = supervisor.advance(recovered_state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert recovered_state.phase == Phase.AWAITING_APPROVAL
+    assert recovered_state.plan_id == "PLAN-009"
+    assert recovered_state.plan_repair_attempt is None
+

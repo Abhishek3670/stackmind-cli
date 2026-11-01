@@ -59,13 +59,23 @@ class _PhasesMixin:
             op_id = op.get("operation_id")
             if not op_id or op_id in ignored or op_id == planning_op:
                 continue
-            if (op.get("metadata") or {}).get("plan_repair_attempt") is None:
+            repair_meta = (op.get("metadata") or {}).get("plan_repair_attempt")
+            if repair_meta is None:
                 continue
             if str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
                 # In-flight repair continuation: wait for it regardless of how
                 # many earlier repair attempts already terminated.
+                try:
+                    state.plan_repair_attempt = int(repair_meta)
+                except Exception:
+                    state.plan_repair_attempt = 1
                 return op
             repair = op
+        if repair is not None:
+            try:
+                state.plan_repair_attempt = int((repair.get("metadata") or {}).get("plan_repair_attempt", 1))
+            except Exception:
+                state.plan_repair_attempt = 1
         return repair
 
     def _advance_planning(self, state: RunState) -> AdvanceResult:
@@ -115,9 +125,11 @@ class _PhasesMixin:
                         # plan-match path (never fabricate a plan here).
                         state.ignored_operation_ids.append(planning_op_id)
                         state.planning_operation_id = repair.get("operation_id")
+                        state.plan_repair_attempt = None
                         return self._advance_planning(state)
                     # Repair itself terminated non-successfully: fail the run
                     # with the original planning error evidence.
+                    state.plan_repair_attempt = None
                 err_detail = _extract_op_error(op) or op.get("error") or "unknown"
                 state.error = f"Planning turn failed ({status.lower()}): {err_detail}"
                 self._transition(state, Phase.FAILED)
