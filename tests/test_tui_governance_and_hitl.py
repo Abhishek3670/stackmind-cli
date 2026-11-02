@@ -200,6 +200,56 @@ def test_plan_hitl_approval_dispatch():
     assert "Plan 'PLAN-032' approved" in state.messages[-1].content
 
 
+def test_hitl_approval_fallback_idle_returns_cleanly():
+    """Verify :approve outside of plan approval returns cleanly when daemon is idle."""
+    client = MockDaemonClient()
+    client.plan_data = {}
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    session = {"session_id": "session-42", "contract": {}}
+    state = AutonomousDeliveryState(session_id="session-42")
+    state.phase = ProjectPhase.INITIALIZING
+    state.plan = {}
+
+    sess, should_exit = dispatch_delivery_command(
+        adapter, client, session, ":approve looks good", state  # type: ignore[arg-type]
+    )
+    assert not should_exit
+    assert client.session_approvals == [("session-42", True, "looks good")]
+    assert state.has_conversation
+    assert "HITL Approval recorded" in state.messages[-1].content
+
+
+def test_hitl_approval_fallback_with_active_work_orders_triggers_goal(tmp_path: Path):
+    """Verify :approve with active work orders on disk dispatches the goal execution."""
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True)
+    (wo_dir / "WO-001.yaml").write_text("id: WO-001\ntitle: Test Core", encoding="utf-8")
+
+    client = MockDaemonClient()
+    client.plan_data = {}
+    adapter = StackMindTuiAdapter(client)  # type: ignore[arg-type]
+    session = {"session_id": "session-42", "workspace": str(tmp_path), "contract": {}}
+    state = AutonomousDeliveryState(session_id="session-42")
+    state.phase = ProjectPhase.INITIALIZING
+    state.plan = {}
+
+    goals_dispatched: list[str] = []
+    original_command = adapter.command
+    def mock_command(text: str, **kwargs: Any) -> Any:
+        if text.startswith(":goal"):
+            goals_dispatched.append(text)
+            return {"operation_id": "op-goal-1"}
+        return original_command(text, **kwargs)
+    adapter.command = mock_command  # type: ignore[method-assign]
+
+    sess, should_exit = dispatch_delivery_command(
+        adapter, client, session, ":approve proceed", state, client_timeout=0.1
+    )
+    assert not should_exit
+    assert client.session_approvals == [("session-42", True, "proceed")]
+    assert any(":goal Deliver approved work orders" in g for g in goals_dispatched)
+
+
 def test_plan_hitl_rejection_dispatch():
     """Verify :reject command calls daemon plan_reject RPC and records revision feedback."""
     client = MockDaemonClient()

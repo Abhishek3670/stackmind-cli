@@ -960,6 +960,17 @@ def _stream_turn_execution(
 
     def _daemon_has_running_work() -> bool:
         """True when the daemon still reports an operation in flight for this session."""
+        sid = session.get("session_id")
+        if sid and hasattr(client, "get_session"):
+            try:
+                fresh_sess = client.get_session(sid)
+                if isinstance(fresh_sess, Mapping):
+                    act_op = fresh_sess.get("active_operation")
+                    if not act_op:
+                        return False
+                    return True
+            except Exception:
+                pass
         for op in getattr(state, "operations", {}).values():
             if str(getattr(op, "status", "")).upper() in _RUNNING_OP_STATUS:
                 return True
@@ -994,7 +1005,11 @@ def _stream_turn_execution(
                 pass
         # No terminal event, no operation in flight, and the answer already
         # arrived: the daemon is done with this turn.
-        if (streamed_chunks or assistant_rendered) and not _daemon_has_running_work():
+        if not _daemon_has_running_work():
+            if (streamed_chunks or assistant_rendered) and now - last_domain_event_time >= 3.0:
+                return True
+            if not streamed_chunks and not assistant_rendered and now - start_time >= 3.0:
+                return True
             if now - last_domain_event_time >= 3.0:
                 return True
         return False
@@ -2860,9 +2875,66 @@ def dispatch_delivery_command(
         adapter.command(f":approve {clean_reason}".strip(), session_id=session["session_id"])
         state.add_message("user", normalized)
         state.add_message("assistant", f"✓ HITL Approval recorded: {clean_reason}")
+
+        # If active work orders exist on disk and no supervisor run is in flight,
+        # seamlessly kick off autonomous delivery goal as requested by Architecture
+        ws_path_str = session.get("workspace") if isinstance(session, dict) else "."
+        ws_path = Path(ws_path_str) if ws_path_str else Path(".")
+        active_wo_files = (
+            list((ws_path / ".sync" / "work-orders" / "ACTIVE").glob("WO-*.yaml"))
+            if (ws_path / ".sync" / "work-orders" / "ACTIVE").is_dir()
+            else []
+        )
+        has_running_run = False
+        try:
+            if hasattr(client, "run_get"):
+                active_run_check = client.run_get(session.get("session_id", ""))
+                if isinstance(active_run_check, dict) and active_run_check.get("phase") not in (
+                    "COMPLETE", "FAILED", "BLOCKED", None
+                ):
+                    has_running_run = True
+        except Exception:
+            pass
+
+        if active_wo_files and not has_running_run:
+            goal_prompt = ":goal Deliver approved work orders"
+            state.add_message(
+                "system",
+                f"[SUPERVISOR] Starting autonomous multi-agent execution on {len(active_wo_files)} approved work order(s)...",
+            )
+            return dispatch_delivery_command(
+                adapter,
+                client,
+                session,
+                goal_prompt,
+                state,
+                client_timeout=effective_timeout,
+                live_manager=live_manager,
+            )
+
         if not is_tty:
             click.echo("Approval recorded.")
             return session, False
+
+        # Check if an actual turn or daemon operation is in flight before streaming
+        has_running_work = False
+        try:
+            sid = session.get("session_id", "")
+            if hasattr(client, "get_session"):
+                s_info = client.get_session(sid)
+                if isinstance(s_info, dict) and s_info.get("active_operation"):
+                    has_running_work = True
+        except Exception:
+            pass
+        if not has_running_work and hasattr(state, "operations"):
+            has_running_work = any(
+                getattr(n, "status", "") in ("RUNNING", "QUEUED")
+                for n in state.operations.values()
+            )
+
+        if not has_running_work:
+            return session, False
+
         model_label = resolve_turn_model_attribution(state, session)
         return _stream_turn_execution(
             adapter,
