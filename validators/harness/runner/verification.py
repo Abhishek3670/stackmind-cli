@@ -59,12 +59,14 @@ class _VerificationMixin:
 
         diff_changed = tuple(Path(p).as_posix().lstrip('/') for p in diff.all_changed_files)
         changed_files = diff_changed + tuple(tool_written_files)
-        bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/')
+        bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
+        bookkeeping_exact = ('.sync/work-orders/INDEX.yaml', 'work-orders/INDEX.yaml', '.sync/runtime/TREE.yaml')
         dec_norm = {Path(p).as_posix().lstrip('/') for p in decision.modified_files if p}
         task_changed_files = tuple(
             relative_path for relative_path in changed_files
             if not (any(relative_path.startswith(prefix) for prefix in bookkeeping_prefixes) and relative_path not in dec_norm)
             and not (relative_path.startswith('.sync/work-orders/') and relative_path not in dec_norm)
+            and not (relative_path in bookkeeping_exact and relative_path not in dec_norm)
         )
         scope_verified = declaration_matches
         # Include tool-written files for scope verification
@@ -88,70 +90,86 @@ class _VerificationMixin:
                 scope_verified = False
                 staged_errors.append(str(exc))
 
+        norm_agent = str(self.agent or '').lower().strip()
+        arch_aliases = ('claude', 'architecture', 'architect')
+        is_arch = norm_agent in arch_aliases or getattr(task, 'is_authoring', False)
+
         # Runtime contracts use path rules; validate those directly when present.
         raw_contract = None
         if task.work_order_id:
             contract_path = self.sync_path / 'contracts' / f'{task.work_order_id}.yaml'
             if contract_path.exists():
-                raw_contract = self._read_yaml(contract_path)
-                allow_rules = raw_contract.get('scope', {}).get('allow', [])
-                deny_rules = raw_contract.get('scope', {}).get('deny', [])
+                candidate_contract = self._read_yaml(contract_path)
+                cand_agent = str(candidate_contract.get('agent_id', '') or '').lower().strip()
+                if not cand_agent or cand_agent == norm_agent or (is_arch and cand_agent in arch_aliases):
+                    raw_contract = candidate_contract
 
-                def _rule_to_path(rule: Any) -> str:
-                    if isinstance(rule, dict):
-                        p = rule.get('path') or rule.get('target') or rule.get('module')
-                        return str(p or '')
-                    if isinstance(rule, str):
-                        return rule
-                    return ''
+        if raw_contract is None and is_arch:
+            arch_contract_path = self.sync_path / 'agents' / 'claude.contract.yaml'
+            if arch_contract_path.exists():
+                raw_contract = self._read_yaml(arch_contract_path)
 
-                def _path_matches_rule(target_path: str, rule_str: str) -> bool:
-                    r = rule_str.replace('\\', '/')
-                    if r.startswith('./'):
-                        r = r[2:]
-                    r_clean = r.rstrip('/*').rstrip('/')
-                    if (
-                        target_path == r
-                        or target_path == r_clean
-                        or target_path.startswith(r_clean + '/')
-                        or fnmatch.fnmatch(target_path, r)
-                        or (r.endswith('/**') and fnmatch.fnmatch(target_path, r))
-                        or fnmatch.fnmatch(target_path, r_clean + '/*')
-                        or fnmatch.fnmatch(target_path, r_clean + '/**')
+        if raw_contract is not None:
+            allow_rules = raw_contract.get('scope', {}).get('allow', [])
+            deny_rules = raw_contract.get('scope', {}).get('deny', [])
+
+            def _rule_to_path(rule: Any) -> str:
+                if isinstance(rule, dict):
+                    p = rule.get('path') or rule.get('target') or rule.get('module')
+                    return str(p or '')
+                if isinstance(rule, str):
+                    return rule
+                return ''
+
+            def _path_matches_rule(target_path: str, rule_str: str) -> bool:
+                r = rule_str.replace('\\', '/')
+                if r.startswith('./'):
+                    r = r[2:]
+                r_clean = r.rstrip('/*').rstrip('/')
+                if (
+                    target_path == r
+                    or target_path == r_clean
+                    or target_path.startswith(r_clean + '/')
+                    or fnmatch.fnmatch(target_path, r)
+                    or (r.endswith('/**') and fnmatch.fnmatch(target_path, r))
+                    or fnmatch.fnmatch(target_path, r_clean + '/*')
+                    or fnmatch.fnmatch(target_path, r_clean + '/**')
+                ):
+                    return True
+                r_slash = r_clean.replace('.', '/')
+                if (
+                    target_path == r_slash
+                    or target_path == (r_slash + '.py')
+                    or target_path.startswith(r_slash + '/')
+                    or fnmatch.fnmatch(target_path, r_slash)
+                ):
+                    return True
+                return False
+
+            allow_paths = [p for rule in allow_rules if (p := _rule_to_path(rule))]
+            deny_paths = [p for rule in deny_rules if (p := _rule_to_path(rule))]
+            for relative_path in task_changed_files:
+                normalized = Path(relative_path).as_posix()
+                if normalized.startswith('.sync/') and relative_path not in decision.modified_files:
+                    continue  # Harness-owned bookkeeping writes are authorized separately.
+                if is_arch and (normalized.startswith('.sync/work-orders/') or normalized.startswith('.sync/contracts/') or normalized.startswith('.sync/decisions/') or normalized in ('.sync/work-orders/INDEX.yaml', 'PLAN.md', 'README.md')):
+                    continue  # Architect authoring scope is governed by AuthoringGate, not worker contracts.
+                allowed = not allow_paths or any(_path_matches_rule(normalized, rule) for rule in allow_paths)
+                denied = any(_path_matches_rule(normalized, rule) for rule in deny_paths)
+                if denied:
+                    matching_deny = [r for r in deny_paths if _path_matches_rule(normalized, r)]
+                    matching_allow = [r for r in allow_paths if _path_matches_rule(normalized, r)]
+                    if matching_allow and all(
+                        any(
+                            _path_matches_rule(a.replace('\\', '/').rstrip('/*'), d)
+                            and not _path_matches_rule(d.replace('\\', '/').rstrip('/*'), a)
+                            for a in matching_allow
+                        )
+                        for d in matching_deny
                     ):
-                        return True
-                    r_slash = r_clean.replace('.', '/')
-                    if (
-                        target_path == r_slash
-                        or target_path == (r_slash + '.py')
-                        or target_path.startswith(r_slash + '/')
-                        or fnmatch.fnmatch(target_path, r_slash)
-                    ):
-                        return True
-                    return False
-
-                allow_paths = [p for rule in allow_rules if (p := _rule_to_path(rule))]
-                deny_paths = [p for rule in deny_rules if (p := _rule_to_path(rule))]
-                for relative_path in task_changed_files:
-                    normalized = Path(relative_path).as_posix()
-                    if normalized.startswith('.sync/') and relative_path not in decision.modified_files:
-                        continue  # Harness-owned bookkeeping writes are authorized separately.
-                    allowed = not allow_paths or any(_path_matches_rule(normalized, rule) for rule in allow_paths)
-                    denied = any(_path_matches_rule(normalized, rule) for rule in deny_paths)
-                    if denied:
-                        matching_deny = [r for r in deny_paths if _path_matches_rule(normalized, r)]
-                        matching_allow = [r for r in allow_paths if _path_matches_rule(normalized, r)]
-                        if matching_allow and all(
-                            any(
-                                _path_matches_rule(a.replace('\\', '/').rstrip('/*'), d)
-                                and not _path_matches_rule(d.replace('\\', '/').rstrip('/*'), a)
-                                for a in matching_allow
-                            )
-                            for d in matching_deny
-                        ):
-                            denied = False
-                    if not allowed or denied:
-                        scope_verified = False
+                        denied = False
+                if not allowed or denied:
+                    scope_verified = False
 
         state_verified = not staged_errors
         for relative_path in changed_files:

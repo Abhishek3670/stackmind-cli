@@ -137,12 +137,24 @@ def _check_overwrite_conflict(
                 for rf in sup_dir.glob("run-*.yaml"):
                     try:
                         rdata = yaml.safe_load(rf.read_text(encoding="utf-8"))
-                        if isinstance(rdata, dict) and (
-                            str(rdata.get("phase", "")).upper() in {"ARCHITECT_REPAIR", "BLOCKED", "AUTHORING_READINESS_GATE"}
-                            or bool(rdata.get("readiness_issues"))
-                        ):
-                            is_repair = True
-                            break
+                        if isinstance(rdata, dict):
+                            phase_up = str(rdata.get("phase", "")).upper()
+                            wo_stem = Path(norm_path).stem
+                            if (
+                                phase_up in {
+                                    "ARCHITECT_REPAIR",
+                                    "ARCHITECT_RECOVERY_DECISION",
+                                    "BLOCKED",
+                                    "AUTHORING_READINESS_GATE",
+                                    "RECOVERY",
+                                }
+                                or bool(rdata.get("readiness_issues"))
+                                or bool(rdata.get("worker_blockers"))
+                                or rdata.get("recovery_wo_id") == wo_stem
+                                or wo_stem in (rdata.get("worker_blockers") or {})
+                            ):
+                                is_repair = True
+                                break
                     except Exception:
                         pass
 

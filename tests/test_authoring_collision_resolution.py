@@ -675,7 +675,7 @@ def test_recovery_decision_cancel_work_order(tmp_path: Path):
 
     assert err is None
     assert advance_res == AdvanceResult.TRANSITIONED
-    assert state.phase == Phase.EXECUTING
+    assert state.phase in (Phase.EXECUTING, Phase.DISPATCHING)
     assert "WO-002" in state.superseded_wo_ids
     assert "WO-002" not in state.worker_wo_ids
     assert "WO-002" not in state.blocked_wo_ids

@@ -460,6 +460,31 @@ class _ExecutionMixin:
             if self._is_cancelled(cancellation):
                 return self._cancelled_result(task, operation_id)
 
+            # The write_file journal is authoritative for what the turn actually
+            # touched: reconcile the model's self-reported modified_files against
+            # it so undeclared-but-written files are reported honestly instead of
+            # failing the declaration gate, and claimed-but-never-written files
+            # stay a declaration failure.
+            auto_added_files: list[str] = []
+            boundary = (
+                getattr(tool_runtime, "boundary", None)
+                or getattr(getattr(tool_runtime, "gateway", None), "boundary", None)
+            )
+            journal = getattr(boundary, "journal", None) if boundary is not None else None
+            if decision is not None and journal is not None:
+                written_paths = [
+                    Path(rec.request.target.replace('workspace/', '', 1)).as_posix().lstrip('/')
+                    for rec in journal.records
+                    if getattr(getattr(rec.request, 'operation_type', None), 'value', None) in ('write_file', 'batch_write_files', 'delegate_task')
+                    and rec.result in ('written', 'delegated')
+                ]
+                decision, auto_added_files = reconcile_modified_files(decision, written_paths)
+
+            if self.agent == 'claude' and decision is not None:
+                decision, auto_added_files = self._reconcile_authored_work_orders(
+                    workspace_root, decision, auto_added_files
+                )
+
             # Post-execution declared validation
             from validators.harness.contract_gate import verify_post_execution
             from validators.harness.d024_gate import D024ViolationError
@@ -471,10 +496,13 @@ class _ExecutionMixin:
                     )
                     curr_diff = before_snapshot.diff(curr_snap)
                     bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
+                    bookkeeping_exact = ('.sync/work-orders/INDEX.yaml', 'work-orders/INDEX.yaml', '.sync/runtime/TREE.yaml')
+                    dec_norm_gate = {Path(p).as_posix().lstrip('/') for p in getattr(decision, 'modified_files', ()) if p}
                     observed_files_for_gate = tuple(
                         norm_p for path in curr_diff.all_changed_files
                         if (norm_p := Path(path).as_posix().lstrip('/'))
                         and not any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes)
+                        and not (norm_p in bookkeeping_exact and norm_p not in dec_norm_gate)
                     )
                 verify_post_execution(
                     self.project_path,
@@ -524,31 +552,6 @@ class _ExecutionMixin:
             # 8. Post-post-execution contract verification.
             if self._is_cancelled(cancellation):
                 return self._cancelled_result(task, operation_id)
-
-            # The write_file journal is authoritative for what the turn actually
-            # touched: reconcile the model's self-reported modified_files against
-            # it so undeclared-but-written files are reported honestly instead of
-            # failing the declaration gate, and claimed-but-never-written files
-            # stay a declaration failure.
-            auto_added_files: list[str] = []
-            boundary = (
-                getattr(tool_runtime, "boundary", None)
-                or getattr(getattr(tool_runtime, "gateway", None), "boundary", None)
-            )
-            journal = getattr(boundary, "journal", None) if boundary is not None else None
-            if decision is not None and journal is not None:
-                written_paths = [
-                    Path(rec.request.target.replace('workspace/', '', 1)).as_posix().lstrip('/')
-                    for rec in journal.records
-                    if getattr(getattr(rec.request, 'operation_type', None), 'value', None) in ('write_file', 'batch_write_files', 'delegate_task')
-                    and rec.result in ('written', 'delegated')
-                ]
-                decision, auto_added_files = reconcile_modified_files(decision, written_paths)
-
-            if self.agent == 'claude' and decision is not None:
-                decision, auto_added_files = self._reconcile_authored_work_orders(
-                    workspace_root, decision, auto_added_files
-                )
 
             stage_inputs = {
                 'completion': completion,
@@ -655,7 +658,8 @@ class _ExecutionMixin:
                     diff = before_snapshot.diff(after_snapshot)
                     # LLM declarations describe task changes, not harness-owned audit,
                     # inbox, and report bookkeeping under `.sync/`.
-                    bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/')
+                    bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
+                    bookkeeping_exact = ('.sync/work-orders/INDEX.yaml', 'work-orders/INDEX.yaml', '.sync/runtime/TREE.yaml')
                     task_wo_rel = (
                         task.path.relative_to(self.project_path).as_posix()
                         if task.work_order_id and task.path and task.path.is_relative_to(self.project_path)
@@ -695,6 +699,8 @@ class _ExecutionMixin:
                         norm_p for path in sorted(all_observed)
                         if (norm_p := Path(path).as_posix().lstrip('/'))
                         and not (any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes) and norm_p not in dec_norm)
+                        and not (norm_p in bookkeeping_exact and norm_p not in dec_norm)
+                        and not (norm_p.startswith('.sync/work-orders/') and norm_p not in dec_norm)
                         and (task_wo_rel is None or norm_p != task_wo_rel or norm_p in dec_norm)
                     )
                     phantom_files = {

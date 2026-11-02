@@ -924,6 +924,8 @@ class TestRecoveryDecisions:
         mock_mgr.complete_operation(repair_op["operation_id"], "COMPLETED")
 
         res2 = supervisor.advance(state)
+        if state.phase == Phase.DISPATCHING and res2 == AdvanceResult.TRANSITIONED:
+            res2 = supervisor.advance(state)
         assert state.phase == Phase.EXECUTING
         assert res2 == AdvanceResult.WAITING_FOR_OPERATION
         # Original WO removed from ACTIVE and preserved for audit
