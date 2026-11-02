@@ -3292,10 +3292,17 @@ class ToolGateway:
                     contract_dict = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
                     requested_scope = ccr_data.get("requested_scope", {})
                     current_allow = list(contract_dict.get("allow", []))
+                    if not current_allow and isinstance(contract_dict.get("scope"), dict):
+                        current_allow = [
+                            r["module"] if isinstance(r, dict) else r
+                            for r in contract_dict.get("scope", {}).get("allow", [])
+                        ]
                     for item in requested_scope.get("allow", []):
                         if item not in current_allow:
                             current_allow.append(item)
                     contract_dict["allow"] = current_allow
+                    if isinstance(contract_dict.get("scope"), dict):
+                        contract_dict["scope"]["allow"] = list(current_allow)
                     if "deny" in requested_scope:
                         contract_dict["deny"] = list(requested_scope["deny"])
                     rev = int(contract_dict.get("revision", contract_dict.get("version", 1))) + 1
@@ -3336,6 +3343,7 @@ class ToolGateway:
 
         self.boundary.journal.complete(record.request.operation_id, f"{clean_req} {decision_upper}")
         return {
+            "success": True,
             "evaluated": True,
             "request_id": clean_req,
             "work_order_id": wo_id,

@@ -2482,6 +2482,15 @@ class SessionManager:
             self._transition(record, final_status)
             record.update(completed_at=_now(), result=result)
 
+            # Record operation span in WorkOrderTracer (Item C.6)
+            if record.get("work_order_id") or record.get("work_order"):
+                try:
+                    from validators.kernel.tracing import record_operation_span
+                    ws_path = Path(session.get("workspace", "."))
+                    record_operation_span(ws_path, session, record)
+                except Exception:
+                    pass
+
             if final_status == "CANCELLED":
                 ws_path = Path(session.get("workspace", "."))
                 wo_id = record.get("work_order_id") or record.get("work_order")
