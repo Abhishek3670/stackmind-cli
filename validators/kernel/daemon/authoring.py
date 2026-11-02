@@ -1467,8 +1467,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     def _wo_precedence(cand: tuple[Path, str, dict[str, Any], Any]) -> tuple[int, int, str]:
         _file, _id, _data, _ = cand
         has_plan_ref = 1 if _data.get("plan_ref") else 0
-        is_bootstrap = 1 if str(_data.get("synthesized_by", "")).lower() == "bootstrap" else 0
-        type_score = 2 if has_plan_ref else (0 if is_bootstrap else 1)
+        synth = str(_data.get("synthesized_by", "")).lower()
+        is_bootstrap = 1 if synth == "bootstrap" else 0
+        is_delegated = 1 if synth in ("architect_delegation", "recovery-repair", "recovery", "qa_defect") else 0
+        type_score = 3 if is_delegated else (2 if has_plan_ref else (0 if is_bootstrap else 1))
         idx = _parse_wo_index(_id) or 0
         ts = str(_data.get("updated") or _data.get("created") or "")
         return (type_score, idx, ts)
@@ -1477,6 +1479,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
     # Pass 1: Parse and categorize all active work orders
     matched_by_milestone: dict[str, list[tuple[Path, str, dict[str, Any], Any]]] = {}
+    delegated_survivors: list[tuple[Path, str, dict[str, Any], Any]] = []
 
     for wo_file in active_files:
         try:
@@ -1485,6 +1488,13 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 continue
             wo_id = str(wo_data.get("id") or wo_file.stem)
             current_status = str(wo_data.get("status", "")).upper()
+            synth = str(wo_data.get("synthesized_by", "")).lower()
+            wo_type = str(wo_data.get("type", "")).upper()
+            is_delegated_or_repair = (
+                synth in ("architect_delegation", "recovery-repair", "recovery", "qa_defect", "repair")
+                or wo_type in ("FIX", "BUGFIX", "HOTFIX", "REFACTOR")
+                or any(kw in str(wo_data.get("title", "")).lower() for kw in ("repair ", "rework ", "defect "))
+            )
             if current_status == "CANCELLED":
                 # Check if this work order is actually an approved task in PLAN.md
                 # that was erroneously cancelled by prior deduplication
@@ -1497,7 +1507,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     kw in str(wo_data.get("cancellation_reason") or wo_data.get("error") or "").lower()
                     for kw in ("duplicate deliverable", "superseded by", "parallel deliverable")
                 )
-                if is_in_plan and (is_dedup_cancel or not wo_data.get("cancellation_reason")):
+                is_erroneous_orphan_cancel = "orphaned work order not present in current plan.md" in str(
+                    wo_data.get("cancellation_reason") or wo_data.get("error") or ""
+                ).lower()
+                if (is_in_plan and (is_dedup_cancel or not wo_data.get("cancellation_reason"))) or (
+                    is_delegated_or_repair and is_erroneous_orphan_cancel
+                ):
                     current_status = "ACTIVE"
                     wo_data["status"] = "ACTIVE"
                     wo_data.pop("error", None)
@@ -1509,6 +1524,9 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             elif current_status in ("COMPLETED", "FAILED"):
                 continue
             if _is_meta_work_order(wo_data):
+                continue
+            if is_delegated_or_repair:
+                delegated_survivors.append((wo_file, wo_id, wo_data, None))
                 continue
 
             matched_ref = next((r for r in plan_milestones if _wo_matches_milestone(wo_data, r)), None)
@@ -1527,7 +1545,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     # A milestone can contain multiple distinct component work orders (e.g. package.json,
     # styles.css, main.js). Group and deduplicate only work orders that claim the SAME
     # deliverable path or identical title within the milestone.
-    surviving_entries: list[tuple[Path, str, dict[str, Any], Any]] = []
+    surviving_entries: list[tuple[Path, str, dict[str, Any], Any]] = list(delegated_survivors)
     for m_key, cands in matched_by_milestone.items():
         task_groups: dict[str, list[tuple[Path, str, dict[str, Any], Any]]] = {}
         for cand in cands:

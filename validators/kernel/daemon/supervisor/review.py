@@ -5,6 +5,7 @@ Part of the :mod:`validators.kernel.daemon.supervisor` package.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -66,6 +67,7 @@ class _ReviewMixin:
         if not targets:
             evidence_text = f"{blocker_text}\n{err_msg}"
             search_dirs = [
+                ws / ".sync" / "reviews" / "qa",
                 ws / ".sync" / "inbox" / "claude",
                 ws / ".sync" / "inbox" / "claude" / "_read",
                 ws / ".sync" / "reviews",
@@ -74,7 +76,11 @@ class _ReviewMixin:
             for d in search_dirs:
                 if d.is_dir():
                     for f in d.iterdir():
-                        if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
+                        if not f.is_file():
+                            continue
+                        if any(k in f.name for k in ("-stale-", "-invalidated-", "-consumed-")):
+                            continue
+                        if f.suffix.lower() == ".json" or any(k in f.name.lower() for k in ("verdict", "review")):
                             try:
                                 evidence_text += "\n" + f.read_text(encoding="utf-8")
                             except Exception:
@@ -205,6 +211,7 @@ class _ReviewMixin:
         """
         hits: list[tuple[str, str, Path]] = []
         search_dirs = [
+            ws / ".sync" / "reviews" / "qa",
             ws / ".sync" / "inbox" / "claude",
             ws / ".sync" / "inbox" / "claude" / "_read",
             ws / ".sync" / "reviews",
@@ -217,14 +224,44 @@ class _ReviewMixin:
                 if not f.is_file():
                     continue
                 name = f.name
-                if not any(k in name.lower() for k in ("verdict", "review")):
+                if any(k in name for k in ("-stale-", "-invalidated-", "-consumed-")):
                     continue
-                try:
-                    text = f.read_text(encoding="utf-8")
-                except Exception:
-                    continue
-                if "NEEDS_CHANGES" not in text.upper() and "NEEDS CHANGES" not in text.upper():
-                    continue
+                is_json = f.suffix.lower() == ".json"
+                text = ""
+                json_data = None
+                if is_json:
+                    try:
+                        json_data = json.loads(f.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if not isinstance(json_data, dict):
+                        continue
+                    v_val = str(json_data.get("verdict", "")).upper()
+                    if v_val not in ("FAIL", "NEEDS_CHANGES", "FAILED", "REJECTED"):
+                        continue
+                    text_parts = []
+                    if json_data.get("required_action"):
+                        text_parts.append(str(json_data["required_action"]))
+                    for finding in json_data.get("findings", []):
+                        if isinstance(finding, dict):
+                            det = finding.get("detail") or ""
+                            rep = finding.get("reproduce") or ""
+                            text_parts.append(f"{det}\n{rep}".strip())
+                    for crit in json_data.get("criteria", []):
+                        if isinstance(crit, dict):
+                            c_out = str(crit.get("outcome", "")).upper()
+                            if c_out in ("FAIL", "FAILED"):
+                                text_parts.append(f"{crit.get('description', '')}: {crit.get('evidence', '')}")
+                    text = "\n".join(text_parts) or f.read_text(encoding="utf-8")
+                else:
+                    if not any(k in name.lower() for k in ("verdict", "review")):
+                        continue
+                    try:
+                        text = f.read_text(encoding="utf-8")
+                    except Exception:
+                        continue
+                    if "NEEDS_CHANGES" not in text.upper() and "NEEDS CHANGES" not in text.upper():
+                        continue
                 # 1. Check for deliverable path references in the verdict first.
                 # Concrete deliverable ownership takes precedence over LLM-hallucinated
                 # work order IDs in the review text or filename.
@@ -295,6 +332,7 @@ class _ReviewMixin:
         archive = ws / ".sync" / "reviews" / "_consumed"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         search_dirs = [
+            ws / ".sync" / "reviews" / "qa",
             ws / ".sync" / "inbox" / "claude",
             ws / ".sync" / "inbox" / "claude" / "_read",
             ws / ".sync" / "reviews",
@@ -306,14 +344,30 @@ class _ReviewMixin:
             if not d.is_dir():
                 continue
             for f in list(d.iterdir()):
-                if not f.is_file() or not any(k in f.name.lower() for k in ("verdict", "review")):
+                if not f.is_file():
+                    continue
+                if any(k in f.name for k in ("-stale-", "-invalidated-", "-consumed-")):
+                    continue
+                is_json = f.suffix.lower() == ".json"
+                if not is_json and not any(k in f.name.lower() for k in ("verdict", "review")):
                     continue
                 try:
                     txt = f.read_text(encoding="utf-8")
                 except Exception:
                     continue
-                if "NEEDS_CHANGES" not in txt.upper() and "NEEDS CHANGES" not in txt.upper():
-                    continue
+                if is_json:
+                    try:
+                        j_data = json.loads(txt)
+                    except Exception:
+                        continue
+                    if not isinstance(j_data, dict):
+                        continue
+                    v_val = str(j_data.get("verdict", "")).upper()
+                    if v_val not in ("FAIL", "NEEDS_CHANGES", "FAILED", "REJECTED"):
+                        continue
+                else:
+                    if "NEEDS_CHANGES" not in txt.upper() and "NEEDS CHANGES" not in txt.upper():
+                        continue
 
                 wos_in_name = self._WO_ID_RE.findall(f.name)
                 if wos_in_name and wo_id not in wos_in_name:

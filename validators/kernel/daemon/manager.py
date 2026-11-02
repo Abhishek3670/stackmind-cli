@@ -1780,6 +1780,7 @@ class SessionManager:
         # so stale exhaustion from previous sessions must not dead-end it.
         state.integration_rework_rounds = 0
         state.authoring_repair_attempts = 0
+        state.final_prerequisite_rounds = 0
         # Held-back QA re-dispatch is likewise released: the fresh QA turn
         # re-evaluates the deliverables and re-routes defects if they persist.
         if hasattr(state, "qa_rework_targets"):
