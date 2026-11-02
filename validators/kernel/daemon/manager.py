@@ -2457,6 +2457,22 @@ class SessionManager:
 
             self._transition(record, final_status)
             record.update(completed_at=_now(), result=result)
+
+            if final_status == "CANCELLED":
+                ws_path = Path(session.get("workspace", "."))
+                wo_id = record.get("work_order_id") or record.get("work_order")
+                try:
+                    from validators.kernel.work_order_ops import cleanup_cancelled_operation
+                    cleanup_cancelled_operation(
+                        ws_path,
+                        operation_id=target_op_id,
+                        work_order_id=wo_id,
+                        reason=str((result or {}).get("reason") or "Cancelled by operator") if isinstance(result, Mapping) else "Cancelled by operator",
+                        actor=record.get("role") or session.get("role") or "operator",
+                        session_id=session.get("session_id"),
+                    )
+                except Exception:
+                    pass
             if final_status in ("FAILED", "BLOCKED") and not record.get("error"):
                 if isinstance(result, Mapping):
                     raw_e = result.get("error") or result.get("reason") or result.get("message")

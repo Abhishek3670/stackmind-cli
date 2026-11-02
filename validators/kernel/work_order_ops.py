@@ -847,6 +847,111 @@ def blocking_operation_for(root: Path, wo_id: str) -> dict[str, Any] | None:
     return None
 
 
+def cancel_work_order(
+    root: Path,
+    wo_id: str,
+    reason: str = "Cancelled by operator",
+    actor: str = "supervisor",
+    session_id: str | None = None,
+    op_id: str | None = None,
+) -> Path | None:
+    """Transition a work order to CANCELLED on disk, updating INDEX.yaml and audit log."""
+    ref = load_work_order(root, wo_id)
+    if not ref:
+        return None
+    now_str = utc_now()
+    data = dict(ref.data)
+    data["status"] = "CANCELLED"
+    data["cancellation_reason"] = reason
+    data["updated"] = now_str
+
+    # Persist updated work order
+    durable_write_yaml(ref.path, data)
+
+    # Update INDEX.yaml
+    index_path = Path(root) / ".sync" / "work-orders" / "INDEX.yaml"
+    if index_path.is_file():
+        try:
+            index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+            if isinstance(index_data, dict) and isinstance(index_data.get("orders"), list):
+                updated_any = False
+                for order in index_data["orders"]:
+                    if isinstance(order, dict) and order.get("id") == wo_id:
+                        order["status"] = "CANCELLED"
+                        updated_any = True
+                if updated_any:
+                    index_data["last_updated"] = now_str
+                    durable_write_yaml(index_path, index_data)
+        except Exception:
+            pass
+
+    # Audit the cancellation
+    append_audit(
+        root,
+        {
+            "action": "cancel_work_order",
+            "work_order": wo_id,
+            "status": "CANCELLED",
+            "reason": reason,
+            "op_id": op_id,
+        },
+        actor=actor,
+        session_id=session_id,
+    )
+    return ref.path
+
+
+def cleanup_cancelled_operation(
+    root: Path,
+    operation_id: str | None = None,
+    work_order_id: str | None = None,
+    reason: str = "Cancelled by operator",
+    actor: str = "operator",
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Execute clean end-state cleanup for a cancelled turn or operation.
+
+    1. Transition on-disk work order to CANCELLED if specified.
+    2. Reset uncommitted git index/staging changes so workspace remains clean.
+    """
+    import subprocess
+    ws = Path(root).resolve()
+    result: dict[str, Any] = {
+        "operation_id": operation_id,
+        "work_order_id": work_order_id,
+        "cancelled_wo_path": None,
+        "git_reset": False,
+    }
+
+    if work_order_id:
+        wo_path = cancel_work_order(
+            ws,
+            work_order_id,
+            reason=reason,
+            actor=actor,
+            session_id=session_id,
+            op_id=operation_id,
+        )
+        if wo_path:
+            result["cancelled_wo_path"] = str(wo_path)
+
+    # Clean uncommitted staged changes in git index
+    if (ws / ".git").is_dir():
+        try:
+            reset_proc = subprocess.run(
+                ["git", "reset", "HEAD"],
+                cwd=str(ws),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            result["git_reset"] = reset_proc.returncode == 0
+        except Exception:
+            pass
+
+    return result
+
+
 __all__ = [
     "AUDIT_REL",
     "CODE_AFFECTING_FIELDS",
@@ -856,6 +961,8 @@ __all__ = [
     "WorkOrderRef",
     "append_audit",
     "blocking_operation_for",
+    "cancel_work_order",
+    "cleanup_cancelled_operation",
     "contract_revision",
     "dependency_graph",
     "finalize_operation",

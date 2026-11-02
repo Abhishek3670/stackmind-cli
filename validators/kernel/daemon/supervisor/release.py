@@ -66,7 +66,41 @@ def create_gitops_commit(
         architect=architect,
         target_work_orders=target_work_orders,
     )
+    # 1. Idempotency check: if HEAD was already created for this release commit
+    # (e.g. process crashed mid-turn after git commit and before checkpoint/state saving),
+    # return the existing HEAD commit SHA instead of creating a duplicate commit.
+    head_log = subprocess.run(
+        ["git", "log", "-1", "--pretty=%B"],
+        cwd=str(ws),
+        capture_output=True,
+        text=True,
+    )
+    if head_log.returncode == 0 and f"Work-Order: {work_order_id}" in head_log.stdout:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ws),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if head_sha:
+            return head_sha
+
     subprocess.run(["git", "add", "."], cwd=str(ws), check=True, capture_output=True)
+
+    # 2. If index is clean, return current HEAD SHA without failing or duplicating
+    diff_cached = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=str(ws),
+        check=False,
+    )
+    if diff_cached.returncode == 0:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ws),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
     subprocess.run(
         ["git", "commit", "-m", commit_msg],
         cwd=str(ws),
