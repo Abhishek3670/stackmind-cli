@@ -59,6 +59,8 @@ class OperationType(str, Enum):
     EXPLAIN_DENIAL = "explain_denial"
     INSPECT_BUDGET = "inspect_budget"
     SUBMIT_FOR_REVIEW = "submit_for_review"
+    REQUEST_CONTRACT_CHANGE = "request_contract_change"
+    EVALUATE_CONTRACT_CHANGE = "evaluate_contract_change"
 
     # Planning
     ASK_USER = "ask_user"

@@ -162,6 +162,7 @@ class ContractEvaluator:
 
     _PROTOCOL_REPORTING_OPERATIONS = {
         "submit_verdict", "request_changes", "approve_work_order", "submit_for_review",
+        "request_contract_change", "evaluate_contract_change",
     }
 
     @staticmethod
@@ -339,7 +340,19 @@ class ContractEvaluator:
                     return False, "target is outside allowed scope"
 
                 # Permit reading workspace application code, assets, documentation
-                return True, "authorized" 
+                safe_reference_exact = {
+                    "plan.md", "readme.md", "agents.md", "architecture.md",
+                    "brand-kit.html", "brand-kit.md", "brand-kit.txt",
+                    "package.json", "pyproject.toml", "cargo.toml", "go.mod", "tsconfig.json",
+                    ".sync/system_context.md",
+                }
+                if (
+                    lower_t in safe_reference_exact
+                    or (lower_t.count("/") == 0 and lower_t.startswith("brand-kit"))
+                    or (lower_t.count("/") == 0 and lower_t.endswith(".md"))
+                ):
+                    return True, "authorized"
+                return False, "target is outside allowed scope"
 
             return False, "target is outside allowed scope"
         return True, "authorized"

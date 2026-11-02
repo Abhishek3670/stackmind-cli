@@ -222,6 +222,11 @@
     "plan_ref": {
       "type": "string"
     },
+    "plan_binding_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 hash of the approved PLAN.md at the time this work order was authored or bound."
+    },
     "revision": {
       "type": "integer",
       "minimum": 1,

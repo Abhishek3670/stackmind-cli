@@ -336,6 +336,43 @@ class AuthoringGate:
                                 except Exception:
                                     pass
 
+        # Plan binding and scope drift check
+        binding_hash = data.get("plan_binding_hash")
+        is_follow_up = bool(data.get("reopened_from") or data.get("reopened_at") or data.get("parent_wo"))
+        if (binding_hash or is_follow_up) and self._project_root:
+            if binding_hash:
+                from validators.harness.review_gate import plan_hash
+                current_plan_hash = plan_hash(self._project_root)
+                if current_plan_hash and binding_hash != current_plan_hash:
+                    errors.append(
+                        f"Work order '{wo_id}' plan_binding_hash '{binding_hash}' does not match approved PLAN.md hash '{current_plan_hash}'"
+                    )
+
+            if wo_id != "WO-000":
+                plan_file = self._project_root / "PLAN.md"
+                if plan_file.is_file():
+                    try:
+                        plan_text = plan_file.read_text(encoding="utf-8")
+                        if isinstance(deliverable, dict) and deliverable.get("path"):
+                            deliv_path = str(deliverable.get("path")).strip()
+                            exempt_prefixes = ("tests/", "test_", ".sync/", ".github/")
+                            exempt_names = {
+                                "PLAN.md", "README.md", "CHANGELOG.md", "VERSION",
+                                ".gitignore", "package.json", "pyproject.toml",
+                                "setup.py", "tsconfig.json", "vite.config.js",
+                            }
+                            path_obj = Path(deliv_path)
+                            if (
+                                not deliv_path.startswith(exempt_prefixes)
+                                and path_obj.name not in exempt_names
+                            ):
+                                if deliv_path not in plan_text and path_obj.name not in plan_text:
+                                    errors.append(
+                                        f"Scope drift violation: deliverable '{deliv_path}' in work order '{wo_id}' is not in approved PLAN.md"
+                                    )
+                    except Exception:
+                        pass
+
     def _validate_contract(
         self, norm_path: str, data: dict[str, Any], errors: list[str]
     ) -> None:

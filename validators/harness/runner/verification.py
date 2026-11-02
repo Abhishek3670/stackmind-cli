@@ -437,7 +437,7 @@ class _VerificationMixin:
 
             has_declared_files = bool(deliv_evidence.get("declared_paths"))
             is_arch_conversational = (
-                (is_arch or str(task.work_order_id) == "WO-000")
+                str(task.work_order_id) == "WO-000"
                 and not deliverable_touched
             )
             if has_declared_files and not is_arch_conversational:

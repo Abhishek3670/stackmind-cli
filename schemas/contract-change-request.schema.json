@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StackMind Contract Change Request",
+  "description": "Structured message from worker agents (codex, gemini) to the Architect proposing scope or budget changes when code requirements encounter contract boundaries.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "request_id",
+    "work_order_id",
+    "requesting_agent",
+    "requested_scope",
+    "rationale",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^CCR-[0-9]{3}$"
+    },
+    "work_order_id": {
+      "type": "string",
+      "pattern": "^WO-[0-9]{3}$"
+    },
+    "requesting_agent": {
+      "type": "string",
+      "enum": ["codex", "gemini", "gemma", "local-llm"]
+    },
+    "requested_scope": {
+      "type": "object",
+      "required": ["allow"],
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 5
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING", "APPROVED", "REJECTED"]
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "architect_response": {
+      "type": "object",
+      "required": ["decision", "reason"],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": ["APPROVED", "REJECTED"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_at": {
+          "type": "string"
+        },
+        "contract_revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

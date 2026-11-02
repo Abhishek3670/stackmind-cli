@@ -3188,6 +3188,163 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, f"Submitted review to {notice_path.name}")
         return {"submitted": True, "notice_path": str(notice_path.relative_to(self.workspace.root))}
 
+    def request_contract_change(
+        self,
+        work_order: str,
+        rationale: str,
+        requested_allow: list[str],
+        requested_deny: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Worker agents propose contract scope amendments to the Lead Architect."""
+        import json
+        clean_id = os.path.basename(work_order).replace(".yaml", "").strip()
+        record = self._authorize(OperationType.REQUEST_CONTRACT_CHANGE, f"workspace/inbox/claude/ccr/{clean_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        ccr_dir = self.workspace.root / ".sync" / "inbox" / "claude" / "ccr"
+        ccr_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_ccrs = list(ccr_dir.glob("CCR-*.json"))
+        max_num = 0
+        for f in existing_ccrs:
+            m = re.match(r"^CCR-([0-9]{3})\.json$", f.name)
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+        req_id = f"CCR-{max_num + 1:03d}"
+
+        payload = {
+            "schema_version": 1,
+            "request_id": req_id,
+            "work_order_id": clean_id,
+            "requesting_agent": self.actor_id,
+            "requested_scope": {
+                "allow": list(requested_allow),
+            },
+            "rationale": rationale,
+            "status": "PENDING",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if requested_deny is not None:
+            payload["requested_scope"]["deny"] = list(requested_deny)
+
+        schema_file = self.workspace.root / "schemas" / "contract-change-request.schema.json"
+        if not schema_file.is_file():
+            schema_file = Path(__file__).resolve().parent.parent.parent / "schemas" / "contract-change-request.schema.json"
+        if schema_file.is_file():
+            try:
+                from jsonschema import Draft7Validator
+                schema_data = json.loads(schema_file.read_text(encoding="utf-8"))
+                validator = Draft7Validator(schema_data)
+                errors = [e.message for e in validator.iter_errors(payload)]
+                if errors:
+                    raise ValueError(f"Contract change request schema validation failed: {'; '.join(errors)}")
+            except Exception as e:
+                if isinstance(e, ValueError):
+                    raise
+
+        ccr_path = ccr_dir / f"{req_id}.json"
+        ccr_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.boundary.journal.complete(record.request.operation_id, f"Created {req_id} for {clean_id}")
+        return {
+            "success": True,
+            "request_id": req_id,
+            "work_order_id": clean_id,
+            "path": str(ccr_path.relative_to(self.workspace.root)),
+            "status": "PENDING",
+        }
+
+    def evaluate_contract_change_request(
+        self,
+        request_id: str,
+        decision: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Lead Architect approves or rejects a contract change request and notifies the worker."""
+        import json
+        clean_req = os.path.basename(request_id).replace(".json", "").strip()
+        record = self._authorize(OperationType.EVALUATE_CONTRACT_CHANGE, f"workspace/inbox/claude/ccr/{clean_req}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        decision_upper = decision.upper().strip()
+        if decision_upper not in ("APPROVED", "REJECTED"):
+            raise ValueError(f"Decision must be 'APPROVED' or 'REJECTED', got '{decision}'")
+
+        ccr_path = self.workspace.root / ".sync" / "inbox" / "claude" / "ccr" / f"{clean_req}.json"
+        if not ccr_path.is_file():
+            raise FileNotFoundError(f"Contract change request '{clean_req}' not found at {ccr_path}")
+
+        ccr_data = json.loads(ccr_path.read_text(encoding="utf-8"))
+        if ccr_data.get("status") != "PENDING":
+            raise ValueError(f"Contract change request '{clean_req}' is already {ccr_data.get('status')}")
+
+        wo_id = ccr_data.get("work_order_id")
+        requesting_agent = ccr_data.get("requesting_agent", "unknown")
+        resolved_at = datetime.now(timezone.utc).isoformat()
+        contract_revision = None
+        contract_updated = False
+
+        if decision_upper == "APPROVED":
+            contract_path = self.workspace.path_for(f".sync/contracts/{wo_id}.yaml")
+            if contract_path.is_file():
+                try:
+                    contract_dict = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+                    requested_scope = ccr_data.get("requested_scope", {})
+                    current_allow = list(contract_dict.get("allow", []))
+                    for item in requested_scope.get("allow", []):
+                        if item not in current_allow:
+                            current_allow.append(item)
+                    contract_dict["allow"] = current_allow
+                    if "deny" in requested_scope:
+                        contract_dict["deny"] = list(requested_scope["deny"])
+                    rev = int(contract_dict.get("revision", contract_dict.get("version", 1))) + 1
+                    contract_dict["revision"] = rev
+                    contract_revision = rev
+                    contract_path.write_text(yaml.safe_dump(contract_dict, sort_keys=False), encoding="utf-8")
+                    contract_updated = True
+
+                    if self.contract and self.contract.work_order == wo_id:
+                        self.contract.allow = tuple(current_allow)
+                except Exception as e:
+                    self.boundary.journal.complete(record.request.operation_id, f"error updating contract: {e}")
+                    raise
+
+        ccr_data["status"] = decision_upper
+        response_payload = {
+            "decision": decision_upper,
+            "reason": reason or ("Approved by Lead Architect." if decision_upper == "APPROVED" else "Rejected by Lead Architect."),
+            "resolved_at": resolved_at,
+        }
+        if contract_revision is not None:
+            response_payload["contract_revision"] = contract_revision
+        ccr_data["architect_response"] = response_payload
+        ccr_path.write_text(json.dumps(ccr_data, indent=2), encoding="utf-8")
+
+        agent_inbox = self.workspace.root / ".sync" / "inbox" / requesting_agent
+        agent_inbox.mkdir(parents=True, exist_ok=True)
+        now_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        notice_file = agent_inbox / f"{now_stamp}_{clean_req}_{decision_upper.lower()}.md"
+        notice_text = (
+            f"# Contract Change Request {clean_req}: {decision_upper}\n\n"
+            f"**Work Order:** {wo_id}\n"
+            f"**Decision:** {decision_upper}\n"
+            f"**Reason:** {reason}\n"
+            f"**Contract Revision:** {contract_revision}\n"
+        )
+        notice_file.write_text(notice_text, encoding="utf-8")
+
+        self.boundary.journal.complete(record.request.operation_id, f"{clean_req} {decision_upper}")
+        return {
+            "evaluated": True,
+            "request_id": clean_req,
+            "work_order_id": wo_id,
+            "decision": decision_upper,
+            "contract_updated": contract_updated,
+            "contract_revision": contract_revision,
+            "notification_path": str(notice_file.relative_to(self.workspace.root)),
+        }
+
     def inspect_work_order(self, wo_id: str) -> dict[str, Any]:
         clean_id = os.path.basename(wo_id).replace(".yaml", "").strip()
         record = self._authorize(OperationType.INSPECT_WORK_ORDER, f"work-orders/{clean_id}")
