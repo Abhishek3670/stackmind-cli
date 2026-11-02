@@ -78,15 +78,17 @@ def get_permission_matrix_prompt(role: str | None = None) -> str:
     elif clean_role in ("codex", "backend"):
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: BACKEND SPECIALIST\n"
-            "You own server-side logic, APIs, endpoints, and database models under `src/`. "
-            "You may optionally author unit tests under `tests/` to self-verify your deliverables. "
+            "You own server-side logic, APIs, endpoints, and database models under `src/` and `app/`.\n"
+            "READ ACCESSIBILITY: You have complete read-only access to inspect frontend components, templates, and tests to understand client-side schemas and contracts.\n"
+            "You may optionally author unit tests under `tests/` to self-verify your deliverables.\n"
             "Do NOT modify frontend templates or governance work orders directly."
         )
     elif clean_role in ("gemini", "frontend"):
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: FRONTEND SPECIALIST\n"
-            "You own client-side interface, HTML/CSS/JS, and assets under `index.html` and `src/`. "
-            "You may optionally author unit tests under `tests/` to self-verify your deliverables. "
+            "You own client-side interface, HTML/CSS/JS, and assets under `index.html`, `src/`, and `assets/`.\n"
+            "READ ACCESSIBILITY: You have complete read-only access to inspect backend endpoints, server code (e.g. `app/`, `src/`), and API schemas to understand data contracts.\n"
+            "You may optionally author unit tests under `tests/` to self-verify your deliverables.\n"
             "Do NOT modify server-side backend logic or governance work orders directly."
         )
     elif clean_role in ("gemma", "qa"):

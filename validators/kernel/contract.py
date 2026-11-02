@@ -312,54 +312,21 @@ class ContractEvaluator:
                 if (lower_t.startswith(".sync/work-orders/") or lower_t.startswith(".sync/contracts/")) and not is_architect:
                     return False, "target is outside allowed scope"
 
-                is_qa_agent = (contract.agent_id.lower() in ("gemma", "qa") or role_str in ("qa", "quality"))
-                if is_qa_agent:
-                    secret_patterns = (
-                        ".git/**", ".git", ".env", ".env.*", ".sync/runtime/**",
-                        ".sync/snapshots/**", "*secret*", "*credential*", "*token*", "*.key", "*.pem",
-                    )
-                    if any(self._matches(target, sp) for sp in secret_patterns):
-                        return False, "target is explicitly denied"
-                    # QA verifiers require full read visibility across workspace code, configs, and resource folders
-                    # (server/, src/, tests/, assets/, index.html, package.json, configs, etc.) to inspect deliverables under test.
-                    return True, "authorized"
+                # Check security deny patterns (credentials, secrets, .git, .env, private snapshots)
+                secret_patterns = (
+                    ".git/**", ".git", ".env", ".env.*", ".sync/runtime/**",
+                    ".sync/snapshots/**", "*secret*", "*credential*", "*token*", "*.key", "*.pem",
+                )
+                if any(self._matches(target, sp) for sp in secret_patterns):
+                    return False, "target is explicitly denied"
 
-                if operation_type in ("list_directory", "glob"):
-                    if is_architect and (
-                        lower_t in (".sync", ".sync/work-orders", ".sync/contracts", ".sync/decisions")
-                        or lower_t.startswith((".sync/work-orders/", ".sync/contracts/", ".sync/decisions/"))
-                    ):
-                        return True, "authorized"
-                    if norm_t in ("workspace", ".", ""):
-                        return True, "authorized"
-                    first_seg = lower_t.split("/")[0]
-                    if first_seg in ("assets", "public", "static", "docs", "templates"):
-                        return True, "authorized"
-                    for a in contract.allow:
-                        norm_a = posixpath.normpath(a.replace("\\", "/").strip("/"))
-                        norm_a_clean = norm_a[len("workspace/"):] if norm_a.startswith("workspace/") else norm_a
-                        if (
-                            norm_a_clean.startswith(norm_t_clean + "/")
-                            or norm_a.startswith(norm_t + "/")
-                            or norm_t_clean.startswith(norm_a_clean.rstrip("/*") + "/")
-                        ):
-                            return True, "authorized"
-                    return False, "target is outside allowed scope"
-
-                # Permit reading workspace application code, assets, documentation
-                safe_reference_exact = {
-                    "plan.md", "readme.md", "agents.md", "architecture.md",
-                    "brand-kit.html", "brand-kit.md", "brand-kit.txt",
-                    "package.json", "pyproject.toml", "cargo.toml", "go.mod", "tsconfig.json",
-                    ".sync/system_context.md",
-                }
-                if (
-                    lower_t in safe_reference_exact
-                    or (lower_t.count("/") == 0 and lower_t.startswith("brand-kit"))
-                    or (lower_t.count("/") == 0 and lower_t.endswith(".md"))
-                ):
-                    return True, "authorized"
-                return False, "target is outside allowed scope"
+                # UNIVERSAL READ-ONLY ACCESS ACROSS APPLICATION WORKSPACE:
+                # Engineering specialists (Frontend, Backend, QA, Architecture, GitOps) are granted
+                # read-only visibility across workspace application code, components, endpoints, tests,
+                # configs, and documentation (e.g. app/**, src/**, assets/**, index.html, package.json,
+                # requirements.txt, tsconfig.json, etc.) so they can understand peer interfaces, API schemas,
+                # and companion deliverables. Write operations remain strictly restricted to allowed contract scope.
+                return True, "authorized"
 
             return False, "target is outside allowed scope"
         return True, "authorized"

@@ -1,4 +1,4 @@
-"""Tests for QA Full Read Visibility & Persistent Agent Memory (SDP-MEM-001)."""
+"""Tests for QA & Specialist Full Read Visibility, Persistent Agent Memory, and Safe Operation Resolution (SDP-MEM-001)."""
 
 from __future__ import annotations
 
@@ -58,6 +58,75 @@ def test_qa_agent_unrestricted_read_access():
     # 5. Write permissions are still strictly restricted to allowed modules (tests/**)
     assert evaluator.authorize(qa_contract, "write_file", "workspace/index.html")[0] is False
     assert evaluator.authorize(qa_contract, "write_file", "workspace/tests/test_calculator.py") == (True, "authorized")
+
+
+def test_cross_agent_read_access_and_write_partitioning():
+    """Verify Frontend and Backend can freely read each other's code, but cannot write peer files."""
+    evaluator = ContractEvaluator()
+
+    # Frontend contract: allowed to write src/components/** and index.html
+    frontend_contract = AgentContract(
+        agent_id="gemini",
+        work_order="WO-002",
+        allow=(
+            "src/components/**",
+            "workspace/src/components/**",
+            "index.html",
+            "workspace/index.html",
+        ),
+        deny=(".git/**", "workspace/.git/**"),
+        write_mode="read-write",
+    )
+
+    # Backend contract: allowed to write app/** and server files
+    backend_contract = AgentContract(
+        agent_id="codex",
+        work_order="WO-001",
+        allow=(
+            "app/**",
+            "workspace/app/**",
+            "package.json",
+            "workspace/package.json",
+        ),
+        deny=(".git/**", "workspace/.git/**"),
+        write_mode="read-write",
+    )
+
+    # 1. Frontend CAN read Backend files (app/calculator.py, package.json, etc.)
+    assert evaluator.authorize(frontend_contract, "read_file", "workspace/app/calculator.py") == (True, "authorized")
+    assert evaluator.authorize(frontend_contract, "read_file", "workspace/package.json") == (True, "authorized")
+
+    # 2. Backend CAN read Frontend files (src/components/Calculator.tsx, index.html)
+    assert evaluator.authorize(backend_contract, "read_file", "workspace/src/components/Calculator.tsx") == (True, "authorized")
+    assert evaluator.authorize(backend_contract, "read_file", "workspace/index.html") == (True, "authorized")
+
+    # 3. Frontend CANNOT write Backend files
+    assert evaluator.authorize(frontend_contract, "write_file", "workspace/app/calculator.py")[0] is False
+
+    # 4. Backend CANNOT write Frontend files
+    assert evaluator.authorize(backend_contract, "write_file", "workspace/src/components/Calculator.tsx")[0] is False
+    assert evaluator.authorize(backend_contract, "write_file", "workspace/index.html")[0] is False
+
+    # 5. Security boundaries remain enforced for both
+    assert evaluator.authorize(frontend_contract, "read_file", "workspace/.env")[0] is False
+    assert evaluator.authorize(backend_contract, "read_file", "workspace/.env")[0] is False
+
+
+def test_session_manager_get_operation_returns_none_safely(tmp_path: Path):
+    """Verify get_operation safely returns None instead of raising KeyError for unknown operations."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path)
+    manager = SessionManager(storage)
+
+    # Non-existent operation must return None cleanly without KeyError
+    result = manager.get_operation("non-existent-op-uuid-1234")
+    assert result is None
+
+    # list_children on non-existent operation must return empty list without KeyError
+    children = manager.list_children("non-existent-op-uuid-1234")
+    assert children == []
 
 
 def test_agent_persistent_memory_assembly(tmp_path: Path):

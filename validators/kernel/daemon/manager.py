@@ -501,7 +501,7 @@ def synthesize_bootstrap_planning(
                 {"module": ".sync/work-orders/**"},
                 {"module": ".sync/contracts/**"},
 
-    
+
                 {"module": ".sync/decisions/**"},
             {"module": ".sync/inbox/local-llm/**"},
                 {"module": ".sync/inbox/claude/**"},
@@ -2363,21 +2363,26 @@ class SessionManager:
                     return session, record
         raise KeyError("unknown operation")
 
-    def get_operation(self, operation_id: str) -> dict[str, Any]:
+    def get_operation(self, operation_id: str) -> dict[str, Any] | None:
         with self._lock:
-            _, record = self._operation(operation_id)
-            return dict(record)
+            try:
+                _, record = self._operation(operation_id)
+                return dict(record)
+            except KeyError:
+                return None
 
     def list_children(self, operation_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            _, record = self._operation(operation_id)
+            try:
+                _, record = self._operation(operation_id)
+            except KeyError:
+                return []
             children_ids = record.get("children", [])
             children = []
             for child_id in children_ids:
-                try:
-                    children.append(self.get_operation(child_id))
-                except KeyError:
-                    pass
+                child = self.get_operation(child_id)
+                if child is not None:
+                    children.append(child)
             return children
 
     def list_operations(self, session_id: str | None = None) -> list[dict[str, Any]]:
