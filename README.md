@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.10.10` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.11.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -96,9 +96,15 @@ Authority is `CEO → Claude (architect, sole writer of TREE.yaml/boot) → Gemm
 
 The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:status`, `:approve`/`:reject`, `:resume`, streamed output — not a second source of truth.
 
-## Harness
+## Harness & Governance
 
-`AgentRunner` (`validators/harness/runner/`) executes one contracted turn: inbox/WO discovery → contract + citizenship checks → `assemble_context` → scratch workspace → provider tool loop (`read_file`/`write_file`/`run_command`/`query_graph`/`web_search`/`image_search`/`web_fetch` via `validators/kernel/tools.py` + `providers/gateway.py`) → staged-diff verification (incl. no-op, `D024` QA gates, and `DeliverableVerifier` HTML media asset integrity checks) → validated write-back. Default provider is `EchoLLMProvider`; gateway also supports real backends (Ollama etc.).
+`AgentRunner` (`validators/harness/runner/`) executes contracted agent turns with multi-layer governance:
+- **Contract Change Requests (CCR)**: Worker agents dynamically request scope expansion via `request_contract_change`; strictly the Lead Architect (`claude`) can approve amendments.
+- **Plan Binding & Scope Guard**: Binds work orders to `PLAN.md` content hashes and rejects unapproved scope drift.
+- **Concurrency Limiting**: Thread-safe `AgentConcurrencyLimiter` caps concurrent running agents (`STACKMIND_MAX_CONCURRENT_AGENTS`, default 2).
+- **Observability & Tracing**: `WorkOrderTracer` (`.sync/traces/{wo_id}.json`) and Run Cost Ledgers (`.sync/traces/run_cost_ledger.json`) calculate token consumption and USD costs per agent.
+- **Fixed Feature Evals**: Canonical regression test suite (`validators/harness/evals.py`) to verify determinism and compliance across model or prompt updates.
+- **Verification Gates**: Staged-diff verification, `D024` QA gates, and `DeliverableVerifier` HTML media asset integrity checks before validated write-back. Default provider is `EchoLLMProvider`; gateway also supports real backends (Ollama etc.).
 
 ## Docs
 
@@ -109,6 +115,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.10.10`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.11.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

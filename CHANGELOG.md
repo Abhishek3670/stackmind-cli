@@ -5,6 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.11.0] - 2026-11-02
+
+### Added
+- **Contract Change Request (CCR) Protocol (Item C.1)**:
+  - Formally implemented schema-backed dynamic contract amendment protocol in `schemas/contract-change-request.schema.json`.
+  - Added `request_contract_change` and `evaluate_contract_change_request` operations to `validators/kernel/operations.py` and `validators/kernel/tools.py`.
+  - Role-gated execution in `validators/kernel/identity.py`: worker agents (`codex`, `gemini`, `gemma`, `local-llm`) can request scope changes with sequential `CCR-xxx` tracking; strictly the Lead Architect (`claude`) can approve or reject amendments.
+  - On approval, dynamically updates `.sync/contracts/<wo_id>.yaml`, bumps contract revision, synchronizes runtime contract state, and sends an inbox notification to the requesting agent.
+- **Plan Binding & Scope Drift Guard (Item C.2)**:
+  - Added `plan_binding_hash` (SHA-256) property to `schemas/work-order.schema.json`.
+  - In `validators/harness/authoring_gate.py` and `authoring_semantic.py`, added fail-closed verification: work orders bound to an approved `PLAN.md` must match its content hash.
+  - Scope drift guard parses deliverables against `PLAN.md` milestones and rejects unapproved deliverables.
+- **Global Concurrency Semaphore & Agent Limits (Item D.3)**:
+  - Implemented `AgentConcurrencyLimiter` in `validators/kernel/concurrency.py` with thread-safe acquisition, capacity checks, and cancellation support.
+  - Added `max_concurrent_agents` (default 2) to `StackMindSettings` with `STACKMIND_MAX_CONCURRENT_AGENTS` environment override.
+  - Integrated cooperative turn queueing with cancellation polling in `SessionManager._run_turn` and slot release in `finally:`.
+  - Enforced concurrency cap on parallel dispatches in `LifecycleSupervisor._advance_dispatching` and `_advance_executing`.
+- **Distributed Work Order Tracing & Run Cost Ledger (Item C.6)**:
+  - Implemented `WorkOrderTracer` in `validators/kernel/tracing.py` recording execution spans for all participating agents (`claude`, `codex`, `gemini`, `gemma`, `local-llm`) into `.sync/traces/{work_order_id}.json`.
+  - Token consumption and USD pricing tables with `compute_token_cost()`.
+  - Maintained global `.sync/traces/run_cost_ledger.json` tracking total cost, token count, and breakdowns per agent and per work order.
+  - Added markdown summary exporter (`export_summary_markdown`) and automatic span recording in `SessionManager.complete_operation`.
+- **Fixed Feature Evals Regression Suite (Item C.7)**:
+  - Implemented `FixedFeatureEvalRunner` in `validators/harness/evals.py` running canonical past feature scenarios (`ScaffoldFeatureScenario`, `AuthFeatureScenario`, `ContractGovernanceScenario`) to verify determinism, contract enforcement, and tool compliance when prompts, tools, or models change.
+- **Crash Recovery & Cancel Cleanup Hardening (Items B.2 & C.4)**:
+  - Added commit trailer verification (`StackMind-Work-Order`, `StackMind-Contract-Revision`) to `create_gitops_commit` in `validators/kernel/daemon/supervisor/release.py` to ensure idempotent resume without duplicate commits.
+  - Implemented `cleanup_cancelled_operation` in `validators/kernel/work_order_ops.py` to unstage git changes, reset index, and update `INDEX.yaml` on cancel.
+- **Cross-Platform Linux Import Integrity (WO-001)**:
+  - Safely promoted Windows process creation constant `_CREATE_SUSPENDED` to module scope in `validators/kernel/sandbox.py` to prevent import failures on Linux environments.
+
 ## [3.10.10] - 2026-10-30
 
 ### Changed
