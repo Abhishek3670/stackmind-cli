@@ -1622,8 +1622,23 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             for other in bucket_sorted:
                 if other[1] == entry[1]:
                     continue
-                # If they are sequential, they do not collide
+                # If they are sequential, ensure DAG dependency exists between them
                 if _are_sequential(entry, other):
+                    # Guarantee the later work order depends on the earlier one
+                    m_entry = str(entry[3].get("id") or entry[3].get("title") or "") if isinstance(entry[3], dict) else ""
+                    m_other = str(other[3].get("id") or other[3].get("title") or "") if isinstance(other[3], dict) else ""
+                    order_entry = milestone_order_map.get(m_entry, 0)
+                    order_other = milestone_order_map.get(m_other, 0)
+                    if order_other > order_entry:
+                        other_deps = other[2].setdefault("dependencies", [])
+                        if entry[1] not in other_deps:
+                            other_deps.append(entry[1])
+                            durable_write_yaml(other[0], other[2])
+                    elif order_entry > order_other:
+                        entry_deps = entry[2].setdefault("dependencies", [])
+                        if other[1] not in entry_deps:
+                            entry_deps.append(other[1])
+                            durable_write_yaml(entry[0], entry[2])
                     continue
                 # Truly parallel collision: the higher precedence one survives
                 if _wo_precedence(other) > _wo_precedence(entry):

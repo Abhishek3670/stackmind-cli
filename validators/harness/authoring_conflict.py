@@ -222,17 +222,31 @@ def _check_overwrite_conflict(
         if is_contract and isinstance(data, dict):
             existing_rev = existing_data.get("contract_revision", 1)
             new_rev = data.get("contract_revision")
-            if isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev:
-                return
+            existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
+            if not (isinstance(new_rev, int) and new_rev > existing_num):
+                data["contract_revision"] = max(existing_num + 1, int(new_rev or 0) + 1)
+            return
 
-        # Task amendment: an authorized author may sharpen a live work
-        # order in place, but only behind a strictly increasing revision
-        # (recorded with its amendment reason), never a silent clobber.
+        # Task amendment: an authorized author (Architect/CEO) may sharpen a live work
+        # order in place. If the revision was not manually bumped, auto-bump it so
+        # authorized amendments never fail with an overwrite conflict.
         if is_active_wo and isinstance(data, dict):
             existing_rev = existing_data.get("revision", 1)
             new_rev = data.get("revision")
             if isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev:
                 return
+            existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
+            bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
+            data["revision"] = bumped_rev
+            amendments = data.setdefault("amendments", [])
+            if isinstance(amendments, list):
+                amendments.append(
+                    {
+                        "revision": bumped_rev,
+                        "reason": "Authoring amendment by lead architect",
+                    }
+                )
+            return
 
     # Conflict: attempting to overwrite an active artifact from another task or unauthorized update
     artifact_label = "work order" if is_active_wo else "contract"
