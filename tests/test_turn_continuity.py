@@ -23,7 +23,7 @@ class TestTurnContinuity:
         # One header only
         assert content.count("✦") == 1
         # Thinking section shown
-        assert "Thinking..." in content
+        assert "Thought for" in content
 
     def test_thinking_plus_answer_shows_one_header(self):
         """Verify thinking followed by answer deltas still renders one header."""
@@ -41,7 +41,7 @@ class TestTurnContinuity:
         # One header only
         assert content.count("✦") == 1
         # Thinking shown during answer streaming (not yet finalized)
-        assert "Thinking..." in content
+        assert "Thought for" in content
 
     def test_thinking_heading_appears_at_most_once(self):
         """Verify Thinking heading appears at most once per assistant turn."""
@@ -56,7 +56,7 @@ class TestTurnContinuity:
             latest_act_desc="running", start_time=0, max_wait=0, layout_width=80,
         )
 
-        assert content.count("Thinking...") == 1
+        assert content.count("Thought for") == 1
 
     def test_thinking_visible_after_answer_starts(self):
         """Verify thinking remains in final transcript when answer generation completes."""
@@ -89,7 +89,7 @@ class TestTurnContinuity:
                 latest_act_desc="running", start_time=0, max_wait=0, layout_width=80,
             )
             # Thinking should remain visible when answer is streaming
-            assert "Thinking..." in content
+            assert "Thought for" in content
 
     def test_finalization_no_duplication(self):
         """Verify finalization does not duplicate content."""
@@ -156,7 +156,7 @@ class TestTranscriptRendering:
         content = render_chat_transcript_str(messages, width=80)
 
         # Should include thinking section
-        assert "Thinking..." in content or "thinking" in content.lower()
+        assert "Thought for" in content or "thinking" in content.lower()
 
 
 if __name__ == "__main__":

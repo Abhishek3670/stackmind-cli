@@ -106,10 +106,12 @@ def test_source_editing_and_test_tools_follow_the_matrix() -> None:
         assert _permits(agent, "apply_patch")
     for agent in ("claude", "gemma"):
         assert not get_role_policy(agent).permits("apply_patch")
-    # Test execution and security scanning: workers + QA, not the architect.
+    # Test execution and security scanning: workers + QA; the architect holds
+    # run_tests for authorized self-verification but never apply_patch.
     for agent in ("codex", "gemini", "gemma", "local-llm"):
         assert _permits(agent, "run_tests", "run_security_scan")
-    assert not get_role_policy("claude").permits("run_tests")
+    assert get_role_policy("claude").permits("run_tests")
+    assert not get_role_policy("claude").permits("run_security_scan")
     # Gemma edits tests but never refactors application code (INV-007).
     assert _permits("gemma", "write_file")
     assert not get_role_policy("gemma").permits("delete_file")

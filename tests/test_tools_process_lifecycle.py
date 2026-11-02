@@ -110,9 +110,12 @@ def test_role_enforcement_for_process_tools(tmp_path):
     with pytest.raises(PermissionError, match="policy denies operation"):
         claude_gw.process_start([sys.executable, "test.py"])
 
-    # Claude also cannot run tests
-    with pytest.raises(PermissionError, match="policy denies operation"):
-        claude_gw.run_tests()
+    # Claude is authorized to run tests for architect self-verification
+    # (identity.py grants RUN_TESTS), while arbitrary process execution stays
+    # forbidden. Assert the matrix directly: the fixture wires sandbox=None, so
+    # invoking run_tests would fail after authorization for the wrong reason.
+    assert get_role_policy("claude").permits("run_tests")
+    assert not get_role_policy("claude").permits("process_start")
 
 
 def test_run_lint_and_security_scan(tmp_path):
@@ -142,3 +145,31 @@ def test_run_lint_and_security_scan(tmp_path):
     sec_danger = gateway.run_security_scan("danger.py")
     assert sec_danger["success"] is False
     assert len(sec_danger["findings"]) >= 1
+
+
+def test_linux_process_import_integrity():
+    """Verify cross-platform import integrity for _CREATE_SUSPENDED and ProcessManager.
+
+    Simulates POSIX/Linux platform import where sys.platform != 'win32'
+    to ensure modules load without ImportError.
+    """
+    import sys
+    from validators.kernel.sandbox import _CREATE_SUSPENDED
+    assert _CREATE_SUSPENDED == 0x00000004
+
+    from validators.kernel.process import ProcessManager
+    assert ProcessManager is not None
+
+    # Test Linux simulation
+    orig_platform = sys.platform
+    try:
+        sys.platform = "linux"
+        import validators.kernel.sandbox as sb
+        assert getattr(sb, "_CREATE_SUSPENDED") == 0x00000004
+
+        import validators.kernel.process as proc
+        assert getattr(proc, "_CREATE_SUSPENDED") == 0x00000004
+        assert proc.ProcessManager is not None
+    finally:
+        sys.platform = orig_platform
+

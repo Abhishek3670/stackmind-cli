@@ -104,9 +104,13 @@ def test_allowlist_is_tunable_per_sandbox(tmp_path: Path):
     authoritative.mkdir(parents=True, exist_ok=True)
     ws = ScratchWorkspace.create(authoritative, "sandbox-tuned")
     tight = ProcessSandbox(ws, env_allowlist=[])
-    result = run_py(tight, "import os; print(len(os.environ))")
+    result = run_py(tight, "import os; print(','.join(sorted(os.environ)))")
     assert result.returncode == 0
-    assert result.stdout.strip() == "0"
+    # An empty allowlist must leak nothing from the parent environment. The only
+    # permitted entry is the sandbox's own PATH (venv Scripts prepended by
+    # _child_env), which is injected independently of the allowlist.
+    leaked = {k for k in result.stdout.strip().split(",") if k and k != "PATH"}
+    assert not leaked, leaked
     # Default allowlist still contains the essentials.
     assert "PATH" in DEFAULT_ENV_ALLOWLIST
 
@@ -179,7 +183,7 @@ def test_denylist_blocks_python3_c_case_insensitive(tmp_path):
 
 def test_denylist_blocks_node_eval_and_perl_e(tmp_path):
     gateway, _ = _gateway_sandbox(tmp_path)
-    with pytest.raises(PermissionError, match="code-string flag"):
+    with pytest.raises(PermissionError, match="denied at the agent boundary"):
         gateway.run_command(["node", "--eval", "require('fs')"])
     with pytest.raises(PermissionError, match="code-string flag"):
         gateway.run_command(["perl", "-e", "print 1"])
@@ -224,6 +228,63 @@ def test_denylist_normalization_unit_cases():
     assert check_command(["pytest", "-q"]) is None
     assert check_command(["npm", "test"]) is None
     assert check_command(["python", "script.py"]) is None  # file form stays allowed
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b: exact `git --version` read-only exception (WO-004)
+# ---------------------------------------------------------------------------
+
+
+def test_git_version_exact_invocation_is_allowed():
+    """The sole non-GitOps Git exception is the exact version probe."""
+    assert check_command(["git", "--version"]) is None
+    assert check_command(["git", "--version"], role="codex") is None
+    assert check_command(["git", "--version"], role="gemma") is None
+    assert check_command(["C:\\Program Files\\Git\\cmd\\git.exe", "--version"]) is None
+
+
+def test_git_version_exception_does_not_expand_allowlist():
+    """No extra argv, subcommand or argument may ride along with the probe."""
+    denied = [
+        ["git", "--version", "--help"],
+        ["git", "--version", "status"],
+        ["git", "--version", "; rm -rf /", "#"],
+        ["git", "--version=2"],
+        ["git", "--versionx"],
+        ["git", "-v"],
+        ["git"],
+        ["git", "status", "--version"],
+        ["git", "commit", "-m", "x"],
+        ["git", "push", "origin", "main"],
+        ["git", "config", "--global", "user.email", "x@y.z"],
+    ]
+    for argv in denied:
+        assert check_command(argv) is not None, argv
+
+
+def test_git_version_exception_cannot_be_wrapped_in_a_shell():
+    """Shell and eval wrappers remain denied, so the probe cannot smuggle code."""
+    for argv in (
+        ["sh", "-c", "git --version"],
+        ["bash", "-c", "git --version"],
+        ['"C:\\Windows\\System32\\cmd.exe"', "/c", "git --version"],
+        ["powershell", "-Command", "git --version"],
+        ["eval", "git --version"],
+    ):
+        assert check_command(argv) is not None, argv
+
+
+def test_gateway_allows_git_version_but_keeps_git_mutations_denied(tmp_path):
+    """Boundary-level: the probe runs, mutations stay denied for non-GitOps."""
+    gateway, _ = _gateway_sandbox(tmp_path)
+    result = gateway.run_command(["git", "--version"])
+    assert result.returncode == 0
+    assert "git version" in result.stdout.lower()
+
+    with pytest.raises(PermissionError, match="denied"):
+        gateway.run_command(["git", "push", "origin", "main"])
+    with pytest.raises(PermissionError, match="denied"):
+        gateway.run_command(["git", "--version", "--help"])
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +494,7 @@ def test_harness_runner_denies_dangerous_and_nonexistent(tmp_path):
         runner._execute_sandboxed_command('echo "unbalanced', project),
     ]
     assert "command denied" in results[0].stderr
-    assert results[1].returncode != 0 and "FileNotFoundError" in results[1].stderr
+    assert results[1].returncode != 0 and "not found" in results[1].stderr.lower()
     assert "unparseable command" in results[2].stderr
     assert not (project / "unbalanced").exists() and results[0].returncode != 0
 

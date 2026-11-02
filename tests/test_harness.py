@@ -77,14 +77,13 @@ def test_runner_completes_assigned_work_order_and_keeps_tree_byte_identical(tmp_
         'status': 'ACTIVE',
         'priority': 'P2',
         'assigned_agents': ['codex'],
-        'dependencies': [],
-        'deliverable': {
-            'type': 'module',
+        'dependencies': [],        'deliverable': {
+            'type': 'doc',
             'path': 'validators/harness/runner.py',
             'description': 'Harness runtime',
         },
-        'description': 'Complete the governed harness task.',
-    }
+            'description': 'Complete the governed harness task.',
+        }
     _write_yaml(project / '.sync' / 'work-orders' / 'ACTIVE' / 'WO-101.yaml', work_order)
 
     index_path = project / '.sync' / 'work-orders' / 'INDEX.yaml'
@@ -98,7 +97,7 @@ def test_runner_completes_assigned_work_order_and_keeps_tree_byte_identical(tmp_
         'assigned_agents': ['codex'],
         'dependencies': [],
         'deliverable': {
-            'type': 'module',
+            'type': 'doc',
             'path': 'validators/harness/runner.py',
             'description': 'Harness runtime',
         },

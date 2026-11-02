@@ -6,7 +6,10 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from validators.ingest import (
     AttachmentRecord,
@@ -52,10 +55,19 @@ def _create_mock_docx(paragraphs: list[str], table_rows: list[list[str]] | None 
 
 def _create_mock_png(width: int = 200, height: int = 100) -> bytes:
     """Create a simple PNG image in memory."""
-    img = Image.new("RGB", (width, height), color=(73, 109, 137))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    if Image is not None:
+        img = Image.new("RGB", (width, height), color=(73, 109, 137))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    # Pure-Python fallback valid minimal PNG
+    header = b"\x89PNG\r\n\x1a\n"
+    ihdr_len = b"\x00\x00\x00\r"
+    ihdr_type = b"IHDR"
+    dims = struct.pack(">II", width, height)
+    ihdr_rest = b"\x08\x02\x00\x00\x00"
+    crc = b"\x00\x00\x00\x00"
+    return header + ihdr_len + ihdr_type + dims + ihdr_rest + crc
 
 
 def test_detect_attachment_type():

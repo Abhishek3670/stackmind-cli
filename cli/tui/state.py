@@ -775,21 +775,27 @@ class AutonomousDeliveryState:
         else:
             self.current_turn_segments.append({"kind": "text", "content": delta, "is_chatter": False})
 
-    def record_turn_thinking(self, text: str) -> None:
-        """Record live thinking chunk in the chronological turn segments."""
+    def _append_thinking_segment(self, text: str) -> None:
+        """Append a reasoning chunk to the chronological turn segments."""
         if not text:
             return
         if not hasattr(self, "current_turn_segments"):
             self.current_turn_segments = []
-        if getattr(self, "current_turn_thinking", None):
-            self.current_turn_thinking += text
-        else:
-            self.current_turn_thinking = text
         import time
         if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "thinking":
             self.current_turn_segments[-1]["content"] += text
         else:
             self.current_turn_segments.append({"kind": "thinking", "content": text, "start_time": time.monotonic()})
+
+    def record_turn_thinking(self, text: str) -> None:
+        """Record live thinking chunk in the chronological turn segments."""
+        if not text:
+            return
+        if getattr(self, "current_turn_thinking", None):
+            self.current_turn_thinking += text
+        else:
+            self.current_turn_thinking = text
+        self._append_thinking_segment(text)
 
     def reset_attempts_and_retries(self) -> None:
         """Reset attempt and retry counters for a fresh session or completed task."""
@@ -2589,22 +2595,27 @@ class AutonomousDeliveryState:
                 if getattr(self, "current_turn_thinking_start_time", None) is None:
                     import time
                     self.current_turn_thinking_start_time = time.monotonic()
-                if getattr(self, "current_turn_thinking", None):
-                    curr = self.current_turn_thinking
+                curr = getattr(self, "current_turn_thinking", None)
+                if curr:
                     if curr.endswith((" ", "\t", "\n")) or think_text.startswith((" ", "\t", "\n")):
-                        self.current_turn_thinking += think_text
+                        chunk = think_text
                     elif think_text[0] in ".,:;!?')]}->/\"'`:":
-                        self.current_turn_thinking += think_text
+                        chunk = think_text
                     elif curr[-1] in "-/([{\"':":
-                        self.current_turn_thinking += think_text
+                        chunk = think_text
                     elif " " in think_text:
-                        self.current_turn_thinking += " " + think_text
+                        chunk = " " + think_text
                     else:
-                        self.current_turn_thinking += think_text
+                        chunk = think_text
                 else:
-                    self.current_turn_thinking = think_text
+                    chunk = think_text
+                self.current_turn_thinking = (curr or "") + chunk
+                # Keep the live timeline in sync so reasoning survives once a
+                # tool/action segment exists (segments take over rendering).
+                self._append_thinking_segment(chunk)
             elif think_text and getattr(self, "current_turn_thinking", None):
                 self.current_turn_thinking += think_text
+                self._append_thinking_segment(think_text)
 
         elif name in {"verification.completed", "verification.recorded"}:
             res = payload.get("result")

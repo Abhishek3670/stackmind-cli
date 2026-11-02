@@ -1221,8 +1221,8 @@ def _stream_turn_execution(
             delta = extract_text_delta(ev)
             think_delta = extract_reasoning_delta(ev)
             if think_delta:
-                if hasattr(state, "record_turn_thinking"):
-                    state.record_turn_thinking(think_delta)
+                # process_event() already appended this delta to both the thinking
+                # buffer and the turn segments; recording it again doubled it.
                 if getattr(state, "current_turn_thinking_start_time", None) is None:
                     state.current_turn_thinking_start_time = time.monotonic()
                 if not streaming_active:
@@ -3204,8 +3204,6 @@ def dispatch_delivery_command(
                 from validators.kernel.settings import load_settings, save_settings
                 s = load_settings(ws)
                 s.govern_verbosity = clean_mode
-                if backend_arg in s.providers:
-                    s.providers[backend_arg].enabled = True
                 save_settings(s, ws)
             except Exception:
                 pass

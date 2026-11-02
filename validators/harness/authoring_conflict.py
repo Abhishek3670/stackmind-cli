@@ -177,11 +177,16 @@ def _check_overwrite_conflict(
                             }
                         )
             elif is_contract and isinstance(data, dict):
+                # A repair must produce a strictly increasing contract_revision,
+                # exactly like the work-order branch above. Repair turns
+                # deliberately resubmit the revision they read, so falling back
+                # to "only accept an already-higher revision" left the repaired
+                # contract indistinguishable from the one it replaced.
                 existing_rev = existing_data.get("contract_revision", 1)
                 new_rev = data.get("contract_revision")
                 existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
-                if isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev:
-                    data["contract_revision"] = max(existing_num + 1, int(new_rev or 0))
+                if not (isinstance(new_rev, int) and new_rev > existing_num):
+                    data["contract_revision"] = max(existing_num + 1, int(new_rev or 0) + 1)
             return
 
         if is_contract and isinstance(data, dict):

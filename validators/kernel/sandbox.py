@@ -126,6 +126,12 @@ def _ensure_posix_shim() -> str | None:
         return None
 
 
+# Win32 process creation flag (CREATE_SUSPENDED = 0x00000004).
+# Defined unconditionally at module scope for cross-platform import integrity
+# so dependent modules (e.g. process.py) can import it safely on Linux/POSIX.
+# Only passed to creationflags on win32 when attaching a Windows Job Object.
+_CREATE_SUSPENDED = 0x00000004
+
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
@@ -168,7 +174,6 @@ if sys.platform == "win32":
     _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     _JobObjectExtendedLimitInformation = 9
-    _CREATE_SUSPENDED = 0x00000004
 
 
 def _setup_windows_job(

@@ -436,7 +436,10 @@ class AuthoringGate:
         block_indent = 0
 
         for line in lines:
-            block_start = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*[:][>|][+-]?\s*$", line)
+            # NOTE: whitespace is legal between the colon and the indicator
+            # (`description: >`), so it must be optional here — without it the
+            # repair silently no-ops and the artifact stays unparseable.
+            block_start = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*:\s*[>|][+-]?\s*$", line)
             if block_start:
                 in_block = True
                 key_indent = len(block_start.group(1))

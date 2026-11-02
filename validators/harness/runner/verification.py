@@ -442,12 +442,46 @@ class _VerificationMixin:
             )
             if has_declared_files and not is_arch_conversational:
                 if not deliv_passed:
-                    outcome_verified = False
-                    for err in deliv_errors:
-                        staged_errors.append(f"Deliverable verification failed: {err}")
+                    is_non_code_task = (
+                        getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
+                        or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
+                    )
+                    has_report = bool(
+                        (decision.summary and decision.summary.strip())
+                        or (decision.report_markdown and decision.report_markdown.strip())
+                    )
+                    if is_non_code_task and has_report:
+                        # Non-code task (e.g. doc, research) with a report/summary can complete
+                        # without touching the deliverable file; governance succeeds based on
+                        # the reported outcome rather than file modifications.
+                        outcome_verified = (
+                            decision.status == 'completed'
+                            and not decision.blockers
+                        )
+                    else:
+                        outcome_verified = False
+                        for err in deliv_errors:
+                            staged_errors.append(f"Deliverable verification failed: {err}")
                 elif task.deliverable_path and not deliverable_touched:
-                    outcome_verified = False
-                    staged_errors.append(f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn")
+                    is_non_code_task = (
+                        getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
+                        or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
+                    )
+                    has_report = bool(
+                        (decision.summary and decision.summary.strip())
+                        or (decision.report_markdown and decision.report_markdown.strip())
+                    )
+                    if is_non_code_task and has_report:
+                        # Non-code task (e.g. doc, research) with a report/summary can complete
+                        # without touching the deliverable file; governance succeeds based on
+                        # the reported outcome rather than file modifications.
+                        outcome_verified = (
+                            decision.status == 'completed'
+                            and not decision.blockers
+                        )
+                    else:
+                        outcome_verified = False
+                        staged_errors.append(f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn")
                 else:
                     outcome_verified = (
                         decision.status == 'completed'

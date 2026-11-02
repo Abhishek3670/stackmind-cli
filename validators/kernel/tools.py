@@ -207,6 +207,27 @@ class ToolGateway:
             "routes QA findings to the architect."
         )
 
+    def _architect_source_write_denial(self, target: str) -> str | None:
+        """Deny source writes to the architecture/planning role.
+
+        The architect holds WRITE_FILE so it can author governance artifacts
+        (PLAN.md, work orders, contracts, review findings). Application source
+        changes must be delegated to an implementation agent — allowing direct
+        edits would collapse the planning/implementation separation
+        (Agent Matrix §12, INV-005).
+        """
+        from validators.kernel.identity import is_architect_role, is_architect_writable_path
+
+        if not is_architect_role(self.actor_id):
+            return None
+        if is_architect_writable_path(target):
+            return None
+        return (
+            f"Architecture role '{self.actor_id}' may not write application source "
+            f"directly ('{target}'). Author a work order/contract and delegate the "
+            f"implementation to an authorized implementation agent (codex/gemini)."
+        )
+
     def write_file(self, target: str, content: str) -> None:
         # In-turn ownership guard (worker task contract): deny writes to other
         # work orders' deliverables and over-budget file counts WITH actionable
@@ -219,6 +240,9 @@ class ToolGateway:
         verdict_denial = self._verdict_channel_denial(target)
         if verdict_denial:
             raise PermissionError(verdict_denial)
+        architect_denial = self._architect_source_write_denial(target)
+        if architect_denial:
+            raise PermissionError(architect_denial)
         record = self._authorize(OperationType.WRITE_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)

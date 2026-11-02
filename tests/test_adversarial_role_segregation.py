@@ -87,6 +87,45 @@ def test_codex_cannot_git_commit_or_git_push(tmp_path: Path) -> None:
     assert "denies" in str(exc_push.value).lower() or "not permitted" in str(exc_push.value).lower() or "denied" in str(exc_push.value).lower()
 
 
+def test_claude_cannot_write_application_source(tmp_path: Path) -> None:
+    """The architect plans, approves and reviews — it must not edit source."""
+    gateway, _, _ = _build_gateway(tmp_path, "claude")
+
+    with pytest.raises(PermissionError, match="may not write application source"):
+        gateway.write_file("src/app.py", "print('escalation')\n")
+    with pytest.raises(PermissionError, match="may not write application source"):
+        gateway.write_file("html/index.html", "<h1>x</h1>\n")
+    with pytest.raises(PermissionError, match="may not write application source"):
+        gateway.batch_write_files([{"path": "app.py", "content": "x = 1\n"}])
+
+
+def test_claude_retains_governance_and_plan_writes(tmp_path: Path) -> None:
+    """Plans and governance artifacts remain writable by the architect."""
+    gateway, workspace, _ = _build_gateway(tmp_path, "claude")
+
+    gateway.write_file("PLAN.md", "# Project Plan\n")
+    assert (workspace.root / "PLAN.md").is_file()
+
+    gateway.write_file(".sync/reviews/WO-001-review.md", "looks good\n")
+    assert (workspace.root / ".sync" / "reviews" / "WO-001-review.md").is_file()
+
+
+def test_claude_holds_no_patch_authority(tmp_path: Path) -> None:
+    """Implementation authority stays with codex/gemini/local-llm."""
+    policy = get_role_policy("claude")
+    assert not policy.permits("apply_patch")
+    assert policy.permits("write_file")  # governance artifacts only, bounded above
+    assert policy.permits("run_tests")  # authorized self-verification
+
+
+def test_implementation_agent_can_write_application_source(tmp_path: Path) -> None:
+    """The boundary is role-specific: codex keeps source-writing authority."""
+    gateway, workspace, _ = _build_gateway(tmp_path, "codex")
+
+    gateway.write_file("src/app.py", "print('ok')\n")
+    assert (workspace.root / "src" / "app.py").is_file()
+
+
 def test_gemma_writes_scoped_artifacts_but_cannot_apply_patch(tmp_path: Path) -> None:
     """QA doctrine: gemma authors its executable test suites via write_file —
     bounded by contract scope — while source-editing tools stay withheld."""

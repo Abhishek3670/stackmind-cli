@@ -284,6 +284,14 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
     if not command:
         return None
 
+    # Shells and eval-style constructs are denied as the command itself. This is
+    # checked *before* unwrapping: _unwrap_command() replaces the command with its
+    # inner payload (cmd /c whoami -> whoami), so unwrapping first would launder
+    # the shell away and let `cmd /c ...` through the boundary.
+    outer = command[0]
+    if _exe_name(outer) in _SHELLS_LOWER or str(outer).strip().lower() in _EVAL:
+        return f"shell or eval-style interpreter '{outer}' is denied at the agent boundary"
+
     # Resolve wrappers before checking
     cmd = _unwrap_command(command)
     if not cmd:
@@ -307,7 +315,8 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
             while args and (args[0].startswith("-2") or args[0].startswith("-3")):
                 args.pop(0)
         for index, part in enumerate(args):
-            if part in ("-c", "--command") or part.lower() in ("-command", "-encodedcommand"):
+            # Case-insensitive: `python -C` is the same code-string flag.
+            if part.lower() in ("-c", "--command", "-command", "-encodedcommand"):
                 return f"interpreter '{cmd[0]}' invoked with code-string flag '{part}' is denied at the agent boundary"
             if part == "-m":
                 if index + 1 < len(args):
@@ -358,6 +367,13 @@ def check_command(command: Sequence[str], role: str | None = None) -> str | None
         # 4c. Git command and flag allowlist
         if exe == "git":
             args = list(cmd[1:])
+            # WO-004 read-only version probe: the exact argv `git --version` is
+            # permitted to non-GitOps roles as an executable/version check. Any
+            # extra argument, subcommand or option falls through to the strict
+            # parser below and stays denied. This is not a general Git allowlist
+            # expansion and grants no mutation capability.
+            if args == ["--version"]:
+                return None
             idx = 0
             # 1. Strict parse: only valueless global flags before subcommand
             while idx < len(args) and args[idx].startswith("-"):

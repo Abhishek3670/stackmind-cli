@@ -139,7 +139,9 @@ class TestQaVerdictChannelInjection:
 
         result = compile_authoring_artifacts(tmp_path)
 
-        assert result.normalized_paths == ()
+        # The companion-test authorization may touch the contract; the QA verdict
+        # channel must never be injected into a non-QA contract.
+        assert "+scope.allow: .sync/inbox/claude/**" not in result.injections.get(contract_rel, ())
         saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
         assert not any(".sync/inbox" in str(rule) for rule in saved["scope"]["allow"])
 
@@ -265,7 +267,9 @@ class TestMilestoneIdentityInjection:
         result = compile_authoring_artifacts(tmp_path, None)
 
         assert not result.decision_required
-        assert wo_rel not in result.normalized_paths
+        # A companion test_plan may be defaulted, but without a plan no milestone
+        # identity may be injected.
+        assert not any("milestone_id" in item for item in result.injections.get(wo_rel, ()))
         saved = yaml.safe_load((tmp_path / wo_rel).read_text(encoding="utf-8"))
         assert "milestone_id" not in saved
 
@@ -278,9 +282,12 @@ class TestConsolidatedTestPlanDefault:
     repair rounds could not add it.  The compiler now defaults the mapping."""
 
     def _build(self, tmp_path: Path) -> None:
-        write_wo(tmp_path, make_wo("WO-001", "gemini", "css/style.css"))
+        # A code deliverable is required: .css/.html assets classify as non-code
+        # (_NON_CODE_EXTENSIONS), so the D024 gate never demands coverage for them
+        # and no consolidated default applies.
+        write_wo(tmp_path, make_wo("WO-001", "gemini", "public/script.js"))
         write_wo(tmp_path, make_wo("WO-002", "gemma", "tests/test_visuals.py"))
-        write_contract(tmp_path, make_contract("WO-001", "gemini", [{"module": "css/**"}]))
+        write_contract(tmp_path, make_contract("WO-001", "gemini", [{"module": "public/**"}]))
         write_contract(tmp_path, make_contract("WO-002", "gemma", [{"module": "tests/**"}]))
 
     def test_single_qa_suite_becomes_declared_coverage(self, tmp_path: Path) -> None:
@@ -293,7 +300,7 @@ class TestConsolidatedTestPlanDefault:
         assert wo_rel in result.normalized_paths
         saved = yaml.safe_load((tmp_path / wo_rel).read_text(encoding="utf-8"))
         assert saved["test_plan"] == [
-            {"sources": ["css/style.css"], "tests": ["tests/test_visuals.py"]}
+            {"sources": ["public/script.js"], "tests": ["tests/test_visuals.py"]}
         ]
         assert saved["normalized_by"].startswith("authoring-compiler/")
 
@@ -378,7 +385,7 @@ class TestContractIdentityNormalization:
 
         result = compile_authoring_artifacts(tmp_path)
 
-        assert contract_rel not in result.normalized_paths
+        assert not any("agent_id ->" in item for item in result.injections.get(contract_rel, ()))
         saved = yaml.safe_load((tmp_path / contract_rel).read_text(encoding="utf-8"))
         assert saved["agent_id"] == "codex"
 

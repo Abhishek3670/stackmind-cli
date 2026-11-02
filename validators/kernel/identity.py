@@ -44,6 +44,33 @@ class AuthorizationPolicy:
         return operation_type in self.permitted_operations
 
 
+# Architecture / planning role aliases. These roles author governance artifacts
+# (plans, work orders, contracts, review findings) and delegate implementation;
+# they do not edit application source (Agent Matrix §12).
+ARCHITECT_ROLE_KEYS: tuple[str, ...] = ("claude", "architecture", "architect")
+
+# The only paths an architecture role may write directly. Everything else is an
+# implementation change and must go through a work order to codex/gemini.
+ARCHITECT_WRITABLE_PREFIXES: tuple[str, ...] = (".sync/",)
+ARCHITECT_WRITABLE_FILES: frozenset[str] = frozenset({"PLAN.md"})
+
+
+def is_architect_role(role_or_agent: str) -> bool:
+    """True when the identity belongs to the architecture/planning role."""
+    norm = str(role_or_agent or "").lower().strip()
+    return any(key in norm for key in ARCHITECT_ROLE_KEYS)
+
+
+def is_architect_writable_path(target: str) -> bool:
+    """True when an architecture role is allowed to write this path directly."""
+    norm = str(target or "").replace("\\", "/").strip().lstrip("/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    if norm.startswith(("work-orders/", "contracts/")):
+        norm = f".sync/{norm}"
+    return norm in ARCHITECT_WRITABLE_FILES or norm.startswith(ARCHITECT_WRITABLE_PREFIXES)
+
+
 def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
     """Return the canonical AuthorizationPolicy for a given agent role or alias."""
     from .operations import OperationType
@@ -120,12 +147,14 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         | universal_knowledge
     )
 
-    if any(k in norm for k in ("claude", "architecture", "architect")):
+    if is_architect_role(norm):
+        # Source writing is deliberately withheld: WRITE_FILE exists so the
+        # architect can author governance artifacts (PLAN.md, work orders,
+        # contracts, review findings) and APPLY_PATCH is not granted at all.
+        # ToolGateway additionally rejects source paths on this role.
         ops = base_set | {
-            OperationType.WRITE_FILE.value,
-            OperationType.BATCH_WRITE_FILES.value,  # Governed artifacts and blocker fixes
+            OperationType.WRITE_FILE.value,  # Governance artifacts only
             OperationType.BATCH_WRITE_FILES.value,  # Atomic multi-artifact authoring
-            OperationType.APPLY_PATCH.value,  # Direct blocker patches
             OperationType.RUN_COMMAND.value,  # Read-only inspect and execution
             OperationType.RUN_TESTS.value,  # Verify fixes against test suites
             OperationType.RUN_LINT.value,  # Verify linting

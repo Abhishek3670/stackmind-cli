@@ -18,7 +18,7 @@ class TestTurnLifecycleStreaming:
         content1 = _build_in_progress_turn_content(
             state, "model", [], "running", 0, 0, 80,
         )
-        assert "Thinking..." in content1
+        assert "Thought for" in content1
         assert "First thinking text" in content1
 
         # Phase 2: Thinking + Answer streaming
@@ -27,7 +27,7 @@ class TestTurnLifecycleStreaming:
             state, "model", ["Answer chunk 1", " chunk 2"], "running", 0, 0, 80,
         )
         # Thinking should still be visible during streaming
-        assert "Thinking..." in content2
+        assert "Thought for" in content2
         assert "Answer chunk 1" in content2
 
         # Phase 3: Finalization - add message with thinking
@@ -133,8 +133,8 @@ class TestInTransContentNoDuplication:
             state, "model", ["answer"], "running", 0, 0, 80,
         )
 
-        # Should have exactly one "Thinking..."
-        assert content.count("Thinking...") == 1
+        # Should have exactly one live thinking block
+        assert content.count("Thought for") == 1
 
     def test_transcript_after_completion_has_no_in_progress(self):
         """Verify transcript after completion has no in-progress artifacts."""

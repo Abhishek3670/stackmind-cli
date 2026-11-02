@@ -1068,6 +1068,10 @@ def render_action_preview(action: Any, avail_width: int = 80) -> RenderableType 
     output = getattr(action, "output", None)
     code = getattr(action, "code", None)
     error = getattr(action, "error", None)
+    # Command/test previews read body_text on every status path; it must be
+    # bound before the Agent branch, which previously introduced it as a local
+    # and left the common path raising UnboundLocalError.
+    body_text = output or error or ""
 
     # Suppress duplicate Agent preview headers
     if desc.startswith("Agent") or "harness" in t_name:

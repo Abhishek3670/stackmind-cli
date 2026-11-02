@@ -26,7 +26,9 @@ def repair_yaml_block_scalars(text: str) -> str:
     block_indent = 0
 
     for line in lines:
-        block_start = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*[:][>|][+-]?\s*$", line)
+        # Whitespace is legal between the colon and the indicator
+        # (`description: >`); omitting it made this repair a silent no-op.
+        block_start = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*:\s*[>|][+-]?\s*$", line)
         if block_start:
             in_block = True
             key_indent = len(block_start.group(1))
