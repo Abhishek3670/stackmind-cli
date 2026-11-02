@@ -57,7 +57,7 @@ def normalize_status(raw_status: str | None) -> str:
     return val
 
 
-def clean_error_message(err: Any) -> str:
+def clean_error_message(err: Any, max_len: int = 160) -> str:
     """Extract a concise human-readable error string avoiding raw dicts or traces, stripping internal LLM prompts."""
     if not err:
         return ""
@@ -65,21 +65,46 @@ def clean_error_message(err: Any) -> str:
         for key in ("message", "error", "reason", "summary", "detail"):
             val = err.get(key)
             if val and val != err:
-                cleaned = clean_error_message(val)
+                cleaned = clean_error_message(val, max_len=max_len)
                 if cleaned and cleaned.lower() not in {"failed", "blocked", "error"}:
                     return cleaned
         for val in err.values():
             if isinstance(val, str) and val.strip() and val.strip().lower() not in {"failed", "blocked", "error"}:
-                return clean_error_message(val)
+                return clean_error_message(val, max_len=max_len)
         return "Operation failed"
 
     msg = str(err).strip()
+
+    # Extract embedded JSON error payloads e.g. [402]: {"error": {"message": ...}}
+    if "{" in msg and "}" in msg:
+        start_idx = msg.find("{")
+        end_idx = msg.rfind("}") + 1
+        json_candidate = msg[start_idx:end_idx]
+        try:
+            import json as _json
+            parsed = _json.loads(json_candidate)
+            if isinstance(parsed, Mapping):
+                inner_msg = clean_error_message(parsed, max_len=max_len)
+                if inner_msg and inner_msg.lower() not in {"failed", "blocked", "error"}:
+                    prefix = msg[:start_idx].strip()
+                    suffix = msg[end_idx:].strip()
+                    import re as _re
+                    code_match = _re.search(r"\[(\d{3})\]", prefix) or _re.search(r"\b(\d{3})\b", prefix)
+                    code_str = f"[{code_match.group(1)}] " if code_match else ""
+                    reset_str = f" {suffix}" if suffix else ""
+                    res = f"{code_str}{inner_msg}{reset_str}".strip()
+                    if max_len and len(res) > max_len:
+                        res = res[:max_len - 3] + "..."
+                    return res
+        except Exception:
+            pass
+
     if msg.startswith("{") and msg.endswith("}") and ("'reason':" in msg or "'error':" in msg or "'message':" in msg):
         try:
             import ast
             parsed = ast.literal_eval(msg)
             if isinstance(parsed, Mapping):
-                return clean_error_message(parsed)
+                return clean_error_message(parsed, max_len=max_len)
         except Exception:
             pass
     if "Traceback (most recent call last):" in msg:
@@ -114,9 +139,8 @@ def clean_error_message(err: Any) -> str:
         if sent_match:
             msg = msg[: sent_match.start()].rstrip()
 
-    # Hard-cap inline error to 60 chars max
-    if len(msg) > 60:
-        msg = msg[:57] + "..."
+    if max_len and len(msg) > max_len:
+        msg = msg[:max_len - 3] + "..."
 
     return msg
 

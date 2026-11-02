@@ -113,6 +113,7 @@ class OperationNode:
     parent_id: str | None = None
     children: list[str] = field(default_factory=list)
     model: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -2422,13 +2423,21 @@ class AutonomousDeliveryState:
             err_msg = clean_error_message(payload.get("error") or payload.get("reason") or "failed")
             if op_id and op_id in self.operations:
                 self.operations[op_id].status = "FAILED"
+                self.operations[op_id].error = err_msg
             else:
                 for op in self.operations.values():
                     if (op.role == normalized_role or (op_name and op.name == op_name)) and op.status == "RUNNING":
                         op.status = "FAILED"
+                        op.error = err_msg
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "FAILED"
+            self.error = err_msg
             self.add_activity(normalized_role, "failed", str(err_msg))
+            role_label = normalized_role or "System"
+            formatted_fail = f"✗ [{role_label}] Operation failed: {err_msg}"
+            last_msg = self.messages[-1].content if self.messages else ""
+            if last_msg != formatted_fail:
+                self.add_message("assistant", formatted_fail)
 
         elif name in {"operation.blocked", "turn.blocked"}:
             self.active_working_status = None
@@ -2440,15 +2449,24 @@ class AutonomousDeliveryState:
             block_msg = clean_error_message(payload.get("error") or payload.get("reason") or "blocked")
             if op_id and op_id in self.operations:
                 self.operations[op_id].status = "BLOCKED"
+                self.operations[op_id].error = block_msg
             else:
                 for op in self.operations.values():
                     if (op.role == normalized_role or (op_name and op.name == op_name)) and op.status == "RUNNING":
                         op.status = "BLOCKED"
+                        op.error = block_msg
             if normalized_role in self.roles:
                 self.roles[normalized_role].state = "BLOCKED"
+            self.error = block_msg
             # Canonical blocker display: one entry per (failure_code, work
             # order, contract revision); raw evidence stays nested in the payload.
             self.add_activity(normalized_role, "blocked", canonical_blocker_text(block_msg), deduplicate=True)
+            role_label = normalized_role or "System"
+            if block_msg and block_msg.lower() not in {"blocked", "turn blocked"}:
+                formatted_block = f"⊘ [{role_label}] Blocked: {block_msg}"
+                last_msg = self.messages[-1].content if self.messages else ""
+                if last_msg != formatted_block:
+                    self.add_message("assistant", formatted_block)
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")

@@ -379,6 +379,61 @@ def test_clean_error_message_formats_cleanly():
     tb = "Traceback (most recent call last):\n  File 'app.py', line 10\nConnectionResetError: Remote disconnected"
     assert clean_error_message(tb) == "ConnectionResetError: Remote disconnected"
 
+    # 5. Embedded JSON payload with HTTP status code and reset interval (e.g. Inception 402/429)
+    raw_api_err = (
+        'Backend execution error: [openai-compatible-chat-d8339794-0ba8-4221-82ef-50d4f64758d4] [402]: '
+        '{"error":{"message":"Free tier limit reached. Please upgrade to a paid plan to continue using the service.","type":"free_tier_quota_exceeded"}} '
+        '(reset after 1m 59s)'
+    )
+    cleaned = clean_error_message(raw_api_err)
+    assert "[402]" in cleaned
+    assert "Free tier limit reached" in cleaned
+    assert "(reset after 1m 59s)" in cleaned
+
+
+def test_operation_failure_and_blocked_surfaced_in_state_and_hud():
+    """Verify operation failures and blockers append to chat messages and render in HUD."""
+    from cli.tui.events import clean_error_message
+    from cli.tui.runtime_panel import format_current_operation
+    from cli.tui.state import AutonomousDeliveryState, OperationNode
+
+    state = AutonomousDeliveryState()
+    raw_api_err = (
+        'Backend execution error: [openai-compatible-chat-123] [402]: '
+        '{"error":{"message":"Free tier limit reached. Please upgrade.","type":"free_tier_quota_exceeded"}} '
+        '(reset after 1m 59s)'
+    )
+
+    # 1. Process operation.failed event
+    state.process_event({
+        "name": "operation.failed",
+        "payload": {
+            "op_id": "op-42",
+            "op_name": "package.json",
+            "role": "backend",
+            "error": raw_api_err,
+        },
+    })
+
+    assert state.error is not None
+    assert "[402] Free tier limit reached" in state.error
+    assert len(state.messages) == 1
+    assert state.messages[0].role == "assistant"
+    assert "✗ [Backend] Operation failed:" in state.messages[0].content
+    assert "[402] Free tier limit reached" in state.messages[0].content
+
+    # 2. HUD formatting when idle with error
+    lines = format_current_operation(current_operation=None, state=state, width=80)
+    rendered_plain = [getattr(l, "plain", str(l)) for l in lines]
+    assert any("Idle (Error)" in p for p in rendered_plain)
+    assert any("402" in p for p in rendered_plain)
+
+    # 3. HUD formatting when operation failed
+    failed_op = OperationNode(operation_id="op-42", name="package.json", status="FAILED", role="backend", error=state.error)
+    lines_op = format_current_operation(current_operation=failed_op, state=state, width=80)
+    rendered_op_plain = [getattr(l, "plain", str(l)) for l in lines_op]
+    assert any("402" in p for p in rendered_op_plain)
+
 
 def test_actions_group_failure_visibility():
     """Verify ActionsGroup auto-expands and highlights failures in red with clean descriptions."""

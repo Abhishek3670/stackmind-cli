@@ -429,13 +429,13 @@ def format_current_operation(
 ) -> list[Text]:
     """Format current operation section into compact display."""
     if not current_operation:
+        err = getattr(state, "error", None) if state is not None else None
         if state is not None and getattr(state, "phase", None) in ("BLOCKED", "FAILED"):
             st_phase = getattr(state, "phase")
             phase_val = st_phase.value if hasattr(st_phase, "value") else str(st_phase)
             st_text = "Blocked" if phase_val.upper() == "BLOCKED" else "Failed"
             st_color = "#f43f5e" if phase_val.upper() == "FAILED" else "#f59e0b"
             res_lines = [Text(f"  ⊘ {st_text}", style=f"bold {st_color}")]
-            err = getattr(state, "error", None)
             if err:
                 from cli.tui.events import clean_error_message
                 short_err = clean_error_message(err)
@@ -448,6 +448,18 @@ def format_current_operation(
             elif phase_val.upper() == "FAILED":
                 res_lines.append(Text("    Run :resume to recover", style="dim #fbbf24"))
             return res_lines
+
+        if err and state is not None and getattr(state, "phase", None) not in ("PROJECT_COMPLETE",):
+            from cli.tui.events import clean_error_message
+            short_err = clean_error_message(err)
+            max_len = max((width - 4), 20) if width else 35
+            if len(short_err) > max_len:
+                short_err = short_err[:max_len - 1] + "…"
+            return [
+                Text("  ⊘ Idle (Error)", style="bold #f43f5e"),
+                Text(f"    {short_err}", style="dim #ef4444"),
+                Text("    Run :resume to continue", style="dim #fbbf24"),
+            ]
 
         if state is not None:
             phase = getattr(state, "phase", None)
@@ -499,6 +511,23 @@ def format_current_operation(
         sub.append(f"{op_name} ", style="dim white")
     sub.append(f"({disp})", style="dim #64748b")
     lines.append(sub)
+
+    # Surface error line if the operation failed, is blocked, or state has recorded error
+    op_err = None
+    if isinstance(current_operation, Mapping):
+        op_err = current_operation.get("error")
+    elif hasattr(current_operation, "error"):
+        op_err = getattr(current_operation, "error", None)
+    if not op_err and state is not None:
+        op_err = getattr(state, "error", None)
+
+    if op_err and str(op_status).upper() in {"FAILED", "BLOCKED", "ERROR"}:
+        from cli.tui.events import clean_error_message
+        clean_err = clean_error_message(op_err)
+        max_len = max((width - 6), 20) if width else 45
+        if len(clean_err) > max_len:
+            clean_err = clean_err[:max_len - 1] + "…"
+        lines.append(Text(f"    {clean_err}", style="dim #ef4444"))
 
     return lines
 
