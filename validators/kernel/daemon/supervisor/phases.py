@@ -158,10 +158,12 @@ class _PhasesMixin:
                 if plan_state == "APPROVED":
                     self._transition(state, Phase.AUTHORING)
                     return AdvanceResult.TRANSITIONED
-            # No plan proposed but turn completed — this is unexpected
-            state.error = "Planning turn completed without proposing a plan"
-            self._transition(state, Phase.FAILED)
-            return AdvanceResult.FAILED
+            # No plan proposed but turn completed — consultative/conversational turn.
+            # Architect judged that requirements / conversation are ongoing before building.
+            state.planning_operation_id = None
+            state.interrupted_phase = state.phase.value
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
 
         # Dispatch planning turn
         op = self.manager.start_turn(

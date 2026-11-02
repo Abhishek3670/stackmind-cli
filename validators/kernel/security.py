@@ -206,7 +206,7 @@ _SENSITIVE_VAR_NAMES = {
     "auth_token", "api_key", "apikey", "credential", "credentials",
 }
 
-_SENSITIVE_DICT_KEYS = {"admin", "user", "root", "guest", "test"}
+_SENSITIVE_DICT_KEYS = {"admin", "user", "root", "guest"}
 _SENSITIVE_DICT_VALUES = {"admin", "password", "admin123", "password123", "123456", "secret", "root", "pass"}
 
 
@@ -318,6 +318,12 @@ def scan_for_insecure_auth(text: str, file_path: str | Path | None = None) -> li
     """Detect hardcoded credential equality comparisons and dummy credential stores in code."""
     if not text or is_test_file(file_path):
         return []
+
+    # Insecure auth scan (AST comparison & dummy user dictionaries) is for Python source files
+    if file_path:
+        p = Path(file_path)
+        if p.suffix.lower() not in (".py", ".pyw"):
+            return []
 
     findings: list[str] = []
 

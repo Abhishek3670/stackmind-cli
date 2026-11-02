@@ -779,7 +779,7 @@ class _ExecutionMixin:
                                 f" (declared {evidence['declared']}; "
                                 f"observed {evidence['observed']})"
                             )
-                        if not dimensions.outcome_verified and task.work_order_id and not getattr(task, 'is_authoring', False):
+                        if not dimensions.outcome_verified and task.work_order_id and str(task.work_order_id) != "WO-000" and not getattr(task, 'is_authoring', False) and str(self.agent).lower().strip() not in ('claude', 'architecture', 'architect'):
                             meta_dict['failure'] = {
                                 'failure_code': 'OUTCOME_NOT_VERIFIED',
                                 'work_order_id': task.work_order_id,

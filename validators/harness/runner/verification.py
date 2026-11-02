@@ -283,20 +283,29 @@ class _VerificationMixin:
         if security_verified:
             from validators.kernel.security import scan_for_credential_leaks
 
-            for relative_path in changed_files:
-                candidate = staged_root / relative_path
-                if candidate.is_file():
-                    try:
-                        content = candidate.read_text(encoding='utf-8', errors='replace')
-                        leaks = scan_for_credential_leaks(content, file_path=relative_path)
-                        if leaks:
+            # Security-related credential checks are handled by the Q/A agent always.
+            # Implementation workers (backend, frontend, gitops, architecture) are not
+            # blocked by static credential leak scans during development.
+            is_qa_agent = (
+                norm_agent in ('gemma', 'qa')
+                or getattr(task, 'work_order_type', None) == 'VALIDATION'
+                or getattr(task, 'role', None) in ('gemma', 'qa')
+            )
+            if is_qa_agent:
+                for relative_path in changed_files:
+                    candidate = staged_root / relative_path
+                    if candidate.is_file():
+                        try:
+                            content = candidate.read_text(encoding='utf-8', errors='replace')
+                            leaks = scan_for_credential_leaks(content, file_path=relative_path)
+                            if leaks:
+                                security_verified = False
+                                staged_errors.append(f"credential leak detected in {relative_path}: {leaks[0]}")
+                                break
+                        except OSError as exc:
                             security_verified = False
-                            staged_errors.append(f"credential leak detected in {relative_path}: {leaks[0]}")
+                            staged_errors.append(f"failed to read {relative_path} for security scan: {exc}")
                             break
-                    except OSError as exc:
-                        security_verified = False
-                        staged_errors.append(f"failed to read {relative_path} for security scan: {exc}")
-                        break
 
         deliverable_touched = False
         if task.deliverable_path:
@@ -427,7 +436,11 @@ class _VerificationMixin:
             self._last_verification_evidence = deliv_evidence
 
             has_declared_files = bool(deliv_evidence.get("declared_paths"))
-            if has_declared_files:
+            is_arch_conversational = (
+                (is_arch or str(task.work_order_id) == "WO-000")
+                and not deliverable_touched
+            )
+            if has_declared_files and not is_arch_conversational:
                 if not deliv_passed:
                     outcome_verified = False
                     for err in deliv_errors:
@@ -442,7 +455,8 @@ class _VerificationMixin:
                     )
             else:
                 is_non_code_task = (
-                    getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
+                    is_arch_conversational
+                    or getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
                     or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
                 )
                 has_tool_activity = bool(

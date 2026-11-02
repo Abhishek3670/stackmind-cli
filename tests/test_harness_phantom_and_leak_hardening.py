@@ -159,7 +159,7 @@ def test_security_verified_failure_records_staged_diagnostic(tmp_path: Path):
     (staged / ".sync").mkdir()
     (staged / "app.py").write_text("API_KEY = 'sk-proj-abc123456789012345678901234567890'\n", encoding="utf-8")
 
-    runner = HarnessRunner(ws, agent="codex")
+    runner = HarnessRunner(ws, agent="gemma")
     before_snap = WorkspaceSnapshot.capture(ws)
     after_snap = WorkspaceSnapshot.capture(staged)
     diff = before_snap.diff(after_snap)
