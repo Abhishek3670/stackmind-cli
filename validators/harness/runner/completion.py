@@ -424,6 +424,19 @@ class _CompletionMixin:
             # instead of guesswork. Live turns remain invisible by design.
             task_text += self._architect_board_block(getattr(request.task, 'work_order_id', None))
 
+            # Persistent Agent Memory & Cross-Turn Continuity (SDP-MEM-001)
+            try:
+                from validators.harness.runner.agent_memory import build_agent_persistent_memory_context
+                mem_ctx = build_agent_persistent_memory_context(
+                    self.project_path,
+                    self.agent,
+                    work_order_id=getattr(request.task, 'work_order_id', None),
+                )
+                if mem_ctx:
+                    task_text = f"{mem_ctx}\n\n{task_text}"
+            except Exception:
+                pass
+
             if request.task.deliverable_path and not is_architecture:
                 task_text += (
                     f"\nDELIVERABLE INSTRUCTION:\nYou MUST create or update '{request.task.deliverable_path}' by calling the `write_file` tool. "
@@ -432,10 +445,20 @@ class _CompletionMixin:
                 )
 
             user_content = f'{task_text}Context:\n{full_context if not is_architecture else getattr(request.context, "text", "")}'
-            messages = [
-                Message.system(system_msg),
-                Message.user(user_content),
-            ]
+            messages = [Message.system(system_msg)]
+            if request.session_history:
+                for turn in request.session_history[-8:]:
+                    role = str(turn.get("role", "")).lower().strip()
+                    content = str(turn.get("content", "")).strip()
+                    if not content or content.startswith(":"):
+                        continue
+                    if len(content) > 1500:
+                        content = content[:1500] + "..."
+                    if role in ("user", "human"):
+                        messages.append(Message.user(content))
+                    elif role in ("assistant", "agent", "model"):
+                        messages.append(Message.assistant(content))
+            messages.append(Message.user(user_content))
         from validators.kernel.providers.errors import (
             ConsecutiveToolFailureError,
             NoProgressLoopError,

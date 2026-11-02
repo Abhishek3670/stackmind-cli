@@ -312,6 +312,18 @@ class ContractEvaluator:
                 if (lower_t.startswith(".sync/work-orders/") or lower_t.startswith(".sync/contracts/")) and not is_architect:
                     return False, "target is outside allowed scope"
 
+                is_qa_agent = (contract.agent_id.lower() in ("gemma", "qa") or role_str in ("qa", "quality"))
+                if is_qa_agent:
+                    secret_patterns = (
+                        ".git/**", ".git", ".env", ".env.*", ".sync/runtime/**",
+                        ".sync/snapshots/**", "*secret*", "*credential*", "*token*", "*.key", "*.pem",
+                    )
+                    if any(self._matches(target, sp) for sp in secret_patterns):
+                        return False, "target is explicitly denied"
+                    # QA verifiers require full read visibility across workspace code, configs, and resource folders
+                    # (server/, src/, tests/, assets/, index.html, package.json, configs, etc.) to inspect deliverables under test.
+                    return True, "authorized"
+
                 if operation_type in ("list_directory", "glob"):
                     if is_architect and (
                         lower_t in (".sync", ".sync/work-orders", ".sync/contracts", ".sync/decisions")
@@ -321,11 +333,6 @@ class ContractEvaluator:
                     if norm_t in ("workspace", ".", ""):
                         return True, "authorized"
                     first_seg = lower_t.split("/")[0]
-                    is_qa_agent = (contract.agent_id.lower() in ("gemma", "qa") or role_str in ("qa", "quality"))
-                    if is_qa_agent:
-                        # QA verifiers require full read visibility across workspace code and resource folders
-                        # (server/, src/, css/, etc.) to inspect deliverables under test and craft accurate assertions.
-                        return True, "authorized"
                     if first_seg in ("assets", "public", "static", "docs", "templates"):
                         return True, "authorized"
                     for a in contract.allow:
