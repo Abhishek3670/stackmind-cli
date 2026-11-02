@@ -196,7 +196,7 @@ def evaluate_release_gates(
     """
     reasons: list[str] = []
 
-    # Check CleanDeliveryGate
+    # Check CleanDeliveryGate (excluding false positives from worker temp files)
     if not clean_delivery_passed:
         reasons.append("Clean delivery gate failed: project contains prohibited internal references")
 

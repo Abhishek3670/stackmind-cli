@@ -3482,6 +3482,60 @@ class ToolGateway:
             ),
         }
 
+    @staticmethod
+    def _find_active_wo_for_agent(scan_root: "Path", agent: str, target_files: list[str]) -> str | None:
+        """Check if an active WO already exists for the same agent with overlapping scope.
+
+        Returns the existing WO ID if found, None otherwise. This prevents
+        delegate_task from creating duplicate work orders for the same agent/scope.
+        """
+        import yaml as _yaml
+        active_dir = scan_root / ".sync" / "work-orders" / "ACTIVE"
+        if not active_dir.is_dir():
+            return None
+
+        target_set = {f.replace("\\", "/").strip("/").lower() for f in target_files} if target_files else set()
+
+        for wo_file in sorted(active_dir.glob("*.yaml")):
+            if wo_file.stem == ".gitkeep":
+                continue
+            try:
+                data = _yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            status = str(data.get("status", "")).upper()
+            if status in ("CANCELLED", "COMPLETED", "BLOCKED", "SUPERSEDED"):
+                continue
+
+            # Check if same agent is assigned
+            assigned = data.get("assigned_agents", [])
+            if not isinstance(assigned, list):
+                assigned = [str(assigned)]
+            assigned_lower = [str(a).lower() for a in assigned]
+            if agent.lower() not in assigned_lower:
+                continue
+
+            # If no target files specified, any active WO for same agent is a match
+            if not target_set:
+                return wo_file.stem
+
+            # Check for overlapping deliverable paths
+            existing_paths = set()
+            deliv = data.get("deliverable")
+            if isinstance(deliv, dict) and deliv.get("path"):
+                existing_paths.add(str(deliv["path"]).replace("\\", "/").strip("/").lower())
+            for d in data.get("deliverables", []) or []:
+                if isinstance(d, dict) and d.get("path"):
+                    existing_paths.add(str(d["path"]).replace("\\", "/").strip("/").lower())
+
+            if existing_paths & target_set:
+                return wo_file.stem
+
+        return None
+
     def delegate_task(
         self,
         target_agent: str,
@@ -3537,6 +3591,7 @@ class ToolGateway:
         # 2. Author schema-conforming Work Order and Contract in .sync/work-orders/ACTIVE/ and .sync/contracts/
         wo_id: str | None = None
         rel_wo_file: str | None = None
+        rel_contract_file: str | None = None
         try:
             from validators.kernel.daemon.authoring import (
                 get_next_work_order_int,
@@ -3549,6 +3604,34 @@ class ToolGateway:
                 ws_roots.append(auth_root)
 
             scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
+
+            # --- Deduplication: check for existing active WO for same agent ---
+            existing_wo_id = self._find_active_wo_for_agent(
+                scan_root, canonical_agent, clean_files,
+            )
+            if existing_wo_id:
+                wo_id = existing_wo_id
+                rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+                rel_contract_file = f".sync/contracts/{wo_id}.yaml"
+                self.boundary.journal.complete(record.request.operation_id, f"Reused existing {wo_id}")
+                return {
+                    "status": "delegated",
+                    "work_order_id": wo_id,
+                    "work_order_file": rel_wo_file,
+                    "contract_file": rel_contract_file,
+                    "agent": canonical_agent,
+                    "role": canonical_role,
+                    "instructions": str(instructions).strip(),
+                    "target_files": clean_files,
+                    "deduplicated": True,
+                    "message": (
+                        f"Reused existing active work order {wo_id} for {canonical_role} ({canonical_agent}). "
+                        f"An active work order already targets this agent with overlapping scope. "
+                        f"No duplicate was created."
+                    ),
+                }
+            # --- End deduplication ---
+
             next_idx = get_next_work_order_int(scan_root)
             wo_id = f"WO-{next_idx:03d}"
 

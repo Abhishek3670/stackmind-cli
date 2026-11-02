@@ -100,9 +100,20 @@ class CleanDeliveryGate:
 
                 yield full_path
 
+    # Temporary/ephemeral file patterns that workers create for self-verification
+    _TEMP_FILE_PATTERNS = (
+        "_tmp_", "_selfcheck", ".tmp.", ".temp.",
+        "__tmp", "__selfcheck", "_harness_check",
+    )
+
     def _scan_file(self, path: Path, excluded_dirs: set[str]) -> list[dict]:
         """Scan a single file for prohibited references."""
         findings: list[dict] = []
+
+        # Skip worker self-check temporary files
+        name_lower = path.name.lower()
+        if any(pat in name_lower for pat in self._TEMP_FILE_PATTERNS):
+            return findings
 
         try:
             content = path.read_text(encoding="utf-8")

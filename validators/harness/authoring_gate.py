@@ -96,8 +96,10 @@ class AuthoringGate:
         self._schemas_dir = schemas_dir or self._find_schemas_dir()
         self._project_root = Path(project_root).resolve() if project_root is not None else None
         self._schema_cache: dict[str, dict[str, Any]] = {}
-        # Reset session-authored paths for new gate instance
-        _session_authored_paths.clear()
+        # Note: we no longer clear _session_authored_paths on init.
+        # Paths are now tracked per daemon session ID to persist across turns.
+        # The set is managed by set_daemon_session_id() in authoring_conflict.py.
+        pass
 
     @staticmethod
     def _find_schemas_dir() -> Path:
@@ -249,7 +251,8 @@ class AuthoringGate:
 
         passed = len(errors) == 0
         if passed:
-            _session_authored_paths.add(norm_path)
+            from .authoring_conflict import mark_authored
+            mark_authored(norm_path)
             if isinstance(data, dict):
                 try:
                     normalized_content = yaml.safe_dump(data, sort_keys=False)

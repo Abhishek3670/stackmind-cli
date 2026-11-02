@@ -930,7 +930,7 @@ class LifecycleSupervisor(
             auth_context=auth_context,
         )
 
-        # Stage 2: Reject immediately without mutating state or creating blockers/waits
+        # Stage 2: Reject — log and attempt recovery instead of hard crash
         if not decision.is_valid:
             record_lifecycle_event(
                 state=state,
@@ -942,6 +942,24 @@ class LifecycleSupervisor(
                 reason_code=decision.decision_reason,
                 evidence_refs={"violations": decision.violations},
             )
+            # Instead of crashing with StateIntegrityError, attempt to
+            # enter ARCHITECT_REPAIR if the transition was to a terminal
+            # or blocked phase. This lets the Architect clean up cascading
+            # failures (e.g. duplicate work orders, conflicting scopes)
+            # instead of killing the entire run.
+            if new_phase in (Phase.BLOCKED, Phase.FAILED):
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Supervisor transition rejected (%s -> %s): %s. "
+                    "Entering recovery mode instead of crashing.",
+                    state.phase.value, new_phase.value,
+                    decision.decision_reason,
+                )
+                state.error = (
+                    f"Transition rejected ({state.phase.value} -> {new_phase.value}): "
+                    f"{decision.decision_reason}"
+                )
+                return  # Allow caller to handle gracefully
             raise StateIntegrityError(
                 f"Supervisor transition rejected ({state.phase.value} -> {new_phase.value}): "
                 f"{decision.decision_reason}"

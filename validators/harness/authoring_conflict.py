@@ -1,4 +1,8 @@
-"""Overwrite conflict detection for authored artifacts.\n\nPrevents clobbering existing active work orders or contracts from other tasks.\nTerminal buckets (COMPLETED, BLOCKED) are protected from in-place rewriting.\n"""
+"""Overwrite conflict detection for authored artifacts.
+
+Prevents clobbering existing active work orders or contracts from other tasks.
+Terminal buckets (COMPLETED, BLOCKED) are protected from in-place rewriting.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +10,34 @@ import yaml
 from pathlib import Path
 from typing import Any, Set
 
-# Track paths authored in the current session (shared state)
+# Track paths authored in the current session (shared state).
+# Keyed by daemon session ID so multi-turn architect sessions
+# remember which artifacts they authored across turns.
 _session_authored_paths: Set[str] = set()
+_session_authored_by_session: dict[str, Set[str]] = {}
+_current_daemon_session_id: str | None = None
+
+
+def set_daemon_session_id(session_id: str | None) -> None:
+    """Set the current daemon session ID for overwrite conflict tracking.
+
+    Called by the daemon/supervisor when starting a new turn so that
+    authored paths persist across multi-turn architect sessions.
+    """
+    global _current_daemon_session_id, _session_authored_paths
+    _current_daemon_session_id = session_id
+    if session_id:
+        if session_id not in _session_authored_by_session:
+            _session_authored_by_session[session_id] = set()
+        # Merge: the module-level set is the union of the session's paths
+        _session_authored_paths = _session_authored_by_session[session_id]
+
+
+def mark_authored(norm_path: str) -> None:
+    """Record that a path was authored in the current session."""
+    _session_authored_paths.add(norm_path)
+    if _current_daemon_session_id and _current_daemon_session_id in _session_authored_by_session:
+        _session_authored_by_session[_current_daemon_session_id].add(norm_path)
 
 
 def _check_overwrite_conflict(
