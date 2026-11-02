@@ -157,6 +157,7 @@ class StackMindSettings:
     govern_verbosity: str = "tree"
     laya_mode: str = "active"
     client_timeout: int = 0
+    max_concurrent_agents: int = 2
 
     @property
     def effective_profile(self) -> Any:
@@ -166,6 +167,7 @@ class StackMindSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "client_timeout": self.client_timeout,
+            "max_concurrent_agents": self.max_concurrent_agents,
             "execution_profile": self.execution_profile,
             "govern_verbosity": self.govern_verbosity,
             "laya_mode": self.laya_mode,
@@ -225,6 +227,13 @@ class StackMindSettings:
         if laya_mode not in {"active", "shadow", "disabled"}:
             laya_mode = "active"
         client_to = int(data.get("client_timeout", 0) or 0)
+        raw_concurrency = data.get("max_concurrent_agents")
+        if raw_concurrency is None:
+            raw_concurrency = os.environ.get("STACKMIND_MAX_CONCURRENT_AGENTS", 2)
+        try:
+            max_concurrent = max(1, int(raw_concurrency))
+        except (ValueError, TypeError):
+            max_concurrent = 2
         return cls(
             providers=providers,
             roles=roles,
@@ -232,6 +241,7 @@ class StackMindSettings:
             govern_verbosity=raw_verbosity,
             laya_mode=laya_mode,
             client_timeout=client_to,
+            max_concurrent_agents=max_concurrent,
         )
 
 

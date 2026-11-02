@@ -812,6 +812,20 @@ class SessionManager:
         self._active_runs: dict[str, Any] = {}
         self._run_driver_threads: dict[str, Thread] = {}
         self._run_stop_events: dict[str, Event] = {}
+        from validators.kernel.concurrency import AgentConcurrencyLimiter
+        max_c = 2
+        try:
+            from validators.kernel.settings import load_settings
+            max_c = load_settings().max_concurrent_agents
+        except Exception:
+            env_c = os.environ.get("STACKMIND_MAX_CONCURRENT_AGENTS")
+            if env_c:
+                try:
+                    max_c = int(env_c)
+                except ValueError:
+                    pass
+        self.max_concurrent_agents: int = max_c
+        self.concurrency_limiter: AgentConcurrencyLimiter = AgentConcurrencyLimiter(max_concurrent=self.max_concurrent_agents)
         daemon_ws = None
         if self.storage.root.name == "daemon":
             if self.storage.root.parent.name == "runtime" and self.storage.root.parent.parent.name == ".sync":
@@ -988,6 +1002,16 @@ class SessionManager:
         from validators.kernel.settings import load_settings
         ws = Path(workspace) if workspace else None
         return load_settings(ws).to_dict()
+
+    def get_concurrency_status(self) -> dict[str, Any]:
+        """Inspect the current global agent concurrency status."""
+        return {
+            "max_concurrent": self.concurrency_limiter.max_concurrent,
+            "active_count": self.concurrency_limiter.active_count(),
+            "available_slots": self.concurrency_limiter.available_slots(),
+            "active_agents": self.concurrency_limiter.active_agents(),
+            "active_operations": self.concurrency_limiter.active_operations(),
+        }
 
     def update_settings(self, settings_data: dict[str, Any], workspace: str | None = None) -> dict[str, Any]:
         """Save settings updates to settings.json and apply to running daemon."""
@@ -3082,7 +3106,22 @@ class SessionManager:
             session_id, tool_name, operation_id, {"prompt": prompt}, operation_id,
             role=op_role, agent_id=agent,
         )
+        acquired_slot = False
         try:
+            while not cancel_event.is_set():
+                if self.concurrency_limiter.acquire(agent, operation_id, timeout=0.1):
+                    acquired_slot = True
+                    break
+
+            if cancel_event.is_set() or not acquired_slot:
+                self.complete_operation(
+                    session_id,
+                    operation_id,
+                    {"reason": "Operation cancelled while queued for concurrency slot"},
+                    status="CANCELLED",
+                )
+                return
+
             ws_path = Path(workspace)
             _scaffold_protocol_citizenship(ws_path, agent)
             runner = self._runner_factory(workspace, agent)
@@ -3540,6 +3579,8 @@ class SessionManager:
                 session_id, operation_id, err_dict, status="FAILED"
             )
         finally:
+            if acquired_slot:
+                self.concurrency_limiter.release(operation_id)
             with self._lock:
                 self._turn_threads.pop(operation_id, None)
 

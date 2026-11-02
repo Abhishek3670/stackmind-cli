@@ -503,6 +503,11 @@ class _PhasesMixin:
                 continue
             eligible_wos.append(wo_id)
 
+        # Concurrency Cap (Item D.3): Limit parallel dispatches to max_concurrent_agents
+        max_concurrent = getattr(self.manager, "max_concurrent_agents", 2)
+        if len(eligible_wos) > max_concurrent:
+            eligible_wos = eligible_wos[:max_concurrent]
+
         # 2. S6 Concurrency: When multiple sibling work orders are eligible in this pass,
         # open a parent batch operation so SessionManager.begin_operation does not force them sequential.
         parent_op_id = state.batch_operation_id
@@ -755,7 +760,11 @@ class _PhasesMixin:
                                 except Exception:
                                     pass
                     if wo_id not in state.blocked_wo_ids:
+                        max_c = getattr(self.manager, "max_concurrent_agents", 2)
                         if active_in_flight_ops > 0 and not state.batch_operation_id:
+                            all_done = False
+                            continue
+                        if active_in_flight_ops >= max_c:
                             all_done = False
                             continue
                         agent = self._agent_for_wo(wo_id, ws)
