@@ -921,8 +921,18 @@ def decompose_milestone(
         all_cands = extract_candidate_paths(f"{m.title}\n" + "\n".join(m.tasks))
         non_test_cands = [p for p in all_cands if not _is_test_path(p)]
 
+        role_norm = str(role or "").lower().strip()
+        agent_norm = str(agent or "").lower().strip()
+        is_qa_role = (
+            role_norm in ("qa", "audit", "validation", "verifier", "test")
+            or agent_norm in ("qa", "gemma")
+            or "qa" in role_norm
+            or "audit" in role_norm
+            or "verification" in role_norm
+        )
+
         deliverables_list: list[dict[str, Any]] | None = None
-        if len(non_test_cands) > 1:
+        if len(non_test_cands) > 1 and not is_qa_role:
             deliverables_list = []
             for p in non_test_cands:
                 p_type = "config" if p in ("package.json", "requirements.txt", "pyproject.toml") else "code"
@@ -1628,11 +1638,23 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
     deliv_buckets: dict[str, list[tuple[Path, str, dict[str, Any], Any]]] = {}
     for entry in surviving_entries:
+        paths = []
         d_spec = entry[2].get("deliverable")
         if isinstance(d_spec, dict) and d_spec.get("path"):
-            norm_p = str(d_spec["path"]).replace("\\", "/").strip().lstrip("/").lower()
+            paths.append(str(d_spec["path"]))
+        elif isinstance(d_spec, str) and d_spec.strip():
+            paths.append(str(d_spec))
+        for extra in entry[2].get("deliverables") or []:
+            if isinstance(extra, dict) and extra.get("path"):
+                paths.append(str(extra["path"]))
+            elif isinstance(extra, str) and extra.strip():
+                paths.append(str(extra))
+        for p in paths:
+            norm_p = p.replace("\\", "/").strip().lstrip("/").lower()
             if norm_p:
-                deliv_buckets.setdefault(norm_p, []).append(entry)
+                bucket_list = deliv_buckets.setdefault(norm_p, [])
+                if not any(item[1] == entry[1] for item in bucket_list):
+                    bucket_list.append(entry)
 
     final_survivors: list[tuple[Path, str, dict[str, Any], Any]] = []
     for entry in surviving_entries:

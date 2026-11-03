@@ -58,7 +58,7 @@ class _VerificationMixin:
             ]
 
         diff_changed = tuple(Path(p).as_posix().lstrip('/') for p in diff.all_changed_files)
-        changed_files = diff_changed + tuple(tool_written_files)
+        changed_files = tuple(dict.fromkeys(diff_changed + tuple(tool_written_files)))
         bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
         bookkeeping_exact = ('.sync/work-orders/INDEX.yaml', 'work-orders/INDEX.yaml', '.sync/runtime/TREE.yaml')
         dec_norm = {Path(p).as_posix().lstrip('/') for p in decision.modified_files if p}

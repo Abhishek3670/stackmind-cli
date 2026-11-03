@@ -17,3 +17,13 @@ def reset_click_stream_cache():
                 cell.cell_contents.clear()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def reset_authoring_session_paths():
+    yield
+    try:
+        from validators.harness.authoring_conflict import clear_session_authored_paths
+        clear_session_authored_paths()
+    except Exception:
+        pass

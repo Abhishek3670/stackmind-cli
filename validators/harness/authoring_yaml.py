@@ -55,6 +55,82 @@ def repair_yaml_block_scalars(text: str) -> str:
     return "\n".join(repaired_lines)
 
 
+ALLOWED_WORK_ORDER_KEYS = {
+    "acceptance_criteria",
+    "affected_services",
+    "agent_assignments",
+    "amended_at",
+    "amended_by",
+    "amendments",
+    "api_changes",
+    "assigned_agents",
+    "blocked_by_rework",
+    "blocked_reason",
+    "cancellation_reason",
+    "completed_at",
+    "completion",
+    "completion_history",
+    "constraints",
+    "context",
+    "contract_ref",
+    "created",
+    "created_at",
+    "db_migration",
+    "deliverable",
+    "deliverables",
+    "dependencies",
+    "dependency_graph",
+    "description",
+    "error",
+    "evidence_revalidated_at",
+    "evidence_stale",
+    "files_created",
+    "fix_verified",
+    "frontend_changes",
+    "gate_conditions",
+    "id",
+    "implementation_estimate",
+    "instructions",
+    "log",
+    "milestone",
+    "milestone_id",
+    "milestones",
+    "normalized_by",
+    "notes",
+    "phase_number",
+    "plan_binding_hash",
+    "plan_ref",
+    "priority",
+    "qa_by",
+    "qa_verdict",
+    "quality_gates",
+    "references",
+    "release",
+    "release_commit",
+    "release_tag",
+    "released",
+    "reopened_from",
+    "reproduction_steps",
+    "requirement_refs",
+    "revalidation_history",
+    "revision",
+    "rework_budget",
+    "rework_count",
+    "root_cause",
+    "scope",
+    "skills",
+    "status",
+    "superseded_by",
+    "synthesized_by",
+    "test_plan",
+    "title",
+    "type",
+    "unblocked",
+    "unblocked_reason",
+    "updated",
+}
+
+
 def normalize_work_order_data(
     data: dict[str, Any], project_root: Path | None = None
 ) -> dict[str, Any]:
@@ -68,10 +144,72 @@ def normalize_work_order_data(
         if "acceptance_criteria" not in data or not data["acceptance_criteria"]:
             data["acceptance_criteria"] = crit
 
+    # Absorb revision notes / amendment reasons into amendments array
+    note = (
+        data.pop("revision_note", None)
+        or data.pop("revision_notes", None)
+        or data.pop("change_reason", None)
+        or data.pop("amendment_reason", None)
+        or data.pop("amendment_note", None)
+        or data.pop("reason", None)
+        or data.pop("comment", None)
+    )
+    if note:
+        rev = data.get("revision", 1)
+        if not isinstance(rev, int):
+            try:
+                rev = int(rev)
+            except Exception:
+                rev = 1
+        amendments = data.setdefault("amendments", [])
+        if isinstance(amendments, list):
+            matched = False
+            for a in amendments:
+                if isinstance(a, dict) and a.get("revision") == rev:
+                    if not a.get("reason") or a.get("reason") == "Address authoring readiness gate findings":
+                        a["reason"] = str(note)
+                    matched = True
+                    break
+            if not matched:
+                amendments.append({
+                    "revision": rev,
+                    "reason": str(note),
+                    "agent": str(data.get("amended_by") or "architect"),
+                })
+
+    # Normalize notes to list[str] if string
+    notes = data.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        data["notes"] = [notes.strip()]
+
     # Normalize acceptance_criteria if single string
     ac = data.get("acceptance_criteria")
     if isinstance(ac, str) and ac.strip():
-        data["acceptance_criteria"] = ac.strip()
+        data["acceptance_criteria"] = [ac.strip()]
+    elif isinstance(ac, list):
+        data["acceptance_criteria"] = [str(x).strip() for x in ac if str(x).strip()]
+
+    # Normalize assigned_agents to list[str] if string
+    assigned = data.get("assigned_agents")
+    if isinstance(assigned, str) and assigned.strip():
+        data["assigned_agents"] = [assigned.strip()]
+
+    # Normalize dependencies to list[str] if string
+    deps = data.get("dependencies")
+    if isinstance(deps, str):
+        data["dependencies"] = [deps.strip()] if deps.strip() else []
+
+    # Normalize revision to integer if numeric string
+    if "revision" in data and not isinstance(data["revision"], int):
+        try:
+            data["revision"] = int(data["revision"])
+        except (ValueError, TypeError):
+            pass
+
+    # Strip unexpected top-level keys that violate work-order.schema.json (additionalProperties: false)
+    for k in list(data.keys()):
+        if k not in ALLOWED_WORK_ORDER_KEYS:
+            data.pop(k, None)
 
     # If deliverable is omitted when amending an existing work order on disk,
     # preserve the deliverable from the previous revision.

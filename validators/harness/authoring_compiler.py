@@ -188,6 +188,149 @@ def compile_authoring_artifacts(
             continue
         wo_records.append((rel, wo_path, data))
 
+    # ── Deliverable collision auto-resolution: prevent OVERLAPPING_FILE_OWNERSHIP ──
+    def _extract_all_deliverables(wo_data: dict[str, Any]) -> list[str]:
+        res: list[str] = []
+        d_main = wo_data.get("deliverable")
+        if isinstance(d_main, dict) and d_main.get("path"):
+            res.append(_normalize_rel(d_main["path"]))
+        elif isinstance(d_main, str) and d_main.strip():
+            res.append(_normalize_rel(d_main))
+        for extra in wo_data.get("deliverables") or []:
+            if isinstance(extra, dict) and extra.get("path"):
+                res.append(_normalize_rel(extra["path"]))
+            elif isinstance(extra, str) and extra.strip():
+                res.append(_normalize_rel(extra))
+        return [p for p in res if p]
+
+    def _is_qa_wo(wo_data: dict[str, Any]) -> bool:
+        t = str(wo_data.get("title") or "").lower()
+        typ = str(wo_data.get("type") or "").upper()
+        ass = wo_data.get("assigned_agents") or []
+        ag_list = [str(a).lower().strip() for a in (ass if isinstance(ass, list) else [ass])]
+        if typ in ("AUDIT", "VALIDATION"):
+            return True
+        if any(a in ("qa", "gemma", "audit", "verifier") for a in ag_list):
+            return True
+        if any(kw in t for kw in ("qa:", "qa -", "verify", "verification", "audit", "dom contract", "validation")):
+            return True
+        return False
+
+    def _rebuild_deps_graph() -> dict[str, set[str]]:
+        g: dict[str, set[str]] = {}
+        for _r, _p, _d in wo_records:
+            _id = str(_d.get("id") or _p.stem)
+            _deps = _d.get("dependencies")
+            g[_id] = {str(x).strip() for x in _deps if str(x).strip()} if isinstance(_deps, list) else set()
+        return g
+
+    def _has_dep(g: dict[str, set[str]], src: str, tgt: str) -> bool:
+        visited = set()
+        q = list(g.get(src, set()))
+        while q:
+            curr = q.pop(0)
+            if curr == tgt:
+                return True
+            if curr not in visited:
+                visited.add(curr)
+                q.extend(g.get(curr, set()))
+        return False
+
+    deliv_to_records: dict[str, list[tuple[str, Path, dict[str, Any]]]] = {}
+    for r, p, d in wo_records:
+        for deliv_path in _extract_all_deliverables(d):
+            deliv_to_records.setdefault(deliv_path, []).append((r, p, d))
+
+    dep_graph = _rebuild_deps_graph()
+
+    for deliv_path, claimants in list(deliv_to_records.items()):
+        if len(claimants) <= 1:
+            continue
+        for i in range(len(claimants)):
+            for j in range(i + 1, len(claimants)):
+                rel_a, path_a, data_a = claimants[i]
+                rel_b, path_b, data_b = claimants[j]
+                id_a = str(data_a.get("id") or path_a.stem)
+                id_b = str(data_b.get("id") or path_b.stem)
+                if id_a == id_b:
+                    continue
+                if _has_dep(dep_graph, id_a, id_b) or _has_dep(dep_graph, id_b, id_a):
+                    continue
+
+                is_qa_a = _is_qa_wo(data_a)
+                is_qa_b = _is_qa_wo(data_b)
+
+                if is_qa_b and not _is_test_artifact(deliv_path):
+                    if data_b.get("deliverables"):
+                        filtered = [
+                            x for x in data_b["deliverables"]
+                            if _normalize_rel(x.get("path") if isinstance(x, dict) else x) != deliv_path
+                        ]
+                        data_b["deliverables"] = filtered if filtered else None
+                        if data_b["deliverables"] is None:
+                            data_b.pop("deliverables", None)
+                    d_main = data_b.get("deliverable")
+                    if isinstance(d_main, dict) and _normalize_rel(d_main.get("path")) == deliv_path:
+                        test_cand = f"tests/test_{id_b.lower()}.py"
+                        for cand in _planned_test_paths(data_b):
+                            if cand != deliv_path:
+                                test_cand = cand
+                                break
+                        data_b["deliverable"] = {
+                            "type": "code" if test_cand.endswith((".py", ".js", ".ts", ".mjs")) else "doc",
+                            "path": test_cand,
+                            "description": f"Verification artifact for {data_b.get('title', id_b)}",
+                        }
+                    b_deps = data_b.setdefault("dependencies", [])
+                    if id_a not in b_deps and not _has_dep(dep_graph, id_a, id_b):
+                        b_deps.append(id_a)
+                        dep_graph = _rebuild_deps_graph()
+                    _mark(rel_b, f"resolved deliverable collision on {deliv_path} (pruned inspection deliverable from QA {id_b}, added dependency on {id_a})", data_b, path_b)
+
+                elif is_qa_a and not _is_test_artifact(deliv_path):
+                    if data_a.get("deliverables"):
+                        filtered = [
+                            x for x in data_a["deliverables"]
+                            if _normalize_rel(x.get("path") if isinstance(x, dict) else x) != deliv_path
+                        ]
+                        data_a["deliverables"] = filtered if filtered else None
+                        if data_a["deliverables"] is None:
+                            data_a.pop("deliverables", None)
+                    d_main = data_a.get("deliverable")
+                    if isinstance(d_main, dict) and _normalize_rel(d_main.get("path")) == deliv_path:
+                        test_cand = f"tests/test_{id_a.lower()}.py"
+                        for cand in _planned_test_paths(data_a):
+                            if cand != deliv_path:
+                                test_cand = cand
+                                break
+                        data_a["deliverable"] = {
+                            "type": "code" if test_cand.endswith((".py", ".js", ".ts", ".mjs")) else "doc",
+                            "path": test_cand,
+                            "description": f"Verification artifact for {data_a.get('title', id_a)}",
+                        }
+                    a_deps = data_a.setdefault("dependencies", [])
+                    if id_b not in a_deps and not _has_dep(dep_graph, id_b, id_a):
+                        a_deps.append(id_b)
+                        dep_graph = _rebuild_deps_graph()
+                    _mark(rel_a, f"resolved deliverable collision on {deliv_path} (pruned inspection deliverable from QA {id_a}, added dependency on {id_b})", data_a, path_a)
+
+                else:
+                    idx_a = _parse_wo_index(id_a) or 0
+                    idx_b = _parse_wo_index(id_b) or 0
+                    if idx_a <= idx_b:
+                        earlier_id, later_id = id_a, id_b
+                        later_data, later_path, later_rel = data_b, path_b, rel_b
+                    else:
+                        earlier_id, later_id = id_b, id_a
+                        later_data, later_path, later_rel = data_a, path_a, rel_a
+
+                    if not _has_dep(dep_graph, earlier_id, later_id):
+                        l_deps = later_data.setdefault("dependencies", [])
+                        if earlier_id not in l_deps:
+                            l_deps.append(earlier_id)
+                            dep_graph = _rebuild_deps_graph()
+                            _mark(later_rel, f"+dependencies: {earlier_id} (sequential ordering to resolve overlapping deliverable '{deliv_path}')", later_data, later_path)
+
     mapped_ids: set[str] = set()
     unmapped: list[tuple[str, Path, dict[str, Any]]] = []
     ambiguous: list[tuple[str, Path, dict[str, Any], list[dict[str, Any]]]] = []

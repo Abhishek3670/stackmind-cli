@@ -100,6 +100,11 @@ class ToolGateway:
         self.sandbox = sandbox or ProcessSandbox(workspace)
         self.process_manager = ProcessManager(workspace, self.sandbox)
         self._todo_list: list[dict[str, Any]] = []
+        try:
+            from validators.harness.authoring_conflict import set_daemon_session_id
+            set_daemon_session_id(session_id)
+        except Exception:
+            pass
         self._plan_mode: bool = False
         self._triggered_goal: dict[str, Any] | None = None
         self._delegated_tasks: list[dict[str, Any]] = []

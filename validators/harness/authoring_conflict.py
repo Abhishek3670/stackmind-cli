@@ -33,6 +33,14 @@ def set_daemon_session_id(session_id: str | None) -> None:
         _session_authored_paths = _session_authored_by_session[session_id]
 
 
+def clear_session_authored_paths() -> None:
+    """Clear session authored paths (used for test isolation and fresh gates)."""
+    global _session_authored_paths, _session_authored_by_session, _current_daemon_session_id
+    _session_authored_paths.clear()
+    _session_authored_by_session.clear()
+    _current_daemon_session_id = None
+
+
 def mark_authored(norm_path: str) -> None:
     """Record that a path was authored in the current session."""
     _session_authored_paths.add(norm_path)
@@ -47,6 +55,7 @@ def _check_overwrite_conflict(
     project_root: Path,
     errors: list[str],
     author: str | None = None,
+    authored_paths: set[str] | None = None,
 ) -> None:
     """Prevent overwriting existing active work orders or contracts from other tasks."""
 
@@ -82,7 +91,8 @@ def _check_overwrite_conflict(
 
     # If already authored by THIS session, allow updating it (never for a
     # terminal work order, whose content is completion evidence).
-    if norm_path in _session_authored_paths and not is_terminal_wo:
+    session_paths = authored_paths if authored_paths is not None else _session_authored_paths
+    if norm_path in session_paths and not is_terminal_wo:
         return
 
     # Check if existing content matches what this session is authoring
@@ -223,30 +233,41 @@ def _check_overwrite_conflict(
             existing_rev = existing_data.get("contract_revision", 1)
             new_rev = data.get("contract_revision")
             existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
-            if not (isinstance(new_rev, int) and new_rev > existing_num):
+            if isinstance(new_rev, int) and new_rev > existing_num:
+                return
+            if is_repair:
                 data["contract_revision"] = max(existing_num + 1, int(new_rev or 0) + 1)
-            return
+                return
 
         # Task amendment: an authorized author (Architect/CEO) may sharpen a live work
-        # order in place. If the revision was not manually bumped, auto-bump it so
-        # authorized amendments never fail with an overwrite conflict.
+        # order in place. If the work order carries amendments or is in repair,
+        # auto-bump revision so governed amendments are never rejected as clobbers.
         if is_active_wo and isinstance(data, dict):
             existing_rev = existing_data.get("revision", 1)
             new_rev = data.get("revision")
-            if isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev:
-                return
             existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
-            bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
-            data["revision"] = bumped_rev
-            amendments = data.setdefault("amendments", [])
-            if isinstance(amendments, list):
-                amendments.append(
-                    {
-                        "revision": bumped_rev,
-                        "reason": "Authoring amendment by lead architect",
-                    }
-                )
-            return
+            if isinstance(new_rev, int) and new_rev > existing_num:
+                return
+            has_amendments = bool(data.get("amendments")) or bool(data.get("revision_note"))
+            if is_repair or has_amendments:
+                bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
+                data["revision"] = bumped_rev
+                amendments = data.setdefault("amendments", [])
+                if isinstance(amendments, list):
+                    updated_amendment = False
+                    for a in amendments:
+                        if isinstance(a, dict) and a.get("revision") == new_rev:
+                            a["revision"] = bumped_rev
+                            updated_amendment = True
+                            break
+                    if not updated_amendment:
+                        amendments.append(
+                            {
+                                "revision": bumped_rev,
+                                "reason": "Authoring amendment by lead architect",
+                            }
+                        )
+                return
 
     # Conflict: attempting to overwrite an active artifact from another task or unauthorized update
     artifact_label = "work order" if is_active_wo else "contract"

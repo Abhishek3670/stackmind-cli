@@ -644,6 +644,30 @@ class _RecoveryMixin:
                 "Work Order IDs must be globally unique across ALL state directories. Use the allocated IDs matching your approved milestones.\n\n"
             )
 
+        ownership_directive = ""
+        is_overlapping_ownership = False
+        if state.error and any(kw in state.error for kw in ("OVERLAPPING_FILE_OWNERSHIP", "Overlapping file ownership", "claim the same deliverable")):
+            is_overlapping_ownership = True
+        for issue in getattr(state, "readiness_issues", []):
+            if isinstance(issue, dict) and (
+                issue.get("code") == "OVERLAPPING_FILE_OWNERSHIP"
+                or any(kw in str(issue.get("message", "")) for kw in ("OVERLAPPING_FILE_OWNERSHIP", "Overlapping file ownership", "claim the same deliverable"))
+            ):
+                is_overlapping_ownership = True
+                break
+        if is_overlapping_ownership:
+            ownership_directive = (
+                "CRITICAL DELIVERABLE OWNERSHIP DIRECTIVE (OVERLAPPING_FILE_OWNERSHIP):\n"
+                "Multiple parallel work orders claim the same deliverable file without sequential dependency ordering.\n"
+                "To resolve this, follow these rules strictly:\n"
+                "1. If a QA, verification, or audit work order inspects application deliverables (e.g. index.html), "
+                "its deliverable MUST be the test suite or verification report (e.g. tests/test_*.py or .sync/reviews/*.md), "
+                "NOT the application source files. Application source files belong exclusively to Frontend or Backend work orders.\n"
+                "2. If two work orders legitimately modify the same file in succession, they MUST declare sequential "
+                "dependency ordering: add the earlier work order ID into the later work order's `dependencies` list (e.g. dependencies: ['WO-001']).\n"
+                "3. Ensure the `deliverables` array on each work order only contains files that agent actually writes.\n\n"
+            )
+
         return (
             f"ARCHITECT AUTHORING REPAIR (revision {state.authoring_revision}, "
             f"attempt {state.authoring_repair_attempts}/{state.max_authoring_repairs}).\n\n"
@@ -651,6 +675,7 @@ class _RecoveryMixin:
             f"rejected fail-closed and was NOT dispatched to any worker.\n"
             f"Failure: {state.error}\n\n"
             f"{collision_directive}"
+            f"{ownership_directive}"
             f"{milestone_table_block}"
             f"Readiness diagnostics (bounded):\n{issue_lines or '- (operation-level failure; no artifact diagnostics)'}\n\n"
             f"{affected_intro}\n{affected_lines}\n\n"
