@@ -175,3 +175,67 @@ class TestDelegatedWorkOrderReconciliation:
         )
         assert wo_data["status"] == "ACTIVE"
         assert "cancellation_reason" not in wo_data
+
+
+class TestFinalReviewAndResumeFixes:
+    def test_final_review_routes_qa_failures_to_executing_rework(self, tmp_path: Path):
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        state = supervisor.start_run("run-001", "Build calculator", tmp_path, "sess-001")
+        state.phase = Phase.FINAL_REVIEW
+        state.worker_wo_ids = ["WO-006"]
+        state.completed_wo_ids = ["WO-006"]
+
+        _write_yaml(
+            tmp_path / ".sync" / "work-orders" / "COMPLETED" / "WO-006.yaml",
+            {
+                "id": "WO-006",
+                "type": "FEATURE",
+                "title": "Frontend Calculator",
+                "status": "COMPLETED",
+                "assigned_agents": ["gemini"],
+                "deliverable": {"type": "code", "path": "index.html"},
+            },
+        )
+        (tmp_path / "index.html").write_text("<html>no backspace</html>", encoding="utf-8")
+        (tmp_path / "PLAN.md").write_text(PLAN_TEXT, encoding="utf-8")
+
+        res = supervisor._advance_final_review(state)
+        assert res == AdvanceResult.TRANSITIONED
+        assert state.phase in (Phase.EXECUTING, Phase.DISPATCHING)
+        assert "WO-006" not in state.completed_wo_ids
+        assert state.qa_reworks.get("WO-006", 0) >= 1
+        assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-006.yaml").is_file()
+
+    def test_human_resume_unarchives_blocked_work_orders_and_clears_blockers(self, tmp_path: Path):
+        mock_mgr = MockSessionManager(tmp_path)
+        supervisor = LifecycleSupervisor(mock_mgr)
+        state = supervisor.start_run("run-001", "Build calculator", tmp_path, "sess-001")
+        state.phase = Phase.BLOCKED
+        state.worker_wo_ids = ["WO-004"]
+        state.blocked_wo_ids = ["WO-004"]
+        state.worker_blockers = {"WO-004": {"failure_code": "TEST_FAILED", "canonical_message": "failed"}}
+        state.authoring_repair_attempts = 3
+        state.final_prerequisite_rounds = 2
+
+        _write_yaml(
+            tmp_path / ".sync" / "work-orders" / "BLOCKED" / "WO-004.yaml",
+            {
+                "id": "WO-004",
+                "type": "VALIDATION",
+                "title": "QA verification suite",
+                "status": "BLOCKED",
+                "assigned_agents": ["gemma"],
+                "deliverable": {"type": "code", "path": "tests/test_qa.py"},
+            },
+        )
+
+        res = supervisor.resume_run_with_human_override(state, reason="Operator unblocking run")
+        assert res == AdvanceResult.TRANSITIONED
+        assert state.phase == Phase.DISPATCHING
+        assert state.blocked_wo_ids == []
+        assert state.worker_blockers == {}
+        assert state.authoring_repair_attempts == 0
+        assert state.final_prerequisite_rounds == 0
+        assert (tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-004.yaml").is_file()
+        assert not (tmp_path / ".sync" / "work-orders" / "BLOCKED" / "WO-004.yaml").is_file()

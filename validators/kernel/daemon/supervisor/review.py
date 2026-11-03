@@ -1205,7 +1205,7 @@ class _ReviewMixin:
                 }
             )
             actionable = bool(
-                report.missing_wo_ids or report.blocked_wo_ids or state.qa_rework_targets
+                report.missing_wo_ids or report.blocked_wo_ids or state.qa_rework_targets or report.qa_failures
             )
             actionable_decision = evaluate_retry_budget(
                 state,
@@ -1222,7 +1222,21 @@ class _ReviewMixin:
                 and actionable_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED
             ):
                 state.final_prerequisite_rounds += 1
-                self._transition(state, Phase.EXECUTING)
+                for fail_desc in report.qa_failures:
+                    f_wo = fail_desc.split(":")[0].strip()
+                    if f_wo:
+                        self._unarchive_work_order(ws, f_wo)
+                        if f_wo in state.completed_wo_ids:
+                            state.completed_wo_ids.remove(f_wo)
+                        state.qa_reworks[f_wo] = state.qa_reworks.get(f_wo, 0) + 1
+                        state.retry_counts[f_wo] = 0
+                for b_wo in report.blocked_wo_ids:
+                    self._unarchive_work_order(ws, b_wo)
+                    if b_wo in state.blocked_wo_ids:
+                        state.blocked_wo_ids.remove(b_wo)
+                self._discover_worker_wos(state)
+                dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                self._transition(state, dest, authorized_override=True)
                 return AdvanceResult.TRANSITIONED
             if actionable:
                 state.error = (

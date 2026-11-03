@@ -1765,17 +1765,17 @@ class _ExecutionMixin:
 
     def _get_wo_deliverable_path(self, wo_id: str, ws: Path) -> str | None:
         """Get declared deliverable path for a work order."""
-        wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
-        if not wo_file.is_file():
-            return None
-        try:
-            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                deliv = data.get("deliverable")
-                if isinstance(deliv, dict) and deliv.get("path"):
-                    return str(deliv["path"])
-        except Exception:
-            pass
+        for folder in ("ACTIVE", "BLOCKED", "COMPLETED"):
+            wo_file = ws / ".sync" / "work-orders" / folder / f"{wo_id}.yaml"
+            if wo_file.is_file():
+                try:
+                    data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        deliv = data.get("deliverable")
+                        if isinstance(deliv, dict) and deliv.get("path"):
+                            return str(deliv["path"])
+                except Exception:
+                    pass
         return None
 
     def _verify_work_order_deliverables(

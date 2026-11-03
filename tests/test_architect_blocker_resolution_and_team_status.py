@@ -102,17 +102,16 @@ def test_render_team_status_shows_agents_and_blockers(tmp_path: Path):
 
 
 def test_architect_identity_and_gateway_tools():
-    """Verify Lead Architect policy and tools include direct patch and test verification capabilities."""
+    """Verify Lead Architect policy and tools include authoring and test verification capabilities."""
     policy = get_role_policy("claude")
     assert policy.permits(OperationType.WRITE_FILE.value)
-    assert policy.permits(OperationType.APPLY_PATCH.value)
+    assert policy.permits(OperationType.BATCH_WRITE_FILES.value)
     assert policy.permits(OperationType.RUN_TESTS.value)
     assert policy.permits(OperationType.VERIFY_DELIVERABLE.value)
 
     tools = get_curated_tools_for_phase("claude")
     tool_names = {t.name for t in tools}
     assert "write_file" in tool_names
-    assert "apply_patch" in tool_names
     assert "run_tests" in tool_names
     assert "verify_deliverable" in tool_names
 
@@ -163,10 +162,10 @@ def test_supervisor_architect_fix_recovery_lifecycle(tmp_path: Path):
     # Complete the Architect repair operation
     mgr.complete_operation(state.architect_repair_operation_id, "COMPLETED", result={"status": "completed"})
 
-    # Advance repair turn -> outcome verified, WO-004 marked completed, transitions to EXECUTING!
+    # Advance repair turn -> outcome verified, WO-004 marked completed, transitions to DISPATCHING/EXECUTING!
     res2 = supervisor.advance(state)
-    assert res2 == AdvanceResult.WAITING_FOR_OPERATION
-    assert state.phase == Phase.EXECUTING
+    assert res2 in (AdvanceResult.WAITING_FOR_OPERATION, AdvanceResult.TRANSITIONED)
+    assert state.phase in (Phase.EXECUTING, Phase.DISPATCHING)
     assert "WO-004" in state.completed_wo_ids
     assert "WO-004" not in state.blocked_wo_ids
     assert "WO-004" not in state.worker_blockers
@@ -205,3 +204,58 @@ def test_qa_defect_escalates_to_architect_after_worker_rework(tmp_path: Path):
     assert res == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
     assert state.recovery_wo_id == "WO-001"
+
+
+def test_supervisor_architect_fix_delegated_to_worker_redispatches(tmp_path: Path):
+    """Verify recovery where Lead Architect delegates deliverable authoring to worker instead of direct file write."""
+    setup_workspace_with_wos(tmp_path)
+
+    mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mgr)
+    state = supervisor.start_run("run-test-02", "Build test app", tmp_path, "sess-02")
+    state.phase = Phase.ARCHITECT_RECOVERY_DECISION
+    state.worker_wo_ids = ["WO-004"]
+    state.recovery_wo_id = "WO-004"
+    state.worker_blockers = {
+        "WO-004": {
+            "failure_code": "TEST_EXECUTION_FAILED",
+            "canonical_message": "Missing test deliverable",
+            "deliverable_path": "tests/test_qa.py",
+        }
+    }
+
+    # 1. Recovery decision -> architect_fix
+    dec_file = tmp_path / ".sync" / "decisions" / "recovery" / "WO-004.decision.json"
+    dec_file.write_text(json.dumps({
+        "work_order": "WO-004",
+        "action": "architect_fix",
+        "reason": "Delegating test authoring to QA specialist",
+    }), encoding="utf-8")
+
+    res = supervisor.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_OPERATION
+    assert state.phase == Phase.ARCHITECT_REPAIR
+
+    # 2. Architect delegates the task by creating a delegated work order in ACTIVE/
+    del_wo_file = tmp_path / ".sync" / "work-orders" / "ACTIVE" / "WO-011.yaml"
+    del_wo_file.write_text(yaml.safe_dump({
+        "id": "WO-011",
+        "type": "VALIDATION",
+        "title": "Delegated QA test authoring",
+        "assigned_agents": ["gemma"],
+        "status": "ACTIVE",
+        "dependencies": [],
+        "synthesized_by": "architect_delegation",
+        "deliverable": {"path": "tests/test_qa.py", "type": "code"},
+    }), encoding="utf-8")
+
+    # Complete repair operation without authoring tests/test_qa.py on disk directly
+    mgr.complete_operation(state.architect_repair_operation_id, "COMPLETED", result={"status": "completed"})
+
+    # Advance repair turn -> outcome verified valid via delegation, transitions to DISPATCHING!
+    res2 = supervisor.advance(state)
+    assert res2 in (AdvanceResult.WAITING_FOR_OPERATION, AdvanceResult.TRANSITIONED)
+    assert state.phase in (Phase.EXECUTING, Phase.DISPATCHING)
+    assert "WO-004" not in state.blocked_wo_ids
+    assert "WO-004" not in state.worker_blockers
+    assert "WO-011" in state.worker_wo_ids

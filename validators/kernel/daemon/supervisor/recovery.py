@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from validators.clock import now as _now
+from validators.kernel.identity import is_architect_writable_path
 
 from .attempts import (
     BudgetKey,
@@ -124,22 +125,44 @@ class _RecoveryMixin:
                     self._transition(state, Phase.EXECUTING, authorized_override=True)
                     return AdvanceResult.WAITING_FOR_OPERATION
 
-                # Deliverable fix verified on disk — complete the work order and return to execution!
-                self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
-                if str(wo_id) not in state.completed_wo_ids:
-                    state.completed_wo_ids.append(str(wo_id))
-                if str(wo_id) in state.failed_wo_ids:
-                    state.failed_wo_ids.remove(str(wo_id))
-                if str(wo_id) in state.blocked_wo_ids:
-                    state.blocked_wo_ids.remove(str(wo_id))
-                state.repair_context = {}
-                state.error = None
-                state.architect_repair_operation_id = None
-                state.authoring_repair_attempts = 0
-                self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
-                self._transition(state, dest, authorized_override=True)
-                return AdvanceResult.TRANSITIONED
+                deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(str(wo_id), ws)
+                deliv_on_disk = False
+                if deliv_path:
+                    tf = ws / deliv_path
+                    if tf.is_dir() and any(f.is_file() for f in tf.rglob("*")):
+                        deliv_on_disk = True
+                    elif tf.is_file() and tf.stat().st_size > 0:
+                        deliv_on_disk = True
+
+                if deliv_on_disk:
+                    # Deliverable fix verified on disk — complete the work order and return to execution!
+                    self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
+                    if str(wo_id) not in state.completed_wo_ids:
+                        state.completed_wo_ids.append(str(wo_id))
+                    if str(wo_id) in state.failed_wo_ids:
+                        state.failed_wo_ids.remove(str(wo_id))
+                    if str(wo_id) in state.blocked_wo_ids:
+                        state.blocked_wo_ids.remove(str(wo_id))
+                    state.repair_context = {}
+                    state.error = None
+                    state.architect_repair_operation_id = None
+                    state.authoring_repair_attempts = 0
+                    self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
+                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    self._transition(state, dest, authorized_override=True)
+                    return AdvanceResult.TRANSITIONED
+                else:
+                    # Deliverable was not directly authored on disk (e.g. delegated to worker or work order amended)
+                    # Re-discover worker work orders (including any newly delegated ones) and re-dispatch worker!
+                    state.repair_context = {}
+                    state.error = None
+                    state.architect_repair_operation_id = None
+                    state.authoring_repair_attempts = 0
+                    self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
+                    self._discover_worker_wos(state)
+                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    self._transition(state, dest, authorized_override=True)
+                    return AdvanceResult.TRANSITIONED
 
             # Revalidate the complete artifact set with the readiness gate.
             try:
@@ -195,18 +218,35 @@ class _RecoveryMixin:
                         self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
                         self._transition(state, Phase.EXECUTING, authorized_override=True)
                         return AdvanceResult.WAITING_FOR_OPERATION
-                    self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
-                    if str(wo_id) not in state.completed_wo_ids:
-                        state.completed_wo_ids.append(str(wo_id))
-                    if str(wo_id) in state.failed_wo_ids:
-                        state.failed_wo_ids.remove(str(wo_id))
-                    if str(wo_id) in state.blocked_wo_ids:
-                        state.blocked_wo_ids.remove(str(wo_id))
-                    state.repair_context = {}
-                    self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
-                    self._transition(state, dest, authorized_override=True)
-                    return AdvanceResult.TRANSITIONED
+                    deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(str(wo_id), ws)
+                    deliv_on_disk = False
+                    if deliv_path:
+                        tf = ws / deliv_path
+                        if tf.is_dir() and any(f.is_file() for f in tf.rglob("*")):
+                            deliv_on_disk = True
+                        elif tf.is_file() and tf.stat().st_size > 0:
+                            deliv_on_disk = True
+
+                    if deliv_on_disk:
+                        self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
+                        if str(wo_id) not in state.completed_wo_ids:
+                            state.completed_wo_ids.append(str(wo_id))
+                        if str(wo_id) in state.failed_wo_ids:
+                            state.failed_wo_ids.remove(str(wo_id))
+                        if str(wo_id) in state.blocked_wo_ids:
+                            state.blocked_wo_ids.remove(str(wo_id))
+                        state.repair_context = {}
+                        self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
+                        dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                        self._transition(state, dest, authorized_override=True)
+                        return AdvanceResult.TRANSITIONED
+                    else:
+                        state.repair_context = {}
+                        self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
+                        self._discover_worker_wos(state)
+                        dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                        self._transition(state, dest, authorized_override=True)
+                        return AdvanceResult.TRANSITIONED
                 if action == "split_work_order":
                     # The blocked WO is superseded by its children; they join the
                     # normal execution loop instead of re-dispatching the original.
@@ -497,7 +537,17 @@ class _RecoveryMixin:
                     f".sync/work-orders/ACTIVE/{wo_id}.yaml and update .sync/work-orders/INDEX.yaml using write_file "
                     "to remove or fix the deadlocked dependency, unblocking the worker execution.\n"
                     if (ctx.get("is_dependency_deadlock") or (ctx.get("evidence") or {}).get("failure_code") == "DEPENDENCY_DEADLOCK")
-                    else f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\nDirectly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
+                    else (
+                        f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\nDirectly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
+                        if is_architect_writable_path(str(ctx.get("deliverable_path") or ""))
+                        else (
+                            f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\n"
+                            "Under StackMind governance invariants, you cannot directly write application source or test files. "
+                            "To resolve this blocker, either amend the work order, contract, or dependencies in .sync/work-orders/ or .sync/contracts/, "
+                            "or delegate the deliverable authoring to the assigned specialist agent (Frontend, Backend, or QA) via "
+                            "`delegate_task(target_agent=..., instructions=..., target_files=[...])`.\n"
+                        )
+                    )
                 )
                 if action in ("architect_fix", "resolve_blocker") else ""
             )
@@ -734,14 +784,38 @@ class _RecoveryMixin:
             deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_id, ws)
             if deliv_path:
                 target_file = ws / deliv_path
-                if target_file.is_dir():
-                    if not any(f.is_file() for f in target_file.rglob("*")):
-                        return f"architect_fix expected deliverable directory '{deliv_path}' to contain files"
-                elif not target_file.is_file():
-                    return f"architect_fix expected deliverable '{deliv_path}' to exist on disk"
-                elif target_file.stat().st_size == 0:
-                    return f"architect_fix deliverable '{deliv_path}' is empty"
-            return None
+                if target_file.is_dir() and any(f.is_file() for f in target_file.rglob("*")):
+                    return None
+                if target_file.is_file() and target_file.stat().st_size > 0:
+                    return None
+
+            # If deliverable is not on disk yet, check if the Architect delegated the task,
+            # created replacement/child work orders, or amended the work order/contract for worker execution.
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            wo_file = active_dir / f"{wo_id}.yaml"
+
+            # 1. Did the Architect create delegated work orders (e.g. via delegate_task)?
+            if active_dir.is_dir():
+                for f in active_dir.glob("*.yaml"):
+                    try:
+                        data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+                        if data.get("synthesized_by") == "architect_delegation":
+                            return None
+                    except Exception:
+                        pass
+
+            # 2. Is the work order assigned to a worker role (not the Architect)?
+            assigned_agent = self._agent_for_wo(wo_id, ws)
+            is_worker_wo = assigned_agent and str(assigned_agent).lower().strip() not in ("claude", "architecture", "architect")
+            if is_worker_wo and wo_file.is_file():
+                # Architect cannot directly write worker source code; amending/unblocking the work order
+                # for worker re-dispatch is the authorized outcome.
+                return None
+
+            if not deliv_path:
+                return None
+
+            return f"architect_fix expected deliverable '{deliv_path}' to exist on disk or be delegated to a worker agent" 
         if action == "amend_contract":
             expected_revision = state.repair_context.get("decision", {}).get("contract_revision")
             current_hash = self._sha256_file(ws / ".sync" / "contracts" / f"{wo_id}.yaml")

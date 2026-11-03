@@ -210,6 +210,36 @@ class _ControlsMixin:
         state.error = None
         state.exit_code = EXIT_SUCCESS
         state.stall_ticks = 0
+        state.authoring_repair_attempts = 0
+        state.final_prerequisite_rounds = 0
+        state.blocked_wo_ids.clear()
+        state.worker_blockers.clear()
+
+        # Self-heal active or blocked work orders
+        try:
+            ws = Path(state.workspace)
+            blocked_dir = ws / ".sync" / "work-orders" / "BLOCKED"
+            if blocked_dir.is_dir():
+                for f in list(blocked_dir.glob("*.yaml")):
+                    self._unarchive_work_order(ws, f.stem)
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            if active_dir.is_dir():
+                for f in active_dir.glob("*.yaml"):
+                    try:
+                        content = f.read_text(encoding="utf-8")
+                        if "Architect repair outcome invalid" in content or "status: BLOCKED" in content:
+                            import yaml
+                            wo_d = yaml.safe_load(content) or {}
+                            if isinstance(wo_d, dict) and wo_d.get("status") == "BLOCKED":
+                                wo_d["status"] = "ACTIVE"
+                                wo_d.pop("error", None)
+                                wo_d.pop("blocked_reason", None)
+                                f.write_text(yaml.safe_dump(wo_d, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
+            self._discover_worker_wos(state)
+        except Exception:
+            pass
         if target_phase is not None:
             dest_phase = target_phase
         elif state.interrupted_phase and state.interrupted_phase not in (Phase.WAITING_FOR_HUMAN.value, Phase.FAILED.value, Phase.BLOCKED.value):
