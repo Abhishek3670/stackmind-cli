@@ -772,6 +772,11 @@ class _ExecutionMixin:
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         if agent == "gemma" and deliv_path:
             import sys
+            from validators.harness import review_gate
+            wo_data = review_gate.load_wo(ws, wo_id)
+            criteria = wo_data.get("acceptance_criteria") or wo_data.get("test_plan") or []
+            criteria_str = "\n".join(f"- {c}" for c in criteria) if criteria else ""
+            criteria_section = f"\nDeclared Acceptance Criteria:\n{criteria_str}\n" if criteria_str else ""
             os_note = (
                 "\nHost OS: Windows. Use list_directory and read_file to inspect application deliverables (server/, src/, index.html); "
                 "do NOT run Unix shell commands like 'ls -la'."
@@ -780,13 +785,14 @@ class _ExecutionMixin:
             return (
                 f"Execute work order {wo_id} as the QA worker.\n"
                 f"1. Inspect existing workspace deliverables (e.g. server/, src/, index.html) with read_file and list_directory to ground your test assertions.{os_note}\n"
+                f"   CRITICAL INTERFACE CONTRACT INVARIANT: Your test assertions MUST strictly verify against the actual exported public signatures, function return types, error return conventions, and DOM hooks as implemented in the deliverables under test and specified in .sync/playbook/ and .sync/contracts/. Do not invent contradictory return shapes, token types, or incompatible signatures.\n"
                 f"2. Author the declared test suite '{deliv_path}' with write_file — thorough "
-                f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.\n"
+                f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.{criteria_section}\n"
                 f"3. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
-                f"3. Run the run_security_scan tool over the deliverables and triage the output; "
+                f"4. Run the run_security_scan tool over the deliverables and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
-                f"4. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
-                f"5. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
+                f"5. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
+                f"6. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
                 "Review against the security checklist: no hardcoded secrets or env-fallback defaults, "
                 "debug flags disabled, authentication logic free of obvious flaws, and forms protected "
                 "against CSRF/replay where applicable."

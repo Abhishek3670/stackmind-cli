@@ -307,7 +307,13 @@ def extract_deliverable_spec(
     if is_node:
         is_ts = (stack and stack.backend_language == "typescript") or ("typescript" in combined_lower)
         ext = ".ts" if is_ts else ".js"
-        if any(kw in combined_lower for kw in ("auth", "login", "user")):
+        is_static_app = (
+            (stack and stack.backend_framework is None and stack.frontend_framework in ("html", "vanilla", "static"))
+            or any(kw in combined_lower for kw in ("static single-page", "standalone static", "vanilla html", "no build step and no external dependencies"))
+        )
+        if is_static_app and not any(kw in combined_lower for kw in ("api", "server", "express", "backend")):
+            target_path = "app.js"
+        elif any(kw in combined_lower for kw in ("auth", "login", "user")):
             target_path = f"src/routes/auth{ext}"
         elif "api" in combined_lower or "server" in combined_lower:
             target_path = f"src/server{ext}"

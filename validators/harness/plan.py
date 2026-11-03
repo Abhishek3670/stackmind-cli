@@ -688,35 +688,71 @@ def parse_plan(content: str, project_path: Path | str | None = None) -> PlanStru
                 continue
             # Top-level milestone: starts at column 0 with '- ['
             if line_str.startswith("- ["):
-                m_match = re.match(r"^-\s*\[([ xX])\]\s+([^:]+)(?::\s*(.*))?$", line_str)
-                if m_match:
-                    checked = m_match.group(1).lower() == "x"
-                    m_id_or_title = m_match.group(2).strip()
-                    m_extra = (m_match.group(3) or "").strip()
-                    if m_extra:
-                        m_id = m_id_or_title
-                        m_title = m_extra
-                    else:
-                        m_id = f"M{len(milestones) + 1}"
-                        m_title = m_id_or_title
+                cb_match = re.match(r"^-\s*\[([ xX])\]\s*(.*)$", line_str)
+                if cb_match:
+                    checked = cb_match.group(1).lower() == "x"
+                    raw_content = cb_match.group(2).strip()
 
-                    # Separate skills and agent metadata from the semantic title:
-                    # "(Skills: <id>)" and "(Agent: <id>)" are metadata annotations,
-                    # not part of the semantic milestone title.
+                    # 1. Extract Agent annotation: (Agent: <name>) or ; Agent: <name> or (agent: <name>)
+                    m_agent: str | None = None
+                    agent_match = re.search(r"[\(;]?\s*(?:Agent|agent)\s*:\s*([a-zA-Z0-9_\-]+)\s*[\)]?", raw_content)
+                    if agent_match:
+                        m_agent = agent_match.group(1).strip().lower()
+                        raw_content = (raw_content[: agent_match.start()] + raw_content[agent_match.end() :]).strip()
+
+                    # 2. Extract Skills annotation: (Skills: ...) or ; Skills: ...
                     m_skills: list[str] = []
-                    skills_match = _MILESTONE_SKILLS_ANNOTATION_RE.search(m_title)
+                    skills_match = re.search(r"[\(;]?\s*(?:Skills|skills)\s*:\s*([^);]+)\s*[\)]?", raw_content)
                     if skills_match:
                         raw_skills = skills_match.group(1).split(",")
                         m_skills = [s.strip().lower() for s in raw_skills if s.strip()]
-                        m_title = (m_title[: skills_match.start()] + m_title[skills_match.end() :]).strip()
-                        m_title = m_title.rstrip("-–—,").strip()
+                        raw_content = (raw_content[: skills_match.start()] + raw_content[skills_match.end() :]).strip()
 
-                    m_agent: str | None = None
-                    agent_match = _MILESTONE_AGENT_ANNOTATION_RE.search(m_title)
-                    if agent_match:
-                        m_agent = agent_match.group(1).strip().lower()
-                        m_title = (m_title[: agent_match.start()] + m_title[agent_match.end() :]).strip()
-                        m_title = m_title.rstrip("-–—,").strip()
+                    # 3. Clean leftover empty brackets or parentheses: e.g. '()', '(; )', '( )'
+                    raw_content = re.sub(r"\(\s*[;,]?\s*\)", "", raw_content).strip()
+
+                    # 4. Extract Milestone ID and semantic title
+                    # Check if wrapped in bold markdown: **Milestone 1 — Title** (details)
+                    bold_match = re.match(r"^\*\*([^*]+)\*\*(.*)$", raw_content)
+                    if bold_match:
+                        head = bold_match.group(1).strip()
+                        tail = bold_match.group(2).strip()
+                        sub = re.match(r"^((?:Milestone|Phase|Step|M|Task)\s*[0-9A-Za-z]+)\s*[:—–-]\s*(.*)$", head, re.I)
+                        if sub:
+                            m_id = sub.group(1).strip()
+                            m_title = sub.group(2).strip()
+                        else:
+                            colon = re.match(r"^([^:—–]+)[:—–]\s*(.*)$", head)
+                            if colon:
+                                m_id = colon.group(1).strip()
+                                m_title = colon.group(2).strip()
+                            else:
+                                m_id = f"M{len(milestones) + 1}"
+                                m_title = head
+                        if tail:
+                            tail_clean = tail.strip().lstrip("—–-:,;").strip()
+                            if tail_clean:
+                                m_title = f"{m_title} {tail_clean}" if tail_clean.startswith("(") else f"{m_title} ({tail_clean})"
+                    else:
+                        clean = re.sub(r"\*\*", "", raw_content).strip()
+                        sub = re.match(r"^((?:Milestone|Phase|Step|M|Task)\s*[0-9A-Za-z]+)\s*[:—–-]\s*(.*)$", clean, re.I)
+                        if sub:
+                            m_id = sub.group(1).strip()
+                            m_title = sub.group(2).strip()
+                        else:
+                            colon = re.match(r"^([^:—–]+)[:—–]\s*(.*)$", clean)
+                            if colon and len(colon.group(1).split()) <= 4:
+                                m_id = colon.group(1).strip()
+                                m_title = colon.group(2).strip()
+                            else:
+                                m_id = f"M{len(milestones) + 1}"
+                                m_title = clean
+
+                    # Final cleanup of m_title
+                    m_title = m_title.strip().rstrip("—–-:,;").strip()
+                    # Zero-entropy guard: If title resolved degenerate or just an agent name, restore from raw
+                    if re.match(r"^(gemini|codex|gemma|claude|local-llm)\)?$", m_title, re.I):
+                        m_title = raw_content.strip()
 
                     current_milestone = PlanMilestone(
                         id=m_id,
