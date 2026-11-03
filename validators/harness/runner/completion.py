@@ -154,6 +154,7 @@ class _CompletionMixin:
             else "authoring" if is_authoring_task
             else "integration" if is_integration_review
             else "delivery_status" if is_delivery_status
+            else "adhoc" if request.task.kind == 'adhoc'
             else None
         )
         uses_task_contract = False
@@ -174,6 +175,7 @@ class _CompletionMixin:
             on_usage=getattr(self, 'on_usage', None),
         )
         gateway.is_authoring = is_authoring_task
+        gateway.is_adhoc = (request.task.kind == 'adhoc')
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
             task_text += f"\nImportant PLAN.md formatting requirement:\n{PLAN_GENERATION_INSTRUCTIONS}\n"

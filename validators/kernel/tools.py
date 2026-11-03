@@ -147,6 +147,12 @@ class ToolGateway:
         path = self.workspace.path_for(target)
         if not path.is_file():
             norm_target = target.replace("\\", "/").strip().lstrip("/")
+            if norm_target.startswith(("schemas/", "work-orders/", "contracts/")):
+                sync_p = self.workspace.path_for(f".sync/{norm_target}")
+                if sync_p.is_file():
+                    value = sync_p.read_text(encoding="utf-8")
+                    self.boundary.journal.complete(record.request.operation_id, "read")
+                    return value
             candidate = PurePath(norm_target)
             if not candidate.is_absolute() and ".." not in candidate.parts:
                 auth_path = (self.workspace.authoritative_root / Path(candidate)).resolve()
@@ -249,7 +255,7 @@ class ToolGateway:
 
         # Fail-closed authoring gate for governed artifacts (.sync/contracts and .sync/work-orders)
         normalized_target = target.replace("\\", "/").strip().lstrip("/")
-        if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/"):
+        if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/") or normalized_target.startswith("schemas/"):
             normalized_target = f".sync/{normalized_target}"
             target = normalized_target
         if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):

@@ -1333,6 +1333,25 @@ ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "reopen_work_order",
     "revalidate_work_order",
 )
+ARCHITECTURE_ADHOC_TOOL_NAMES = (
+    "read_file",
+    "list_directory",
+    "glob",
+    "grep",
+    "query_graph",
+    "find_symbol",
+    "find_references",
+    "web_search",
+    "image_search",
+    "web_fetch",
+    "git_log",
+    "git_diff",
+    "trigger_goal",
+    "delegate_task",
+    "update_work_order",
+    "reopen_work_order",
+    "revalidate_work_order",
+)
 
 
 WORKER_CODE_CORE_TOOL_NAMES = (
@@ -1391,6 +1410,8 @@ def get_curated_tools_for_phase(
             wanted = set(PLANNING_CORE_TOOL_NAMES)
         elif phase == "authoring":
             wanted = set(AUTHORING_CORE_TOOL_NAMES)
+        elif phase == "adhoc":
+            wanted = set(ARCHITECTURE_ADHOC_TOOL_NAMES)
         else:
             wanted = set(ARCHITECTURE_INVESTIGATION_TOOL_NAMES)
 
@@ -1880,6 +1901,15 @@ class ProviderGateway:
                         )
                     return res
 
+                if getattr(self, "is_adhoc", False):
+                    norm_target = str(target or "").replace("\\", "/").strip().lstrip("/")
+                    if norm_target.startswith((".sync/work-orders/", ".sync/contracts/")):
+                        self.consecutive_failures += 1
+                        return (
+                            f"Error: Authoring work orders or contracts ('{target}') is disabled during ad-hoc conversation. "
+                            "In ad-hoc mode, discuss requirements with the user or call delegate_task/trigger_goal when an autonomous execution goal is confirmed."
+                        )
+
                 content = (
                     args.get("content")
                     if "content" in args
@@ -1940,6 +1970,18 @@ class ProviderGateway:
                 if not files:
                     self.consecutive_failures += 1
                     return "Error: 'batch_write_files' requires a non-empty 'files' array."
+
+                if getattr(self, "is_adhoc", False):
+                    has_wo = any(
+                        str(f.get("path") or f.get("target") or "").replace("\\", "/").strip().lstrip("/").startswith((".sync/work-orders/", ".sync/contracts/"))
+                        for f in files if isinstance(f, dict)
+                    )
+                    if has_wo:
+                        self.consecutive_failures += 1
+                        return (
+                            "Error: Authoring work orders or contracts via 'batch_write_files' is disabled during ad-hoc conversation. "
+                            "In ad-hoc mode, discuss requirements with the user or call delegate_task/trigger_goal when an autonomous execution goal is confirmed."
+                        )
                 res = self.tool_gateway.batch_write_files(files)
                 self.consecutive_failures = 0
                 for f in res.get("files", []):
@@ -2634,8 +2676,10 @@ class ProviderGateway:
                 is_arch = any(k in actor_str for k in ("claude", "architect", "architecture"))
                 has_work_orders = any(p.startswith((".sync/work-orders/ACTIVE/", ".sync/contracts/")) for p in norm_written)
 
+                is_adhoc = bool(getattr(self, "is_adhoc", False))
                 should_nudge = bool(
-                    (required_deliverable or getattr(self, "is_authoring", False) or is_arch)
+                    not is_adhoc
+                    and (required_deliverable or getattr(self, "is_authoring", False) or is_arch)
                     and has_write_tool
                     and empty_tool_nudges < max_empty_tool_nudges
                     and (self.total_tool_calls == 0 or has_unwritten_deliverable or (is_arch and not has_work_orders))

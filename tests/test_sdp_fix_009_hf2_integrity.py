@@ -542,10 +542,10 @@ def test_provider_gateway_warns_when_budget_is_low(tmp_path: Path):
     ws = ScratchWorkspace.create(tmp_path, attempt_id="test-gw-warn")
     journal = OperationJournal()
     boundary = RuntimeBoundary(journal)
-    contract = KernelContract("claude", "WO-000", ("workspace/**",), (), "read-write", budget={"max_tool_calls": 5}).freeze()
+    contract = KernelContract("codex", "WO-000", ("workspace/**",), (), "read-write", budget={"max_tool_calls": 5}).freeze()
     policy = AuthorizationPolicy.permit("test", ("write_file",))
 
-    tools = ToolGateway(ws, boundary, contract, policy, "s", "a", "claude", "mock")
+    tools = ToolGateway(ws, boundary, contract, policy, "s", "a", "codex", "mock")
 
     mock_adapter = MagicMock()
     del mock_adapter.stream

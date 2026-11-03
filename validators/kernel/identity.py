@@ -66,7 +66,7 @@ def is_architect_writable_path(target: str) -> bool:
     norm = str(target or "").replace("\\", "/").strip().lstrip("/")
     if norm.startswith("./"):
         norm = norm[2:]
-    if norm.startswith(("work-orders/", "contracts/")):
+    if norm.startswith(("work-orders/", "contracts/", "schemas/")):
         norm = f".sync/{norm}"
     return norm in ARCHITECT_WRITABLE_FILES or norm.startswith(ARCHITECT_WRITABLE_PREFIXES)
 
