@@ -82,7 +82,8 @@ def _validate_work_order(
                 )
 
         if wo_id != "WO-000":
-            plan_file = project_root / "PLAN.md"
+            from validators.harness.plan import resolve_playbook_file
+            plan_file = resolve_playbook_file(project_root, "PLAN.md")
             if plan_file.is_file():
                 try:
                     plan_text = plan_file.read_text(encoding="utf-8")
@@ -90,7 +91,7 @@ def _validate_work_order(
                         deliv_path = str(deliverable.get("path")).strip()
                         exempt_prefixes = ("tests/", "test_", ".sync/", ".github/")
                         exempt_names = {
-                            "PLAN.md", "README.md", "CHANGELOG.md", "VERSION",
+                            "PLAN.md", "README.md", "CHANGELOG.md", "VERSION", "ARCHITECTURE.md", "DESIGN.md",
                             ".gitignore", "package.json", "pyproject.toml",
                             "setup.py", "tsconfig.json", "vite.config.js",
                         }

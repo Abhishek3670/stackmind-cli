@@ -433,7 +433,8 @@ def plan_criteria(workspace: Path | str) -> list[str]:
     ws = Path(workspace)
     criteria: list[str] = []
 
-    plan = ws / "PLAN.md"
+    from validators.harness.plan import resolve_playbook_file
+    plan = resolve_playbook_file(ws, "PLAN.md")
     if plan.is_file():
         try:
             lines = plan.read_text(encoding="utf-8").splitlines()
@@ -487,12 +488,13 @@ def evaluate_planning_completeness(
     criteria = list(required_criteria) if required_criteria is not None else plan_criteria(ws)
     checks: list[DeliveryCheck] = []
 
+    resolved_plan = resolve_playbook_file(ws, "PLAN.md")
     checks.append(DeliveryCheck(
         "plan_present",
-        (ws / "PLAN.md").is_file(),
-        PASSED if (ws / "PLAN.md").is_file() else FAILED,
-        "Approved PLAN.md is present" if (ws / "PLAN.md").is_file() else "No PLAN.md exists in the workspace",
-        {"plan": str(ws / "PLAN.md")},
+        resolved_plan.is_file(),
+        PASSED if resolved_plan.is_file() else FAILED,
+        "Approved PLAN.md is present" if resolved_plan.is_file() else "No PLAN.md exists in the workspace",
+        {"plan": str(resolved_plan)},
     ))
 
     checks.append(DeliveryCheck(

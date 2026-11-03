@@ -2103,7 +2103,9 @@ class AutonomousDeliveryState:
                 self.workspace = ws_path
                 self.sync_work_orders_from_disk(ws_path)
 
-                plan_file = ws_path / ".sync" / "PLAN.md"
+                plan_file = ws_path / ".sync" / "playbook" / "PLAN.md"
+                if not plan_file.exists():
+                    plan_file = ws_path / ".sync" / "PLAN.md"
                 if not plan_file.exists():
                     plan_file = ws_path / "PLAN.md"
                 if plan_file.exists():

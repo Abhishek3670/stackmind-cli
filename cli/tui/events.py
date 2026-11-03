@@ -562,14 +562,14 @@ def extract_assistant_response(
             user_mods = [f for f in mods if not str(f).startswith((".sync", ".sync/"))]
             if user_mods:
                 files_str = ", ".join(f"`{f}`" for f in user_mods)
-                if any("PLAN.md" in str(f) for f in user_mods):
+                if any(any(k in str(f) for k in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", "playbook")) for f in user_mods):
                     return clean_response(
-                        f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                        f"Created project playbook in {files_str}. Use `:plan` to review or `:approve` to proceed."
                     )
                 return clean_response(f"Completed turn. Modified files: {files_str}.")
-            elif any("PLAN.md" in str(f) for f in mods):
+            elif any(any(k in str(f) for k in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", "playbook")) for f in mods):
                 return clean_response(
-                    "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
+                    "Created project playbook in `.sync/playbook/` (`ARCHITECTURE.md`, `DESIGN.md`, `PLAN.md`). Use `:plan` to review or `:approve` to proceed."
                 )
             return clean_response("Completed turn.")
 

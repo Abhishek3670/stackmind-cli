@@ -440,7 +440,14 @@ def compile_worker_task_contract(
     budget_block = (contract_data or {}).get("budget") if isinstance(contract_data, dict) else None
     file_budget = int(budget_block.get("max_files_touched", 0)) if isinstance(budget_block, dict) else 0
 
-    deliverable = _norm(getattr(task, "deliverable_path", None))
+    deliv_from_wo = (wo_data or {}).get("deliverable")
+    if isinstance(deliv_from_wo, dict):
+        deliv_wo_path = deliv_from_wo.get("path")
+    elif isinstance(deliv_from_wo, str):
+        deliv_wo_path = deliv_from_wo
+    else:
+        deliv_wo_path = None
+    deliverable = _norm(getattr(task, "deliverable_path", None) or deliv_wo_path)
     peers = collect_peer_deliverables(workspace, getattr(task, "work_order_id", None))
     peer_files = sorted({p for _wo, p in peers if not _is_glob(p) and p != deliverable})
     peer_prefixes = sorted({p.rstrip("/") + "/" for _wo, p in peers if _is_glob(p) or p.endswith("/")})
@@ -555,14 +562,42 @@ def compile_worker_task_contract(
     if assigned_skills:
         result["assigned_skills"] = assigned_skills
 
-    plan_file = Path(workspace) / "PLAN.md"
+    from validators.harness.plan import resolve_playbook_file
+
+    plan_file = resolve_playbook_file(workspace, "PLAN.md")
     if plan_file.is_file():
         try:
             plan_text = plan_file.read_text(encoding="utf-8").strip()
             if plan_text:
-                if len(plan_text) > 600:
-                    plan_text = plan_text[:600] + " …"
+                if len(plan_text) > 800:
+                    plan_text = plan_text[:800] + " …"
                 result["project_plan_overview"] = plan_text
+        except Exception:
+            pass
+
+    arch_file = resolve_playbook_file(workspace, "ARCHITECTURE.md")
+    if arch_file.is_file():
+        try:
+            arch_text = arch_file.read_text(encoding="utf-8").strip()
+            if arch_text:
+                if len(arch_text) > 800:
+                    arch_text = arch_text[:800] + " …"
+                result["architecture_grounding"] = (
+                    f"Project Architecture Reference ({arch_file.name}):\n{arch_text}"
+                )
+        except Exception:
+            pass
+
+    design_file = resolve_playbook_file(workspace, "DESIGN.md")
+    if design_file.is_file():
+        try:
+            design_text = design_file.read_text(encoding="utf-8").strip()
+            if design_text:
+                if len(design_text) > 800:
+                    design_text = design_text[:800] + " …"
+                result["design_grounding"] = (
+                    f"UI/UX Design Specification Reference ({design_file.name}):\n{design_text}"
+                )
         except Exception:
             pass
 
@@ -642,9 +677,8 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     )
     workflow_steps = (
         f"\nWORKFLOW INSTRUCTIONS:\n"
-        f"1. In your first action, use `read_file` to inspect existing workspace files "
-        f"(e.g. index.html, PLAN.md, brand-kit.html) and ground your deliverable in the project architecture, brand tokens, and required DOM contract hooks. "
-        f"deliverable must integrate with.\n"
+        f"1. In your first action, use `read_file` to inspect existing workspace and playbook files "
+        f"(e.g. .sync/playbook/ARCHITECTURE.md, .sync/playbook/DESIGN.md, .sync/playbook/PLAN.md, index.html) and ground your deliverable in the project architecture, design tokens, and required DOM contract hooks.\n"
         f"2. Call `write_file(path='{deliverable}', content='...')` to author your deliverable as complete final content.\n"
         f"3. Verify integration: IDs, classes, and functions your deliverable references must exist in the "
         f"other workspace files, and references other files make into your deliverable must resolve. If your "

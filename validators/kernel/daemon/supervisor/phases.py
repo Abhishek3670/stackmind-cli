@@ -126,6 +126,17 @@ class _PhasesMixin:
                         state.ignored_operation_ids.append(planning_op_id)
                         state.planning_operation_id = repair.get("operation_id")
                         state.plan_repair_attempt = None
+                        plans = self.manager.list_plans(state.session_id)
+                        repair_op_id = repair.get("operation_id")
+                        has_repair_plan = any(
+                            p.get("metadata", {}).get("operation_id") == repair_op_id
+                            or str(p.get("state", "")).upper() == "AWAITING_APPROVAL"
+                            for p in plans
+                        )
+                        if not has_repair_plan:
+                            state.error = "Plan repair turn completed without proposing a valid plan"
+                            self._transition(state, Phase.FAILED)
+                            return AdvanceResult.FAILED
                         return self._advance_planning(state)
                     # Repair itself terminated non-successfully: fail the run
                     # with the original planning error evidence.

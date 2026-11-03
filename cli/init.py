@@ -181,6 +181,7 @@ def _create_empty_dirs(sync_path: Path, agents: list[str]) -> None:
     """
     # Directories that get .gitkeep
     gitkeep_dirs = [
+        "playbook",
         "decisions",
         "reviews",
         "escalations",
@@ -308,6 +309,7 @@ def ensure_workspace_protocol_scaffolding(workspace: Path | str) -> None:
                 version_path.write_text(default_content, encoding="utf-8")
 
         # 3. Create all baseline directories with .gitkeep
+        (sync_path / "playbook").mkdir(parents=True, exist_ok=True)
         _create_empty_dirs(sync_path, DEFAULT_AGENTS)
 
         # 4. Repair schema-invalid FAILED status on work orders
@@ -539,7 +541,6 @@ def ensure_canonical_tree(workspace: Path | str) -> dict[str, Any]:
 STACKMIND_ROOT_FILES = (
     ".gitignore",
     "README.md",
-    "PLAN.md",
     "CHANGELOG.md",
     "VERSION",
 )
@@ -831,11 +832,7 @@ def init(
             context,
         )
 
-    plan_template = templates_dir / "PLAN.template.md"
-    if plan_template.exists() and (
-        not preserve_existing or not (project_path / "PLAN.md").exists()
-    ):
-        render_template_file(plan_template, project_path / "PLAN.md", context)
+    # Playbook artifacts (ARCHITECTURE.md, DESIGN.md, PLAN.md) authored by Architect into .sync/playbook/
 
     changelog_template = templates_dir / "CHANGELOG.template.md"
     if changelog_template.exists() and (
@@ -862,7 +859,7 @@ def init(
         if ".sync/" not in current_gi:
             gitignore_path.write_text(current_gi.rstrip() + "\n\n# Stackmind runtime\n.sync/\ngraphify-out/\n", encoding="utf-8", newline="\n")
 
-    console.print("[bold green][+][/bold green] Rendered PLAN.md, CHANGELOG.md, VERSION, .gitignore")
+    console.print("[bold green][+][/bold green] Rendered CHANGELOG.md, VERSION, .gitignore")
 
     # ── Step 5: Create .sync/ structure ───────────────────────
     sync_path.mkdir(parents=True, exist_ok=True)
@@ -938,7 +935,9 @@ def init(
     try:
         from validators.kernel.home import register_project, save_authoritative_plan
         register_project(project_path, name=name, agents=agents)
-        plan_f = project_path / "PLAN.md"
+        plan_f = project_path / ".sync" / "playbook" / "PLAN.md"
+        if not plan_f.is_file():
+            plan_f = project_path / "PLAN.md"
         if plan_f.is_file():
             save_authoritative_plan(project_path, plan_f.read_text(encoding="utf-8"), version=1)
     except Exception:

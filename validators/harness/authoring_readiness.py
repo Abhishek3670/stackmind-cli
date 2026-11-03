@@ -276,7 +276,8 @@ def load_plan_milestones(workspace: Path | str) -> list[dict[str, Any]] | None:
     title separated from any trailing "(Agent: <id>)" annotation, or None when
     the plan is missing/unparseable/empty.
     """
-    plan_file = Path(workspace) / "PLAN.md"
+    from validators.harness.plan import resolve_playbook_file
+    plan_file = resolve_playbook_file(workspace, "PLAN.md")
     if not plan_file.is_file():
         return None
     try:

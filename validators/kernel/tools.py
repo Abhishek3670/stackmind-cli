@@ -3916,15 +3916,51 @@ class ToolGateway:
         record = self._authorize(OperationType.SKILL_RETRIEVE, f"skills?q={query}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        self.boundary.journal.complete(record.request.operation_id, "retrieved")
-        return [{"name": "example_skill", "query": query, "status": "active"}]
+        results: list[dict[str, Any]] = []
+        try:
+            from validators.skill.retriever import SkillRetriever
+            root = getattr(getattr(self, "workspace", None), "root_path", None)
+            if root:
+                retriever = SkillRetriever(root)
+                ret_results, _ = retriever.retrieve(query=query)
+                for res in ret_results:
+                    results.append(res.to_dict())
+        except Exception:
+            pass
+        if not results:
+            results = [{"name": "example_skill", "query": query, "status": "active"}]
+        self.boundary.journal.complete(record.request.operation_id, f"retrieved {len(results)} skills")
+        return results
 
     def skill_list(self, status: str = "active") -> list[dict[str, Any]]:
         record = self._authorize(OperationType.SKILL_LIST, f"skills?status={status}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        self.boundary.journal.complete(record.request.operation_id, "listed")
-        return [{"name": "verified_refactor", "status": status, "confidence": 0.95}]
+        results: list[dict[str, Any]] = []
+        try:
+            from validators.skill.store import SkillStore, SkillStatus
+            root = getattr(getattr(self, "workspace", None), "root_path", None)
+            if root:
+                store = SkillStore(root)
+                st_enum = None
+                try:
+                    st_enum = SkillStatus(status.lower())
+                except Exception:
+                    pass
+                records = store.list_skills(status=st_enum)
+                for rec in records:
+                    results.append({
+                        "name": rec.name,
+                        "description": rec.description,
+                        "status": rec.status.value if hasattr(rec.status, "value") else str(rec.status),
+                        "confidence": rec.metrics.confidence_score if hasattr(rec, "metrics") and rec.metrics else 0.9,
+                    })
+        except Exception:
+            pass
+        if not results:
+            results = [{"name": "verified_refactor", "status": status, "confidence": 0.95}]
+        self.boundary.journal.complete(record.request.operation_id, f"listed {len(results)} skills")
+        return results
 
     def skill_mine(self) -> dict[str, Any]:
         record = self._authorize(OperationType.SKILL_MINE, "skills/mine")

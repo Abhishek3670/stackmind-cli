@@ -60,7 +60,7 @@ def extract_candidate_paths(text: str) -> list[str]:
             ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite", ".go", ".rs", ".vue", ".svelte",
             ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot"
         )):
-            if not clean.startswith(".sync") and not clean.startswith(".git") and clean not in ("PLAN.md", ".env"):
+            if not clean.startswith(".sync") and not clean.startswith(".git") and clean not in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", ".env"):
                 candidate_paths.append(clean)
                 seen.add(clean)
 
@@ -1049,7 +1049,8 @@ def synthesize_child_work_orders(
         plan_raw_text = plan
 
     if not plan_raw_text:
-        plan_file = ws / "PLAN.md"
+        from validators.harness.plan import resolve_playbook_file
+        plan_file = resolve_playbook_file(ws, "PLAN.md")
         if plan_file.is_file():
             try:
                 plan_raw_text = plan_file.read_text(encoding="utf-8")
@@ -1084,7 +1085,8 @@ def synthesize_child_work_orders(
 
     # Fallback to reading PLAN.md directly if still empty
     if not proposed_wos:
-        plan_file = ws / "PLAN.md"
+        from validators.harness.plan import resolve_playbook_file
+        plan_file = resolve_playbook_file(ws, "PLAN.md")
         if plan_file.is_file():
             parsed = parse_plan(plan_file.read_text(encoding="utf-8"), project_path=ws)
             proposed_wos = decompose_plan_milestones(parsed.milestones, start_idx, stack=tech_stack, project_path=ws)
@@ -1394,7 +1396,8 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     if not plan_milestones:
         return []
 
-    plan_file = ws / "PLAN.md"
+    from validators.harness.plan import resolve_playbook_file
+    plan_file = resolve_playbook_file(ws, "PLAN.md")
     plan_raw_text = ""
     if plan_file.is_file():
         try:
@@ -1946,7 +1949,8 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     except Exception:
                         pass
 
-        plan_file = ws / "PLAN.md"
+        from validators.harness.plan import resolve_playbook_file
+        plan_file = resolve_playbook_file(ws, "PLAN.md")
         parsed_plan = None
         if plan_file.is_file():
             try:

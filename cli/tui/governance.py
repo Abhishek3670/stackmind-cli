@@ -326,6 +326,32 @@ def render_plan_panel(state: AutonomousDeliveryState) -> Panel:
     stat_line.append(status, style=f"bold {status_color}")
     lines.append(stat_line)
 
+    # Playbook Artifacts
+    ws = getattr(state, "workspace", None)
+    if ws:
+        try:
+            from validators.harness.plan import resolve_playbook_file
+            arch_p = resolve_playbook_file(ws, "ARCHITECTURE.md")
+            design_p = resolve_playbook_file(ws, "DESIGN.md")
+            plan_p = resolve_playbook_file(ws, "PLAN.md")
+            lines.append(Text(""))
+            lines.append(Text("PLAYBOOK ARTIFACTS (.sync/playbook/):", style="bold white"))
+            for fname, fpath, purpose in [
+                ("ARCHITECTURE.md", arch_p, "System architecture, tech stack & boundaries"),
+                ("DESIGN.md", design_p, "UI/UX design, styling & interaction tokens"),
+                ("PLAN.md", plan_p, "Project phases, milestones & roadmap"),
+            ]:
+                pline = Text("  • ", style="bold cyan")
+                pline.append(fname, style="bold white" if fpath.is_file() else "dim white")
+                if fpath.is_file():
+                    pline.append(" [FOUND]", style="bold green")
+                else:
+                    pline.append(" [PENDING]", style="dim yellow")
+                pline.append(f" — {purpose}", style="dim")
+                lines.append(pline)
+        except Exception:
+            pass
+
     # Work Decomposition
     lines.append(Text(""))
     lines.append(Text("WORK DECOMPOSITION:", style="bold white"))

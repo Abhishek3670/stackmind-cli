@@ -52,7 +52,14 @@ ARCHITECT_ROLE_KEYS: tuple[str, ...] = ("claude", "architecture", "architect")
 # The only paths an architecture role may write directly. Everything else is an
 # implementation change and must go through a work order to codex/gemini.
 ARCHITECT_WRITABLE_PREFIXES: tuple[str, ...] = (".sync/",)
-ARCHITECT_WRITABLE_FILES: frozenset[str] = frozenset({"PLAN.md"})
+ARCHITECT_WRITABLE_FILES: frozenset[str] = frozenset({
+    "PLAN.md",
+    "ARCHITECTURE.md",
+    "DESIGN.md",
+    ".sync/playbook/ARCHITECTURE.md",
+    ".sync/playbook/DESIGN.md",
+    ".sync/playbook/PLAN.md",
+})
 
 
 def is_architect_role(role_or_agent: str) -> bool:
@@ -66,7 +73,7 @@ def is_architect_writable_path(target: str) -> bool:
     norm = str(target or "").replace("\\", "/").strip().lstrip("/")
     if norm.startswith("./"):
         norm = norm[2:]
-    if norm.startswith(("work-orders/", "contracts/", "schemas/")):
+    if norm.startswith(("work-orders/", "contracts/", "schemas/", "playbook/")):
         norm = f".sync/{norm}"
     return norm in ARCHITECT_WRITABLE_FILES or norm.startswith(ARCHITECT_WRITABLE_PREFIXES)
 

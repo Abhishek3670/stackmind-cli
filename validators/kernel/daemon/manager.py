@@ -293,10 +293,12 @@ def _scaffold_protocol_citizenship(workspace: Path, agent: str) -> None:
     if agent == "claude":
         claude_contract = sync_dir / "agents" / "claude.contract.yaml"
         default_claude_allow = [
+            {"module": ".sync/playbook/**"},
             {"module": "PLAN.md"},
             {"module": "README.md"},
             {"module": "AGENTS.md"},
             {"module": "ARCHITECTURE.md"},
+            {"module": "DESIGN.md"},
             {"module": "VERSION"},
             {"module": "*.md"},
             {"module": "package.json"},
@@ -469,7 +471,7 @@ def synthesize_bootstrap_planning(
         "dependencies": [],
         "deliverable": {
             "type": "doc",
-            "path": "PLAN.md",
+            "path": ".sync/playbook/PLAN.md",
             "description": "System architecture and execution plan",
         },
         "description": prompt.strip(),
@@ -488,10 +490,12 @@ def synthesize_bootstrap_planning(
         },
         "scope": {
             "allow": [
+                {"module": ".sync/playbook/**"},
                 {"module": "PLAN.md"},
                 {"module": "README.md"},
                 {"module": "AGENTS.md"},
                 {"module": "ARCHITECTURE.md"},
+                {"module": "DESIGN.md"},
                 {"module": "VERSION"},
                 {"module": "*.md"},
                 {"module": "package.json"},
@@ -3306,9 +3310,10 @@ class SessionManager:
                 is_goal_turn = bool((op_rec.get("metadata") or {}).get("is_goal"))
                 is_authoring_turn = bool((op_rec.get("metadata") or {}).get("is_authoring"))
                 plan_repair_turn = bool((op_rec.get("metadata") or {}).get("plan_repair_attempt"))
-                plan_file = ws_path / "PLAN.md"
+                from validators.harness.plan import resolve_playbook_file
+                plan_file = resolve_playbook_file(ws_path, "PLAN.md")
                 mod_files = [str(f).replace("\\", "/").strip().lstrip("/") for f in (res_meta.get("modified_files") or [])]
-                plan_written_this_turn = any(f.endswith("PLAN.md") for f in mod_files)
+                plan_written_this_turn = any(f.endswith("PLAN.md") or "playbook" in f for f in mod_files)
                 if (is_goal_turn or plan_written_this_turn) and (not is_authoring_turn or plan_repair_turn) and plan_file.is_file():
                     try:
                         from validators.harness.plan import validate_plan_structure, parse_plan

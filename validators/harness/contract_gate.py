@@ -413,7 +413,7 @@ def verify_post_execution(
                     ):
                         allowed = True
                         break
-        if not allowed and not (norm_fp.startswith((".sync/decisions/", "decisions/")) or "/.sync/decisions/" in norm_fp or (str(agent).lower().strip() in ("claude", "architecture", "architect") and (norm_fp.startswith((".sync/work-orders/", "work-orders/", ".sync/contracts/", "contracts/", ".sync/agents/")) or norm_fp in ("plan.md", "index.yaml")))):
+        if not allowed and not (norm_fp.startswith((".sync/decisions/", "decisions/")) or "/.sync/decisions/" in norm_fp or (str(agent).lower().strip() in ("claude", "architecture", "architect") and (norm_fp.startswith((".sync/work-orders/", "work-orders/", ".sync/contracts/", "contracts/", ".sync/agents/", ".sync/playbook/", "playbook/")) or norm_fp in ("plan.md", "architecture.md", "design.md", "index.yaml")))):
             raise ContractAccessDenied(
                 f"Modification to file {file_path} is outside allowed contract scope"
             )

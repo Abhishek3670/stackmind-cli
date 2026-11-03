@@ -19,17 +19,36 @@ _MILESTONE_SKILLS_ANNOTATION_RE = re.compile(r"\(\s*(?:Skills?|skills?)\s*:\s*([
 
 
 PLAN_GENERATION_INSTRUCTIONS = (
-    "When generating or updating PLAN.md, you MUST strictly structure it as follows:\n\n"
-    "# Project Plan: <project-name>\n\n"
-    "## Current Architecture\n"
-    "<overview of system components, boundaries, and dependencies>\n"
-    "Stack & Dependencies: Explicitly specify runtime stack and all third-party dependencies.\n\n"
-    "## Milestones & Roadmap\n"
-    "- [ ] Milestone 1: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>)\n"
-    "  - [ ] Task 1.1: <actionable task description>\n"
-    "  - [ ] Task 1.2: <actionable task description>\n"
-    "- [ ] Milestone 2: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>)\n"
-    "  - [ ] Task 2.1: <actionable task description>\n\n"
+    "When generating or updating the project playbook, you MUST strictly structure and author all three mandatory playbook files in `.sync/playbook/`:\n\n"
+    "1. `.sync/playbook/ARCHITECTURE.md` (Grounds system architecture, tech stack, directory structure, module boundaries, backend/data specifications):\n"
+    "   # Architecture Specification: <project-name>\n"
+    "   ## System Architecture\n"
+    "   <overview of components, system boundaries, and architectural patterns>\n"
+    "   ## Tech Stack & Dependencies\n"
+    "   Explicitly specify runtime stack, frameworks, database, and all third-party dependencies.\n"
+    "   ## Directory & Module Structure\n"
+    "   Define exact directory tree layout, module boundaries, and file responsibilities.\n"
+    "   ## Data & Interface Contracts\n"
+    "   Specify API routes, data structures, and contract hooks.\n\n"
+    "2. `.sync/playbook/DESIGN.md` (Grounds UI/UX design, visual themes, color palette, component hierarchy, interaction models, and accessibility):\n"
+    "   # Design Specification: <project-name>\n"
+    "   ## UI/UX Design & Theme\n"
+    "   Visual aesthetic, styling guidelines, color palette variables/tokens, typography.\n"
+    "   ## Component Hierarchy & Layout\n"
+    "   Grid/Flex layout, container structure, class naming conventions, and DOM hooks (#display, .btn-digit, .btn-op).\n"
+    "   ## Interaction & States\n"
+    "   User interaction flows, hover/active/error states, transitions, accessibility (ARIA).\n\n"
+    "3. `.sync/playbook/PLAN.md` (Grounds project phases, milestones, roadmap, work order specifications, and acceptance gates):\n"
+    "   # Project Plan: <project-name>\n\n"
+    "   ## Current Architecture\n"
+    "   <overview of system components, boundaries, and dependencies>\n"
+    "   Stack & Dependencies: Explicitly specify runtime stack and all third-party dependencies.\n\n"
+    "   ## Milestones & Roadmap\n"
+    "   - [ ] Milestone 1: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>)\n"
+    "     - [ ] Task 1.1: <actionable task description>\n"
+    "     - [ ] Task 1.2: <actionable task description>\n"
+    "   - [ ] Milestone 2: <Milestone Name> (Agent: <codex|gemini|gemma|local-llm>)\n"
+    "     - [ ] Task 2.1: <actionable task description>\n\n"
     "Structural requirements:\n"
     "1. Top-level '# ' heading must contain 'Plan' (e.g. '# Project Plan: <name>').\n"
     "2. Must include a '## Current Architecture' (or '## Architecture') section.\n"
@@ -46,35 +65,73 @@ PLAN_GENERATION_INSTRUCTIONS = (
 )
 
 
+ARCHITECTURE_SPEC_TEMPLATE = (
+    "# Architecture Specification: {{PROJECT_NAME}}\n\n"
+    "## System Architecture\n"
+    "Overview of system components, architectural patterns, and execution flow.\n\n"
+    "## Tech Stack & Dependencies\n"
+    "- Language/Runtime: {{RUNTIME}}\n"
+    "- Core Frameworks: {{FRAMEWORKS}}\n"
+    "- Storage/Database: {{STORAGE}}\n"
+    "- Dependencies: {{DEPENDENCIES}}\n\n"
+    "## Directory & Module Structure\n"
+    "- Project Layout: Define clear directory structure and responsibilities.\n"
+    "- Module Boundaries: Define strict boundaries between modules.\n\n"
+    "## Data & Interface Contracts\n"
+    "- Interfaces and Data Models: Specify contract hooks and data transfer objects.\n"
+)
+
+
+DESIGN_SPEC_TEMPLATE = (
+    "# Design Specification: {{PROJECT_NAME}}\n\n"
+    "## UI/UX Design & Theme\n"
+    "- Design Aesthetics: Visual tone, color palette, typography tokens.\n"
+    "- CSS Variables & Styling Tokens: Standardized design variables.\n\n"
+    "## Component Hierarchy & Layout\n"
+    "- Layout Grid & Containers: Page layout, responsive breakpoints.\n"
+    "- DOM Structure & Hooks: Container IDs and class names for downstream code integration.\n\n"
+    "## Interaction & States\n"
+    "- Interaction Flows: User inputs, button activations, keyboard navigation.\n"
+    "- Visual Feedback & Accessibility: Hover/focus states, ARIA attributes.\n"
+)
+
+
 ARCHITECTURE_RESEARCH_INSTRUCTIONS = (
     "## Architecture Research & Workflow Requirements\n\n"
     "You are Claude, the Senior Architect. Before drafting an architecture plan or authoring tasks, "
     "you MUST follow this strict multi-step sequence:\n\n"
-    "### Step 1: Mandatory Codebase Research (FIRST ACTION)\n"
+    "### Step 1: Mandatory Codebase & Skills Research (FIRST ACTION)\n"
     "- In your FIRST action, you MUST call the `query_graph` tool (e.g. `query_graph(query='architecture')` "
     "or `query_graph(query='auth')`) to discover existing modules, patterns, and codebase conventions.\n"
     "- Do NOT call `write_file` until you have first called `query_graph` and reviewed the response.\n"
+    "- Procedural Skills Discovery: Call `skill_retrieve(query='...')` and `skill_list()` to retrieve verified "
+    "procedural skills and best practices relevant to the architecture and design.\n"
     "- Dynamic Tool Activation: If you need additional specialized tools to understand the codebase "
     "(such as `git_log` or `git_diff` to see how architecture evolved, `find_callers` or `impact_analysis` "
     "for dependency structure, or linters to identify existing constraints), call `request_tools(query='git')` "
     "or `request_tools(query='<tool_name>')` to dynamically activate them.\n"
-    "- Web Research & Documentation: You have access to `web_search(query='...')` and `web_fetch(url='...')` "
-    "to look up framework documentation, library APIs, and latest technical specifications when designing the architecture stack.\n\n"
-    "### Step 2: Write PLAN.md (AFTER RESEARCH)\n"
-    "- Once research results are returned, use `write_file` to write the complete project plan to `PLAN.md`.\n"
-    "- The file MUST strictly conform to the PLAN.md formatting specification below.\n"
-    "- Agent Allocation: For each milestone in 'Milestones & Roadmap', decide which agent is best suited:\n"
+    "- Web Research & Trends: You have access to `web_search(query='...')`, `image_search(query='...')`, and `web_fetch(url='...')` "
+    "to look up current trends, framework documentation, library APIs, and latest technical specifications when designing the architecture stack and UI.\n\n"
+    "### Step 2: Active User Alignment & Co-Design\n"
+    "- Maintain an active conversation with the user to co-design and clarify requirements, tech stack, UI/UX aesthetics, and trade-offs.\n"
+    "- Continue aligning and refining the specifications until receiving a green signal approval from the user (`:approve`).\n\n"
+    "### Step 3: Write Playbook Artifacts in `.sync/playbook/` (AFTER RESEARCH)\n"
+    "- Once research and alignment results are established, use `write_file` to author all three mandatory playbook artifacts:\n"
+    "  1. `.sync/playbook/ARCHITECTURE.md`: Grounds system architecture, tech stack, directory structure, module boundaries, backend/data specifications.\n"
+    "  2. `.sync/playbook/DESIGN.md`: Grounds UI/UX design, styling guidelines, color palette/theme, component hierarchy, interaction models, and accessibility.\n"
+    "  3. `.sync/playbook/PLAN.md`: Grounds project description, phases, milestones, roadmap, work order specifications, and acceptance gates.\n"
+    "- Agent Allocation: For each milestone in 'Milestones & Roadmap' in `PLAN.md`, decide which agent is best suited:\n"
     "  * Codex (Agent: codex) for backend implementation, business logic, and code modules.\n"
     "  * Gemini (Agent: gemini) for frontend UI, client state, and templates.\n"
     "  * Gemma (Agent: gemma) for QA verification, test execution, and test coverage.\n"
     "  * Local-LLM (Agent: local-llm) for GitOps, version tags, changelog, and release commits.\n"
     "  Append `(Agent: <agent>)` to each milestone title.\n"
-    "- Dependency & Stack Decision: Explicitly specify all required third-party packages in PLAN.md. "
+    "- Dependency & Stack Decision: Explicitly specify all required third-party packages in `ARCHITECTURE.md` and `PLAN.md`. "
     "When external dependencies are needed, plan an explicit scaffolding Work Order to create or update "
     "the dependency manifest (requirements.txt or pyproject.toml) BEFORE any implementation Work Orders.\n\n"
-    "### Step 3: Complete the Turn\n"
-    "- After writing `PLAN.md`, conclude the turn by emitting the final JSON decision payload "
-    "declaring status 'completed' and modified_files ['PLAN.md'].\n"
+    "### Step 4: Complete the Turn\n"
+    "- After authoring the playbook files in `.sync/playbook/`, conclude the turn by emitting the final JSON decision payload "
+    "declaring status 'completed' and modified_files ['.sync/playbook/ARCHITECTURE.md', '.sync/playbook/DESIGN.md', '.sync/playbook/PLAN.md'].\n"
 )
 
 
@@ -746,3 +803,149 @@ def extract_plan_from_text(raw_text: str, default_title: str = "System Architect
                 return candidate
 
     return None
+
+
+def resolve_playbook_file(workspace: Path | str, filename: str) -> Path:
+    """Resolve a playbook artifact file with canonical precedence:
+    1. <workspace>/.sync/playbook/<filename>
+    2. <workspace>/<filename>
+    3. <workspace>/.sync/<filename>
+    Returns the first path that exists, or defaults to <workspace>/.sync/playbook/<filename>.
+    """
+    ws = Path(workspace).resolve()
+    clean_name = Path(filename).name
+    primary = ws / ".sync" / "playbook" / clean_name
+    if primary.is_file():
+        return primary
+    root_fallback = ws / clean_name
+    if root_fallback.is_file():
+        return root_fallback
+    sync_fallback = ws / ".sync" / clean_name
+    if sync_fallback.is_file():
+        return sync_fallback
+    return primary
+
+
+def validate_architecture_structure(content: str) -> tuple[bool, list[str]]:
+    """Validate that ARCHITECTURE.md conforms to required architecture, stack, and module sections.
+
+    Returns:
+        tuple of (is_valid, list of error messages)
+    """
+    errors: list[str] = []
+    if not content or not content.strip():
+        return False, ["ARCHITECTURE.md content is empty"]
+
+    # 1. Heading 1 (Title)
+    title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
+    if not title_match:
+        errors.append("ARCHITECTURE.md is missing a top-level '# ' heading (e.g. '# Architecture: <name>')")
+    else:
+        title_text = title_match.group(1).lower()
+        if "architecture" not in title_text and "system" not in title_text:
+            errors.append("Top-level heading must reference 'Architecture' (e.g. '# Architecture: <name>')")
+
+    # 2. System Architecture / Overview
+    arch_match = re.search(
+        r"^##\s+.*(?:Architecture|System Architecture|Overview|System Design|Components).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not arch_match:
+        errors.append("ARCHITECTURE.md is missing a '## System Architecture' (or '## Architecture Overview') section")
+
+    # 3. Tech Stack & Dependencies
+    stack_match = re.search(
+        r"^##\s+.*(?:Stack|Dependencies|Technologies|Tech Stack|Core Technologies).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not stack_match:
+        errors.append("ARCHITECTURE.md is missing a '## Tech Stack & Dependencies' section")
+
+    # 4. Directory & Module Boundaries / Structure
+    module_match = re.search(
+        r"^##\s+.*(?:Structure|Module|Boundaries|Directory|Project Structure|Layout).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not module_match:
+        errors.append("ARCHITECTURE.md is missing a '## Directory & Module Structure' section")
+
+    return len(errors) == 0, errors
+
+
+def validate_design_structure(content: str) -> tuple[bool, list[str]]:
+    """Validate that DESIGN.md conforms to UI/UX design, styling, and layout sections.
+
+    Returns:
+        tuple of (is_valid, list of error messages)
+    """
+    errors: list[str] = []
+    if not content or not content.strip():
+        return False, ["DESIGN.md content is empty"]
+
+    # 1. Heading 1 (Title)
+    title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
+    if not title_match:
+        errors.append("DESIGN.md is missing a top-level '# ' heading (e.g. '# Design: <name>')")
+    else:
+        title_text = title_match.group(1).lower()
+        if "design" not in title_text and "ui" not in title_text and "ux" not in title_text:
+            errors.append("Top-level heading must reference 'Design' (e.g. '# Design: <name>')")
+
+    # 2. UI/UX Design System / Theme
+    theme_match = re.search(
+        r"^##\s+.*(?:Design|Theme|Visual|Color|Styling|Brand|UI/UX).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not theme_match:
+        errors.append("DESIGN.md is missing a '## UI/UX Design & Theme' (or '## Visual Design') section")
+
+    # 3. Component Hierarchy & Layout
+    comp_match = re.search(
+        r"^##\s+.*(?:Component|Hierarchy|Layout|Wireframe|View|Page).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not comp_match:
+        errors.append("DESIGN.md is missing a '## Component Hierarchy & Layout' section")
+
+    # 4. Interaction & States
+    inter_match = re.search(
+        r"^##\s+.*(?:Interaction|State|Flow|Behavior|Accessibility|Feedback).*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not inter_match:
+        errors.append("DESIGN.md is missing a '## Interaction & States' section")
+
+    return len(errors) == 0, errors
+
+
+def validate_playbook_artifacts(workspace: Path | str) -> dict[str, tuple[bool, list[str]]]:
+    """Validate all three mandatory playbook artifacts in .sync/playbook/ (or fallback locations)."""
+    ws = Path(workspace).resolve()
+    results: dict[str, tuple[bool, list[str]]] = {}
+
+    arch_file = resolve_playbook_file(ws, "ARCHITECTURE.md")
+    if arch_file.is_file():
+        results["ARCHITECTURE.md"] = validate_architecture_structure(arch_file.read_text(encoding="utf-8"))
+    else:
+        results["ARCHITECTURE.md"] = (False, ["ARCHITECTURE.md is missing from .sync/playbook/"])
+
+    design_file = resolve_playbook_file(ws, "DESIGN.md")
+    if design_file.is_file():
+        results["DESIGN.md"] = validate_design_structure(design_file.read_text(encoding="utf-8"))
+    else:
+        results["DESIGN.md"] = (False, ["DESIGN.md is missing from .sync/playbook/"])
+
+    plan_file = resolve_playbook_file(ws, "PLAN.md")
+    if plan_file.is_file():
+        results["PLAN.md"] = validate_plan_structure(plan_file.read_text(encoding="utf-8"))
+    else:
+        results["PLAN.md"] = (False, ["PLAN.md is missing from .sync/playbook/"])
+
+    return results
+

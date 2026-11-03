@@ -381,8 +381,13 @@ def copy_approved_plan_to_workspace(
         return None
 
     ws_root = Path(project_path).resolve()
-    dest_file = ws_root / "PLAN.md"
+    playbook_dir = ws_root / ".sync" / "playbook"
+    if playbook_dir.exists():
+        dest_file = playbook_dir / "PLAN.md"
+    else:
+        dest_file = ws_root / "PLAN.md"
     try:
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_file, dest_file)
         return dest_file
     except Exception:

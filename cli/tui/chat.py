@@ -290,11 +290,11 @@ def format_contract_payload(content: str) -> str:
                 user_mods = [f for f in mods if not str(f).startswith((".sync", ".sync/"))]
                 if user_mods:
                     files_str = ", ".join(f"`{f}`" for f in user_mods)
-                    if any("PLAN.md" in str(f) for f in user_mods):
-                        return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                    if any(any(k in str(f) for k in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", "playbook")) for f in user_mods):
+                        return f"Created project playbook in {files_str}. Use `:plan` to review or `:approve` to proceed."
                     return f"Completed turn. Modified files: {files_str}."
-                elif any("PLAN.md" in str(f) for f in mods):
-                    return "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
+                elif any(any(k in str(f) for k in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", "playbook")) for f in mods):
+                    return "Created project playbook in `.sync/playbook/` (`ARCHITECTURE.md`, `DESIGN.md`, `PLAN.md`). Use `:plan` to review or `:approve` to proceed."
                 return "Completed turn via tools."
             if verdict:
                 return f"### QA Verdict: {verdict}"
@@ -352,11 +352,11 @@ def format_contract_payload(content: str) -> str:
             user_files = [f for f in files_raw if not f.startswith((".sync", ".sync/"))]
             if user_files:
                 files_str = ", ".join(f"`{f}`" for f in user_files)
-                if any("PLAN.md" in f for f in user_files):
-                    return f"Created implementation plan in {files_str}. Use `:plan` to review or `:approve` to proceed."
+                if any(any(k in str(f) for k in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", "playbook")) for f in user_files):
+                    return f"Created project playbook in {files_str}. Use `:plan` to review or `:approve` to proceed."
                 return f"Completed turn. Modified files: {files_str}."
-            elif any("PLAN.md" in f for f in files_raw):
-                return "Created implementation plan in `PLAN.md`. Use `:plan` to review or `:approve` to proceed."
+            elif any(any(k in str(f) for k in ("PLAN.md", "ARCHITECTURE.md", "DESIGN.md", "playbook")) for f in files_raw):
+                return "Created project playbook in `.sync/playbook/` (`ARCHITECTURE.md`, `DESIGN.md`, `PLAN.md`). Use `:plan` to review or `:approve` to proceed."
         if unfenced.endswith("}"):
             return "Completed turn."
         # While JSON is streaming before summary key arrives, don't dump raw syntax

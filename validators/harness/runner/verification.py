@@ -152,7 +152,7 @@ class _VerificationMixin:
                 normalized = Path(relative_path).as_posix()
                 if normalized.startswith('.sync/') and relative_path not in decision.modified_files:
                     continue  # Harness-owned bookkeeping writes are authorized separately.
-                if is_arch and (normalized.startswith('.sync/work-orders/') or normalized.startswith('.sync/contracts/') or normalized.startswith('.sync/decisions/') or normalized in ('.sync/work-orders/INDEX.yaml', 'PLAN.md', 'README.md')):
+                if is_arch and (normalized.startswith(('.sync/work-orders/', '.sync/contracts/', '.sync/decisions/', '.sync/playbook/')) or normalized in ('.sync/work-orders/INDEX.yaml', 'PLAN.md', 'README.md', 'ARCHITECTURE.md', 'DESIGN.md')):
                     continue  # Architect authoring scope is governed by AuthoringGate, not worker contracts.
                 allowed = not allow_paths or any(_path_matches_rule(normalized, rule) for rule in allow_paths)
                 denied = any(_path_matches_rule(normalized, rule) for rule in deny_paths)
@@ -204,25 +204,15 @@ class _VerificationMixin:
                     except (OSError, UnicodeDecodeError, SyntaxError):
                         code_verified = False
 
-            # Phase C: PLAN.md structural validation (with auto-repair)
+            # Playbook structural validations
             norm_rel = Path(relative_path).as_posix()
             if norm_rel == "PLAN.md" or norm_rel.endswith("/PLAN.md"):
                 candidate = staged_root / relative_path
                 if candidate.exists():
-                    from validators.harness.plan import (
-                        repair_plan_structure,
-                        validate_plan_structure,
-                    )
+                    from validators.harness.plan import validate_plan_structure
                     try:
                         raw_plan = candidate.read_text(encoding='utf-8')
                         plan_valid, plan_errs = validate_plan_structure(raw_plan)
-                        if not plan_valid:
-                            repaired_plan = repair_plan_structure(raw_plan, default_name=self.project_path.name)
-                            rep_valid, rep_errs = validate_plan_structure(repaired_plan)
-                            if rep_valid:
-                                candidate.write_text(repaired_plan, encoding='utf-8')
-                                plan_valid = True
-                                plan_errs = []
                         if not plan_valid:
                             code_verified = False
                             state_verified = False
@@ -232,6 +222,40 @@ class _VerificationMixin:
                         code_verified = False
                         state_verified = False
                         staged_errors.append(f"PLAN.md read error: {exc}")
+
+            if norm_rel == "ARCHITECTURE.md" or norm_rel.endswith("/ARCHITECTURE.md"):
+                candidate = staged_root / relative_path
+                if candidate.exists():
+                    from validators.harness.plan import validate_architecture_structure
+                    try:
+                        raw_arch = candidate.read_text(encoding='utf-8')
+                        arch_valid, arch_errs = validate_architecture_structure(raw_arch)
+                        if not arch_valid:
+                            code_verified = False
+                            state_verified = False
+                            for err in arch_errs:
+                                staged_errors.append(f"ARCHITECTURE.md: {err}")
+                    except Exception as exc:
+                        code_verified = False
+                        state_verified = False
+                        staged_errors.append(f"ARCHITECTURE.md read error: {exc}")
+
+            if norm_rel == "DESIGN.md" or norm_rel.endswith("/DESIGN.md"):
+                candidate = staged_root / relative_path
+                if candidate.exists():
+                    from validators.harness.plan import validate_design_structure
+                    try:
+                        raw_design = candidate.read_text(encoding='utf-8')
+                        design_valid, design_errs = validate_design_structure(raw_design)
+                        if not design_valid:
+                            code_verified = False
+                            state_verified = False
+                            for err in design_errs:
+                                staged_errors.append(f"DESIGN.md: {err}")
+                    except Exception as exc:
+                        code_verified = False
+                        state_verified = False
+                        staged_errors.append(f"DESIGN.md read error: {exc}")
 
             # Phase D: Governed YAML authoring gate (.sync/work-orders and .sync/contracts)
             if (norm_rel.startswith('.sync/work-orders/') or norm_rel.startswith('.sync/contracts/')) and norm_rel in dec_norm:

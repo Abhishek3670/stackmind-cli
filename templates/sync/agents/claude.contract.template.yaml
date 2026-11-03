@@ -6,10 +6,12 @@ identity:
   reports_to: ceo
 scope:
   allow:
+    - module: .sync/playbook/**
     - module: PLAN.md
+    - module: ARCHITECTURE.md
+    - module: DESIGN.md
     - module: README.md
     - module: AGENTS.md
-    - module: ARCHITECTURE.md
     - module: VERSION
     - module: "*.md"
     - module: package.json

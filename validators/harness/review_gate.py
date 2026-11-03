@@ -214,7 +214,8 @@ def subject_hash(workspace: Path | str, wo_id: str, data: dict[str, Any] | None 
 
 
 def plan_hash(workspace: Path | str) -> str | None:
-    return file_sha256(Path(workspace) / "PLAN.md")
+    from validators.harness.plan import resolve_playbook_file
+    return file_sha256(resolve_playbook_file(workspace, "PLAN.md"))
 
 
 # ─── Verdict persistence ──────────────────────────────────────────────

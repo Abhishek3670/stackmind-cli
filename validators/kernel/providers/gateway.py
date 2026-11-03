@@ -1307,7 +1307,7 @@ def get_tools_for_role(role_or_agent: str) -> list[ToolDefinition]:
     return [t for t in STANDARD_KERNEL_TOOLS if policy.permits(t.name)]
 
 
-PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "batch_write_files", "delegate_task", "web_search", "image_search", "web_fetch")
+PLANNING_CORE_TOOL_NAMES = ("query_graph", "list_directory", "read_file", "write_file", "batch_write_files", "delegate_task", "web_search", "image_search", "web_fetch", "skill_retrieve", "skill_list")
 AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "batch_write_files", "delegate_task", "list_directory")
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
