@@ -166,8 +166,22 @@ def test_ensure_workspace_protocol_scaffolding_mirrors_schemas(tmp_path: Path):
     ws.mkdir(parents=True, exist_ok=True)
     ensure_workspace_protocol_scaffolding(ws)
     
-    schema_file = ws / "schemas" / "contract.schema.json"
+    schema_file = ws / ".sync" / "schemas" / "contract.schema.json"
     assert schema_file.exists()
-    assert (ws / "schemas" / "work-order.schema.json").exists()
+    assert (ws / ".sync" / "schemas" / "work-order.schema.json").exists()
+    assert not (ws / "schemas").exists()
     data = json.loads(schema_file.read_text(encoding="utf-8"))
     assert data["title"] == "stackmind Agent Contract"
+
+
+def test_ensure_workspace_protocol_scaffolding_cleans_legacy_root_schemas(tmp_path: Path):
+    ws = tmp_path / "legacy_project"
+    legacy_schemas = ws / "schemas"
+    legacy_schemas.mkdir(parents=True, exist_ok=True)
+    (legacy_schemas / "work-order.schema.json").write_text("{}", encoding="utf-8")
+    (legacy_schemas / "contract.schema.json").write_text("{}", encoding="utf-8")
+    
+    ensure_workspace_protocol_scaffolding(ws)
+    
+    assert (ws / ".sync" / "schemas" / "contract.schema.json").exists()
+    assert not (ws / "schemas").exists()
