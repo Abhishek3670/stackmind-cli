@@ -5,6 +5,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.12.0] - 2026-11-04
+
+### Added
+- **General Architecture Resilience & Harness Hardening**:
+  - **Recovery & Repair Overwrite Governance**:
+    - Enhanced `validators/harness/authoring_conflict.py` to recognize recovery repair context from `.sync/decisions/recovery/*.json`, supervisor execution run state, and repair markers.
+    - Added automated revision bumping (`revision` and `contract_revision`) and audit trail appending during recovery and repair passes, completely eliminating `Overwrite conflict` deadlocks when the Lead Architect (`claude`) amends active tasks.
+  - **Unquoted YAML Scalar Auto-Repair**:
+    - Implemented `repair_unquoted_yaml_scalars()` in `validators/harness/authoring_yaml.py` and integrated into `validators/harness/authoring_gate.py`.
+    - Automatically folds unquoted scalar strings containing colons (e.g. `description: ... EXTRACT PURE LOGIC: ...`) or indented multi-line continuations into YAML folded block scalars (`>-`), eliminating PyYAML `ScannerError` ("mapping values are not allowed here").
+  - **Work Order & Contract Schema Normalization**:
+    - Added comprehensive normalization in `normalize_work_order_data()`: sanitizes `amendments` (mapping `author` -> `agent`, `timestamp`/`time` -> `date`, `entry`/`message`/`note` -> `reason`, ensuring required integer `revision` and string `reason`) and `log` (mapping `author` -> `agent`, `timestamp`/`time` -> `date`, `entry`/`message`/`note` -> `action`), stripping unexpected properties to strictly satisfy schema validation (`additionalProperties: false`).
+    - Added `budget` sanitization in `normalize_contract_data()` to strip unexpected LLM keys.
+  - **Ephemeral Test & Smoke Log Budget Exemption**:
+    - Added `_is_ephemeral_test_file()` filtering in `validators/harness/contract_gate.py`: ignores scratch smoke logs, runner logs, and temporary test artifacts (`tests/*_smoke_log.*`, `*_log.txt`, `*.tmp`, `*.log`, `_tmp_*`) during post-execution file budget validation.
+    - Buffered `max_files_touched` in `validators/kernel/daemon/authoring.py` to `max(5, len(expected) + 3)` so workers have headroom for test fixtures.
+  - **Plan Structure Auto-Repair**:
+    - Integrated `repair_plan_structure()` in `validators/kernel/tools.py` (`ToolGateway.write_file`) and `validators/harness/runner/verification.py` to ensure `PLAN.md` always contains checklist milestone items (`- [ ] Milestone 1: ...`), preventing empty writes or checklist omission blocks.
+
+### Fixed
+- **Supervisor Advance & Auto-Healing on Resume**:
+  - In `validators/kernel/daemon/manager.py`, prevented invalid `EXECUTING` transitions when no operations are active, and added auto-healing for `FAILED` active work orders on resume.
+- **Deliverable Collisions & Milestone Binding**:
+  - In `validators/harness/authoring_compiler.py`, automatically deconflicted deliverables between QA and developer work orders, binding contract scopes to explicit milestone deliverables.
+- **QA Review Scope Bounding**:
+  - Bound QA review verification strictly to declared deliverables, preventing QA reviews from flagging unaffected workspace files as unverified.
+
+
 ## [3.11.0] - 2026-11-02
 
 ### Added
