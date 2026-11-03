@@ -270,6 +270,17 @@ class AuthoringGate:
 
     def _validate_work_order(self, norm_path: str, data: dict[str, Any], errors: list[str]) -> None:
         """Validate work order schema and semantic constraints."""
+        raw_ac = data.get("acceptance_criteria")
+        if isinstance(raw_ac, list):
+            norm_ac = []
+            for item in raw_ac:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        norm_ac.append(f"{k}: {v}" if v else str(k))
+                elif item is not None and str(item).strip():
+                    norm_ac.append(str(item).strip())
+            data["acceptance_criteria"] = norm_ac
+
         schema = self.get_schema("work-order.schema.json")
         if schema:
             validator = Draft7Validator(schema)

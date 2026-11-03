@@ -147,6 +147,19 @@ class ToolGateway:
         path = self.workspace.path_for(target)
         if not path.is_file():
             norm_target = target.replace("\\", "/").strip().lstrip("/")
+            if norm_target.startswith(("schemas/", "work-orders/", "contracts/", "playbook/")):
+                sync_p = self.workspace.path_for(f".sync/{norm_target}")
+                if sync_p.is_file():
+                    value = sync_p.read_text(encoding="utf-8")
+                    self.boundary.journal.complete(record.request.operation_id, "read")
+                    return value
+            if norm_target.lower() in ("plan.md", "architecture.md", "design.md"):
+                target_fname = "PLAN.md" if norm_target.lower() == "plan.md" else ("ARCHITECTURE.md" if norm_target.lower() == "architecture.md" else "DESIGN.md")
+                playbook_p = self.workspace.path_for(f".sync/playbook/{target_fname}")
+                if playbook_p.is_file():
+                    value = playbook_p.read_text(encoding="utf-8")
+                    self.boundary.journal.complete(record.request.operation_id, "read")
+                    return value
             if norm_target.startswith(("schemas/", "work-orders/", "contracts/")):
                 sync_p = self.workspace.path_for(f".sync/{norm_target}")
                 if sync_p.is_file():
@@ -179,6 +192,14 @@ class ToolGateway:
                     value = bundled_file.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
                     return value
+        if not path.is_file():
+            norm_target = target.replace("\\", "/").strip().lstrip("/")
+            if norm_target.lower() in ("plan.md", "architecture.md", "design.md"):
+                raise FileNotFoundError(
+                    f"File '{target}' does not exist in workspace yet. The playbook files "
+                    f"(.sync/playbook/ARCHITECTURE.md, .sync/playbook/DESIGN.md, .sync/playbook/PLAN.md) "
+                    f"are roadmap documents to be authored by the Lead Architect using write_file."
+                )
         value = path.read_text(encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "read")
         return value

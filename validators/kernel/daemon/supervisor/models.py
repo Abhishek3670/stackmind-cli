@@ -93,18 +93,18 @@ EXIT_INTEGRITY_VIOLATION = 5
 EXIT_HEADLESS_TIMEOUT = 137
 
 DEFAULT_TIMEOUTS: dict[Any, float] = {
-    Phase.PLANNING: 60.0,
+    Phase.PLANNING: 300.0,
     Phase.AUTHORING: 600.0,
-    Phase.AUTHORING_READINESS_GATE: 60.0,
-    Phase.DISPATCHING: 60.0,
-    Phase.EXECUTING: 180.0,
-    Phase.QA_REVIEW: 180.0,
-    Phase.INTEGRATION_REVIEW: 180.0,
-    Phase.FINAL_REVIEW: 180.0,
-    Phase.ARCHITECT_REPAIR: 180.0,
+    Phase.AUTHORING_READINESS_GATE: 180.0,
+    Phase.DISPATCHING: 180.0,
+    Phase.EXECUTING: 300.0,
+    Phase.QA_REVIEW: 300.0,
+    Phase.INTEGRATION_REVIEW: 300.0,
+    Phase.FINAL_REVIEW: 300.0,
+    Phase.ARCHITECT_REPAIR: 300.0,
     Phase.ARCHITECT_RECOVERY_DECISION: 300.0,
-    Phase.GITOPS: 60.0,
-    "gate": 60.0,
+    Phase.GITOPS: 180.0,
+    "gate": 180.0,
     "ci_wait_timeout": 60.0,
     "ci_run_timeout": 1800.0,
 }

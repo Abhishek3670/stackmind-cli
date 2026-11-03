@@ -181,15 +181,18 @@ class _CompletionMixin:
             task_text += f"\nImportant PLAN.md formatting requirement:\n{PLAN_GENERATION_INSTRUCTIONS}\n"
 
         if is_architecture and is_plan_task:
-            from validators.harness.plan import (
-                ARCHITECTURE_RESEARCH_INSTRUCTIONS,
-                CONTRACT_SCHEMA_TEMPLATE,
-                WORK_ORDER_SCHEMA_TEMPLATE,
-            )
+            from validators.harness.plan import ARCHITECTURE_RESEARCH_INSTRUCTIONS
             from validators.skill.selector import format_skills_for_architect_prompt
             task_text += f"\n{ARCHITECTURE_RESEARCH_INSTRUCTIONS}\n"
-            task_text += f"\nGoverned Artifact Authoring Schemas (for reference when planning tasks):\n"
-            task_text += f"{WORK_ORDER_SCHEMA_TEMPLATE}\n{CONTRACT_SCHEMA_TEMPLATE}\n"
+            task_text += (
+                "\nCRITICAL PLANNING PHASE SCOPE DIRECTIVE:\n"
+                "- In this Planning turn (Turn 1), author ONLY the three Playbook artifacts in `.sync/playbook/`:\n"
+                "  1. `.sync/playbook/ARCHITECTURE.md`\n"
+                "  2. `.sync/playbook/DESIGN.md`\n"
+                "  3. `.sync/playbook/PLAN.md`\n"
+                "- Do NOT write `.sync/work-orders/ACTIVE/WO-xxx.yaml` or `.sync/contracts/WO-xxx.yaml` in this turn. "
+                "Individual child work orders and contracts will be authored in Turn 2 after the user reviews and approves the plan (`:approve`).\n"
+            )
             t_title = getattr(request.task, 'title', '') or ''
             t_desc = getattr(request.task, 'body', '') or getattr(request.task, 'query', '') or getattr(request.context, 'text', '') or ''
             skills_prompt = format_skills_for_architect_prompt(
