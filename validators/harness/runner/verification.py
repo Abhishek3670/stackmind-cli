@@ -209,15 +209,21 @@ class _VerificationMixin:
             if norm_rel == "PLAN.md" or norm_rel.endswith("/PLAN.md"):
                 candidate = staged_root / relative_path
                 if candidate.exists():
-                    from validators.harness.plan import validate_plan_structure
+                    from validators.harness.plan import validate_plan_structure, repair_plan_structure
                     try:
                         raw_plan = candidate.read_text(encoding='utf-8')
                         plan_valid, plan_errs = validate_plan_structure(raw_plan)
                         if not plan_valid:
-                            code_verified = False
-                            state_verified = False
-                            for err in plan_errs:
-                                staged_errors.append(f"PLAN.md: {err}")
+                            repaired_plan = repair_plan_structure(raw_plan)
+                            repaired_valid, _ = validate_plan_structure(repaired_plan)
+                            if repaired_valid:
+                                candidate.write_text(repaired_plan, encoding='utf-8')
+                                plan_valid = True
+                            else:
+                                code_verified = False
+                                state_verified = False
+                                for err in plan_errs:
+                                    staged_errors.append(f"PLAN.md: {err}")
                     except Exception as exc:
                         code_verified = False
                         state_verified = False

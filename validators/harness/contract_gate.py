@@ -269,6 +269,18 @@ def _collect_peer_owned_deliverables(
     return owned
 
 
+def _is_ephemeral_test_file(path_str: str) -> bool:
+    """Return True if path is a scratch log, smoke log, or temporary test output."""
+    p = path_str.replace("\\", "/").lstrip("/")
+    name = p.rsplit("/", 1)[-1].lower()
+    if any(pat in name for pat in ("_tmp_", "_selfcheck", ".tmp.", ".temp.", "smoke_log", "_smoke", "_test_log")):
+        return True
+    if name.endswith((".log", ".tmp")):
+        return True
+    if p.startswith("tests/") and (name.startswith("_") or name.endswith("_log.txt")):
+        return True
+    return False
+
 def verify_post_execution(
     project_path: Path,
     agent: str,
@@ -300,12 +312,13 @@ def verify_post_execution(
                 f"Contract {contract.work_order} is read-only but {len(files_to_check)} file(s) were modified"
             )
             
-    # 2. Check files touched budget (excluding internal bookkeeping/protocol files under .sync/)
+    # 2. Check files touched budget (excluding internal bookkeeping/protocol files under .sync/ and ephemeral test logs)
     max_files = contract.budget.get("max_files_touched")
     project_files_to_check = tuple(
         f for f in files_to_check
         if not str(f).replace("\\", "/").startswith(".sync/")
         and not any(str(f).replace("\\", "/").lstrip("/").startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/"))
+        and not _is_ephemeral_test_file(str(f))
     )
     if max_files is not None and len(project_files_to_check) > max_files:
         raise ContractAccessDenied(

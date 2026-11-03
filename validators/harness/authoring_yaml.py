@@ -54,6 +54,67 @@ def repair_yaml_block_scalars(text: str) -> str:
 
     return "\n".join(repaired_lines)
 
+def repair_unquoted_yaml_scalars(text: str) -> str:
+    """Repair unquoted YAML string fields containing unquoted colons or multiline text.
+
+    LLMs often author descriptions or instructions containing colons (e.g.
+    'description: Build behavior. EXTRACT PURE LOGIC: expose a global...') without
+    quoting or block indicators, which causes yaml.scanner.ScannerError: 'mapping
+    values are not allowed here'. This converts such fields into folded block scalars.
+    """
+    lines = text.splitlines()
+    out = []
+    keys = {
+        "description",
+        "instructions",
+        "notes",
+        "cancellation_reason",
+        "blocked_reason",
+        "unblocked_reason",
+        "guidelines",
+        "reason",
+        "comment",
+        "title",
+    }
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*:\s*(.*)$", line)
+        if m:
+            indent, key, val = m.group(1), m.group(2), m.group(3).strip()
+            key_indent_len = len(indent)
+            if key in keys and not val.startswith(('"', "'", ">", "|", "[", "{")):
+                has_colon = ": " in val
+                has_indented_next = (
+                    i + 1 < len(lines)
+                    and re.match(r"^(\s+)\S", lines[i + 1])
+                    and len(re.match(r"^(\s+)\S", lines[i + 1]).group(1)) > key_indent_len
+                    and not re.match(r"^\s*[a-zA-Z0-9_-]+\s*:", lines[i + 1])
+                )
+                if has_colon or has_indented_next or not val:
+                    block_lines = []
+                    if val:
+                        block_lines.append(f"{indent}  {val}")
+                    i += 1
+                    while i < len(lines):
+                        nxt = lines[i]
+                        nm = re.match(r"^(\s*)([a-zA-Z0-9_-]+)\s*:", nxt)
+                        if nm and len(nm.group(1)) <= key_indent_len:
+                            break
+                        strip_nxt = nxt.strip()
+                        if strip_nxt:
+                            block_lines.append(f"{indent}  {strip_nxt}")
+                        else:
+                            block_lines.append("")
+                        i += 1
+                    out.append(f"{indent}{key}: >-")
+                    out.extend(block_lines)
+                    continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 
 ALLOWED_WORK_ORDER_KEYS = {
     "acceptance_criteria",
@@ -206,6 +267,65 @@ def normalize_work_order_data(
         except (ValueError, TypeError):
             pass
 
+    # Normalize amendments array to strictly conform to work-order.schema.json
+    raw_amendments = data.get("amendments")
+    if isinstance(raw_amendments, list):
+        clean_amendments = []
+        for idx_am, item in enumerate(raw_amendments):
+            if isinstance(item, str):
+                item = {"reason": item, "revision": data.get("revision", idx_am + 1)}
+            elif not isinstance(item, dict):
+                continue
+            item = dict(item)
+            if "author" in item and "agent" not in item:
+                item["agent"] = str(item.pop("author"))
+            if "timestamp" in item and "date" not in item:
+                item["date"] = str(item.pop("timestamp"))
+            if "time" in item and "date" not in item:
+                item["date"] = str(item.pop("time"))
+            if "entry" in item and "reason" not in item:
+                item["reason"] = str(item.pop("entry"))
+            if "note" in item and "reason" not in item:
+                item["reason"] = str(item.pop("note"))
+            if "description" in item and "reason" not in item:
+                item["reason"] = str(item.pop("description"))
+
+            if "revision" not in item or not isinstance(item["revision"], int):
+                try:
+                    item["revision"] = int(item["revision"])
+                except Exception:
+                    item["revision"] = int(data.get("revision", idx_am + 1) or 1)
+            if not item.get("reason"):
+                item["reason"] = f"Revision {item['revision']} amendment"
+            else:
+                item["reason"] = str(item["reason"])
+
+            ALLOWED_AMENDMENT_KEYS = {"revision", "agent", "date", "reason", "changed_fields"}
+            for k in list(item.keys()):
+                if k not in ALLOWED_AMENDMENT_KEYS:
+                    item.pop(k, None)
+            clean_amendments.append(item)
+        data["amendments"] = clean_amendments
+
+    # Normalize log array to conform to work-order.schema.json
+    raw_log = data.get("log")
+    if isinstance(raw_log, list):
+        clean_log = []
+        for item in raw_log:
+            if isinstance(item, str):
+                clean_log.append(item)
+            elif isinstance(item, dict):
+                d = dict(item)
+                date_val = d.pop("date", None) or d.pop("timestamp", None) or d.pop("time", None) or "2026-11-04T00:00:00Z"
+                agent_val = d.pop("agent", None) or d.pop("author", None) or "architect"
+                action_val = d.pop("action", None) or d.pop("entry", None) or d.pop("message", None) or d.pop("note", None) or "log entry"
+                clean_log.append({
+                    "date": str(date_val),
+                    "agent": str(agent_val),
+                    "action": str(action_val),
+                })
+        data["log"] = clean_log
+
     # Strip unexpected top-level keys that violate work-order.schema.json (additionalProperties: false)
     for k in list(data.keys()):
         if k not in ALLOWED_WORK_ORDER_KEYS:
@@ -326,6 +446,18 @@ def normalize_contract_data(data: dict[str, Any]) -> dict[str, Any]:
                     new_deny.append(item)
             scope["deny"] = new_deny
 
+    budget = data.get("budget")
+    if isinstance(budget, dict):
+        ALLOWED_BUDGET_KEYS = {"max_files_touched", "max_tokens", "expires_at"}
+        for k in list(budget.keys()):
+            if k not in ALLOWED_BUDGET_KEYS:
+                budget.pop(k, None)
+        if "max_files_touched" in budget:
+            try:
+                budget["max_files_touched"] = max(1, int(budget["max_files_touched"]))
+            except Exception:
+                pass
+
     return data
 
 
@@ -387,14 +519,19 @@ def validate_artifact_content(
             data = yaml.safe_load(repaired_text)
             normalized_content = repaired_text
         except Exception:
-            return {
-                "passed": False,
-                "artifact_type": artifact_type,
-                "path": norm_path,
-                "author": author,
-                "errors": [f"YAML syntax parsing error: {exc}"],
-                "normalized_content": None,
-            }
+            repaired_text2 = repair_unquoted_yaml_scalars(repaired_text)
+            try:
+                data = yaml.safe_load(repaired_text2)
+                normalized_content = repaired_text2
+            except Exception:
+                return {
+                    "passed": False,
+                    "artifact_type": artifact_type,
+                    "path": norm_path,
+                    "author": author,
+                    "errors": [f"YAML syntax parsing error: {exc}"],
+                    "normalized_content": None,
+                }
     except Exception as exc:
         return {
             "passed": False,

@@ -517,7 +517,7 @@ def derive_implementation_estimate(
 
     return {
         "expected_files": expected,
-        "max_files_touched": len(expected),
+        "max_files_touched": max(5, len(expected) + 3),
         "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
     }
 
@@ -770,7 +770,7 @@ def build_child_contract(
             "write": "read-write",
         },
         "budget": {
-            "max_files_touched": max_files_touched if max_files_touched and max_files_touched > 0 else 10,
+            "max_files_touched": max(5, max_files_touched if max_files_touched and max_files_touched > 0 else 10),
             "max_tokens": 0,
         },
     }

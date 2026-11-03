@@ -189,13 +189,19 @@ class AuthoringGate:
                 data = yaml.safe_load(repaired_text)
                 normalized_content = repaired_text
             except Exception:
-                return AuthoringGateDecision(
-                    passed=False,
-                    artifact_type=artifact_type,
-                    path=norm_path,
-                    author=author,
-                    errors=[f"YAML syntax parsing error: {exc}"],
-                )
+                from .authoring_yaml import repair_unquoted_yaml_scalars
+                repaired_text2 = repair_unquoted_yaml_scalars(repaired_text)
+                try:
+                    data = yaml.safe_load(repaired_text2)
+                    normalized_content = repaired_text2
+                except Exception:
+                    return AuthoringGateDecision(
+                        passed=False,
+                        artifact_type=artifact_type,
+                        path=norm_path,
+                        author=author,
+                        errors=[f"YAML syntax parsing error: {exc}"],
+                    )
         except Exception as exc:
             return AuthoringGateDecision(
                 passed=False,

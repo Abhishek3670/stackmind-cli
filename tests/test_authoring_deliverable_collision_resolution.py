@@ -209,3 +209,115 @@ def test_architect_amends_active_work_order_with_amendments_auto_bumps_and_avoid
     )
     assert not dec_fail.passed
     assert any("Overwrite conflict" in e for e in dec_fail.errors)
+
+
+def test_authoring_gate_sanitizes_amendments_and_log_schema_variations(tmp_path: Path):
+    """Verify that amendments with author/timestamp and log with timestamp/entry are sanitized to schema."""
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    raw_wo = {
+        "id": "WO-012",
+        "type": "BUGFIX",
+        "title": "Backend recovery repair",
+        "status": "ACTIVE",
+        "priority": "P1",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "revision": 2,
+        "deliverable": {"type": "code", "path": "calculator-core.js", "description": "Core"},
+        "description": "Fix core calculation logic",
+        "acceptance_criteria": ["All tests pass"],
+        "amendments": [
+            {
+                "author": "claude",
+                "timestamp": "2026-11-04T00:19:00Z",
+                "entry": "Amended contract to broaden scope",
+            }
+        ],
+        "log": [
+            {
+                "timestamp": "2026-11-04T00:02:40.111086+05:30",
+                "entry": "Re-authored styles.css satisfying acceptance criteria",
+            }
+        ],
+    }
+    gate = AuthoringGate(project_root=tmp_path)
+    dec = gate.validate_artifact_content(
+        ".sync/work-orders/ACTIVE/WO-012.yaml",
+        yaml.safe_dump(raw_wo, sort_keys=False),
+        agent="claude",
+        project_root=tmp_path,
+    )
+    assert dec.passed, dec.errors
+    normalized = yaml.safe_load(dec.normalized_content)
+    # amendments sanitized
+    assert "author" not in normalized["amendments"][0]
+    assert normalized["amendments"][0]["agent"] == "claude"
+    assert normalized["amendments"][0]["date"] == "2026-11-04T00:19:00Z"
+    assert normalized["amendments"][0]["reason"] == "Amended contract to broaden scope"
+    assert normalized["amendments"][0]["revision"] == 2
+    # log sanitized
+    assert "entry" not in normalized["log"][0]
+    assert normalized["log"][0]["action"] == "Re-authored styles.css satisfying acceptance criteria"
+
+
+def test_authoring_gate_repairs_unquoted_colon_in_description(tmp_path: Path):
+    """Verify that descriptions containing colons (EXTRACT PURE LOGIC: ...) parse and repair cleanly."""
+    raw_yaml = """id: WO-003
+type: FEATURE
+title: Build calculator core
+status: ACTIVE
+priority: P1
+assigned_agents:
+  - codex
+dependencies: []
+deliverable:
+  type: code
+  path: calculator-core.js
+  description: Core logic
+acceptance_criteria:
+  - Functions are exposed
+description: Build calculator behavior. EXTRACT PURE LOGIC: expose a global CalculatorCore
+"""
+    gate = AuthoringGate(project_root=tmp_path)
+    dec = gate.validate_artifact_content(
+        ".sync/work-orders/ACTIVE/WO-003.yaml",
+        raw_yaml,
+        agent="claude",
+        project_root=tmp_path,
+    )
+    assert dec.passed, dec.errors
+    parsed = yaml.safe_load(dec.normalized_content)
+    assert "EXTRACT PURE LOGIC: expose a global CalculatorCore" in parsed["description"]
+
+
+def test_ephemeral_test_files_ignored_by_contract_gate():
+    """Verify that smoke logs and test logs do not trip contract max_files_touched."""
+    from validators.harness.contract_gate import _is_ephemeral_test_file
+    assert _is_ephemeral_test_file("tests/_wo012_smoke_log.txt") is True
+    assert _is_ephemeral_test_file("tests/_smoke_check.log") is True
+    assert _is_ephemeral_test_file("temp.tmp") is True
+    assert _is_ephemeral_test_file("src/calculator.js") is False
+    assert _is_ephemeral_test_file("tests/test_calculator.py") is False
+
+
+def test_plan_structure_auto_repair_in_verification():
+    """Verify that plan structure without checklist items is repaired into valid milestones."""
+    from validators.harness.plan import validate_plan_structure, repair_plan_structure
+    bad_plan = """# Project Plan
+
+## Architecture Overview
+System architecture details.
+
+## Milestones
+Milestone 1: Scaffold index.html
+Milestone 2: Implement styling
+"""
+    valid, err = validate_plan_structure(bad_plan)
+    assert not valid
+    assert any("must contain at least one checklist item" in e for e in err)
+
+    repaired = repair_plan_structure(bad_plan)
+    valid_repaired, _ = validate_plan_structure(repaired)
+    assert valid_repaired
+    assert "- [ ]" in repaired

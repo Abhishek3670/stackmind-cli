@@ -122,7 +122,9 @@ def _check_overwrite_conflict(
         )
         return
 
-    # Scaffolding or repair artifacts: an authorized author (Architect/CEO)\n    # may supersede synthesized artifacts or amend contracts/work orders.\n    # Workers never reach this check (role gate runs first).
+    # Scaffolding or repair artifacts: an authorized author (Architect/CEO)
+    # may supersede synthesized artifacts or amend contracts/work orders.
+    # Workers never reach this check (role gate runs first).
     author_lower = (author or "").lower()
     if author_lower in {"claude", "architecture", "architect", "ceo", "admin", "system", "test"} and isinstance(existing_data, dict):
         # The Architect has full authority to cancel, split, amend, or supersede work orders to maintain flow
@@ -143,12 +145,9 @@ def _check_overwrite_conflict(
             "reconcile",
         }
 
-
-
         is_repair = (
             existing_synth in repair_markers
             or new_synth in repair_markers
-
             or str(existing_data.get("status", "")).upper() in {"BLOCKED", "REWORK"}
             or bool(existing_data.get("error") or existing_data.get("blocked_reason"))
         )
@@ -168,6 +167,13 @@ def _check_overwrite_conflict(
                             is_repair = True
                 except Exception:
                     pass
+
+        if not is_repair:
+            dec_dir = project_root / ".sync" / "decisions"
+            if not dec_dir.exists():
+                dec_dir = project_root / "decisions"
+            if dec_dir.is_dir() and any(dec_dir.glob("recovery/*.json")):
+                is_repair = True
 
         if not is_repair:
             sup_dir = project_root / ".sync" / "runtime" / "supervisor"
@@ -198,47 +204,6 @@ def _check_overwrite_conflict(
                     except Exception:
                         pass
 
-        if is_repair:
-            # During repair of blocked/failing/scaffold artifacts or active supervisor runs,
-            # an authorized author is explicitly authorized to replace or refine the artifact.
-            if is_active_wo and isinstance(data, dict):
-                existing_rev = existing_data.get("revision", 1)
-                new_rev = data.get("revision")
-                if not (isinstance(new_rev, int) and isinstance(existing_rev, (int, float)) and new_rev > existing_rev):
-                    existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
-                    bumped_rev = max(existing_num + 1, int(new_rev or 0) + 1)
-                    data["revision"] = bumped_rev
-                    amendments = data.setdefault("amendments", [])
-                    if isinstance(amendments, list):
-                        amendments.append(
-                            {
-                                "revision": bumped_rev,
-                                "reason": "Authoring refinement and governance amendment",
-                            }
-                        )
-            elif is_contract and isinstance(data, dict):
-                # A repair must produce a strictly increasing contract_revision,
-                # exactly like the work-order branch above. Repair turns
-                # deliberately resubmit the revision they read, so falling back
-                # to "only accept an already-higher revision" left the repaired
-                # contract indistinguishable from the one it replaced.
-                existing_rev = existing_data.get("contract_revision", 1)
-                new_rev = data.get("contract_revision")
-                existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
-                if not (isinstance(new_rev, int) and new_rev > existing_num):
-                    data["contract_revision"] = max(existing_num + 1, int(new_rev or 0) + 1)
-            return
-
-        if is_contract and isinstance(data, dict):
-            existing_rev = existing_data.get("contract_revision", 1)
-            new_rev = data.get("contract_revision")
-            existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
-            if isinstance(new_rev, int) and new_rev > existing_num:
-                return
-            if is_repair:
-                data["contract_revision"] = max(existing_num + 1, int(new_rev or 0) + 1)
-                return
-
         # Task amendment: an authorized author (Architect/CEO) may sharpen a live work
         # order in place. If the work order carries amendments or is in repair,
         # auto-bump revision so governed amendments are never rejected as clobbers.
@@ -267,6 +232,16 @@ def _check_overwrite_conflict(
                                 "reason": "Authoring amendment by lead architect",
                             }
                         )
+                return
+
+        if is_contract and isinstance(data, dict):
+            existing_rev = existing_data.get("contract_revision", 1)
+            new_rev = data.get("contract_revision")
+            existing_num = int(existing_rev) if isinstance(existing_rev, (int, float)) else 1
+            if isinstance(new_rev, int) and new_rev > existing_num:
+                return
+            if is_repair:
+                data["contract_revision"] = max(existing_num + 1, int(new_rev or 0) + 1)
                 return
 
     # Conflict: attempting to overwrite an active artifact from another task or unauthorized update

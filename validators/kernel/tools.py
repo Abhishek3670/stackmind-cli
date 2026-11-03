@@ -284,6 +284,15 @@ class ToolGateway:
         if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/") or normalized_target.startswith("schemas/"):
             normalized_target = f".sync/{normalized_target}"
             target = normalized_target
+        if normalized_target == "PLAN.md" or normalized_target.endswith("/PLAN.md"):
+            if not content or not content.strip():
+                raise PermissionError("Cannot write empty content to PLAN.md. A valid Project Plan with Architecture and Milestones is required.")
+            from validators.harness.plan import repair_plan_structure, validate_plan_structure
+            repaired = repair_plan_structure(content)
+            valid, _ = validate_plan_structure(repaired)
+            if valid:
+                content = repaired
+
         if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):
             from validators.harness.authoring_gate import AuthoringGate
             gate = getattr(self, "_authoring_gate", None)
