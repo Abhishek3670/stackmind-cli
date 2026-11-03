@@ -1011,6 +1011,8 @@ class LifecycleSupervisor(
             state.waiting_for_human_entered_at = time.monotonic()
         elif new_phase != Phase.WAITING_FOR_HUMAN:
             state.waiting_for_human_entered_at = None
+        if new_phase not in (Phase.BLOCKED, Phase.FAILED):
+            state.error = None
         state.transitions.append({
             "from": state.phase.value,
             "to": new_phase.value,

@@ -449,6 +449,17 @@ def format_current_operation(
                 res_lines.append(Text("    Run :resume to recover", style="dim #fbbf24"))
             return res_lines
 
+        if state is not None:
+            phase_val = state.phase.value if hasattr(getattr(state, "phase", None), "value") else str(getattr(state, "phase", "") or "")
+            plan_obj = getattr(state, "plan", None) or {}
+            plan_state = str(plan_obj.get("state", "")).upper()
+            if phase_val in ("AWAITING_APPROVAL", "PLAN_PROPOSED") or plan_state == "AWAITING_APPROVAL":
+                plan_id = plan_obj.get("plan_id") or plan_obj.get("id") or "PLAN"
+                return [
+                    Text(f"  ◐ Plan Ready ({plan_id})", style="bold #f59e0b"),
+                    Text("    Run :approve to execute", style="dim #fbbf24"),
+                ]
+
         if err and state is not None and getattr(state, "phase", None) not in ("PROJECT_COMPLETE",):
             from cli.tui.events import clean_error_message
             short_err = clean_error_message(err)

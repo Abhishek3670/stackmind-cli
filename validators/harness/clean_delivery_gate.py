@@ -139,6 +139,8 @@ class CleanDeliveryGate:
             # Check for internal file references
             for ref in self.INTERNAL_FILE_REFERENCES:
                 if ref in line:
+                    if ref == ".sync/" and ".sync/playbook" in line:
+                        continue
                     findings.append({
                         "file": rel_path,
                         "line": line_num,

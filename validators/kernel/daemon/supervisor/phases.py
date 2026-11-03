@@ -159,6 +159,7 @@ class _PhasesMixin:
 
             if matching_plan:
                 state.plan_id = matching_plan.get("plan_id")
+                state.error = None
                 if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
                     state.completed_wo_ids.append(state.planning_wo_id)
                     archive_completed_work_orders(Path(state.workspace), [state.planning_wo_id])
