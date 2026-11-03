@@ -623,11 +623,21 @@ class _PhasesMixin:
             or valid_dependency_wait
         )
         if not pending:
-            # Nothing left to execute here; EXECUTING drives completion.
+            non_gitops_wos = [
+                wid for wid in state.worker_wo_ids
+                if wid not in superseded and (not published or wid in published) and wid != state.gitops_wo_id
+            ]
+            if non_gitops_wos and all(wid in state.completed_wo_ids for wid in non_gitops_wos):
+                self._transition(state, Phase.INTEGRATION_REVIEW)
+                return AdvanceResult.TRANSITIONED
+            if dispatched_any or self._has_active_operations(state):
+                self._transition(state, Phase.EXECUTING)
+                return AdvanceResult.WAITING_FOR_OPERATION
+            return AdvanceResult.WAITING_FOR_OPERATION
+        if dispatched_any or (valid_wait and self._has_active_operations(state)):
             self._transition(state, Phase.EXECUTING)
-            return AdvanceResult.TRANSITIONED
-        if dispatched_any or valid_wait:
-            self._transition(state, Phase.EXECUTING)
+            return AdvanceResult.WAITING_FOR_OPERATION
+        if valid_wait:
             return AdvanceResult.WAITING_FOR_OPERATION
         # No worker was dispatched, no operation is awaiting, and work remains:
         # entering EXECUTING would falsely claim that work is underway.

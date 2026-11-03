@@ -214,6 +214,7 @@ class _ControlsMixin:
         state.final_prerequisite_rounds = 0
         state.blocked_wo_ids.clear()
         state.worker_blockers.clear()
+        state.failed_wo_ids.clear()
 
         # Self-heal active or blocked work orders
         try:
@@ -227,10 +228,10 @@ class _ControlsMixin:
                 for f in active_dir.glob("*.yaml"):
                     try:
                         content = f.read_text(encoding="utf-8")
-                        if "Architect repair outcome invalid" in content or "status: BLOCKED" in content:
+                        if "Architect repair outcome invalid" in content or "status: BLOCKED" in content or "status: FAILED" in content:
                             import yaml
                             wo_d = yaml.safe_load(content) or {}
-                            if isinstance(wo_d, dict) and wo_d.get("status") == "BLOCKED":
+                            if isinstance(wo_d, dict) and wo_d.get("status") in ("BLOCKED", "FAILED"):
                                 wo_d["status"] = "ACTIVE"
                                 wo_d.pop("error", None)
                                 wo_d.pop("blocked_reason", None)
