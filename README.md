@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.12.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.12.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/architectures/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -62,7 +62,7 @@ stackmind <command> --help
 | `skill {list|show|create|test|promote|…|retrieve|audit}` | Procedural skills with execution profiles & 3-stage verification |
 | `learn {clusters|mine|distill}` | Pattern mining → candidate skills |
 
-Full reference: [`docs/cli-reference.md`](docs/cli-reference.md), [`docs/getting-started.md`](docs/getting-started.md), [`docs/protocols.md`](docs/protocols.md).
+Full reference: [`docs/governance/cli-reference.md`](docs/governance/cli-reference.md), [`docs/roadmap/getting-started.md`](docs/roadmap/getting-started.md), [`docs/governance/protocols.md`](docs/governance/protocols.md).
 
 ## Knowledge graph
 
@@ -88,7 +88,7 @@ stackmind graph tasks | task-flow | migrations
 
 ## Governance in one paragraph
 
-Authority is `CEO → Claude (architect, sole writer of TREE.yaml/boot) → Gemma (QA gate) → Workers`. Work orders are the unit of work (typed YAML + `INDEX.yaml` ledger). Writes are serialized by `.sync/runtime/LOCK` (writes-only, checked acquire). Every layer is validated (`stackmind validate`); drift between `TREE.yaml` and `INDEX.yaml`, lock malformation, and registry/node invariants are all gated. See [`docs/protocols.md`](docs/protocols.md).
+Authority is `CEO → Claude (architect, sole writer of TREE.yaml/boot) → Gemma (QA gate) → Workers`. Work orders are the unit of work (typed YAML + `INDEX.yaml` ledger). Writes are serialized by `.sync/runtime/LOCK` (writes-only, checked acquire). Every layer is validated (`stackmind validate`); drift between `TREE.yaml` and `INDEX.yaml`, lock malformation, and registry/node invariants are all gated. See [`docs/governance/protocols.md`](docs/governance/protocols.md).
 
 ## Daemon & lifecycle
 
@@ -112,10 +112,10 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Docs
 
-- Architecture handbook: [`docs/STACKMIND_ARCHITECTURE.md`](docs/STACKMIND_ARCHITECTURE.md)
+- Architecture handbook: [`docs/architectures/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md)
 - RFCs: [`docs/rfcs/`](docs/rfcs/) (RFC-001 identity → RFC-006 harness)
-- Harness evaluation: [`docs/HARNESS-ENGINEERING-EVALUATION.md`](docs/HARNESS-ENGINEERING-EVALUATION.md)
-- Migration guide: [`docs/migration-guide.md`](docs/migration-guide.md)
+- Harness evaluation: [`docs/governance/HARNESS-ENGINEERING-EVALUATION.md`](docs/governance/HARNESS-ENGINEERING-EVALUATION.md)
+- Migration guide: [`docs/roadmap/migration-guide.md`](docs/roadmap/migration-guide.md)
 
 ## Versioning
 
