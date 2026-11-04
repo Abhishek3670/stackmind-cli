@@ -69,7 +69,7 @@ class DummyOperationManager:
             "work_order_id": work_order_id,
             "parent_operation_id": parent_operation_id,
             "prompt": prompt,
-            "status": "COMPLETED",
+            "status": "RUNNING",
             "result": {"status": "completed"},
         }
         self.operations[op_id] = op_record

@@ -199,6 +199,50 @@ def normalize_work_order_data(
     if not isinstance(data, dict):
         return data
 
+    # Normalize work-order type
+    WO_TYPE_MAP = {
+        "QA": "VALIDATION",
+        "TEST": "VALIDATION",
+        "TESTING": "VALIDATION",
+        "VERIFICATION": "VALIDATION",
+        "REVIEW": "VALIDATION",
+    }
+    raw_type = data.get("type")
+    if isinstance(raw_type, str):
+        cleaned_type = raw_type.strip().upper()
+        if cleaned_type in WO_TYPE_MAP:
+            data["type"] = WO_TYPE_MAP[cleaned_type]
+
+    # Normalize deliverable.type and deliverables[].type
+    DELIVERABLE_TYPE_MAP = {
+        "report": "doc",
+        "documentation": "doc",
+        "document": "doc",
+        "markdown": "doc",
+        "audit": "doc",
+        "review": "doc",
+        "test": "code",
+        "tests": "code",
+        "testing": "code",
+        "script": "code",
+        "scripts": "code",
+        "configuration": "config",
+        "conf": "config",
+    }
+    deliverable = data.get("deliverable")
+    if isinstance(deliverable, dict):
+        dtype = deliverable.get("type")
+        if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+            deliverable["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+
+    deliverables = data.get("deliverables")
+    if isinstance(deliverables, list):
+        for item in deliverables:
+            if isinstance(item, dict):
+                dtype = item.get("type")
+                if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+                    item["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+
     deliverable = data.get("deliverable")
     if isinstance(deliverable, dict) and "acceptance_criteria" in deliverable:
         crit = deliverable.pop("acceptance_criteria")
@@ -568,7 +612,12 @@ def validate_artifact_content(
             except Exception:
                 pass
     elif artifact_type == "index":
-        pass
+        if isinstance(data, dict):
+            wos = data.get("work_orders")
+            if isinstance(wos, list):
+                for wo in wos:
+                    if isinstance(wo, dict):
+                        normalize_work_order_data(wo, project_root=project_root)
     else:
         pass
 

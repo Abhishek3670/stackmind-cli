@@ -28,6 +28,101 @@ from .models import (
     HarnessTask,
 )
 
+
+def copy_workspace_for_staging(
+    src_path: Path | str,
+    dst_path: Path | str,
+    *,
+    extra_ignore_patterns: tuple[str, ...] = (),
+    dirs_exist_ok: bool = True,
+) -> Path:
+    """Robust staging copy of a workspace excluding live runtime files and temporary artifacts."""
+    src = Path(src_path).resolve()
+    dst = Path(dst_path)
+
+    def _staging_ignore(dir_path: str, names: list[str]) -> set[str]:
+        p = Path(dir_path).resolve()
+        try:
+            rel = p.relative_to(src)
+            rel_parts = rel.parts
+        except Exception:
+            rel_parts = ()
+
+        ignored: set[str] = set()
+        for name in names:
+            name_lower = name.lower()
+            # VCS, caches, virtualenvs, dependencies, IDE directories
+            if name in (
+                '.git', '__pycache__', '.pytest_cache', '.ruff_cache', '.coverage',
+                '.venv', 'venv', 'env', 'node_modules', '.next', '.turbo', 'dist', 'build',
+                '.cache', 'cache', '.idea', '.vscode', '.windsurf', '.claude',
+            ) or name in extra_ignore_patterns:
+                ignored.add(name)
+                continue
+
+            # Ephemeral / temporary / log files
+            if (
+                name_lower.startswith((".tmp", "tmp", "~"))
+                or name_lower.endswith((".tmp", ".tmp.json", ".bak", ".swp"))
+                or ".tmp." in name_lower
+                or "_tmp_" in name_lower
+                or "smoke_log" in name_lower
+            ):
+                ignored.add(name)
+                continue
+
+            # Under .sync, strictly ignore live runtime, daemon locks, and transient states.
+            # `.sync/runtime/boot/` is the exception: `stackmind validate` runs on the
+            # staged copy and requires the agent boot snapshots to discover agents.
+            if rel_parts and rel_parts[0] == ".sync":
+                if len(rel_parts) == 1 and name in (
+                    "state", "reports", "snapshots", "drafts", "lock",
+                    "outbox", "experience", "knowledge", "daemon",
+                ):
+                    ignored.add(name)
+                    continue
+                if len(rel_parts) == 2 and rel_parts[1] == "runtime" and name != "boot":
+                    ignored.add(name)
+                    continue
+
+        return ignored
+
+    def _safe_copy_file(s: str, d: str, *, follow_symlinks: bool = True) -> None:
+        try:
+            shutil.copy2(s, d, follow_symlinks=follow_symlinks)
+        except (FileNotFoundError, PermissionError, OSError):
+            # Ephemeral file deleted, renamed, or locked by another concurrent process/thread during staging
+            pass
+
+    try:
+        shutil.copytree(
+            src,
+            dst,
+            dirs_exist_ok=dirs_exist_ok,
+            ignore=_staging_ignore,
+            copy_function=_safe_copy_file,
+        )
+    except shutil.Error as err:
+        # Filter out errors from files that vanished or were locked during copy
+        remaining = [
+            e for e in err.args[0]
+            if not any(
+                term in str(e[2]).lower()
+                for term in (
+                    "no such file or directory",
+                    "cannot find the file",
+                    "permission denied",
+                    "used by another process",
+                    "cannot access the file",
+                )
+            )
+        ]
+        if remaining:
+            raise shutil.Error(remaining)
+
+    return dst
+
+
 class _StagingMixin:
     """Staged-state validation, write staging, report/events rendering."""
 
@@ -36,42 +131,21 @@ class _StagingMixin:
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp_dir:
             staged_root = Path(tmp_dir) / self.project_path.name
-            shutil.copytree(
-                self.project_path,
-                staged_root,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(
-                    '.git',
-                    '__pycache__',
-                    '.pytest_cache',
-                    '.ruff_cache',
-                ),
-            )
+            copy_workspace_for_staging(self.project_path, staged_root)
             if source_root is not None and source_root.resolve() != self.project_path.resolve():
-                shutil.copytree(
-                    source_root,
-                    staged_root,
-                    dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        '.git',
-                        '.sync',
-                        '__pycache__',
-                        '.pytest_cache',
-                        '.ruff_cache',
-                    ),
-                )
+                copy_workspace_for_staging(source_root, staged_root, extra_ignore_patterns=('.sync',))
                 if self._is_architect_agent():
                     for sub in ('work-orders', 'contracts'):
                         src_sub = source_root / '.sync' / sub
                         if src_sub.is_dir():
                             dst_sub = staged_root / '.sync' / sub
-                            shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+                            copy_workspace_for_staging(src_sub, dst_sub)
                 elif self.agent == 'gemma':
                     for sub in ('inbox', 'reviews', 'qa'):
                         src_sub = source_root / '.sync' / sub
                         if src_sub.is_dir():
                             dst_sub = staged_root / '.sync' / sub
-                            shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+                            copy_workspace_for_staging(src_sub, dst_sub)
                 if self._is_architect_agent():
                     self._reconcile_staged_work_order_collisions(staged_root)
                 self._sync_index_and_tree_yaml(staged_root)

@@ -38,6 +38,7 @@ import yaml
 
 from validators.harness import review_gate
 from validators.harness.integration_gate import IntegrationGate
+from validators.harness.plan import resolve_playbook_file
 
 PLANNING_GATE = "planning"
 ARTIFACT_GATE = "artifacts"
@@ -849,6 +850,12 @@ def qa_status(workspace: Path | str, wo_id: str) -> tuple[str, str]:
         return (QA_PASSED if ok else QA_FAILED), reason if not ok else "QA verdict accepted"
     if raw == review_gate.QA_FAIL:
         return QA_FAILED, "QA verdict is FAIL"
+    if raw in (review_gate.QA_NO_TEST_EVIDENCE, review_gate.QA_PROVISIONAL_PASS, "QA_NO_TEST_EVIDENCE"):
+        # Accepted per work order, but never sufficient for delivery: tests were deferred.
+        return QA_INCONCLUSIVE, (
+            "QA verdict is provisional (NO_TEST_EVIDENCE): tests were deferred; "
+            "re-run QA against the authored tests to obtain a real PASS before delivery"
+        )
     if raw in ("RUNNING", "IN_PROGRESS", "PENDING"):
         return QA_RUNNING, "QA verdict is still in progress"
     if raw in ("BLOCKED", "WAITING_FOR_HUMAN"):

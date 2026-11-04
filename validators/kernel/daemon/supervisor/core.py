@@ -29,6 +29,15 @@ from .attempts import (
 from .controls import _ControlsMixin
 from .execution import _ExecutionMixin
 from .gitops import _GitopsMixin
+try:
+    from enum import Enum
+    yaml.SafeDumper.add_multi_representer(
+        Enum,
+        lambda dumper, data: dumper.represent_str(str(data.value if hasattr(data, "value") else data)),
+    )
+except Exception:
+    pass
+
 from .models import (
     DEFAULT_TIMEOUTS,
     EXIT_BUDGET_EXHAUSTED,
@@ -538,6 +547,21 @@ class LifecycleSupervisor(
                     state.error = "BUDGET_EXHAUSTED: Global turn budget (B) reached 0."
                     state.exit_code = EXIT_BUDGET_EXHAUSTED
                     self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    self._sync_budget_file(state)
+                    if hasattr(self, "manager") and hasattr(self.manager, "events"):
+                        self.manager.events.publish(
+                            "run.phase",
+                            state.session_id,
+                            run_id=state.run_id,
+                            phase=state.phase.value,
+                            goal=state.product_goal,
+                            error=state.error,
+                        )
+                    if state.workspace:
+                        try:
+                            self.save_run_state(state, Path(state.workspace))
+                        except Exception:
+                            pass
                     raise BudgetExhaustedError("Global turn budget exhausted.")
 
             result = original_start_turn(*args, **kwargs)
@@ -1011,7 +1035,7 @@ class LifecycleSupervisor(
             state.waiting_for_human_entered_at = time.monotonic()
         elif new_phase != Phase.WAITING_FOR_HUMAN:
             state.waiting_for_human_entered_at = None
-        if new_phase not in (Phase.BLOCKED, Phase.FAILED):
+        if new_phase in (Phase.INIT, Phase.DISPATCHING, Phase.EXECUTING, Phase.PLANNING):
             state.error = None
         state.transitions.append({
             "from": state.phase.value,

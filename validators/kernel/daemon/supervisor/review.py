@@ -833,11 +833,16 @@ class _ReviewMixin:
         try:
             for op in reversed(self.manager.list_operations(state.session_id)):
                 op_id = op.get("operation_id")
+                if op_id in (getattr(state, "planning_operation_id", None), getattr(state, "authoring_operation_id", None), getattr(state, "recovery_decision_operation_id", None), getattr(state, "architect_repair_operation_id", None), getattr(state, "gitops_operation_id", None)):
+                    continue
                 if op_id and op_id in getattr(state, "ignored_operation_ids", []):
                     continue
                 op_wo = op.get("work_order_id")
                 op_role = str(op.get("role", "")).lower()
-                if (op_wo == fallback_wo_id or op_role == "architecture") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                if (
+                    (fallback_wo_id and op_wo == fallback_wo_id)
+                    or (fallback_wo_id is None and op_role in ("architecture", "architect") and op_wo not in getattr(state, "worker_wo_ids", []))
+                ) and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
                     state.integration_operation_id = op_id
                     state.integration_wo_id = op_wo or fallback_wo_id
                     return op_id
@@ -1621,6 +1626,23 @@ class _ReviewMixin:
                 target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
                 source.unlink()
                 archived.append(rel)
+
+                # Also archive companion contract or work order so we never leave an orphan contract
+                wo_id = Path(rel).stem
+                if ".sync/work-orders/ACTIVE/" in rel:
+                    c_path = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+                    if c_path.is_file():
+                        c_target = audit_dir / f"{wo_id}-contract.yaml"
+                        c_target.write_text(c_path.read_text(encoding="utf-8"), encoding="utf-8")
+                        c_path.unlink()
+                        archived.append(str(c_path.relative_to(ws)).replace("\\", "/"))
+                elif ".sync/contracts/" in rel:
+                    w_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                    if w_path.is_file():
+                        w_target = audit_dir / f"{wo_id}-wo.yaml"
+                        w_target.write_text(w_path.read_text(encoding="utf-8"), encoding="utf-8")
+                        w_path.unlink()
+                        archived.append(str(w_path.relative_to(ws)).replace("\\", "/"))
             except Exception:
                 continue
         if archived:

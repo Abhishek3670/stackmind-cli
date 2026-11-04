@@ -637,12 +637,8 @@ class _ExecutionMixin:
                 with staging_context as staging_path:
                     staged_root = Path(staging_path) if tool_runtime is not None else Path(staging_path) / self.project_path.name
                     if tool_runtime is None:
-                        shutil.copytree(
-                            self.project_path,
-                            staged_root,
-                            dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns('.git', '__pycache__', '.pytest_cache', '.ruff_cache'),
-                        )
+                        from .staging import copy_workspace_for_staging
+                        copy_workspace_for_staging(self.project_path, staged_root)
                     self._apply_non_report_writes(stage_inputs, base_path=staged_root)
                     command_results: list[subprocess.CompletedProcess[str]] = []
                     for cmd in decision.commands:

@@ -430,23 +430,39 @@ def format_current_operation(
     """Format current operation section into compact display."""
     if not current_operation:
         err = getattr(state, "error", None) if state is not None else None
-        if state is not None and getattr(state, "phase", None) in ("BLOCKED", "FAILED"):
+        if state is not None and (
+            getattr(state, "phase", None) in ("BLOCKED", "FAILED", "WAITING_FOR_HUMAN")
+            or getattr(state, "budget_exhausted", False)
+        ):
             st_phase = getattr(state, "phase")
             phase_val = st_phase.value if hasattr(st_phase, "value") else str(st_phase)
-            st_text = "Blocked" if phase_val.upper() == "BLOCKED" else "Failed"
-            st_color = "#f43f5e" if phase_val.upper() == "FAILED" else "#f59e0b"
+            phase_upper = phase_val.upper()
+            if phase_upper == "FAILED":
+                st_text = "Failed"
+                st_color = "#f43f5e"
+            elif phase_upper == "WAITING_FOR_HUMAN" or getattr(state, "budget_exhausted", False):
+                st_text = "Waiting for Human"
+                st_color = "#f59e0b"
+            else:
+                st_text = "Blocked"
+                st_color = "#f59e0b"
+
             res_lines = [Text(f"  ⊘ {st_text}", style=f"bold {st_color}")]
-            if err:
+            if getattr(state, "budget_exhausted", False):
+                res_lines.append(Text("    Global turn budget exhausted", style="dim #ef4444"))
+            elif err:
                 from cli.tui.events import clean_error_message
                 short_err = clean_error_message(err)
                 max_len = max((width - 4), 20) if width else 35
                 if len(short_err) > max_len:
                     short_err = short_err[:max_len - 1] + "…"
                 res_lines.append(Text(f"    {short_err}", style="dim #ef4444"))
-            if phase_val.upper() == "BLOCKED":
+            if phase_upper == "BLOCKED":
                 res_lines.append(Text("    Run :resume to retry", style="dim #fbbf24"))
-            elif phase_val.upper() == "FAILED":
+            elif phase_upper == "FAILED":
                 res_lines.append(Text("    Run :resume to recover", style="dim #fbbf24"))
+            else:
+                res_lines.append(Text("    Run :resume to continue", style="dim #fbbf24"))
             return res_lines
 
         if state is not None:

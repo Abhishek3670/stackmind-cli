@@ -129,10 +129,11 @@ def verify_post_execution(
             )
 
     # 2. Check files touched budget (excluding internal bookkeeping/protocol files under .sync/)
+    from .contract_gate import _is_ephemeral_test_file
     max_files = contract.budget.get("max_files_touched") if contract.budget else None
     project_files_to_check = tuple(
         f for f in files_to_check
-        if not str(f).replace("\\", "/").startswith(".sync/")
+        if not str(f).replace("\\", "/").startswith(".sync/") and not _is_ephemeral_test_file(str(f))
         and not any(
             str(f).replace("\\", "/").lstrip("/").startswith(p)
             for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")

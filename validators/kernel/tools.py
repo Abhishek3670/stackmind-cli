@@ -3577,6 +3577,67 @@ class ToolGateway:
 
         return None
 
+    def _find_existing_deliverable_owner(
+        self, scan_root: Path, target_files: Sequence[str] | None,
+    ) -> tuple[str, str, str, str, str] | None:
+        """Find if any target file is already claimed by an existing work order.
+
+        Scans ACTIVE, BLOCKED, and COMPLETED work orders.
+        Returns (wo_id, agent, role, status, matched_path) if found, else None.
+        Enforces one owner per deliverable across the workspace.
+        """
+        import yaml as _yaml
+        if not target_files:
+            return None
+        target_set = {f.replace("\\", "/").strip("/").lower() for f in target_files if f}
+        if not target_set:
+            return None
+
+        wo_root = scan_root / ".sync" / "work-orders"
+        if not wo_root.is_dir():
+            return None
+
+        for bucket in ("ACTIVE", "BLOCKED", "COMPLETED"):
+            b_dir = wo_root / bucket
+            if not b_dir.is_dir():
+                continue
+            for wo_file in sorted(b_dir.glob("*.yaml")):
+                if wo_file.stem.startswith("."):
+                    continue
+                try:
+                    data = _yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                status = str(data.get("status", bucket)).upper()
+                if status in ("CANCELLED", "SUPERSEDED"):
+                    continue
+                assigned = data.get("assigned_agents", [])
+                if not isinstance(assigned, list):
+                    assigned = [str(assigned)]
+                agent_name = str(assigned[0]).lower().strip() if assigned else "unknown"
+                role_name = str(data.get("role") or "").lower().strip()
+
+                paths: list[str] = []
+                deliv = data.get("deliverable")
+                if isinstance(deliv, dict) and deliv.get("path"):
+                    paths.append(str(deliv["path"]))
+                elif isinstance(deliv, str) and deliv.strip():
+                    paths.append(str(deliv))
+                for d in data.get("deliverables", []) or []:
+                    if isinstance(d, dict) and d.get("path"):
+                        paths.append(str(d["path"]))
+                    elif isinstance(d, str) and d.strip():
+                        paths.append(str(d))
+
+                for p in paths:
+                    norm_p = p.replace("\\", "/").strip("/").lower()
+                    if norm_p in target_set:
+                        return (wo_file.stem, agent_name, role_name, status, p)
+
+        return None
+
     def delegate_task(
         self,
         target_agent: str,
@@ -3646,7 +3707,60 @@ class ToolGateway:
 
             scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
 
-            # --- Deduplication: check for existing active WO for same agent ---
+            # --- Deliverable Ownership Enforcement & Review Deduplication ---
+            owner_info = self._find_existing_deliverable_owner(scan_root, clean_files)
+            if owner_info:
+                existing_wo_id, existing_agent, existing_role, existing_status, matched_file = owner_info
+                is_review = (canonical_role == "qa") or any(
+                    w in instructions.lower() for w in ("review", "verify", "qa", "test", "audit")
+                )
+                if is_review:
+                    # A QA review of an existing order is a review operation, NOT a new work order!
+                    self.boundary.journal.complete(record.request.operation_id, f"Registered QA review for {existing_wo_id}")
+                    return {
+                        "status": "review_scheduled",
+                        "work_order_id": existing_wo_id,
+                        "target_work_order": existing_wo_id,
+                        "role": "qa",
+                        "agent": canonical_agent,
+                        "instructions": str(instructions).strip(),
+                        "target_files": clean_files,
+                        "deduplicated": True,
+                        "message": (
+                            f"QA review registered for existing work order {existing_wo_id} "
+                            f"(owning deliverable '{matched_file}'). Review operations evaluate "
+                            f"existing work orders rather than creating duplicate orders that claim files."
+                        ),
+                    }
+                elif canonical_agent == existing_agent or canonical_role == existing_role:
+                    wo_id = existing_wo_id
+                    rel_wo_file = f".sync/work-orders/{existing_status}/{wo_id}.yaml"
+                    rel_contract_file = f".sync/contracts/{wo_id}.yaml"
+                    self.boundary.journal.complete(record.request.operation_id, f"Reused existing {wo_id}")
+                    return {
+                        "status": "delegated",
+                        "work_order_id": wo_id,
+                        "work_order_file": rel_wo_file,
+                        "contract_file": rel_contract_file,
+                        "agent": canonical_agent,
+                        "role": canonical_role,
+                        "instructions": str(instructions).strip(),
+                        "target_files": clean_files,
+                        "deduplicated": True,
+                        "message": (
+                            f"Reused existing work order {wo_id} for {canonical_role} ({canonical_agent}). "
+                            f"A work order already targets this agent with overlapping scope."
+                        ),
+                    }
+                else:
+                    # Enforce single deliverable ownership across the workspace
+                    raise ValueError(
+                        f"CONTRACT_VALIDATION_ERROR: Modification to deliverable '{matched_file}' is rejected: "
+                        f"owned by another work order ('{existing_wo_id}' assigned to '{existing_agent}'). "
+                        f"Workers cannot modify each other's work; inter-worker needs must be coordinated through Architecture."
+                    )
+
+            # --- Fallback agent-based deduplication ---
             existing_wo_id = self._find_active_wo_for_agent(
                 scan_root, canonical_agent, clean_files,
             )
@@ -3678,19 +3792,22 @@ class ToolGateway:
 
             if clean_files:
                 primary_deliv = clean_files[0]
-                deliv_type = "doc" if primary_deliv.endswith(".md") else "code"
+                if canonical_role == "qa":
+                    deliv_type = "test" if "test" in primary_deliv.lower() else "report"
+                else:
+                    deliv_type = "doc" if primary_deliv.endswith(".md") else "code"
                 deliv_spec = {
                     "path": primary_deliv,
                     "type": deliv_type,
                     "description": f"Deliverables for {canonical_role}: {', '.join(clean_files)}",
                 }
                 deliv_list = [
-                    {"path": f, "type": ("doc" if f.endswith(".md") else "code")}
+                    {"path": f, "type": ("test" if canonical_role == "qa" else ("doc" if f.endswith(".md") else "code"))}
                     for f in clean_files
                 ]
             else:
                 primary_deliv = None
-                deliv_type = "code"
+                deliv_type = "report" if canonical_role == "qa" else "code"
                 deliv_spec = {
                     "type": deliv_type,
                     "description": str(instructions).strip()[:120] or f"{canonical_role.title()} task deliverable",

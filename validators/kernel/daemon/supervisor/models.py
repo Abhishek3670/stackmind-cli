@@ -9,7 +9,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any
 
 from ..state_store import (  # noqa: F401  (re-exported for the historical module surface)
@@ -108,6 +108,15 @@ DEFAULT_TIMEOUTS: dict[Any, float] = {
     "ci_wait_timeout": 60.0,
     "ci_run_timeout": 1800.0,
 }
+
+def _sanitize_for_yaml(obj: Any) -> Any:
+    if isinstance(obj, Enum):
+        return obj.value if hasattr(obj, "value") else str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_yaml(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_yaml(item) for item in obj]
+    return obj
 
 @dataclass
 class RunState:
@@ -273,7 +282,7 @@ class RunState:
         return self.wait_registry
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        raw = {
             "run_id": self.run_id,
             "product_goal": self.product_goal,
             "workspace": self.workspace,
@@ -393,6 +402,7 @@ class RunState:
             "deadlock_reports": [dict(d) for d in self.deadlock_reports],
             "reconciliation_history": [dict(rh) for rh in self.reconciliation_history],
         }
+        return _sanitize_for_yaml(raw)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunState":

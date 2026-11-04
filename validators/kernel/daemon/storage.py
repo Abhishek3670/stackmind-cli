@@ -28,7 +28,7 @@ class DaemonStorage:
 
     def save(self, state: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
+        temporary = self.root / f".daemon-state.tmp.{os.getpid()}.{time.time_ns()}"
         try:
             with temporary.open("w", encoding="utf-8") as handle:
                 json.dump(state, handle, indent=2, sort_keys=True, default=str)

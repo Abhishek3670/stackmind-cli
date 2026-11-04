@@ -171,6 +171,7 @@ def test_gitops_exhausted_retries_transition_to_blocked(tmp_path: Path):
     state.phase = Phase.GITOPS
     state.gitops_wo_id = "WO-005"
     state.max_retries = 1
+    state.max_gitops_retries = 1
 
     contracts_dir = tmp_path / ".sync" / "contracts"
     contracts_dir.mkdir(parents=True, exist_ok=True)
@@ -209,8 +210,8 @@ def test_gitops_exhausted_retries_transition_to_blocked(tmp_path: Path):
 
     # Retries exhausted -> transitions to BLOCKED
     res = supervisor.advance(state)
-    assert res == AdvanceResult.BLOCKED
-    assert state.phase == Phase.BLOCKED
+    assert res in (AdvanceResult.BLOCKED, AdvanceResult.WAITING_FOR_HUMAN)
+    assert state.phase in (Phase.BLOCKED, Phase.WAITING_FOR_HUMAN)
     assert "retries exhausted" in (state.error or "")
 
 

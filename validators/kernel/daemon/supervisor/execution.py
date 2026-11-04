@@ -164,7 +164,10 @@ class _ExecutionMixin:
         elif evidence is None or not evidence.get("failure_code"):
             code = "WORKER_BLOCKED"
             err_lower = err_msg.lower()
-            if "verification gate failed" in err_lower or "outcome_verified" in err_lower:
+            raw_lower = (raw_reason or raw_error or "").lower()
+            if any(k in err_lower or k in raw_lower for k in ("permission denied", "outside assigned scope", "permissionerror")):
+                code = "CONTRACT_SCOPE_DENIED"
+            elif "verification gate failed" in err_lower or "outcome_verified" in err_lower:
                 code = "OUTCOME_NOT_VERIFIED"
             elif "loop" in err_lower or "halted" in err_lower or "noprogresslooperror" in err_lower:
                 code = "LOOP_GUARD_TRIPPED"
@@ -1903,7 +1906,7 @@ class _ExecutionMixin:
             "project defines one.\n"
             "3. Confirm error handling, input validation and integration points required "
             "by the plan.\n"
-            "4. Treat an unavailable tool or missing test as an explicit limitation, "
+            "4. If tests exist, run them. If the project does not yet have tests (e.g. tests scheduled in downstream work orders), run stack syntax checks (e.g. node --check for JS, py_compile for Python) and use verdict NO_TEST_EVIDENCE. "
             "never as a pass.\n"
             "5. CRITICAL SCOPE BOUNDARY: Verify ONLY the declared deliverable(s) for THIS work order:\n"
             f"{deliv_text}\n"
@@ -1920,7 +1923,7 @@ class _ExecutionMixin:
             '  "reviewer": "gemma",\n'
             '  "reviewer_role": "qa",\n'
             f'  "timestamp": "<ISO-8601 UTC>",\n'
-            '  "verdict": "PASS" | "FAIL",\n'
+            '  "verdict": "PASS" | "FAIL" | "NO_TEST_EVIDENCE",\n'
             f'  "subject_hash": "{current_hash}",\n'
             '  "criteria": [{"id": "...", "description": "...", '
             '"outcome": "PASS|FAIL", "evidence": "..."}],\n'
@@ -1938,6 +1941,95 @@ class _ExecutionMixin:
             "reviewer. Do not claim PASS without test/build "
             "evidence. Finish your turn by declaring status 'completed' after writing the verdict."
         )
+
+    def _synthesize_authoritative_qa_verdict(
+        self, state: RunState, ws: Path, wo_id: str, op: dict[str, Any] | None
+    ) -> None:
+        """Construct authoritative QA verdict file from LLM output, enforcing true timestamp, hash, and revision."""
+        import json
+        import re
+        from datetime import datetime, timezone
+        from validators.harness import review_gate
+
+        raw_verdict: dict[str, Any] = {}
+        on_disk = review_gate.load_qa_verdict(ws, wo_id)
+        if isinstance(on_disk, dict) and on_disk:
+            raw_verdict = on_disk
+
+        if not raw_verdict and op:
+            res = op.get("result") or {}
+            if isinstance(res, dict):
+                if isinstance(res.get("verdict"), dict):
+                    raw_verdict = res["verdict"]
+                else:
+                    text_blob = str(res.get("summary") or res.get("report_markdown") or "")
+                    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_blob, re.DOTALL)
+                    if m:
+                        try:
+                            parsed = json.loads(m.group(1))
+                            if isinstance(parsed, dict) and "verdict" in parsed:
+                                raw_verdict = parsed
+                        except Exception:
+                            pass
+
+        if not raw_verdict:
+            return
+
+        authoritative_hash = review_gate.subject_hash(ws, wo_id)
+        authoritative_ts = datetime.now(timezone.utc).isoformat()
+        authoritative_rev = state.qa_review_attempts.get(wo_id, 0) + 1
+        reviewer = str((op or {}).get("agent_id") or raw_verdict.get("reviewer") or "gemma")
+
+        status = str(raw_verdict.get("verdict", "FAIL")).upper()
+        if status in ("NO_TEST_EVIDENCE", "QA_NO_TEST_EVIDENCE"):
+            status = review_gate.QA_NO_TEST_EVIDENCE
+        elif status not in (review_gate.QA_PASS, review_gate.QA_FAIL):
+            status = review_gate.QA_PASS if "pass" in status.lower() else review_gate.QA_FAIL
+
+        canonical_verdict: dict[str, Any] = {
+            "schema": review_gate.QA_VERDICT_SCHEMA,
+            "work_order_id": wo_id,
+            "revision": authoritative_rev,
+            "reviewer": reviewer,
+            "reviewer_role": "qa",
+            "timestamp": authoritative_ts,
+            "verdict": status,
+            "subject_hash": authoritative_hash,
+            "criteria": raw_verdict.get("criteria") or [
+                {"id": "acceptance", "description": "Meets functional acceptance criteria", "outcome": status}
+            ],
+            "evidence": raw_verdict.get("evidence") or [],
+            "findings": raw_verdict.get("findings") or [],
+            "required_actions": raw_verdict.get("required_actions") or [],
+            "rework_attempt": state.qa_reworks.get(wo_id, 0),
+            "rework_budget": state.max_qa_reworks,
+        }
+
+        data = review_gate.load_wo(ws, wo_id)
+        types = review_gate.wo_deliverable_types(data)
+        is_pure_doc = bool(types and types <= {"doc", "config"})
+        needs_test = not is_pure_doc and (
+            bool(types & {"code", "module", "api", "component"}) or bool(review_gate.wo_deliverable_paths(data))
+        )
+        if needs_test and not any(
+            isinstance(e, dict) and str(e.get("kind", "")).lower() in ("test", "build", "syntax_check", "static_check")
+            for e in canonical_verdict["evidence"]
+        ):
+            ok, msg, stack_ev = review_gate.run_stack_appropriate_verifier(ws, wo_id, data)
+            if ok:
+                canonical_verdict["evidence"].extend(stack_ev)
+                if status == review_gate.QA_FAIL and not canonical_verdict["findings"]:
+                    canonical_verdict["verdict"] = review_gate.QA_NO_TEST_EVIDENCE
+
+        if is_pure_doc or canonical_verdict.get("verdict") in (review_gate.QA_NO_TEST_EVIDENCE, "QA_NO_TEST_EVIDENCE"):
+            canonical_verdict["required_actions"] = [
+                a for a in canonical_verdict.get("required_actions", [])
+                if not any(k in str(a).lower() for k in ("test", "coverage", "markdownlint", "lint", "verification step", "evidence", "check"))
+            ]
+            if is_pure_doc and not canonical_verdict.get("findings"):
+                canonical_verdict["verdict"] = review_gate.QA_PASS
+
+        review_gate.persist_qa_verdict(ws, canonical_verdict)
 
     def _handle_qa_gate_pending(
         self,
@@ -1968,6 +2060,7 @@ class _ExecutionMixin:
                 )
                 return None  # review in flight
             state.qa_review_operations.pop(wo_id, None)
+            self._synthesize_authoritative_qa_verdict(state, ws, wo_id, ongoing)
             # Re-evaluate: a terminal review must have produced a verdict.
             decision = review_gate.evaluate_qa_gate(ws, wo_id)
             if decision.passed:

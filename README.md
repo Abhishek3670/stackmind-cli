@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.12.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/architectures/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.13.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -105,6 +105,13 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 - **Observability & Tracing**: `WorkOrderTracer` (`.sync/traces/{wo_id}.json`) and Run Cost Ledgers (`.sync/traces/run_cost_ledger.json`) calculate token consumption and USD costs per agent.
 - **Fixed Feature Evals**: Canonical regression test suite (`validators/harness/evals.py`) to verify determinism and compliance across model or prompt updates.
 - **Verification Gates**: Staged-diff verification, `D024` QA gates, and `DeliverableVerifier` HTML media asset integrity checks before validated write-back. Default provider is `EchoLLMProvider`; gateway also supports real backends (Ollama etc.).
+- **The Evidence-Based Principle ("LLM Proposes, Harness Decides")**:
+  - **`QA_NO_TEST_EVIDENCE` & Stack-Appropriate Static Verifiers**: In early work orders before test suites are authored, empty test runs (e.g. pytest exits 4/5) receive a deterministic `NO_TEST_EVIDENCE` outcome backed by stack-native checks (`node --check`, AST verification, `py_compile`, HTML/CSS parsers) instead of triggering false-negative rework or recovery cycles.
+  - **Authoritative Harness QA Verdict Synthesis**: The harness authors `qa_verdict.json` using system UTC timestamps, true deliverable SHA-256 hashes, and canonical revisions, eliminating LLM date/hash hallucinations.
+  - **Single Deliverable Ownership**: Strict enforcement in `delegate_task` ensures every deliverable path has exactly one owner across `ACTIVE`, `BLOCKED`, and `COMPLETED` work orders. QA reviews of existing orders register review operations rather than duplicate conflicting work orders.
+  - **Strict `architect_fix` Recovery Gate**: The Lead Architect cannot close a blocked work order without all prerequisite dependencies being completed, deliverables existing on disk with valid SHA-256 hashes, and static checks passing.
+  - **Full Blocker Diagnostics & Typed Failure Codes**: Blocker reports retain full findings (no ~200-char clipping) and supervisor transitions preserve error contexts, eliminating `failure_code: UNKNOWN`.
+  - **Model Specialization Guidance**: Architectural governance recommends assigning strong reasoning models (e.g. Claude 3.5 Sonnet / Gemini Pro) to Architecture and QA roles, and dedicated models to Worker roles.
 - **Recovery & Repair Overwrite Governance**: Automatic detection of recovery repairs and auto-bumping of revisions (`revision` and `contract_revision`) on active work orders and contracts, preventing deadlocks when the Lead Architect amends tasks.
 - **Unquoted YAML Scalar Auto-Repair & Schema Sanitization**: Automatically folds unquoted multi-line descriptions with colons (`>-`) and normalizes `amendments` / `log` schema variations to ensure deterministic authoring writes.
 - **Ephemeral Test & Smoke Log Budget Exemption**: Excludes scratch smoke and test logs (`tests/*_smoke_log.*`, `*.tmp`, `*.log`) from file budget checks, preventing artificial gate blocks.
@@ -119,6 +126,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.12.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.13.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

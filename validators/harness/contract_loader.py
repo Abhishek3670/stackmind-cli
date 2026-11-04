@@ -37,6 +37,38 @@ def load_harness_contract(
                 c_agent = str(getattr(c, "agent_id", "") or "").lower().strip()
                 if not norm_agent or not c_agent or norm_agent == c_agent:
                     return c
+                # If agent IDs differ, check if contract was synthesized for recovery-repair
+                # or if norm_agent is the worker assigned to this work order:
+                is_recovery_synth = (
+                    c.data.get("synthesized_by") == "recovery-repair"
+                    or c_agent in ("claude", "architecture")
+                )
+                from validators.harness import review_gate
+                wo_data = review_gate.load_wo(project_path, work_order_id)
+                assigned = [str(a).lower().strip() for a in (wo_data.get("assigned_agents") or [])]
+                if is_recovery_synth or norm_agent in assigned or not assigned:
+                    c.agent_id = norm_agent
+                    c.data["agent_id"] = norm_agent
+                    ident = c.identity if isinstance(c.identity, dict) else {}
+                    ident["role"] = getattr(c, "identity", {}).get("role", "worker")
+                    ident["reports_to"] = "claude"
+                    # Reinforce deliverable paths and expected files
+                    deliv_paths = review_gate.wo_deliverable_paths(wo_data)
+                    existing_mods = {r.get("module") for r in c.allow_rules if isinstance(r, dict)}
+                    for dp in deliv_paths:
+                        if dp and dp not in existing_mods:
+                            rule = {"module": dp}
+                            c.allow_rules.append(rule)
+                            c.scope.setdefault("allow", []).append(rule)
+                            existing_mods.add(dp)
+                    est = wo_data.get("implementation_estimate") or {}
+                    for ef in est.get("expected_files") or []:
+                        if ef and ef not in existing_mods:
+                            rule = {"module": ef}
+                            c.allow_rules.append(rule)
+                            c.scope.setdefault("allow", []).append(rule)
+                            existing_mods.add(ef)
+                    return c
         except (FileNotFoundError, Exception):
             pass
 
@@ -48,6 +80,23 @@ def load_harness_contract(
             if work_order_id:
                 contract.work_order = work_order_id
                 contract.data["work_order"] = work_order_id
+                from validators.harness import review_gate
+                wo_data = review_gate.load_wo(project_path, work_order_id)
+                deliv_paths = review_gate.wo_deliverable_paths(wo_data)
+                existing_mods = {r.get("module") for r in contract.allow_rules if isinstance(r, dict)}
+                for dp in deliv_paths:
+                    if dp and dp not in existing_mods:
+                        rule = {"module": dp}
+                        contract.allow_rules.append(rule)
+                        contract.scope.setdefault("allow", []).append(rule)
+                        existing_mods.add(dp)
+                est = wo_data.get("implementation_estimate") or {}
+                for ef in est.get("expected_files") or []:
+                    if ef and ef not in existing_mods:
+                        rule = {"module": ef}
+                        contract.allow_rules.append(rule)
+                        contract.scope.setdefault("allow", []).append(rule)
+                        existing_mods.add(ef)
             return contract
         except Exception:
             pass

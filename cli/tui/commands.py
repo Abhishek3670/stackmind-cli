@@ -3531,6 +3531,14 @@ def dispatch_delivery_command(
                 title="OPERATION IN FLIGHT",
                 hint="Wait for the current operation to complete, or use :cancel to abort it.",
             )
+        elif "budget" in err_str and "exhaust" in err_str:
+            hint = "Global turn budget is exhausted. Run :resume to continue with additional budget."
+            state.add_message("system", f"[ERROR] Could not submit turn: {err}\nHint: {hint}")
+            err_box = render_error_box_str(
+                f"Could not submit turn: {err}",
+                title="BUDGET EXHAUSTED",
+                hint=hint,
+            )
         elif is_connection_error(err):
             state.connection_status = "reconnecting"
             err_box = render_error_box_str(

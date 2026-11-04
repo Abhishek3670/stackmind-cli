@@ -649,7 +649,11 @@ def validate_authoring_readiness(
                 continue
             if p_idx is not None and (_parse_wo_index(wo_ref) or 0) <= p_idx:
                 continue
-            if _is_meta_work_order(data) or str(data.get("agent_id") or "").lower() in ("claude", "architecture"):
+            if _is_meta_work_order(data):
+                continue
+            is_arch_agent = str(data.get("agent_id") or "").lower() in ("claude", "architecture")
+            is_recovery = str(data.get("synthesized_by") or "").startswith("recovery-repair")
+            if is_arch_agent and not is_recovery:
                 continue
             cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
             if cand.is_file():
@@ -830,7 +834,8 @@ def validate_authoring_readiness(
         if contract is not None:
             if str(contract.data.get("work_order") or "") != wo_id:
                 _issue(issues, "CONTRACT_WO_MISMATCH", "schema", f"Contract '{contract.path}' declares work_order " f"'{contract.data.get('work_order')}' but is bound to '{wo_id}'", work_order_id=wo_id, artifact_path=contract.path)
-            if primary_agent and str(contract.agent_id or "").lower().strip() != primary_agent:
+            is_recovery_contract = str(contract.data.get("synthesized_by") or "").startswith("recovery-repair")
+            if not is_recovery_contract and primary_agent and str(contract.agent_id or "").lower().strip() != primary_agent:
                 _issue(issues, "CONTRACT_AGENT_MISMATCH", "schema", f"Contract '{contract.path}' agent_id '{contract.agent_id}' does not match " f"work order assignee '{primary_agent}'", work_order_id=wo_id, artifact_path=contract.path)
 
             # Budget: explicitly present and positive
@@ -863,11 +868,18 @@ def validate_authoring_readiness(
         # QA work orders must deliver an executable test suite, not a sign-off
         # document: D024 demands a companion test file for every code deliverable.
         if primary_agent == "gemma":
+            is_review_order = (
+                str(data.get("type", "")).upper() == "VALIDATION"
+                and deliv_path
+                and (".sync/reviews/" in deliv_path or ".sync/inbox/" in deliv_path or deliv_type == "doc")
+            )
             qa_ok = (
-                isinstance(deliverable, dict)
-                and str(deliverable.get("type", "")).lower() == "code"
-                and bool(deliv_path)
-                and _is_test_artifact(deliv_path)
+                is_review_order or (
+                    isinstance(deliverable, dict)
+                    and str(deliverable.get("type", "")).lower() == "code"
+                    and bool(deliv_path)
+                    and _is_test_artifact(deliv_path)
+                )
             )
             if not qa_ok:
                 _issue(

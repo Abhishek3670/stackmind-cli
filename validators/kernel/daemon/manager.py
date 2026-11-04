@@ -1835,10 +1835,8 @@ class SessionManager:
                 if t is None or not t.is_alive():
                     session["active_operation"] = None
 
-        # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
-        self.supervisor.unblock_in_flight_work_orders(state)
-
         # Clean up any stale active duplicates for work orders that are already completed
+        # and populate state.completed_wo_ids from disk before unblocking in-flight work orders
         active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
         completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
         if active_dir.is_dir() and completed_dir.is_dir():
@@ -1851,6 +1849,9 @@ class SessionManager:
                         pass
                 if comp_file.stem not in getattr(state, "completed_wo_ids", []):
                     state.completed_wo_ids.append(comp_file.stem)
+
+        # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
+        self.supervisor.unblock_in_flight_work_orders(state)
 
         # Synchronize INDEX.yaml and TREE.yaml with the unblocked work orders
         try:
@@ -1969,14 +1970,44 @@ class SessionManager:
                         candidate = Phase(p_from) if p_from else None
                     except ValueError:
                         candidate = None
-                    if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED, Phase.ARCHITECT_REPAIR, Phase.INIT):
+                    if candidate and candidate not in (
+                        Phase.FAILED,
+                        Phase.BLOCKED,
+                        Phase.ARCHITECT_REPAIR,
+                        Phase.ARCHITECT_RECOVERY_DECISION,
+                        Phase.WAITING_FOR_HUMAN,
+                        Phase.INIT,
+                    ):
                         prev_phase = candidate
                         break
-            target_phase = prev_phase or (
-                Phase.DISPATCHING if state.worker_wo_ids
-                else Phase.AUTHORING if state.plan_id
-                else Phase.PLANNING
-            )
+
+            if prev_phase:
+                target_phase = prev_phase
+            else:
+                non_gitops_workers = [
+                    wid for wid in getattr(state, "worker_wo_ids", [])
+                    if wid != getattr(state, "gitops_wo_id", None)
+                ]
+                if hasattr(self.supervisor, "_role_for_agent") and hasattr(self.supervisor, "_agent_for_wo"):
+                    non_gitops_workers = [
+                        wid for wid in non_gitops_workers
+                        if self.supervisor._role_for_agent(self.supervisor._agent_for_wo(wid, ws)) != "gitops"
+                    ]
+
+                all_workers_done = bool(non_gitops_workers and all(wid in getattr(state, "completed_wo_ids", []) for wid in non_gitops_workers))
+
+                if all_workers_done:
+                    int_wo = getattr(state, "integration_wo_id", None)
+                    if int_wo and int_wo in getattr(state, "completed_wo_ids", []):
+                        target_phase = Phase.GITOPS
+                    else:
+                        target_phase = Phase.INTEGRATION_REVIEW
+                else:
+                    target_phase = (
+                        Phase.DISPATCHING if state.worker_wo_ids
+                        else Phase.AUTHORING if state.plan_id
+                        else Phase.PLANNING
+                    )
         state.error = None
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase, authorized_override=True)
@@ -2227,18 +2258,33 @@ class SessionManager:
                             active_rec = r
                             break
 
-                    if (
-                        active_rec is None
-                        or active_rec.get("status") in _OPERATION_TERMINAL
-                        or active_rec.get("status") == "CANCEL_REQUESTED"
-                        or not is_thread_alive
-                    ):
-                        if active_rec and active_rec.get("status") not in _OPERATION_TERMINAL:
+                    try:
+                        grace = float(os.environ.get("STALE_OPERATION_GRACE_SECONDS", "15"))
+                    except ValueError:
+                        grace = 15.0
+
+                    now_dt = datetime.now(timezone.utc)
+                    op_age = 999.0
+                    if active_rec:
+                        try:
+                            started_dt = datetime.fromisoformat(str(active_rec.get("started_at")))
+                            if started_dt.tzinfo is None:
+                                started_dt = started_dt.replace(tzinfo=timezone.utc)
+                            op_age = (now_dt - started_dt).total_seconds()
+                        except (TypeError, ValueError, AttributeError):
+                            op_age = grace
+
+                    is_terminal = active_rec and active_rec.get("status") in _OPERATION_TERMINAL
+                    is_cancel_req = active_rec and active_rec.get("status") == "CANCEL_REQUESTED"
+                    is_truly_orphaned = not is_thread_alive and op_age >= grace
+
+                    if active_rec is None or is_terminal or is_cancel_req or is_truly_orphaned:
+                        if active_rec and not is_terminal:
                             self.complete_operation(
                                 session_id,
                                 active_op_id,
                                 {"reason": "Orphaned operation cleaned up on new turn"},
-                                status="CANCELLED" if active_rec.get("status") == "CANCEL_REQUESTED" else "FAILED",
+                                status="CANCELLED" if is_cancel_req else "FAILED",
                             )
                         session["active_operation"] = None
                     else:
@@ -2504,18 +2550,23 @@ class SessionManager:
             if final_status == "CANCELLED":
                 ws_path = Path(session.get("workspace", "."))
                 wo_id = record.get("work_order_id") or record.get("work_order")
-                try:
-                    from validators.kernel.work_order_ops import cleanup_cancelled_operation
-                    cleanup_cancelled_operation(
-                        ws_path,
-                        operation_id=target_op_id,
-                        work_order_id=wo_id,
-                        reason=str((result or {}).get("reason") or "Cancelled by operator") if isinstance(result, Mapping) else "Cancelled by operator",
-                        actor=record.get("role") or session.get("role") or "operator",
-                        session_id=session.get("session_id"),
-                    )
-                except Exception:
-                    pass
+                is_internal_cleanup = any(
+                    kw in str((result or {}).get("reason") or "").lower()
+                    for kw in ("contention", "cleared by supervisor", "cleared by orchestrator", "turn reset", "operation cleared", "invalidated_on_resume")
+                ) if isinstance(result, Mapping) else False
+                if not is_internal_cleanup:
+                    try:
+                        from validators.kernel.work_order_ops import cleanup_cancelled_operation
+                        cleanup_cancelled_operation(
+                            ws_path,
+                            operation_id=target_op_id,
+                            work_order_id=wo_id,
+                            reason=str((result or {}).get("reason") or "Cancelled by operator") if isinstance(result, Mapping) else "Cancelled by operator",
+                            actor=record.get("role") or session.get("role") or "operator",
+                            session_id=session.get("session_id"),
+                        )
+                    except Exception:
+                        pass
             if final_status in ("FAILED", "BLOCKED") and not record.get("error"):
                 if isinstance(result, Mapping):
                     raw_e = result.get("error") or result.get("reason") or result.get("message")
@@ -3531,48 +3582,59 @@ class SessionManager:
                         self.events.publish("error", session_id, message=f"Failed to auto-revert plan to architect: {repair_exc}")
                         return
                 elif is_wo_gate_failure and wo_retry_count < 2:
-                    self.events.publish(
-                        "work_order.auto_repair_requested",
-                        session_id,
-                        attempt=wo_retry_count + 1,
-                        errors=computed_err,
-                        operation_id=operation_id,
+                    has_supervisor = any(
+                        getattr(r, "session_id", None) == session_id
+                        for r in self._active_runs.values()
                     )
-                    wo_repair_prompt = (
-                        f"CRITICAL ARCHITECTURE INSTRUCTION: Your authored Work Order, Contract, or Index YAML was REJECTED by StackMind runtime validation with the following errors:\n"
-                        f"{computed_err}\n\n"
-                        f"Please immediately repair and re-author the offending YAML file(s) in .sync/work-orders/ or .sync/contracts/ using write_file conforming to StackMind schemas:\n"
-                        f"1. Allowed 'type' enums for Work Orders and INDEX.yaml:\n"
-                        f"   ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']\n"
-                        f"   *GUIDANCE: For QA/verification tasks, declare type: 'VALIDATION' (NEVER 'QA' or 'TEST'). QA is an assigned agent/role, not a work-order type.*\n"
-                        f"2. Allowed 'deliverable.type' enums for Work Orders:\n"
-                        f"   ['code', 'doc', 'config', 'module']\n"
-                        f"   *GUIDANCE: For test suites use deliverable.type: 'code' (with path under tests/); for reviews/reports use deliverable.type: 'doc' (NEVER 'test' or 'report').*\n"
-                        f"3. Priorities and Statuses:\n"
-                        f"   - priority must be 'P0', 'P1', 'P2', or 'P3'\n"
-                        f"   - status must be 'ACTIVE', 'PENDING', 'READY', 'BLOCKED', or 'COMPLETED'\n"
-                        f"4. Dependencies: list of existing WO IDs, e.g. ['WO-001'] or []\n"
-                        f"5. All entries in .sync/work-orders/INDEX.yaml must match the corresponding .sync/work-orders/ACTIVE/<WO-ID>.yaml files.\n\n"
-                        f"Re-author the valid YAML file(s) now."
-                    )
-                    self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
-                    self.events.tool_result(
-                        session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
-                        result=result_data, role=op_role, agent_id=agent,
-                    )
-                    try:
-                        self.start_turn(
+                    if not has_supervisor:
+                        self.events.publish(
+                            "work_order.auto_repair_requested",
                             session_id,
-                            wo_repair_prompt,
-                            role="architecture",
-                            agent_id="claude",
-                            is_authoring=True,
-                            wo_repair_attempt=wo_retry_count + 1,
+                            attempt=wo_retry_count + 1,
+                            errors=computed_err,
+                            operation_id=operation_id,
                         )
-                        return
-                    except Exception as repair_exc:
-                        self.events.publish("error", session_id, message=f"Failed to auto-revert work order repair to architect: {repair_exc}")
-                        return
+                        wo_repair_prompt = (
+                            f"CRITICAL ARCHITECTURE INSTRUCTION: Your authored Work Order, Contract, or Index YAML was REJECTED by StackMind runtime validation with the following errors:\n"
+                            f"{computed_err}\n\n"
+                            f"Please immediately repair and re-author the offending YAML file(s) in .sync/work-orders/ or .sync/contracts/ using write_file conforming to StackMind schemas:\n"
+                            f"1. Allowed 'type' enums for Work Orders and INDEX.yaml:\n"
+                            f"   ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']\n"
+                            f"   *GUIDANCE: For QA/verification tasks, declare type: 'VALIDATION' (NEVER 'QA' or 'TEST'). QA is an assigned agent/role, not a work-order type.*\n"
+                            f"2. Allowed 'deliverable.type' enums for Work Orders:\n"
+                            f"   ['code', 'doc', 'config', 'module']\n"
+                            f"   *GUIDANCE: For test suites use deliverable.type: 'code' (with path under tests/); for reviews/reports use deliverable.type: 'doc' (NEVER 'test' or 'report').*\n"
+                            f"3. Priorities and Statuses:\n"
+                            f"   - priority must be 'P0', 'P1', 'P2', or 'P3'\n"
+                            f"   - status must be 'ACTIVE', 'PENDING', 'READY', 'BLOCKED', or 'COMPLETED'\n"
+                            f"4. Dependencies: list of existing WO IDs, e.g. ['WO-001'] or []\n"
+                            f"5. All entries in .sync/work-orders/INDEX.yaml must match the corresponding .sync/work-orders/ACTIVE/<WO-ID>.yaml files.\n\n"
+                            f"Re-author the valid YAML file(s) now."
+                        )
+                        self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
+                        self.events.tool_result(
+                            session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                            result=result_data, role=op_role, agent_id=agent,
+                        )
+                        try:
+                            self.start_turn(
+                                session_id,
+                                wo_repair_prompt,
+                                role="architecture",
+                                agent_id="claude",
+                                is_authoring=True,
+                                wo_repair_attempt=wo_retry_count + 1,
+                            )
+                            return
+                        except Exception as repair_exc:
+                            self.events.publish("error", session_id, message=f"Failed to auto-revert work order repair to architect: {repair_exc}")
+                            return
+                    else:
+                        self.events.tool_result(
+                            session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                            result=result_data, role=op_role, agent_id=agent,
+                        )
+                        self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
                 else:
                     self.events.tool_result(
                         session_id, tool_name, operation_id, "blocked", operation_id=operation_id,

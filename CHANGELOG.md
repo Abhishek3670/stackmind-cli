@@ -5,6 +5,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.13.0] - 2026-11-04
+
+### Added
+- **Evidence-Based Closed-Loop Verification ("LLM Proposes, Harness Decides")**:
+  - **`QA_NO_TEST_EVIDENCE` Outcome & Stack-Appropriate Static Verifiers**:
+    - Introduced `QA_NO_TEST_EVIDENCE = "NO_TEST_EVIDENCE"` and `QA_PROVISIONAL_PASS = "PROVISIONAL_PASS"` in `validators/harness/review_gate.py`.
+    - Implemented `run_stack_appropriate_verifier` providing deterministic syntax and structure validation:
+      - JavaScript/TypeScript: `node --check` with deterministic AST balance checks.
+      - Python: bytecode compile check via `python -m py_compile`.
+      - HTML: document tree balance and structure parsing via `HTMLParser`.
+      - CSS: selector syntax and block brace matching.
+      - JSON: structural parsing via `json.loads`.
+    - In `validate_qa_verdict`, automatically converts false-negative QA rejections caused by absent test suites (pytest exit codes 4/5) into `NO_TEST_EVIDENCE` when static checks pass, preventing premature rework and recovery turns on early work orders.
+  - **Authoritative Harness QA Verdict Synthesis**:
+    - Implemented `_synthesize_authoritative_qa_verdict` in `validators/kernel/daemon/supervisor/execution.py`.
+    - Governed verdict files (`.sync/reviews/{wo_id}/qa_verdict.json`) are synthesized authoritatively by the harness:
+      - Timestamp is generated from system UTC ISO-8601 (`datetime.now(timezone.utc)`), eliminating LLM hallucinated dates (e.g. 2025-05-22).
+      - Subject hash is computed directly from true deliverable SHA-256 hashes on disk.
+      - Revision count is governed by the supervisor's authoritative ledger.
+  - **Single Deliverable Ownership Across the Workspace**:
+    - Added `_find_existing_deliverable_owner` to `validators/kernel/tools.py` (`ToolGateway`) scanning `ACTIVE`, `BLOCKED`, and `COMPLETED` work orders.
+    - Updated `delegate_task` so that when the Lead Architect delegates a QA review for an existing deliverable, the supervisor registers a review operation rather than authoring duplicate competing work orders (e.g. WO-011, WO-012, WO-013) that claim the worker's files.
+    - Cross-worker deliverable collisions raise `CONTRACT_VALIDATION_ERROR` immediately at authoring time.
+  - **Resume and Recovery Self-Healing & Completed Work Order Integrity**:
+    - Guarded `cancel_work_order` to strictly forbid cancelling work orders that are already `COMPLETED` or archived on disk.
+    - Fixed `manager.py:complete_operation` so internal operation contention cleanups or supervisor turn resets do not inadvertently cancel underlying work orders.
+    - Fixed order of operations in `_prepare_run_for_resume` to populate `state.completed_wo_ids` from `COMPLETED/` before calling `unblock_in_flight_work_orders`, preventing completed tasks from being pulled back to `ACTIVE/`.
+    - Corrected `unblock_in_flight_work_orders` in `controls.py` to leave already completed work orders in `COMPLETED/`.
+    - Fixed `_advance_recovery_decision` in `recovery.py`: when no work orders remain blocked on resume, transitions directly to `INTEGRATION_REVIEW` (or `DISPATCHING`), eliminating the "Recovery decision operation was lost and could not be re-dispatched" failure loop.
+  - **Strict `architect_fix` Recovery Gate**:
+    - Hardened `_advance_architect_repair` in `validators/kernel/daemon/supervisor/recovery.py`:
+      1. **Prerequisite Dependency Verification**: An Architect repair turn cannot mark a work order `COMPLETED` if any of its declared dependencies are `BLOCKED`, `FAILED`, or incomplete.
+      2. **Harness Delivery Hash Verification**: Computes SHA-256 hashes of declared deliverables on disk to ensure physical artifacts exist before order closure.
+      3. **Static Verifier Gate**: Executes `run_stack_appropriate_verifier` on repaired deliverables; orders failing static checks cannot be closed and are redispatched with concrete diagnostic context.
+  - **Full QA Diagnostics Retention & Elimination of `failure_code: UNKNOWN`**:
+    - Fixed the "lost-reason" bug in `validators/kernel/daemon/supervisor/core.py` where `_transition` previously cleared `state.error = None` on transitions to `WAITING_FOR_HUMAN`, `ARCHITECT_RECOVERY_DECISION`, and `FINAL_REVIEW`.
+    - Implemented `_classify_failure_code` in `validators/kernel/daemon/supervisor/controls.py`, ensuring all worker blockers escalated to recovery receive typed, non-empty canonical failure codes (never `UNKNOWN`).
+    - Expanded truncation clips from 200 characters to 4,000 characters in `completion.py` and 2,000 characters in `task_contract.py` so the Architect receives the complete QA report, failure stack traces, and actionable remediation instructions.
+  - **Ephemeral Smoke & Test Log Exemption**:
+    - Updated `validators/harness/contract_validation.py` to filter out ephemeral test artifacts (`tests/*_smoke_log.*`, `*.tmp`, `*.log`, `_tmp_*`) from the post-execution `max_files_touched` file budget.
+  - **Model Specialization Architectural Guidance**:
+    - Documented recommendations for role-model specialization: deploying high-reasoning models for Architecture (`claude`) and QA (`gemma`), while isolating dedicated execution models for Worker tasks (`codex`, `gemini`, `local-llm`).
+
+### Fixed
+- Fixed unhandled `NameError` for `resolve_playbook_file` in `validators/harness/delivery_integrity.py`.
+- Fixed recovery repair indentation and branch structure in `validators/kernel/daemon/supervisor/recovery.py`.
+- Fixed `shutil.copytree` workspace staging race condition: replaced raw directory copy in `staging.py` and `execution.py` with `copy_workspace_for_staging`, which excludes `.sync/runtime`, daemon lock/state files, and transient `.tmp` files, and safely handles files unlinked concurrently by background daemon processes.
+- **Preserved Agent Boot Snapshots in Staged Workspace**:
+  - In `validators/harness/runner/staging.py`, updated `copy_workspace_for_staging` to preserve `.sync/runtime/boot/` snapshots while excluding ephemeral daemon locks and state, allowing `stackmind validate` on staged copies to discover registered agents.
+- **Transparent Global Turn Budget Exhaustion**:
+  - In `validators/kernel/daemon/protocol.py`, explicitly caught `BudgetExhaustedError` and return JSON-RPC error code `-32002` with actionable guidance (`"Global turn budget exhausted: ... Run :resume to continue."`), eliminating generic `"Internal error"` masks.
+  - In `cli/tui/commands.py` and `cli/tui/runtime_panel.py`, added dedicated budget-exhausted warning boxes and status displays indicating that running `:resume` replenishes the turn budget.
+- **PyYAML Enum Serialization & Run State Persistence**:
+  - In `validators/kernel/daemon/supervisor/control_plane.py`, `models.py`, and `core.py`, converted Enum instances (e.g. `BlockerSubsystem`) to strings in lifecycle events, added recursive YAML sanitization in `RunState.to_dict()`, and registered `yaml.SafeDumper.add_multi_representer(Enum, ...)` to ensure shadow run state files are persisted reliably without swallowed `RepresenterError` exceptions.
+- **Integration Review Adoption Scoping**:
+  - In `validators/kernel/daemon/supervisor/review.py`, ensured `_adopt_running_integration_operation` ignores planning, authoring, recovery, and worker operations, eliminating false adoption of active turns from other phases.
+- **Orphaned Operation Startup Grace Period (`manager.py:begin_operation`)**:
+  - Added elapsed grace period check (`STALE_OPERATION_GRACE_SECONDS`, 15.0s) in `begin_operation` before terminating an active operation whose thread is still starting.
+  - Prevents newly dispatched operations whose worker threads are in the process of spinning up from being falsely killed as orphaned operations (`"Orphaned operation cleaned up on new turn"`).
+- **Dual-Repair Dispatch Prevention (`manager.py:_drive_turn_execution`)**:
+  - Guarded work-order gate failure auto-repair in `manager.py`: when an active supervisor run exists (`has_supervisor`), the daemon manager defers repair lifecycle to the supervisor's state machine (`Phase.ARCHITECT_REPAIR`), preventing double-dispatch collisions.
+- **Tolerant Work Order & Index Deliverable Type Normalization (`authoring_yaml.py`)**:
+  - Added automatic mapping of common LLM aliases to schema-conformant enums in `normalize_work_order_data`:
+    - `type`: `QA`, `TEST`, `TESTING`, `VERIFICATION`, `REVIEW` -> `VALIDATION`.
+    - `deliverable.type` & `deliverables[].type`: `report`, `documentation`, `audit`, `markdown` -> `doc`; `test`, `tests`, `script` -> `code`.
+  - Normalized work order entries inside `INDEX.yaml` during staged validation.
+- **Resumption Phase Preservation (`manager.py:resume_run`)**:
+  - Restored priority check for historical non-terminal `prev_phase` in `resume_run` before evaluating worker completion fallbacks.
+- **`QA_NO_TEST_EVIDENCE` and Documentation Deliverable Gate Support (`review_gate.py`, `execution.py`, `delivery_integrity.py`)**:
+  - In `validate_qa_verdict`, implemented `_is_missing_test_evidence_item` to structurally verify that failing test evidence items indicate absent tests (exit code 4/5, no tests found), strictly preventing real functional test failures (`AssertionError`, `traceback`, failed test assertions) from being laundered into provisional passes.
+  - Narrowed `required_actions` exemptions in `validate_qa_verdict` so generic words (such as "check") do not launder functional bug remediation.
+  - In `delivery_integrity.py:qa_status`, guarded delivery release gates by treating provisional `NO_TEST_EVIDENCE` verdicts as `QA_INCONCLUSIVE` with clear guidance that final delivery requires genuine test execution before release.
+  - In `_synthesize_authoritative_qa_verdict`, sanitized test-requesting actions from `required_actions` for documentation-only deliverables (`types <= {"doc", "config"}`) and promoted verdicts to `QA_PASS` when functional acceptance criteria pass.
+- **Review Deliverable Exemption for QA Agents (`authoring_readiness.py`)**:
+  - Updated `validate_authoring_readiness` to allow review/validation work orders assigned to `gemma` (`type: VALIDATION` or deliverables under `.sync/reviews/` / `.sync/inbox/` / `type: doc`) without requiring an executable code deliverable under `tests/`.
+- **Atomic Companion Contract Cleanup in Artifact Archival (`review.py`)**:
+  - Updated `_archive_rejected_artifacts` to archive and unlink companion contracts alongside archived work orders, completely preventing orphaned contract files from blocking authoring readiness gates.
+
 ## [3.12.0] - 2026-11-04
 
 ### Added

@@ -138,15 +138,17 @@ class _CompletionMixin:
                 )
             )
         )
+        deliv_p = str(request.task.deliverable_path or "").replace("\\", "/").strip()
         is_plan_task = (
             not is_delivery_status
-            and
-            not is_authoring_task
+            and not is_authoring_task
             and not is_integration_review
             and (
-                request.task.deliverable_path == 'PLAN.md'
-                or 'PLAN.md' in request.task.title
-                or 'PLAN.md' in (request.task.body or '')
+                deliv_p in ("PLAN.md", ".sync/playbook/PLAN.md")
+                or deliv_p.endswith("/PLAN.md")
+                or getattr(request.task, "work_order_id", None) == "WO-000"
+                or 'PLAN.md' in (request.task.title or "")
+                or 'PLAN.md' in (request.task.body or "")
             )
         )
         task_phase = (
@@ -738,13 +740,13 @@ class _CompletionMixin:
             if is_unfulfilled_deliverable:
                 payload = {
                     'status': 'blocked',
-                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {effective_raw_text[:200]}",
+                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {effective_raw_text[:4000]}",
                     'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {effective_raw_text}",
                     'modified_files': written_files,
                     'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
                 }
             elif is_validation_or_review:
-                blocker_detail = effective_raw_text[:200] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
+                blocker_detail = effective_raw_text[:4000] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
                 payload = {
                     'status': 'blocked',
                     'summary': f"Validation review requires resolution: {blocker_detail}",
@@ -753,7 +755,7 @@ class _CompletionMixin:
                     'blockers': [blocker_detail],
                 }
             else:
-                summary_text = extracted_summary or (effective_raw_text if ((request.task.kind == 'adhoc' or is_delivery_status) and effective_raw_text) else (effective_raw_text[:200] if effective_raw_text else None))
+                summary_text = extracted_summary or (effective_raw_text if ((request.task.kind == 'adhoc' or is_delivery_status) and effective_raw_text) else (effective_raw_text[:4000] if effective_raw_text else None))
                 payload = {
                     'status': 'completed',
                     'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),

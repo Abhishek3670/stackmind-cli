@@ -550,7 +550,7 @@ def compile_worker_task_contract(
             "stale": True,
             "revision": stale.get("revision"),
             "invalidated_at": _safe_clip(stale.get("invalidated_at"), 40),
-            "reason": _safe_clip(stale.get("reason"), 200),
+            "reason": _safe_clip(stale.get("reason"), 2000),
             "fields": [
                 _safe_clip(field, 60)
                 for field in (stale.get("fields") or [])[:10]

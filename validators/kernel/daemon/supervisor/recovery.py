@@ -125,16 +125,52 @@ class _RecoveryMixin:
                     self._transition(state, Phase.EXECUTING, authorized_override=True)
                     return AdvanceResult.WAITING_FOR_OPERATION
 
-                deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(str(wo_id), ws)
-                deliv_on_disk = False
-                if deliv_path:
-                    tf = ws / deliv_path
-                    if tf.is_dir() and any(f.is_file() for f in tf.rglob("*")):
-                        deliv_on_disk = True
-                    elif tf.is_file() and tf.stat().st_size > 0:
-                        deliv_on_disk = True
+                wo_str = str(wo_id)
+                from validators.harness import review_gate
+                wo_data = review_gate.load_wo(ws, wo_str)
+                deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_str, ws)
 
+                # 1. Dependency check: cannot close order if prerequisite dependencies are not completed
+                disk_deps = wo_data.get("dependencies")
+                if disk_deps is not None:
+                    declared_deps = list(disk_deps)
+                    state.wo_dependencies[wo_str] = list(disk_deps)
+                else:
+                    declared_deps = list(state.wo_dependencies.get(wo_str) or [])
+                unmet_deps = [
+                    d for d in declared_deps
+                    if str(d) not in state.completed_wo_ids or str(d) in state.blocked_wo_ids or str(d) in state.failed_wo_ids
+                ]
+
+                # 2. Harness-recorded hash of declared deliverables
+                deliv_paths = review_gate.wo_deliverable_paths(wo_data) or ([deliv_path] if deliv_path else [])
+                deliv_hashes: dict[str, str] = {}
+                missing_delivs: list[str] = []
+                for dp in deliv_paths:
+                    tf = ws / dp
+                    if tf.is_file() and tf.stat().st_size > 0:
+                        h = review_gate.file_sha256(tf)
+                        if h:
+                            deliv_hashes[dp] = h
+                        else:
+                            missing_delivs.append(dp)
+                    elif tf.is_dir() and any(subf.is_file() for subf in tf.rglob("*")):
+                        deliv_hashes[dp] = "directory"
+                    else:
+                        missing_delivs.append(dp)
+
+                deliv_on_disk = bool(deliv_hashes and not missing_delivs)
+
+                # 3. Passing verification check (stack verifier)
+                check_passed = False
                 if deliv_on_disk:
+                    check_passed, check_msg, _ = review_gate.run_stack_appropriate_verifier(ws, wo_str, wo_data)
+                    if not check_passed:
+                        state.repair_context["post_check_error"] = f"Verification check failed: {check_msg}"
+
+                can_close = deliv_on_disk and check_passed and not unmet_deps
+
+                if can_close:
                     # Deliverable fix verified on disk — complete the work order and return to execution!
                     self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
                     if str(wo_id) not in state.completed_wo_ids:
@@ -218,16 +254,47 @@ class _RecoveryMixin:
                         self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
                         self._transition(state, Phase.EXECUTING, authorized_override=True)
                         return AdvanceResult.WAITING_FOR_OPERATION
-                    deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(str(wo_id), ws)
-                    deliv_on_disk = False
-                    if deliv_path:
-                        tf = ws / deliv_path
-                        if tf.is_dir() and any(f.is_file() for f in tf.rglob("*")):
-                            deliv_on_disk = True
-                        elif tf.is_file() and tf.stat().st_size > 0:
-                            deliv_on_disk = True
+                    wo_str = str(wo_id)
+                    from validators.harness import review_gate
+                    wo_data = review_gate.load_wo(ws, wo_str)
+                    deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_str, ws)
 
+                    # 1. Dependency check: cannot close order if prerequisite dependencies are not completed
+                    declared_deps = list(state.wo_dependencies.get(wo_str) or wo_data.get("dependencies") or [])
+                    unmet_deps = [
+                        d for d in declared_deps
+                        if str(d) not in state.completed_wo_ids or str(d) in state.blocked_wo_ids or str(d) in state.failed_wo_ids
+                    ]
+
+                    # 2. Harness-recorded hash of declared deliverables
+                    deliv_paths = review_gate.wo_deliverable_paths(wo_data) or ([deliv_path] if deliv_path else [])
+                    deliv_hashes: dict[str, str] = {}
+                    missing_delivs: list[str] = []
+                    for dp in deliv_paths:
+                        tf = ws / dp
+                        if tf.is_file() and tf.stat().st_size > 0:
+                            h = review_gate.file_sha256(tf)
+                            if h:
+                                deliv_hashes[dp] = h
+                            else:
+                                missing_delivs.append(dp)
+                        elif tf.is_dir() and any(subf.is_file() for subf in tf.rglob("*")):
+                            deliv_hashes[dp] = "directory"
+                        else:
+                            missing_delivs.append(dp)
+
+                    deliv_on_disk = bool(deliv_hashes and not missing_delivs)
+
+                    # 3. Passing verification check (stack verifier)
+                    check_passed = False
                     if deliv_on_disk:
+                        check_passed, check_msg, _ = review_gate.run_stack_appropriate_verifier(ws, wo_str, wo_data)
+                        if not check_passed:
+                            state.repair_context["post_check_error"] = f"Verification check failed: {check_msg}"
+
+                    can_close = deliv_on_disk and check_passed and not unmet_deps
+
+                    if can_close:
                         self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
                         if str(wo_id) not in state.completed_wo_ids:
                             state.completed_wo_ids.append(str(wo_id))
@@ -382,6 +449,17 @@ class _RecoveryMixin:
                     if blocked_files:
                         wo_id = sorted(blocked_files)[0]
                         state.recovery_wo_id = wo_id
+
+        if not wo_id:
+            # No work order is blocked and no recovery target exists.
+            # Transition cleanly to INTEGRATION_REVIEW or DISPATCHING instead of falsely failing.
+            state.error = None
+            non_gitops = [wid for wid in getattr(state, "worker_wo_ids", []) if wid != getattr(state, "gitops_wo_id", None)]
+            if non_gitops and all(wid in getattr(state, "completed_wo_ids", []) for wid in non_gitops):
+                self._transition(state, Phase.INTEGRATION_REVIEW)
+            else:
+                self._transition(state, Phase.DISPATCHING)
+            return AdvanceResult.TRANSITIONED
 
         if wo_id:
             decision, decision_error = self._load_recovery_decision(ws, str(wo_id), {})
@@ -802,9 +880,10 @@ class _RecoveryMixin:
                 or (state.worker_blockers.get(wo_id) or {}).get("failure_code") == "DEPENDENCY_DEADLOCK"
             )
             if is_deadlock:
-                wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                from validators.harness import review_gate
+                wo_file = review_gate.find_wo_file(ws, wo_id)
                 if not wo_file.is_file():
-                    return f"architect_fix expected work order '{wo_id}.yaml' to exist in .sync/work-orders/ACTIVE/"
+                    return f"architect_fix expected work order '{wo_id}.yaml' to exist in .sync/work-orders/"
                 return None
             deliv_path = state.repair_context.get("deliverable_path") or self._get_wo_deliverable_path(wo_id, ws)
             if deliv_path:
@@ -812,6 +891,10 @@ class _RecoveryMixin:
                 if target_file.is_dir() and any(f.is_file() for f in target_file.rglob("*")):
                     return None
                 if target_file.is_file() and target_file.stat().st_size > 0:
+                    from validators.harness import review_gate
+                    ok, msg, _ = review_gate.run_stack_appropriate_verifier(ws, wo_id)
+                    if not ok:
+                        return f"architect_fix deliverable '{deliv_path}' failed verification: {msg}"
                     return None
 
             # If deliverable is not on disk yet, check if the Architect delegated the task,
@@ -991,13 +1074,16 @@ class _RecoveryMixin:
             + deadlock_note
             + "A governed worker execution was blocked. "
             "Bounded evidence packet:\n"
-            f"- failure_code: {evidence.get('failure_code', 'UNKNOWN')}\n"
+            f"- failure_code: {evidence.get('failure_code') or getattr(self, '_classify_failure_code', lambda r: 'WORKER_FAILURE')(evidence.get('canonical_message') or evidence.get('raw_reason') or state.error or '')}\n"
             f"- failure: {evidence.get('canonical_message') or evidence.get('raw_reason') or 'unspecified'}\n"
             f"- current contract revision: {current_rev} "
             f"(hash {str(evidence.get('contract_hash') or '')[:12]})\n"
             f"- file budget: {evidence.get('file_budget')} ; observed changed files: "
             f"{evidence.get('observed_file_count', len(observed))}\n"
             f"- observed files:\n" + "".join(f"  - {p}\n" for p in preview) + more + "\n\n"
+            + ("- QA findings:\n" + "".join(f"  * {f}\n" for f in (evidence.get("qa_findings") or evidence.get("findings") or [])) + "\n" if (evidence.get("qa_findings") or evidence.get("findings")) else "")
+            + ("- Required corrective actions:\n" + "".join(f"  * {a}\n" for a in (evidence.get("qa_required_actions") or evidence.get("required_actions") or [])) + "\n" if (evidence.get("qa_required_actions") or evidence.get("required_actions")) else "")
+            + (f"- Full verification report:\n{evidence.get('qa_report') or evidence.get('report')}\n\n" if (evidence.get("qa_report") or evidence.get("report")) else "")
             + (f"Your previous decision was rejected: {corrective}\n\n" if corrective else "")
             + "As Senior Architect you must decide how to recover:\n"
             "1. Write your decision as a JSON file to "
@@ -1538,6 +1624,85 @@ class _RecoveryMixin:
         contract_file.parent.mkdir(parents=True, exist_ok=True)
         contract_file.write_text(contract_yaml, encoding="utf-8")
 
+    def _restore_worker_contract_after_recovery(
+        self, ws: Path, wo_id: str, state: RunState | None = None
+    ) -> None:
+        """Ensure the contract for a redispatched work order is assigned to the worker,
+        not left with transitional architect repair authorization.
+        """
+        agent = self._agent_for_wo(wo_id, ws)
+        contract_file = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+
+        # 1. Try restoring the saved original contract if it belonged to the worker
+        if state and getattr(state, "repair_context", None):
+            orig = state.repair_context.get("original_contract")
+            if isinstance(orig, dict) and str(orig.get("agent_id", "")).lower().strip() == str(agent).lower().strip():
+                try:
+                    contract_file.parent.mkdir(parents=True, exist_ok=True)
+                    contract_file.write_text(yaml.safe_dump(orig, sort_keys=False), encoding="utf-8")
+                    return
+                except Exception:
+                    pass
+
+        # 2. If the contract on disk exists and has a mismatched agent_id (e.g. claude from repair)
+        # or needs deliverable scope reinforcement:
+        data: dict[str, Any] = {}
+        if contract_file.is_file():
+            try:
+                loaded = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+
+        if not data:
+            data = {
+                "schema_version": 1,
+                "agent_id": agent,
+                "work_order": wo_id,
+                "identity": {"role": self._role_for_agent(agent), "reports_to": "claude"},
+                "scope": {"allow": [], "deny": [{"module": ".git/**"}], "write": "read-write"},
+                "budget": {"max_files_touched": 20, "max_tokens": 50000},
+            }
+        else:
+            data["agent_id"] = agent
+            ident = data.setdefault("identity", {})
+            if isinstance(ident, dict):
+                ident["role"] = self._role_for_agent(agent)
+                ident["reports_to"] = "claude"
+            if data.get("synthesized_by") == "recovery-repair":
+                data.pop("synthesized_by", None)
+            data["normalized_by"] = "recovery-redispatch"
+
+        # 3. Ensure work order deliverables and expected files are in scope.allow
+        scope = data.setdefault("scope", {})
+        allow_list = scope.setdefault("allow", [])
+        existing_modules = {r.get("module") for r in allow_list if isinstance(r, dict)}
+
+        from validators.harness import review_gate
+        wo_data = review_gate.load_wo(ws, wo_id)
+        deliv_paths = review_gate.wo_deliverable_paths(wo_data)
+        for dp in deliv_paths:
+            if dp and dp not in existing_modules:
+                allow_list.append({"module": dp})
+                existing_modules.add(dp)
+
+        est = wo_data.get("implementation_estimate") or {}
+        for ef in est.get("expected_files") or []:
+            if ef and ef not in existing_modules:
+                allow_list.append({"module": ef})
+                existing_modules.add(ef)
+
+        inbox_mod = f".sync/inbox/{agent}/**"
+        if inbox_mod not in existing_modules:
+            allow_list.append({"module": inbox_mod})
+
+        try:
+            contract_file.parent.mkdir(parents=True, exist_ok=True)
+            contract_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        except Exception:
+            pass
+
     def _archive_stale_inbox_notices(self, ws: Path) -> None:
         """Move stale completion/review notices out of agent inboxes when their
         work order is no longer active.
@@ -1675,6 +1840,7 @@ class _RecoveryMixin:
         self._archive_verdicts_for_wo(wo_id, ws)
         self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         if redispatch:
+            self._restore_worker_contract_after_recovery(ws, wo_id, state)
             agent = self._agent_for_wo(wo_id, ws)
             try:
                 self.manager.start_turn(
