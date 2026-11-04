@@ -17,6 +17,35 @@ from .models import (
     LLMRequest,
 )
 
+
+def _is_plan_task(
+    *,
+    is_architecture: bool,
+    is_delivery_status: bool,
+    is_authoring_task: bool,
+    is_integration_review: bool,
+    deliverable_path: Any,
+    work_order_id: Any,
+    title: Any,
+    body: Any,
+) -> bool:
+    """Classify a task as the PLAN.md planning turn.
+
+    Structural signals (deliverable path, WO-000) apply to any agent. Free-text mentions
+    of PLAN.md only count for the architect: QA and worker prompts routinely reference
+    PLAN.md without being planning turns, and must not receive planning tools or the
+    PLAN.md write-back.
+    """
+    if is_delivery_status or is_authoring_task or is_integration_review:
+        return False
+    path = str(deliverable_path or "").replace("\\", "/").strip()
+    if path in ("PLAN.md", ".sync/playbook/PLAN.md") or path.endswith("/PLAN.md"):
+        return True
+    if work_order_id == "WO-000":
+        return True
+    return bool(is_architecture and ("PLAN.md" in str(title or "") or "PLAN.md" in str(body or "")))
+
+
 class _CompletionMixin:
     """LLM request assembly and completion handling (_complete_request)."""
 
@@ -138,18 +167,15 @@ class _CompletionMixin:
                 )
             )
         )
-        deliv_p = str(request.task.deliverable_path or "").replace("\\", "/").strip()
-        is_plan_task = (
-            not is_delivery_status
-            and not is_authoring_task
-            and not is_integration_review
-            and (
-                deliv_p in ("PLAN.md", ".sync/playbook/PLAN.md")
-                or deliv_p.endswith("/PLAN.md")
-                or getattr(request.task, "work_order_id", None) == "WO-000"
-                or 'PLAN.md' in (request.task.title or "")
-                or 'PLAN.md' in (request.task.body or "")
-            )
+        is_plan_task = _is_plan_task(
+            is_architecture=is_architecture,
+            is_delivery_status=is_delivery_status,
+            is_authoring_task=is_authoring_task,
+            is_integration_review=is_integration_review,
+            deliverable_path=request.task.deliverable_path,
+            work_order_id=getattr(request.task, "work_order_id", None),
+            title=request.task.title,
+            body=request.task.body,
         )
         task_phase = (
             "planning" if is_plan_task
@@ -286,6 +312,32 @@ class _CompletionMixin:
                 "to the Product Delivery Status prompt feature rules. Include executive goal fulfillment, architecture & components, "
                 "release manifest, verification proof, and getting started instructions.\n"
             )
+        elif is_architecture and is_plan_task:
+            system_msg = (
+                "You are Claude, the Senior Architect for StackMind CLI in the PLANNING PHASE (Turn 1 / Plan Formulation).\n"
+                "Your objective in this turn is to research the codebase and domain, align system design, and author the three living blueprint artifacts in `.sync/playbook/`:\n"
+                "  1. `.sync/playbook/ARCHITECTURE.md` (System architecture, tech stack, directory & module structure, contracts)\n"
+                "  2. `.sync/playbook/DESIGN.md` (UI/UX design, layout, color palette, typography, component hierarchy, accessibility)\n"
+                "  3. `.sync/playbook/PLAN.md` (Project overview, phases, sequential milestones with assigned worker roles, verification gates)\n\n"
+                "MANDATORY TURN 1 BOUNDARIES & WORKFLOW:\n"
+                "1. FIRST ACTION: Call `query_graph` to inspect existing project architecture, files, and dependencies.\n"
+                "2. DOMAIN RESEARCH: Use `web_search`, `image_search`, `web_fetch`, or `skill_retrieve` if external best practices or asset intelligence are needed.\n"
+                "3. AUTHOR PLAYBOOK ARTIFACTS: Author `.sync/playbook/ARCHITECTURE.md`, `.sync/playbook/DESIGN.md`, and `.sync/playbook/PLAN.md` via `write_file` or `batch_write_files`.\n"
+                "4. DO NOT WRITE WORK ORDERS OR CONTRACTS IN THIS TURN: Do NOT create `.sync/work-orders/ACTIVE/WO-xxx.yaml`, `.sync/contracts/WO-xxx.yaml`, or `.sync/work-orders/INDEX.yaml`. Individual work orders and contracts are authored in Turn 2 only after the operator reviews and approves the plan via `:approve`.\n"
+                "5. DO NOT DELEGATE TASKS IN THIS TURN: Worker agents must NOT be dispatched before the operator approves the plan. Focus exclusively on the three playbook artifacts.\n"
+                "6. When all three playbook artifacts are authored, return the final HarnessDecision as JSON."
+            )
+            try:
+                from validators.kernel.incidents import format_incidents_for_prompt
+                from validators.kernel.permission_matrix import get_permission_matrix_prompt
+                perm_prompt = get_permission_matrix_prompt(self.agent, phase=task_phase)
+                if perm_prompt:
+                    system_msg = f"{system_msg}\n\n{perm_prompt}"
+                incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
+                if incidents_prompt:
+                    system_msg = f"{system_msg}\n\n{incidents_prompt}"
+            except Exception:
+                pass
         elif request.task.kind == 'adhoc':
             system_msg = self._build_adhoc_system_message()
             raw_context = getattr(request.context, 'text', '') if request.context else ''
@@ -307,7 +359,7 @@ class _CompletionMixin:
             try:
                 from validators.kernel.incidents import format_incidents_for_prompt
                 from validators.kernel.permission_matrix import get_permission_matrix_prompt
-                perm_prompt = get_permission_matrix_prompt(self.agent)
+                perm_prompt = get_permission_matrix_prompt(self.agent, phase=task_phase)
                 if perm_prompt:
                     system_msg = f"{system_msg}\n\n{perm_prompt}"
                 incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
@@ -320,7 +372,7 @@ class _CompletionMixin:
             try:
                 from validators.kernel.incidents import format_incidents_for_prompt
                 from validators.kernel.permission_matrix import get_permission_matrix_prompt
-                perm_prompt = get_permission_matrix_prompt(self.agent)
+                perm_prompt = get_permission_matrix_prompt(self.agent, phase=task_phase)
                 if perm_prompt:
                     system_msg = f"{system_msg}\n\n{perm_prompt}"
                 incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
@@ -343,7 +395,7 @@ class _CompletionMixin:
             try:
                 from validators.kernel.incidents import format_incidents_for_prompt
                 from validators.kernel.permission_matrix import get_permission_matrix_prompt
-                perm_prompt = get_permission_matrix_prompt(self.agent)
+                perm_prompt = get_permission_matrix_prompt(self.agent, phase=task_phase)
                 if perm_prompt:
                     system_msg = f"{system_msg}\n\n{perm_prompt}"
                 incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)
@@ -381,7 +433,7 @@ class _CompletionMixin:
             try:
                 from validators.kernel.incidents import format_incidents_for_prompt
                 from validators.kernel.permission_matrix import get_permission_matrix_prompt
-                perm_prompt = get_permission_matrix_prompt(self.agent)
+                perm_prompt = get_permission_matrix_prompt(self.agent, phase=task_phase)
                 if perm_prompt:
                     system_msg = f"{system_msg}\n\n{perm_prompt}"
                 incidents_prompt = format_incidents_for_prompt(self.project_path, self.agent)

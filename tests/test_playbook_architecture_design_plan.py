@@ -246,9 +246,88 @@ def test_worker_task_contract_grounding(tmp_path: Path):
 
 
 def test_planning_core_tool_names_include_skills_and_search():
-    """Architect's planning tools must include skill retrieval and web search."""
+    """Architect's planning tools must include skill retrieval and web search, but exclude delegation."""
     assert "skill_retrieve" in PLANNING_CORE_TOOL_NAMES
     assert "skill_list" in PLANNING_CORE_TOOL_NAMES
     assert "web_search" in PLANNING_CORE_TOOL_NAMES
     assert "web_fetch" in PLANNING_CORE_TOOL_NAMES
     assert "image_search" in PLANNING_CORE_TOOL_NAMES
+    assert "delegate_task" not in PLANNING_CORE_TOOL_NAMES
+
+
+def test_planning_permission_directive_scopes_to_playbook():
+    """Planning phase prompt must strictly direct architect to playbook artifacts."""
+    from validators.kernel.permission_matrix import get_permission_matrix_prompt
+
+    prompt = get_permission_matrix_prompt("claude", phase="planning")
+    assert "PLANNING PHASE / TURN 1" in prompt
+    assert ".sync/playbook/ARCHITECTURE.md" in prompt
+    assert ".sync/playbook/DESIGN.md" in prompt
+    assert ".sync/playbook/PLAN.md" in prompt
+    assert "DO NOT WRITE WORK ORDERS OR CONTRACTS IN THIS TURN" in prompt
+    assert "Do NOT attempt to delegate tasks before plan approval" in prompt
+
+
+def test_work_order_alias_and_deliverable_normalization():
+    """Work orders with shorthand agent and missing deliverable description must normalize."""
+    from validators.harness.authoring_yaml import normalize_work_order_data
+    from validators.harness.authoring_gate import AuthoringGate
+
+    raw = {
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Project Scaffolding",
+        "status": "READY",
+        "priority": "P1",
+        "dependencies": [],
+        "agent": "codex",
+        "deliverable": {
+            "path": "package.json",
+            "type": "config",
+        },
+    }
+    normalized = normalize_work_order_data(raw)
+    assert normalized["assigned_agents"] == ["codex"]
+    assert normalized["deliverable"]["description"] == "Deliverable for Project Scaffolding"
+    assert normalized["dependencies"] == []
+    assert normalized["priority"] == "P1"
+    assert normalized["status"] == "READY"
+
+    gate = AuthoringGate()
+    decision = gate.validate_artifact_content(
+        ".sync/work-orders/ACTIVE/WO-001.yaml",
+        yaml.safe_dump(raw),
+        agent="claude",
+    )
+    assert decision.passed is True, f"Validation failed: {decision.errors}"
+
+
+def test_index_yaml_normalization_and_gate_validation():
+    """INDEX.yaml missing schema_version, next_id, and using work_orders must normalize and pass."""
+    from validators.harness.authoring_gate import AuthoringGate
+
+    raw_index = {
+        "work_orders": [
+            {
+                "id": "WO-001",
+                "title": "Scaffolding",
+                "status": "READY",
+                "agent": "codex",
+                "deliverable": {"path": "package.json", "type": "config"},
+            }
+        ]
+    }
+    gate = AuthoringGate()
+    decision = gate.validate_artifact_content(
+        ".sync/work-orders/INDEX.yaml",
+        yaml.safe_dump(raw_index),
+        agent="claude",
+    )
+    assert decision.passed is True, f"Validation failed: {decision.errors}"
+    assert decision.normalized_content is not None
+    loaded = yaml.safe_load(decision.normalized_content)
+    assert loaded["schema_version"] == 1
+    assert loaded["next_id"] == 2
+    assert "orders" in loaded
+    assert len(loaded["orders"]) == 1
+    assert loaded["orders"][0]["assigned_agents"] == ["codex"]

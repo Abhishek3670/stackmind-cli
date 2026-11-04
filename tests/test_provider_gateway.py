@@ -479,7 +479,7 @@ def test_get_curated_tools_for_phase():
     for name in AUTHORING_CORE_TOOL_NAMES:
         assert name in authoring_names
     assert "request_tools" in authoring_names
-    assert len(authoring_tools) <= 4
+    assert len(authoring_tools) <= len(AUTHORING_CORE_TOOL_NAMES) + 1
 
     # Investigation / general architecture phase
     arch_tools = get_curated_tools_for_phase("claude", phase=None)

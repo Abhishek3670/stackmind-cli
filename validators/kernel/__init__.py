@@ -64,6 +64,7 @@ from .incidents import (
 )
 from .permission_matrix import (
     ARCHITECT_PERMISSION_DIRECTIVE,
+    ARCHITECT_PLANNING_PERMISSION_DIRECTIVE,
     PERMISSION_MATRIX_TABLE,
     get_permission_matrix_prompt,
 )

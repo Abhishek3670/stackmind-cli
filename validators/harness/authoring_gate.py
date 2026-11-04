@@ -241,7 +241,14 @@ class AuthoringGate:
                 except Exception:
                     pass
         elif artifact_type == "index":
+            from .authoring_yaml import normalize_index_data
+            data = normalize_index_data(data, project_root=effective_root)
             self._validate_index(norm_path, data, errors)
+            if not errors:
+                try:
+                    normalized_content = yaml.safe_dump(data, sort_keys=False)
+                except Exception:
+                    pass
         else:
             # Not a governed work-order or contract
             pass

@@ -62,13 +62,33 @@ You are the **Lead Architect**. Under StackMind governance rules:
 """
 
 
-def get_permission_matrix_prompt(role: str | None = None) -> str:
+ARCHITECT_PLANNING_PERMISSION_DIRECTIVE = """
+### 🔴 CRITICAL ARCHITECT BOUNDARY RULES (PLANNING PHASE / TURN 1):
+You are the **Lead Architect** in the Planning Phase (Turn 1). Under StackMind governance rules:
+1. 🔴 **DO NOT DIRECTLY WRITE APPLICATION CODE**: You cannot write `assets/**`, `src/**`, or `*.html`/`*.css`/`*.js` files. Any attempt to call `write_file` on application code will be BLOCKED by runtime security.
+2. 🔴 **DO NOT RUN SHELL COMMANDS**: Tools like `bash`, `mkdir`, `grep`, and `ls` are strictly DENIED for the Architect.
+   - To inspect file contents, ALWAYS use `read_file(target='...')`.
+   - To inspect directory structure, use `list_directory(target='...')` or `query_graph(query='...')`.
+3. 🟢 **YOUR SOLE AUTHORIZED DELIVERABLES IN THIS TURN**: The three Playbook artifacts in `.sync/playbook/`:
+   - `.sync/playbook/ARCHITECTURE.md` (System architecture, tech stack, directory & module structure, contracts)
+   - `.sync/playbook/DESIGN.md` (UI/UX design, visual tone, color palette, typography, layout grid)
+   - `.sync/playbook/PLAN.md` (Living roadmap with numbered milestones, assigned agents, and acceptance gates)
+4. 🔴 **DO NOT WRITE WORK ORDERS OR CONTRACTS IN THIS TURN**: Do NOT create `.sync/work-orders/ACTIVE/WO-xxx.yaml`, `.sync/contracts/WO-xxx.yaml`, or `.sync/work-orders/INDEX.yaml`.
+   - Individual child work orders and contracts will be authored in Turn 2 (Authoring Phase) only after the human operator reviews and approves the plan (`:approve`).
+   - Do NOT attempt to delegate tasks before plan approval.
+"""
+
+
+def get_permission_matrix_prompt(role: str | None = None, phase: str | None = None) -> str:
     """Generate the permission matrix and role-specific directive for agent prompt injection."""
     clean_role = (role or "").strip().lower()
     blocks = [PERMISSION_MATRIX_TABLE.strip()]
 
     if clean_role in ("claude", "architect", "architecture"):
-        blocks.append(ARCHITECT_PERMISSION_DIRECTIVE.strip())
+        if phase == "planning":
+            blocks.append(ARCHITECT_PLANNING_PERMISSION_DIRECTIVE.strip())
+        else:
+            blocks.append(ARCHITECT_PERMISSION_DIRECTIVE.strip())
     elif clean_role in ("gemini", "frontend"):
         blocks.append(
             "### 🟢 ROLE DIRECTIVE: FRONTEND SPECIALIST\n"
@@ -130,6 +150,7 @@ def get_permission_matrix_prompt(role: str | None = None) -> str:
 
 __all__ = [
     "ARCHITECT_PERMISSION_DIRECTIVE",
+    "ARCHITECT_PLANNING_PERMISSION_DIRECTIVE",
     "PERMISSION_MATRIX_TABLE",
     "get_permission_matrix_prompt",
 ]

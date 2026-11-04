@@ -212,6 +212,10 @@ def normalize_work_order_data(
         cleaned_type = raw_type.strip().upper()
         if cleaned_type in WO_TYPE_MAP:
             data["type"] = WO_TYPE_MAP[cleaned_type]
+        else:
+            data["type"] = cleaned_type
+    elif not raw_type:
+        data["type"] = "FEATURE"
 
     # Normalize deliverable.type and deliverables[].type
     DELIVERABLE_TYPE_MAP = {
@@ -229,11 +233,42 @@ def normalize_work_order_data(
         "configuration": "config",
         "conf": "config",
     }
-    deliverable = data.get("deliverable")
-    if isinstance(deliverable, dict):
-        dtype = deliverable.get("type")
+    raw_deliv = data.get("deliverable")
+    if isinstance(raw_deliv, str) and raw_deliv.strip():
+        p = raw_deliv.strip()
+        dtype = "doc" if p.endswith((".md", ".txt", ".rst")) else ("config" if p.endswith((".json", ".yaml", ".yml", ".toml")) else "code")
+        data["deliverable"] = {
+            "path": p,
+            "type": dtype,
+            "description": data.get("description") or f"Deliverable {p} for {data.get('title', 'work order')}",
+        }
+    elif isinstance(raw_deliv, dict):
+        deliv = raw_deliv
+        dtype = deliv.get("type")
         if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
-            deliverable["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+            deliv["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+        elif not dtype or not isinstance(dtype, str):
+            p = str(deliv.get("path", "")).strip()
+            deliv["type"] = "doc" if p.endswith((".md", ".txt", ".rst")) else ("config" if p.endswith((".json", ".yaml", ".yml", ".toml")) else "code")
+        if not deliv.get("description") or not str(deliv.get("description")).strip():
+            deliv["description"] = data.get("description") or f"Deliverable for {data.get('title', data.get('id', 'work order'))}"
+    elif not raw_deliv:
+        delivs = data.get("deliverables")
+        if isinstance(delivs, list) and delivs and isinstance(delivs[0], dict):
+            first = dict(delivs[0])
+            dtype = first.get("type")
+            if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+                first["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+            elif not dtype:
+                first["type"] = "code"
+            if not first.get("description"):
+                first["description"] = data.get("description") or f"Deliverable for {data.get('title', 'work order')}"
+            data["deliverable"] = first
+        else:
+            data["deliverable"] = {
+                "type": "code",
+                "description": data.get("description") or f"Deliverable for {data.get('title', data.get('id', 'work order'))}",
+            }
 
     deliverables = data.get("deliverables")
     if isinstance(deliverables, list):
@@ -294,15 +329,57 @@ def normalize_work_order_data(
     elif isinstance(ac, list):
         data["acceptance_criteria"] = [str(x).strip() for x in ac if str(x).strip()]
 
-    # Normalize assigned_agents to list[str] if string
+    # Normalize assigned_agents
+    if not data.get("assigned_agents"):
+        for alias_key in ("agent", "assigned_agent", "owner", "assigned_to", "assignee", "assigned"):
+            val = data.get(alias_key)
+            if isinstance(val, str) and val.strip():
+                data["assigned_agents"] = [val.strip()]
+                break
+            elif isinstance(val, list) and val:
+                data["assigned_agents"] = [str(x).strip() for x in val if str(x).strip()]
+                break
     assigned = data.get("assigned_agents")
     if isinstance(assigned, str) and assigned.strip():
         data["assigned_agents"] = [assigned.strip()]
+    elif isinstance(assigned, list):
+        data["assigned_agents"] = [str(x).strip() for x in assigned if str(x).strip()]
+    if not data.get("assigned_agents"):
+        deliv = data.get("deliverable")
+        path_str = str(deliv.get("path") if isinstance(deliv, dict) else (deliv or "")).lower()
+        wo_type = str(data.get("type", "")).upper()
+        if wo_type == "VALIDATION":
+            data["assigned_agents"] = ["gemma"]
+        elif any(ext in path_str for ext in (".html", ".css", "assets/", "style", "ui")):
+            data["assigned_agents"] = ["gemini"]
+        elif wo_type in ("AUDIT", "RESEARCH") or any(ext in path_str for ext in ("version", "changelog", "readme")):
+            data["assigned_agents"] = ["local-llm"]
+        else:
+            data["assigned_agents"] = ["codex"]
 
-    # Normalize dependencies to list[str] if string
+    # Normalize dependencies
     deps = data.get("dependencies")
     if isinstance(deps, str):
         data["dependencies"] = [deps.strip()] if deps.strip() else []
+    elif isinstance(deps, list):
+        data["dependencies"] = [str(x).strip() for x in deps if str(x).strip()]
+
+    # Normalize priority
+    pri = data.get("priority")
+    if isinstance(pri, str):
+        pri_clean = pri.strip().upper()
+        if pri_clean in ("P0", "P1", "P2", "P3"):
+            data["priority"] = pri_clean
+
+    # Normalize status
+    stat = data.get("status")
+    if isinstance(stat, str):
+        stat_clean = stat.strip().upper()
+        if stat_clean == "IN_PROGRESS":
+            stat_clean = "ACTIVE"
+        elif stat_clean == "DONE":
+            stat_clean = "COMPLETED"
+        data["status"] = stat_clean
 
     # Normalize revision to integer if numeric string
     if "revision" in data and not isinstance(data["revision"], int):
@@ -505,6 +582,58 @@ def normalize_contract_data(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def normalize_index_data(
+    data: dict[str, Any], project_root: Path | None = None
+) -> dict[str, Any]:
+    """Normalize common LLM shorthand/structure issues in work order index dictionaries."""
+    if not isinstance(data, dict):
+        return data
+
+    if "schema_version" not in data:
+        data["schema_version"] = 1
+    elif not isinstance(data["schema_version"], int):
+        try:
+            data["schema_version"] = int(data["schema_version"])
+        except Exception:
+            data["schema_version"] = 1
+
+    # Map work_orders / items / orders_list -> orders
+    if "orders" not in data:
+        if isinstance(data.get("work_orders"), list):
+            data["orders"] = data.pop("work_orders")
+        elif isinstance(data.get("items"), list):
+            data["orders"] = data.pop("items")
+        elif isinstance(data.get("orders_list"), list):
+            data["orders"] = data.pop("orders_list")
+        else:
+            data["orders"] = []
+
+    if isinstance(data.get("orders"), list):
+        clean_orders = []
+        for o in data["orders"]:
+            if isinstance(o, dict):
+                o = normalize_work_order_data(o, project_root=project_root)
+                if "id" not in o and "wo_id" in o:
+                    o["id"] = o.pop("wo_id")
+                if "status" not in o:
+                    o["status"] = "READY"
+                if "title" not in o:
+                    o["title"] = f"Work Order {o.get('id', '')}".strip()
+                clean_orders.append(o)
+        data["orders"] = clean_orders
+
+    if "next_id" not in data or not isinstance(data.get("next_id"), int):
+        max_id = 0
+        for o in data.get("orders", []):
+            if isinstance(o, dict) and "id" in o:
+                m = re.search(r"(\d+)", str(o["id"]))
+                if m:
+                    max_id = max(max_id, int(m.group(1)))
+        data["next_id"] = max_id + 1
+
+    return data
+
+
 def validate_artifact_content(
     rel_path: str,
     content: str,
@@ -612,12 +741,12 @@ def validate_artifact_content(
             except Exception:
                 pass
     elif artifact_type == "index":
-        if isinstance(data, dict):
-            wos = data.get("work_orders")
-            if isinstance(wos, list):
-                for wo in wos:
-                    if isinstance(wo, dict):
-                        normalize_work_order_data(wo, project_root=project_root)
+        data = normalize_index_data(data, project_root=project_root)
+        if not errors:
+            try:
+                normalized_content = yaml.safe_dump(data, sort_keys=False)
+            except Exception:
+                pass
     else:
         pass
 
