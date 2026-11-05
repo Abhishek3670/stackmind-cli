@@ -763,10 +763,12 @@ def verify_work_order_deliverables(
             pass
 
     if peer_paths and declared_paths:
+        primary_deliv_raw = (wo_data.get("deliverable") or {}).get("path") if isinstance(wo_data.get("deliverable"), dict) else wo_data.get("deliverable")
+        primary_deliv = str(primary_deliv_raw).replace("\\", "/").strip().lstrip("/").lower() if primary_deliv_raw else None
         filtered_paths = []
         for p in declared_paths:
             norm_p = str(p).replace("\\", "/").strip().lstrip("/").lower()
-            if norm_p not in peer_paths:
+            if (primary_deliv and norm_p == primary_deliv) or norm_p not in peer_paths:
                 filtered_paths.append(p)
         declared_paths = filtered_paths
 

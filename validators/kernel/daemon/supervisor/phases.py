@@ -954,8 +954,12 @@ class _PhasesMixin:
 
             # Completed with deliverable on disk — check QA verdict (developer work orders only;
             # QA work orders produce verdicts and are never subject to QA review on themselves).
+            from validators.harness import review_gate as _review_gate
+            wo_data = _review_gate.load_wo(ws, wo_id)
             if (
-                self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
+                _review_gate.requires_qa(ws, wo_id, wo_data)
+                and not _review_gate.is_qa_work_order(wo_data)
+                and self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
                 and self._check_qa_verdict(wo_id, ws) == "NEEDS_CHANGES"
             ):
                 reworks = state.qa_reworks.get(wo_id, 0)

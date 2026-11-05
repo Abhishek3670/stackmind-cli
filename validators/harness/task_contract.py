@@ -58,7 +58,7 @@ def _is_glob(pattern: str) -> bool:
 
 
 def collect_peer_deliverables(workspace: Path | str, own_wo_id: str | None) -> list[tuple[str, str]]:
-    """Deliverable paths declared by OTHER active or completed work orders: (wo_id, path)."""
+    """Deliverable paths declared by OTHER active work orders: (wo_id, path)."""
     ws = Path(workspace)
     peers: list[tuple[str, str]] = []
     seen_pairs: set[tuple[str, str]] = set()
@@ -75,13 +75,27 @@ def collect_peer_deliverables(workspace: Path | str, own_wo_id: str | None) -> l
                 peers.append((wo_stem, pv))
                 seen_pairs.add((wo_stem, pv))
 
-    # 1. Scan ACTIVE and COMPLETED work orders
-    for folder in ("ACTIVE", "COMPLETED"):
-        wo_dir = ws / ".sync" / "work-orders" / folder
-        if not wo_dir.is_dir():
-            continue
+    # Read INDEX.yaml if available to determine definitive work order statuses
+    index_status: dict[str, str] = {}
+    index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
+    if index_path.is_file():
+        try:
+            index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+            if isinstance(index_data, dict):
+                for order in index_data.get("orders") or []:
+                    if isinstance(order, dict) and order.get("id"):
+                        index_status[str(order["id"])] = str(order.get("status", "")).upper()
+        except Exception:
+            pass
+
+    # Scan ACTIVE work orders (completed work orders do not lock deliverables from future tasks)
+    wo_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    if wo_dir.is_dir():
         for wo_file in sorted(wo_dir.glob("*.yaml")):
-            if wo_file.stem == own_wo_id or wo_file.stem in _PLANNING_WO_IDS:
+            wo_stem = wo_file.stem
+            if wo_stem == own_wo_id or wo_stem in _PLANNING_WO_IDS:
+                continue
+            if index_status.get(wo_stem) in ("CANCELLED", "SUPERSEDED", "COMPLETED"):
                 continue
             try:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
@@ -90,27 +104,11 @@ def collect_peer_deliverables(workspace: Path | str, own_wo_id: str | None) -> l
             if not isinstance(data, dict):
                 continue
             status = str(data.get("status", "")).upper()
-            if status in ("CANCELLED", "SUPERSEDED"):
+            if status in ("CANCELLED", "SUPERSEDED", "COMPLETED"):
                 continue
-            _add_deliv(wo_file.stem, data.get("deliverable"))
+            _add_deliv(wo_stem, data.get("deliverable"))
             for extra in (data.get("deliverables") or []):
-                _add_deliv(wo_file.stem, extra)
-
-    # 2. Check contracts directory as fallback
-    contracts_dir = ws / ".sync" / "contracts"
-    if contracts_dir.is_dir():
-        for c_file in sorted(contracts_dir.glob("*.yaml")):
-            wo_stem = c_file.stem
-            if wo_stem == own_wo_id or wo_stem in _PLANNING_WO_IDS:
-                continue
-            try:
-                c_data = yaml.safe_load(c_file.read_text(encoding="utf-8"))
-                if isinstance(c_data, dict):
-                    c_deliv = c_data.get("deliverable") or c_data.get("deliverable_path")
-                    if c_deliv:
-                        _add_deliv(wo_stem, c_deliv)
-            except Exception:
-                pass
+                _add_deliv(wo_stem, extra)
 
     return peers
 
@@ -482,34 +480,39 @@ def compile_worker_task_contract(
         deliv_wo_path = deliv_from_wo
     else:
         deliv_wo_path = None
-    deliverable = _norm(getattr(task, "deliverable_path", None) or deliv_wo_path)
-    peers = collect_peer_deliverables(workspace, getattr(task, "work_order_id", None))
-    peer_dict = {p: wo for wo, p in peers if not _is_glob(p)}
 
-    # Single Deliverable Ownership enforcement:
-    # If candidate deliverable is actually owned by a peer work order,
-    # prevent peer deliverable leakage into this worker's contract.
     assigned_agents = [str(a).lower().strip() for a in ((wo_data or {}).get("assigned_agents") or [])]
     worker_agent = str(getattr(task, "agent_id", "") or (assigned_agents[0] if assigned_agents else "")).lower()
     worker_role = str(getattr(task, "role", "") or (contract_data or {}).get("identity", {}).get("role", "")).lower()
 
-    if deliverable and deliverable in peer_dict:
-        replacement_deliv = None
-        for extra in (wo_data or {}).get("deliverables") or []:
-            ep = _norm(extra.get("path") if isinstance(extra, dict) else extra)
-            if ep and ep not in peer_dict:
-                replacement_deliv = ep
-                break
-        if not replacement_deliv:
-            if worker_role in ("backend", "server") or worker_agent == "codex":
-                replacement_deliv = "package.json" if (Path(workspace) / "package.json").is_file() else "src/backend.py"
-            elif worker_role in ("frontend", "ui") or worker_agent == "gemini":
-                replacement_deliv = "index.html"
-            elif worker_role in ("qa", "test") or worker_agent == "gemma":
-                replacement_deliv = "tests/test_qa_verification.py"
-            elif worker_role in ("gitops", "release") or worker_agent == "local-llm":
-                replacement_deliv = "VERSION.md"
-        deliverable = replacement_deliv or ""
+    peers = collect_peer_deliverables(workspace, getattr(task, "work_order_id", None))
+    peer_dict = {p: wo for wo, p in peers if not _is_glob(p)}
+
+    if deliv_wo_path:
+        # Deliverable explicitly declared in work order definition is authoritative!
+        deliverable = _norm(deliv_wo_path)
+    else:
+        # Fallback to task.deliverable_path, checking for peer deliverable leakage
+        candidate = _norm(getattr(task, "deliverable_path", None))
+        if candidate and candidate in peer_dict:
+            replacement_deliv = None
+            for extra in (wo_data or {}).get("deliverables") or []:
+                ep = _norm(extra.get("path") if isinstance(extra, dict) else extra)
+                if ep and ep not in peer_dict:
+                    replacement_deliv = ep
+                    break
+            if not replacement_deliv:
+                if worker_role in ("backend", "server") or worker_agent == "codex":
+                    replacement_deliv = "package.json" if (Path(workspace) / "package.json").is_file() else "src/backend.py"
+                elif worker_role in ("frontend", "ui") or worker_agent == "gemini":
+                    replacement_deliv = "index.html"
+                elif worker_role in ("qa", "test") or worker_agent == "gemma":
+                    replacement_deliv = "tests/test_qa_verification.py"
+                elif worker_role in ("gitops", "release") or worker_agent == "local-llm":
+                    replacement_deliv = "VERSION.md"
+            deliverable = replacement_deliv or ""
+        else:
+            deliverable = candidate or ""
 
     peer_files = sorted({p for _wo, p in peers if not _is_glob(p) and p != deliverable})
     peer_prefixes = sorted({p.rstrip("/") + "/" for _wo, p in peers if _is_glob(p) or p.endswith("/")})
@@ -815,9 +818,14 @@ class TaskOwnership:
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> "TaskOwnership":
         budget = (contract.get("file_budget") or {}).get("max_files_touched") or 0
+        deliv = _norm((contract.get("your_deliverable") or {}).get("path"))
+        ro_files = tuple(
+            _norm(p) for p in contract.get("read_only_files") or []
+            if _norm(p) and _norm(p) != deliv
+        )
         return cls(
-            deliverable=_norm((contract.get("your_deliverable") or {}).get("path")),
-            read_only_files=tuple(_norm(p) for p in contract.get("read_only_files") or []),
+            deliverable=deliv,
+            read_only_files=ro_files,
             read_only_prefixes=tuple(_norm(p).rstrip("/") + "/" for p in contract.get("read_only_prefixes") or []),
             file_budget=int(budget),
         )
@@ -826,6 +834,9 @@ class TaskOwnership:
         """Return a denial reason for this write, or None when allowed."""
         path = _norm(path_value)
         if not path:
+            return None
+        # Deliverable is ALWAYS allowed to be written by its owner
+        if self.deliverable and path == self.deliverable:
             return None
         if path in self.read_only_files or any(path.startswith(p) for p in self.read_only_prefixes):
             owner_hint = (

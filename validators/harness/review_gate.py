@@ -149,6 +149,9 @@ def is_qa_work_order(data: dict[str, Any]) -> bool:
     wo_type = str(data.get("type", "")).upper().strip()
     if wo_type in ("QA", "TEST", "VERIFICATION", "VALIDATION"):
         return True
+    title = str(data.get("title", "")).lower()
+    if any(k in title for k in ("qa review", "qa verification", "e2e test", "test suite", "verify ")):
+        return True
     paths = wo_deliverable_paths(data)
     if paths and all(str(p).replace("\\", "/").startswith(("tests/", "test/")) for p in paths):
         return True

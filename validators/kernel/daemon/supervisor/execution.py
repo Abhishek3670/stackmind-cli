@@ -1840,6 +1840,10 @@ class _ExecutionMixin:
     def _check_qa_verdict(self, wo_id: str, ws: Path) -> str | None:
         """Check for a QA verdict file for a work order. Returns 'APPROVED', 'NEEDS_CHANGES', or None."""
         # QA work orders produce verdicts; they are never subject to QA review on themselves.
+        from validators.harness import review_gate as _review_gate
+        wo_data = _review_gate.load_wo(ws, wo_id)
+        if _review_gate.is_qa_work_order(wo_data):
+            return None
         agent = self._agent_for_wo(wo_id, ws)
         if self._role_for_agent(agent) == "qa":
             return None
@@ -1951,6 +1955,10 @@ class _ExecutionMixin:
 
     def _get_qa_feedback(self, wo_id: str, ws: Path) -> str:
         """Extract QA review feedback text from verdict file if present."""
+        from validators.harness import review_gate as _review_gate
+        wo_data = _review_gate.load_wo(ws, wo_id)
+        if _review_gate.is_qa_work_order(wo_data):
+            return ""
         agent = self._agent_for_wo(wo_id, ws)
         if self._role_for_agent(agent) == "qa":
             return ""

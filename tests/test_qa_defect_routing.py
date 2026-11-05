@@ -843,7 +843,7 @@ def test_qa_json_verdict_ingestion_and_formatting(tmp_path: Path) -> None:
     """A structured JSON QA verdict (.sync/reviews/qa/{wo_id}.json) must be
     ingested and formatted into human-readable Markdown for worker dispatch."""
     import json
-    _write_worker_yaml(tmp_path, "WO-002", "gemini", "tests/test_qa_verification.py")
+    _write_worker_yaml(tmp_path, "WO-002", "gemini", "script.js")
     qa_dir = tmp_path / ".sync" / "reviews" / "qa"
     qa_dir.mkdir(parents=True, exist_ok=True)
     verdict_json = qa_dir / "WO-002.json"
@@ -901,7 +901,7 @@ def test_qa_json_verdict_ingestion_and_formatting(tmp_path: Path) -> None:
 def test_qa_markdown_verdict_with_fail_token_ingested(tmp_path: Path) -> None:
     """A Markdown QA review (.sync/reviews/{wo_id}.md) with Verdict: FAIL
     must be recognized as NEEDS_CHANGES and returned in feedback."""
-    _write_worker_yaml(tmp_path, "WO-002", "gemini", "tests/test_qa_verification.py")
+    _write_worker_yaml(tmp_path, "WO-002", "gemini", "script.js")
     reviews_dir = tmp_path / ".sync" / "reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     review_file = reviews_dir / "WO-002.md"
