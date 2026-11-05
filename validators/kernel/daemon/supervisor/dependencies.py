@@ -907,13 +907,14 @@ def evaluate_dependencies(
                 from validators.harness.review_gate import wo_deliverable_paths
                 delivs = wo_deliverable_paths(dep_dict)
                 if delivs and all((root / d).exists() for d in delivs):
+                    deliv_str = ", ".join(delivs)
                     remediated_obs = PrerequisiteObservation(
                         wo_id=obs.wo_id,
                         bucket=obs.bucket,
                         revision=obs.revision,
                         contract_revision=obs.contract_revision,
                         state=PrerequisiteState.COMPLETED_VALID,
-                        detail=f"prerequisite deliverable present on disk for {wo_type} repair ({", ".join(delivs)})",
+                        detail=f"prerequisite deliverable present on disk for {wo_type} repair ({deliv_str})",
                     )
                     remediated_observations.append(remediated_obs)
                     continue
