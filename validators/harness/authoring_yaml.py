@@ -253,22 +253,34 @@ def normalize_work_order_data(
         if not deliv.get("description") or not str(deliv.get("description")).strip():
             deliv["description"] = data.get("description") or f"Deliverable for {data.get('title', data.get('id', 'work order'))}"
     elif not raw_deliv:
-        delivs = data.get("deliverables")
-        if isinstance(delivs, list) and delivs and isinstance(delivs[0], dict):
-            first = dict(delivs[0])
-            dtype = first.get("type")
-            if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
-                first["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
-            elif not dtype:
-                first["type"] = "code"
-            if not first.get("description"):
-                first["description"] = data.get("description") or f"Deliverable for {data.get('title', 'work order')}"
-            data["deliverable"] = first
+        # Preserve deliverable from existing work order on disk (e.g. during amendment)
+        prior_deliv = None
+        wo_id = data.get("id")
+        if project_root and wo_id:
+            for bucket in ("ACTIVE", "COMPLETED"):
+                cand = Path(project_root) / ".sync" / "work-orders" / bucket / f"{wo_id}.yaml"
+                if cand.is_file():
+                    try:
+                        orig = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                        if isinstance(orig, dict) and orig.get("deliverable"):
+                            prior_deliv = orig["deliverable"]
+                            break
+                    except Exception:
+                        pass
+        if prior_deliv:
+            data["deliverable"] = prior_deliv
         else:
-            data["deliverable"] = {
-                "type": "code",
-                "description": data.get("description") or f"Deliverable for {data.get('title', data.get('id', 'work order'))}",
-            }
+            delivs = data.get("deliverables")
+            if isinstance(delivs, list) and delivs and isinstance(delivs[0], dict):
+                first = dict(delivs[0])
+                dtype = first.get("type")
+                if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+                    first["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+                elif not dtype:
+                    first["type"] = "code"
+                if not first.get("description"):
+                    first["description"] = data.get("description") or f"Deliverable for {data.get('title', 'work order')}"
+                data["deliverable"] = first
 
     deliverables = data.get("deliverables")
     if isinstance(deliverables, list):

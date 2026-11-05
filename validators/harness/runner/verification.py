@@ -465,6 +465,18 @@ class _VerificationMixin:
             )
             self._last_verification_evidence = deliv_evidence
 
+            # If task was dispatched for a specific deliverable, evaluate whether that specific
+            # deliverable passed. Collateral failures on secondary/peer files must not block the turn.
+            if not deliv_passed and task.deliverable_path:
+                task_norm = Path(task.deliverable_path).as_posix().lstrip('/')
+                results_by_path = {
+                    Path(r.get("relative_path", "")).as_posix().lstrip('/'): r.get("passed", False)
+                    for r in deliv_evidence.get("results", [])
+                }
+                if results_by_path.get(task_norm):
+                    deliv_passed = True
+                    deliv_errors = []
+
             has_declared_files = bool(deliv_evidence.get("declared_paths"))
             is_arch_conversational = (
                 str(task.work_order_id) == "WO-000"

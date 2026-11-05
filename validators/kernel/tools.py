@@ -3790,6 +3790,40 @@ class ToolGateway:
             next_idx = get_next_work_order_int(scan_root)
             wo_id = f"WO-{next_idx:03d}"
 
+            # Filter clean_files to respect Single Deliverable Ownership:
+            # 1. Exclude files already owned by other active work orders
+            # 2. Exclude files inappropriate for the assigned role
+            if clean_files:
+                try:
+                    from validators.harness.task_contract import collect_peer_deliverables
+                    peer_delivs = {
+                        p.replace("\\", "/").strip().lstrip("/").lower()
+                        for _, p in collect_peer_deliverables(scan_root, None)
+                    }
+                except Exception:
+                    peer_delivs = set()
+
+                filtered_files = [
+                    f for f in clean_files
+                    if f.replace("\\", "/").strip().lstrip("/").lower() not in peer_delivs
+                ]
+                if canonical_role == "backend":
+                    backend_files = [
+                        f for f in filtered_files
+                        if not f.lower().endswith((".html", ".htm", ".css", ".scss", ".sass", ".less"))
+                        and not f.lower().startswith("assets/css")
+                    ]
+                    filtered_files = backend_files if backend_files else filtered_files
+                elif canonical_role == "frontend":
+                    frontend_files = [
+                        f for f in filtered_files
+                        if not f.lower().endswith((".py", ".sql", ".db", ".sqlite"))
+                        and not f.lower().startswith(("models/", "services/", "routes/", "controllers/"))
+                    ]
+                    filtered_files = frontend_files if frontend_files else filtered_files
+
+                clean_files = filtered_files if filtered_files else clean_files
+
             if clean_files:
                 primary_deliv = clean_files[0]
                 if canonical_role == "qa":
@@ -3804,7 +3838,7 @@ class ToolGateway:
                 deliv_list = [
                     {"path": f, "type": ("test" if canonical_role == "qa" else ("doc" if f.endswith(".md") else "code"))}
                     for f in clean_files
-                ]
+                ] if len(clean_files) > 1 else None
             else:
                 primary_deliv = None
                 deliv_type = "report" if canonical_role == "qa" else "code"

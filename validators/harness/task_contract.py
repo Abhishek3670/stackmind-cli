@@ -72,6 +72,9 @@ def collect_peer_deliverables(workspace: Path | str, own_wo_id: str | None) -> l
             continue
         if not isinstance(data, dict):
             continue
+        status = str(data.get("status", "")).upper()
+        if status in ("CANCELLED", "SUPERSEDED"):
+            continue
         deliverable = data.get("deliverable")
         if isinstance(deliverable, dict):
             path_value = _norm(deliverable.get("path"))
