@@ -23,6 +23,7 @@ class OperationType(str, Enum):
 
     # Editing
     APPLY_PATCH = "apply_patch"
+    EDIT_FILE = "edit_file"
     WRITE_FILE = "write_file"
     BATCH_WRITE_FILES = "batch_write_files"
     MOVE_FILE = "move_file"
@@ -199,6 +200,7 @@ class OperationJournal:
 
 MUTATING_OPERATIONS: frozenset[str] = frozenset({
     OperationType.APPLY_PATCH.value,
+    OperationType.EDIT_FILE.value,
     OperationType.WRITE_FILE.value,
     OperationType.MOVE_FILE.value,
     OperationType.DELETE_FILE.value,

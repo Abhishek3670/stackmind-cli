@@ -47,6 +47,12 @@ class GovernedToolRegistry:
                 ["path", "content"],
             ),
             self._definition(
+                "stackmind.edit_file",
+                "Edit a contract-authorized scratch file by replacing a unique search block",
+                {"path": _STRING, "search_text": _STRING, "replace_text": _STRING},
+                ["path", "search_text", "replace_text"],
+            ),
+            self._definition(
                 "stackmind.run_command",
                 "Run a sandboxed command in the scratch workspace",
                 {"command": {"type": "array", "items": _STRING}},
@@ -112,6 +118,13 @@ class GovernedToolRegistry:
                 self._string(arguments, "path"), self._string(arguments, "content")
             )
             return {"written": True}
+        if name == "stackmind.edit_file":
+            self.gateway.edit_file(
+                self._string(arguments, "path"),
+                self._string(arguments, "search_text"),
+                self._string(arguments, "replace_text"),
+            )
+            return {"edited": True}
         if name == "stackmind.run_command":
             command = arguments.get("command")
             if not isinstance(command, Sequence) or isinstance(command, (str, bytes)):

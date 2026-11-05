@@ -42,13 +42,29 @@ from .models import (
 STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         name="read_file",
-        description="Read the text content of a file located within the scratch workspace.",
+        description="Read the text content of a file located within the scratch workspace. Optionally slice a specific line range using start_line and end_line (1-indexed inclusive).",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path inside workspace"}
+                "path": {"type": "string", "description": "Relative file path inside workspace"},
+                "start_line": {"type": "integer", "description": "Optional 1-indexed starting line number (inclusive)"},
+                "end_line": {"type": "integer", "description": "Optional 1-indexed ending line number (inclusive)"},
+                "line_numbers": {"type": "boolean", "description": "Optional flag to prefix line numbers (default: false)"},
             },
             "required": ["path"],
+        },
+    ),
+    ToolDefinition(
+        name="edit_file",
+        description="Edit an existing file by replacing a unique search_text block with replace_text. Requires search_text to occur exactly once in the target file.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Relative file path inside workspace to edit"},
+                "search_text": {"type": "string", "description": "The exact existing text block to be replaced (must match uniquely)"},
+                "replace_text": {"type": "string", "description": "The new text block that replaces search_text"},
+            },
+            "required": ["target", "search_text", "replace_text"],
         },
     ),
     ToolDefinition(
@@ -1410,6 +1426,7 @@ ARCHITECTURE_ADHOC_TOOL_NAMES = (
 
 WORKER_CODE_CORE_TOOL_NAMES = (
     "read_file",
+    "edit_file",
     "write_file",
     "batch_write_files",
     "apply_patch",
@@ -1518,16 +1535,17 @@ _STREAM_POLL_INTERVAL: float = 0.1
 
 
 def truncate_tool_output(output: str, max_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS) -> str:
-    """Safely truncate tool output if it exceeds max_chars."""
+    """Safely truncate tool output if it exceeds max_chars, preserving head and tail."""
     if len(output) <= max_chars:
         return output
-    head_len = max_chars // 2
-    tail_len = max_chars // 2
+    banner_reserve = 120
+    content_room = max(100, max_chars - banner_reserve)
+    head_len = int(content_room * 0.3)
+    tail_len = content_room - head_len
     omitted = len(output) - (head_len + tail_len)
     return (
         f"{output[:head_len]}\n\n"
-        f"[... TRUNCATED: tool output exceeded {max_chars} characters. "
-        f"{omitted} characters omitted ...]\n\n"
+        f"[... TRUNCATED: {omitted} characters omitted. Showing first {head_len} chars and last {tail_len} chars ...]\n\n"
         f"{output[-tail_len:]}"
     )
 
@@ -2179,6 +2197,14 @@ class ProviderGateway:
                         kwargs[param_name] = args.get("id") or args.get("cp_id") or args.get("label")
                     elif param_name == "patch_content" and any(k in args for k in ("patch", "diff", "content")):
                         kwargs[param_name] = args.get("patch") or args.get("diff") or args.get("content")
+                    elif param_name == "search_text" and any(k in args for k in ("search", "find", "old", "old_str")):
+                        kwargs[param_name] = args.get("search") or args.get("find") or args.get("old") or args.get("old_str")
+                    elif param_name == "replace_text" and any(k in args for k in ("replace", "new", "replacement", "new_str")):
+                        kwargs[param_name] = args.get("replace") or args.get("new") or args.get("replacement") or args.get("new_str")
+                    elif param_name == "start_line" and any(k in args for k in ("start", "line_start", "from_line")):
+                        kwargs[param_name] = args.get("start") or args.get("line_start") or args.get("from_line")
+                    elif param_name == "end_line" and any(k in args for k in ("end", "line_end", "to_line")):
+                        kwargs[param_name] = args.get("end") or args.get("line_end") or args.get("to_line")
                     elif param_name == "agent_name" and any(k in args for k in ("agent", "name", "role", "actor")):
                         kwargs[param_name] = args.get("agent") or args.get("name") or args.get("role") or args.get("actor")
                     elif param_name == "wo_id" and any(k in args for k in ("work_order_id", "work_order", "id", "wo", "workorder")):
@@ -2237,6 +2263,13 @@ class ProviderGateway:
                     p_content = kwargs.get("patch_content") or ""
                     tgt = kwargs.get("target") or "file"
                     out_str = f"Successfully applied patch to {tgt}\n{p_content}".strip()
+                    if tgt not in self.written_files:
+                        self.written_files.append(str(tgt))
+                elif name == "edit_file":
+                    tgt = kwargs.get("target") or kwargs.get("path") or "file"
+                    out_str = f"Successfully edited {tgt}".strip()
+                    if tgt not in self.written_files:
+                        self.written_files.append(str(tgt))
                 elif result is None:
                     out_str = f"Successfully executed {name}"
                 elif isinstance(result, str):

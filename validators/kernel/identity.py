@@ -193,6 +193,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
     elif any(k in norm for k in ("codex", "backend")):
         ops = base_set | {
             OperationType.APPLY_PATCH.value,
+            OperationType.EDIT_FILE.value,
             OperationType.WRITE_FILE.value,
             OperationType.BATCH_WRITE_FILES.value,
             OperationType.MOVE_FILE.value,
@@ -227,6 +228,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
     elif any(k in norm for k in ("gemini", "frontend")):
         ops = base_set | {
             OperationType.APPLY_PATCH.value,
+            OperationType.EDIT_FILE.value,
             OperationType.WRITE_FILE.value,
             OperationType.BATCH_WRITE_FILES.value,
             OperationType.MOVE_FILE.value,
@@ -313,7 +315,8 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
     elif any(k in norm for k in ("local-llm", "gitops", "release")):
         # Exclusively holds all Git mutations and release management
         ops = base_set | {
-            OperationType.APPLY_PATCH.value,  # Version/changelog metadata only
+            OperationType.APPLY_PATCH.value,
+            OperationType.EDIT_FILE.value,  # Version/changelog metadata only
             OperationType.WRITE_FILE.value,
             OperationType.BATCH_WRITE_FILES.value,   # Version/changelog metadata only
             OperationType.MOVE_FILE.value,

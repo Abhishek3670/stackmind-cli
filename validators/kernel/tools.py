@@ -126,7 +126,7 @@ class ToolGateway:
         result: list[str] = []
         for rec in journal.records:
             op_val = getattr(getattr(rec.request, "operation_type", None), "value", None)
-            if op_val in ("write_file", "batch_write_files") and rec.result == "written":
+            if op_val in ("write_file", "batch_write_files", "apply_patch", "edit_file") and rec.result in ("written", "patched", "edited"):
                 target = getattr(rec.request, "target", "") or ""
                 clean = target.replace("\\", "/")
                 if clean.startswith("workspace/"):
@@ -145,10 +145,31 @@ class ToolGateway:
     def _authorize(self, operation_type: OperationType, target: str):
         return self.boundary.submit(self._request(operation_type, target), self.contract, self.policy)
 
-    def read_file(self, target: str) -> str:
+    def read_file(
+        self,
+        target: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        line_numbers: bool = False,
+    ) -> str:
         record = self._authorize(OperationType.READ_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
+
+        def _slice_content(val: str) -> str:
+            if start_line is None and end_line is None:
+                return val
+            lines = val.splitlines(keepends=True)
+            total = len(lines)
+            s = max(1, start_line) if start_line is not None else 1
+            e = min(total, end_line) if end_line is not None else total
+            if s > total:
+                return f"[Line {s} is beyond end of file ({total} lines total)]\n"
+            selected = lines[s - 1 : e]
+            if line_numbers:
+                return "".join(f"{num:5d} | {l}" for num, l in enumerate(selected, start=s))
+            return "".join(selected)
+
         path = self.workspace.path_for(target)
         if not path.is_file():
             norm_target = target.replace("\\", "/").strip().lstrip("/")
@@ -157,20 +178,20 @@ class ToolGateway:
                 if sync_p.is_file():
                     value = sync_p.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
             if norm_target.lower() in ("plan.md", "architecture.md", "design.md"):
                 target_fname = "PLAN.md" if norm_target.lower() == "plan.md" else ("ARCHITECTURE.md" if norm_target.lower() == "architecture.md" else "DESIGN.md")
                 playbook_p = self.workspace.path_for(f".sync/playbook/{target_fname}")
                 if playbook_p.is_file():
                     value = playbook_p.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
             if norm_target.startswith(("schemas/", "work-orders/", "contracts/")):
                 sync_p = self.workspace.path_for(f".sync/{norm_target}")
                 if sync_p.is_file():
                     value = sync_p.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
             candidate = PurePath(norm_target)
             if not candidate.is_absolute() and ".." not in candidate.parts:
                 auth_path = (self.workspace.authoritative_root / Path(candidate)).resolve()
@@ -179,7 +200,7 @@ class ToolGateway:
                     if auth_path.is_file():
                         value = auth_path.read_text(encoding="utf-8")
                         self.boundary.journal.complete(record.request.operation_id, "read")
-                        return value
+                        return _slice_content(value)
                 except ValueError:
                     pass
             # Fallback for bundled schemas when workspace does not have a local schemas/ copy
@@ -196,7 +217,7 @@ class ToolGateway:
                 if bundled_file.is_file():
                     value = bundled_file.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
         if not path.is_file():
             norm_target = target.replace("\\", "/").strip().lstrip("/")
             if norm_target.lower() in ("plan.md", "architecture.md", "design.md"):
@@ -207,7 +228,7 @@ class ToolGateway:
                 )
         value = path.read_text(encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "read")
-        return value
+        return _slice_content(value)
 
     def _verdict_channel_denial(self, target: str) -> str | None:
         """Deny verdict/review-channel writes to agents without verdict authority.
@@ -551,22 +572,39 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        import ast
+        api = self._get_knowledge_api()
         matches = []
-        for py_file in self.workspace.root.rglob("*.py"):
+        if api is not None:
             try:
-                tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        if node.name == name or name in node.name:
-                            matches.append({
-                                "file": py_file.relative_to(self.workspace.root).as_posix(),
-                                "name": node.name,
-                                "type": "class" if isinstance(node, ast.ClassDef) else "function",
-                                "line": getattr(node, "lineno", 1),
-                            })
+                sym_fn = getattr(api, "find_symbol", None) or getattr(api, "symbols", None)
+                if callable(sym_fn):
+                    res = sym_fn(name, contract=self.contract)
+                    if res:
+                        matches = [{
+                            "file": getattr(r, "file", str(r)),
+                            "name": getattr(r, "name", name),
+                            "type": getattr(r, "kind", "symbol"),
+                            "line": getattr(r, "line", 1),
+                        } for r in res]
             except Exception:
-                continue
+                matches = []
+
+        if not matches:
+            import ast
+            for py_file in self.workspace.root.rglob("*.py"):
+                try:
+                    tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            if node.name == name or name in node.name:
+                                matches.append({
+                                    "file": py_file.relative_to(self.workspace.root).as_posix(),
+                                    "name": node.name,
+                                    "type": "class" if isinstance(node, ast.ClassDef) else "function",
+                                    "line": getattr(node, "lineno", 1),
+                                })
+                except Exception:
+                    continue
 
         self.boundary.journal.complete(record.request.operation_id, f"found {len(matches)} symbols")
         return matches
@@ -575,23 +613,39 @@ class ToolGateway:
         record = self._authorize(OperationType.FIND_REFERENCES, f"workspace/references/{symbol}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        # Search for exact symbol token references across code files
-        regex = re.compile(rf"\b{re.escape(symbol)}\b")
+
+        api = self._get_knowledge_api()
         matches = []
-        for code_file in self.workspace.root.rglob("*"):
-            if not code_file.is_file() or code_file.suffix not in (".py", ".js", ".ts", ".html", ".css", ".json", ".md"):
-                continue
+        if api is not None:
             try:
-                lines = code_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                for line_no, line in enumerate(lines, start=1):
-                    if regex.search(line):
-                        matches.append({
-                            "file": code_file.relative_to(self.workspace.root).as_posix(),
-                            "line": line_no,
-                            "content": line.strip(),
-                        })
+                ref_fn = getattr(api, "find_references", None) or getattr(api, "references", None)
+                if callable(ref_fn):
+                    res = ref_fn(symbol, contract=self.contract)
+                    if res:
+                        matches = [{
+                            "file": getattr(r, "file", str(r)),
+                            "line": getattr(r, "line", 1),
+                            "content": getattr(r, "content", ""),
+                        } for r in res]
             except Exception:
-                continue
+                matches = []
+
+        if not matches:
+            regex = re.compile(rf"\b{re.escape(symbol)}\b")
+            for code_file in self.workspace.root.rglob("*"):
+                if not code_file.is_file() or code_file.suffix not in (".py", ".js", ".ts", ".html", ".css", ".json", ".md"):
+                    continue
+                try:
+                    lines = code_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    for line_no, line in enumerate(lines, start=1):
+                        if regex.search(line):
+                            matches.append({
+                                "file": code_file.relative_to(self.workspace.root).as_posix(),
+                                "line": line_no,
+                                "content": line.strip(),
+                            })
+                except Exception:
+                    continue
 
         self.boundary.journal.complete(record.request.operation_id, f"found {len(matches)} references")
         return matches
@@ -650,6 +704,66 @@ class ToolGateway:
 
         path.write_text(new_content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "patched")
+
+    def edit_file(self, target: str, search_text: str, replace_text: str) -> None:
+        record = self._authorize(OperationType.EDIT_FILE, f"workspace/{target}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        ownership = getattr(self, "task_ownership", None)
+        if ownership is not None:
+            denial = ownership.check_write(target)
+            if denial:
+                raise PermissionError(denial)
+        verdict_denial = self._verdict_channel_denial(target)
+        if verdict_denial:
+            raise PermissionError(verdict_denial)
+        architect_denial = self._architect_source_write_denial(target)
+        if architect_denial:
+            raise PermissionError(architect_denial)
+
+        path = self.workspace.path_for(target)
+        if not path.is_file():
+            raise FileNotFoundError(f"Target file '{target}' does not exist to edit")
+
+        content = path.read_text(encoding="utf-8")
+        if not search_text:
+            raise ValueError("search_text must not be empty")
+
+        count = content.count(search_text)
+        if count == 0:
+            raise ValueError(f"search_text not found in '{target}'")
+        if count > 1:
+            raise ValueError(
+                f"search_text occurs {count} times in '{target}'. Provide more surrounding context to disambiguate the target block."
+            )
+
+        new_content = content.replace(search_text, replace_text, 1)
+
+        normalized_target = target.replace("\\", "/").strip().lstrip("/")
+        if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/"):
+            normalized_target = f".sync/{normalized_target}"
+            target = normalized_target
+        if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):
+            from validators.harness.authoring_gate import AuthoringGate
+            gate = getattr(self, "_authoring_gate", None)
+            authoritative_root = getattr(self.workspace, "authoritative_root", None)
+            if gate is None:
+                gate = AuthoringGate(project_root=authoritative_root)
+                self._authoring_gate = gate
+            auth_ok, reason = gate.validate_author_role(self.actor_id, normalized_target)
+            if not auth_ok and reason:
+                raise PermissionError(reason)
+            decision = gate.validate_artifact_content(
+                normalized_target, new_content, agent=self.actor_id, project_root=authoritative_root
+            )
+            if not decision.passed:
+                raise PermissionError(f"Authoring validation failed for {target}: {'; '.join(decision.errors)}")
+            if decision.normalized_content is not None:
+                new_content = decision.normalized_content
+
+        path.write_text(new_content, encoding="utf-8")
+        self.boundary.journal.complete(record.request.operation_id, "edited")
 
     def move_file(self, source: str, destination: str) -> None:
         rec_src = self._authorize(OperationType.MOVE_FILE, f"workspace/{source}")
@@ -986,6 +1100,26 @@ class ToolGateway:
             raise PermissionError(record.reason)
 
         target_path = self.workspace.path_for(target)
+        rel_target = target_path.relative_to(self.workspace.root).as_posix() if target_path != self.workspace.root else "."
+
+        # Check if ruff is available in environment
+        ruff_bin = shutil.which("ruff")
+        if ruff_bin:
+            try:
+                res = self.sandbox.run([sys.executable, "-m", "ruff", "check", rel_target], timeout=60)
+                errors = [line for line in res.stdout.splitlines() if line.strip() and not line.startswith("Found ")]
+                files_checked = len([target_path]) if target_path.is_file() else len(list(target_path.rglob("*.py")))
+                out = {
+                    "success": res.returncode == 0,
+                    "errors": errors,
+                    "files_checked": files_checked,
+                    "stdout": res.stdout,
+                }
+                self.boundary.journal.complete(record.request.operation_id, f"{len(errors)} ruff lint findings")
+                return out
+            except Exception:
+                pass
+
         files_to_check = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
         errors = []
         for py_file in files_to_check:
@@ -1010,12 +1144,47 @@ class ToolGateway:
         record = self._authorize(OperationType.RUN_TYPECHECK, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
+
+        target_path = self.workspace.path_for(target)
+        rel_target = target_path.relative_to(self.workspace.root).as_posix() if target_path != self.workspace.root else "."
+
+        # Check if mypy is available in environment
+        mypy_bin = shutil.which("mypy")
+        if mypy_bin:
+            try:
+                res = self.sandbox.run([sys.executable, "-m", "mypy", rel_target, "--ignore-missing-imports"], timeout=60)
+                errors = [line for line in res.stdout.splitlines() if ": error:" in line]
+                out = {
+                    "success": res.returncode == 0,
+                    "errors": errors,
+                    "path": target,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                    "exit_code": res.returncode,
+                }
+                self.boundary.journal.complete(record.request.operation_id, f"{len(errors)} mypy errors")
+                return out
+            except Exception:
+                pass
+
+        files_to_check = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
+        errors = []
+        for py_file in files_to_check:
+            try:
+                ast.parse(py_file.read_text(encoding="utf-8", errors="replace"), filename=py_file.name)
+            except SyntaxError as e:
+                errors.append({
+                    "file": py_file.relative_to(self.workspace.root).as_posix(),
+                    "line": e.lineno,
+                    "error": str(e),
+                })
         out = {
-            "success": True,
-            "errors": [],
+            "success": len(errors) == 0,
+            "errors": errors,
             "path": target,
+            "note": "Static syntax/structure verified (mypy not installed for full static type analysis)",
         }
-        self.boundary.journal.complete(record.request.operation_id, "typecheck passed")
+        self.boundary.journal.complete(record.request.operation_id, f"typecheck complete ({len(errors)} errors)")
         return out
 
     def run_security_scan(self, target: str | None = None) -> dict[str, Any]:
