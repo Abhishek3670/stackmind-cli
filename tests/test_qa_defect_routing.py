@@ -674,6 +674,45 @@ def test_check_qa_verdict_ignores_verdicts_explicitly_targeting_other_wos(tmp_pa
     assert "Fix the database schema" in supervisor._get_qa_feedback("WO-002", tmp_path)
 
 
+def test_delegation_brief_reaches_the_worker_dispatch_prompt(tmp_path: Path) -> None:
+    """A ``delegate_task`` briefing must be injected into the worker's prompt.
+
+    ``delegate_task`` writes ``{ts}_{actor}_delegation.md`` into the target
+    agent's inbox, but the supervisor only accepted ``verdict``/``review``
+    filenames, so a hand-authored defect brief never reached its worker. A
+    briefing is addressed to the worker and is injected whole, without needing
+    a verdict token.
+    """
+    _write_worker_yaml(tmp_path, "WO-008", "gemini", "script.js")
+    inbox = tmp_path / ".sync" / "inbox" / "gemini"
+    inbox.mkdir(parents=True, exist_ok=True)
+    brief = inbox / "20261105_131910_claude_delegation.md"
+    brief.write_text(
+        "# Delegated Task: Frontend\n\n"
+        "**To:** gemini (frontend)\n\n"
+        "### Instructions\n"
+        "You are fixing Work Order WO-008 targeting script.js.\n"
+        "Repro: 2, +, 3, = displays 25 (expected 5).\n",
+        encoding="utf-8",
+    )
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    feedback = supervisor._get_qa_feedback("WO-008", tmp_path)
+    assert "displays 25 (expected 5)" in feedback
+
+    # A briefing is not a judgement: it must not set the work order's QA status.
+    assert supervisor._check_qa_verdict("WO-008", tmp_path) is None
+
+    # A QA verdict derived from running the deliverable outranks the briefing,
+    # even when the briefing was written later.
+    verdict = tmp_path / ".sync" / "reviews" / "WO-008-review.md"
+    verdict.parent.mkdir(parents=True, exist_ok=True)
+    verdict.write_text("Status: NEEDS_CHANGES\n2 + 3 = returns 25, expected 5\n", encoding="utf-8")
+    assert "returns 25, expected 5" in supervisor._get_qa_feedback("WO-008", tmp_path)
+
+
 def test_task_contract_extracts_and_renders_critical_turn_instructions(tmp_path: Path) -> None:
     """When a task includes Turn Instructions, compile_worker_task_contract extracts them and renders the directive banner."""
     from validators.harness.task_contract import compile_worker_task_contract, render_task_block, render_worker_system

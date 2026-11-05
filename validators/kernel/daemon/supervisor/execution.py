@@ -69,6 +69,53 @@ def _is_schema_validation_error(exc: BaseException) -> bool:
             return True
     return False
 
+# ── Worker briefing contract ──────────────────────────────────────────────
+# A brief is any file the supervisor injects into a worker's dispatch prompt.
+# The producer (validators/kernel/tools.py ``delegate_task``) writes
+# ``{ts}_{actor}_delegation.md`` into the target agent's inbox; QA writes
+# verdict/review reports. Both sides must agree on where briefs live and how
+# they are named, so the contract is defined once, here, and shared.
+WORKER_BRIEF_NAME_KEYWORDS = ("verdict", "review", "delegation")
+# Only these names carry a verdict, so only these are allowed to set a work
+# order's QA status. A delegation notice is a briefing, not a judgement.
+WORKER_VERDICT_NAME_KEYWORDS = ("verdict", "review")
+
+
+def worker_brief_dirs(ws: Path) -> list[Path]:
+    """Inbox/review locations that may hold a brief for a work order's worker."""
+    return [
+        ws / ".sync" / "inbox" / "claude",
+        ws / ".sync" / "inbox" / "claude" / "_read",
+        ws / ".sync" / "inbox" / "codex",
+        ws / ".sync" / "inbox" / "gemini",
+        ws / ".sync" / "reviews",
+        ws / ".sync" / "qa" / "verdicts",
+    ]
+
+
+def worker_brief_candidates(ws: Path) -> list[Path]:
+    """All brief files in the workspace, most authoritative first.
+
+    A QA verdict/review is derived from executing the deliverable, so it
+    outranks a hand-written delegation notice even when the notice is newer.
+    Within each class the newest file wins.
+    """
+    candidates: list[Path] = []
+    for d in worker_brief_dirs(ws):
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.is_file() and any(k in f.name.lower() for k in WORKER_BRIEF_NAME_KEYWORDS):
+                candidates.append(f)
+
+    def _rank(p: Path) -> tuple[int, float]:
+        is_verdict = any(k in p.name.lower() for k in WORKER_VERDICT_NAME_KEYWORDS)
+        return (0 if is_verdict else 1, -p.stat().st_mtime if p.exists() else 0.0)
+
+    candidates.sort(key=_rank)
+    return candidates
+
+
 class _ExecutionMixin:
     """Work-order dispatch, worker retry, QA gate handling and operation tracking during EXECUTING."""
 
@@ -1720,21 +1767,13 @@ class _ExecutionMixin:
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         deliv_name = Path(deliv_path).name if deliv_path else None
 
-        search_dirs = [
-            ws / ".sync" / "inbox" / "claude",
-            ws / ".sync" / "inbox" / "claude" / "_read",
-            ws / ".sync" / "reviews",
-            ws / ".sync" / "qa" / "verdicts",
+        # A delegation notice is a briefing, never a QA verdict: only files
+        # whose name declares a verdict may set a work order's QA status.
+        candidates = [
+            f
+            for f in worker_brief_candidates(ws)
+            if any(k in f.name.lower() for k in WORKER_VERDICT_NAME_KEYWORDS)
         ]
-        candidates: list[Path] = []
-        for d in search_dirs:
-            if not d.is_dir():
-                continue
-            for f in d.iterdir():
-                if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
-                    candidates.append(f)
-
-        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
 
         for f in candidates:
             try:
@@ -1828,23 +1867,7 @@ class _ExecutionMixin:
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         deliv_name = Path(deliv_path).name if deliv_path else None
 
-        search_dirs = [
-            ws / ".sync" / "inbox" / "claude",
-            ws / ".sync" / "inbox" / "claude" / "_read",
-            ws / ".sync" / "inbox" / "codex",
-            ws / ".sync" / "inbox" / "gemini",
-            ws / ".sync" / "reviews",
-            ws / ".sync" / "qa" / "verdicts",
-        ]
-        candidates: list[Path] = []
-        for d in search_dirs:
-            if not d.is_dir():
-                continue
-            for f in d.iterdir():
-                if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
-                    candidates.append(f)
-
-        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        candidates = worker_brief_candidates(ws)
 
         for f in candidates:
             try:
@@ -1871,8 +1894,14 @@ class _ExecutionMixin:
                         elif deliv_name and len(deliv_name) > 6 and deliv_name in text:
                             matches_wo = True
             if matches_wo:
-                if "NEEDS_CHANGES" in text.upper() or "NEEDS CHANGES" in text.upper():
-                    return text.strip()
+                # A verdict must say the work needs changing; a delegation
+                # briefing is addressed to the worker and is injected whole.
+                is_verdict = any(k in f.name.lower() for k in WORKER_VERDICT_NAME_KEYWORDS)
+                if is_verdict:
+                    upper = text.upper()
+                    if "NEEDS_CHANGES" not in upper and "NEEDS CHANGES" not in upper:
+                        continue
+                return text.strip()
         return ""
 
     # ── Mandatory QA review gate ──────────────────────────────────────
