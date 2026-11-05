@@ -109,6 +109,27 @@ def doctor(project_path: Path) -> bool:
         for name, version in schema_versions.items():
             console.print(f"  {name}: v{version}")
 
+    # Role & Model Diversity Check
+    settings_file = sync_path / "settings.json"
+    if not settings_file.is_file():
+        settings_file = sync_path / "setting.json"
+    if settings_file.is_file():
+        try:
+            import json as _json
+            from validators.kernel.settings import check_role_diversity
+            s_data = _json.loads(settings_file.read_text(encoding="utf-8"))
+            s_roles = s_data.get("roles", {})
+            div_warnings = check_role_diversity(s_roles)
+            console.print(f"\n[bold]Role & Model Diversity Check[/bold]")
+            console.print("-" * 40)
+            if div_warnings:
+                for w in div_warnings:
+                    console.print(f"  [bold yellow][WARN][/bold yellow] {w}")
+            else:
+                console.print("  [bold green]Role models are diverse and decoupled.[/bold green]")
+        except Exception:
+            pass
+
     # Agent summary
     console.print(f"\n[bold]Agent Summary[/bold]")
     console.print("-" * 40)

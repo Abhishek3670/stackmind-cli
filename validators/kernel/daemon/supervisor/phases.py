@@ -160,9 +160,17 @@ class _PhasesMixin:
             if matching_plan:
                 state.plan_id = matching_plan.get("plan_id")
                 state.error = None
+                from validators.harness.plan import resolve_playbook_file
+                ws_path = Path(state.workspace)
+                plan_file = resolve_playbook_file(ws_path, "PLAN.md")
+                if (not plan_file.is_file() or plan_file.stat().st_size == 0) and matching_plan.get("content"):
+                    plan_file.parent.mkdir(parents=True, exist_ok=True)
+                    plan_file.write_text(str(matching_plan["content"]), encoding="utf-8")
+
                 if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
-                    state.completed_wo_ids.append(state.planning_wo_id)
-                    archive_completed_work_orders(Path(state.workspace), [state.planning_wo_id])
+                    if plan_file.is_file() and plan_file.stat().st_size > 0:
+                        state.completed_wo_ids.append(state.planning_wo_id)
+                        archive_completed_work_orders(ws_path, [state.planning_wo_id])
                 plan_state = str(matching_plan.get("state", "")).upper()
                 if plan_state == "AWAITING_APPROVAL":
                     self._transition(state, Phase.AWAITING_APPROVAL)
@@ -440,12 +448,38 @@ class _PhasesMixin:
             state.readiness_issues = []
             state.error = None
             # Reconcile planning WO-000 to COMPLETED upon publishing worker orders
-            for p_id in (state.planning_wo_id, "WO-000"):
-                if p_id:
-                    if p_id not in state.completed_wo_ids:
-                        state.completed_wo_ids.insert(0, p_id)
-                    self._mark_wo_status_on_disk(ws, p_id, "COMPLETED")
-            archive_completed_work_orders(ws, [state.planning_wo_id or "WO-000", "WO-000"])
+            from validators.harness.plan import resolve_playbook_file
+            plan_file = resolve_playbook_file(ws, "PLAN.md")
+            if (not plan_file.is_file() or plan_file.stat().st_size == 0) and state.plan_id:
+                for p in reversed(self.manager.list_plans(state.session_id)):
+                    if p.get("plan_id") == state.plan_id and p.get("content"):
+                        plan_file.parent.mkdir(parents=True, exist_ok=True)
+                        plan_file.write_text(str(p["content"]), encoding="utf-8")
+                        break
+
+            if plan_file.is_file() and plan_file.stat().st_size > 0:
+                for p_id in (state.planning_wo_id, "WO-000"):
+                    if p_id:
+                        if p_id not in state.completed_wo_ids:
+                            state.completed_wo_ids.insert(0, p_id)
+                        self._mark_wo_status_on_disk(ws, p_id, "COMPLETED")
+                archive_completed_work_orders(ws, [state.planning_wo_id or "WO-000", "WO-000"])
+            else:
+                from validators.harness.authoring_readiness import AuthoringReadinessResult, ReadinessIssue
+                gate_result = AuthoringReadinessResult(
+                    ready=False,
+                    plan_id=state.plan_id or "",
+                    issues=(ReadinessIssue(
+                        code="MISSING_PLAN_DELIVERABLE",
+                        category="coverage",
+                        message=f"Planning deliverable PLAN.md is missing or empty at {plan_file}. Workers cannot be dispatched without approved PLAN.md on disk.",
+                        artifact_path="PLAN.md",
+                        work_order_id=state.planning_wo_id or "WO-000",
+                    ),),
+                )
+                self._persist_readiness_report(state, ws, gate_result)
+                state.readiness_issues = list(gate_result.issues)
+                return gate_result
             # Dynamic budget scaling: B = 18 + 5N (Amendment D)
             n_wos = max(1, len(state.published_wo_ids or state.worker_wo_ids))
             dynamic_budget = 18 + 5 * n_wos

@@ -1966,6 +1966,34 @@ class _ExecutionMixin:
         if isinstance(on_disk, dict) and on_disk:
             raw_verdict = on_disk
 
+        if not raw_verdict:
+            import yaml
+            alt_candidates = [
+                ws / ".sync" / "reviews" / "qa" / f"{wo_id}.yaml",
+                ws / ".sync" / "reviews" / f"{wo_id}-verdict.json",
+                ws / ".sync" / "reviews" / f"{wo_id}-verdict.yaml",
+                ws / ".sync" / "reviews" / f"{wo_id}.json",
+                ws / ".sync" / "reviews" / f"{wo_id}.yaml",
+                ws / ".sync" / "qa" / f"{wo_id}-review.yaml",
+                ws / ".sync" / "qa" / f"{wo_id}-review.json",
+                ws / ".sync" / "qa" / f"{wo_id}.yaml",
+                ws / ".sync" / "qa" / f"{wo_id}.json",
+            ]
+            for cand in alt_candidates:
+                if cand.is_file():
+                    try:
+                        content_txt = cand.read_text(encoding="utf-8")
+                        c_data = (
+                            json.loads(content_txt)
+                            if cand.suffix.lower() == ".json"
+                            else yaml.safe_load(content_txt)
+                        )
+                        if isinstance(c_data, dict) and c_data.get("verdict"):
+                            raw_verdict = c_data
+                            break
+                    except Exception:
+                        pass
+
         if not raw_verdict and op:
             res = op.get("result") or {}
             if isinstance(res, dict):
@@ -1981,6 +2009,26 @@ class _ExecutionMixin:
                                 raw_verdict = parsed
                         except Exception:
                             pass
+                    if not raw_verdict:
+                        m_unfenced = re.search(r'\{\s*"verdict"\s*:\s*"[^"]+".*?\}', text_blob, re.DOTALL)
+                        if m_unfenced:
+                            try:
+                                parsed = json.loads(m_unfenced.group(0))
+                                if isinstance(parsed, dict) and "verdict" in parsed:
+                                    raw_verdict = parsed
+                            except Exception:
+                                pass
+                    if not raw_verdict:
+                        m_txt = re.search(
+                            r"""(?i)\bverdict\s*[:=-]\s*['"]?(PASS|FAIL|NO_TEST_EVIDENCE|QA_PASS|QA_FAIL|QA_NO_TEST_EVIDENCE)['"]?""",
+                            text_blob,
+                        )
+                        if m_txt:
+                            v_found = m_txt.group(1).upper()
+                            raw_verdict = {
+                                "verdict": v_found,
+                                "summary": text_blob.strip()[:300],
+                            }
 
         if not raw_verdict:
             return

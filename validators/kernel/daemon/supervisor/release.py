@@ -182,13 +182,18 @@ def completion_record_for(
     record["verified_at_contract_revision"] = _current_contract_revision(ws, wo_id)
 
     hashes: dict[str, str] = {}
+    missing_deliverables: list[str] = []
     for rel_path in _declared_deliverable_paths(wo_data):
         resolved = _contained_deliverable_file(ws, rel_path)
-        if resolved is None:
+        if resolved is None or not resolved.is_file() or resolved.stat().st_size == 0:
+            missing_deliverables.append(rel_path)
             continue
         digest = sha256_file(resolved)
         if digest:
             hashes[rel_path] = digest
+
+    if missing_deliverables:
+        record["missing_deliverables"] = missing_deliverables
     record["deliverable_hashes"] = hashes
     record["completed_at"] = timestamp
     return record
