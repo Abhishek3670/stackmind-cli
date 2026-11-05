@@ -93,6 +93,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
         OperationType.GREP.value,
         OperationType.FIND_SYMBOL.value,
         OperationType.FIND_REFERENCES.value,
+        OperationType.COMPUTE_FILE_HASH.value,
     }
 
     # Universal governance introspection
@@ -166,6 +167,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
             OperationType.RUN_TESTS.value,  # Verify fixes against test suites
             OperationType.RUN_LINT.value,  # Verify linting
             OperationType.VERIFY_DELIVERABLE.value,  # Verify deliverable state
+            OperationType.SUBMIT_QA_VERDICT.value,
             OperationType.ASK_USER.value,
             OperationType.ENTER_PLAN_MODE.value,
             OperationType.EXIT_PLAN_MODE.value,
@@ -299,6 +301,7 @@ def get_role_policy(role_or_agent: str) -> AuthorizationPolicy:
             OperationType.VERIFY_DIFF.value,
             OperationType.VERIFY_PROVENANCE.value,
             OperationType.SUBMIT_VERDICT.value,
+            OperationType.SUBMIT_QA_VERDICT.value,
             OperationType.REQUEST_CHANGES.value,
             OperationType.APPROVE_WORK_ORDER.value,
             OperationType.SKILL_TEST.value,

@@ -313,8 +313,11 @@ class _ExecutionMixin:
                 state.error = None
                 agent = self._agent_for_wo(wo_id, ws)
                 declared = list(scope_evidence.get("declared") or [])
-                deliv_path = self._get_wo_deliverable_path(wo_id, ws) or (
-                    declared[0] if declared else "the declared deliverable"
+                deliv_path = self._get_wo_deliverable_path(wo_id, ws) or (declared[0] if declared else "the declared deliverable")
+                deliv_path = ((deliv_path if not (agent == "codex" and deliv_path and any(str(deliv_path).endswith(ext) for ext in (".html", ".htm", ".css"))) else ("package.json" if (ws / "package.json").is_file() else "src/backend.py")
+                )
+                # check role deliverable compatibility
+                    # disambiguate backend deliverable
                 )
                 if agent == "gemma":
                     nudge = (
@@ -327,10 +330,10 @@ class _ExecutionMixin:
                     )
                 else:
                     nudge = (
-                        f"Retry work order {wo_id} (attempt {retries + 2}): your previous turn "
-                        f"declared {declared} but invoked NO tools, so nothing was written. You "
-                        f"MUST invoke the write_file tool to create '{deliv_path}' with the full "
-                        f"deliverable content, then return your final decision declaring it."
+                        f"Retry work order {wo_id} (attempt {retries + 2}): your previous turn declared {declared} but invoked NO tools, so nothing was written. Your assigned deliverable is '{deliv_path}'. "
+                        f"You MUST invoke the write_file tool to create or update '{deliv_path}' with complete content. "
+                        f"Stay strictly within your role ({self._role_for_agent(agent)}) "
+                        f"and do NOT modify files belonging to peer work orders."
                     )
                 try:
                     self.manager.start_turn(
@@ -426,6 +429,8 @@ class _ExecutionMixin:
                 state.error = None
                 agent = self._agent_for_wo(wo_id, ws)
                 deliv_path = self._get_wo_deliverable_path(wo_id, ws)
+                # check role deliverable compatibility
+                    # disambiguate backend deliverable
                 target_str = f" '{deliv_path}'" if deliv_path else ""
                 # Targeted feedback: the scope evidence tells the model exactly
                 # which declarations were not written — a blind "author the
@@ -1914,7 +1919,12 @@ class _ExecutionMixin:
             "backend logic, or test modules) owned by OTHER work orders do not yet exist on disk. "
             "Downstream files will be built by companion workers in subsequent work orders. "
             "Do NOT demand creation of files outside this work order's declared scope in required_actions.\n\n"
-            f"Then persist the structured verdict as JSON to `${rel_verdict}` using write_file. "
+            "RECOMMENDED: Persist the verdict directly using the first-class `submit_qa_verdict` tool:\n"
+            f"  submit_qa_verdict(wo_id='{wo_id}', verdict='PASS'|'FAIL'|'NO_TEST_EVIDENCE', summary='...')\n"
+            "The `submit_qa_verdict` tool automatically derives the authoritative subject_hash and stamps the UTC timestamp.\n\n"
+
+            "Do NOT demand creation of files outside this work order's declared scope in required_actions.\n\n"
+            f"Alternatively, you may persist the structured verdict as JSON to `${rel_verdict}` using write_file. "
             "The verdict MUST be exactly this shape:\n"
             "{\n"
             f'  "schema": "{review_gate.QA_VERDICT_SCHEMA}",\n'

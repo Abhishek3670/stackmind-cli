@@ -296,6 +296,19 @@ def normalize_work_order_data(
         if "acceptance_criteria" not in data or not data["acceptance_criteria"]:
             data["acceptance_criteria"] = crit
 
+    # Reconcile role vs deliverable compatibility
+    assigned = [str(a).lower().strip() for a in (data.get("assigned_agents") or [])]
+    deliv_entry = data.get("deliverable")
+    if isinstance(deliv_entry, dict) and deliv_entry.get("path"):
+        d_path = str(deliv_entry["path"]).strip().lower()
+        if "codex" in assigned and any(d_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+            alt = next((e for e in (data.get("deliverables") or []) if isinstance(e, dict) and not str(e.get("path", "")).lower().endswith((".html", ".htm", ".css"))), None)
+            if alt:
+                data["deliverable"] = alt
+            elif any(w in str(data.get("title", "")).lower() for w in ("scaffold", "dependency", "manifest", "setup")):
+                deliv_entry["path"] = "package.json"
+                deliv_entry["type"] = "config"
+
     # Absorb revision notes / amendment reasons into amendments array
     note = (
         data.pop("revision_note", None)

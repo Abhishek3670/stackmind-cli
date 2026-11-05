@@ -323,6 +323,30 @@ class AuthoringGate:
             if not deliverable.get("description"):
                 errors.append("Work Order deliverable requires a non-empty 'description'")
 
+        # Validate role vs deliverable compatibility
+        assigned_agents = [str(a).lower().strip() for a in (data.get("assigned_agents") or [])]
+        deliv_path_val = str((deliverable or {}).get("path") if isinstance(deliverable, dict) else (deliverable or "")).strip().lower()
+        if deliv_path_val:
+            if "codex" in assigned_agents and any(deliv_path_val.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+                errors.append(
+                    f"Work Order '{wo_id}': Role-deliverable mismatch. Backend agent 'codex' cannot be assigned "
+                    f"frontend deliverable '{deliv_path_val}'. Assign frontend UI deliverables to 'gemini'."
+                )
+            elif (
+                "gemini" in assigned_agents
+                and not (deliv_path_val.startswith("tests/") or "test" in deliv_path_val)
+                and any(deliv_path_val.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db"))
+            ):
+                errors.append(
+                    f"Work Order '{wo_id}': Role-deliverable mismatch. Frontend agent 'gemini' cannot be assigned "
+                    f"backend deliverable '{deliv_path_val}'. Assign backend deliverables to 'codex'."
+                )
+            elif "gemma" in assigned_agents and not ("test" in deliv_path_val or deliv_path_val.startswith("tests/")):
+                errors.append(
+                    f"Work Order '{wo_id}': Role-deliverable mismatch. QA agent 'gemma' cannot be assigned "
+                    f"application deliverable '{deliv_path_val}'. QA deliverables must be test suites under 'tests/'."
+                )
+
         # Validate requirement_refs if present
         requirement_refs = data.get("requirement_refs")
         if isinstance(requirement_refs, list):

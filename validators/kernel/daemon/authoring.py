@@ -517,7 +517,7 @@ def derive_implementation_estimate(
 
     return {
         "expected_files": expected,
-        "max_files_touched": max(5, len(expected) + 3),
+        "max_files_touched": len(expected),
         "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
     }
 
@@ -770,7 +770,7 @@ def build_child_contract(
             "write": "read-write",
         },
         "budget": {
-            "max_files_touched": max(5, max_files_touched if max_files_touched and max_files_touched > 0 else 10),
+            "max_files_touched": max_files_touched if max_files_touched and max_files_touched > 0 else 10,
             "max_tokens": 0,
         },
     }
@@ -1678,12 +1678,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     m_other = str(other[3].get("id") or other[3].get("title") or "") if isinstance(other[3], dict) else ""
                     order_entry = milestone_order_map.get(m_entry, 0)
                     order_other = milestone_order_map.get(m_other, 0)
-                    if order_other > order_entry:
+                    if order_other > order_entry and not _has_transitive_dep(other[1], entry[1]):
                         other_deps = other[2].setdefault("dependencies", [])
                         if entry[1] not in other_deps:
                             other_deps.append(entry[1])
                             durable_write_yaml(other[0], other[2])
-                    elif order_entry > order_other:
+                    elif order_entry > order_other and not _has_transitive_dep(entry[1], other[1]):
                         entry_deps = entry[2].setdefault("dependencies", [])
                         if other[1] not in entry_deps:
                             entry_deps.append(other[1])
@@ -1905,6 +1905,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     target_agent = "gemini"
                 else:
                     target_agent = "codex"
+            elif primary_agent == "codex" and deliv_path and any(deliv_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+                target_agent = "gemini"
+            elif primary_agent == "gemini" and deliv_path and not is_test_path and any(deliv_path.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db")):
+                target_agent = "codex"
 
             if target_agent and target_agent != primary_agent:
                 wo_data["assigned_agents"] = [target_agent]

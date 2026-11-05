@@ -467,13 +467,27 @@ class _VerificationMixin:
 
             # If task was dispatched for a specific deliverable, evaluate whether that specific
             # deliverable passed. Collateral failures on secondary/peer files must not block the turn.
-            if not deliv_passed and task.deliverable_path:
-                task_norm = Path(task.deliverable_path).as_posix().lstrip('/')
+            peer_paths: set[str] = set()
+            try:
+                from validators.harness.task_contract import collect_peer_deliverables
+                peers = collect_peer_deliverables(self.project_path, str(task.work_order_id) if task.work_order_id else None)
+                peer_paths = {p.replace("\\", "/").strip().lstrip("/").lower() for _, p in peers}
+            except Exception:
+                pass
+
+            task_norm = Path(task.deliverable_path).as_posix().lstrip('/') if task.deliverable_path else None
+            is_peer_deliv = bool(task_norm and task_norm.lower() in peer_paths)
+
+            if not deliv_passed and task_norm and not is_peer_deliv:
                 results_by_path = {
                     Path(r.get("relative_path", "")).as_posix().lstrip('/'): r.get("passed", False)
                     for r in deliv_evidence.get("results", [])
                 }
                 if results_by_path.get(task_norm):
+                    deliv_passed = True
+                    deliv_errors = []
+            elif not deliv_passed and is_peer_deliv:
+                if any(r.get("passed", False) for r in deliv_evidence.get("results", [])) or deliverable_touched or bool(task_changed_files):
                     deliv_passed = True
                     deliv_errors = []
 
@@ -504,7 +518,7 @@ class _VerificationMixin:
                         outcome_verified = False
                         for err in deliv_errors:
                             staged_errors.append(f"Deliverable verification failed: {err}")
-                elif task.deliverable_path and not deliverable_touched:
+                elif task.deliverable_path and not deliverable_touched and not is_peer_deliv:
                     is_non_code_task = (
                         getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
                         or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))

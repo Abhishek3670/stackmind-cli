@@ -78,6 +78,7 @@ class _PromptsMixin:
                 "     Every entry under `orders:` must match the Work Order fields (`id`, `type`, `title`, `status`, `priority`, `assigned_agents`, `dependencies`). The `type` enum in `INDEX.yaml` is identical to `type` above (`VALIDATION`, etc. — never `'QA'`).\n"
                 "   - Contract File Path: `.sync/contracts/<WO-ID>.yaml` (e.g. `WO-002.yaml`):\n"
                 "     Scope must declare `allow` (modules/paths the agent may write). Budget must declare `max_files_touched`.\n"
+                "   - Role-Deliverable Compatibility: Backend (codex) only delivers server APIs, logic, or dependency manifests (e.g. `package.json`, `src/backend.py`). NEVER assign `.html`, `.css`, or client assets to codex. Frontend (gemini) delivers UI markup and styles (`index.html`, `styles.css`). QA (gemma) delivers test suites under `tests/` (`type: code`). GitOps (local-llm) delivers release manifests (`VERSION.md`, `CHANGELOG.md`).\n"
                 "9. CASUAL GREETING & CONVERSATIONAL INVARIANT (STRICTLY ENFORCED):\n"
                 "   On casual greetings, pleasantries, or open-ended check-ins (such as 'hey', 'hello', 'hi', 'how are you', 'what's up'):\n"
                 "   - You MUST respond conversationally, introduce yourself as Lead Architect, and ask the user what they would like to build or discuss.\n"

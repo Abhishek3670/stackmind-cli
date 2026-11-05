@@ -804,6 +804,50 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
         },
     ),
     ToolDefinition(
+        name="submit_qa_verdict",
+        description="Submit and persist an authoritative schema-conforming QA verdict JSON to .sync/reviews/qa/{wo_id}.json. Automatically derives subject_hash and timestamp.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "wo_id": {"type": "string", "description": "Work order ID (e.g. WO-002)"},
+                "verdict": {"type": "string", "enum": ["PASS", "FAIL", "NO_TEST_EVIDENCE", "PROVISIONAL_PASS"], "description": "QA verdict outcome"},
+                "criteria": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional evaluated criteria items with id, description, outcome, evidence",
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional evidence items with kind, command/inspection, result, passed",
+                },
+                "findings": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional findings/observations list",
+                },
+                "required_actions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional required rework actions if FAIL",
+                },
+                "summary": {"type": "string", "description": "Summary rationale of the QA evaluation"},
+            },
+            "required": ["wo_id", "verdict"],
+        },
+    ),
+    ToolDefinition(
+        name="compute_file_hash",
+        description="Compute the SHA-256 cryptographic digest and size of any workspace file.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace file path"},
+            },
+            "required": ["path"],
+        },
+    ),
+    ToolDefinition(
         name="skill_test",
         description="Run 3-stage verification pipeline on a procedural skill candidate.",
         parameters={

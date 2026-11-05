@@ -754,10 +754,10 @@ def verify_work_order_deliverables(
     # Collect peer deliverables to exclude files owned by other work orders
     peer_paths: set[str] = set()
     wo_id = wo_data.get("id")
-    if project_path and wo_id:
+    if project_path:
         try:
             from validators.harness.task_contract import collect_peer_deliverables
-            peers = collect_peer_deliverables(project_path, str(wo_id))
+            peers = collect_peer_deliverables(project_path, str(wo_id) if wo_id else None)
             peer_paths = {p.replace("\\", "/").strip().lstrip("/").lower() for _, p in peers}
         except Exception:
             pass
@@ -769,6 +769,33 @@ def verify_work_order_deliverables(
             if norm_p not in peer_paths:
                 filtered_paths.append(p)
         declared_paths = filtered_paths
+
+    # Role-based deliverable filtering:
+    # A backend worker must never fail verification for client UI files
+    # A frontend worker must never fail verification for backend python/db files
+    # A QA worker must never fail verification for application source code
+    assigned_agents = [str(a).lower().strip() for a in (wo_data.get("assigned_agents") or [])]
+    role_hint = str(wo_data.get("role", "")).lower().strip()
+    if "codex" in assigned_agents or role_hint == "backend":
+        backend_only = [
+            p for p in declared_paths
+            if not str(p).lower().endswith((".html", ".htm", ".css", ".scss", ".sass"))
+            and not str(p).lower().startswith(("assets/css", "assets/img", "public/css"))
+        ]
+        if backend_only:
+            declared_paths = backend_only
+    elif "gemini" in assigned_agents or role_hint == "frontend":
+        frontend_only = [
+            p for p in declared_paths
+            if not str(p).lower().endswith((".py", ".sql", ".sqlite", ".db"))
+            and not str(p).lower().startswith(("models/", "services/", "controllers/", "routes/"))
+        ]
+        if frontend_only:
+            declared_paths = frontend_only
+    elif "gemma" in assigned_agents or role_hint == "qa":
+        qa_only = [p for p in declared_paths if "test" in str(p).lower() or str(p).startswith("tests/")]
+        if qa_only:
+            declared_paths = qa_only
 
     if not declared_paths:
         # Non-file work order (e.g. pure sign-off, doc/research without file path, or peer-owned)

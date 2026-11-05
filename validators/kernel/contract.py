@@ -123,7 +123,7 @@ class ContractEvaluator:
         "revalidate_work_order",
         "checkpoint", "restore_checkpoint",
         "update_version", "update_changelog", "prepare_release", "submit_for_review",
-        "submit_verdict", "request_changes", "approve_work_order",
+        "submit_verdict", "submit_qa_verdict", "request_changes", "approve_work_order",
         "dispatch_subagent", "browser_screenshot", "browser_click", "browser_type",
         "skill_mine", "skill_promote",
     }
@@ -139,13 +139,13 @@ class ContractEvaluator:
         "web_search", "web_fetch", "search_docs",
         "browser_open", "browser_navigate", "inspect_screenshot",
         "experience_search", "skill_retrieve", "skill_list",
-        "inspect_version", "generate_release_notes",
+        "inspect_version", "generate_release_notes", "compute_file_hash",
     }
 
     _PROTOCOL_TARGET_PREFIXES = (
         "workspace/command",
         "workspace/process",
-        "workspace/verdicts",
+        "workspace/verdicts", "workspace/reviews",
         "workspace/inbox",
         "workspace/git",
         "workspace/release",
@@ -161,7 +161,7 @@ class ContractEvaluator:
     )
 
     _PROTOCOL_REPORTING_OPERATIONS = {
-        "submit_verdict", "request_changes", "approve_work_order", "submit_for_review",
+        "submit_verdict", "submit_qa_verdict", "request_changes", "approve_work_order", "submit_for_review",
         "request_contract_change", "evaluate_contract_change",
     }
 
