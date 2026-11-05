@@ -894,6 +894,32 @@ def evaluate_dependencies(
         for dep_id in declaration.dependencies
     )
 
+    wo_data = ref.data if ref is not None else load_work_order(root, wo_id) or {}
+    wo_type = str(wo_data.get("type", "")).upper().strip()
+    is_bugfix_order = wo_type in ("BUGFIX", "HOTFIX", "FIX")
+
+    if is_bugfix_order:
+        remediated_observations = []
+        for obs in observations:
+            if not obs.state.satisfies and obs.state in (PrerequisiteState.BLOCKED, PrerequisiteState.FAILED):
+                dep_data = records.get(obs.wo_id)
+                dep_dict = dep_data.data if dep_data is not None else load_work_order(root, obs.wo_id) or {}
+                from validators.harness.review_gate import wo_deliverable_paths
+                delivs = wo_deliverable_paths(dep_dict)
+                if delivs and all((root / d).exists() for d in delivs):
+                    remediated_obs = PrerequisiteObservation(
+                        wo_id=obs.wo_id,
+                        bucket=obs.bucket,
+                        revision=obs.revision,
+                        contract_revision=obs.contract_revision,
+                        state=PrerequisiteState.COMPLETED_VALID,
+                        detail=f"prerequisite deliverable present on disk for {wo_type} repair ({", ".join(delivs)})",
+                    )
+                    remediated_observations.append(remediated_obs)
+                    continue
+            remediated_observations.append(obs)
+        observations = tuple(remediated_observations)
+
     if graph_issues:
         status = DependencyStatus.INVALID
         code = next(

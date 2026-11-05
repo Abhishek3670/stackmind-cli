@@ -142,8 +142,15 @@ def wo_agents(data: dict[str, Any]) -> list[str]:
 
 
 def is_qa_work_order(data: dict[str, Any]) -> bool:
-    """True when the work order belongs to the QA role (verdict producer)."""
-    if str(data.get("role", "")).lower().strip() in ("qa", "q/a"):
+    """True when the work order belongs to the QA role (verdict producer) or is a test/validation task."""
+    role = str(data.get("role", "")).lower().strip()
+    if role in ("qa", "q/a", "quality"):
+        return True
+    wo_type = str(data.get("type", "")).upper().strip()
+    if wo_type in ("QA", "TEST", "VERIFICATION", "VALIDATION"):
+        return True
+    paths = wo_deliverable_paths(data)
+    if paths and all(str(p).replace("\\", "/").startswith(("tests/", "test/")) for p in paths):
         return True
     return any(role_for_agent(a) == "qa" for a in wo_agents(data))
 

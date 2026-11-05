@@ -89,8 +89,80 @@ def worker_brief_dirs(ws: Path) -> list[Path]:
         ws / ".sync" / "inbox" / "codex",
         ws / ".sync" / "inbox" / "gemini",
         ws / ".sync" / "reviews",
+        ws / ".sync" / "reviews" / "qa",
         ws / ".sync" / "qa" / "verdicts",
     ]
+
+
+def _is_verdict_file(p: Path) -> bool:
+    """True if file is an authoritative QA verdict or review document."""
+    name_lower = p.name.lower()
+    if any(k in name_lower for k in WORKER_VERDICT_NAME_KEYWORDS):
+        return True
+    parts_lower = [part.lower() for part in p.parts]
+    if any(k in parts_lower for k in ("reviews", "verdicts", "qa")) and p.suffix.lower() in (".md", ".json"):
+        return True
+    return False
+
+
+def _format_json_qa_verdict(v: dict[str, Any]) -> str:
+    """Format structured QA verdict JSON into human-readable Markdown feedback."""
+    wo_id = v.get("work_order_id", "Unknown")
+    verdict = v.get("verdict", "FAIL")
+    reviewer = v.get("reviewer", "qa")
+    lines = [
+        f"# QA Review Verdict: {verdict}",
+        f"**Work Order:** {wo_id} | **Reviewer:** {reviewer}",
+        "",
+    ]
+    summary = v.get("summary") or v.get("detail")
+    if summary:
+        lines.extend([f"**Summary:** {summary}", ""])
+
+    findings = v.get("findings") or []
+    if findings:
+        lines.append("## Findings")
+        for f in findings:
+            if isinstance(f, dict):
+                sev = f.get("severity", "issue")
+                detail = f.get("detail", "")
+                repro = f.get("reproduce")
+                repro_str = f" (Repro: `{repro}`)" if repro else ""
+                lines.append(f"- [{sev}] {detail}{repro_str}")
+            else:
+                lines.append(f"- {f}")
+        lines.append("")
+
+    criteria = v.get("criteria") or []
+    failing_criteria = [c for c in criteria if isinstance(c, dict) and str(c.get("outcome", "")).upper() == "FAIL"]
+    if failing_criteria:
+        lines.append("## Failing Criteria")
+        for c in failing_criteria:
+            cid = c.get("id", "")
+            desc = c.get("description", "")
+            ev = c.get("evidence", "")
+            ev_str = f" — {ev}" if ev else ""
+            lines.append(f"- **{cid}**: {desc}{ev_str}")
+        lines.append("")
+
+    req_actions = v.get("required_actions") or []
+    if req_actions:
+        lines.append("## Required Corrective Actions")
+        for a in req_actions:
+            lines.append(f"- {a}")
+        lines.append("")
+
+    evidence = v.get("evidence") or []
+    failing_ev = [e for e in evidence if isinstance(e, dict) and not e.get("passed", True)]
+    if failing_ev:
+        lines.append("## Test Evidence")
+        for e in failing_ev:
+            cmd = e.get("command") or e.get("kind", "evidence")
+            res = e.get("result", "")
+            lines.append(f"- `{cmd}`: {res}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def worker_brief_candidates(ws: Path) -> list[Path]:
@@ -101,15 +173,23 @@ def worker_brief_candidates(ws: Path) -> list[Path]:
     Within each class the newest file wins.
     """
     candidates: list[Path] = []
+    seen: set[Path] = set()
     for d in worker_brief_dirs(ws):
         if not d.is_dir():
             continue
+        is_review_dir = any(k in [part.lower() for part in d.parts] for k in ("reviews", "verdicts", "qa"))
         for f in d.iterdir():
-            if f.is_file() and any(k in f.name.lower() for k in WORKER_BRIEF_NAME_KEYWORDS):
+            if not f.is_file() or f in seen:
+                continue
+            if is_review_dir and f.suffix.lower() in (".md", ".json"):
                 candidates.append(f)
+                seen.add(f)
+            elif any(k in f.name.lower() for k in WORKER_BRIEF_NAME_KEYWORDS):
+                candidates.append(f)
+                seen.add(f)
 
     def _rank(p: Path) -> tuple[int, float]:
-        is_verdict = any(k in p.name.lower() for k in WORKER_VERDICT_NAME_KEYWORDS)
+        is_verdict = _is_verdict_file(p)
         return (0 if is_verdict else 1, -p.stat().st_mtime if p.exists() else 0.0)
 
     candidates.sort(key=_rank)
@@ -1768,11 +1848,11 @@ class _ExecutionMixin:
         deliv_name = Path(deliv_path).name if deliv_path else None
 
         # A delegation notice is a briefing, never a QA verdict: only files
-        # whose name declares a verdict may set a work order's QA status.
+        # that are verdict/review documents may set a work order's QA status.
         candidates = [
             f
             for f in worker_brief_candidates(ws)
-            if any(k in f.name.lower() for k in WORKER_VERDICT_NAME_KEYWORDS)
+            if _is_verdict_file(f)
         ]
 
         for f in candidates:
@@ -1804,15 +1884,26 @@ class _ExecutionMixin:
                         elif deliv_name and len(deliv_name) > 6 and deliv_name in raw_text:
                             matches_wo = True
             if matches_wo:
-                status_match = re.search(r"status\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES)", content, re.IGNORECASE)
+                if f.suffix.lower() == ".json":
+                    try:
+                        v_json = json.loads(raw_text)
+                        if isinstance(v_json, dict) and "verdict" in v_json:
+                            v_val = str(v_json["verdict"]).upper()
+                            if v_val in ("PASS", "APPROVED", "QA_PASS"):
+                                return "APPROVED"
+                            if v_val in ("FAIL", "NEEDS_CHANGES", "NEEDS CHANGES", "QA_FAIL", "REJECTED"):
+                                return "NEEDS_CHANGES"
+                    except Exception:
+                        pass
+                status_match = re.search(r"(?:status|verdict)\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES|PASS|FAIL|REJECTED)", content, re.IGNORECASE)
                 if status_match:
                     val = status_match.group(1).upper()
-                    if "NEEDS" in val:
+                    if val in ("NEEDS", "NEEDS_CHANGES", "FAIL", "REJECTED"):
                         return "NEEDS_CHANGES"
                     return "APPROVED"
-                if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content:
+                if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content or "FAIL" in content or "REJECTED" in content:
                     return "NEEDS_CHANGES"
-                if "APPROVED" in content:
+                if "APPROVED" in content or "PASS" in content:
                     return "APPROVED"
         return None
 
@@ -1896,10 +1987,23 @@ class _ExecutionMixin:
             if matches_wo:
                 # A verdict must say the work needs changing; a delegation
                 # briefing is addressed to the worker and is injected whole.
-                is_verdict = any(k in f.name.lower() for k in WORKER_VERDICT_NAME_KEYWORDS)
+                is_verdict = _is_verdict_file(f)
                 if is_verdict:
+                    if f.suffix.lower() == ".json":
+                        try:
+                            v_json = json.loads(text)
+                            if isinstance(v_json, dict):
+                                v_stat = str(v_json.get("verdict", "")).upper()
+                                if v_stat in ("PASS", "APPROVED", "QA_PASS"):
+                                    continue
+                                formatted = _format_json_qa_verdict(v_json)
+                                if formatted:
+                                    return formatted
+                        except Exception:
+                            pass
                     upper = text.upper()
-                    if "NEEDS_CHANGES" not in upper and "NEEDS CHANGES" not in upper:
+                    has_failure_token = any(tok in upper for tok in ("NEEDS_CHANGES", "NEEDS CHANGES", "FAIL", "REJECTED"))
+                    if not has_failure_token:
                         continue
                 return text.strip()
         return ""
@@ -2188,17 +2292,19 @@ class _ExecutionMixin:
                 state.qa_reworks[wo_id] = reworks + 1
                 correction = "\n".join(f"- {a}" for a in decision.required_actions)
                 findings = "\n".join(f"- {f}" for f in decision.findings)
+                data = review_gate.load_wo(ws, wo_id)
+                deliv_paths = review_gate.wo_deliverable_paths(data)
+                deliv_desc = ", ".join(deliv_paths) if deliv_paths else "assigned deliverables"
 
                 def _qa_rework_prompt(n: int, agent: str) -> str:
                     return (
                         f"Rework work order {wo_id} after mandatory QA review (attempt {n}).\n"
+                        f"Target deliverable(s): {deliv_desc}\n\n"
                         f"QA findings:\n"
-                        f"{findings or '- deliverable did not satisfy the acceptance criteria'}\n"
-                        + (f"Required corrective actions:\n{correction}\n" if correction else "")
-                        + "\nCRITICAL SCOPE RULE: Restrict your changes strictly to your assigned deliverable(s). Do NOT attempt to create or modify companion files owned by other work orders or marked read_only_files (such as companion CSS, JS, or tests). Those are authored by other workers in separate work orders.\n"
-                        + "Restrict your changes to the identified defects. When you finish, the "
-                        "deliverable must be re-verified and re-reviewed by QA before it "
-                        "can be accepted."
+                        f"{findings or '- deliverable did not satisfy the acceptance criteria'}\n\n"
+                        + (f"Required corrective actions:\n{correction}\n\n" if correction else "")
+                        + f"CRITICAL SCOPE RULE: Restrict your changes strictly to your assigned deliverable(s): {deliv_desc}. Do NOT attempt to create or modify companion files owned by other work orders or marked read_only_files (such as companion CSS, JS, or tests). Those are authored by other workers in separate work orders.\n"
+                        + "When you finish, the deliverable must be re-verified and re-reviewed by QA before it can be accepted."
                     )
 
                 if wo_id in state.completed_wo_ids:
