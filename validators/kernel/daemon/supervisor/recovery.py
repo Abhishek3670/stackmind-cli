@@ -1090,7 +1090,7 @@ class _RecoveryMixin:
             f".sync/decisions/recovery/{wo_id}.decision.json conforming to "
             "schemas/recovery-decision.schema.json (fields: work_order, action, reason, plus "
             "failure_code/transient/replacement_work_orders/contract_revision as applicable).\n"
-            "2. Permitted actions: architect_fix (RECOMMENDED for defects, failing deliverables, or broken tests — the Architect directly repairs the deliverable files in the follow-up repair turn), "
+            "2. Permitted actions: architect_fix (RECOMMENDED for defects, failing deliverables, or broken tests — the Architect resolves it in the follow-up repair turn by authoring governed artifacts only (work orders, contract amendments, acceptance criteria, decisions); the Architect can NOT write application source or test files, so code defects are fixed by re-dispatching the owning worker), "
             f"retry_unchanged (ONLY for transient failures with an unchanged contract), "
             f"amend_contract (set contract_revision to {current_rev + 1} or higher; current revision is {current_rev}; the amended contract is authored in the follow-up repair turn), "
             "split_work_order (list replacement_work_orders child IDs), create_dependency_work_order (list new prerequisite WO IDs), "
@@ -1828,8 +1828,20 @@ class _RecoveryMixin:
                 renewal_kind="recovery_decision_clear",
                 allow_unchanged_input=True,
             )
+            # Verdicts are archived below so repair is followed by a genuinely fresh
+            # review; that review needs a fresh QA_REVIEW budget too. Without this the
+            # exhausted QA budget trips instantly on every cycle and QA is never re-run.
+            _renew_budget(
+                state,
+                BudgetKey.QA_REVIEW,
+                wo_id,
+                reason="authorized recovery decision cleared the blocker; fresh QA review follows",
+                renewal_kind="recovery_decision_clear",
+                allow_unchanged_input=True,
+            )
         except Exception:
             state.retry_counts[wo_id] = 0
+            state.qa_review_attempts[wo_id] = 0
         if state.recovery_wo_id == wo_id:
             state.recovery_wo_id = None
         state.dispatch_failures.pop(wo_id, None)

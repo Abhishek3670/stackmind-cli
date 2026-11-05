@@ -2076,8 +2076,9 @@ class _ExecutionMixin:
             if decision.passed:
                 return None
             if decision.verdict is None:
-                state.qa_review_attempts[wo_id] = state.qa_review_attempts.get(wo_id, 0) + 1
-                if state.qa_review_attempts[wo_id] >= state.max_qa_review_attempts:
+                # The dispatch path already counted this review turn (prior_attempts + 1).
+                # Counting it again here made ONE failed review exhaust a budget of two.
+                if state.qa_review_attempts.get(wo_id, 0) >= state.max_qa_review_attempts:
                     state.error = (
                         f"QA review for {wo_id} produced no verdict after "
                         f"{state.qa_review_attempts[wo_id]} attempt(s): {decision.detail}"
