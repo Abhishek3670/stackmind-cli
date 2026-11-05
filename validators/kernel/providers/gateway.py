@@ -2205,9 +2205,25 @@ class ProviderGateway:
                         kwargs[param_name] = args.get("start") or args.get("line_start") or args.get("from_line")
                     elif param_name == "end_line" and any(k in args for k in ("end", "line_end", "to_line")):
                         kwargs[param_name] = args.get("end") or args.get("line_end") or args.get("to_line")
+                    elif param_name == "screenshot_path" and any(k in args for k in ("screenshot_path", "image_path", "path", "image", "file")):
+                        kwargs[param_name] = args.get("screenshot_path") or args.get("image_path") or args.get("path") or args.get("image") or args.get("file")
+                    elif param_name == "base_dir" and any(k in args for k in ("base_dir", "path", "dir", "directory")):
+                        kwargs[param_name] = args.get("base_dir") or args.get("path") or args.get("dir") or args.get("directory")
                     elif param_name == "agent_name" and any(k in args for k in ("agent", "name", "role", "actor")):
                         kwargs[param_name] = args.get("agent") or args.get("name") or args.get("role") or args.get("actor")
-                    elif param_name == "wo_id" and any(k in args for k in ("work_order_id", "work_order", "id", "wo", "workorder")):
+                    elif param_name == "wo_id":
+                        val = (
+                            args.get("work_order_id")
+                            or args.get("work_order")
+                            or args.get("id")
+                            or args.get("wo")
+                            or args.get("workorder")
+                        )
+                        if not val and self.contract and getattr(self.contract, "work_order", None):
+                            val = self.contract.work_order
+                        if val:
+                            kwargs[param_name] = val
+                    if False:
                         kwargs[param_name] = (
                             args.get("work_order_id")
                             or args.get("work_order")
