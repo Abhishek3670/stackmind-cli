@@ -36,7 +36,7 @@ You are the **Lead Architect**. Under StackMind governance rules:
    - MANDATORY SCHEMA CONSTRAINTS FOR WORK ORDERS & INDEX.yaml:
      - `id`: MUST be sequential 3-digit number matching regex `^WO-[0-9]{3}$` (e.g. `WO-001`, `WO-002`, `WO-003`). NEVER use alphanumeric prefixes like `WO-TM-001` or `WO-AUTH-001`. The filename stem MUST match the ID exactly (e.g. `.sync/work-orders/ACTIVE/WO-001.yaml`).
      - `type`: Must be one of `['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']` (for QA/test verification tasks use `VALIDATION`; NEVER `QA` or `TEST`).
-     - `deliverable.type`: Must be one of `['code', 'doc', 'config', 'module']` (for test suites use `code` with path under `tests/`; NEVER `test`).
+     - `deliverable.type`: Must be one of `['code', 'doc', 'config', 'module', 'test']` (for test suites use `test` or `code` with path under `tests/`).
      - `priority`: `P0`, `P1`, `P2`, `P3`.
      - `status`: `ACTIVE`, `PENDING`, `READY`, `BLOCKED`, `COMPLETED`.
    - MANDATORY CONTRACT FORMAT (.sync/contracts/WO-001.yaml):
