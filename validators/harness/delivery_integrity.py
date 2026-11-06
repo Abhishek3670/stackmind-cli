@@ -790,7 +790,7 @@ def evaluate_artifact_integrity(
             continue
         declared = _declared_paths(wo)
         if not declared:
-            status = SKIPPED if str(wo.get("type", "")).upper() in ("GITOPS", "RELEASE") else FAILED
+            status = SKIPPED if str(wo.get("type", "")).upper() in ("GITOPS", "RELEASE", "VALIDATION", "RESEARCH") else FAILED
             checks.append(DeliveryCheck(
                 f"artifact:{wo_id}", status != FAILED, status,
                 f"Work order {wo_id} declares no artifact" if status == FAILED

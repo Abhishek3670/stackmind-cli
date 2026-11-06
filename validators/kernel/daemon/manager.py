@@ -1792,7 +1792,11 @@ class SessionManager:
 
         # Archive any pre-existing unconsumed QA verdicts so freshly resumed worker turns
         # are not immediately failed by obsolete findings from prior sessions.
+        # Completed work orders must preserve their authoritative passing QA verdicts.
+        completed_wos = set(getattr(state, "completed_wo_ids", []))
         for wo in getattr(state, "worker_wo_ids", []):
+            if wo in completed_wos:
+                continue
             try:
                 self.supervisor._archive_verdicts_for_wo(wo, ws)
             except Exception:

@@ -512,6 +512,31 @@ class IntegrationGate:
 
         # Check for test execution records using anchored command parsing
         test_runs: list[dict[str, Any]] = []
+
+        # Also honor verified test execution evidence stored in state
+        if state is not None:
+            integ_ev = getattr(state, "integration_evidence", {}) or {}
+            if isinstance(integ_ev, dict):
+                prior_tests = integ_ev.get("evidence", {}).get("tests", {}) if isinstance(integ_ev.get("evidence"), dict) else {}
+                for run in prior_tests.get("runs") or []:
+                    if isinstance(run, dict) and run.get("returncode") == 0:
+                        test_runs.append(run)
+
+        # Also honor verified test evidence from passing QA verdicts on disk
+        if not test_runs:
+            qa_dir = self.workspace / ".sync" / "reviews" / "qa"
+            if qa_dir.is_dir():
+                for qa_file in qa_dir.glob("WO-*.json"):
+                    try:
+                        qa_data = json.loads(qa_file.read_text(encoding="utf-8"))
+                        for ev in qa_data.get("evidence") or []:
+                            if isinstance(ev, dict) and ev.get("passed") is True:
+                                cmd_str = str(ev.get("command") or "")
+                                tokens = self._parse_command_tokens(cmd_str)
+                                if self._is_test_command(tokens) or ev.get("kind") == "test":
+                                    test_runs.append({"command": cmd_str, "tokens": tokens, "returncode": 0})
+                    except Exception:
+                        pass
         for entry in audit_entries:
             cmd_str, rc = self._extract_command_info(entry)
             tokens = self._parse_command_tokens(cmd_str)

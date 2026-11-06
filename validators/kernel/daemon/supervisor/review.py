@@ -1230,7 +1230,7 @@ class _ReviewMixin:
             if (
                 actionable
                 and state.final_prerequisite_rounds < state.max_final_review_rounds + 2
-                and actionable_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED
+                and state.global_turn_budget > 0
             ):
                 state.final_prerequisite_rounds += 1
                 for fail_desc in report.qa_failures:
