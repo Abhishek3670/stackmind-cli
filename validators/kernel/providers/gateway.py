@@ -1976,11 +1976,18 @@ class ProviderGateway:
                 if getattr(self, "is_adhoc", False):
                     norm_target = str(target or "").replace("\\", "/").strip().lstrip("/")
                     if norm_target.startswith((".sync/work-orders/", ".sync/contracts/")):
-                        self.consecutive_failures += 1
-                        return (
-                            f"Error: Authoring work orders or contracts ('{target}') is disabled during ad-hoc conversation. "
-                            "In ad-hoc mode, discuss requirements with the user or call delegate_task/trigger_goal when an autonomous execution goal is confirmed."
+                        is_arch = (
+                            getattr(self, "is_architecture", False)
+                            or getattr(self, "is_authoring", False)
+                            or str(getattr(self, "role", "")).lower().strip() in ("architecture", "architect")
+                            or str((getattr(self, "contract", None) and getattr(self.contract, "identity", None) and getattr(self.contract.identity, "role", "")) or "").lower().strip() in ("architecture", "architect")
                         )
+                        if not is_arch:
+                            self.consecutive_failures += 1
+                            return (
+                                f"Error: Authoring work orders or contracts ('{target}') is disabled during ad-hoc conversation. "
+                                "In ad-hoc mode, discuss requirements with the user or call delegate_task/trigger_goal when an autonomous execution goal is confirmed."
+                            )
 
                 content = (
                     args.get("content")
@@ -2044,16 +2051,23 @@ class ProviderGateway:
                     return "Error: 'batch_write_files' requires a non-empty 'files' array."
 
                 if getattr(self, "is_adhoc", False):
-                    has_wo = any(
-                        str(f.get("path") or f.get("target") or "").replace("\\", "/").strip().lstrip("/").startswith((".sync/work-orders/", ".sync/contracts/"))
-                        for f in files if isinstance(f, dict)
+                    is_arch = (
+                        getattr(self, "is_architecture", False)
+                        or getattr(self, "is_authoring", False)
+                        or str(getattr(self, "role", "")).lower().strip() in ("architecture", "architect")
+                        or str((getattr(self, "contract", None) and getattr(self.contract, "identity", None) and getattr(self.contract.identity, "role", "")) or "").lower().strip() in ("architecture", "architect")
                     )
-                    if has_wo:
-                        self.consecutive_failures += 1
-                        return (
-                            "Error: Authoring work orders or contracts via 'batch_write_files' is disabled during ad-hoc conversation. "
-                            "In ad-hoc mode, discuss requirements with the user or call delegate_task/trigger_goal when an autonomous execution goal is confirmed."
+                    if not is_arch:
+                        has_wo = any(
+                            str(f.get("path") or f.get("target") or "").replace("\\", "/").strip().lstrip("/").startswith((".sync/work-orders/", ".sync/contracts/"))
+                            for f in files if isinstance(f, dict)
                         )
+                        if has_wo:
+                            self.consecutive_failures += 1
+                            return (
+                                "Error: Authoring work orders or contracts via 'batch_write_files' is disabled during ad-hoc conversation. "
+                                "In ad-hoc mode, discuss requirements with the user or call delegate_task/trigger_goal when an autonomous execution goal is confirmed."
+                            )
                 res = self.tool_gateway.batch_write_files(files)
                 self.consecutive_failures = 0
                 for f in res.get("files", []):

@@ -2106,6 +2106,18 @@ class SessionManager:
                     self.supervisor.save_run_state(state, ws)
                 except Exception:
                     pass
+            # If active work orders exist on disk, populate worker_wo_ids before re-attest
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            if active_dir.is_dir():
+                for wo_file in sorted(active_dir.glob("*.yaml")):
+                    wo_id = wo_file.stem
+                    if wo_id not in state.completed_wo_ids and wo_id not in state.worker_wo_ids:
+                        state.worker_wo_ids.append(wo_id)
+            if state.phase == Phase.COMPLETE and state.worker_wo_ids:
+                state.phase = Phase.DISPATCHING
+                state.exit_code = 0
+                state.error = None
+
             if hasattr(self.supervisor, "re_attest_run"):
                 try:
                     self.supervisor.re_attest_run(

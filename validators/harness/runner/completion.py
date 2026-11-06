@@ -202,7 +202,8 @@ class _CompletionMixin:
             on_token=getattr(self, 'on_token', None),
             on_usage=getattr(self, 'on_usage', None),
         )
-        gateway.is_authoring = is_authoring_task
+        gateway.is_authoring = is_authoring_task or is_architecture
+        gateway.is_architecture = is_architecture
         gateway.is_adhoc = (request.task.kind == 'adhoc')
         if is_plan_task:
             from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS

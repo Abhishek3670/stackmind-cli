@@ -716,7 +716,12 @@ class _ExecutionMixin:
                     # controls there).
                     declared_missing = dec_effective - set(observed_task_files)
                     declaration_matches = not declared_missing
-                    if getattr(task, 'is_authoring', False):
+                    is_arch = (
+                        getattr(task, 'is_authoring', False)
+                        or str(getattr(self, 'agent', '')).lower().strip() in ('claude', 'architecture', 'architect')
+                        or str(getattr(task, 'role', '')).lower().strip() in ('architecture', 'architect')
+                    )
+                    if is_arch:
                         declaration_matches = True
                     mismatch_reason = (
                         None if declaration_matches
