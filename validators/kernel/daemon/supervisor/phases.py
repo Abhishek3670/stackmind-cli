@@ -563,6 +563,10 @@ class _PhasesMixin:
 
         # 2. S6 Concurrency: When multiple sibling work orders are eligible in this pass,
         # open a parent batch operation so SessionManager.begin_operation does not force them sequential.
+        if state.batch_operation_id:
+            batch_op = self._get_operation(state.batch_operation_id)
+            if batch_op is None or batch_op.get("status") in _OPERATION_TERMINAL:
+                state.batch_operation_id = None
         parent_op_id = state.batch_operation_id
         if len(eligible_wos) > 1 and not parent_op_id and hasattr(self.manager, "begin_operation"):
             try:

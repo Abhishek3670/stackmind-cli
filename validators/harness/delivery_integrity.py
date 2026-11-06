@@ -466,6 +466,17 @@ def plan_criteria(workspace: Path | str) -> list[str]:
                     text = str(item).strip()
                     if text and text not in criteria:
                         criteria.append(text)
+
+    if not criteria:
+        # Fall back to work orders' declared acceptance criteria
+        try:
+            for wo in load_work_orders(ws).values():
+                for c in wo.get("acceptance_criteria") or []:
+                    c_str = str(c).strip()
+                    if c_str and c_str not in criteria:
+                        criteria.append(c_str)
+        except Exception:
+            pass
     return criteria
 
 
@@ -528,7 +539,7 @@ def evaluate_planning_completeness(
 
     missing_deliverables = [
         wo_id for wo_id, wo in orders.items()
-        if not _declared_paths(wo) and str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE")
+        if not _declared_paths(wo) and str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE", "VALIDATION", "RESEARCH")
     ]
     checks.append(DeliveryCheck(
         "meaningful_deliverables",
@@ -562,7 +573,7 @@ def evaluate_planning_completeness(
 
     criteria_ownerless = [
         wo_id for wo_id, wo in orders.items()
-        if str(wo.get("type", "")).upper() not in ("GITOPS", "RELEASE")
+        if str(wo.get("type", "")).upper() not in ("GITOPS", "RELEASE", "VALIDATION", "RESEARCH")
         and not _criteria(wo)
         and not _requirements_refs(wo)
     ]
@@ -1142,7 +1153,7 @@ def evaluate_release_readiness(
     # Governance: every completed implementation order has an authoritative contract.
     missing_contracts = [
         wo_id for wo_id, wo in orders.items()
-        if str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE")
+        if str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE", "VALIDATION", "RESEARCH")
         and not (ws / ".sync" / "contracts" / f"{wo_id}.yaml").is_file()
     ]
     checks.append(DeliveryCheck(

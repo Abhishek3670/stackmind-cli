@@ -1261,10 +1261,15 @@ class _ReviewMixin:
 
         required = review_gate.required_wo_ids_for_run(state, ws)
         verdict = review_gate.load_final_verdict(ws, state.run_id)
+        # Check if release integrity was blocked after this verdict was created
+        recent_release_blocked = any(
+            h.get("event") in ("release_integrity_blocked", "release_integrity_stale")
+            for h in getattr(state, "final_review_history", [])[-3:]
+        )
         ok, why = review_gate.validate_final_verdict(
             verdict, ws, run_id=state.run_id, plan_id=state.plan_id, required_wo_ids=required,
         )
-        if ok:
+        if ok and not recent_release_blocked:
             state.error = None
             state.final_review_operation_id = None
             self._transition(state, Phase.PRODUCT_READY)

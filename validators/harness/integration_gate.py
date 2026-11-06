@@ -1348,8 +1348,10 @@ class IntegrationGate:
         return tokens
 
     @staticmethod
-    def _is_test_command(tokens: list[str]) -> bool:
+    def _is_test_command(tokens: list[str] | str) -> bool:
         """Anchored check whether command tokens represent a test execution invocation."""
+        if isinstance(tokens, str):
+            tokens = IntegrationGate._parse_command_tokens(tokens)
         if not tokens:
             return False
 
@@ -1371,6 +1373,16 @@ class IntegrationGate:
         }
         if first_tok in direct_runners:
             return True
+
+        # Node.js test runner: node --test, node --test tests/..., or node running test files
+        if first_tok == "node":
+            for tok in tokens[1:]:
+                t_lower = tok.lower()
+                if t_lower == "--test" or t_lower.startswith("--test=") or t_lower.startswith("--test-name-pattern"):
+                    return True
+                if any(t_lower.endswith(sfx) for sfx in (".test.js", ".test.mjs", ".test.cjs", ".spec.js", ".spec.mjs")):
+                    return True
+            return False
 
         # Python test module invocations: python -m pytest / unittest
         if first_tok in ("python", "python3", "py"):

@@ -306,3 +306,201 @@ def test_waiting_for_human_notification_and_pruning(tmp_path: Path):
     assert "run-test-alert" in alert_text
     assert "stackmind resume" in alert_text
     assert ":resume" in alert_text
+
+# =========================================================================
+# Tests for Postmortem run-8b5c360c Architectural Fixes:
+# 1. node --test runner recognition
+# 2. VALIDATION and RESEARCH deliverable exclusions
+# 3. plan_criteria fallback to work orders
+# 4. GITOPS bounded retries and verdict invalidation
+# 5. Zero-turn phase oscillation loop breaker
+# =========================================================================
+
+from validators.harness.integration_gate import IntegrationGate
+from validators.harness.delivery_integrity import (
+    evaluate_planning_completeness,
+    evaluate_release_readiness,
+    plan_criteria,
+)
+from validators.kernel.daemon.supervisor.models import AdvanceResult
+
+
+def test_node_test_runner_recognition(tmp_path: Path):
+    """IntegrationGate._is_test_command must recognize modern Node.js test runners."""
+    gate = IntegrationGate(tmp_path)
+    # Test with string commands
+    assert gate._is_test_command("node --test")
+    assert gate._is_test_command("node --test tests/timing-engine.test.js")
+    assert gate._is_test_command("node --test-name-pattern=timer tests/suite.js")
+    assert gate._is_test_command("node tests/engine.test.js")
+    assert gate._is_test_command("node tests/engine.spec.mjs")
+    assert not gate._is_test_command("node src/main.js")
+    assert not gate._is_test_command("node server.js")
+
+    # Test with parsed token lists
+    assert gate._is_test_command(["node", "--test", "tests/timing-engine.test.js"])
+    assert gate._is_test_command(["node", "tests/timing-engine.test.js"])
+    assert not gate._is_test_command(["node", "src/timing-engine.js"])
+
+
+def test_validation_and_research_deliverable_exclusions(tmp_path: Path):
+    """Work orders of type VALIDATION and RESEARCH should not be flagged for missing deliverables or contracts."""
+    ws = tmp_path
+    sync_dir = ws / ".sync"
+    act_dir = sync_dir / "work-orders" / "ACTIVE"
+    contracts_dir = sync_dir / "contracts"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    (ws / "PLAN.md").write_text("# Plan\n\n# Acceptance Criteria\n- Criterion 1", encoding="utf-8")
+
+    (act_dir / "WO-007.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-007",
+            "type": "VALIDATION",
+            "status": "COMPLETED",
+            "title": "Integration Review",
+            "acceptance_criteria": ["Verify integration"],
+        }),
+        encoding="utf-8",
+    )
+    (act_dir / "WO-008.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-008",
+            "type": "RESEARCH",
+            "status": "COMPLETED",
+            "title": "Spike",
+            "acceptance_criteria": ["Evaluate library"],
+        }),
+        encoding="utf-8",
+    )
+
+    report = evaluate_planning_completeness(ws)
+    for check in report.checks:
+        if check.name in ("meaningful_deliverables", "criteria_ownership"):
+            assert "WO-007" not in str(check.evidence)
+            assert "WO-008" not in str(check.evidence)
+            assert check.passed
+
+    release_report = evaluate_release_readiness(ws)
+    for check in release_report.checks:
+        if check.name == "governance_contracts":
+            assert "WO-007" not in str(check.evidence)
+            assert "WO-008" not in str(check.evidence)
+
+
+def test_plan_criteria_fallback_to_work_orders(tmp_path: Path):
+    """When PLAN.md has no explicit '# Acceptance Criteria' section, fall back to work orders' criteria."""
+    ws = tmp_path
+    sync_dir = ws / ".sync"
+    act_dir = sync_dir / "work-orders" / "ACTIVE"
+    act_dir.mkdir(parents=True, exist_ok=True)
+
+    (ws / "PLAN.md").write_text("# Project Plan\n\n## Tasks\n- Task 1", encoding="utf-8")
+
+    (act_dir / "WO-001.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-001",
+            "title": "Task 1",
+            "acceptance_criteria": ["Criteria from WO-001: millisecond precision", "Criteria from WO-001: dark theme"],
+        }),
+        encoding="utf-8",
+    )
+
+    criteria = plan_criteria(ws)
+    assert "Criteria from WO-001: millisecond precision" in criteria
+    assert "Criteria from WO-001: dark theme" in criteria
+
+
+def test_gitops_bounded_retries_and_verdict_invalidation(tmp_path: Path):
+    """When release readiness fails repeatedly in GITOPS, retries are bounded and verdict is invalidated."""
+    ws = tmp_path
+    sync_dir = ws / ".sync"
+    reviews_dir = sync_dir / "reviews" / "architect"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    final_verdict = reviews_dir / "run-test-bounce.json"
+    final_verdict.write_text('{"verdict": "PASS"}', encoding="utf-8")
+
+    class FakeGitopsManager:
+        def __init__(self):
+            self.operations = {
+                "op-gitops-1": {
+                    "operation_id": "op-gitops-1",
+                    "status": "COMPLETED",
+                    "result": {"status": "completed"},
+                }
+            }
+        def get_operation(self, op_id):
+            return self.operations.get(op_id)
+
+    manager = FakeGitopsManager()
+    supervisor = LifecycleSupervisor(manager)
+    state = RunState(
+        run_id="run-test-bounce",
+        session_id="test-session",
+        workspace=str(ws),
+        phase=Phase.GITOPS,
+        product_goal="Test bounce breaker",
+        gitops_retries=0,
+        max_gitops_retries=2,
+        gitops_operation_id="op-gitops-1",
+    )
+
+    result = supervisor._advance_gitops(state)
+    assert result == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.FINAL_REVIEW
+    assert state.gitops_retries == 1
+    assert not final_verdict.is_file()
+
+    final_verdict.write_text('{"verdict": "PASS"}', encoding="utf-8")
+    state.phase = Phase.GITOPS
+    state.gitops_operation_id = "op-gitops-1"
+    result = supervisor._advance_gitops(state)
+    assert result == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.FINAL_REVIEW
+    assert state.gitops_retries == 2
+    assert not final_verdict.is_file()
+
+    state.phase = Phase.GITOPS
+    state.gitops_operation_id = "op-gitops-1"
+    result = supervisor._advance_gitops(state)
+    assert result == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert "retries exhausted" in str(state.error)
+
+
+def test_zero_turn_phase_oscillation_breaker(tmp_path: Path):
+    """Supervisor advance loop must detect and halt zero-turn phase oscillations (>=12 transitions) at WAITING_FOR_HUMAN."""
+    class OscillatingSupervisor(LifecycleSupervisor):
+        def _transition(self, state, new_phase, authorized_override=False, **kwargs):
+            state.phase = new_phase
+
+        def _advance_dispatching(self, state):
+            self._transition(state, Phase.FINAL_REVIEW)
+            return AdvanceResult.TRANSITIONED
+
+        def _advance_final_review(self, state):
+            self._transition(state, Phase.DISPATCHING)
+            return AdvanceResult.TRANSITIONED
+
+    class FakeManager:
+        pass
+
+    sup = OscillatingSupervisor(FakeManager())
+    state = RunState(
+        run_id="run-test-oscillation",
+        session_id="test-session",
+        workspace=str(tmp_path),
+        phase=Phase.DISPATCHING,
+        product_goal="Test oscillation breaker",
+        global_turn_budget=100,
+    )
+
+    for _ in range(11):
+        res = sup.advance(state)
+        assert res == AdvanceResult.TRANSITIONED
+
+    res = sup.advance(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert "PHASE_OSCILLATION_LOOP" in str(state.error)

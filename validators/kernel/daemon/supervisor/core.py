@@ -791,10 +791,29 @@ class LifecycleSupervisor(
                 phase_changed = (state.phase != old_phase)
                 turn_dispatched = (state.global_turn_budget < old_budget)
                 active_op = self._has_active_operations(state)
-                if phase_changed or turn_dispatched or active_op:
+
+                if turn_dispatched or active_op:
                     state.stall_ticks = 0
+                    if hasattr(state, "_zero_turn_phase_count"):
+                        state._zero_turn_phase_count = 0
+                elif phase_changed:
+                    # Track zero-turn phase transitions to detect cyclic oscillations
+                    count = getattr(state, "_zero_turn_phase_count", 0) + 1
+                    state._zero_turn_phase_count = count
+                    if count >= 12:
+                        state.error = (
+                            f"PHASE_OSCILLATION_LOOP: Supervisor transitioned phases "
+                            f"{count} times without dispatching any agent turns "
+                            f"or active operations. Halting at WAITING_FOR_HUMAN."
+                        )
+                        state.exit_code = EXIT_RETRIES_EXHAUSTED
+                        state._zero_turn_phase_count = 0
+                        self._transition(state, Phase.WAITING_FOR_HUMAN)
+                        return AdvanceResult.WAITING_FOR_HUMAN
                 else:
                     state.stall_ticks += 1
+                    if hasattr(state, "_zero_turn_phase_count"):
+                        state._zero_turn_phase_count = 0
                     if state.stall_ticks >= state.max_stall_ticks:
                         # Attempt autonomous Architect recovery escalation if retry budget remains
                         recovery_attempts = state.recovery_attempts.get("IDLE_STALL", 0)
