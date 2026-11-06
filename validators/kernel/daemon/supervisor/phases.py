@@ -991,6 +991,7 @@ class _PhasesMixin:
                 if self._retry_worker(state, ws, wo_id, _rework_prompt):
                     turns_dispatched += 1
                     all_done = False
+                    _review_gate.archive_qa_verdict(ws, wo_id, suffix="stale")
                 continue
 
             # ── Mandatory QA review gate ──────────────────────────────────

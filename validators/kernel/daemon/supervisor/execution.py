@@ -97,6 +97,8 @@ def worker_brief_dirs(ws: Path) -> list[Path]:
 def _is_verdict_file(p: Path) -> bool:
     """True if file is an authoritative QA verdict or review document."""
     name_lower = p.name.lower()
+    if any(k in name_lower for k in ("-stale-", "-invalidated-", "-superseded-", "-rejected-")):
+        return False
     if any(k in name_lower for k in WORKER_VERDICT_NAME_KEYWORDS):
         return True
     parts_lower = [part.lower() for part in p.parts]
@@ -1922,6 +1924,12 @@ class _ExecutionMixin:
                     try:
                         v_json = json.loads(raw_text)
                         if isinstance(v_json, dict) and "verdict" in v_json:
+                            # Freshness check: if the deliverable hash changed since this verdict was recorded,
+                            # this verdict reflects an older version before developer rework and is stale.
+                            curr_hash = _review_gate.subject_hash(ws, wo_id)
+                            rec_hash = str(v_json.get("subject_hash", ""))
+                            if curr_hash and rec_hash and curr_hash != rec_hash:
+                                continue
                             v_val = str(v_json["verdict"]).upper()
                             if v_val in ("PASS", "APPROVED", "QA_PASS"):
                                 return "APPROVED"
