@@ -374,6 +374,9 @@ def validate_dependency_graph(
     """
     records = load_all_work_orders(root)
     superseded = {str(s) for s in superseded_ids}
+    for wid, ref in records.items():
+        if str(ref.data.get("status", "")).upper() in ("SUPERSEDED", "CANCELLED"):
+            superseded.add(wid)
     graph = _declared_graph(root, records)
     issues: list[GraphIssue] = []
     plan_ids = {
@@ -475,6 +478,27 @@ def _successor_for(records: Mapping[str, Any], wo_id: str) -> str | None:
     split = data.get("replacement_work_orders")
     if isinstance(split, list) and split:
         return str(split[-1])
+    # Fallback 1: check log text for rebase/replacement pointer (e.g. rebased onto WO-001)
+    log_entries = data.get("log") or []
+    if isinstance(log_entries, list):
+        for entry in log_entries:
+            if isinstance(entry, str):
+                m = re.search(r'(?:rebased|replaced|superseded).*?onto(?:\s+the\s+completed\s+\w+)?\s+(WO-\d+)', entry, re.I)
+                if m:
+                    candidate = m.group(1).upper()
+                    if candidate in records:
+                        return candidate
+    # Fallback 2: if cancelled/superseded, find another completed work order with matching deliverable
+    status = str(data.get("status", "")).upper()
+    if status in ("CANCELLED", "SUPERSEDED"):
+        deliv = data.get("deliverable")
+        if isinstance(deliv, dict) and deliv.get("path"):
+            target_path = str(deliv.get("path")).strip()
+            for other_id, other_ref in records.items():
+                if other_id != wo_id and str(other_ref.data.get("status", "")).upper() == "COMPLETED":
+                    other_deliv = other_ref.data.get("deliverable")
+                    if isinstance(other_deliv, dict) and str(other_deliv.get("path", "")).strip() == target_path:
+                        return other_id
     return None
 
 

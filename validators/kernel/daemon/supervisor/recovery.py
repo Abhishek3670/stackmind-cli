@@ -247,7 +247,8 @@ class _RecoveryMixin:
                 if action in ("architect_fix", "resolve_blocker"):
                     is_deadlock = (
                         state.repair_context.get("is_dependency_deadlock")
-                        or (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code") == "DEPENDENCY_DEADLOCK"
+                        or (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code") in ("DEPENDENCY_DEADLOCK", "INVALID_DEPENDENCY")
+                        or (state.worker_blockers.get(str(wo_id)) or {}).get("dependency_code") == "SUPERSEDED_DEPENDENCY"
                     )
                     if is_deadlock:
                         state.repair_context = {}
@@ -295,6 +296,7 @@ class _RecoveryMixin:
                     can_close = deliv_on_disk and check_passed and not unmet_deps
 
                     if can_close:
+                        self._archive_recovery_artifact(ws, state.run_id, f".sync/decisions/recovery/{wo_id}.decision.json")
                         self._mark_wo_status_on_disk(ws, str(wo_id), "COMPLETED", clear_error=True)
                         if str(wo_id) not in state.completed_wo_ids:
                             state.completed_wo_ids.append(str(wo_id))
@@ -371,6 +373,7 @@ class _RecoveryMixin:
         """
         ws = Path(state.workspace)
         wo_id = state.recovery_wo_id
+        self._current_recovery_failure_code = (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code")
 
         if state.recovery_decision_operation_id:
             op = self._get_operation(state.recovery_decision_operation_id)
@@ -616,14 +619,24 @@ class _RecoveryMixin:
                     "to remove or fix the deadlocked dependency, unblocking the worker execution.\n"
                     if (ctx.get("is_dependency_deadlock") or (ctx.get("evidence") or {}).get("failure_code") == "DEPENDENCY_DEADLOCK")
                     else (
-                        f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\nDirectly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
-                        if is_architect_writable_path(str(ctx.get("deliverable_path") or ""))
+                        "CRITICAL: The blocker is an INVALID_DEPENDENCY / SUPERSEDED_DEPENDENCY. "
+                        f"Work order '{wo_id}' (or related work orders) depends on a superseded/cancelled work order. "
+                        "Directly edit the active work order YAML in .sync/work-orders/ACTIVE/ using write_file "
+                        "to rewire the dependencies onto their authoritative replacements or remove the obsolete dependency.\n"
+                        if (
+                            (ctx.get("evidence") or {}).get("failure_code") == "INVALID_DEPENDENCY"
+                            or (ctx.get("evidence") or {}).get("dependency_code") == "SUPERSEDED_DEPENDENCY"
+                        )
                         else (
-                            f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\n"
-                            "Under StackMind governance invariants, you cannot directly write application source or test files. "
-                            "To resolve this blocker, either amend the work order, contract, or dependencies in .sync/work-orders/ or .sync/contracts/, "
-                            "or delegate the deliverable authoring to the assigned specialist agent (Frontend, Backend, or QA) via "
-                            "`delegate_task(target_agent=..., instructions=..., target_files=[...])`.\n"
+                            f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\nDirectly repair the deliverable and any related workspace files with write_file so that all requirements and tests pass.\n"
+                            if is_architect_writable_path(str(ctx.get("deliverable_path") or ""))
+                            else (
+                                f"Target deliverable: {ctx.get('deliverable_path') or 'declared deliverables'}\n"
+                                "Under StackMind governance invariants, you cannot directly write application source or test files. "
+                                "To resolve this blocker, either amend the work order, contract, or dependencies in .sync/work-orders/ or .sync/contracts/, "
+                                "or delegate the deliverable authoring to the assigned specialist agent (Frontend, Backend, or QA) via "
+                                "`delegate_task(target_agent=..., instructions=..., target_files=[...])`.\n"
+                            )
                         )
                     )
                 )
@@ -1039,6 +1052,10 @@ class _RecoveryMixin:
         """Dispatch the Architect turn that produces the machine-readable recovery decision."""
         evidence = state.worker_blockers.get(wo_id, {})
         self._ensure_recovery_decision_channel(ws, wo_id)
+        # Archive any leftover decision file from an earlier failure so it cannot be loaded as stale
+        old_decision = ws / ".sync" / "decisions" / "recovery" / f"{wo_id}.decision.json"
+        if old_decision.is_file():
+            self._archive_recovery_artifact(ws, state.run_id, f".sync/decisions/recovery/{wo_id}.decision.json")
         # The decision-channel grant is deterministic supervisor bookkeeping;
         # re-baseline the contract hash AFTER it so retry/amend verification
         # measures only Architect-made changes.

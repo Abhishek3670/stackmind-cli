@@ -1653,6 +1653,37 @@ class _ExecutionMixin:
         escalation is already in flight and the caller should just stop
         dispatching this work order (no duplicate recovery turn, no retry burn).
         """
+        # Auto-rewire superseded dependencies if an authoritative successor exists
+        from validators.kernel.daemon.supervisor.dependencies import _successor_for, load_all_work_orders
+        ws = Path(ws)
+        records = load_all_work_orders(ws)
+        rewired_any = False
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        if active_dir.is_dir():
+            for issue in result.graph_issues:
+                if getattr(issue, "code", "") == "SUPERSEDED_DEPENDENCY":
+                    superseded_dep = getattr(issue, "dependency_id", "")
+                    successor = _successor_for(records, superseded_dep)
+                    if successor:
+                        for wo_file in active_dir.glob("*.yaml"):
+                            try:
+                                wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                                deps = wo_data.get("dependencies")
+                                if isinstance(deps, list) and superseded_dep in [str(d) for d in deps]:
+                                    wo_data["dependencies"] = [
+                                        successor if str(d) == superseded_dep else d for d in deps
+                                    ]
+                                    wo_data["updated"] = _now()
+                                    wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                                    rewired_any = True
+                            except Exception:
+                                continue
+        if rewired_any:
+            new_res = self._dependency_result(state, wo_id, ws)
+            if new_res.status is not DependencyStatus.INVALID:
+                state.error = None
+                return AdvanceResult.TRANSITIONED
+
         state.dependency_waits.pop(wo_id, None)
         blocking = [obs for obs in result.prerequisites if not obs.state.satisfies]
         record = result.to_wait_record(timestamp=result.evaluated_at or _now())

@@ -450,12 +450,18 @@ class _PhasesMixin:
             # Reconcile planning WO-000 to COMPLETED upon publishing worker orders
             from validators.harness.plan import resolve_playbook_file
             plan_file = resolve_playbook_file(ws, "PLAN.md")
-            if (not plan_file.is_file() or plan_file.stat().st_size == 0) and state.plan_id:
-                for p in reversed(self.manager.list_plans(state.session_id)):
-                    if p.get("plan_id") == state.plan_id and p.get("content"):
-                        plan_file.parent.mkdir(parents=True, exist_ok=True)
-                        plan_file.write_text(str(p["content"]), encoding="utf-8")
-                        break
+            if not plan_file.is_file() or plan_file.stat().st_size == 0:
+                if state.plan_id:
+                    for p in reversed(self.manager.list_plans(state.session_id)):
+                        if p.get("plan_id") == state.plan_id and p.get("content"):
+                            plan_file.parent.mkdir(parents=True, exist_ok=True)
+                            plan_file.write_text(str(p["content"]), encoding="utf-8")
+                            break
+                elif getattr(state, "product_goal", None) or getattr(state, "goal", None):
+                    # In synthetic/test setups that jump straight to authoring, synthesize PLAN.md
+                    goal_val = getattr(state, "product_goal", None) or getattr(state, "goal", None)
+                    plan_file.parent.mkdir(parents=True, exist_ok=True)
+                    plan_file.write_text(f"# Delivery Plan\n\nGoal: {goal_val}\n", encoding="utf-8")
 
             if plan_file.is_file() and plan_file.stat().st_size > 0:
                 for p_id in (state.planning_wo_id, "WO-000"):
