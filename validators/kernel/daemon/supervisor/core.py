@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1033,6 +1035,8 @@ class LifecycleSupervisor(
         if new_phase == Phase.WAITING_FOR_HUMAN and state.phase != Phase.WAITING_FOR_HUMAN:
             state.interrupted_phase = state.phase.value
             state.waiting_for_human_entered_at = time.monotonic()
+            halt_reason = state.error or decision.decision_reason or "Human intervention required"
+            self._notify_waiting_for_human(state, halt_reason)
         elif new_phase != Phase.WAITING_FOR_HUMAN:
             state.waiting_for_human_entered_at = None
         if new_phase in (Phase.INIT, Phase.DISPATCHING, Phase.EXECUTING, Phase.PLANNING):
@@ -1051,6 +1055,90 @@ class LifecycleSupervisor(
         # so that rebind and other policy guards don't see stale ACTIVE WOs.
         if new_phase in (Phase.FAILED, Phase.BLOCKED):
             self._finalize_in_flight_work_orders(state, new_phase.value)
+
+    def _notify_waiting_for_human(self, state: RunState, reason: str) -> None:
+        """Active multi-channel notification and state reconciliation when supervisor halts."""
+        ws = Path(state.workspace).resolve() if getattr(state, "workspace", None) else None
+
+        # 1. Reconcile and prune completed work orders from state
+        completed_set = set(getattr(state, "completed_wo_ids", []) or [])
+        if ws:
+            comp_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+            if comp_dir.is_dir():
+                for f in comp_dir.glob("*.yaml"):
+                    completed_set.add(f.stem)
+        if completed_set:
+            if hasattr(state, "worker_wo_ids") and state.worker_wo_ids:
+                state.worker_wo_ids = [w for w in state.worker_wo_ids if w not in completed_set]
+            if hasattr(state, "blocked_wo_ids") and state.blocked_wo_ids:
+                state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w not in completed_set]
+
+        # 2. Write ALERT.md into .sync/inbox/human and .sync/inbox/CEO
+        if ws:
+            now_iso = _now()
+            interrupted = getattr(state, "interrupted_phase", None) or state.phase.value
+            active_wos = getattr(state, "worker_wo_ids", [])
+            blocked_wos = getattr(state, "blocked_wo_ids", [])
+            alert_content = (
+                "# ⚠️ SUPERVISOR HALTED: WAITING FOR HUMAN\n\n"
+                f"- **Run ID**: `{state.run_id}`\n"
+                f"- **Interrupted Phase**: `{interrupted}`\n"
+                f"- **Halted At**: `{now_iso}`\n"
+                f"- **Reason**: {reason}\n\n"
+                "## Working Set Status\n"
+                f"- **Active/Worker Work Orders**: `{active_wos}`\n"
+                f"- **Blocked Work Orders**: `{blocked_wos}`\n"
+                f"- **Completed Work Orders**: {len(completed_set)} completed\n\n"
+                "## Resume Instructions\n"
+                "To unblock and resume execution:\n"
+                "1. Address the blocker or review the state above.\n"
+                "2. Run from workspace root:\n"
+                "   ```bash\n"
+                "   stackmind resume\n"
+                "   ```\n"
+                "   Or in the interactive TUI prompt, enter:\n"
+                "   ```text\n"
+                "   :resume\n"
+                "   ```\n"
+            )
+            for inbox_name in ("human", "CEO"):
+                inbox_dir = ws / ".sync" / "inbox" / inbox_name
+                try:
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    (inbox_dir / "ALERT.md").write_text(alert_content, encoding="utf-8")
+                except Exception:
+                    pass
+
+        # 3. Audible and Terminal Alerts
+        banner = (
+            f"\n"
+            f"╔══════════════════════════════════════════════════════════════════╗\n"
+            f"║ 🚨 [STACKMIND ALERT] Supervisor WAITING FOR HUMAN               ║\n"
+            f"║ Run ID: {state.run_id:<48} ║\n"
+            f"║ Interrupted: {getattr(state, 'interrupted_phase', 'UNKNOWN'):<43} ║\n"
+            f"║ Reason: {reason[:48]:<48} ║\n"
+            f"║ To resume: 'stackmind resume' or ':resume'                       ║\n"
+            f"╚══════════════════════════════════════════════════════════════════╝\n"
+        )
+        try:
+            sys.stderr.write("\a" + banner)
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+        # 4. OS-level non-blocking beep on Windows
+        if sys.platform == "win32":
+            def _safe_beep() -> None:
+                try:
+                    import winsound
+                    winsound.Beep(1000, 400)
+                except Exception:
+                    pass
+
+            try:
+                threading.Thread(target=_safe_beep, daemon=True).start()
+            except Exception:
+                pass
 
     # ── Persistence ───────────────────────────────────────────────────
 

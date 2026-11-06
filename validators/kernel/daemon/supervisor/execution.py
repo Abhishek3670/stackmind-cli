@@ -1433,8 +1433,7 @@ class _ExecutionMixin:
                         wo_ids.append(wo_id)
             except Exception:
                 wo_ids.append(wo_id)
-        if wo_ids or not state.worker_wo_ids:
-            state.worker_wo_ids = wo_ids
+        state.worker_wo_ids = [w for w in wo_ids if w not in getattr(state, "completed_wo_ids", [])]
 
     def _dependency_result(self, state: RunState, wo_id: str, ws: Path) -> DependencyResult:
         """Authoritative, fail-closed dependency evaluation for one work order."""

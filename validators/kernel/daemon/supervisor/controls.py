@@ -113,6 +113,8 @@ class _ControlsMixin:
             self._unarchive_work_order(ws, wo_id)
             if wo_id in state.blocked_wo_ids:
                 state.blocked_wo_ids.remove(wo_id)
+        state.worker_wo_ids = [w for w in state.worker_wo_ids if w not in state.completed_wo_ids]
+        state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w not in state.completed_wo_ids]
 
     # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
 

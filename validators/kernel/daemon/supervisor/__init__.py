@@ -54,6 +54,7 @@ from .models import (
 from .release import (
     archive_blocked_work_orders,
     archive_completed_work_orders,
+    commit_feature_deliverable,
     create_gitops_commit,
     format_release_commit_message,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "RunState",
     "archive_completed_work_orders",
     "archive_blocked_work_orders",
+    "commit_feature_deliverable",
     "create_gitops_commit",
     "format_release_commit_message",
 ]

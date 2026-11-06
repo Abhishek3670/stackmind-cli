@@ -105,9 +105,11 @@ def final_pass(
             if str(wdata.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE"):
                 deliv_info = wdata.get("deliverable")
                 p = deliv_info.get("path") if isinstance(deliv_info, dict) else None
+                deliv_added = False
                 if not p:
                     p = f"src/{wid.lower()}.py"
                     wdata["deliverable"] = {"path": p, "type": "code"}
+                    deliv_added = True
                     if not wdata.get("acceptance_criteria"):
                         wdata["acceptance_criteria"] = ["plan delivered"]
                     if not wdata.get("test_plan"):
@@ -121,6 +123,7 @@ def final_pass(
                 target_file.parent.mkdir(parents=True, exist_ok=True)
                 if not target_file.is_file():
                     target_file.write_text("def run():\n    return 'ok'\nrun()\n", encoding="utf-8")
+                    deliv_added = True
                 c_file = ws / ".sync" / "contracts" / f"{wid}.yaml"
                 if not c_file.is_file():
                     c_file.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +137,7 @@ def final_pass(
                         encoding="utf-8",
                     )
                 qa_file = ws / ".sync" / "reviews" / "qa" / f"{wid}.json"
-                if not qa_file.is_file():
+                if not qa_file.is_file() or deliv_added:
                     qa_pass(ws, wid)
         if not target_wo_ids:
             target_wo_ids = list(existing_orders.keys())

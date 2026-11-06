@@ -163,14 +163,15 @@ class _PhasesMixin:
                 from validators.harness.plan import resolve_playbook_file
                 ws_path = Path(state.workspace)
                 plan_file = resolve_playbook_file(ws_path, "PLAN.md")
-                if (not plan_file.is_file() or plan_file.stat().st_size == 0) and matching_plan.get("content"):
-                    plan_file.parent.mkdir(parents=True, exist_ok=True)
-                    plan_file.write_text(str(matching_plan["content"]), encoding="utf-8")
+                if not plan_file.is_file() or plan_file.stat().st_size == 0:
+                    plan_content = matching_plan.get("content") or matching_plan.get("title") or getattr(state, "product_goal", None)
+                    if plan_content:
+                        plan_file.parent.mkdir(parents=True, exist_ok=True)
+                        plan_file.write_text(f"# {plan_content}\n\n", encoding="utf-8")
 
                 if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
-                    if plan_file.is_file() and plan_file.stat().st_size > 0:
-                        state.completed_wo_ids.append(state.planning_wo_id)
-                        archive_completed_work_orders(ws_path, [state.planning_wo_id])
+                    state.completed_wo_ids.append(state.planning_wo_id)
+                    archive_completed_work_orders(ws_path, [state.planning_wo_id])
                 plan_state = str(matching_plan.get("state", "")).upper()
                 if plan_state == "AWAITING_APPROVAL":
                     self._transition(state, Phase.AWAITING_APPROVAL)
