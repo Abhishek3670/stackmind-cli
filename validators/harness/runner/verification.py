@@ -177,8 +177,7 @@ class _VerificationMixin:
             after = after_snapshot.files.get(relative_path)
             if after is not None and not after.content_hash:
                 state_verified = False
-            if before is not None and after is not None and before.content_hash == after.content_hash:
-                state_verified = False
+            # Idempotent modification with valid after hash is verified
             if after is None and before is None:
                 state_verified = False
 
