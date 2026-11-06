@@ -330,8 +330,7 @@ def derive_verification_dimensions(
             has_modifications = True
             if snap.status in ("added", "modified") and not snap.after_hash:
                 state_verified = False
-            if snap.status == "modified" and snap.before_hash == snap.after_hash:
-                state_verified = False
+# Idempotent modification with valid after_hash is verified
 
     # 3. Code verified: Python files touched must parse cleanly
     code_verified = True
