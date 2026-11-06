@@ -658,6 +658,12 @@ class _ReviewMixin:
                             or "active on board" in b_lower
                             or "release-packaging" in b_lower
                             or "documentation gap" in b_lower
+                            or "contract is read-only" in b_lower
+                            or "contract read-only" in b_lower
+                            or "policy denied writing" in b_lower
+                            or "permissionerror" in b_lower
+                            or "release-phase work order" in b_lower
+                            or "not a code defect" in b_lower
                         )
 
                     gov_blockers = [b for b in blockers if _is_governance_or_packaging_blocker(b)]
