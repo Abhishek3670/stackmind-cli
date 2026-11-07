@@ -35,6 +35,7 @@ from .models import (
     Phase,
     RunState,
     _extract_op_error,
+    resolve_next_execution_phase,
 )
 
 logger = logging.getLogger("stackmind.supervisor")
@@ -184,7 +185,7 @@ class _RecoveryMixin:
                     state.architect_repair_operation_id = None
                     state.authoring_repair_attempts = 0
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    dest = resolve_next_execution_phase(state)
                     self._transition(state, dest, authorized_override=True)
                     return AdvanceResult.TRANSITIONED
                 else:
@@ -196,7 +197,7 @@ class _RecoveryMixin:
                     state.authoring_repair_attempts = 0
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
                     self._discover_worker_wos(state)
-                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    dest = resolve_next_execution_phase(state)
                     self._transition(state, dest, authorized_override=True)
                     return AdvanceResult.TRANSITIONED
 
@@ -306,14 +307,14 @@ class _RecoveryMixin:
                             state.blocked_wo_ids.remove(str(wo_id))
                         state.repair_context = {}
                         self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                        dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                        dest = resolve_next_execution_phase(state)
                         self._transition(state, dest, authorized_override=True)
                         return AdvanceResult.TRANSITIONED
                     else:
                         state.repair_context = {}
                         self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
                         self._discover_worker_wos(state)
-                        dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                        dest = resolve_next_execution_phase(state)
                         self._transition(state, dest, authorized_override=True)
                         return AdvanceResult.TRANSITIONED
                 if action == "split_work_order":
@@ -326,7 +327,7 @@ class _RecoveryMixin:
                     )
                     state.repair_context = {}
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=False)
-                    dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                    dest = resolve_next_execution_phase(state)
                     self._transition(state, dest, authorized_override=True)
                     return AdvanceResult.TRANSITIONED
                 if action == "create_dependency_work_order":
@@ -1405,7 +1406,7 @@ class _RecoveryMixin:
                 state.ignored_operation_ids.append(str(old_op_id))
             state.recovery_decisions.append({**record, "applied": True})
             state.error = None
-            dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            dest = resolve_next_execution_phase(state)
             self._transition(state, dest, authorized_override=True)
             return AdvanceResult.TRANSITIONED, None
 
@@ -1892,7 +1893,7 @@ class _RecoveryMixin:
             self._transition(state, Phase.EXECUTING, authorized_override=True)
             return AdvanceResult.WAITING_FOR_OPERATION
         else:
-            dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            dest = resolve_next_execution_phase(state)
             self._transition(state, dest, authorized_override=True)
             return AdvanceResult.TRANSITIONED
 

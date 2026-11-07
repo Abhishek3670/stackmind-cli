@@ -84,7 +84,8 @@ class CleanDeliveryGate:
 
             for filename in files:
                 # Skip internal runtime files
-                if filename.startswith("stackmind") or filename in ("AGENTS.md", "PLAN.md", "ARCHITECTURE.md", "DESIGN.md"):
+                fname_lower = filename.lower()
+                if fname_lower.startswith("stackmind") or fname_lower in ("agents.md", "plan.md", "architecture.md", "design.md"):
                     continue
 
                 # Skip gitignore files (they legitimately contain runtime paths)

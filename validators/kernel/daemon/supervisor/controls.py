@@ -21,6 +21,7 @@ from .models import (
     AdvanceResult,
     Phase,
     RunState,
+    resolve_next_execution_phase,
 )
 
 logger = logging.getLogger("stackmind.supervisor")
@@ -258,9 +259,9 @@ class _ControlsMixin:
             try:
                 dest_phase = Phase(state.interrupted_phase)
             except ValueError:
-                dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                dest_phase = resolve_next_execution_phase(state)
         else:
-            dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            dest_phase = resolve_next_execution_phase(state)
         if dest_phase == Phase.EXECUTING:
             has_live_op = False
             if hasattr(self, "manager") and self.manager and hasattr(self.manager, "get_operation"):
@@ -272,7 +273,7 @@ class _ControlsMixin:
                             has_live_op = True
                             break
             if not has_live_op:
-                dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                dest_phase = resolve_next_execution_phase(state)
 
         self._transition(state, dest_phase, authorized_override=True)
         return AdvanceResult.TRANSITIONED
@@ -382,7 +383,7 @@ class _ControlsMixin:
                 resume_phase = None
 
         if resume_phase is None or resume_phase == Phase.WAITING_FOR_HUMAN:
-            resume_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            resume_phase = resolve_next_execution_phase(state)
 
         # If no explicit target provided, restore the recorded interrupted phase directly
 

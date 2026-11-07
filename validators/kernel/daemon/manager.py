@@ -1982,6 +1982,8 @@ class SessionManager:
                         Phase.WAITING_FOR_HUMAN,
                         Phase.INIT,
                     ):
+                        if getattr(state, "completed_wo_ids", None) and candidate in (Phase.PLANNING, Phase.AUTHORING, Phase.AUTHORING_READINESS_GATE):
+                            continue
                         prev_phase = candidate
                         break
 
@@ -2007,11 +2009,8 @@ class SessionManager:
                     else:
                         target_phase = Phase.INTEGRATION_REVIEW
                 else:
-                    target_phase = (
-                        Phase.DISPATCHING if state.worker_wo_ids
-                        else Phase.AUTHORING if state.plan_id
-                        else Phase.PLANNING
-                    )
+                    from .supervisor.models import resolve_next_execution_phase
+                    target_phase = resolve_next_execution_phase(state)
         state.error = None
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase, authorized_override=True)

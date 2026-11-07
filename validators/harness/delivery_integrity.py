@@ -672,7 +672,28 @@ def evaluate_planning_completeness(
     for wo_id, wo in orders.items():
         for rel in _declared_paths(wo):
             owners.setdefault(rel, []).append(wo_id)
-    overlaps = {rel: ids for rel, ids in owners.items() if len(ids) > 1}
+    overlaps = {}
+    for rel, ids in owners.items():
+        if len(ids) > 1:
+            unjustified = []
+            for i, id1 in enumerate(ids):
+                wo1 = orders.get(id1, {})
+                t1 = str(wo1.get("type", "")).upper()
+                d1 = wo1.get("dependencies", []) or []
+                for id2 in ids[i+1:]:
+                    wo2 = orders.get(id2, {})
+                    t2 = str(wo2.get("type", "")).upper()
+                    d2 = wo2.get("dependencies", []) or []
+                    is_repair = (
+                        t1 in ("FIX", "BUGFIX", "HOTFIX", "REPAIR")
+                        or t2 in ("FIX", "BUGFIX", "HOTFIX", "REPAIR")
+                        or id1 in d2
+                        or id2 in d1
+                    )
+                    if not is_repair:
+                        unjustified.extend([id1, id2])
+            if unjustified:
+                overlaps[rel] = list(dict.fromkeys(unjustified))
     checks.append(DeliveryCheck(
         "no_unjustified_overlap",
         not overlaps,

@@ -600,3 +600,27 @@ _AGENT_ROLE_KEYWORDS = {
     "gemma": ("qa", "test", "verification", "audit", "review"),
     "local-llm": ("release", "git", "deploy", "packaging", "version", "gitops"),
 }
+
+
+def resolve_next_execution_phase(state: Any) -> Phase:
+    """Determine whether to dispatch remaining worker WOs or advance to review/planning."""
+    worker_wos = getattr(state, "worker_wo_ids", None) or []
+    completed_wos = getattr(state, "completed_wo_ids", None) or []
+    gitops_wo = getattr(state, "gitops_wo_id", None)
+    non_gitops_workers = [wid for wid in worker_wos if wid != gitops_wo]
+
+    pending_workers = [wid for wid in non_gitops_workers if wid not in completed_wos]
+    if pending_workers:
+        return Phase.DISPATCHING
+
+    if completed_wos:
+        int_wo = getattr(state, "integration_wo_id", None)
+        if int_wo and int_wo in completed_wos:
+            return Phase.FINAL_REVIEW
+        return Phase.INTEGRATION_REVIEW
+
+    if getattr(state, "plan_id", None):
+        return Phase.AUTHORING
+
+    return Phase.PLANNING
+

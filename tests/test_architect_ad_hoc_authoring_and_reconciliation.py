@@ -285,3 +285,49 @@ def test_reworkable_integration_wos_ignores_pure_governance_blockers(tmp_path: P
     reworkable = sup._reworkable_integration_wos(state, tmp_path, blockers)
     assert reworkable == [], f"Expected empty reworkable for pure governance blocker, got {reworkable}"
 
+
+
+def test_resolve_next_execution_phase_advances_to_review_when_workers_done() -> None:
+    """resolve_next_execution_phase must advance to INTEGRATION_REVIEW when all worker WOs are done."""
+    from validators.kernel.daemon.supervisor.models import RunState, Phase, resolve_next_execution_phase
+
+    # Case 1: Workers pending dispatch
+    s1 = RunState(run_id="r1", product_goal="Goal", workspace="/tmp", session_id="s1", worker_wo_ids=["WO-001"], completed_wo_ids=[])
+    assert resolve_next_execution_phase(s1) == Phase.DISPATCHING
+
+    # Case 2: All worker WOs completed, none pending
+    s2 = RunState(run_id="r2", product_goal="Goal", workspace="/tmp", session_id="s2", worker_wo_ids=["WO-001"], completed_wo_ids=["WO-001"])
+    assert resolve_next_execution_phase(s2) == Phase.INTEGRATION_REVIEW
+
+    # Case 3: Empty worker_wo_ids but completed_wo_ids non-empty
+    s3 = RunState(run_id="r3", product_goal="Goal", workspace="/tmp", session_id="s3", worker_wo_ids=[], completed_wo_ids=["WO-000", "WO-001", "WO-005"])
+    assert resolve_next_execution_phase(s3) == Phase.INTEGRATION_REVIEW
+
+    # Case 4: Integration review also completed -> FINAL_REVIEW
+    s4 = RunState(run_id="r4", product_goal="Goal", workspace="/tmp", session_id="s4", worker_wo_ids=[], completed_wo_ids=["WO-000", "WO-001", "WO-007"], integration_wo_id="WO-007")
+    assert resolve_next_execution_phase(s4) == Phase.FINAL_REVIEW
+
+    # Case 5: Fresh unstarted project with plan -> AUTHORING
+    s5 = RunState(run_id="r5", product_goal="Goal", workspace="/tmp", session_id="s5", worker_wo_ids=[], completed_wo_ids=[], plan_id="PLAN-001")
+    assert resolve_next_execution_phase(s5) == Phase.AUTHORING
+
+    # Case 6: Completely uninitialized run -> PLANNING
+    s6 = RunState(run_id="r6", product_goal="Goal", workspace="/tmp", session_id="s6", worker_wo_ids=[], completed_wo_ids=[])
+    assert resolve_next_execution_phase(s6) == Phase.PLANNING
+
+
+def test_clean_delivery_gate_ignores_uppercase_stackmind_run_report(tmp_path: Path) -> None:
+    """CleanDeliveryGate must skip STACKMIND_RUN_REPORT.md and not fail on internal StackMind references in it."""
+    from validators.harness.clean_delivery_gate import CleanDeliveryGate
+
+    # Create dummy app file
+    (tmp_path / "index.html").write_text("<!DOCTYPE html><html><body>Stopwatch</body></html>", encoding="utf-8")
+
+    # Create uppercase STACKMIND_RUN_REPORT.md containing internal runtime references
+    report_file = tmp_path / "STACKMIND_RUN_REPORT.md"
+    report_file.write_text("# STACKMIND RUN REPORT\nInternal: .sync/runtime/\nagent: claude", encoding="utf-8")
+
+    gate = CleanDeliveryGate(tmp_path)
+    passed, findings = gate.validate()
+    assert passed is True, f"CleanDeliveryGate should pass when report is skipped, got findings: {findings}"
+    assert len(findings) == 0

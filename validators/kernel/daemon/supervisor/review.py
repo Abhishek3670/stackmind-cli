@@ -33,6 +33,7 @@ from .models import (
     Phase,
     RunState,
     _strip_code_fences,
+    resolve_next_execution_phase,
 )
 from .release import (
     archive_completed_work_orders,
@@ -1277,7 +1278,7 @@ class _ReviewMixin:
                     if b_wo in state.blocked_wo_ids:
                         state.blocked_wo_ids.remove(b_wo)
                 self._discover_worker_wos(state)
-                dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                dest = resolve_next_execution_phase(state)
                 self._transition(state, dest, authorized_override=True)
                 return AdvanceResult.TRANSITIONED
             if actionable:
