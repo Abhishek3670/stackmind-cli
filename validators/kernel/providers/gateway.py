@@ -2286,7 +2286,7 @@ class ProviderGateway:
                     wo_f = result.get("work_order_file")
                     if wo_f and wo_f not in self.written_files:
                         self.written_files.append(str(wo_f))
-                    c_f = result.get("contract_file") or (f".sync/contracts/{result['work_order_id']}.yaml" if result.get("work_order_id") else None)
+                    c_f = result.get("contract_file")
                     if c_f and c_f not in self.written_files:
                         self.written_files.append(str(c_f))
                 if name == "apply_patch":

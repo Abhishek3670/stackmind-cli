@@ -4065,8 +4065,23 @@ class ToolGateway:
                     }
                 elif canonical_agent == existing_agent or canonical_role == existing_role:
                     wo_id = existing_wo_id
-                    rel_wo_file = f".sync/work-orders/{existing_status}/{wo_id}.yaml"
+                    comp_f = self.workspace.root / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
+                    act_f = self.workspace.root / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                    rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
                     rel_contract_file = f".sync/contracts/{wo_id}.yaml"
+                    if comp_f.is_file() and not act_f.is_file():
+                        try:
+                            wo_data = yaml.safe_load(comp_f.read_text(encoding="utf-8")) or {}
+                            wo_data["status"] = "ACTIVE"
+                            rev = int(wo_data.get("revision", 1)) + 1
+                            wo_data["revision"] = rev
+                            act_f.parent.mkdir(parents=True, exist_ok=True)
+                            act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                            comp_f.unlink()
+                        except Exception:
+                            rel_wo_file = f".sync/work-orders/{existing_status}/{wo_id}.yaml"
+                    elif not act_f.is_file():
+                        rel_wo_file = f".sync/work-orders/{existing_status}/{wo_id}.yaml"
                     self.boundary.journal.complete(record.request.operation_id, f"Reused existing {wo_id}")
                     return {
                         "status": "delegated",
