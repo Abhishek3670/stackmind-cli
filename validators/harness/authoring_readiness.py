@@ -724,6 +724,13 @@ def validate_authoring_readiness(
                         break
                 except Exception:
                     pass
+        if not is_archived_or_terminal:
+            archive_dir = ws / ".sync" / "archive"
+            if archive_dir.is_dir():
+                for af in archive_dir.rglob("*.yaml"):
+                    if wo_ref in af.name:
+                        is_archived_or_terminal = True
+                        break
         if is_archived_or_terminal:
             continue
         _issue(issues, "ORPHAN_CONTRACT", "coverage", f"Contract '{contract.path}' references work order '{wo_ref}' " f"which is not an active authored work order", work_order_id=wo_ref, artifact_path=contract.path)

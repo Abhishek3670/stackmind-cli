@@ -1641,7 +1641,7 @@ class _ReviewMixin:
 
         content_failure_codes = {
             "BUDGET_MISSING", "BUDGET_INVALID", "BUDGET_UNDER_ESTIMATE",
-            "DELIVERABLE_OUTSIDE_SCOPE", "OVERWRITE_CONFLICT",
+            "DELIVERABLE_OUTSIDE_SCOPE", "OVERWRITE_CONFLICT", "ORPHAN_CONTRACT",
         }
         archived: list[str] = []
         seen_paths: set[str] = set()

@@ -440,3 +440,41 @@ def test_runtime_panel_does_not_render_error_when_project_is_complete() -> None:
     rendered = " ".join(str(l) for l in lines)
     assert "Idle (Error)" not in rendered
     assert "Stale error" not in rendered
+
+
+def test_authoring_readiness_ignores_contracts_for_archived_work_orders(tmp_path: Path) -> None:
+    """Contracts whose corresponding work order has been archived to .sync/archive/ must not trigger ORPHAN_CONTRACT."""
+    from validators.harness.authoring_readiness import validate_authoring_readiness
+
+    ws = tmp_path
+    sync_dir = ws / ".sync"
+    contracts_dir = sync_dir / "contracts"
+    archive_dir = sync_dir / "archive" / "work-orders"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # Active work order WO-001 and its contract
+    (active_dir / "WO-001.yaml").write_text(
+        "id: WO-001\ntype: FEATURE\ntitle: Feature One\nstatus: ACTIVE\npriority: P1\nassigned_agents:\n- gemini\ndeliverable:\n  type: code\n  path: src/feature.js\n",
+        encoding="utf-8",
+    )
+    (contracts_dir / "WO-001.yaml").write_text(
+        "schema_version: 1\nagent_id: gemini\nwork_order: WO-001\nidentity:\n  role: frontend\n  reports_to: claude\nscope:\n  allow:\n  - module: src/feature.js\n  write: read-write\nbudget:\n  max_files_touched: 5\n  max_tokens: 30000\n",
+        encoding="utf-8",
+    )
+
+    # Archived work order WO-011 and its contract left in contracts/
+    (archive_dir / "WO-011-ACTIVE.yaml").write_text(
+        "id: WO-011\ntype: VALIDATION\ntitle: Old Validation\nstatus: CANCELLED\n",
+        encoding="utf-8",
+    )
+    (contracts_dir / "WO-011.yaml").write_text(
+        "schema_version: 1\nagent_id: gemma\nwork_order: WO-011\nidentity:\n  role: qa\n  reports_to: claude\nscope:\n  allow:\n  - module: tests/old.test.js\n  write: read-write\nbudget:\n  max_files_touched: 5\n  max_tokens: 30000\n",
+        encoding="utf-8",
+    )
+
+    res = validate_authoring_readiness(ws)
+    orphan_issues = [i for i in res.issues if i.code == "ORPHAN_CONTRACT"]
+    assert len(orphan_issues) == 0, f"Expected no ORPHAN_CONTRACT issues, got: {orphan_issues}"
