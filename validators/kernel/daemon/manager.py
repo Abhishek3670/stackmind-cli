@@ -1227,10 +1227,14 @@ class SessionManager:
         with self._lock:
             try:
                 view = self._view(self._sessions[session_id])
-                active_run = self.get_active_run(session_id)
-                if active_run:
-                    view["run"] = active_run
-                    view["phase"] = active_run.get("phase")
+                latest_run = self.get_active_run(session_id) or self.get_latest_run(session_id)
+                if latest_run:
+                    view["run"] = latest_run
+                    view["phase"] = latest_run.get("phase")
+                    if latest_run.get("error"):
+                        view["error"] = latest_run.get("error")
+                    elif str(latest_run.get("phase", "")).upper() == "COMPLETE":
+                        view["error"] = None
                 return view
             except KeyError as error:
                 raise KeyError("unknown session") from error
@@ -2110,10 +2114,15 @@ class SessionManager:
             if active_dir.is_dir():
                 for wo_file in sorted(active_dir.glob("*.yaml")):
                     wo_id = wo_file.stem
-                    if wo_id not in state.completed_wo_ids and wo_id not in state.worker_wo_ids:
+                    if wo_id in state.completed_wo_ids:
+                        state.completed_wo_ids.remove(wo_id)
+                    if wo_id not in state.worker_wo_ids:
                         state.worker_wo_ids.append(wo_id)
             if state.phase == Phase.COMPLETE and state.worker_wo_ids:
                 state.phase = Phase.DISPATCHING
+                state.exit_code = 0
+                state.error = None
+            elif state.phase == Phase.COMPLETE and not state.worker_wo_ids:
                 state.exit_code = 0
                 state.error = None
 
@@ -3138,6 +3147,24 @@ class SessionManager:
                 for rf in run_files:
                     persisted = self.supervisor.load_run_state(rf.stem, ws)
                     if persisted and persisted.session_id == session_id and persisted.phase != Phase.COMPLETE:
+                        self._active_runs[rf.stem] = persisted
+                        return persisted.to_dict()
+        return None
+
+    def get_latest_run(self, session_id: str) -> dict[str, Any] | None:
+        """Get the latest run state for a session, including completed runs."""
+        for state in self._active_runs.values():
+            if state.session_id == session_id:
+                return state.to_dict()
+        session = self._sessions.get(session_id)
+        if session:
+            ws = Path(session.get("workspace", ""))
+            sup_dir = ws / ".sync" / "runtime" / "supervisor"
+            if sup_dir.is_dir():
+                run_files = sorted(sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True)
+                for rf in run_files:
+                    persisted = self.supervisor.load_run_state(rf.stem, ws)
+                    if persisted and persisted.session_id == session_id:
                         self._active_runs[rf.stem] = persisted
                         return persisted.to_dict()
         return None

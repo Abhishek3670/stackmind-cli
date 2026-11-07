@@ -108,7 +108,7 @@ def test_resume_reopens_complete_run_when_active_work_orders_exist(tmp_path: Pat
     ws = tmp_path / "project"
     active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
     active_dir.mkdir(parents=True, exist_ok=True)
-    (active_dir / "WO-008.yaml").write_text("id: WO-008\nstatus: ACTIVE\n", encoding="utf-8")
+    (active_dir / "WO-008.yaml").write_text("id: WO-008\nstatus: ACTIVE\ndependencies: []\n", encoding="utf-8")
 
     # Setup session
     session = manager.create_session("claude", "test", {}, str(ws))
@@ -331,3 +331,112 @@ def test_clean_delivery_gate_ignores_uppercase_stackmind_run_report(tmp_path: Pa
     passed, findings = gate.validate()
     assert passed is True, f"CleanDeliveryGate should pass when report is skipped, got findings: {findings}"
     assert len(findings) == 0
+
+
+def test_resume_reopens_reopened_work_order_even_if_in_completed_ids(tmp_path: Path) -> None:
+    """If a completed work order is reopened (present in ACTIVE/ and completed_wo_ids), resume_run must move it to worker_wo_ids and transition to DISPATCHING."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon.db")
+    manager = SessionManager(storage=storage)
+
+    ws = tmp_path / "project"
+    active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    (active_dir / "WO-008.yaml").write_text("id: WO-008\nstatus: ACTIVE\ndependencies: []\n", encoding="utf-8")
+
+    session = manager.create_session("claude", "test", {}, str(ws))
+    session_id = session["session_id"]
+
+    # WO-008 is in completed_wo_ids from prior iteration
+    state = RunState(
+        run_id="run-reopen",
+        workspace=str(ws),
+        session_id=session_id,
+        phase=Phase.COMPLETE,
+        product_goal="Goal",
+        completed_wo_ids=["WO-000", "WO-001", "WO-008"],
+        worker_wo_ids=[],
+    )
+    sup_dir = ws / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+    manager.supervisor.save_run_state(state, ws)
+
+    res = manager.resume_run(session_id, run_id="run-reopen")
+
+    assert res["phase"] == "DISPATCHING"
+    assert "WO-008" in res["worker_wo_ids"]
+    assert "WO-008" not in res["completed_wo_ids"]
+    assert res["error"] is None
+
+
+def test_get_session_reflects_completed_run_and_clears_error(tmp_path: Path) -> None:
+    """get_session must return latest run even if COMPLETE, exposing phase COMPLETE and error None."""
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+
+    storage = DaemonStorage(tmp_path / "daemon.db")
+    manager = SessionManager(storage=storage)
+
+    ws = tmp_path / "project"
+    sup_dir = ws / ".sync" / "runtime" / "supervisor"
+    sup_dir.mkdir(parents=True, exist_ok=True)
+
+    session = manager.create_session("claude", "test", {}, str(ws))
+    session_id = session["session_id"]
+
+    state = RunState(
+        run_id="run-done",
+        workspace=str(ws),
+        session_id=session_id,
+        phase=Phase.COMPLETE,
+        product_goal="Goal",
+        completed_wo_ids=["WO-000", "WO-001"],
+        worker_wo_ids=[],
+    )
+    manager.supervisor.save_run_state(state, ws)
+
+    s_view = manager.get_session(session_id)
+    assert s_view.get("run") is not None
+    assert s_view.get("phase") == "COMPLETE"
+    assert s_view.get("error") is None
+
+
+def test_tui_state_sync_clears_error_when_all_wos_completed(tmp_path: Path) -> None:
+    """sync_work_orders_from_disk must transition state to PROJECT_COMPLETE and clear state.error when all WOs are completed."""
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    ws = tmp_path / "project"
+    sync_wos = ws / ".sync" / "work-orders"
+    completed_dir = sync_wos / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    (completed_dir / "WO-001.yaml").write_text("id: WO-001\nstatus: COMPLETED\ntitle: T1\n", encoding="utf-8")
+    (completed_dir / "WO-002.yaml").write_text("id: WO-002\nstatus: COMPLETED\ntitle: T2\n", encoding="utf-8")
+
+    state = AutonomousDeliveryState()
+    state.workspace = ws
+    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+    state.error = "MAX_AUTHORING_REPAIRS_EXHAUSTED: Authoring state ARCHITECT_REPAIR timed out after 300.0s"
+
+    state.sync_work_orders_from_disk(ws)
+
+    assert state.phase == ProjectPhase.PROJECT_COMPLETE
+    assert state.is_complete is True
+    assert state.error is None
+
+
+def test_runtime_panel_does_not_render_error_when_project_is_complete() -> None:
+    """_render_current_operation must not show error indicator when project is complete."""
+    from cli.tui.runtime_panel import format_current_operation
+    from cli.tui.state import AutonomousDeliveryState, ProjectPhase
+
+    state = AutonomousDeliveryState()
+    state.is_complete = True
+    state.phase = ProjectPhase.PROJECT_COMPLETE
+    state.error = "Stale error from earlier turn"
+
+    lines = format_current_operation(None, width=80, state=state)
+    rendered = " ".join(str(l) for l in lines)
+    assert "Idle (Error)" not in rendered
+    assert "Stale error" not in rendered

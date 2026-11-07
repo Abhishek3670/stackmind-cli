@@ -1979,7 +1979,8 @@ class ProviderGateway:
                         is_arch = (
                             getattr(self, "is_architecture", False)
                             or getattr(self, "is_authoring", False)
-                            or str(getattr(self, "role", "")).lower().strip() in ("architecture", "architect")
+                            or str(getattr(self, "role", "")).lower().strip() in ("architecture", "architect", "claude")
+                            or str(getattr(getattr(self, "contract", None), "agent_id", "")).lower().strip() in ("claude", "architecture", "architect")
                             or str((getattr(self, "contract", None) and getattr(self.contract, "identity", None) and getattr(self.contract.identity, "role", "")) or "").lower().strip() in ("architecture", "architect")
                         )
                         if not is_arch:

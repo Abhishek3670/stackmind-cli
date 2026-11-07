@@ -1803,6 +1803,10 @@ class AutonomousDeliveryState:
                         w.status = disk_statuses[w.id]
         except Exception:
             pass
+        if self.work_orders and all(w.status.upper() in {"COMPLETED", "DONE", "SUCCESS"} for w in self.work_orders):
+            self.is_complete = True
+            self.phase = ProjectPhase.PROJECT_COMPLETE
+            self.error = None
         self.reconcile_roles_from_work_orders()
 
     def reconcile_roles_from_work_orders(self) -> None:
@@ -2688,12 +2692,13 @@ class AutonomousDeliveryState:
                 self.error = None
             elif phase_val == "AWAITING_APPROVAL":
                 self.phase = ProjectPhase.AWAITING_APPROVAL
-            elif phase_val == "BLOCKED":
+            elif phase_val in ("BLOCKED", "WAITING_FOR_HUMAN"):
                 self.phase = ProjectPhase.BLOCKED
                 if payload.get("error"):
                     from cli.tui.events import clean_error_message
                     self.error = clean_error_message(payload["error"])
-                self.add_activity("StackMind", "run blocked", canonical_blocker_text(payload.get("error", "")), deduplicate=True)
+                act_label = "waiting for human" if phase_val == "WAITING_FOR_HUMAN" else "run blocked"
+                self.add_activity("StackMind", act_label, canonical_blocker_text(payload.get("error", "")), deduplicate=True)
                 for r_obj in self.roles.values():
                     if r_obj.state.upper() in {"RUNNING", "ACTIVE"}:
                         r_obj.state = "WAITING"

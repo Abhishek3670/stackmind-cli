@@ -476,7 +476,8 @@ def format_current_operation(
                     Text("    Run :approve to execute", style="dim #fbbf24"),
                 ]
 
-        if err and state is not None and getattr(state, "phase", None) not in ("PROJECT_COMPLETE",):
+        from cli.tui.state import ProjectPhase
+        if err and state is not None and getattr(state, "phase", None) not in ("PROJECT_COMPLETE", ProjectPhase.PROJECT_COMPLETE) and not getattr(state, "is_complete", False):
             from cli.tui.events import clean_error_message
             short_err = clean_error_message(err)
             max_len = max((width - 4), 20) if width else 35
