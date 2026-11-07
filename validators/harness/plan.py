@@ -686,19 +686,22 @@ def parse_plan(content: str, project_path: Path | str | None = None) -> PlanStru
             line_str = line.rstrip()
             if not line_str.strip():
                 continue
-            # Top-level milestone: starts at column 0 with '- ['
-            if line_str.startswith("- ["):
-                cb_match = re.match(r"^-\s*\[([ xX])\]\s*(.*)$", line_str)
-                if cb_match:
-                    checked = cb_match.group(1).lower() == "x"
-                    raw_content = cb_match.group(2).strip()
+            # Top-level milestone: starts at column 0 with '- [' or '- **['
+            cb_match = re.match(r"^-\s*(?:\*\*)?\[([ xX])\](?:\*\*)?\s*(.*)$", line_str)
+            if cb_match:
+                checked = cb_match.group(1).lower() == "x"
+                raw_content = cb_match.group(2).strip()
 
-                    # 1. Extract Agent annotation: (Agent: <name>) or ; Agent: <name> or (agent: <name>)
-                    m_agent: str | None = None
-                    agent_match = re.search(r"[\(;]?\s*(?:Agent|agent)\s*:\s*([a-zA-Z0-9_\-]+)\s*[\)]?", raw_content)
-                    if agent_match:
-                        m_agent = agent_match.group(1).strip().lower()
-                        raw_content = (raw_content[: agent_match.start()] + raw_content[agent_match.end() :]).strip()
+                # Clean leading/trailing markdown asterisks from raw content
+                raw_content = re.sub(r"^\*\*", "", raw_content)
+                raw_content = re.sub(r"\*\*\s*$", "", raw_content).strip()
+
+                # 1. Extract Agent annotation: (Agent: <name>) or ; Agent: <name> or (agent: <name>)
+                m_agent: str | None = None
+                agent_match = re.search(r"[\(;]?\s*(?:Agent|agent)\s*:\s*([a-zA-Z0-9_\-/ ]+)\s*[\)]?", raw_content)
+                if agent_match:
+                    m_agent = agent_match.group(1).strip().lower()
+                    raw_content = (raw_content[: agent_match.start()] + raw_content[agent_match.end() :]).strip()
 
                     # 2. Extract Skills annotation: (Skills: ...) or ; Skills: ...
                     m_skills: list[str] = []

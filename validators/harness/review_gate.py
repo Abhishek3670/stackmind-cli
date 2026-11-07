@@ -503,7 +503,7 @@ def validate_qa_verdict(
         return False, "no QA verdict persisted"
     if str(verdict.get("schema", "")) != QA_VERDICT_SCHEMA:
         return False, f"unsupported QA verdict schema {verdict.get('schema')!r}"
-    if str(verdict.get("work_order_id", "")) != wo_id:
+    if str(verdict.get("work_order_id") or verdict.get("wo_id") or "") != wo_id:
         return False, "QA verdict targets a different work order"
 
     status = str(verdict.get("verdict", "")).upper()
@@ -525,7 +525,7 @@ def validate_qa_verdict(
         failed = [
             c for c in criteria
             if isinstance(c, dict)
-            and str(c.get("outcome", "")).upper() not in (QA_PASS, "APPROVED", "N/A", QA_NO_TEST_EVIDENCE, "PENDING_TESTS", "SKIPPED")
+            and str(c.get("outcome") or c.get("result") or c.get("status") or "").upper() not in (QA_PASS, "APPROVED", "N/A", QA_NO_TEST_EVIDENCE, "PENDING_TESTS", "SKIPPED")
         ]
         if failed:
             return False, "QA verdict claims PASS while criteria are not all satisfied"
