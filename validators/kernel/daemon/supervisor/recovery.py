@@ -122,9 +122,7 @@ class _RecoveryMixin:
                     state.error = None
                     state.architect_repair_operation_id = None
                     state.authoring_repair_attempts = 0
-                    self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
-                    self._transition(state, Phase.EXECUTING, authorized_override=True)
-                    return AdvanceResult.WAITING_FOR_OPERATION
+                    return self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
 
                 wo_str = str(wo_id)
                 from validators.harness import review_gate
@@ -253,9 +251,7 @@ class _RecoveryMixin:
                     )
                     if is_deadlock:
                         state.repair_context = {}
-                        self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
-                        self._transition(state, Phase.EXECUTING, authorized_override=True)
-                        return AdvanceResult.WAITING_FOR_OPERATION
+                        return self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
                     wo_str = str(wo_id)
                     from validators.harness import review_gate
                     wo_data = review_gate.load_wo(ws, wo_str)

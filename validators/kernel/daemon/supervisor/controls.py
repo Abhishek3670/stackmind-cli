@@ -385,6 +385,19 @@ class _ControlsMixin:
         if resume_phase is None or resume_phase == Phase.WAITING_FOR_HUMAN:
             resume_phase = resolve_next_execution_phase(state)
 
+        if resume_phase == Phase.EXECUTING:
+            has_live_op = False
+            if hasattr(self, "manager") and self.manager and hasattr(self.manager, "get_operation"):
+                for op_attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id"):
+                    op_val = getattr(state, op_attr, None)
+                    if op_val:
+                        rec = self.manager.get_operation(op_val)
+                        if rec and str(rec.get("status", "")).upper() not in ("COMPLETED", "FAILED", "CANCELLED"):
+                            has_live_op = True
+                            break
+            if not has_live_op:
+                resume_phase = resolve_next_execution_phase(state)
+
         # If no explicit target provided, restore the recorded interrupted phase directly
 
         self._transition(state, resume_phase, authorized_override=True, auth_context="re_attest")

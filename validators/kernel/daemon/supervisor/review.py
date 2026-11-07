@@ -1089,7 +1089,7 @@ class _ReviewMixin:
             "'remediation': the concrete fix the worker should apply (you are the prescribing "
             "architect — prescribe precisely; workers apply your prescription verbatim).\n"
             "- When status is 'completed', 'blockers' MUST be an empty array [].\n"
-            "- Your contract scope authorizes authoring release documentation (README.md, CHANGELOG.md, VERSION.md, review reports). Do NOT attempt to write or edit application source code or test files.\n\n"
+            "- Your contract scope is read-only for application and test files; it authorizes authoring release documentation (README.md, CHANGELOG.md, VERSION.md, review reports). Do NOT attempt to write or edit application source code or test files.\n\n"
             f"{security_checklist}"
         )
 

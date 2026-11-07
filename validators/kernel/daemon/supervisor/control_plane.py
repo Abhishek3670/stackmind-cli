@@ -1533,7 +1533,7 @@ def evaluate_supervisor_state(
     if target_phase in (Phase.AWAITING_APPROVAL, Phase.WAITING_FOR_HUMAN) or target_ctrl == ControllerState.WAITING:
         has_wait_condition = (
             bool(wait_condition_refs)
-            or target_phase in (Phase.AWAITING_APPROVAL, Phase.WAITING_FOR_HUMAN)
+            or target_phase == Phase.AWAITING_APPROVAL
             or bool(state.error)
             or bool(state.interrupted_phase)
         )

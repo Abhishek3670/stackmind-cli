@@ -1775,6 +1775,7 @@ class SessionManager:
         state.dependency_escalation_retries.clear()
         state.integration_retries = 0
         state.worker_blockers.clear()
+        state.integration_blockers.clear()
         if session.get("state") != "COMPLETED":
             session["state"] = "RUNNING"
             session["updated_at"] = _now()
@@ -2015,6 +2016,22 @@ class SessionManager:
                 else:
                     from .supervisor.models import resolve_next_execution_phase
                     target_phase = resolve_next_execution_phase(state)
+
+        if target_phase == Phase.EXECUTING:
+            has_live_op = False
+            if hasattr(self, "list_operations"):
+                try:
+                    for op in self.list_operations(state.session_id):
+                        st = str(op.get("status", "")).upper()
+                        if st not in _OPERATION_TERMINAL and st not in ("CANCELLED", "CANCEL_REQUESTED"):
+                            has_live_op = True
+                            break
+                except Exception:
+                    pass
+            if not has_live_op:
+                from .supervisor.models import resolve_next_execution_phase
+                target_phase = resolve_next_execution_phase(state)
+
         state.error = None
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase, authorized_override=True)
