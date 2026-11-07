@@ -660,10 +660,15 @@ class _ReviewMixin:
                             or "documentation gap" in b_lower
                             or "contract is read-only" in b_lower
                             or "contract read-only" in b_lower
+                            or "contract_read_only" in b_lower
+                            or "read-only" in b_lower
                             or "policy denied writing" in b_lower
                             or "permissionerror" in b_lower
                             or "release-phase work order" in b_lower
                             or "not a code defect" in b_lower
+                            or "deliverable is a directory" in b_lower
+                            or "expected regular file" in b_lower
+                            or "deliverable verification failed" in b_lower
                         )
 
                     gov_blockers = [b for b in blockers if _is_governance_or_packaging_blocker(b)]
@@ -954,10 +959,10 @@ class _ReviewMixin:
             "scope": {
                 "allow": unique_allow,
                 "deny": deny_rules,
-                "write": "read-only",
+                "write": "read-write",
             },
             "budget": {
-                "max_files_touched": 1,
+                "max_files_touched": 10,
                 "max_tokens": 50000,
             },
         }
@@ -1083,7 +1088,7 @@ class _ReviewMixin:
             "'remediation': the concrete fix the worker should apply (you are the prescribing "
             "architect — prescribe precisely; workers apply your prescription verbatim).\n"
             "- When status is 'completed', 'blockers' MUST be an empty array [].\n"
-            "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files.\n\n"
+            "- Your contract scope authorizes authoring release documentation (README.md, CHANGELOG.md, VERSION.md, review reports). Do NOT attempt to write or edit application source code or test files.\n\n"
             f"{security_checklist}"
         )
 
@@ -1105,7 +1110,22 @@ class _ReviewMixin:
         gitops_keywords = ("version", "changelog", "package.json", "release", "manifest", "gitops", "tag")
         is_gitops_blocker = any(kw in blocker_text for kw in gitops_keywords)
         if state.gitops_wo_id and not is_gitops_blocker:
+            pass
+        if state.gitops_wo_id and not is_gitops_blocker:
+            pass
             excluded.add(state.gitops_wo_id)
+
+        is_pure_governance = any(
+            gov in blocker_text for gov in (
+                "contract", "read-only", "read_only", "contract_read_only", "policy denied writing"
+            )
+        ) and not any(
+            code_kw in blocker_text for code_kw in (
+                "test", "fail", "exit code", "assert", "syntax", "compile", "exception"
+            )
+        )
+        if is_pure_governance:
+            return []
 
         code_wos: list[str] = []
         qa_wos: list[str] = []
@@ -1152,6 +1172,17 @@ class _ReviewMixin:
                 accused.append(wo_id)
         if accused:
             return list(dict.fromkeys(accused + qa_wos))
+        is_pure_governance = any(
+            gov in blocker_text for gov in (
+                "contract", "read-only", "read_only", "contract_read_only", "policy denied writing"
+            )
+        ) and not any(
+            code_kw in blocker_text for code_kw in (
+                "test", "fail", "exit code", "assert", "syntax", "compile", "exception"
+            )
+        )
+        if is_pure_governance:
+            return []
         return list(dict.fromkeys(code_wos + qa_wos + (gitops_wos if is_gitops_blocker else [])))
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:

@@ -159,17 +159,27 @@ class DeliverableVerifier:
             ))
             return result
 
+        is_directory_deliverable = False
         if path.is_dir():
-            result.checked = True
-            result.checks.append(VerificationCheck(
-                name="file_type",
-                passed=False,
-                message=f"Deliverable is a directory, expected regular file: {path}",
-                severity="error",
-            ))
-            return result
+            if any(p.is_file() for p in path.rglob("*")):
+                is_directory_deliverable = True
+                result.checks.append(VerificationCheck(
+                    name="file_type",
+                    passed=True,
+                    message=f"Deliverable directory '{path}' contains files",
+                    severity="info",
+                ))
+            else:
+                result.checked = True
+                result.checks.append(VerificationCheck(
+                    name="file_type",
+                    passed=False,
+                    message=f"Deliverable is a directory, expected regular file: {path}",
+                    severity="error",
+                ))
+                return result
 
-        if not path.is_file():
+        if not is_directory_deliverable and not path.is_file():
             result.checked = True
             result.checks.append(VerificationCheck(
                 name="file_type",
@@ -179,30 +189,43 @@ class DeliverableVerifier:
             ))
             return result
 
-        result.checks.append(VerificationCheck(
-            name="file_type",
-            passed=True,
-            message="Deliverable is a regular file",
-            severity="info",
-        ))
+        if not is_directory_deliverable:
+            result.checks.append(VerificationCheck(
+                name="file_type",
+                passed=True,
+                message="Deliverable is a regular file",
+                severity="info",
+            ))
 
         # Compute content hash for freshness tracking
-        try:
-            content = path.read_bytes()
-            result.content_hash = hashlib.sha256(content).hexdigest()[:16]
-        except Exception:
-            pass
+        if is_directory_deliverable:
+            try:
+                dir_hasher = hashlib.sha256()
+                for subfile in sorted(path.rglob("*")):
+                    if subfile.is_file():
+                        dir_hasher.update(subfile.name.encode("utf-8"))
+                        dir_hasher.update(subfile.read_bytes())
+                result.content_hash = dir_hasher.hexdigest()[:16]
+            except Exception:
+                pass
+            text_content = f"# Directory deliverable: {path.name}\n"
+        else:
+            try:
+                content = path.read_bytes()
+                result.content_hash = hashlib.sha256(content).hexdigest()[:16]
+            except Exception:
+                pass
 
-        try:
-            text_content = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            result.checks.append(VerificationCheck(
-                name="readability",
-                passed=False,
-                message=f"Cannot read file: {e}",
-                severity="error",
-            ))
-            return result
+            try:
+                text_content = path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                result.checks.append(VerificationCheck(
+                    name="readability",
+                    passed=False,
+                    message=f"Cannot read file: {e}",
+                    severity="error",
+                ))
+                return result
 
         result.checked = True
 

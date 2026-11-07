@@ -4124,7 +4124,8 @@ class ToolGateway:
             # Filter clean_files to respect Single Deliverable Ownership:
             # 1. Exclude files already owned by other active work orders
             # 2. Exclude files inappropriate for the assigned role
-            if clean_files:
+            valid_files = [f for f in clean_files if not (scan_root / f).is_dir() and not str(f).endswith("/")] if clean_files else []
+            if valid_files:
                 try:
                     from validators.harness.task_contract import collect_peer_deliverables
                     peer_delivs = {
@@ -4155,8 +4156,9 @@ class ToolGateway:
 
                 clean_files = filtered_files
 
-            if clean_files:
-                primary_deliv = clean_files[0]
+            valid_files = [f for f in clean_files if not (scan_root / f).is_dir() and not str(f).endswith("/")] if clean_files else []
+            if valid_files:
+                primary_deliv = valid_files[0]
                 if canonical_role == "qa":
                     deliv_type = "test" if "test" in primary_deliv.lower() else "report"
                 else:
@@ -4164,12 +4166,12 @@ class ToolGateway:
                 deliv_spec = {
                     "path": primary_deliv,
                     "type": deliv_type,
-                    "description": f"Deliverables for {canonical_role}: {', '.join(clean_files)}",
+                    "description": f"Deliverables for {canonical_role}: {', '.join(valid_files)}",
                 }
                 deliv_list = [
                     {"path": f, "type": ("test" if canonical_role == "qa" else ("doc" if f.endswith(".md") else "code"))}
-                    for f in clean_files
-                ] if len(clean_files) > 1 else None
+                    for f in valid_files
+                ] if len(valid_files) > 1 else None
             else:
                 primary_deliv = None
                 deliv_type = "report" if canonical_role == "qa" else "code"
