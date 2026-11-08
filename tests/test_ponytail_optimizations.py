@@ -128,4 +128,19 @@ def test_collect_peer_owned_deliverables_skips_ephemeral_files(tmp_path):
     assert "src/real.js" in owned, "Real code deliverables must remain registered"
 
 
+def test_evaluate_final_acceptance_defaults_plan_id_when_plan_exists(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from validators.harness import review_gate
+
+    # Mock plan_hash and required_wo_ids_for_run
+    monkeypatch.setattr(review_gate, "plan_hash", lambda ws: "mock_plan_hash")
+    monkeypatch.setattr(review_gate, "required_wo_ids_for_run", lambda state, ws: [])
+
+    state = SimpleNamespace(plan_id=None, completed_wo_ids=[], integration_wo_id=None, blocked_wo_ids=[])
+    report = review_gate.evaluate_final_acceptance(state, tmp_path)
+    assert "no user-approved plan is recorded for this run" not in report.reasons
+    assert state.plan_id == "PLAN-001"
+
+
+
 

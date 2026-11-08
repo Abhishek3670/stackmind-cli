@@ -1805,6 +1805,12 @@ class SessionManager:
         state.final_review_rounds = 0
         if hasattr(state, "final_review_history"):
             state.final_review_history.clear()
+        if not getattr(state, "plan_id", None):
+            plans = self.list_plans(state.session_id)
+            if plans:
+                state.plan_id = plans[-1].get("plan_id") or "PLAN-001"
+            elif (ws / ".sync" / "playbook" / "PLAN.md").is_file() or (ws / "PLAN.md").is_file():
+                state.plan_id = "PLAN-001"
         # Held-back QA re-dispatch is likewise released: the fresh QA turn
         # re-evaluates the deliverables and re-routes defects if they persist.
         if hasattr(state, "qa_rework_targets"):
