@@ -1801,6 +1801,10 @@ class SessionManager:
         state.integration_rework_rounds = 0
         state.authoring_repair_attempts = 0
         state.final_prerequisite_rounds = 0
+        # ponytail: reset final review rounds and history so human :resume does not immediately fail with FINAL_REVIEW_BUDGET_EXHAUSTED
+        state.final_review_rounds = 0
+        if hasattr(state, "final_review_history"):
+            state.final_review_history.clear()
         # Held-back QA re-dispatch is likewise released: the fresh QA turn
         # re-evaluates the deliverables and re-routes defects if they persist.
         if hasattr(state, "qa_rework_targets"):

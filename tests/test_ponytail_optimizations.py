@@ -52,3 +52,32 @@ def test_authoring_yaml_auto_repairs_inner_quotes_in_lists():
     assert len(data["acceptance_criteria"]) == 4
     assert 'src="src/app.js"' in data["acceptance_criteria"][1]
     assert 'scripts.test' in data["acceptance_criteria"][2]
+
+
+def test_validate_final_verdict_auto_populates_missing_completed_wos(tmp_path, monkeypatch):
+    from validators.harness import review_gate
+
+    # Mock subject_hash and plan_hash
+    monkeypatch.setattr(review_gate, "subject_hash", lambda ws, wo_id: f"hash_{wo_id}")
+    monkeypatch.setattr(review_gate, "plan_hash", lambda ws: "mock_plan_hash")
+
+    verdict = {
+        "schema": review_gate.FINAL_REVIEW_SCHEMA,
+        "run_id": "run-test",
+        "plan_id": "PLAN-001",
+        "plan_hash": "mock_plan_hash",
+        "status": "PASS",
+        "reviewed_work_orders": [{"id": "WO-001", "subject_hash": "hash_WO-001"}],
+        "acceptance_criteria": [{"id": "AC-1", "outcome": "PASS"}],
+        "evidence": [{"kind": "test", "passed": True}],
+        "findings": [],
+        "required_actions": [],
+    }
+
+    # Calling with required WO-001 and WO-002: WO-002 was omitted by LLM but exists on disk
+    ok, why = review_gate.validate_final_verdict(
+        verdict, tmp_path, run_id="run-test", plan_id="PLAN-001", required_wo_ids=["WO-001", "WO-002"]
+    )
+    assert ok is True, f"Expected validation success with auto-population, got {why}"
+    reviewed_ids = [w["id"] for w in verdict["reviewed_work_orders"]]
+    assert "WO-002" in reviewed_ids
