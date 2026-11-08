@@ -455,8 +455,10 @@ def run_stack_appropriate_verifier(
 
 
 _NO_TESTS_RE = re.compile(
-    r"\bno (?:[a-zA-Z0-9_\-]+\s+)?tests?(?:\s+files?)?\s+(?:ran|were found|found|collected|exist(?:s|ed)?)\b"
+    r"\bno (?:[a-zA-Z0-9_\-\/]+\s+)?tests?(?:\s+files?)?\s+(?:ran|were found|found|collected|exist(?:s|ed)?)\b"
     r"|\bno\s+(?:automated\s+)?coverage\b"
+    r"|\bno (?:[a-zA-Z0-9_\-\/]+\s+)*(?:build|test|qa)\s+evidence\b"
+    r"|\bno\s+(?:runnable\s+)?(?:[a-zA-Z0-9_\-\/]+\s+)*(?:static[-_ ]check|check|lint|test|build)\b"
     r"|\bno (?:[a-zA-Z0-9_\-\/]+\s+)*(?:build|test|lint|static[-_]check)[a-zA-Z0-9_\-\/]*\s+(?:script|system|target|command|config|configuration|manifest|toolchain|framework|runner)s?"
     r"|\bno tests? (?:ran|were found|found|collected|exist(?:s|ed)?)\b"
     r"|\bcollected 0 items\b"
