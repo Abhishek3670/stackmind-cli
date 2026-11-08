@@ -81,3 +81,14 @@ def test_validate_final_verdict_auto_populates_missing_completed_wos(tmp_path, m
     assert ok is True, f"Expected validation success with auto-population, got {why}"
     reviewed_ids = [w["id"] for w in verdict["reviewed_work_orders"]]
     assert "WO-002" in reviewed_ids
+
+
+def test_ephemeral_test_files_ignored_in_contract_scope():
+    from validators.harness.contract_gate import _is_ephemeral_test_file
+
+    assert _is_ephemeral_test_file("tests/.node_test_output.log") is True
+    assert _is_ephemeral_test_file("tests/_smoke_run.tmp") is True
+    assert _is_ephemeral_test_file("build/test.log") is True
+    assert _is_ephemeral_test_file("src/index.js") is False
+    assert _is_ephemeral_test_file("styles.css") is False
+

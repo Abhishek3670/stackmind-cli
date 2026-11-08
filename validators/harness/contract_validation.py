@@ -158,6 +158,8 @@ def verify_post_execution(
 
         if any(norm_fp.startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")):
             continue
+        if _is_ephemeral_test_file(norm_fp):
+            continue
 
         # Cross-worker modification guard: workers cannot modify each other's work
         if norm_fp in peer_owned:

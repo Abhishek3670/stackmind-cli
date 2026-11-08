@@ -1512,8 +1512,8 @@ def get_curated_tools_for_phase(
         all_permitted.append(request_tools_def)
     return all_permitted
 
-DEFAULT_MAX_TURNS: int = 35
-DEFAULT_MAX_TOOL_CALLS: int = 35
+DEFAULT_MAX_TURNS: int = 60
+DEFAULT_MAX_TOOL_CALLS: int = 60
 DEFAULT_MAX_TOOL_CALLS_PER_TURN: int = 10
 DEFAULT_MAX_TOOL_OUTPUT_CHARS: int = 16_000
 DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS: int = 3

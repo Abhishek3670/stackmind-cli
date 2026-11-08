@@ -334,6 +334,8 @@ def verify_post_execution(
             norm_fp = norm_fp[2:]
         if any(norm_fp.startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")):
             continue
+        if _is_ephemeral_test_file(norm_fp):
+            continue
 
         # Cross-worker modification guard: workers cannot modify each other's work
         if norm_fp in peer_owned:
@@ -348,6 +350,8 @@ def verify_post_execution(
         if norm_fp.startswith("./"):
             norm_fp = norm_fp[2:]
         if any(norm_fp.startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")):
+            continue
+        if _is_ephemeral_test_file(norm_fp):
             continue
         mod = path_to_module(norm_fp)
         if norm_fp.startswith("./"):
