@@ -92,3 +92,18 @@ def test_ephemeral_test_files_ignored_in_contract_scope():
     assert _is_ephemeral_test_file("src/index.js") is False
     assert _is_ephemeral_test_file("styles.css") is False
 
+
+def test_work_order_schema_allows_report_type():
+    schema_path = Path("schemas/work-order.schema.json")
+    data = json.loads(schema_path.read_text(encoding="utf-8"))
+    enums = data["properties"]["deliverable"]["properties"]["type"]["enum"]
+    assert "report" in enums, f"Expected 'report' in deliverable.type enum, got {enums}"
+
+
+def test_default_max_tool_calls_headroom():
+    from validators.kernel.providers.gateway import DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TURNS
+
+    assert DEFAULT_MAX_TOOL_CALLS >= 60, f"Expected >= 60 tool calls headroom, got {DEFAULT_MAX_TOOL_CALLS}"
+    assert DEFAULT_MAX_TURNS >= 60, f"Expected >= 60 turns headroom, got {DEFAULT_MAX_TURNS}"
+
+

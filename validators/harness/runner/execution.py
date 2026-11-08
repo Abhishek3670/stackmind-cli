@@ -497,12 +497,14 @@ class _ExecutionMixin:
                     curr_diff = before_snapshot.diff(curr_snap)
                     bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
                     bookkeeping_exact = ('.sync/work-orders/INDEX.yaml', 'work-orders/INDEX.yaml', '.sync/runtime/TREE.yaml')
+                    from validators.harness.contract_gate import _is_ephemeral_test_file
                     dec_norm_gate = {Path(p).as_posix().lstrip('/') for p in getattr(decision, 'modified_files', ()) if p}
                     observed_files_for_gate = tuple(
                         norm_p for path in curr_diff.all_changed_files
                         if (norm_p := Path(path).as_posix().lstrip('/'))
                         and not any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes)
                         and not (norm_p in bookkeeping_exact and norm_p not in dec_norm_gate)
+                        and not _is_ephemeral_test_file(norm_p)
                     )
                 verify_post_execution(
                     self.project_path,

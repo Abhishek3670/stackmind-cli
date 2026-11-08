@@ -800,14 +800,39 @@ class _CompletionMixin:
                     'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
                 }
             elif is_validation_or_review:
-                blocker_detail = effective_raw_text[:4000] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
-                payload = {
-                    'status': 'blocked',
-                    'summary': f"Validation review requires resolution: {blocker_detail}",
-                    'report_markdown': effective_raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
-                    'modified_files': written_files,
-                    'blockers': [blocker_detail],
-                }
+                has_pass_verdict = False
+                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+                for wf in written_files:
+                    if 'reviews' in wf and wf.endswith(('.json', '.yaml', '.yml', '.md')):
+                        try:
+                            fcontent = (target_dir / wf).read_text(encoding='utf-8', errors='ignore')
+                            if any(pat in fcontent for pat in ('"verdict": "PASS"', 'verdict: PASS', 'status: PASS', '"status": "PASS"')):
+                                has_pass_verdict = True
+                                break
+                        except Exception:
+                            pass
+                if not has_pass_verdict and effective_raw_text and not guard_trip:
+                    raw_up = effective_raw_text.upper()
+                    if ("VERDICT: PASS" in raw_up or ("VERDICT FOR" in raw_up and "PASS" in raw_up)) and "FAIL" not in raw_up:
+                        has_pass_verdict = True
+
+                if has_pass_verdict and not guard_trip:
+                    payload = {
+                        'status': 'completed',
+                        'summary': extracted_summary or effective_raw_text[:4000] or 'Validation review passed',
+                        'report_markdown': effective_raw_text or 'Validation review passed',
+                        'modified_files': written_files,
+                        'blockers': [],
+                    }
+                else:
+                    blocker_detail = effective_raw_text[:4000] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
+                    payload = {
+                        'status': 'blocked',
+                        'summary': f"Validation review requires resolution: {blocker_detail}",
+                        'report_markdown': effective_raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
+                        'modified_files': written_files,
+                        'blockers': [blocker_detail],
+                    }
             else:
                 summary_text = extracted_summary or (effective_raw_text if ((request.task.kind == 'adhoc' or is_delivery_status) and effective_raw_text) else (effective_raw_text[:4000] if effective_raw_text else None))
                 payload = {

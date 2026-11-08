@@ -208,7 +208,8 @@
             "doc",
             "config",
             "module",
-            "test"
+            "test",
+            "report"
           ]
         },
         "path": {
