@@ -1805,6 +1805,10 @@ class SessionManager:
         state.final_review_rounds = 0
         if hasattr(state, "final_review_history"):
             state.final_review_history.clear()
+        if hasattr(state, "budget_usage") and isinstance(state.budget_usage, dict):
+            for k in ("FINAL_REVIEW", "final_review"):
+                if k in state.budget_usage:
+                    state.budget_usage[k].clear()
         if not getattr(state, "plan_id", None):
             plans = self.list_plans(state.session_id)
             if plans:
@@ -2015,7 +2019,14 @@ class SessionManager:
                         prev_phase = candidate
                         break
 
-            if prev_phase:
+            pending_workers = [
+                wid for wid in getattr(state, "worker_wo_ids", [])
+                if wid not in getattr(state, "completed_wo_ids", [])
+                and wid != getattr(state, "gitops_wo_id", None)
+            ]
+            if pending_workers and prev_phase in (Phase.FINAL_REVIEW, Phase.GITOPS, Phase.INTEGRATION_REVIEW):
+                target_phase = Phase.DISPATCHING
+            elif prev_phase:
                 target_phase = prev_phase
             else:
                 non_gitops_workers = [

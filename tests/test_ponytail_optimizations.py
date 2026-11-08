@@ -141,6 +141,69 @@ def test_evaluate_final_acceptance_defaults_plan_id_when_plan_exists(tmp_path, m
     assert "no user-approved plan is recorded for this run" not in report.reasons
     assert state.plan_id == "PLAN-001"
 
+def test_authoring_gate_allows_qa_report_deliverable_without_role_mismatch():
+    from validators.harness.authoring_gate import AuthoringGate
+
+    gate = AuthoringGate()
+    wo_data = {
+        "id": "WO-012",
+        "type": "VALIDATION",
+        "assigned_agents": ["gemma"],
+        "deliverable": {
+            "type": "report",
+            "description": "Run automated test suite and report evidence."
+        }
+    }
+    errors = []
+    gate._validate_work_order("work-orders/WO-012.yaml", wo_data, errors)
+    mismatch_errors = [e for e in errors if "Role-deliverable mismatch" in e]
+    assert not mismatch_errors, f"Unexpected role-deliverable mismatch error: {mismatch_errors}"
 
 
+def test_prepare_run_for_resume_clears_final_review_budget_and_routes_to_dispatching(tmp_path):
+    from types import SimpleNamespace
+    from validators.kernel.daemon.manager import SessionManager
+    from validators.kernel.daemon.storage import DaemonStorage
+    from validators.kernel.daemon.supervisor import Phase
+
+    storage = DaemonStorage(tmp_path / "daemon")
+    mgr = SessionManager(storage=storage)
+    mgr.list_plans = lambda sid: [{"plan_id": "PLAN-001"}]
+    mgr.supervisor = SimpleNamespace(
+        unblock_in_flight_work_orders=lambda state: None,
+        _discover_worker_wos=lambda state: None,
+        _archive_verdicts_for_wo=lambda wo, ws: None,
+        _find_latest_contract_for_wo=lambda *args, **kwargs: None,
+        _transition=lambda state, phase, **kwargs: setattr(state, "phase", phase),
+    )
+
+    state = SimpleNamespace(
+        session_id="s1",
+        run_id="run-1",
+        planning_wo_id=None,
+        completed_wo_ids=["WO-001"],
+        worker_wo_ids=["WO-001", "WO-002"],
+        gitops_wo_id=None,
+        transitions=[{"from": "FINAL_REVIEW", "to": "BLOCKED"}],
+        budget_usage={"FINAL_REVIEW": {"RUN": 2}},
+        final_review_rounds=2,
+        final_review_history=[{"event": "exhausted"}],
+        plan_id=None,
+        blocked_wo_ids=[],
+        failed_wo_ids=[],
+        retry_counts={},
+        recovery_attempts={},
+        worker_retries={},
+        qa_reworks={},
+        dependency_escalation_retries={},
+        worker_blockers={},
+        integration_blockers={},
+        error="Blocked",
+    )
+    session = {"state": "RUNNING", "journal": []}
+
+    mgr._prepare_run_for_resume(state, session, tmp_path)
+    assert state.final_review_rounds == 0
+    assert len(state.budget_usage.get("FINAL_REVIEW", {})) == 0
+    assert state.phase == Phase.DISPATCHING
 

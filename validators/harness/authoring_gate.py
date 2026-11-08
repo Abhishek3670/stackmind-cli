@@ -318,14 +318,15 @@ class AuthoringGate:
                 )
         if isinstance(deliverable, dict):
             deliv_type = deliverable.get("type")
-            if deliv_type not in ("code", "doc", "config", "module"):
-                errors.append(f"Work Order deliverable type '{deliv_type}' invalid; must be code, doc, config, or module")
+            if deliv_type not in ("code", "doc", "config", "module", "report"):
+                errors.append(f"Work Order deliverable type '{deliv_type}' invalid; must be code, doc, config, module, or report")
             if not deliverable.get("description"):
                 errors.append("Work Order deliverable requires a non-empty 'description'")
 
         # Validate role vs deliverable compatibility
         assigned_agents = [str(a).lower().strip() for a in (data.get("assigned_agents") or [])]
-        deliv_path_val = str((deliverable or {}).get("path") if isinstance(deliverable, dict) else (deliverable or "")).strip().lower()
+        raw_deliv_path = (deliverable or {}).get("path") if isinstance(deliverable, dict) else deliverable
+        deliv_path_val = str(raw_deliv_path).strip().lower() if raw_deliv_path else ""
         if deliv_path_val:
             if "codex" in assigned_agents and any(deliv_path_val.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
                 errors.append(
