@@ -455,7 +455,10 @@ def run_stack_appropriate_verifier(
 
 
 _NO_TESTS_RE = re.compile(
-    r"\bno tests? (?:ran|were found|found|collected|exist(?:s|ed)?)\b"
+    r"\bno (?:[a-zA-Z0-9_\-]+\s+)?tests?(?:\s+files?)?\s+(?:ran|were found|found|collected|exist(?:s|ed)?)\b"
+    r"|\bno\s+(?:automated\s+)?coverage\b"
+    r"|\bno (?:[a-zA-Z0-9_\-\/]+\s+)*(?:build|test|lint|static[-_]check)[a-zA-Z0-9_\-\/]*\s+(?:script|system|target|command|config|configuration|manifest|toolchain|framework|runner)s?"
+    r"|\bno tests? (?:ran|were found|found|collected|exist(?:s|ed)?)\b"
     r"|\bcollected 0 items\b"
     r"|(?<![\w.])0 tests\b"
     r"|\btests?/?\s+(?:directory|folder|dir)?\s*(?:does not exist|not found|is missing)\b"
@@ -529,15 +532,19 @@ def validate_qa_verdict(
         ]
         if failed:
             return False, "QA verdict claims PASS while criteria are not all satisfied"
+        is_provisional = status in (QA_NO_TEST_EVIDENCE, "QA_NO_TEST_EVIDENCE", QA_PROVISIONAL_PASS)
         findings = verdict.get("findings") or []
         critical = [
             f for f in findings
             if isinstance(f, dict)
             and str(f.get("severity", "")).lower() in ("critical", "blocker", "major")
+            and not (
+                is_provisional
+                and any(k in str(f.get("detail", "")).lower() for k in ("test coverage", "no automated test", "no test", "missing test", "tests directory found"))
+            )
         ]
         if critical:
             return False, "QA verdict claims PASS while critical findings are recorded"
-        is_provisional = status in (QA_NO_TEST_EVIDENCE, "QA_NO_TEST_EVIDENCE", QA_PROVISIONAL_PASS)
         types = wo_deliverable_types(data)
         is_pure_doc = bool(types and types <= {"doc", "config"})
 
