@@ -295,11 +295,35 @@ def load_plan_milestones(workspace: Path | str) -> list[dict[str, Any]] | None:
                     "id": m.id,
                     "title": m.title,
                     "agent": m.agent,
+                    "tasks": list(getattr(m, "tasks", []) or []),
                     "status": getattr(m, "status", "PENDING"),
                 })
     except Exception:
         return None
     return refs or None
+
+
+_FILE_CANDIDATE_PATTERN = re.compile(
+    r"(?:[`\"'\s(\[{<]|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?=[`\"'\s)\]}>,;:]|$)"
+)
+
+
+def _extract_paths_from_text(text: str) -> set[str]:
+    if not text:
+        return set()
+    found = set()
+    for m in _FILE_CANDIDATE_PATTERN.findall(text):
+        clean = m.strip().strip("`\"'.,()").replace("\\", "/").lstrip("/").lower()
+        if any(clean.endswith(ext) for ext in (
+            ".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md",
+            ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite", ".go", ".rs", ".vue", ".svelte",
+        )):
+            if not clean.startswith(".sync") and not clean.startswith(".git") and clean not in ("plan.md", "architecture.md", "design.md"):
+                found.add(clean)
+    for mf in ("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod", "version.md", "changelog.md"):
+        if mf in text.lower():
+            found.add(mf)
+    return found
 
 
 def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
@@ -327,13 +351,13 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
         return True
 
     ref_agent = str(ref.get("agent") or "").strip().lower()
+    wo_assigned = data.get("assigned_agents")
+    wo_agents = [
+        str(a).strip().lower()
+        for a in (wo_assigned if isinstance(wo_assigned, list) else [wo_assigned])
+        if a
+    ]
     if ref_agent:
-        wo_assigned = data.get("assigned_agents")
-        wo_agents = [
-            str(a).strip().lower()
-            for a in (wo_assigned if isinstance(wo_assigned, list) else [wo_assigned])
-            if a
-        ]
         if ref_agent in wo_agents:
             m_tokens = _title_tokens(ref.get("title")) - _ACTION_PREFIX_VERBS
             w_tokens = _title_tokens(data.get("title")) - _ACTION_PREFIX_VERBS
@@ -350,6 +374,32 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
                     return True
                 if (m_matched / len(m_tokens) >= 0.6) and (w_matched / len(w_tokens) >= 0.6):
                     return True
+
+    # Path / Deliverable overlap check: If work order deliverables or touched files overlap
+    # with the files declared in ref's tasks or title, and assigned agents are compatible.
+    if not (ref_agent and wo_agents and ref_agent not in wo_agents):
+        ref_paths: set[str] = set()
+        for t in ref.get("tasks") or []:
+            ref_paths.update(_extract_paths_from_text(str(t)))
+        ref_paths.update(_extract_paths_from_text(str(ref.get("title") or "")))
+
+        if ref_paths:
+            wo_paths: set[str] = set()
+            deliv = data.get("deliverable") or {}
+            if deliv.get("path"):
+                wo_paths.add(str(deliv["path"]).strip().replace("\\", "/").lstrip("/").lower())
+            for d in data.get("deliverables") or []:
+                if isinstance(d, dict) and d.get("path"):
+                    wo_paths.add(str(d.get("path")).strip().replace("\\", "/").lstrip("/").lower())
+            impl = data.get("implementation_estimate") or {}
+            for ef in impl.get("expected_files") or []:
+                if ef:
+                    wo_paths.add(str(ef).strip().replace("\\", "/").lstrip("/").lower())
+            wo_paths.update(_extract_paths_from_text(str(data.get("description") or "")))
+            wo_paths.update(_extract_paths_from_text(str(data.get("title") or "")))
+
+            if wo_paths & ref_paths:
+                return True
 
     return False
 

@@ -143,10 +143,21 @@ class _ReconciliationMixin:
         for wo_file in list(active_dir.glob("*.yaml")):
             wo_id = wo_file.stem
             if wo_id in closed_ids:
-                # When an active work order collides with closed states (e.g. reopened by architect),
-                # remove the stale archived copies in COMPLETED/BLOCKED so the active order takes precedence.
-                for sub in ("COMPLETED", "BLOCKED"):
-                    (sync_dir / "work-orders" / sub / f"{wo_id}.yaml").unlink(missing_ok=True)
+                is_reopened = False
+                try:
+                    wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                    if wo_data.get("reopened") or int(wo_data.get("revision", 1)) > 1:
+                        is_reopened = True
+                except Exception:
+                    pass
+
+                if is_reopened:
+                    for sub in ("COMPLETED", "BLOCKED"):
+                        (sync_dir / "work-orders" / sub / f"{wo_id}.yaml").unlink(missing_ok=True)
+                else:
+                    wo_file.unlink(missing_ok=True)
+                    if contracts_dir.is_dir():
+                        (contracts_dir / f"{wo_id}.yaml").unlink(missing_ok=True)
 
     @staticmethod
     def _sync_index_and_tree_yaml(base_dir: Path) -> None:

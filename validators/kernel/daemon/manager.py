@@ -1858,6 +1858,8 @@ class SessionManager:
                         pass
                 if comp_file.stem not in getattr(state, "completed_wo_ids", []):
                     state.completed_wo_ids.append(comp_file.stem)
+                if state.planning_wo_id == comp_file.stem:
+                    state.planning_wo_id = None
 
         # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
         self.supervisor.unblock_in_flight_work_orders(state)

@@ -2078,6 +2078,19 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             except Exception:
                 pass
 
+        existing_deliv_paths: set[str] = set()
+        for w in existing_wos:
+            p = (w.get("deliverable") or {}).get("path")
+            if p:
+                existing_deliv_paths.add(str(p).strip().replace("\\", "/").lstrip("/").lower())
+            for d in w.get("deliverables") or []:
+                if isinstance(d, dict) and d.get("path"):
+                    existing_deliv_paths.add(str(d.get("path")).strip().replace("\\", "/").lstrip("/").lower())
+            impl = w.get("implementation_estimate") or {}
+            for ef in impl.get("expected_files") or []:
+                if ef:
+                    existing_deliv_paths.add(str(ef).strip().replace("\\", "/").lstrip("/").lower())
+
         uncovered_milestones = [
             m for m in plan_milestones
             if not (
@@ -2119,7 +2132,24 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     prev_wo_id=prev_wo_id,
                 )
 
-                for wo in child_wos:
+                filtered_child_wos = []
+                for c_wo in child_wos:
+                    c_deliv = c_wo.get("deliverable") or {}
+                    c_path = str(c_deliv.get("path") or "").strip().replace("\\", "/").lstrip("/").lower()
+                    if c_path and c_path in existing_deliv_paths:
+                        continue
+                    filtered_child_wos.append(c_wo)
+
+                if not filtered_child_wos:
+                    continue
+
+                valid_existing_ids = {str(w.get("id")) for w in existing_wos}
+                chain_prev = prev_wo_id if (prev_wo_id and prev_wo_id in valid_existing_ids) else None
+                for c_wo in filtered_child_wos:
+                    c_wo["dependencies"] = [chain_prev] if chain_prev else []
+                    chain_prev = str(c_wo.get("id"))
+
+                for wo in filtered_child_wos:
                     wo_id = str(wo.get("id"))
                     assigned = wo.get("assigned_agents", ["codex"])
                     primary_agent = assigned[0] if assigned else "codex"
@@ -2198,6 +2228,9 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     durable_write_yaml(wo_file_path, wo_rec)
                     durable_write_yaml(contract_file_path, contract_rec)
                     existing_wos.append(wo_rec)
+                    w_deliv_clean = str((wo.get("deliverable") or {}).get("path") or "").strip().replace("\\", "/").lstrip("/").lower()
+                    if w_deliv_clean:
+                        existing_deliv_paths.add(w_deliv_clean)
                     reconciled_ids.append(wo_id)
 
                     index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"

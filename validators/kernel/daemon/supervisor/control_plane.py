@@ -1536,6 +1536,8 @@ def evaluate_supervisor_state(
             or target_phase == Phase.AWAITING_APPROVAL
             or bool(state.error)
             or bool(state.interrupted_phase)
+            or bool(getattr(state, "blocked_wo_ids", None))
+            or authorized_override
         )
         if not has_wait_condition:
             violations.append(
