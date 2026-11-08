@@ -110,6 +110,21 @@ def repair_unquoted_yaml_scalars(text: str) -> str:
                     out.append(f"{indent}{key}: >-")
                     out.extend(block_lines)
                     continue
+
+        # ponytail: auto-escape nested double quotes or unquoted colons in list items
+        list_match = re.match(r"^(\s*-\s*)\"(.*)\"\s*$", line)
+        if list_match:
+            prefix, inner = list_match.groups()
+            if '"' in inner:
+                inner_escaped = re.sub(r'(?<!\\)"', r'\"', inner)
+                line = f'{prefix}"{inner_escaped}"'
+        else:
+            list_colon_match = re.match(r"^(\s*-\s*)([^\"'>|\[{].*:\s+.*)$", line)
+            if list_colon_match:
+                prefix, val = list_colon_match.groups()
+                escaped = val.replace('"', '\\"')
+                line = f'{prefix}"{escaped}"'
+
         out.append(line)
         i += 1
     return "\n".join(out)

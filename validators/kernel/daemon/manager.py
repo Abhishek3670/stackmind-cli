@@ -884,15 +884,26 @@ class SessionManager:
     def _persist_event(self, event: RuntimeEvent) -> None:
         # Event listeners may publish from runner threads; serialize persistence
         # with all session/operation transitions to avoid competing temp-file replaces.
-        if getattr(event, "name", None) in {"token.delta", "reasoning.delta"}:
+        ev_name = getattr(event, "name", None) or ""
+        if ev_name in {"token.delta", "reasoning.delta"}:
             return
-        with self._lock:
-            self._save()
+        # ponytail: throttle event-driven saves; major lifecycle events save immediately, noisy tool telemetry debounced
+        now = time.monotonic()
+        is_major = any(k in ev_name for k in ("started", "completed", "failed", "cancelled", "recovered", "blocked", "recorded", "approved"))
+        last = getattr(self, "_last_event_save_time", 0.0)
+        if is_major or (now - last) >= 1.0:
+            self._last_event_save_time = now
+            with self._lock:
+                self._save()
 
     def _save(self) -> None:
+        # ponytail: cap in-memory event dump in state file to 500 recent events; prevents multi-megabyte daemon-state bloat
+        events_dump = self.events.dump()
+        if len(events_dump) > 500:
+            events_dump = events_dump[-500:]
         self.storage.save({
             "sessions": self._sessions,
-            "events": self.events.dump(),
+            "events": events_dump,
             "roles": self._roles,
         })
 

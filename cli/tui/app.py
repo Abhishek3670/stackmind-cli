@@ -464,6 +464,7 @@ def tui(
         term_size = shutil.get_terminal_size(fallback=(80, 24))
         current_cols, current_lines = term_size.columns, term_size.lines
         last_idle_poll_time = 0.0
+        last_disk_sync_time = 0.0
         while True:
             try:
                 resized, new_cols, new_lines = check_terminal_resize(current_cols, current_lines)
@@ -915,9 +916,10 @@ def tui(
                     sid = session.get("session_id")
                     if not sid:
                         return
-                    nonlocal last_idle_poll_time
+                    nonlocal last_idle_poll_time, last_disk_sync_time
                     now = time.monotonic()
-                    if now - last_idle_poll_time < 0.15:
+                    # ponytail: poll at 0.35s instead of 0.15s to eliminate keystroke contention
+                    if now - last_idle_poll_time < 0.35:
                         return
                     last_idle_poll_time = now
                     try:
@@ -928,7 +930,9 @@ def tui(
                                 missed, state, workspace=workspace.resolve()
                             )
                             did_update = True
-                        if workspace:
+                        # ponytail: only sync full work orders from disk if events arrived or every 2.0s
+                        if workspace and (missed or (now - last_disk_sync_time) >= 2.0):
+                            last_disk_sync_time = now
                             prev_wos = [(w.id, w.status) for w in state.work_orders]
                             state.sync_work_orders_from_disk(workspace.resolve())
                             new_wos = [(w.id, w.status) for w in state.work_orders]
