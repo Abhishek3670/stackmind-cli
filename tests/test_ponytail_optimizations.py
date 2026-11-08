@@ -107,3 +107,25 @@ def test_default_max_tool_calls_headroom():
     assert DEFAULT_MAX_TURNS >= 60, f"Expected >= 60 turns headroom, got {DEFAULT_MAX_TURNS}"
 
 
+def test_collect_peer_owned_deliverables_skips_ephemeral_files(tmp_path):
+    from validators.harness.contract_gate import _collect_peer_owned_deliverables
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True)
+    # Simulate a cleanup WO that declares a log file as deliverable
+    (active_dir / "WO-011.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-011",
+            "assigned_agents": ["codex"],
+            "deliverable": {"path": "tests/.node_test_output.log"},
+            "deliverables": [{"path": "src/real.js"}],
+        }),
+        encoding="utf-8"
+    )
+
+    owned = _collect_peer_owned_deliverables(tmp_path, own_wo_id="WO-002", current_agent="gemma")
+    assert "tests/.node_test_output.log" not in owned, "Ephemeral logs must not be registered as owned deliverables"
+    assert "src/real.js" in owned, "Real code deliverables must remain registered"
+
+
+

@@ -2016,7 +2016,13 @@ class _RecoveryMixin:
         for wid in incomplete_wos:
             deps: list[str] = []
             if wid in state.wo_dependencies:
-                deps.extend(state.wo_dependencies[wid])
+                w_deps = state.wo_dependencies[wid]
+                if isinstance(w_deps, list):
+                    deps.extend(w_deps)
+                elif isinstance(w_deps, dict):
+                    deps.extend(w_deps.keys())
+                elif w_deps:
+                    deps.append(str(w_deps))
             wo_file = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wid}.yaml"
             if wo_file.is_file():
                 try:

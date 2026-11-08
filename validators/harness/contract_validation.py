@@ -319,18 +319,19 @@ def _collect_peer_owned_deliverables(
             if norm_agent and norm_agent in assigned_norm:
                 continue
             peer_agent = assigned_norm[0] if assigned_norm else "unknown"
+            from .contract_gate import _is_ephemeral_test_file
             deliv = data.get("deliverable")
             if isinstance(deliv, dict) and deliv.get("path"):
                 p = str(deliv["path"]).replace("\\", "/").strip().lstrip("/")
-                if p:
+                if p and not _is_ephemeral_test_file(p):
                     owned[p] = (wo_file.stem, peer_agent)
             for extra in data.get("deliverables") or []:
                 if isinstance(extra, dict) and extra.get("path"):
                     p = str(extra["path"]).replace("\\", "/").strip().lstrip("/")
-                    if p:
+                    if p and not _is_ephemeral_test_file(p):
                         owned[p] = (wo_file.stem, peer_agent)
                 elif isinstance(extra, str) and extra.strip():
                     p = extra.replace("\\", "/").strip().lstrip("/")
-                    if p:
+                    if p and not _is_ephemeral_test_file(p):
                         owned[p] = (wo_file.stem, peer_agent)
     return owned

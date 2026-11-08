@@ -2223,6 +2223,20 @@ class _ExecutionMixin:
         elif status not in (review_gate.QA_PASS, review_gate.QA_FAIL):
             status = review_gate.QA_PASS if "pass" in status.lower() else review_gate.QA_FAIL
 
+        raw_crit = raw_verdict.get("criteria")
+        crit_list = list(raw_crit) if isinstance(raw_crit, list) else ([raw_crit] if isinstance(raw_crit, dict) else [
+            {"id": "acceptance", "description": "Meets functional acceptance criteria", "outcome": status}
+        ])
+
+        raw_ev = raw_verdict.get("evidence")
+        ev_list = list(raw_ev) if isinstance(raw_ev, list) else ([raw_ev] if isinstance(raw_ev, dict) else [])
+
+        raw_find = raw_verdict.get("findings")
+        find_list = list(raw_find) if isinstance(raw_find, list) else ([raw_find] if isinstance(raw_find, dict) else [])
+
+        raw_act = raw_verdict.get("required_actions")
+        act_list = list(raw_act) if isinstance(raw_act, list) else ([raw_act] if isinstance(raw_act, dict) else [])
+
         canonical_verdict: dict[str, Any] = {
             "schema": review_gate.QA_VERDICT_SCHEMA,
             "work_order_id": wo_id,
@@ -2232,12 +2246,10 @@ class _ExecutionMixin:
             "timestamp": authoritative_ts,
             "verdict": status,
             "subject_hash": authoritative_hash,
-            "criteria": raw_verdict.get("criteria") or [
-                {"id": "acceptance", "description": "Meets functional acceptance criteria", "outcome": status}
-            ],
-            "evidence": raw_verdict.get("evidence") or [],
-            "findings": raw_verdict.get("findings") or [],
-            "required_actions": raw_verdict.get("required_actions") or [],
+            "criteria": crit_list,
+            "evidence": ev_list,
+            "findings": find_list,
+            "required_actions": act_list,
             "rework_attempt": state.qa_reworks.get(wo_id, 0),
             "rework_budget": state.max_qa_reworks,
         }
@@ -2254,7 +2266,10 @@ class _ExecutionMixin:
         ):
             ok, msg, stack_ev = review_gate.run_stack_appropriate_verifier(ws, wo_id, data)
             if ok:
-                canonical_verdict["evidence"].extend(stack_ev)
+                if isinstance(canonical_verdict["evidence"], list):
+                    canonical_verdict["evidence"].extend(stack_ev)
+                else:
+                    canonical_verdict["evidence"] = [canonical_verdict["evidence"]] + list(stack_ev)
                 if status == review_gate.QA_FAIL and not canonical_verdict["findings"]:
                     canonical_verdict["verdict"] = review_gate.QA_NO_TEST_EVIDENCE
 
