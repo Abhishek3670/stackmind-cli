@@ -112,18 +112,23 @@ def repair_unquoted_yaml_scalars(text: str) -> str:
                     continue
 
         # ponytail: auto-escape nested double quotes or unquoted colons in list items
-        list_match = re.match(r"^(\s*-\s*)\"(.*)\"\s*$", line)
-        if list_match:
-            prefix, inner = list_match.groups()
-            if '"' in inner:
-                inner_escaped = re.sub(r'(?<!\\)"', r'\"', inner)
-                line = f'{prefix}"{inner_escaped}"'
-        else:
-            list_colon_match = re.match(r"^(\s*-\s*)([^\"'>|\[{].*:\s+.*)$", line)
-            if list_colon_match:
-                prefix, val = list_colon_match.groups()
-                escaped = val.replace('"', '\\"')
-                line = f'{prefix}"{escaped}"'
+        list_item_match = re.match(r"^(\s*-\s*)(.*)$", line)
+        if list_item_match:
+            prefix, val = list_item_match.groups()
+            stripped_val = val.strip()
+            if stripped_val and not stripped_val.startswith(("> ", "| ", "---")):
+                if '"' in val:
+                    if stripped_val.startswith('"') and stripped_val.endswith('"') and len(stripped_val) >= 2:
+                        inner = stripped_val[1:-1]
+                        if '"' in inner:
+                            inner_escaped = re.sub(r'(?<!\\)"', r'\"', inner)
+                            line = f'{prefix}"{inner_escaped}"'
+                    else:
+                        val_escaped = re.sub(r'(?<!\\)"', r'\"', stripped_val)
+                        line = f'{prefix}"{val_escaped}"'
+                elif ":" in val and not (stripped_val.startswith('"') or stripped_val.startswith("'")):
+                    escaped = stripped_val.replace('"', '\\"')
+                    line = f'{prefix}"{escaped}"'
 
         out.append(line)
         i += 1

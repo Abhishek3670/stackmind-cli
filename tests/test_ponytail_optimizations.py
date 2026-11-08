@@ -43,10 +43,12 @@ def test_authoring_yaml_auto_repairs_inner_quotes_in_lists():
         "acceptance_criteria:\n"
         '  - "Includes <link rel=\\"stylesheet\\"> in <head> and module script src=\\"src/app.js\\""\n'
         '  - "Renders all required elements in <head> and module script src="src/app.js""\n'
+        '  - "scripts.test" runs node --test against tests/\n'
         "  - Unquoted item with: a colon inside\n"
     )
     repaired = repair_unquoted_yaml_scalars(malformed_yaml)
     data = yaml.safe_load(repaired)
     assert isinstance(data, dict)
-    assert len(data["acceptance_criteria"]) == 3
+    assert len(data["acceptance_criteria"]) == 4
     assert 'src="src/app.js"' in data["acceptance_criteria"][1]
+    assert 'scripts.test' in data["acceptance_criteria"][2]
