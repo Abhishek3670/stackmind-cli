@@ -241,5 +241,50 @@ def test_outcome_verified_allows_blocked_planning_turn(tmp_path: Path):
     assert dims.outcome_verified is True
 
 
+def test_planning_turn_synthesizes_plan_deliverable(tmp_path: Path):
+    from validators.harness.runner.completion import _CompletionMixin
+    from validators.harness.runner.models import HarnessTask, LLMRequest
+    from unittest.mock import MagicMock
+
+    mixin = _CompletionMixin()
+    mixin.project_path = tmp_path
+    mixin.sync_path = tmp_path / ".sync"
+    mixin.agent = "claude"
+
+    task = HarnessTask(
+        identifier="WO-000",
+        kind="work_order",
+        work_order_id="WO-000",
+        title="System architecture and execution plan",
+        deliverable_path=".sync/playbook/PLAN.md",
+        deliverable_type="doc",
+        path=mixin.sync_path / "work-orders" / "ACTIVE" / "WO-000.yaml",
+        body="",
+        query="",
+    )
+
+    req = LLMRequest(
+        agent="claude",
+        session_count=1,
+        task=task,
+        context=MagicMock(),
+        retrieval=MagicMock(),
+    )
+
+    # When model outputs raw markdown without JSON decision or write_file
+    raw_markdown = "I propose a 3D mobile launch site using Three.js and GSAP."
+    payload, written_files = mixin._extract_unstructured_fallback(
+        request=req,
+        raw_text=raw_markdown,
+        tool_runtime=None,
+        written_files=[],
+    )
+
+    assert payload.get("status") == "completed"
+    assert (tmp_path / ".sync" / "playbook" / "PLAN.md").is_file()
+    assert ".sync/playbook/PLAN.md" in payload.get("modified_files", [])
+
+
+
 
 

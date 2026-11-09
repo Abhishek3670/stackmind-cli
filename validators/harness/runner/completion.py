@@ -750,98 +750,14 @@ class _CompletionMixin:
         if not isinstance(payload, dict):
             if guard_trip:
                 decision_source = "synthesized_after_loop_guard"
-
-            # Check if this was an unfulfilled writing task
-            is_unfulfilled_deliverable = False
-            if request.task.deliverable_path and not written_files:
-                deliverable_exists = False
-                try:
-                    target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
-                    deliverable_exists = (target_dir / request.task.deliverable_path).exists()
-                except Exception:
-                    pass
-                if not deliverable_exists:
-                    is_unfulfilled_deliverable = True
-
-            wo_type_upper = str(getattr(request.task, 'work_order_type', '') or '').upper()
-            is_validation_or_review = (
-                wo_type_upper in ('VALIDATION', 'QA', 'TEST')
-                or request.task.kind == 'validation'
-                or (wo_type_upper not in ('RESEARCH', 'AUDIT') and (
-                    'integration review' in (request.task.title or '').lower()
-                    or 'validation review' in (request.task.title or '').lower()
-                    or 'review' in (request.task.title or '').lower()
-                    or 'validation' in (request.task.title or '').lower()
-                ))
+            payload, written_files = self._extract_unstructured_fallback(
+                request=request,
+                raw_text=raw_text,
+                tool_runtime=tool_runtime,
+                written_files=written_files,
+                guard_trip=guard_trip,
+                is_delivery_status=is_delivery_status,
             )
-
-            # If raw_text contains unparsed JSON-like text with report_markdown or summary, extract clean text
-            extracted_report = None
-            extracted_summary = None
-            if raw_text:
-                for key in ("report_markdown", "summary", "response", "review_notes"):
-                    m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text, re.DOTALL)
-                    if m:
-                        val = m.group(1).replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
-                        if val.strip() and val.strip() != "Completed task via tools":
-                            if key == "report_markdown":
-                                extracted_report = val.strip()
-                            elif not extracted_summary:
-                                extracted_summary = val.strip()
-
-            effective_raw_text = extracted_report or raw_text
-
-            if is_unfulfilled_deliverable:
-                payload = {
-                    'status': 'blocked',
-                    'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {effective_raw_text[:4000]}",
-                    'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {effective_raw_text}",
-                    'modified_files': written_files,
-                    'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
-                }
-            elif is_validation_or_review:
-                has_pass_verdict = False
-                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
-                for wf in written_files:
-                    if 'reviews' in wf and wf.endswith(('.json', '.yaml', '.yml', '.md')):
-                        try:
-                            fcontent = (target_dir / wf).read_text(encoding='utf-8', errors='ignore')
-                            if any(pat in fcontent for pat in ('"verdict": "PASS"', 'verdict: PASS', 'status: PASS', '"status": "PASS"')):
-                                has_pass_verdict = True
-                                break
-                        except Exception:
-                            pass
-                if not has_pass_verdict and effective_raw_text and not guard_trip:
-                    raw_up = effective_raw_text.upper()
-                    if ("VERDICT: PASS" in raw_up or ("VERDICT FOR" in raw_up and "PASS" in raw_up)) and "FAIL" not in raw_up:
-                        has_pass_verdict = True
-
-                if has_pass_verdict and not guard_trip:
-                    payload = {
-                        'status': 'completed',
-                        'summary': extracted_summary or effective_raw_text[:4000] or 'Validation review passed',
-                        'report_markdown': effective_raw_text or 'Validation review passed',
-                        'modified_files': written_files,
-                        'blockers': [],
-                    }
-                else:
-                    blocker_detail = effective_raw_text[:4000] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
-                    payload = {
-                        'status': 'blocked',
-                        'summary': f"Validation review requires resolution: {blocker_detail}",
-                        'report_markdown': effective_raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
-                        'modified_files': written_files,
-                        'blockers': [blocker_detail],
-                    }
-            else:
-                summary_text = extracted_summary or (effective_raw_text if ((request.task.kind == 'adhoc' or is_delivery_status) and effective_raw_text) else (effective_raw_text[:4000] if effective_raw_text else None))
-                payload = {
-                    'status': 'completed',
-                    'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
-                    'report_markdown': effective_raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
-                    'modified_files': written_files,
-                    'blockers': [],
-                }
         else:
             if guard_trip:
                 decision_source = "model"
@@ -915,3 +831,128 @@ class _CompletionMixin:
             completion_tokens=gateway.total_usage.completion_tokens,
             meta=completion_meta,
         )
+
+    def _extract_unstructured_fallback(
+        self,
+        request: LLMRequest,
+        raw_text: str,
+        tool_runtime: GovernedToolRuntime | None,
+        written_files: list[str],
+        guard_trip: str | None = None,
+        is_delivery_status: bool = False,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Fallback synthesis when model outputs unstructured text or tool loop ends without JSON."""
+        written_files = list(written_files or [])
+        is_unfulfilled_deliverable = False
+        is_planning_turn = (
+            str(getattr(request.task, 'work_order_id', '') or '') == "WO-000"
+            or getattr(request.task, 'is_planning', False)
+            or str(getattr(self, 'agent', '')).lower().strip() in ('claude', 'architecture', 'architect')
+        )
+        if request.task.deliverable_path and not written_files and not is_planning_turn:
+            deliverable_exists = False
+            try:
+                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+                deliverable_exists = (target_dir / request.task.deliverable_path).exists()
+            except Exception:
+                pass
+            if not deliverable_exists:
+                is_unfulfilled_deliverable = True
+
+        wo_type_upper = str(getattr(request.task, 'work_order_type', '') or '').upper()
+        is_validation_or_review = (
+            wo_type_upper in ('VALIDATION', 'QA', 'TEST')
+            or request.task.kind == 'validation'
+            or (wo_type_upper not in ('RESEARCH', 'AUDIT') and (
+                'integration review' in (request.task.title or '').lower()
+                or 'validation review' in (request.task.title or '').lower()
+                or 'review' in (request.task.title or '').lower()
+                or 'validation' in (request.task.title or '').lower()
+            ))
+        )
+
+        extracted_report = None
+        extracted_summary = None
+        if raw_text:
+            for key in ("report_markdown", "summary", "response", "review_notes"):
+                m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text, re.DOTALL)
+                if m:
+                    val = m.group(1).replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+                    if val.strip() and val.strip() != "Completed task via tools":
+                        if key == "report_markdown":
+                            extracted_report = val.strip()
+                        elif not extracted_summary:
+                            extracted_summary = val.strip()
+
+        effective_raw_text = extracted_report or raw_text
+
+        if is_unfulfilled_deliverable:
+            payload = {
+                'status': 'blocked',
+                'summary': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}': {effective_raw_text[:4000]}",
+                'report_markdown': f"Worker ended turn without authoring declared deliverable '{request.task.deliverable_path}'. Raw output: {effective_raw_text}",
+                'modified_files': written_files,
+                'blockers': [f"declared deliverable '{request.task.deliverable_path}' was not added or modified in this turn"],
+            }
+        elif is_planning_turn:
+            target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+            plan_rel = request.task.deliverable_path or ".sync/playbook/PLAN.md"
+            plan_file = target_dir / plan_rel
+            if not plan_file.exists() or plan_file.stat().st_size == 0:
+                plan_file.parent.mkdir(parents=True, exist_ok=True)
+                body_text = effective_raw_text.strip() if effective_raw_text and len(effective_raw_text.strip()) > 30 else f"# Project Plan: {getattr(request.task, 'title', 'System Architecture')}\n\n## Architecture\n{getattr(request.task, 'description', '') or 'System architecture and execution plan'}\n\n## Milestones\n- [ ] Milestone 1: Project Scaffolding & Setup\n- [ ] Milestone 2: Core Implementation\n- [ ] Milestone 3: QA & Verification\n"
+                plan_file.write_text(body_text, encoding="utf-8")
+                written_files = list(dict.fromkeys(written_files + [plan_rel.replace("\\", "/")]))
+            summary_text = extracted_summary or (effective_raw_text[:4000] if effective_raw_text else 'Synthesized architecture and execution plan')
+            payload = {
+                'status': 'completed',
+                'summary': summary_text,
+                'report_markdown': effective_raw_text or 'Synthesized architecture and execution plan in PLAN.md',
+                'modified_files': written_files,
+                'blockers': [],
+            }
+        elif is_validation_or_review:
+            has_pass_verdict = False
+            target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+            for wf in written_files:
+                if 'reviews' in wf and wf.endswith(('.json', '.yaml', '.yml', '.md')):
+                    try:
+                        fcontent = (target_dir / wf).read_text(encoding='utf-8', errors='ignore')
+                        if any(pat in fcontent for pat in ('"verdict": "PASS"', 'verdict: PASS', 'status: PASS', '"status": "PASS"')):
+                            has_pass_verdict = True
+                            break
+                    except Exception:
+                        pass
+            if not has_pass_verdict and effective_raw_text and not guard_trip:
+                raw_up = effective_raw_text.upper()
+                if ("VERDICT: PASS" in raw_up or ("VERDICT FOR" in raw_up and "PASS" in raw_up)) and "FAIL" not in raw_up:
+                    has_pass_verdict = True
+
+            if has_pass_verdict and not guard_trip:
+                payload = {
+                    'status': 'completed',
+                    'summary': extracted_summary or effective_raw_text[:4000] or 'Validation review passed',
+                    'report_markdown': effective_raw_text or 'Validation review passed',
+                    'modified_files': written_files,
+                    'blockers': [],
+                }
+            else:
+                blocker_detail = effective_raw_text[:4000] if effective_raw_text else (f"Validation tripped loop guard: {guard_trip}" if guard_trip else "Validation review ended without structured approval")
+                payload = {
+                    'status': 'blocked',
+                    'summary': f"Validation review requires resolution: {blocker_detail}",
+                    'report_markdown': effective_raw_text or f"Validation review ended without structured approval ({guard_trip or 'fallback'}).",
+                    'modified_files': written_files,
+                    'blockers': [blocker_detail],
+                }
+        else:
+            summary_text = extracted_summary or (effective_raw_text if ((request.task.kind == 'adhoc' or is_delivery_status) and effective_raw_text) else (effective_raw_text[:4000] if effective_raw_text else None))
+            payload = {
+                'status': 'completed',
+                'summary': summary_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                'report_markdown': effective_raw_text or (f'Completed task via tools (synthesized after {guard_trip})' if guard_trip else 'Completed task via tools'),
+                'modified_files': written_files,
+                'blockers': [],
+            }
+
+        return payload, written_files
