@@ -185,4 +185,61 @@ def test_completed_work_order_ignores_cancelled_dependency(tmp_path: Path):
     assert not any(i.code == "SUPERSEDED_DEPENDENCY" and i.work_order_id == "WO-005" for i in issues)
 
 
+def test_outcome_verified_allows_blocked_planning_turn(tmp_path: Path):
+    from validators.harness.runner.verification import _VerificationMixin
+    from validators.harness.runner.models import HarnessTask, HarnessDecision
+    from unittest.mock import MagicMock
+
+    mixin = _VerificationMixin()
+    mixin.project_path = tmp_path
+    mixin.sync_path = tmp_path / ".sync"
+    mixin.agent = "claude"
+
+    task = HarnessTask(
+        identifier="WO-000",
+        kind="work_order",
+        work_order_id="WO-000",
+        title="System architecture and execution plan",
+        deliverable_path=".sync/playbook/PLAN.md",
+        deliverable_type="doc",
+        path=mixin.sync_path / "work-orders" / "ACTIVE" / "WO-000.yaml",
+        body="",
+        query="",
+    )
+
+    dec_blocked = HarnessDecision(
+        status="blocked",
+        summary="Awaiting human clarification on 3D stack requirements",
+        report_markdown="Awaiting clarification",
+        blockers=("Clarification needed",),
+        blocker_details=(),
+        modified_files=(),
+        release_target=None,
+        retrieval_queries=(),
+        uncertainty=(),
+        commands=(),
+    )
+
+    diff = MagicMock()
+    diff.all_changed_files = ()
+
+    dims = mixin._evaluate_verification_dimensions(
+        task=task,
+        decision=dec_blocked,
+        diff=diff,
+        before_snapshot=MagicMock(),
+        after_snapshot=MagicMock(),
+        staged_root=tmp_path,
+        staged_errors=[],
+        declaration_matches=True,
+        command_results=[],
+        d025_passed=True,
+        has_staged_writes=False,
+        tool_runtime=None,
+    )
+    # A blocked planning/architecture turn with valid blockers must not fail outcome_verified
+    assert dims.outcome_verified is True
+
+
+
 

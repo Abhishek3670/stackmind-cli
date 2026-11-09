@@ -782,6 +782,14 @@ class _ExecutionMixin:
                                 f" (declared {evidence['declared']}; "
                                 f"observed {evidence['observed']})"
                             )
+                        if not dimensions.outcome_verified and task.deliverable_path:
+                            norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
+                            stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
+                            stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
+                            if norm_del not in stg_added and norm_del not in stg_mod:
+                                diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
+                                reason_msg += f" ({diag})"
+                                meta_dict['blocker'] = diag
                         if not dimensions.outcome_verified and task.work_order_id and str(task.work_order_id) != "WO-000" and not getattr(task, 'is_authoring', False) and str(self.agent).lower().strip() not in ('claude', 'architecture', 'architect'):
                             meta_dict['failure'] = {
                                 'failure_code': 'OUTCOME_NOT_VERIFIED',
@@ -789,14 +797,6 @@ class _ExecutionMixin:
                                 'canonical_message': reason_msg,
                                 'verification_evidence': stage_inputs.get('verification_evidence'),
                             }
-                            if task.deliverable_path:
-                                norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
-                                stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
-                                stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
-                                if norm_del not in stg_added and norm_del not in stg_mod:
-                                    diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
-                                    reason_msg += f" ({diag})"
-                                    meta_dict['blocker'] = diag
                         return HarnessRunResult(
                             status='blocked',
                             persisted=False,

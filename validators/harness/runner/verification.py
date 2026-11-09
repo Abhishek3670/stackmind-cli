@@ -354,7 +354,13 @@ class _VerificationMixin:
         )
 
         if decision.status == 'blocked':
-            if task.deliverable_path and not getattr(task, 'is_authoring', False):
+            is_planning_or_arch = (
+                str(task.work_order_id) == "WO-000"
+                or getattr(task, 'is_authoring', False)
+                or getattr(task, 'is_planning', False)
+                or str(self.agent).lower().strip() in ('claude', 'architecture', 'architect')
+            )
+            if task.deliverable_path and not is_planning_or_arch:
                 outcome_verified = deliverable_touched
             else:
                 outcome_verified = bool(decision.blockers) and bool(

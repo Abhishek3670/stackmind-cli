@@ -3771,7 +3771,11 @@ class SessionManager:
                             self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")
             elif res_status == "blocked":
                 err_text = str(computed_err or "")
-                is_plan_gate_failure = "PLAN.md" in err_text and "verification gate failed" in err_text.lower()
+                wo_id_str = str(op_rec.get("work_order_id") or "")
+                is_plan_gate_failure = (
+                    ("PLAN.md" in err_text or wo_id_str == "WO-000")
+                    and "verification gate failed" in err_text.lower()
+                )
                 retry_count = int((op_rec.get("metadata") or {}).get("plan_repair_attempt", 0))
                 is_wo_gate_failure = (
                     any(k in err_text.lower() for k in ("work-orders", "contracts", "index.yaml"))
