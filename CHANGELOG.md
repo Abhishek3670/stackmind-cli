@@ -5,6 +5,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.14.0] - 2026-11-09
+
+### Added
+- **Ponytail Turn Budget Scaling & Autonomous Resume Durability**:
+  - Sized the `:resume` command grant to 500 turns (configurable dynamically via `STACKMIND_TURN_BUDGET` environment variable) and initial run turn budget to `200 + 20 * N` work orders in `validators/kernel/daemon/manager.py` and `validators/kernel/daemon/supervisor/phases.py`.
+  - Raised `max_human_resumes` cap from 2 to 100 and `max_daemon_restarts` to 50, preventing `human resume cap exhausted` re-attestation rejections on complex multi-agent runs.
+  - Re-ordered resume preparation in `SessionManager`: `_prepare_run_for_resume` now executes ahead of `re_attest_run`, ensuring newly confirmed budgets take effect before state re-attestation.
+  - Reset `budget_usage["FINAL_REVIEW"]` on resume and re-routed active runs to `Phase.DISPATCHING` instead of prematurely trapping resumed sessions in `FINAL_REVIEW`.
+- **Harness Tool Limits Scaling**:
+  - Increased `DEFAULT_MAX_TOOL_CALLS` and `DEFAULT_MAX_TURNS` from 20 to 75 in `validators/kernel/gateway.py`, preventing mid-turn truncation on heavy test or authoring cycles.
+- **Authoring Gate & Report Deliverable Normalization**:
+  - Added first-class support for `deliverable.type: report` across `validators/harness/authoring_gate.py` and `schemas/work-order.schema.json`.
+  - Hardened deliverable path evaluation in `authoring_gate.py` to prevent `str(None) -> "none"` from failing role-check invariants with false-positive `Role-deliverable mismatch: QA agent cannot be assigned deliverable 'none'`.
+- **Plan Auto-Attestation on Resume**:
+  - Auto-defaults `plan_id = "PLAN-001"` in `validators/harness/review_gate.py` and `validators/kernel/daemon/manager.py` whenever `PLAN.md` is present on disk, eliminating false `FINAL_ACCEPTANCE_BLOCKED: no user-approved plan is recorded for this run`.
+- **Ephemeral Test Log Exemption & Evidence Normalization**:
+  - Excluded ephemeral test logs (`tests/*.log`, `.node_test_output.log`) from peer-owned deliverable registration in `validators/harness/contract_gate.py`, preventing cross-worker contract collision blocks.
+  - Normalized dictionary-shaped QA verdict evidence in `validators/kernel/daemon/supervisor/execution.py` before list operations to prevent `AttributeError: 'dict' object has no attribute 'extend'`.
+
+### Fixed
+- **Autonomous Recovery Loop Resolution & Worker Contention Prevention**:
+  - Implemented immediate archiving of consumed recovery decision files (`.sync/decisions/recovery/{wo_id}.decision.json`) upon application in `_apply_recovery_decision` and on repair exit in `_advance_repair` (`validators/kernel/daemon/supervisor/recovery.py`).
+  - Added automatic action normalization: when a blocker is an `INVALID_DEPENDENCY`, `SUPERSEDED_DEPENDENCY`, or `DEPENDENCY_DEADLOCK`, any `amend_contract` decision is automatically normalized to `architect_fix`. This directs the Lead Architect with permissions to rewrite `.sync/work-orders/ACTIVE/` instead of looping on contract updates.
+  - Eliminated `Architect turn contention cleanup` preemption loops where worker agents (`codex`, `gemma`) were repeatedly cancelled mid-turn.
+
 ## [3.13.0] - 2026-11-04
 
 ### Added

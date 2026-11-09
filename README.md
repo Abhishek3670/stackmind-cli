@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.13.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.14.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -116,6 +116,11 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 - **Unquoted YAML Scalar Auto-Repair & Schema Sanitization**: Automatically folds unquoted multi-line descriptions with colons (`>-`) and normalizes `amendments` / `log` schema variations to ensure deterministic authoring writes.
 - **Ephemeral Test & Smoke Log Budget Exemption**: Excludes scratch smoke and test logs (`tests/*_smoke_log.*`, `*.tmp`, `*.log`) from file budget checks, preventing artificial gate blocks.
 - **Dynamic In-Turn & Verification Auto-Repair for `PLAN.md`**: Validates and auto-repairs checklist structure both in-turn and at verification.
+- **Ponytail Durability & Turn Budget Scaling**: Scales initial turn budget dynamically (`200 + 20N`) and expands `:resume` grant to 500 turns (configurable via `STACKMIND_TURN_BUDGET`), raising human resume limits to 100 to eliminate repetitive budget halts.
+- **Tool Limits & Non-Intrusive Execution**: Expanded default per-turn tool limits from 20 to 75 calls to avoid premature `ToolLimitExceededError`.
+- **Authoring Gate & Report Deliverable Support**: First-class support for `deliverable.type: report` in `authoring_gate.py` and `work-order.schema.json`, plus normalized null path checks to avoid role-mismatch false positives.
+- **Autonomous Recovery Loop Resolution**: Immediate archival of consumed recovery decisions and automatic normalization of `SUPERSEDED_DEPENDENCY` / `INVALID_DEPENDENCY` actions from `amend_contract` to `architect_fix`, preventing contention cancellations and infinite recovery loops.
+- **Plan Auto-Attestation on Resume**: Automatically defaults `plan_id = "PLAN-001"` on resume when `PLAN.md` exists, eliminating false `FINAL_ACCEPTANCE_BLOCKED` rejections.
 
 ## Docs
 
@@ -126,6 +131,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.13.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.14.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect
