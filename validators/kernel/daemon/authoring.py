@@ -1133,15 +1133,39 @@ def synthesize_child_work_orders(
     if not proposed_wos:
         raise ValueError("Cannot synthesize child work orders: no milestones or tasks could be parsed from plan")
 
-    # Anti-collision check: if any proposed WO conflicts with existing on-disk work order, remap IDs sequentially
-    existing_on_disk = set()
-    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+    # Anti-collision check: detect genuine collisions against completed/blocked work orders
+    # or active work orders belonging to unrelated milestones/tasks.
+    # If an active work order matches the milestone (authored by architect in batch write), adopt it without renumbering!
+    from validators.harness.authoring_readiness import _wo_matches_milestone
+
+    immutable_ids = set()
+    for sub in ("COMPLETED", "BLOCKED"):
         d = ws / ".sync" / "work-orders" / sub
         if d.is_dir():
             for f in d.glob("*.yaml"):
-                existing_on_disk.add(f.stem)
+                immutable_ids.add(f.stem)
 
-    if any(w.get("id") in existing_on_disk for w in proposed_wos):
+    colliding_wos = set()
+    for w in proposed_wos:
+        wid = str(w.get("id", ""))
+        if wid in immutable_ids:
+            colliding_wos.add(wid)
+        elif (active_dir / f"{wid}.yaml").is_file():
+            try:
+                existing_data = yaml.safe_load((active_dir / f"{wid}.yaml").read_text(encoding="utf-8"))
+                if isinstance(existing_data, dict):
+                    # If it matches the proposed milestone or title, it is an intended match, not a collision!
+                    is_match = (
+                        _wo_matches_milestone(existing_data, w)
+                        or (existing_data.get("milestone_id") and existing_data.get("milestone_id") == w.get("milestone_id"))
+                        or (str(existing_data.get("title", "")).strip().lower() == str(w.get("title", "")).strip().lower())
+                    )
+                    if not is_match:
+                        colliding_wos.add(wid)
+            except Exception:
+                pass
+
+    if colliding_wos:
         id_map: dict[str, str] = {}
         renumbered_wos: list[dict[str, Any]] = []
         for offset, w in enumerate(proposed_wos):
@@ -1293,10 +1317,27 @@ def synthesize_child_work_orders(
             deliverables=wo.get("deliverables"),
         )
 
+        # If an active work order was already authored by the architect (e.g. via LLM batch write),
+        # preserve its authored details (acceptance criteria, test plan, description) and provenance
+        existing_wo_file = active_dir / f"{wo_id}.yaml"
+        if existing_wo_file.is_file():
+            try:
+                ex_data = yaml.safe_load(existing_wo_file.read_text(encoding="utf-8"))
+                if isinstance(ex_data, dict):
+                    for k in ("acceptance_criteria", "test_plan", "description", "deliverables"):
+                        if ex_data.get(k) and not wo_rec.get(k):
+                            wo_rec[k] = ex_data[k]
+                    if ex_data.get("synthesized_by"):
+                        wo_rec["synthesized_by"] = ex_data["synthesized_by"]
+            except Exception:
+                pass
+
         # Provenance marker: bootstrap-synthesized artifacts are scaffolding an
         # authorized author may supersede via the authoring gate.
-        wo_rec["synthesized_by"] = "bootstrap"
-        contract_rec["synthesized_by"] = "bootstrap"
+        if "synthesized_by" not in wo_rec:
+            wo_rec["synthesized_by"] = "bootstrap"
+        if "synthesized_by" not in contract_rec:
+            contract_rec["synthesized_by"] = "bootstrap"
 
         wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
         contract_yaml = yaml.safe_dump(contract_rec, sort_keys=False)
@@ -1509,13 +1550,14 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     def _wo_precedence(cand: tuple[Path, str, dict[str, Any], Any]) -> tuple[int, int, str]:
         _file, _id, _data, _ = cand
         has_plan_ref = 1 if _data.get("plan_ref") else 0
+        has_completion = 1 if _data.get("completion") else 0
         synth = str(_data.get("synthesized_by", "")).lower()
         is_bootstrap = 1 if synth == "bootstrap" else 0
         is_delegated = 1 if synth in ("architect_delegation", "recovery-repair", "recovery", "qa_defect") else 0
-        type_score = 3 if is_delegated else (2 if has_plan_ref else (0 if is_bootstrap else 1))
+        type_score = 4 if has_completion else (3 if is_delegated else (2 if has_plan_ref else (0 if is_bootstrap else 1)))
         idx = _parse_wo_index(_id) or 0
         ts = str(_data.get("updated") or _data.get("created") or "")
-        return (type_score, idx, ts)
+        return (type_score, -idx, ts)
 
     # Pass 0: Index all completed work orders and their deliverables
     completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
@@ -1545,6 +1587,23 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if not isinstance(wo_data, dict):
                 continue
             wo_id = str(wo_data.get("id") or wo_file.stem)
+
+            # Auto-promote verified work orders that have completed execution evidence
+            if wo_data.get("completion") and isinstance(wo_data["completion"], dict):
+                wo_data["status"] = "COMPLETED"
+                wo_data.pop("error", None)
+                wo_data.pop("blocked_reason", None)
+                wo_data.pop("cancellation_reason", None)
+                durable_write_yaml(completed_dir / wo_file.name, wo_data)
+                wo_file.unlink(missing_ok=True)
+                _sync_index_status(wo_id, "COMPLETED", _now())
+                completed_ids.add(wo_id)
+                for p in _wo_deliverable_paths(wo_data):
+                    completed_deliverables[p] = wo_id
+                if wo_id not in reconciled_ids:
+                    reconciled_ids.append(wo_id)
+                continue
+
             current_status = str(wo_data.get("status", "")).upper()
             synth = str(wo_data.get("synthesized_by", "")).lower()
             wo_type = str(wo_data.get("type", "")).upper()

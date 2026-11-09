@@ -112,23 +112,33 @@ def repair_unquoted_yaml_scalars(text: str) -> str:
                     continue
 
         # ponytail: auto-escape nested double quotes or unquoted colons in list items
-        list_item_match = re.match(r"^(\s*-\s*)(.*)$", line)
-        if list_item_match:
-            prefix, val = list_item_match.groups()
-            stripped_val = val.strip()
-            if stripped_val and not stripped_val.startswith(("> ", "| ", "---")):
-                if '"' in val:
-                    if stripped_val.startswith('"') and stripped_val.endswith('"') and len(stripped_val) >= 2:
-                        inner = stripped_val[1:-1]
-                        if '"' in inner:
-                            inner_escaped = re.sub(r'(?<!\\)"', r'\"', inner)
-                            line = f'{prefix}"{inner_escaped}"'
-                    else:
-                        val_escaped = re.sub(r'(?<!\\)"', r'\"', stripped_val)
-                        line = f'{prefix}"{val_escaped}"'
-                elif ":" in val and not (stripped_val.startswith('"') or stripped_val.startswith("'")):
-                    escaped = stripped_val.replace('"', '\\"')
-                    line = f'{prefix}"{escaped}"'
+        # If the list item starts a mapping (e.g. - revision: 6 or - module: index.html),
+        # do NOT wrap the key in quotes; only escape the value if the value contains unquoted ': '
+        kv_match = re.match(r"^(\s*-\s*)([a-zA-Z0-9_-]+)\s*:\s*(.*)$", line)
+        if kv_match:
+            prefix, k, v = kv_match.groups()
+            stripped_v = v.strip()
+            if ": " in stripped_v and not (stripped_v.startswith('"') or stripped_v.startswith("'")):
+                escaped = stripped_v.replace('"', '\\"')
+                line = f'{prefix}{k}: "{escaped}"'
+        else:
+            list_item_match = re.match(r"^(\s*-\s*)(.*)$", line)
+            if list_item_match:
+                prefix, val = list_item_match.groups()
+                stripped_val = val.strip()
+                if stripped_val and not stripped_val.startswith(("> ", "| ", "---")):
+                    if '"' in val:
+                        if stripped_val.startswith('"') and stripped_val.endswith('"') and len(stripped_val) >= 2:
+                            inner = stripped_val[1:-1]
+                            if '"' in inner:
+                                inner_escaped = re.sub(r'(?<!\\)"', r'\"', inner)
+                                line = f'{prefix}"{inner_escaped}"'
+                        else:
+                            val_escaped = re.sub(r'(?<!\\)"', r'\"', stripped_val)
+                            line = f'{prefix}"{val_escaped}"'
+                    elif ":" in val and not (stripped_val.startswith('"') or stripped_val.startswith("'")):
+                        escaped = stripped_val.replace('"', '\\"')
+                        line = f'{prefix}"{escaped}"'
 
         out.append(line)
         i += 1

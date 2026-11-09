@@ -1587,30 +1587,52 @@ class SessionManager:
                             t = w.get("title", "") if isinstance(w, dict) else str(w)
                             allocated_mapping_lines.append(f"  - Milestone {i+1}: {wo_id} ('{t}')")
 
+                    allocated_already_on_disk = [
+                        wid for wid in allocated_ids
+                        if (workspace / ".sync" / "work-orders" / "ACTIVE" / f"{wid}.yaml").is_file()
+                        and (workspace / ".sync" / "contracts" / f"{wid}.yaml").is_file()
+                    ]
+                    if allocated_already_on_disk and len(allocated_already_on_disk) == len(allocated_ids):
+                        status_guidance = (
+                            f"\nEXISTING AUTHORING RECOGNIZED: All approved milestones already have corresponding Work Orders and Contracts on disk ({', '.join(allocated_already_on_disk)}).\n"
+                            "Inspect them if needed. If any require refinement, use update_work_order or write_file; otherwise return your final HarnessDecision JSON declaring status 'completed'."
+                        )
+                    elif allocated_already_on_disk:
+                        status_guidance = (
+                            f"\nPARTIAL AUTHORING DETECTED: The following work orders and contracts are already on disk: {', '.join(allocated_already_on_disk)}.\n"
+                            f"Please ensure the remaining allocated work orders are authored using write_file or batch_write_files."
+                        )
+                    else:
+                        status_guidance = (
+                            "Call write_file or batch_write_files to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                            "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas."
+                        )
+
                     allocated_block = ""
                     if allocated_mapping_lines:
                         allocated_block = (
                             f"\nAllocated Work Order IDs for approved milestones:\n"
                             + "\n".join(allocated_mapping_lines)
                             + f"\n\nCRITICAL ANTI-COLLISION RULE: You MUST author using ONLY the allocated IDs above ({allocated_list_str}). "
-                            f"Do NOT reuse earlier or completed Work Order IDs (e.g. WO-001).\n"
+                            f"Do NOT reuse completed Work Order IDs.\n"
                         )
 
                     authoring_prompt = (
                         f"The architecture plan '{plan_id}' has been approved by the operator (reason: {reason or 'Approved by operator'}).\n\n"
-                        "Your task now as Senior Architect is to author the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
+                        "Your task now as Senior Architect is to finalize the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
                         f"{allocated_block}\n"
+                        f"{status_guidance}\n\n"
                         "1. Review PLAN.md for the approved milestones and tasks.\n"
-                        f"2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                        f"2. Ensure each allocated task has a valid Work Order YAML in .sync/work-orders/ACTIVE/<WO-ID>.yaml "
                         f"(e.g. {example_id}.yaml) conforming to schemas/work-order.schema.json.\n"
-                        f"3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
+                        f"3. Ensure each Work Order has a corresponding Contract YAML in .sync/contracts/<WO-ID>.yaml "
                         f"(e.g. {example_id}.yaml) conforming to schemas/contract.schema.json.\n"
                         "4. Do NOT explicitly specify or force TDD companion test deliverables on Backend or Frontend work orders. "
                         "Let Backend and Frontend focus on their assigned deliverables according to their work orders (they are permitted to author "
                         "unit tests if they wish to self-verify). QA/verification Work Orders (assigned to gemma) MUST declare an "
                         "executable code deliverable under tests/ — when QA's turn arrives, QA will inspect the deliverables and any "
                         "existing unit tests, then author an independent end-to-end test suite for comprehensive code quality and verification.\n"
-                        "5. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
+                        "5. When all work orders and contracts are finalized, return the final HarnessDecision JSON declaring status 'completed' "
                         "and modified_files listing all authored files."
                     )
                     turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
@@ -1895,6 +1917,25 @@ class SessionManager:
                 if state.planning_wo_id == comp_file.stem:
                     state.planning_wo_id = None
 
+        # Check ACTIVE directory for work orders that already completed
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        if active_dir.is_dir():
+            for act_file in list(active_dir.glob("*.yaml")):
+                try:
+                    adata = yaml.safe_load(act_file.read_text(encoding="utf-8"))
+                    if isinstance(adata, dict) and adata.get("completion") and isinstance(adata["completion"], dict):
+                        adata["status"] = "COMPLETED"
+                        adata.pop("error", None)
+                        adata.pop("blocked_reason", None)
+                        adata.pop("cancellation_reason", None)
+                        dest = completed_dir / act_file.name
+                        dest.write_text(yaml.safe_dump(adata, sort_keys=False), encoding="utf-8")
+                        act_file.unlink(missing_ok=True)
+                        if act_file.stem not in getattr(state, "completed_wo_ids", []):
+                            state.completed_wo_ids.append(act_file.stem)
+                except Exception:
+                    pass
+
         # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
         self.supervisor.unblock_in_flight_work_orders(state)
 
@@ -1923,14 +1964,32 @@ class SessionManager:
         except Exception:
             pass
 
-        # Reset exhausted authoring repair counters so resumed runs have a fresh chance
+        # Reset exhausted authoring repair, recovery, and retry counters so resumed runs have a fresh chance
         state.authoring_repair_attempts = 0
         state.authoring_operation_failed = False
         if hasattr(state, "dependency_escalation_retries") and isinstance(state.dependency_escalation_retries, dict):
             state.dependency_escalation_retries.clear()
+        if hasattr(state, "recovery_attempts") and isinstance(state.recovery_attempts, dict):
+            state.recovery_attempts.clear()
+        if hasattr(state, "worker_retries") and isinstance(state.worker_retries, dict):
+            state.worker_retries.clear()
+        if hasattr(state, "worker_blockers") and isinstance(state.worker_blockers, dict):
+            state.worker_blockers.clear()
+        if hasattr(state, "dispatch_failures") and isinstance(state.dispatch_failures, dict):
+            state.dispatch_failures.clear()
+        state.recovery_wo_id = None
+        state.recovery_decision_operation_id = None
         state.integration_retries = 0
         if state.error and ("exhausted" in state.error or "blocked" in state.error.lower() or "failed" in state.error.lower()):
             state.error = None
+
+        # Clean up stale superseded_wo_ids: any work order that is active or completed on disk is not superseded
+        if hasattr(state, "superseded_wo_ids") and isinstance(state.superseded_wo_ids, list):
+            state.superseded_wo_ids = [
+                wid for wid in state.superseded_wo_ids
+                if wid not in getattr(state, "completed_wo_ids", [])
+                and not (active_dir / f"{wid}.yaml").is_file()
+            ]
 
         self.supervisor._discover_worker_wos(state)
 
@@ -3474,25 +3533,88 @@ class SessionManager:
                         is_valid, _ = validate_plan_structure(plan_content)
                         if is_valid:
                             parsed_plan = parse_plan(plan_content, project_path=ws_path)
-                            from .authoring import get_next_work_order_int, determine_assigned_agent, extract_deliverable_spec
-                            start_idx = get_next_work_order_int(ws_path)
+                            from .authoring import determine_assigned_agent, extract_deliverable_spec
+                            from validators.harness.authoring_readiness import _wo_matches_milestone, _parse_wo_index
+
+                            # Harmonize with existing active work orders authored by Architect (e.g. via LLM batch write)
+                            active_dir = ws_path / ".sync" / "work-orders" / "ACTIVE"
+                            existing_active_wos: list[dict[str, Any]] = []
+                            if active_dir.is_dir():
+                                for f in sorted(active_dir.glob("*.yaml")):
+                                    try:
+                                        data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                                        if isinstance(data, dict) and data.get("id"):
+                                            st = str(data.get("status", "")).upper()
+                                            if st not in ("CANCELLED", "CANCELED"):
+                                                existing_active_wos.append(data)
+                                    except Exception:
+                                        pass
+
+                            all_taken_indices: set[int] = set()
+                            for sub in ("COMPLETED", "BLOCKED"):
+                                d = ws_path / ".sync" / "work-orders" / sub
+                                if d.is_dir():
+                                    for f in d.glob("*.yaml"):
+                                        idx_val = _parse_wo_index(f.stem)
+                                        if idx_val:
+                                            all_taken_indices.add(idx_val)
+                            for w in existing_active_wos:
+                                idx_val = _parse_wo_index(str(w.get("id", "")))
+                                if idx_val:
+                                    all_taken_indices.add(idx_val)
+
+                            def _get_next_free_wo_id(current_free: int) -> tuple[str, int]:
+                                while current_free in all_taken_indices:
+                                    current_free += 1
+                                all_taken_indices.add(current_free)
+                                return f"WO-{current_free:03d}", current_free + 1
+
+                            claimed_wo_ids: set[str] = set()
                             proposed_wos = []
+                            allocated_idx = 1
                             for offset, m in enumerate(parsed_plan.milestones):
-                                idx = start_idx + offset
-                                wo_id = f"WO-{idx:03d}"
-                                agent_id, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
-                                deliv = extract_deliverable_spec(m.title, m.tasks, role, stack=parsed_plan.tech_stack, project_path=ws_path)
-                                proposed_wos.append({
-                                    "id": wo_id,
-                                    "title": m.title,
-                                    "type": "FEATURE",
-                                    "priority": "P1" if offset > 0 else "P0",
-                                    "assigned_agents": [agent_id],
-                                    "dependencies": [f"WO-{idx-1:03d}"] if offset > 0 else [],
-                                    "deliverable": deliv,
-                                    "description": "\n".join(m.tasks) if m.tasks else m.title,
-                                    "milestone_id": m.id,
-                                })
+                                # Check if an existing active work order authored by the architect matches this milestone
+                                matched_wo = next(
+                                    (
+                                        w for w in existing_active_wos
+                                        if str(w.get("id")) not in claimed_wo_ids and _wo_matches_milestone(w, m)
+                                    ),
+                                    None
+                                )
+                                if matched_wo is not None:
+                                    wo_id = str(matched_wo["id"])
+                                    claimed_wo_ids.add(wo_id)
+                                    agent_id = (matched_wo.get("assigned_agents") or ["codex"])[0]
+                                    deliv = matched_wo.get("deliverable") or extract_deliverable_spec(m.title, m.tasks, agent_id, stack=parsed_plan.tech_stack, project_path=ws_path)
+                                    prev_id = proposed_wos[-1]["id"] if proposed_wos else None
+                                    deps = matched_wo.get("dependencies") or ([prev_id] if prev_id else [])
+                                    proposed_wos.append({
+                                        "id": wo_id,
+                                        "title": matched_wo.get("title") or m.title,
+                                        "type": matched_wo.get("type", "FEATURE"),
+                                        "priority": matched_wo.get("priority", "P1" if offset > 0 else "P0"),
+                                        "assigned_agents": matched_wo.get("assigned_agents") or [agent_id],
+                                        "dependencies": deps,
+                                        "deliverable": deliv,
+                                        "description": matched_wo.get("description") or ("\n".join(m.tasks) if m.tasks else m.title),
+                                        "milestone_id": matched_wo.get("milestone_id") or m.id,
+                                    })
+                                else:
+                                    wo_id, allocated_idx = _get_next_free_wo_id(allocated_idx)
+                                    agent_id, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
+                                    deliv = extract_deliverable_spec(m.title, m.tasks, role, stack=parsed_plan.tech_stack, project_path=ws_path)
+                                    prev_id = proposed_wos[-1]["id"] if proposed_wos else None
+                                    proposed_wos.append({
+                                        "id": wo_id,
+                                        "title": m.title,
+                                        "type": "FEATURE",
+                                        "priority": "P1" if offset > 0 else "P0",
+                                        "assigned_agents": [agent_id],
+                                        "dependencies": [prev_id] if prev_id else [],
+                                        "deliverable": deliv,
+                                        "description": "\n".join(m.tasks) if m.tasks else m.title,
+                                        "milestone_id": m.id,
+                                    })
                             plan_meta = {
                                 "work_orders": proposed_wos,
                                 "plan_structure": parsed_plan.to_dict(),

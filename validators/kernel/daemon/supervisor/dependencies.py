@@ -375,8 +375,11 @@ def validate_dependency_graph(
     records = load_all_work_orders(root)
     superseded = {str(s) for s in superseded_ids}
     for wid, ref in records.items():
-        if str(ref.data.get("status", "")).upper() in ("SUPERSEDED", "CANCELLED"):
+        st = str(ref.data.get("status", "")).upper()
+        if st in ("SUPERSEDED", "CANCELLED"):
             superseded.add(wid)
+        elif st == "COMPLETED" and not ref.data.get("superseded_by"):
+            superseded.discard(wid)
     graph = _declared_graph(root, records)
     issues: list[GraphIssue] = []
     plan_ids = {
@@ -591,7 +594,11 @@ def _observe_prerequisite_uncached(
         contract_revision=contract_rev,
     )
 
-    if dep_id in superseded_ids or status == "SUPERSEDED":
+    is_superseded = status == "SUPERSEDED" or (
+        dep_id in superseded_ids
+        and not (status == "COMPLETED" and not data.get("superseded_by"))
+    )
+    if is_superseded:
         successor = _successor_for(records, dep_id)
         return PrerequisiteObservation(
             **base,

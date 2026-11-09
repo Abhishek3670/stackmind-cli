@@ -329,7 +329,15 @@ def format_work_orders(
     if not work_orders:
         return [Text("  No active orders", style="dim #475569")]
 
-    total_count = len(work_orders)
+    # Filter out cancelled / superseded orders from active runtime panel view to avoid confusing duplicates
+    effective_work_orders = [
+        wo for wo in work_orders
+        if str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper() not in {"CANCELLED", "CANCELED", "SUPERSEDED"}
+    ]
+    if not effective_work_orders:
+        effective_work_orders = list(work_orders)
+
+    total_count = len(effective_work_orders)
     inner_w = max(10, (width or 36) - 4)
 
     earlier_count = 0
@@ -349,17 +357,17 @@ def format_work_orders(
             end_idx = max(capacity, total_count - min(scroll.scroll_offset, max_offset))
             start_idx = max(0, end_idx - capacity)
         else:
-            active = next((i for i, w in reversed(list(enumerate(work_orders))) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
+            active = next((i for i, w in reversed(list(enumerate(effective_work_orders))) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
             if active is not None:
                 end_idx = min(total_count, max(capacity, active + max(1, capacity // 2) + 1))
                 start_idx = max(0, end_idx - capacity)
             else:
                 start_idx, end_idx = max(0, total_count - capacity), total_count
 
-        display_orders = work_orders[start_idx:end_idx]
+        display_orders = effective_work_orders[start_idx:end_idx]
         earlier_count, later_count = start_idx, total_count - end_idx
     else:
-        display_orders = work_orders
+        display_orders = effective_work_orders
 
     lines: list[Text] = []
 
@@ -649,8 +657,14 @@ def render_runtime_panel(
     # 4. Section: WORK ORDERS
     is_focused = state is not None and getattr(state, "scroll_focus", "") == "work_orders"
     wo_title = Text("WORK ORDERS", style="bold #38bdf8" if is_focused else "bold #60a5fa")
-    if work_orders and max_wo_items is not None and len(work_orders) > max_wo_items:
-        wo_title.append(f" ({len(work_orders)})", style="dim #64748b")
+    eff_wos = [
+        wo for wo in (work_orders or [])
+        if str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper() not in {"CANCELLED", "CANCELED", "SUPERSEDED"}
+    ]
+    if not eff_wos and work_orders:
+        eff_wos = list(work_orders)
+    if eff_wos and max_wo_items is not None and len(eff_wos) > max_wo_items:
+        wo_title.append(f" ({len(eff_wos)})", style="dim #64748b")
         if is_focused:
             wo_title.append(" [scroll active]", style="bold #38bdf8")
     items.append(wo_title)

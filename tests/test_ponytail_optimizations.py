@@ -252,3 +252,159 @@ def test_recovery_decision_archives_and_normalizes_dependency_action(tmp_path):
     assert state.repair_context["action"] == "architect_fix"
 
 
+def test_plan_synthesizer_adopts_existing_active_work_orders(tmp_path):
+    """Verify that synthesize_child_work_orders adopts existing active work orders without duplicating or renumbering."""
+    from validators.kernel.daemon.authoring import synthesize_child_work_orders
+    from validators.kernel.io import durable_write_yaml
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Simulate Architect proactively authoring WO-001 in Turn 1 via LLM batch write
+    wo1_data = {
+        "id": "WO-001",
+        "title": "Project Scaffolding & Setup",
+        "milestone_id": "Milestone 1",
+        "type": "FEATURE",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["gemini"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "index.html", "description": "HTML entrypoint"},
+        "description": "Initialize project structure and index.html",
+        "acceptance_criteria": ["index.html exists and is valid HTML5"],
+    }
+    durable_write_yaml(active_dir / "WO-001.yaml", wo1_data)
+
+    plan = {
+        "title": "PineApple Marketing Site",
+        "content": (
+            "# PineApple Marketing Site\n\n"
+            "## Architecture\n- Frontend: HTML/Tailwind/GSAP\n\n"
+            "## Milestones\n"
+            "### Milestone 1: Project Scaffolding & Setup\n"
+            "- Role: Frontend\n"
+            "- Deliverable: index.html\n"
+            "- Task 1.1: Initialize project structure\n"
+        ),
+        "metadata": {
+            "work_orders": [
+                {
+                    "id": "WO-001",
+                    "title": "Project Scaffolding & Setup",
+                    "milestone_id": "Milestone 1",
+                    "type": "FEATURE",
+                    "priority": "P0",
+                    "assigned_agents": ["gemini"],
+                    "dependencies": [],
+                    "deliverable": {"type": "code", "path": "index.html"},
+                }
+            ]
+        }
+    }
+
+    result = synthesize_child_work_orders(tmp_path, plan)
+    assert len(result) == 1
+    assert result[0]["id"] == "WO-001", "Must adopt WO-001 instead of renumbering to WO-002"
+    # Preserves Architect's authored acceptance criteria
+    assert result[0]["acceptance_criteria"] == ["index.html exists and is valid HTML5"]
+
+    # Verify no duplicate work order files were written
+    active_files = [f.name for f in active_dir.glob("*.yaml")]
+    assert active_files == ["WO-001.yaml"], f"Expected only WO-001.yaml, got: {active_files}"
+
+
+def test_format_work_orders_filters_cancelled_duplicates():
+    """Verify that format_work_orders suppresses cancelled duplicate work orders in TUI sidebar."""
+    from cli.tui.runtime_panel import format_work_orders
+
+    orders = [
+        {"id": "WO-000", "title": "Planning", "status": "COMPLETED"},
+        {"id": "WO-001", "title": "Scaffolding", "status": "ACTIVE"},
+        {"id": "WO-007", "title": "Scaffolding Duplicate", "status": "CANCELLED"},
+        {"id": "WO-009", "title": "Switcher Duplicate", "status": "CANCELLED"},
+    ]
+    rendered_lines = format_work_orders(orders)
+    rendered_text = "\n".join(line.plain for line in rendered_lines)
+
+    assert "WO-000" in rendered_text
+    assert "WO-001" in rendered_text
+    assert "WO-007" not in rendered_text, "Cancelled duplicate WO-007 must be filtered out"
+    assert "WO-009" not in rendered_text, "Cancelled duplicate WO-009 must be filtered out"
+
+
+def test_reconcile_promotes_active_with_completion(tmp_path):
+    """Verify that work orders in ACTIVE with completion blocks are promoted to COMPLETED."""
+    from validators.kernel.daemon.authoring import reconcile_active_work_orders_with_plan
+    from validators.kernel.io import durable_write_yaml
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    completed_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    completed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write compliant PLAN.md with Milestone 1
+    (tmp_path / "PLAN.md").write_text(
+        "# Project Plan: Web Design\n\n"
+        "## Current Architecture\n"
+        "- Backend: Node\n"
+        "- Frontend: Tailwind\n"
+        "- Database: None\n\n"
+        "## Milestones & Roadmap\n"
+        "- [ ] Milestone 1: Setup\n"
+        "  - Role: Backend\n"
+        "  - Deliverable: package.json\n"
+        "  - Task 1.1: Initialize package.json\n",
+        encoding="utf-8",
+    )
+
+    wo_data = {
+        "id": "WO-001",
+        "title": "Setup",
+        "milestone_id": "Milestone 1",
+        "status": "BLOCKED",
+        "deliverable": {"type": "config", "path": "package.json"},
+        "completion": {
+            "work_order_id": "WO-001",
+            "completed_at": "2026-11-09T12:00:00Z",
+            "deliverable_hashes": {"package.json": "abc"},
+        },
+    }
+    durable_write_yaml(active_dir / "WO-001.yaml", wo_data)
+
+    reconciled = reconcile_active_work_orders_with_plan(tmp_path)
+    assert "WO-001" in reconciled
+    assert not (active_dir / "WO-001.yaml").exists(), "WO-001 must be moved out of ACTIVE"
+    assert (completed_dir / "WO-001.yaml").exists(), "WO-001 must be moved to COMPLETED"
+
+    loaded = yaml.safe_load((completed_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert loaded["status"] == "COMPLETED"
+
+
+def test_reconcile_staged_auto_routes_completed_status(tmp_path):
+    """Verify that staged work orders with status COMPLETED are moved to COMPLETED directory."""
+    from validators.harness.runner import HarnessRunner
+    from validators.kernel.io import durable_write_yaml
+
+    sync_dir = tmp_path / ".sync"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    completed_dir = sync_dir / "work-orders" / "COMPLETED"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    wo_data = {
+        "id": "WO-015",
+        "title": "Completed By Architect",
+        "status": "COMPLETED",
+        "type": "FEATURE",
+    }
+    durable_write_yaml(active_dir / "WO-015.yaml", wo_data)
+
+    HarnessRunner._reconcile_staged_work_order_collisions(tmp_path)
+    assert not (active_dir / "WO-015.yaml").exists(), "Must be moved out of ACTIVE"
+    assert (completed_dir / "WO-015.yaml").exists(), "Must be placed in COMPLETED"
+
+
+
+
