@@ -489,10 +489,17 @@ class _PhasesMixin:
                 return gate_result
             # Dynamic budget scaling: B = 18 + 5N (Amendment D)
             n_wos = max(1, len(state.published_wo_ids or state.worker_wo_ids))
-            dynamic_budget = 18 + 5 * n_wos
+            env_budget_str = os.environ.get("STACKMIND_TURN_BUDGET")
+            try:
+                env_override = int(env_budget_str) if env_budget_str else None
+            except ValueError:
+                env_override = None
+            dynamic_budget = env_override or max(18 + 5 * n_wos, 200 + 20 * n_wos)
             state.initial_turn_budget = dynamic_budget
             if state.global_turn_budget < dynamic_budget:
                 state.global_turn_budget = dynamic_budget
+            state.max_human_resumes = max(getattr(state, "max_human_resumes", 2), 100)
+            state.max_daemon_restarts = max(getattr(state, "max_daemon_restarts", 3), 50)
             self._sync_budget_file(state)
             self._transition(state, Phase.DISPATCHING)
             return AdvanceResult.TRANSITIONED

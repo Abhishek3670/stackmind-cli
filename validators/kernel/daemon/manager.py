@@ -1778,8 +1778,17 @@ class SessionManager:
         state.planning_retries = 0
         state.daemon_restarts = 0
         state.budget_exhausted = False
-        if getattr(state, "global_turn_budget", 0) <= 10:
-            state.global_turn_budget = max(getattr(state, "initial_turn_budget", 0) or 38, 50)
+        # ponytail: eliminate repetitive budget pauses on resume by granting a generous turn budget (default 500, configurable via STACKMIND_TURN_BUDGET)
+        env_budget_str = os.environ.get("STACKMIND_TURN_BUDGET")
+        try:
+            default_grant = int(env_budget_str) if env_budget_str else 500
+        except ValueError:
+            default_grant = 500
+        if getattr(state, "global_turn_budget", 0) <= 20:
+            state.global_turn_budget = max(getattr(state, "initial_turn_budget", 0) or 100, default_grant)
+        state.human_resumes_used = 0
+        state.max_human_resumes = max(getattr(state, "max_human_resumes", 2), 100)
+        state.max_daemon_restarts = max(getattr(state, "max_daemon_restarts", 3), 50)
         state.run_started_at = time.monotonic()
         state.turn_deadline = None
         state.waiting_for_human_entered_at = None
