@@ -80,6 +80,20 @@ class _PhasesMixin:
 
     def _advance_planning(self, state: RunState) -> AdvanceResult:
         """PLANNING: dispatch Architecture planning turn if not already running."""
+        # If workers are already authored / pending, planning is done: advance to dispatching
+        from .models import resolve_next_execution_phase
+        ws_path = Path(state.workspace)
+        active_wos = [
+            f.stem for f in (ws_path / ".sync" / "work-orders" / "ACTIVE").glob("*.yaml")
+            if f.stem != "WO-000" and f.name != ".gitkeep"
+        ] if (ws_path / ".sync" / "work-orders" / "ACTIVE").is_dir() else []
+        if state.worker_wo_ids or active_wos:
+            if not state.worker_wo_ids and active_wos:
+                state.worker_wo_ids = sorted(active_wos)
+            next_p = resolve_next_execution_phase(state)
+            self._transition(state, next_p)
+            return AdvanceResult.TRANSITIONED
+
         if not state.planning_operation_id:
             # S8 Crash recovery check: if operation was already started before a crash,
             # discover it from session operations rather than re-dispatching a duplicate turn.
@@ -179,6 +193,26 @@ class _PhasesMixin:
                 if plan_state == "APPROVED":
                     self._transition(state, Phase.AUTHORING)
                     return AdvanceResult.TRANSITIONED
+            # Check if PLAN.md exists on disk
+            from validators.harness.plan import resolve_playbook_file, validate_plan_structure, parse_plan
+            plan_file = resolve_playbook_file(ws_path, "PLAN.md")
+            if plan_file.is_file() and plan_file.stat().st_size > 0:
+                plan_text = plan_file.read_text(encoding="utf-8")
+                valid, _ = validate_plan_structure(plan_text)
+                if valid:
+                    p_obj = parse_plan(plan_text, project_path=ws_path)
+                    plan_id = self.manager.get_next_plan_id(state.session_id)
+                    self.manager.propose_plan(
+                        session_id=state.session_id,
+                        plan_id=plan_id,
+                        title=p_obj.title or f"Plan for: {getattr(state, 'product_goal', '')[:60]}",
+                        content=plan_text,
+                    )
+                    state.plan_id = plan_id
+                    state.error = None
+                    self._transition(state, Phase.AWAITING_APPROVAL)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+
             # No plan proposed but turn completed — consultative/conversational turn.
             # Architect judged that requirements / conversation are ongoing before building.
             state.planning_operation_id = None

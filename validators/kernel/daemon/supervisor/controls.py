@@ -257,7 +257,11 @@ class _ControlsMixin:
             dest_phase = target_phase
         elif state.interrupted_phase and state.interrupted_phase not in (Phase.WAITING_FOR_HUMAN.value, Phase.FAILED.value, Phase.BLOCKED.value):
             try:
-                dest_phase = Phase(state.interrupted_phase)
+                cand = Phase(state.interrupted_phase)
+                if cand == Phase.PLANNING and (getattr(state, "worker_wo_ids", None) or getattr(state, "plan_id", None)):
+                    dest_phase = resolve_next_execution_phase(state)
+                else:
+                    dest_phase = cand
             except ValueError:
                 dest_phase = resolve_next_execution_phase(state)
         else:
@@ -378,7 +382,11 @@ class _ControlsMixin:
         resume_phase = target_phase
         if resume_phase is None and state.interrupted_phase:
             try:
-                resume_phase = Phase(state.interrupted_phase)
+                cand = Phase(state.interrupted_phase)
+                if cand == Phase.PLANNING and (getattr(state, "worker_wo_ids", None) or getattr(state, "plan_id", None)):
+                    resume_phase = resolve_next_execution_phase(state)
+                else:
+                    resume_phase = cand
             except ValueError:
                 resume_phase = None
 

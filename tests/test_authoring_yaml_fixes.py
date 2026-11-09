@@ -285,6 +285,46 @@ def test_planning_turn_synthesizes_plan_deliverable(tmp_path: Path):
     assert ".sync/playbook/PLAN.md" in payload.get("modified_files", [])
 
 
+def test_resume_run_with_worker_wos_advances_to_dispatching(tmp_path: Path):
+    from unittest.mock import MagicMock
+    from validators.kernel.daemon.supervisor.models import RunState, Phase
+    from validators.kernel.daemon.supervisor.phases import _PhasesMixin
+    from validators.kernel.daemon.supervisor.controls import _ControlsMixin
+
+    class DummySupervisor(_PhasesMixin, _ControlsMixin):
+        def __init__(self):
+            self.manager = MagicMock()
+            self.manager.list_plans.return_value = []
+            self.manager.get_operation.return_value = None
+
+        def _transition(self, state, phase, **kwargs):
+            state.phase = phase
+
+    sup = DummySupervisor()
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    (active_dir / "WO-001.yaml").write_text("id: WO-001\nstatus: ACTIVE\n", encoding="utf-8")
+
+    state = RunState(
+        run_id="run-test",
+        workspace=str(tmp_path),
+        session_id="sess-test",
+        product_goal="Build test app",
+        phase=Phase.PLANNING,
+        planning_wo_id="WO-000",
+        interrupted_phase="PLANNING",
+        worker_wo_ids=["WO-001"],
+    )
+
+    # When advancing planning with worker WOs already present, advances directly to DISPATCHING
+    res = sup._advance_planning(state)
+    assert state.phase == Phase.DISPATCHING
+
+    # Re-attest also honors DISPATCHING rather than reverting to stale interrupted_phase PLANNING
+    sup.re_attest_run(state, human_signature="operator", confirmed_budget=100)
+    assert state.phase == Phase.DISPATCHING
+
+
 
 
 

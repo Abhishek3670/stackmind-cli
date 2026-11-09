@@ -2145,6 +2145,7 @@ class SessionManager:
                 target_phase = resolve_next_execution_phase(state)
 
         state.error = None
+        state.interrupted_phase = None
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase, authorized_override=True)
         return target_phase
@@ -2262,8 +2263,9 @@ class SessionManager:
                 state.exit_code = 0
                 state.error = None
 
+            target_phase = None
             if state.phase != Phase.COMPLETE:
-                self._prepare_run_for_resume(state, session, ws)
+                target_phase = self._prepare_run_for_resume(state, session, ws)
             else:
                 self._cleanup_orphaned_operations(state, session)
 
@@ -2273,6 +2275,7 @@ class SessionManager:
                         state,
                         human_signature="operator",
                         confirmed_budget=state.global_turn_budget or 500,
+                        target_phase=target_phase,
                     )
                 except Exception:
                     pass
