@@ -1924,15 +1924,25 @@ class SessionManager:
                 try:
                     adata = yaml.safe_load(act_file.read_text(encoding="utf-8"))
                     if isinstance(adata, dict) and adata.get("completion") and isinstance(adata["completion"], dict):
-                        adata["status"] = "COMPLETED"
-                        adata.pop("error", None)
-                        adata.pop("blocked_reason", None)
-                        adata.pop("cancellation_reason", None)
-                        dest = completed_dir / act_file.name
-                        dest.write_text(yaml.safe_dump(adata, sort_keys=False), encoding="utf-8")
-                        act_file.unlink(missing_ok=True)
-                        if act_file.stem not in getattr(state, "completed_wo_ids", []):
-                            state.completed_wo_ids.append(act_file.stem)
+                        comp = adata["completion"]
+                        from validators.harness.review_gate import _is_path_like
+                        if isinstance(comp.get("missing_deliverables"), list):
+                            comp["missing_deliverables"] = [
+                                m for m in comp["missing_deliverables"]
+                                if _is_path_like(str(m))
+                            ]
+                            if not comp["missing_deliverables"]:
+                                comp.pop("missing_deliverables", None)
+                        if comp.get("deliverable_hashes") and not comp.get("missing_deliverables"):
+                            adata["status"] = "COMPLETED"
+                            adata.pop("error", None)
+                            adata.pop("blocked_reason", None)
+                            adata.pop("cancellation_reason", None)
+                            dest = completed_dir / act_file.name
+                            dest.write_text(yaml.safe_dump(adata, sort_keys=False), encoding="utf-8")
+                            act_file.unlink(missing_ok=True)
+                            if act_file.stem not in getattr(state, "completed_wo_ids", []):
+                                state.completed_wo_ids.append(act_file.stem)
                 except Exception:
                     pass
 

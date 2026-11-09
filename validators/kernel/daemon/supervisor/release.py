@@ -122,6 +122,7 @@ def _declared_deliverable_paths(wo_data: Any) -> list[str]:
     """Declared deliverable paths from the authoritative work-order record."""
     if not isinstance(wo_data, dict):
         return []
+    from validators.harness.review_gate import _is_path_like
     entries: list[Any] = [wo_data.get("deliverable")]
     extra = wo_data.get("deliverables")
     if isinstance(extra, list):
@@ -129,7 +130,7 @@ def _declared_deliverable_paths(wo_data: Any) -> list[str]:
     paths: list[str] = []
     for entry in entries:
         raw = entry.get("path") if isinstance(entry, dict) else entry
-        if not isinstance(raw, str):
+        if not isinstance(raw, str) or not _is_path_like(raw):
             continue
         rel = raw.strip().replace("\\", "/")
         if rel and rel not in paths:

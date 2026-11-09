@@ -103,18 +103,37 @@ def load_wo(workspace: Path | str, wo_id: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _is_path_like(s: str) -> bool:
+    """Return True if s looks like a valid relative file path rather than human prose."""
+    if not s or not isinstance(s, str):
+        return False
+    s = s.strip()
+    if not s or "\n" in s or len(s) > 255:
+        return False
+    if s.endswith((".", "!", "?", ":", ";")):
+        return False
+    if any(c in s for c in "()[]{}<>\"',;?!*"):
+        return False
+    words = s.split()
+    if len(words) > 4:
+        return False
+    if len(words) > 2 and "/" not in s and "\\" not in s and "." not in s:
+        return False
+    return True
+
+
 def wo_deliverable_paths(data: dict[str, Any]) -> list[str]:
     """All declared deliverable paths for a work order (primary + extras)."""
     paths: list[str] = []
     deliverable = data.get("deliverable")
     if isinstance(deliverable, dict) and deliverable.get("path"):
         paths.append(_norm(deliverable["path"]))
-    elif isinstance(deliverable, str) and deliverable.strip():
+    elif isinstance(deliverable, str) and _is_path_like(deliverable):
         paths.append(_norm(deliverable))
     for extra in data.get("deliverables") or []:
         if isinstance(extra, dict) and extra.get("path"):
             paths.append(_norm(extra["path"]))
-        elif isinstance(extra, str) and extra.strip():
+        elif isinstance(extra, str) and _is_path_like(extra):
             paths.append(_norm(extra))
     out: list[str] = []
     for p in paths:

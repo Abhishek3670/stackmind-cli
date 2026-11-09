@@ -88,3 +88,26 @@ def test_completed_work_order_not_treated_as_superseded(tmp_path: Path):
         superseded_ids={"WO-001"},
     )
     assert res.status is DependencyStatus.SATISFIED
+
+
+def test_wo_deliverable_paths_filters_prose_descriptions():
+    from validators.harness.review_gate import wo_deliverable_paths, _is_path_like
+
+    assert not _is_path_like("QA report detailing any layout shifts (CLS) or performance bottlenecks.")
+    assert not _is_path_like("Verified cross-browser compatibility report.")
+    assert not _is_path_like("Bug fix list for frontend polish.")
+    assert _is_path_like("tests/test_qa_verification.py")
+    assert _is_path_like("package.json")
+    assert _is_path_like("index.html")
+
+    wo = {
+        "deliverable": {"type": "code", "path": "tests/test_qa_verification.py"},
+        "deliverables": [
+            "QA report detailing any layout shifts (CLS) or performance bottlenecks.",
+            "Verified cross-browser compatibility report.",
+            "Bug fix list for frontend polish.",
+        ],
+    }
+    paths = wo_deliverable_paths(wo)
+    assert paths == ["tests/test_qa_verification.py"]
+

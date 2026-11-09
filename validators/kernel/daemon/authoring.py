@@ -111,10 +111,11 @@ def _wo_deliverable_paths(wo_data: dict[str, Any]) -> list[str]:
         paths.append(str(d_spec["path"]))
     elif isinstance(d_spec, str) and d_spec.strip():
         paths.append(str(d_spec))
+    from validators.harness.review_gate import _is_path_like
     for extra in wo_data.get("deliverables") or []:
         if isinstance(extra, dict) and extra.get("path"):
             paths.append(str(extra["path"]))
-        elif isinstance(extra, str) and extra.strip():
+        elif isinstance(extra, str) and _is_path_like(extra):
             paths.append(str(extra))
     normalized: list[str] = []
     for p in paths:
