@@ -425,7 +425,17 @@ def validate_dependency_graph(
                 )
                 continue
             if dep in superseded:
+                # Completed work orders were already satisfied; do not fail graph validation retrospectively
+                wo_ref = records.get(wo_id)
+                if wo_ref is not None and (
+                    wo_ref.bucket == "COMPLETED"
+                    or str(wo_ref.data.get("status", "")).upper() == "COMPLETED"
+                ):
+                    continue
                 successor = _successor_for(records, dep)
+                if successor == wo_id:
+                    # Self-supersession: this work order replaced the dependency
+                    continue
                 issues.append(
                     GraphIssue(
                         code="SUPERSEDED_DEPENDENCY",
@@ -491,6 +501,14 @@ def _successor_for(records: Mapping[str, Any], wo_id: str) -> str | None:
                     candidate = m.group(1).upper()
                     if candidate in records:
                         return candidate
+    for key in ("cancellation_reason", "error"):
+        reason = str(data.get(key) or "")
+        if reason:
+            m = re.search(r'(?:superseded|replaced)\s+by\s+(?:completed\s+)?(WO-\d+)', reason, re.I)
+            if m:
+                candidate = m.group(1).upper()
+                if candidate in records:
+                    return candidate
     # Fallback 2: if cancelled/superseded, find another completed work order with matching deliverable
     status = str(data.get("status", "")).upper()
     if status in ("CANCELLED", "SUPERSEDED"):
@@ -600,6 +618,14 @@ def _observe_prerequisite_uncached(
     )
     if is_superseded:
         successor = _successor_for(records, dep_id)
+        if successor and lineage and (successor in lineage or successor == lineage[-1]):
+            return PrerequisiteObservation(
+                **base,
+                state=PrerequisiteState.COMPLETED_VALID,
+                detail=f"superseded by calling work order {successor}",
+                expected_action="none",
+                resolution_owner="worker",
+            )
         return PrerequisiteObservation(
             **base,
             state=PrerequisiteState.SUPERSEDED,
@@ -920,6 +946,7 @@ def evaluate_dependencies(
             blocked_ids=blocked,
             failed_ids=failed,
             superseded_ids=superseded,
+            lineage=(wo_id,),
             cache=observation_cache,
         )
         for dep_id in declaration.dependencies

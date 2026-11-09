@@ -1536,11 +1536,17 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         except Exception:
             pass
 
-    def _cancel_wo(wo_file: Path, wo_data: dict[str, Any], wo_id: str, reason: str) -> None:
+    def _cancel_wo(wo_file: Path, wo_data: dict[str, Any], wo_id: str, reason: str, superseded_by: str | None = None) -> None:
         now_str = _now()
         wo_data["status"] = "CANCELLED"
         wo_data["error"] = reason
         wo_data["cancellation_reason"] = reason
+        if superseded_by:
+            wo_data["superseded_by"] = superseded_by
+        elif "superseded by" in reason.lower():
+            m = re.search(r'(?:superseded|replaced)\s+by\s+(?:completed\s+)?(WO-\d+)', reason, re.I)
+            if m:
+                wo_data["superseded_by"] = m.group(1).upper()
         wo_data["updated"] = now_str
         durable_write_yaml(wo_file, wo_data)
         _sync_index_status(wo_id, "CANCELLED", now_str)
@@ -1658,6 +1664,11 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 continue
 
             if _is_meta_work_order(wo_data):
+                continue
+
+            if any(p.startswith(".sync/") or p.startswith("schemas/") for p in wo_paths):
+                _cancel_wo(wo_file, wo_data, wo_id, "Internal governance artifact not permitted as work order deliverable")
+                superseded_map[wo_id] = None
                 continue
 
             # Check if an active feature work order claims an already completed deliverable
@@ -1832,10 +1843,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 if prec_other[0] != prec_entry[0]:
                     should_other_win = prec_other[0] > prec_entry[0]
                 else:
-                    if order_other != order_entry:
+                    if order_other != order_entry and (order_other > 0 and order_entry > 0):
                         should_other_win = order_other < order_entry
                     else:
-                        should_other_win = prec_other[1] < prec_entry[1]
+                        idx_entry = _parse_wo_index(entry[1]) or 0
+                        idx_other = _parse_wo_index(other[1]) or 0
+                        should_other_win = idx_other < idx_entry
 
                 if should_other_win:
                     collided_with = other
@@ -1882,6 +1895,24 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             for d in deps:
                 d_str = str(d).strip()
                 target_d = superseded_map.get(d_str, d_str)
+                if target_d == d_str:
+                    for check_sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+                        c_file = ws / ".sync" / "work-orders" / check_sub / f"{d_str}.yaml"
+                        if c_file.is_file():
+                            try:
+                                c_d = yaml.safe_load(c_file.read_text(encoding="utf-8")) or {}
+                                c_st = str(c_d.get("status", "")).upper()
+                                if c_st in ("CANCELLED", "SUPERSEDED"):
+                                    cand = c_d.get("superseded_by")
+                                    if not cand:
+                                        r_text = str(c_d.get("cancellation_reason") or c_d.get("error") or "")
+                                        m = re.search(r'(?:superseded|replaced)\s+by\s+(?:completed\s+)?(WO-\d+)', r_text, re.I)
+                                        if m:
+                                            cand = m.group(1).upper()
+                                    target_d = cand
+                            except Exception:
+                                pass
+                            break
                 if target_d is None or target_d == wo_id:
                     deps_changed = True
                     continue

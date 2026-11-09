@@ -158,6 +158,7 @@ class _StagingMixin:
             )
             events_write = self._build_events_write(stage_inputs, 0, 0)
             self._apply_ops(staged_root, [report_write, events_write])
+            self._reconcile_staged_work_order_collisions(staged_root)
             self._sync_index_and_tree_yaml(staged_root)
             from cli.init import ensure_canonical_tree, ensure_workspace_protocol_scaffolding
             ensure_workspace_protocol_scaffolding(staged_root)

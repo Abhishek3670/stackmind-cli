@@ -111,3 +111,78 @@ def test_wo_deliverable_paths_filters_prose_descriptions():
     paths = wo_deliverable_paths(wo)
     assert paths == ["tests/test_qa_verification.py"]
 
+
+def test_integration_gate_skips_internal_sync_deliverables(tmp_path: Path):
+    from validators.harness.integration_gate import IntegrationGate
+
+    gate = IntegrationGate(tmp_path)
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    act_dir.mkdir(parents=True, exist_ok=True)
+
+    wo15 = {
+        "id": "WO-015",
+        "title": "Repair WO-002",
+        "deliverable": {"type": "config", "path": ".sync/work-orders/ACTIVE/WO-002.yaml"},
+    }
+    (act_dir / "WO-015.yaml").write_text(yaml.safe_dump(wo15), encoding="utf-8")
+
+    check, issues, blockers, ev = gate._check_artifacts_and_freshness(None, None, None)
+    # WO-015's .sync deliverable must be skipped, not failed as missing
+    assert not any("WO-015" in i for i in issues)
+    assert not any("WO-015" in b.get("finding", "") for b in blockers)
+
+
+def test_superseded_dependency_self_supersession(tmp_path: Path):
+    from validators.kernel.daemon.supervisor.dependencies import validate_dependency_graph, _successor_for
+
+    sync = tmp_path / ".sync" / "work-orders"
+    active_dir = sync / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    wo4 = {
+        "id": "WO-004",
+        "status": "CANCELLED",
+        "cancellation_reason": "Superseded by completed WO-005 (deliverable 'tests/test_qa_verification.py' already completed)",
+        "dependencies": ["WO-003"],
+    }
+    wo5 = {
+        "id": "WO-005",
+        "status": "ACTIVE",
+        "dependencies": ["WO-004"],
+    }
+    (active_dir / "WO-004.yaml").write_text(yaml.safe_dump(wo4), encoding="utf-8")
+    (active_dir / "WO-005.yaml").write_text(yaml.safe_dump(wo5), encoding="utf-8")
+
+    issues = validate_dependency_graph(tmp_path)
+    # Self-supersession (WO-005 superseded WO-004) must not trigger SUPERSEDED_DEPENDENCY
+    assert not any(i.code == "SUPERSEDED_DEPENDENCY" and i.work_order_id == "WO-005" for i in issues)
+
+
+def test_completed_work_order_ignores_cancelled_dependency(tmp_path: Path):
+    from validators.kernel.daemon.supervisor.dependencies import validate_dependency_graph
+
+    sync = tmp_path / ".sync" / "work-orders"
+    act_dir = sync / "ACTIVE"
+    comp_dir = sync / "COMPLETED"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    comp_dir.mkdir(parents=True, exist_ok=True)
+
+    wo4 = {
+        "id": "WO-004",
+        "status": "CANCELLED",
+        "cancellation_reason": "Superseded by completed WO-005",
+        "dependencies": [],
+    }
+    wo5 = {
+        "id": "WO-005",
+        "status": "COMPLETED",
+        "dependencies": ["WO-004"],
+    }
+    (act_dir / "WO-004.yaml").write_text(yaml.safe_dump(wo4), encoding="utf-8")
+    (comp_dir / "WO-005.yaml").write_text(yaml.safe_dump(wo5), encoding="utf-8")
+
+    issues = validate_dependency_graph(tmp_path)
+    assert not any(i.code == "SUPERSEDED_DEPENDENCY" and i.work_order_id == "WO-005" for i in issues)
+
+
+

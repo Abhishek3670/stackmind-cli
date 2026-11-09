@@ -809,6 +809,8 @@ class _ExecutionMixin:
                 # `.sync` is excluded from workspace snapshots, so commit the
                 # harness-owned bookkeeping only after the staged verification passes.
                 self._apply_non_report_writes(stage_inputs)
+                self._reconcile_staged_work_order_collisions(self.project_path)
+                self._sync_index_and_tree_yaml(self.project_path)
 
                 write_ms = int((time.monotonic() - hold_started) * 1000)
                 hold_ms = write_ms

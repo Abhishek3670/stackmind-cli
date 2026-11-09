@@ -345,6 +345,11 @@ class IntegrationGate:
             if not deliv.get("path") and not any(d.get("path") for d in delivs if isinstance(d, dict)):
                 continue
 
+            # Skip internal governance / metadata files in .sync or schemas
+            deliv_p = str(deliv.get("path") or "").replace("\\", "/").strip().lstrip("/")
+            if deliv_p.startswith(".sync/") or deliv_p.startswith("schemas/") or deliv_p.startswith(".git/"):
+                continue
+
             passed, errs, ev = verify_work_order_deliverables(self.workspace, wo_data)
             checked_count += 1
 

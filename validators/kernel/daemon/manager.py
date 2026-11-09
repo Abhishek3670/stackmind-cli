@@ -2240,9 +2240,16 @@ class SessionManager:
                     pass
             # If active work orders exist on disk, populate worker_wo_ids before re-attest
             active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
             if active_dir.is_dir():
                 for wo_file in sorted(active_dir.glob("*.yaml")):
                     wo_id = wo_file.stem
+                    if completed_dir.is_dir() and (completed_dir / wo_file.name).is_file():
+                        try:
+                            wo_file.unlink()
+                        except OSError:
+                            pass
+                        continue
                     if wo_id in state.completed_wo_ids:
                         state.completed_wo_ids.remove(wo_id)
                     if wo_id not in state.worker_wo_ids:

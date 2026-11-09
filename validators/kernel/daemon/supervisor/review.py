@@ -1169,7 +1169,8 @@ class _ReviewMixin:
                     accused.append(wo_id)  # no mappable footprint — include defensively
                 continue
             stem = Path(deliv).stem.lower()
-            if (deliv in blocker_text) or (stem and stem in blocker_text):
+            norm_blocker = blocker_text.replace("\\", "/").lower()
+            if (deliv in norm_blocker) or (stem and stem in norm_blocker) or (wo_id.lower() in norm_blocker):
                 accused.append(wo_id)
         if accused:
             return list(dict.fromkeys(accused + qa_wos))
@@ -1184,7 +1185,9 @@ class _ReviewMixin:
         )
         if is_pure_governance:
             return []
-        return list(dict.fromkeys(code_wos + qa_wos + (gitops_wos if is_gitops_blocker else [])))
+        # If no specific work orders are accused, only rework active/uncompleted work orders, never completed ones
+        uncompleted_code_wos = [w for w in code_wos if w not in getattr(state, "completed_wo_ids", [])]
+        return list(dict.fromkeys((uncompleted_code_wos or code_wos) + qa_wos + (gitops_wos if is_gitops_blocker else [])))
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
         """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""
