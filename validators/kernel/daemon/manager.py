@@ -1784,7 +1784,7 @@ class SessionManager:
             default_grant = int(env_budget_str) if env_budget_str else 500
         except ValueError:
             default_grant = 500
-        if getattr(state, "global_turn_budget", 0) <= 20:
+        if getattr(state, "global_turn_budget", 0) <= 50:
             state.global_turn_budget = max(getattr(state, "initial_turn_budget", 0) or 100, default_grant)
         state.human_resumes_used = 0
         state.max_human_resumes = max(getattr(state, "max_human_resumes", 2), 100)
@@ -2186,12 +2186,17 @@ class SessionManager:
                 state.exit_code = 0
                 state.error = None
 
+            if state.phase != Phase.COMPLETE:
+                self._prepare_run_for_resume(state, session, ws)
+            else:
+                self._cleanup_orphaned_operations(state, session)
+
             if hasattr(self.supervisor, "re_attest_run"):
                 try:
                     self.supervisor.re_attest_run(
                         state,
                         human_signature="operator",
-                        confirmed_budget=state.global_turn_budget or 50,
+                        confirmed_budget=state.global_turn_budget or 500,
                     )
                 except Exception:
                     pass
@@ -2201,11 +2206,6 @@ class SessionManager:
                     self.supervisor.state_manager.re_attest_run(state.run_id, "Human re-attestation by operator")
                 except Exception:
                     pass
-
-            if state.phase != Phase.COMPLETE:
-                self._prepare_run_for_resume(state, session, ws)
-            else:
-                self._cleanup_orphaned_operations(state, session)
 
             self._active_runs[target_run_id] = state
             try:
