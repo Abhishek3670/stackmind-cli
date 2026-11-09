@@ -207,3 +207,48 @@ def test_prepare_run_for_resume_clears_final_review_budget_and_routes_to_dispatc
     assert len(state.budget_usage.get("FINAL_REVIEW", {})) == 0
     assert state.phase == Phase.DISPATCHING
 
+
+def test_recovery_decision_archives_and_normalizes_dependency_action(tmp_path):
+    """Ensure recovery decision is archived upon apply and amend_contract is normalized for dependency failures."""
+    from types import SimpleNamespace
+    from pathlib import Path
+    import json
+    from validators.kernel.daemon.supervisor.recovery import _RecoveryMixin
+    from validators.kernel.daemon.supervisor.models import AdvanceResult
+
+    class FakeSup(_RecoveryMixin):
+        def __init__(self):
+            self.archived = []
+        def _archive_recovery_artifact(self, ws, run_id, path):
+            self.archived.append(path)
+        def _enter_recovery_repair(self, state, ws, record):
+            return AdvanceResult.TRANSITIONED, None
+        def _get_wo_deliverable_path(self, wo_id, ws):
+            return None
+        def _find_latest_contract_for_wo(self, ws, run_id, wo_id):
+            return None
+
+    sup = FakeSup()
+    state = SimpleNamespace(
+        run_id="run-1",
+        worker_blockers={"WO-013": {"failure_code": "INVALID_DEPENDENCY", "dependency_code": "SUPERSEDED_DEPENDENCY"}},
+        contract_revisions={},
+        recovery_decisions=[],
+    )
+
+    decision = {
+        "work_order": "WO-013",
+        "action": "amend_contract",
+        "reason": "Remove superseded dependency",
+        "failure_code": "INVALID_DEPENDENCY",
+    }
+
+    advance, err = sup._apply_recovery_decision(state, tmp_path, "WO-013", decision)
+    assert err is None
+    # Must archive decision artifact immediately
+    assert ".sync/decisions/recovery/WO-013.decision.json" in sup.archived
+    # Must normalize amend_contract to architect_fix for dependency failures
+    assert decision["action"] == "architect_fix"
+    assert state.repair_context["action"] == "architect_fix"
+
+

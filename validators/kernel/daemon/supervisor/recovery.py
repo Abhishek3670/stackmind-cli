@@ -307,6 +307,8 @@ class _RecoveryMixin:
                         self._transition(state, dest, authorized_override=True)
                         return AdvanceResult.TRANSITIONED
                     else:
+                        # ponytail: ensure leftover recovery decision is archived so it cannot loop
+                        self._archive_recovery_artifact(ws, state.run_id, f".sync/decisions/recovery/{wo_id}.decision.json")
                         state.repair_context = {}
                         self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
                         self._discover_worker_wos(state)
@@ -1186,6 +1188,21 @@ class _RecoveryMixin:
         """Validate and apply a recovery decision. Returns (advance, error)."""
         action = str(decision.get("action", ""))
         reason = str(decision.get("reason", ""))
+        evidence = state.worker_blockers.get(wo_id, {})
+        failure_code = evidence.get("failure_code") or decision.get("failure_code")
+
+        # ponytail: archive the consumed recovery decision immediately so it is never re-applied from disk in a loop
+        self._archive_recovery_artifact(ws, state.run_id, f".sync/decisions/recovery/{wo_id}.decision.json")
+
+        # ponytail: contract amendments cannot resolve work-order dependency issues (SUPERSEDED_DEPENDENCY / INVALID_DEPENDENCY / DEPENDENCY_DEADLOCK)
+        # normalize to architect_fix so the architect is instructed and authorized to rewire .sync/work-orders/ACTIVE/
+        if action == "amend_contract" and (
+            failure_code in ("INVALID_DEPENDENCY", "SUPERSEDED_DEPENDENCY", "DEPENDENCY_DEADLOCK")
+            or (evidence.get("dependency_code") == "SUPERSEDED_DEPENDENCY")
+        ):
+            action = "architect_fix"
+            decision["action"] = "architect_fix"
+
         record: dict[str, Any] = {
             "work_order": wo_id,
             "action": action,
@@ -1193,7 +1210,6 @@ class _RecoveryMixin:
             "decided_at": _now(),
             **{k: v for k, v in decision.items() if k not in ("work_order", "action", "reason")},
         }
-        evidence = state.worker_blockers.get(wo_id, {})
 
         if action in ("architect_fix", "resolve_blocker"):
             original_contract: dict[str, Any] = {}
