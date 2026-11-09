@@ -325,6 +325,67 @@ def test_resume_run_with_worker_wos_advances_to_dispatching(tmp_path: Path):
     assert state.phase == Phase.DISPATCHING
 
 
+def test_state_verified_allows_sync_directory_writes(tmp_path: Path):
+    from unittest.mock import MagicMock
+    from validators.harness.runner.verification import _VerificationMixin
+    from validators.harness.runner.models import HarnessTask, HarnessDecision
+
+    mixin = _VerificationMixin()
+    mixin.project_path = tmp_path
+    mixin.sync_path = tmp_path / ".sync"
+    mixin.agent = "claude"
+
+    task = HarnessTask(
+        identifier="WO-002",
+        kind="work_order",
+        work_order_id="WO-002",
+        title="Core Implementation",
+        deliverable_path="src/backend.py",
+        deliverable_type="code",
+        path=mixin.sync_path / "work-orders" / "ACTIVE" / "WO-002.yaml",
+        body="",
+        query="",
+    )
+
+    decision = HarnessDecision(
+        status="completed",
+        summary="Recovery decision written",
+        report_markdown="Decision authored",
+        blockers=(),
+        blocker_details=(),
+        modified_files=(".sync/decisions/recovery/WO-002.decision.json",),
+        release_target=None,
+        retrieval_queries=(),
+        uncertainty=(),
+        commands=(),
+    )
+
+    diff = MagicMock()
+    diff.all_changed_files = (".sync/decisions/recovery/WO-002.decision.json",)
+    before_snap = MagicMock()
+    before_snap.files = {}
+    after_snap = MagicMock()
+    after_snap.files = {}
+
+    dims = mixin._evaluate_verification_dimensions(
+        task=task,
+        decision=decision,
+        diff=diff,
+        before_snapshot=before_snap,
+        after_snapshot=after_snap,
+        staged_root=tmp_path,
+        staged_errors=[],
+        declaration_matches=True,
+        command_results=[],
+        d025_passed=True,
+        has_staged_writes=True,
+        tool_runtime=None,
+    )
+
+    # .sync files must not cause state_verified to fail just because snapshots exclude .sync
+    assert dims.state_verified is True
+
+
 
 
 

@@ -173,6 +173,8 @@ class _VerificationMixin:
 
         state_verified = not staged_errors
         for relative_path in changed_files:
+            if relative_path.startswith(('.sync/', '.git/')) or relative_path in ('.sync', '.git'):
+                continue
             before = before_snapshot.files.get(relative_path)
             after = after_snapshot.files.get(relative_path)
             if after is not None and not after.content_hash:
