@@ -676,7 +676,7 @@ def test_pad_frame_to_width_uses_ansi_erase_to_line_end():
 
 def test_strip_trailing_spaces_preserves_ansi_codes():
     """Verify _strip_trailing_spaces removes trailing spaces while preserving ANSI styling."""
-    from cli.tui.terminal import _strip_trailing_spaces
+    from cli.tui.layout import _strip_trailing_spaces
 
     assert _strip_trailing_spaces("Plain text    ") == "Plain text"
     assert _strip_trailing_spaces("Styled \x1b[32mtext\x1b[0m   ") == "Styled \x1b[32mtext\x1b[0m"

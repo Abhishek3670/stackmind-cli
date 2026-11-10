@@ -624,6 +624,12 @@ def render_conversation_column(
 
 # ── Viewport Slicing & Scroll Offset ──────────────────────────────────────────
 
+def _strip_trailing_spaces(line: str) -> str:
+    """Remove trailing space characters while preserving trailing ANSI formatting sequences."""
+    cleaned = line.rstrip(" ")
+    return re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", cleaned)
+
+
 def slice_conversation_viewport(
     content: str,
     viewport_height: int,
@@ -645,10 +651,7 @@ def slice_conversation_viewport(
         c, _ = _make_capture_console(width=avail_width)
         visual_lines: list[str] = []
         for raw_line in content.split("\n"):
-            if not raw_line:
-                visual_lines.append("")
-                continue
-            stripped_line = re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", raw_line.rstrip(" "))
+            stripped_line = _strip_trailing_spaces(raw_line)
             if not stripped_line:
                 visual_lines.append("")
                 continue
@@ -664,13 +667,12 @@ def slice_conversation_viewport(
                         if "\x1b[" in stripped_line:
                             cap, _ = _make_capture_console(width=avail_width, force_color=True)
                             cap.print(part, end="")
-                            p_clean = re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", cap.export_text(styles=True).rstrip(" "))
-                            visual_lines.append(p_clean)
+                            visual_lines.append(_strip_trailing_spaces(cap.export_text(styles=True)))
                         else:
                             visual_lines.append(part.plain.rstrip(" "))
         lines = visual_lines
     else:
-        lines = [re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", l.rstrip(" ")) for l in content.split("\n")]
+        lines = [_strip_trailing_spaces(l) for l in content.split("\n")]
 
     total_lines = len(lines)
 

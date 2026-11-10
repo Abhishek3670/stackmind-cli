@@ -34,6 +34,7 @@ from cli.tui.keyboard import (
     wrap_composer_text,
 )
 from cli.tui.layout import (
+    _strip_trailing_spaces,
     compute_composer_cursor_row,
     compute_layout,
     format_responsive_path,
@@ -704,12 +705,6 @@ def redraw_full_screen(
     return frame
 
 
-def _strip_trailing_spaces(line: str) -> str:
-    """Remove trailing space characters while preserving trailing ANSI formatting sequences."""
-    cleaned = line.rstrip(" ")
-    return re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", cleaned)
-
-
 def _pad_frame_to_width(frame: str, width: int) -> str:
     """Pad every frame line to ``width`` display cells without touching ANSI styles.
 
@@ -719,15 +714,10 @@ def _pad_frame_to_width(frame: str, width: int) -> str:
     """
     if width <= 0:
         return frame
-    padded: list[str] = []
-    for line in frame.split("\n"):
-        cleaned = _strip_trailing_spaces(line)
-        visible = Text.from_ansi(cleaned).cell_len
-        if visible < width:
-            padded.append(cleaned + "\x1b[K")
-        else:
-            padded.append(cleaned)
-    return "\n".join(padded)
+    return "\n".join(
+        (c := _strip_trailing_spaces(l)) + ("\x1b[K" if Text.from_ansi(c).cell_len < width else "")
+        for l in frame.split("\n")
+    )
 
 
 def render_composer_top_border(
