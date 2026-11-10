@@ -1132,6 +1132,11 @@ class _RecoveryMixin:
         validator = Draft7Validator(schema) if schema else None
 
         def _validate(decision: dict[str, Any]) -> str | None:
+            # Sanitize null fields that LLMs commonly emit when no replacements/revisions apply
+            if decision.get("replacement_work_orders") is None:
+                decision.pop("replacement_work_orders", None)
+            if decision.get("contract_revision") is None:
+                decision.pop("contract_revision", None)
             if validator is not None:
                 errors = sorted(validator.iter_errors(decision), key=lambda e: str(e.path))
                 if errors:
