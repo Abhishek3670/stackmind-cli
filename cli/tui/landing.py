@@ -27,6 +27,7 @@ LANDING_PILLARS = ("PLAN", "BUILD", "VERIFY", "GOVERN")
 LANDING_HINTS = [
     ("/", "Start chatting"),
     ("Ctrl+K", "Open commands"),
+    ("Ctrl+B", "Toggle panel"),
     (":help", "Show all commands"),
     (":status", "Show session status"),
 ]

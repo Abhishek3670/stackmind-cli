@@ -989,7 +989,7 @@ def tui(
                         pass
 
                 def _handle_mouse_click(col: int, row: int, button: int, editor: Any = None) -> None:
-                    """Handle mouse clicks: clicking on the scrollbar track or dragging to scroll."""
+                    """Handle mouse clicks: clicking on the scrollbar track, collapsing the runtime sidebar, or dragging to scroll."""
                     if button not in (0, 1, 32):
                         return
                     term_size = shutil.get_terminal_size(fallback=(80, current_lines))
@@ -1002,6 +1002,16 @@ def tui(
 
                     scrollbar_col = layout.conversation_width
                     header_h = 1
+
+                    # Click on collapsed top badge bar (row 0 or 1) -> expand runtime panel
+                    if not layout.show_runtime and layout.show_runtime_badge and row <= 1:
+                        _handle_ctrl_b(editor)
+                        return
+
+                    # Click on runtime panel header row (row <= 2) -> collapse runtime panel
+                    if layout.show_runtime and col > scrollbar_col + 2 and row <= 2:
+                        _handle_ctrl_b(editor)
+                        return
 
                     if scrollbar_col - 2 <= col <= scrollbar_col + 2:
                         active_scroll = state.conversation_scroll
@@ -1038,6 +1048,10 @@ def tui(
                                 state.set_conversation_scroll_offset(target_off)
 
                             _handle_height_change(editor)
+                        else:
+                            # Click on divider when no scrollbar is needed -> toggle sidebar collapse
+                            _handle_ctrl_b(editor)
+                            return
                     elif layout.show_runtime and col > scrollbar_col + 2:
                         total_wo = len(getattr(state, "work_orders", []))
                         cap = getattr(state.scroll, "viewport_height", 8) or 8
@@ -1054,6 +1068,97 @@ def tui(
                     elif col < scrollbar_col - 2:
                         state.scroll_focus = "conversation"
                         _handle_height_change(editor)
+
+                def _handle_mouse_release(start_col: int, start_row: int, end_col: int, end_row: int, editor: Any = None) -> None:
+                    """Handle mouse drag release: extract conversation text cleanly and copy to clipboard."""
+                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
+                    term_cols, term_lines = term_size.columns, term_size.lines
+                    layout = compute_layout(
+                        term_cols,
+                        term_lines,
+                        show_runtime=getattr(state, "runtime_panel_visible", False),
+                    )
+                    scrollbar_col = layout.conversation_width
+
+                    # If drag was inside the sidebar or scrollbar track, do not copy
+                    if start_col >= scrollbar_col - 1 and end_col >= scrollbar_col - 1:
+                        return
+
+                    # Verify that an actual drag occurred (different rows or moved >= 3 columns)
+                    if start_row == end_row and abs(end_col - start_col) < 3:
+                        return
+
+                    # Clamp columns to conversation pane boundary (exclude divider and sidebar)
+                    max_c = max(1, scrollbar_col - 2)
+                    s_col = max(0, min(max_c, start_col - 1))
+                    e_col = max(0, min(max_c, end_col - 1))
+
+                    header_h = 1 if (not layout.show_runtime and layout.show_runtime_badge) else 0
+                    vp_h = compute_viewport_height(term_lines, state=state)
+                    r1 = max(0, min(vp_h - 1, start_row - 1 - header_h))
+                    r2 = max(0, min(vp_h - 1, end_row - 1 - header_h))
+
+                    visible_lines = getattr(state, "visible_conversation_lines", [])
+                    if not visible_lines:
+                        # Fallback: compute from state messages
+                        from cli.tui.chat import render_chat_transcript_str
+                        from cli.tui.layout import slice_conversation_viewport
+                        active_scroll = getattr(state, "conversation_scroll", None)
+                        conv_text = render_chat_transcript_str(getattr(state, "messages", []), width=layout.conversation_width)
+                        sliced = slice_conversation_viewport(
+                            conv_text,
+                            viewport_height=vp_h,
+                            scroll=active_scroll,
+                            pad=False,
+                            avail_width=layout.conversation_width,
+                        )
+                        visible_lines = [Text.from_ansi(l).plain if "\x1b[" in l else l for l in sliced.split("\n")]
+
+                    if not visible_lines:
+                        return
+
+                    min_r = min(r1, r2)
+                    max_r = min(len(visible_lines) - 1, max(r1, r2))
+
+                    if min_r == max_r:
+                        line = visible_lines[min_r] if min_r < len(visible_lines) else ""
+                        c_start = min(s_col, e_col)
+                        c_end = max(s_col, e_col)
+                        selected_text = line[c_start:c_end].strip()
+                    else:
+                        extracted = []
+                        is_forward = (start_row < end_row) or (start_row == end_row and start_col <= end_col)
+                        for r in range(min_r, max_r + 1):
+                            if r >= len(visible_lines):
+                                break
+                            line = visible_lines[r]
+                            if r == min_r:
+                                extracted.append(line[s_col:].rstrip() if is_forward else line[e_col:].rstrip())
+                            elif r == max_r:
+                                extracted.append(line[:e_col].rstrip() if is_forward else line[:s_col].rstrip())
+                            else:
+                                extracted.append(line.rstrip())
+                        selected_text = "\n".join(extracted).strip()
+
+                    if selected_text:
+                        from cli.tui.clipboard import set_clipboard_text
+                        ok = set_clipboard_text(selected_text)
+                        if ok:
+                            lines_cnt = len(selected_text.splitlines())
+                            chars_cnt = len(selected_text)
+                            u = "line" if lines_cnt == 1 else "lines"
+                            alert = f"[CLIPBOARD] Copied {lines_cnt} {u} ({chars_cnt:,} chars) to system clipboard."
+                            if editor is not None:
+                                editor.alert = alert
+                                if hasattr(editor, "on_alert") and editor.on_alert:
+                                    try:
+                                        editor.on_alert(alert)
+                                    except Exception:
+                                        pass
+                                if hasattr(editor, "bottom_border_renderer") and editor.has_borders:
+                                    editor.redraw_line()
+                            elif state is not None:
+                                state.composer_alert = alert
 
                 active_op = session.get("active_operation")
                 is_awaiting_plan = (
@@ -1086,6 +1191,7 @@ def tui(
                     on_wheel_up=_handle_wheel_up,
                     on_wheel_down=_handle_wheel_down,
                     on_mouse_click=_handle_mouse_click,
+                    on_mouse_release=_handle_mouse_release,
                     on_height_change=_handle_height_change,
                     on_idle=_handle_idle,
                     on_resize=_handle_resize,

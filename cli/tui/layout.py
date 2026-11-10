@@ -500,7 +500,13 @@ def render_runtime_badge_bar(
     res.append(op_str, style="dim white")
 
     plain_len = len(res.plain)
-    if plain_len < width:
+    expand_tag = "[+ Expand]"
+    if plain_len + len(expand_tag) + 2 <= width:
+        padding = width - plain_len - len(expand_tag) - 1
+        res.append(" " * padding)
+        res.append(expand_tag, style="bold dim cyan")
+        res.append(" ")
+    elif plain_len < width:
         res.append(" " * (width - plain_len))
     return res
 
@@ -623,6 +629,7 @@ def slice_conversation_viewport(
     scroll: ConversationScroll | int | None = None,
     pad: bool = True,
     avail_width: int | None = None,
+    state: Any | None = None,
 ) -> str:
     """Slice conversation text to fit the viewport height based on scroll offset (§31).
 
@@ -688,6 +695,14 @@ def slice_conversation_viewport(
     if total_lines <= viewport_height:
         if pad:
             lines = lines + [""] * (viewport_height - total_lines)
+        if state is not None:
+            try:
+                state.visible_conversation_lines = [
+                    Text.from_ansi(l).plain if "\x1b[" in l else l
+                    for l in lines
+                ]
+            except Exception:
+                pass
         return "\n".join(lines)
 
     # Content exceeds viewport height
@@ -700,6 +715,15 @@ def slice_conversation_viewport(
         end_idx = total_lines - effective_offset
         start_idx = max(0, end_idx - viewport_height)
         visible = lines[start_idx:end_idx]
+
+    if state is not None:
+        try:
+            state.visible_conversation_lines = [
+                Text.from_ansi(l).plain if "\x1b[" in l else l
+                for l in visible
+            ]
+        except Exception:
+            pass
 
     return "\n".join(visible)
 
@@ -844,6 +868,7 @@ def render_workspace_layout_str(
                 scroll=active_scroll,
                 pad=True,
                 avail_width=conv_w,
+                state=state,
             )
             conversation_text = f"{conversation_text}\n{dialog_str}"
         else:
@@ -853,6 +878,7 @@ def render_workspace_layout_str(
                 scroll=active_scroll,
                 pad=True,
                 avail_width=conv_w,
+                state=state,
             )
 
     console, use_ansi = _make_capture_console(

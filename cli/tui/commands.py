@@ -2031,7 +2031,9 @@ def dispatch_delivery_command(
         if text_to_copy:
             ok = set_clipboard_text(text_to_copy)
             msg_str = (
-                f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard."
+                f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard.\n"
+                "  • Tip: Mouse-drag any conversation text to copy cleanly (side panel is excluded).\n"
+                "  • Tip: Click [–] on header, click divider │, or press Ctrl+B / :collapse to toggle sidebar."
                 if ok
                 else "[ERROR] Failed to write to system clipboard."
             )
@@ -2048,7 +2050,7 @@ def dispatch_delivery_command(
             click.echo(msg_str)
         return session, False
 
-    if normalized in (":panel", ":sidebar", ":side", ":toggle panel", ":panel toggle"):
+    if normalized in (":panel", ":sidebar", ":side", ":collapse", ":toggle panel", ":panel toggle"):
         is_now_visible = state.toggle_runtime_panel() if hasattr(state, "toggle_runtime_panel") else True
         status_text = (
             "[SIDEBAR] Runtime panel restored (2-column split layout)."
@@ -3274,15 +3276,18 @@ def dispatch_delivery_command(
             from cli.tui.keyboard import enable_mouse_reporting
             enable_mouse_reporting(sys.stdout)
             output_str = (
-                "✓ Mouse reporting enabled (wheel scroll, click & drag active).\n"
-                "  • Tip: Hold Shift while dragging to select & copy text natively.\n"
-                "  • Run :mouse off to restore direct drag-to-copy without Shift."
+                "✓ Mouse reporting enabled (wheel scroll, drag-to-copy & click active).\n"
+                "  • Direct drag-to-copy: Drag across conversation text to copy cleanly (side panel is excluded).\n"
+                "  • Collapse side panel: Click [–] on header, click divider │, or press Ctrl+B / :collapse."
             )
         elif clean_mouse in {"off", "disable", "false", "0"}:
             state.mouse_reporting_enabled = False
             from cli.tui.keyboard import disable_mouse_reporting
             disable_mouse_reporting(sys.stdout)
-            output_str = "✓ Mouse reporting disabled (native terminal drag-to-copy text selection active)."
+            output_str = (
+                "✓ Mouse reporting disabled (native terminal drag-to-copy text selection active).\n"
+                "  • Tip: Press Ctrl+B or click [–] to collapse the side panel for full-width native selection."
+            )
         elif clean_mouse in {"toggle", ""}:
             new_val = not getattr(state, "mouse_reporting_enabled", True)
             state.mouse_reporting_enabled = new_val
@@ -3290,13 +3295,16 @@ def dispatch_delivery_command(
                 from cli.tui.keyboard import enable_mouse_reporting
                 enable_mouse_reporting(sys.stdout)
                 output_str = (
-                    "✓ Mouse reporting toggled ON (wheel scroll, click & drag active).\n"
-                    "  • Tip: Hold Shift while dragging to select & copy text natively."
+                    "✓ Mouse reporting toggled ON (wheel scroll, drag-to-copy & click active).\n"
+                    "  • Direct drag-to-copy: Drag across conversation text to copy cleanly (side panel is excluded)."
                 )
             else:
                 from cli.tui.keyboard import disable_mouse_reporting
                 disable_mouse_reporting(sys.stdout)
-                output_str = "✓ Mouse reporting toggled OFF (native terminal drag-to-copy text selection active)."
+                output_str = (
+                    "✓ Mouse reporting toggled OFF (native terminal drag-to-copy text selection active).\n"
+                    "  • Tip: Press Ctrl+B or click [–] to collapse the side panel for full-width native selection."
+                )
         else:
             curr = "ON" if getattr(state, "mouse_reporting_enabled", True) else "OFF"
             tip = "Hold Shift while dragging to select text natively." if curr == "ON" else "Run :mouse on for wheel scrolling."

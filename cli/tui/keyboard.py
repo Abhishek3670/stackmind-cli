@@ -600,6 +600,9 @@ class Win32ConsoleReader:
                 btn = 32
             else:
                 btn = mouse.dwButtonState
+            action_suffix = "_m" if mouse.dwButtonState == 0 and (mouse.dwEventFlags & 0x0001 == 0) else ""
+            if action_suffix:
+                return f"<MOUSE_{btn}_{mouse.dwMousePosition.X}_{mouse.dwMousePosition.Y}{action_suffix}>"
             return f"<MOUSE_{btn}_{mouse.dwMousePosition.X}_{mouse.dwMousePosition.Y}>"
 
         # Key Events (EventType == 0x0001)
@@ -976,6 +979,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":goal", "Submit product goal to Architecture (or adopt suggested goal)", True),
     (":adopt", "Adopt suggested goal from Architecture", False),
     (":panel", "Toggle runtime sidebar panel (Ctrl+B)", False),
+    (":collapse", "Collapse or expand runtime side panel (Ctrl+B)", False),
     (":sidebar", "Toggle runtime sidebar panel (Ctrl+B)", False),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
@@ -1231,6 +1235,7 @@ class RawLineEditor:
         on_alert: Optional[Callable[[Optional[str]], None]] = None,
         on_height_change: Optional[Callable[[Any], None]] = None,
         on_mouse_click: Optional[Callable[[int, int, int], None]] = None,
+        on_mouse_release: Optional[Callable[..., None]] = None,
     ) -> None:
         self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
@@ -1258,6 +1263,10 @@ class RawLineEditor:
         self.on_wheel_up = on_wheel_up
         self.on_wheel_down = on_wheel_down
         self.on_mouse_click = on_mouse_click
+        self.on_mouse_release = on_mouse_release
+        self._mouse_drag_start: Optional[tuple[int, int]] = None
+        self._mouse_drag_current: Optional[tuple[int, int]] = None
+        self._is_mouse_dragging: bool = False
         self.on_transition = on_transition
         self.on_height_change = on_height_change
         self.width = width
@@ -1975,11 +1984,40 @@ class RawLineEditor:
                     self.last_mouse_col = col
                     self.last_mouse_row = row
                     action = parts[4] if len(parts) > 4 else "M"
-                    if action not in ("m",):
-                        # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
-                        if btn == 2 or (btn & 0x0002 != 0):
-                            self.paste_from_clipboard()
-                            return False
+
+                    # Mouse release event (SGR action 'm' or 4-part release)
+                    if action in ("m",) or (len(parts) == 4 and btn == 0 and self._is_mouse_dragging):
+                        if self._is_mouse_dragging and self._mouse_drag_start is not None:
+                            start_col, start_row = self._mouse_drag_start
+                            if self.on_mouse_release:
+                                try:
+                                    self.on_mouse_release(start_col, start_row, col, row, self)
+                                except TypeError:
+                                    self.on_mouse_release(start_col, start_row, col, row)
+                        self._mouse_drag_start = None
+                        self._mouse_drag_current = None
+                        self._is_mouse_dragging = False
+                        return False
+
+                    # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
+                    if btn == 2 or (btn & 0x0002 != 0):
+                        self.paste_from_clipboard()
+                        return False
+
+                    if btn == 0:
+                        # Left button press
+                        self._mouse_drag_start = (col, row)
+                        self._mouse_drag_current = (col, row)
+                        self._is_mouse_dragging = False
+                        if self.on_mouse_click:
+                            self.on_mouse_click(col, row, btn)
+                    elif btn == 32:
+                        # Left button drag / motion
+                        self._is_mouse_dragging = True
+                        self._mouse_drag_current = (col, row)
+                        if self.on_mouse_click:
+                            self.on_mouse_click(col, row, btn)
+                    else:
                         if self.on_mouse_click:
                             self.on_mouse_click(col, row, btn)
                 except Exception:
@@ -2195,6 +2233,7 @@ def raw_prompt_input(
     on_height_change: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
     on_mouse_click: Optional[Callable[..., None]] = None,
+    on_mouse_release: Optional[Callable[..., None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -2346,6 +2385,14 @@ def raw_prompt_input(
             except TypeError:
                 on_mouse_click(col, row, button)
 
+    def wrapped_mouse_release(start_col: int, start_row: int, end_col: int, end_row: int) -> None:
+        """Handle mouse drag release for text selection and copying."""
+        if on_mouse_release:
+            try:
+                on_mouse_release(start_col, start_row, end_col, end_row, editor)
+            except TypeError:
+                on_mouse_release(start_col, start_row, end_col, end_row)
+
     editor = RawLineEditor(
         prompt_prefix=prompt_prefix,
         initial_text=initial_text,
@@ -2366,6 +2413,7 @@ def raw_prompt_input(
         on_wheel_up=wrapped_wheel_up,
         on_wheel_down=wrapped_wheel_down,
         on_mouse_click=wrapped_mouse_click,
+        on_mouse_release=wrapped_mouse_release,
         on_transition=handle_transition,
         width=width,
         commands=commands,

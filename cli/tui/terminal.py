@@ -954,6 +954,7 @@ def prompt_composer_input(
     on_idle: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
     on_mouse_click: Optional[Callable[..., None]] = None,
+    on_mouse_release: Optional[Callable[..., None]] = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
@@ -1184,6 +1185,7 @@ def prompt_composer_input(
                 on_height_change=on_height_change,
                 on_resize=_handle_prompt_resize,
                 on_mouse_click=on_mouse_click,
+                on_mouse_release=on_mouse_release,
             )
         finally:
             if state is not None:
