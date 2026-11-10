@@ -295,6 +295,73 @@ def test_transcript_recovery_with_outbox_report(tmp_path: Path):
     assert "Delivery completed with 100% test pass rate." in recovered[1].content
 
 
+def test_transcript_recovery_excludes_work_orders_and_qa_reviews(tmp_path: Path):
+    """Verify background work orders, QA reports, and specialist agents do not pollute chat transcript."""
+    state = AutonomousDeliveryState(session_id="session-wo-filter-1")
+    outbox = tmp_path / ".sync" / "outbox"
+    outbox.mkdir(parents=True, exist_ok=True)
+
+    # 1. Specialist worker report in outbox/gemma
+    gemma_dir = outbox / "gemma"
+    gemma_dir.mkdir(parents=True, exist_ok=True)
+    (gemma_dir / "harness-2026-11-10T18-35-56.md").write_text(
+        "# Harness Report: WO-052\n- agent: gemma\n- kind: work_order\n\n## Report\nValidation review for **WO-052** is complete.\n\n### Verdict\nPASS",
+        encoding="utf-8",
+    )
+
+    # 2. QA review report in outbox/qa
+    qa_dir = outbox / "qa"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    (qa_dir / "harness-2026-11-10T18-36-00.md").write_text(
+        "# Harness Report: WO-052\n- agent: qa\n- kind: review\n\n## Report\n### Verification Summary\nAll tests pass.\n\n### QA Verdict: PASS",
+        encoding="utf-8",
+    )
+
+    # 3. Old adhoc report from an earlier unrelated session
+    claude_dir = outbox / "claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "harness-old.md").write_text(
+        "# Harness Report: old-op-999\n- agent: claude\n- kind: adhoc\n\n## Report\nOld greeting from yesterday.",
+        encoding="utf-8",
+    )
+
+    # Current session events
+    events = [
+        {"sequence": 1, "name": "turn.started", "payload": {"prompt": "what's left?", "operation_id": "current-op-001"}},
+        {"sequence": 2, "name": "operation.completed", "payload": {
+            "operation_id": "current-op-001",
+            "role": "architecture",
+            "agent_id": "claude",
+            "result": {
+                "summary": "The core Landing Page MVP is 100% built, integrated, and verified.",
+            },
+        }},
+        # Background worker event in the same session
+        {"sequence": 3, "name": "operation.completed", "payload": {
+            "operation_id": "worker-op-002",
+            "role": "qa",
+            "agent_id": "gemma",
+            "work_order_id": "WO-052",
+            "result": {
+                "verdict": "PASS",
+                "review_notes": "Validation review for WO-052 is complete.",
+            },
+        }},
+    ]
+
+    recovered = recover_transcript_from_events(events, state, workspace=tmp_path)
+    # Only the user prompt and the architect's conversational answer should be in chat messages
+    assert len(recovered) == 2
+    assert recovered[0].role == "user"
+    assert recovered[0].content == "what's left?"
+    assert recovered[1].role == "assistant"
+    assert "The core Landing Page MVP is 100% built" in recovered[1].content
+
+    # Work order and old session reports must NOT be in state.messages
+    assert not any("WO-052" in m.content for m in state.messages)
+    assert not any("Old greeting" in m.content for m in state.messages)
+
+
 def test_responsive_terminal_sizing_landing():
     """Verify landing block degrades gracefully without breaking diamond or layout."""
     # Narrow display (width = 40)

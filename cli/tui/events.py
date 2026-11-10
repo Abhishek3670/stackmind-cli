@@ -1038,12 +1038,15 @@ def recover_transcript_from_events(
     """Recover visible conversation transcript and delivery state from event.list.
 
     Reconstructs user prompts and assistant responses while preventing
-    duplicate messages or duplicate activity entries.
+    duplicate messages or duplicate activity entries. Excludes internal
+    background work orders and QA reviews from polluting the chat viewport.
     """
+    import re
     from cli.tui.state import ChatMessage
 
     recovered: list[ChatMessage] = []
     sorted_events = sorted(events, key=lambda ev: ev.get("sequence", 0))
+    session_op_ids: set[str] = set()
 
     for ev in sorted_events:
         seq = ev.get("sequence")
@@ -1053,34 +1056,49 @@ def recover_transcript_from_events(
         name = str(ev.get("name", ""))
         payload = ev.get("payload", {}) if isinstance(ev.get("payload"), Mapping) else {}
 
+        # Collect session operation / task IDs
+        for k in ("operation_id", "task_id", "call_id"):
+            v = payload.get(k)
+            if v:
+                session_op_ids.add(str(v))
+        res = payload.get("result", {})
+        if isinstance(res, Mapping):
+            for k in ("operation_id", "task_id"):
+                v = res.get(k)
+                if v:
+                    session_op_ids.add(str(v))
+
         # Update core delivery state (operations, roles, WOs, verifications)
         state.process_event(ev)
 
+        role = str(payload.get("role") or "").lower().strip()
+        agent_id = str(payload.get("agent_id") or "").lower().strip()
+        delegated_from = payload.get("delegated_from") or payload.get("metadata", {}).get("delegated_from")
+        work_order_id = payload.get("work_order_id")
+        is_subagent_task = bool(
+            delegated_from
+            or work_order_id
+            or (role and role not in ("architecture", "claude", "user"))
+            or (agent_id and agent_id not in ("architecture", "claude"))
+        )
+
         # 1. Recover user prompt from turn.started or operation.started
         if name in {"turn.started", "operation.started"}:
-            prompt = payload.get("prompt") or payload.get("input")
-            role = str(payload.get("role") or "").lower().strip()
-            agent_id = str(payload.get("agent_id") or "").lower().strip()
-            delegated_from = payload.get("delegated_from") or payload.get("metadata", {}).get("delegated_from")
-            work_order_id = payload.get("work_order_id")
-            is_subagent_task = bool(
-                delegated_from
-                or work_order_id
-                or (role and role not in ("architecture", "claude", "user"))
-                or (agent_id and agent_id not in ("architecture", "claude"))
-            )
+            prompt = payload.get("prompt") or payload.get("input") or payload.get("metadata", {}).get("prompt")
             if not is_subagent_task and prompt and isinstance(prompt, str) and prompt.strip():
                 clean_prompt = prompt.strip()
-                msg_key = ("user", clean_prompt)
-                if msg_key not in state.seen_message_keys:
-                    state.seen_message_keys.add(msg_key)
-                    msg = state.add_message("user", clean_prompt)
-                    recovered.append(msg)
+                # Exclude internal supervisor delegation prompts
+                if not clean_prompt.startswith("All implementation work orders have been completed"):
+                    msg_key = ("user", clean_prompt)
+                    if msg_key not in state.seen_message_keys:
+                        state.seen_message_keys.add(msg_key)
+                        msg = state.add_message("user", clean_prompt)
+                        recovered.append(msg)
 
         # 2. Recover assistant response from toolResult, completed, or report
         elif name in {"event.toolResult", "operation.completed", "turn.completed"}:
-            res = payload.get("result") if isinstance(payload.get("result"), Mapping) else {}
-            rpt_raw = res.get("report_path")
+            res_dict = payload.get("result") if isinstance(payload.get("result"), Mapping) else {}
+            rpt_raw = res_dict.get("report_path")
             if rpt_raw:
                 try:
                     rp = Path(rpt_raw)
@@ -1091,15 +1109,16 @@ def recover_transcript_from_events(
                 except Exception:
                     pass
 
-            resp = extract_assistant_response(payload, workspace=workspace)
-            thinking = extract_assistant_thinking(payload, workspace=workspace)
-            if resp and isinstance(resp, str) and resp.strip():
-                clean_resp = resp.strip()
-                msg_key = ("assistant", clean_resp)
-                if msg_key not in state.seen_message_keys:
-                    state.seen_message_keys.add(msg_key)
-                    msg = state.add_message("assistant", clean_resp, thinking=thinking)
-                    recovered.append(msg)
+            if not is_subagent_task:
+                resp = extract_assistant_response(payload, workspace=workspace)
+                thinking = extract_assistant_thinking(payload, workspace=workspace)
+                if resp and isinstance(resp, str) and resp.strip():
+                    clean_resp = resp.strip()
+                    msg_key = ("assistant", clean_resp)
+                    if msg_key not in state.seen_message_keys:
+                        state.seen_message_keys.add(msg_key)
+                        msg = state.add_message("assistant", clean_resp, thinking=thinking)
+                        recovered.append(msg)
 
     # 3. Check outbox for any unattached harness reports if workspace provided
     if workspace:
@@ -1112,8 +1131,49 @@ def recover_transcript_from_events(
                         continue
                     state.seen_harness_reports.add(rpt_key)
 
+                # Skip reports from specialist workers and reviewers
+                parent_name = rpt.parent.name.lower()
+                if parent_name in (
+                    "gemma",
+                    "codex",
+                    "gemini",
+                    "local-llm",
+                    "qa",
+                    "backend",
+                    "frontend",
+                    "gitops",
+                    "security",
+                ):
+                    continue
+
                 try:
                     content = rpt.read_text(encoding="utf-8")
+                    # Skip internal work order executions and reviews
+                    if (
+                        "kind: `work_order`" in content
+                        or "kind: `review`" in content
+                        or "kind: work_order" in content
+                        or "kind: review" in content
+                        or "Validation review for" in content
+                        or "### QA Verdict:" in content
+                        or "### Verification" in content
+                        or bool(re.search(r"-\s*task:\s*`?WO-\d+", content))
+                        or bool(re.search(r"-\s*work_order_id:\s*`?WO-\d+", content))
+                    ):
+                        continue
+
+                    # If session operations are known, only attach reports belonging to this session
+                    if session_op_ids:
+                        task_match = re.search(r"-\s*task:\s*`?([^\s`]+)`?", content)
+                        header_match = re.search(r"#\s*Harness Report:\s*([^\s\n]+)", content)
+                        rpt_task_id = (
+                            task_match.group(1) if task_match else ""
+                        ) or (
+                            header_match.group(1) if header_match else ""
+                        )
+                        if rpt_task_id and rpt_task_id not in session_op_ids:
+                            continue
+
                     thinking = None
                     if "## Thinking" in content:
                         _, _, think_part = content.partition("## Thinking")
