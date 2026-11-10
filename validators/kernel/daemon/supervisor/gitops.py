@@ -254,12 +254,26 @@ class _GitopsMixin:
                         "timestamp": _now(),
                     }
                 )
-                # Do not advance past the final-review boundary when delivery
-                # integrity is not green: the run is not released, and the
-                # failure record (blocker codes, evidence sha256, reasons) is
-                # persisted so remediation can be resumed after a restart.
-                self._transition(state, Phase.FINAL_REVIEW)
-                return AdvanceResult.TRANSITIONED
+                # Bounded retry: if gitops retries exhausted, halt at WAITING_FOR_HUMAN
+                if state.gitops_retries < state.max_gitops_retries:
+                    state.gitops_retries += 1
+                    # Invalidate cached final review verdict so FINAL_REVIEW re-audits
+                    final_verdict_file = ws / ".sync" / "reviews" / "architect" / f"{state.run_id}.json"
+                    if final_verdict_file.is_file():
+                        try:
+                            final_verdict_file.unlink()
+                        except Exception:
+                            pass
+                    self._transition(state, Phase.FINAL_REVIEW)
+                    return AdvanceResult.TRANSITIONED
+                else:
+                    state.error = (
+                        f"{state.error} — release readiness retries exhausted "
+                        f"({state.gitops_retries}/{state.max_gitops_retries})"
+                    )
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
 
             # Guard against a time-of-check/time-of-use gap: the evidence that
             # authorized release must still be the evidence on disk now.
@@ -289,8 +303,24 @@ class _GitopsMixin:
                         "timestamp": _now(),
                     }
                 )
-                self._transition(state, Phase.FINAL_REVIEW)
-                return AdvanceResult.TRANSITIONED
+                if state.gitops_retries < state.max_gitops_retries:
+                    state.gitops_retries += 1
+                    final_verdict_file = ws / ".sync" / "reviews" / "architect" / f"{state.run_id}.json"
+                    if final_verdict_file.is_file():
+                        try:
+                            final_verdict_file.unlink()
+                        except Exception:
+                            pass
+                    self._transition(state, Phase.FINAL_REVIEW)
+                    return AdvanceResult.TRANSITIONED
+                else:
+                    state.error = (
+                        f"{state.error} — release readiness retries exhausted "
+                        f"({state.gitops_retries}/{state.max_gitops_retries})"
+                    )
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
 
             # Before committing, archive completed work orders to .sync/work-orders/COMPLETED/
             to_archive = list(state.completed_wo_ids)

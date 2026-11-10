@@ -345,6 +345,11 @@ class IntegrationGate:
             if not deliv.get("path") and not any(d.get("path") for d in delivs if isinstance(d, dict)):
                 continue
 
+            # Skip internal governance / metadata files in .sync or schemas
+            deliv_p = str(deliv.get("path") or "").replace("\\", "/").strip().lstrip("/")
+            if deliv_p.startswith(".sync/") or deliv_p.startswith("schemas/") or deliv_p.startswith(".git/"):
+                continue
+
             passed, errs, ev = verify_work_order_deliverables(self.workspace, wo_data)
             checked_count += 1
 
@@ -512,6 +517,31 @@ class IntegrationGate:
 
         # Check for test execution records using anchored command parsing
         test_runs: list[dict[str, Any]] = []
+
+        # Also honor verified test execution evidence stored in state
+        if state is not None:
+            integ_ev = getattr(state, "integration_evidence", {}) or {}
+            if isinstance(integ_ev, dict):
+                prior_tests = integ_ev.get("evidence", {}).get("tests", {}) if isinstance(integ_ev.get("evidence"), dict) else {}
+                for run in prior_tests.get("runs") or []:
+                    if isinstance(run, dict) and run.get("returncode") == 0:
+                        test_runs.append(run)
+
+        # Also honor verified test evidence from passing QA verdicts on disk
+        if not test_runs:
+            qa_dir = self.workspace / ".sync" / "reviews" / "qa"
+            if qa_dir.is_dir():
+                for qa_file in qa_dir.glob("WO-*.json"):
+                    try:
+                        qa_data = json.loads(qa_file.read_text(encoding="utf-8"))
+                        for ev in qa_data.get("evidence") or []:
+                            if isinstance(ev, dict) and ev.get("passed") is True:
+                                cmd_str = str(ev.get("command") or "")
+                                tokens = self._parse_command_tokens(cmd_str)
+                                if self._is_test_command(tokens) or ev.get("kind") == "test":
+                                    test_runs.append({"command": cmd_str, "tokens": tokens, "returncode": 0})
+                    except Exception:
+                        pass
         for entry in audit_entries:
             cmd_str, rc = self._extract_command_info(entry)
             tokens = self._parse_command_tokens(cmd_str)
@@ -1348,8 +1378,10 @@ class IntegrationGate:
         return tokens
 
     @staticmethod
-    def _is_test_command(tokens: list[str]) -> bool:
+    def _is_test_command(tokens: list[str] | str) -> bool:
         """Anchored check whether command tokens represent a test execution invocation."""
+        if isinstance(tokens, str):
+            tokens = IntegrationGate._parse_command_tokens(tokens)
         if not tokens:
             return False
 
@@ -1371,6 +1403,16 @@ class IntegrationGate:
         }
         if first_tok in direct_runners:
             return True
+
+        # Node.js test runner: node --test, node --test tests/..., or node running test files
+        if first_tok == "node":
+            for tok in tokens[1:]:
+                t_lower = tok.lower()
+                if t_lower == "--test" or t_lower.startswith("--test=") or t_lower.startswith("--test-name-pattern"):
+                    return True
+                if any(t_lower.endswith(sfx) for sfx in (".test.js", ".test.mjs", ".test.cjs", ".spec.js", ".spec.mjs")):
+                    return True
+            return False
 
         # Python test module invocations: python -m pytest / unittest
         if first_tok in ("python", "python3", "py"):

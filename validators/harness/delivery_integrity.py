@@ -38,6 +38,7 @@ import yaml
 
 from validators.harness import review_gate
 from validators.harness.integration_gate import IntegrationGate
+from validators.harness.plan import resolve_playbook_file
 
 PLANNING_GATE = "planning"
 ARTIFACT_GATE = "artifacts"
@@ -465,6 +466,17 @@ def plan_criteria(workspace: Path | str) -> list[str]:
                     text = str(item).strip()
                     if text and text not in criteria:
                         criteria.append(text)
+
+    if not criteria:
+        # Fall back to work orders' declared acceptance criteria
+        try:
+            for wo in load_work_orders(ws).values():
+                for c in wo.get("acceptance_criteria") or []:
+                    c_str = str(c).strip()
+                    if c_str and c_str not in criteria:
+                        criteria.append(c_str)
+        except Exception:
+            pass
     return criteria
 
 
@@ -527,7 +539,7 @@ def evaluate_planning_completeness(
 
     missing_deliverables = [
         wo_id for wo_id, wo in orders.items()
-        if not _declared_paths(wo) and str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE")
+        if not _declared_paths(wo) and str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE", "VALIDATION", "RESEARCH")
     ]
     checks.append(DeliveryCheck(
         "meaningful_deliverables",
@@ -561,7 +573,7 @@ def evaluate_planning_completeness(
 
     criteria_ownerless = [
         wo_id for wo_id, wo in orders.items()
-        if str(wo.get("type", "")).upper() not in ("GITOPS", "RELEASE")
+        if str(wo.get("type", "")).upper() not in ("GITOPS", "RELEASE", "VALIDATION", "RESEARCH")
         and not _criteria(wo)
         and not _requirements_refs(wo)
     ]
@@ -660,7 +672,28 @@ def evaluate_planning_completeness(
     for wo_id, wo in orders.items():
         for rel in _declared_paths(wo):
             owners.setdefault(rel, []).append(wo_id)
-    overlaps = {rel: ids for rel, ids in owners.items() if len(ids) > 1}
+    overlaps = {}
+    for rel, ids in owners.items():
+        if len(ids) > 1:
+            unjustified = []
+            for i, id1 in enumerate(ids):
+                wo1 = orders.get(id1, {})
+                t1 = str(wo1.get("type", "")).upper()
+                d1 = wo1.get("dependencies", []) or []
+                for id2 in ids[i+1:]:
+                    wo2 = orders.get(id2, {})
+                    t2 = str(wo2.get("type", "")).upper()
+                    d2 = wo2.get("dependencies", []) or []
+                    is_repair = (
+                        t1 in ("FIX", "BUGFIX", "HOTFIX", "REPAIR")
+                        or t2 in ("FIX", "BUGFIX", "HOTFIX", "REPAIR")
+                        or id1 in d2
+                        or id2 in d1
+                    )
+                    if not is_repair:
+                        unjustified.extend([id1, id2])
+            if unjustified:
+                overlaps[rel] = list(dict.fromkeys(unjustified))
     checks.append(DeliveryCheck(
         "no_unjustified_overlap",
         not overlaps,
@@ -778,7 +811,7 @@ def evaluate_artifact_integrity(
             continue
         declared = _declared_paths(wo)
         if not declared:
-            status = SKIPPED if str(wo.get("type", "")).upper() in ("GITOPS", "RELEASE") else FAILED
+            status = SKIPPED if str(wo.get("type", "")).upper() in ("GITOPS", "RELEASE", "VALIDATION", "RESEARCH") else FAILED
             checks.append(DeliveryCheck(
                 f"artifact:{wo_id}", status != FAILED, status,
                 f"Work order {wo_id} declares no artifact" if status == FAILED
@@ -849,6 +882,12 @@ def qa_status(workspace: Path | str, wo_id: str) -> tuple[str, str]:
         return (QA_PASSED if ok else QA_FAILED), reason if not ok else "QA verdict accepted"
     if raw == review_gate.QA_FAIL:
         return QA_FAILED, "QA verdict is FAIL"
+    if raw in (review_gate.QA_NO_TEST_EVIDENCE, review_gate.QA_PROVISIONAL_PASS, "QA_NO_TEST_EVIDENCE"):
+        # Accepted per work order, but never sufficient for delivery: tests were deferred.
+        return QA_INCONCLUSIVE, (
+            "QA verdict is provisional (NO_TEST_EVIDENCE): tests were deferred; "
+            "re-run QA against the authored tests to obtain a real PASS before delivery"
+        )
     if raw in ("RUNNING", "IN_PROGRESS", "PENDING"):
         return QA_RUNNING, "QA verdict is still in progress"
     if raw in ("BLOCKED", "WAITING_FOR_HUMAN"):
@@ -1135,7 +1174,7 @@ def evaluate_release_readiness(
     # Governance: every completed implementation order has an authoritative contract.
     missing_contracts = [
         wo_id for wo_id, wo in orders.items()
-        if str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE")
+        if str(wo.get("type", "")).upper() not in ("QA", "GITOPS", "RELEASE", "VALIDATION", "RESEARCH")
         and not (ws / ".sync" / "contracts" / f"{wo_id}.yaml").is_file()
     ]
     checks.append(DeliveryCheck(

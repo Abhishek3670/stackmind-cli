@@ -859,6 +859,9 @@ def cancel_work_order(
     ref = load_work_order(root, wo_id)
     if not ref:
         return None
+    # Never cancel a work order that is already completed or archived in COMPLETED
+    if str(ref.data.get("status", "")).upper() == "COMPLETED" or ref.path.parent.name == "COMPLETED":
+        return None
     now_str = utc_now()
     data = dict(ref.data)
     data["status"] = "CANCELLED"

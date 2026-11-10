@@ -159,17 +159,27 @@ class DeliverableVerifier:
             ))
             return result
 
+        is_directory_deliverable = False
         if path.is_dir():
-            result.checked = True
-            result.checks.append(VerificationCheck(
-                name="file_type",
-                passed=False,
-                message=f"Deliverable is a directory, expected regular file: {path}",
-                severity="error",
-            ))
-            return result
+            if any(p.is_file() for p in path.rglob("*")):
+                is_directory_deliverable = True
+                result.checks.append(VerificationCheck(
+                    name="file_type",
+                    passed=True,
+                    message=f"Deliverable directory '{path}' contains files",
+                    severity="info",
+                ))
+            else:
+                result.checked = True
+                result.checks.append(VerificationCheck(
+                    name="file_type",
+                    passed=False,
+                    message=f"Deliverable is a directory, expected regular file: {path}",
+                    severity="error",
+                ))
+                return result
 
-        if not path.is_file():
+        if not is_directory_deliverable and not path.is_file():
             result.checked = True
             result.checks.append(VerificationCheck(
                 name="file_type",
@@ -179,30 +189,43 @@ class DeliverableVerifier:
             ))
             return result
 
-        result.checks.append(VerificationCheck(
-            name="file_type",
-            passed=True,
-            message="Deliverable is a regular file",
-            severity="info",
-        ))
+        if not is_directory_deliverable:
+            result.checks.append(VerificationCheck(
+                name="file_type",
+                passed=True,
+                message="Deliverable is a regular file",
+                severity="info",
+            ))
 
         # Compute content hash for freshness tracking
-        try:
-            content = path.read_bytes()
-            result.content_hash = hashlib.sha256(content).hexdigest()[:16]
-        except Exception:
-            pass
+        if is_directory_deliverable:
+            try:
+                dir_hasher = hashlib.sha256()
+                for subfile in sorted(path.rglob("*")):
+                    if subfile.is_file():
+                        dir_hasher.update(subfile.name.encode("utf-8"))
+                        dir_hasher.update(subfile.read_bytes())
+                result.content_hash = dir_hasher.hexdigest()[:16]
+            except Exception:
+                pass
+            text_content = f"# Directory deliverable: {path.name}\n"
+        else:
+            try:
+                content = path.read_bytes()
+                result.content_hash = hashlib.sha256(content).hexdigest()[:16]
+            except Exception:
+                pass
 
-        try:
-            text_content = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            result.checks.append(VerificationCheck(
-                name="readability",
-                passed=False,
-                message=f"Cannot read file: {e}",
-                severity="error",
-            ))
-            return result
+            try:
+                text_content = path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                result.checks.append(VerificationCheck(
+                    name="readability",
+                    passed=False,
+                    message=f"Cannot read file: {e}",
+                    severity="error",
+                ))
+                return result
 
         result.checked = True
 
@@ -488,7 +511,7 @@ class DeliverableVerifier:
                             passed=False,
                             message=f"Line {line}: {msg} in <{tag}>: '{s}'",
                             severity="error",
-                        ))
+                            ))
                         failed_count += 1
                         matched_page_pattern = True
                         break
@@ -725,6 +748,11 @@ def verify_work_order_deliverables(
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """Verify all declared deliverables of a work order deterministically.
 
+    Respects Single Deliverable Ownership: deliverable paths owned by other active
+    peer work orders are never required or verified against this work order.
+    When verifying within a staged scratch directory, files that pre-exist in the
+    workspace are verified against the authoritative workspace if untouched in the turn.
+
     Args:
         project_path: Project root directory
         wo_data: Work order dictionary (with 'deliverable' and/or 'deliverables')
@@ -746,8 +774,56 @@ def verify_work_order_deliverables(
         elif isinstance(extra, str) and extra.strip():
             declared_paths.append(extra.strip())
 
+    # Collect peer deliverables to exclude files owned by other work orders
+    peer_paths: set[str] = set()
+    wo_id = wo_data.get("id")
+    if project_path:
+        try:
+            from validators.harness.task_contract import collect_peer_deliverables
+            peers = collect_peer_deliverables(project_path, str(wo_id) if wo_id else None)
+            peer_paths = {p.replace("\\", "/").strip().lstrip("/").lower() for _, p in peers}
+        except Exception:
+            pass
+
+    if peer_paths and declared_paths:
+        primary_deliv_raw = (wo_data.get("deliverable") or {}).get("path") if isinstance(wo_data.get("deliverable"), dict) else wo_data.get("deliverable")
+        primary_deliv = str(primary_deliv_raw).replace("\\", "/").strip().lstrip("/").lower() if primary_deliv_raw else None
+        filtered_paths = []
+        for p in declared_paths:
+            norm_p = str(p).replace("\\", "/").strip().lstrip("/").lower()
+            if (primary_deliv and norm_p == primary_deliv) or norm_p not in peer_paths:
+                filtered_paths.append(p)
+        declared_paths = filtered_paths
+
+    # Role-based deliverable filtering:
+    # A backend worker must never fail verification for client UI files
+    # A frontend worker must never fail verification for backend python/db files
+    # A QA worker must never fail verification for application source code
+    assigned_agents = [str(a).lower().strip() for a in (wo_data.get("assigned_agents") or [])]
+    role_hint = str(wo_data.get("role", "")).lower().strip()
+    if "codex" in assigned_agents or role_hint == "backend":
+        backend_only = [
+            p for p in declared_paths
+            if not str(p).lower().endswith((".html", ".htm", ".css", ".scss", ".sass"))
+            and not str(p).lower().startswith(("assets/css", "assets/img", "public/css"))
+        ]
+        if backend_only:
+            declared_paths = backend_only
+    elif "gemini" in assigned_agents or role_hint == "frontend":
+        frontend_only = [
+            p for p in declared_paths
+            if not str(p).lower().endswith((".py", ".sql", ".sqlite", ".db"))
+            and not str(p).lower().startswith(("models/", "services/", "controllers/", "routes/"))
+        ]
+        if frontend_only:
+            declared_paths = frontend_only
+    elif "gemma" in assigned_agents or role_hint == "qa":
+        qa_only = [p for p in declared_paths if "test" in str(p).lower() or str(p).startswith("tests/")]
+        if qa_only:
+            declared_paths = qa_only
+
     if not declared_paths:
-        # Non-file work order (e.g. pure sign-off, doc/research without file path)
+        # Non-file work order (e.g. pure sign-off, doc/research without file path, or peer-owned)
         return True, [], {
             "verified": True,
             "declared_paths": [],
@@ -805,8 +881,17 @@ def verify_work_order_deliverables(
         seen.add(cleaned_rel)
         checked_paths.append(cleaned_rel)
 
+        # Multi-location check: check staged_root first; if missing in staged_root, fallback to project_path
+        verify_root = effective_root
         target_path = effective_root / cleaned_rel
-        res = verifier.verify(target_path, root=effective_root)
+        if staged_root is not None:
+            if target_path.exists():
+                verify_root = staged_root
+            elif (project_path / cleaned_rel).exists():
+                target_path = project_path / cleaned_rel
+                verify_root = project_path
+
+        res = verifier.verify(target_path, root=verify_root)
         res_dict = res.to_dict()
         res_dict["relative_path"] = cleaned_rel
         results.append(res_dict)

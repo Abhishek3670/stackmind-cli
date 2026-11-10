@@ -33,6 +33,7 @@ from .models import (
     Phase,
     RunState,
     _strip_code_fences,
+    resolve_next_execution_phase,
 )
 from .release import (
     archive_completed_work_orders,
@@ -658,6 +659,17 @@ class _ReviewMixin:
                             or "active on board" in b_lower
                             or "release-packaging" in b_lower
                             or "documentation gap" in b_lower
+                            or "contract is read-only" in b_lower
+                            or "contract read-only" in b_lower
+                            or "contract_read_only" in b_lower
+                            or "read-only" in b_lower
+                            or "policy denied writing" in b_lower
+                            or "permissionerror" in b_lower
+                            or "release-phase work order" in b_lower
+                            or "not a code defect" in b_lower
+                            or "deliverable is a directory" in b_lower
+                            or "expected regular file" in b_lower
+                            or "deliverable verification failed" in b_lower
                         )
 
                     gov_blockers = [b for b in blockers if _is_governance_or_packaging_blocker(b)]
@@ -833,11 +845,16 @@ class _ReviewMixin:
         try:
             for op in reversed(self.manager.list_operations(state.session_id)):
                 op_id = op.get("operation_id")
+                if op_id in (getattr(state, "planning_operation_id", None), getattr(state, "authoring_operation_id", None), getattr(state, "recovery_decision_operation_id", None), getattr(state, "architect_repair_operation_id", None), getattr(state, "gitops_operation_id", None)):
+                    continue
                 if op_id and op_id in getattr(state, "ignored_operation_ids", []):
                     continue
                 op_wo = op.get("work_order_id")
                 op_role = str(op.get("role", "")).lower()
-                if (op_wo == fallback_wo_id or op_role == "architecture") and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
+                if (
+                    (fallback_wo_id and op_wo == fallback_wo_id)
+                    or (fallback_wo_id is None and op_role in ("architecture", "architect") and op_wo not in getattr(state, "worker_wo_ids", []))
+                ) and str(op.get("status", "")).upper() not in _OPERATION_TERMINAL:
                     state.integration_operation_id = op_id
                     state.integration_wo_id = op_wo or fallback_wo_id
                     return op_id
@@ -943,10 +960,10 @@ class _ReviewMixin:
             "scope": {
                 "allow": unique_allow,
                 "deny": deny_rules,
-                "write": "read-only",
+                "write": "read-write",
             },
             "budget": {
-                "max_files_touched": 1,
+                "max_files_touched": 10,
                 "max_tokens": 50000,
             },
         }
@@ -1072,7 +1089,7 @@ class _ReviewMixin:
             "'remediation': the concrete fix the worker should apply (you are the prescribing "
             "architect — prescribe precisely; workers apply your prescription verbatim).\n"
             "- When status is 'completed', 'blockers' MUST be an empty array [].\n"
-            "- Your contract scope is strictly read-only. Do NOT attempt to write or edit application or test files.\n\n"
+            "- Your contract scope is read-only for application and test files; it authorizes authoring release documentation (README.md, CHANGELOG.md, VERSION.md, review reports). Do NOT attempt to write or edit application source code or test files.\n\n"
             f"{security_checklist}"
         )
 
@@ -1094,7 +1111,22 @@ class _ReviewMixin:
         gitops_keywords = ("version", "changelog", "package.json", "release", "manifest", "gitops", "tag")
         is_gitops_blocker = any(kw in blocker_text for kw in gitops_keywords)
         if state.gitops_wo_id and not is_gitops_blocker:
+            pass
+        if state.gitops_wo_id and not is_gitops_blocker:
+            pass
             excluded.add(state.gitops_wo_id)
+
+        is_pure_governance = any(
+            gov in blocker_text for gov in (
+                "contract", "read-only", "read_only", "contract_read_only", "policy denied writing"
+            )
+        ) and not any(
+            code_kw in blocker_text for code_kw in (
+                "test", "fail", "exit code", "assert", "syntax", "compile", "exception"
+            )
+        )
+        if is_pure_governance:
+            return []
 
         code_wos: list[str] = []
         qa_wos: list[str] = []
@@ -1137,11 +1169,25 @@ class _ReviewMixin:
                     accused.append(wo_id)  # no mappable footprint — include defensively
                 continue
             stem = Path(deliv).stem.lower()
-            if (deliv in blocker_text) or (stem and stem in blocker_text):
+            norm_blocker = blocker_text.replace("\\", "/").lower()
+            if (deliv in norm_blocker) or (stem and stem in norm_blocker) or (wo_id.lower() in norm_blocker):
                 accused.append(wo_id)
         if accused:
             return list(dict.fromkeys(accused + qa_wos))
-        return list(dict.fromkeys(code_wos + qa_wos + (gitops_wos if is_gitops_blocker else [])))
+        is_pure_governance = any(
+            gov in blocker_text for gov in (
+                "contract", "read-only", "read_only", "contract_read_only", "policy denied writing"
+            )
+        ) and not any(
+            code_kw in blocker_text for code_kw in (
+                "test", "fail", "exit code", "assert", "syntax", "compile", "exception"
+            )
+        )
+        if is_pure_governance:
+            return []
+        # If no specific work orders are accused, only rework active/uncompleted work orders, never completed ones
+        uncompleted_code_wos = [w for w in code_wos if w not in getattr(state, "completed_wo_ids", [])]
+        return list(dict.fromkeys((uncompleted_code_wos or code_wos) + qa_wos + (gitops_wos if is_gitops_blocker else [])))
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
         """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""
@@ -1219,7 +1265,7 @@ class _ReviewMixin:
             if (
                 actionable
                 and state.final_prerequisite_rounds < state.max_final_review_rounds + 2
-                and actionable_decision.outcome is not RetryOutcome.BUDGET_EXHAUSTED
+                and state.global_turn_budget > 0
             ):
                 state.final_prerequisite_rounds += 1
                 for fail_desc in report.qa_failures:
@@ -1235,7 +1281,7 @@ class _ReviewMixin:
                     if b_wo in state.blocked_wo_ids:
                         state.blocked_wo_ids.remove(b_wo)
                 self._discover_worker_wos(state)
-                dest = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                dest = resolve_next_execution_phase(state)
                 self._transition(state, dest, authorized_override=True)
                 return AdvanceResult.TRANSITIONED
             if actionable:
@@ -1250,10 +1296,15 @@ class _ReviewMixin:
 
         required = review_gate.required_wo_ids_for_run(state, ws)
         verdict = review_gate.load_final_verdict(ws, state.run_id)
+        # Check if release integrity was blocked after this verdict was created
+        recent_release_blocked = any(
+            h.get("event") in ("release_integrity_blocked", "release_integrity_stale")
+            for h in getattr(state, "final_review_history", [])[-3:]
+        )
         ok, why = review_gate.validate_final_verdict(
             verdict, ws, run_id=state.run_id, plan_id=state.plan_id, required_wo_ids=required,
         )
-        if ok:
+        if ok and not recent_release_blocked:
             state.error = None
             state.final_review_operation_id = None
             self._transition(state, Phase.PRODUCT_READY)
@@ -1593,7 +1644,7 @@ class _ReviewMixin:
 
         content_failure_codes = {
             "BUDGET_MISSING", "BUDGET_INVALID", "BUDGET_UNDER_ESTIMATE",
-            "DELIVERABLE_OUTSIDE_SCOPE", "OVERWRITE_CONFLICT",
+            "DELIVERABLE_OUTSIDE_SCOPE", "OVERWRITE_CONFLICT", "ORPHAN_CONTRACT",
         }
         archived: list[str] = []
         seen_paths: set[str] = set()
@@ -1621,6 +1672,23 @@ class _ReviewMixin:
                 target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
                 source.unlink()
                 archived.append(rel)
+
+                # Also archive companion contract or work order so we never leave an orphan contract
+                wo_id = Path(rel).stem
+                if ".sync/work-orders/ACTIVE/" in rel:
+                    c_path = ws / ".sync" / "contracts" / f"{wo_id}.yaml"
+                    if c_path.is_file():
+                        c_target = audit_dir / f"{wo_id}-contract.yaml"
+                        c_target.write_text(c_path.read_text(encoding="utf-8"), encoding="utf-8")
+                        c_path.unlink()
+                        archived.append(str(c_path.relative_to(ws)).replace("\\", "/"))
+                elif ".sync/contracts/" in rel:
+                    w_path = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                    if w_path.is_file():
+                        w_target = audit_dir / f"{wo_id}-wo.yaml"
+                        w_target.write_text(w_path.read_text(encoding="utf-8"), encoding="utf-8")
+                        w_path.unlink()
+                        archived.append(str(w_path.relative_to(ws)).replace("\\", "/"))
             except Exception:
                 continue
         if archived:

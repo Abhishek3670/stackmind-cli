@@ -374,6 +374,12 @@ def validate_dependency_graph(
     """
     records = load_all_work_orders(root)
     superseded = {str(s) for s in superseded_ids}
+    for wid, ref in records.items():
+        st = str(ref.data.get("status", "")).upper()
+        if st in ("SUPERSEDED", "CANCELLED"):
+            superseded.add(wid)
+        elif st == "COMPLETED" and not ref.data.get("superseded_by"):
+            superseded.discard(wid)
     graph = _declared_graph(root, records)
     issues: list[GraphIssue] = []
     plan_ids = {
@@ -383,6 +389,14 @@ def validate_dependency_graph(
     }
 
     for wo_id in sorted(graph):
+        wo_ref = records.get(wo_id)
+        if wo_ref is not None and (
+            wo_ref.bucket == "COMPLETED"
+            or str(wo_ref.data.get("status", "")).upper() == "COMPLETED"
+            or bool(wo_ref.data.get("completion"))
+        ):
+            # Completed work orders were already satisfied; do not fail graph validation retrospectively
+            continue
         for dep in graph[wo_id]:
             if not _WO_ID_RE.match(dep):
                 issues.append(
@@ -419,7 +433,17 @@ def validate_dependency_graph(
                 )
                 continue
             if dep in superseded:
+                # Completed work orders were already satisfied; do not fail graph validation retrospectively
+                wo_ref = records.get(wo_id)
+                if wo_ref is not None and (
+                    wo_ref.bucket == "COMPLETED"
+                    or str(wo_ref.data.get("status", "")).upper() == "COMPLETED"
+                ):
+                    continue
                 successor = _successor_for(records, dep)
+                if successor == wo_id:
+                    # Self-supersession: this work order replaced the dependency
+                    continue
                 issues.append(
                     GraphIssue(
                         code="SUPERSEDED_DEPENDENCY",
@@ -475,6 +499,35 @@ def _successor_for(records: Mapping[str, Any], wo_id: str) -> str | None:
     split = data.get("replacement_work_orders")
     if isinstance(split, list) and split:
         return str(split[-1])
+    # Fallback 1: check log text for rebase/replacement pointer (e.g. rebased onto WO-001)
+    log_entries = data.get("log") or []
+    if isinstance(log_entries, list):
+        for entry in log_entries:
+            if isinstance(entry, str):
+                m = re.search(r'(?:rebased|replaced|superseded).*?onto(?:\s+the\s+completed\s+\w+)?\s+(WO-\d+)', entry, re.I)
+                if m:
+                    candidate = m.group(1).upper()
+                    if candidate in records:
+                        return candidate
+    for key in ("cancellation_reason", "error"):
+        reason = str(data.get(key) or "")
+        if reason:
+            m = re.search(r'(?:superseded|replaced)\s+by\s+(?:completed\s+)?(WO-\d+)', reason, re.I)
+            if m:
+                candidate = m.group(1).upper()
+                if candidate in records:
+                    return candidate
+    # Fallback 2: if cancelled/superseded, find another completed work order with matching deliverable
+    status = str(data.get("status", "")).upper()
+    if status in ("CANCELLED", "SUPERSEDED"):
+        deliv = data.get("deliverable")
+        if isinstance(deliv, dict) and deliv.get("path"):
+            target_path = str(deliv.get("path")).strip()
+            for other_id, other_ref in records.items():
+                if other_id != wo_id and str(other_ref.data.get("status", "")).upper() == "COMPLETED":
+                    other_deliv = other_ref.data.get("deliverable")
+                    if isinstance(other_deliv, dict) and str(other_deliv.get("path", "")).strip() == target_path:
+                        return other_id
     return None
 
 
@@ -567,8 +620,20 @@ def _observe_prerequisite_uncached(
         contract_revision=contract_rev,
     )
 
-    if dep_id in superseded_ids or status == "SUPERSEDED":
+    is_superseded = status == "SUPERSEDED" or (
+        dep_id in superseded_ids
+        and not (status == "COMPLETED" and not data.get("superseded_by"))
+    )
+    if is_superseded:
         successor = _successor_for(records, dep_id)
+        if successor and lineage and (successor in lineage or successor == lineage[-1]):
+            return PrerequisiteObservation(
+                **base,
+                state=PrerequisiteState.COMPLETED_VALID,
+                detail=f"superseded by calling work order {successor}",
+                expected_action="none",
+                resolution_owner="worker",
+            )
         return PrerequisiteObservation(
             **base,
             state=PrerequisiteState.SUPERSEDED,
@@ -862,6 +927,20 @@ def evaluate_dependencies(
 
     records = load_all_work_orders(root)
     ref = records.get(wo_id)
+    if ref is not None and (
+        ref.bucket == "COMPLETED"
+        or str(ref.data.get("status", "")).upper() == "COMPLETED"
+        or bool(ref.data.get("completion"))
+    ):
+        return DependencyResult(
+            work_order_id=wo_id,
+            status=DependencyStatus.SATISFIED,
+            code="DEPENDENCIES_SATISFIED",
+            detail="work order is already completed",
+            evaluated_at=evaluated_at,
+            dependencies=declaration.dependencies,
+            fingerprint=_fingerprint({"wo": wo_id, "status": "completed"}),
+        )
     revision = ref.revision if ref is not None else None
     contract_rev = contract_revision(root, wo_id)
 
@@ -889,10 +968,38 @@ def evaluate_dependencies(
             blocked_ids=blocked,
             failed_ids=failed,
             superseded_ids=superseded,
+            lineage=(wo_id,),
             cache=observation_cache,
         )
         for dep_id in declaration.dependencies
     )
+
+    wo_data = ref.data if ref is not None else load_work_order(root, wo_id) or {}
+    wo_type = str(wo_data.get("type", "")).upper().strip()
+    is_bugfix_order = wo_type in ("BUGFIX", "HOTFIX", "FIX")
+
+    if is_bugfix_order:
+        remediated_observations = []
+        for obs in observations:
+            if not obs.state.satisfies and obs.state in (PrerequisiteState.BLOCKED, PrerequisiteState.FAILED):
+                dep_data = records.get(obs.wo_id)
+                dep_dict = dep_data.data if dep_data is not None else load_work_order(root, obs.wo_id) or {}
+                from validators.harness.review_gate import wo_deliverable_paths
+                delivs = wo_deliverable_paths(dep_dict)
+                if delivs and all((root / d).exists() for d in delivs):
+                    deliv_str = ", ".join(delivs)
+                    remediated_obs = PrerequisiteObservation(
+                        wo_id=obs.wo_id,
+                        bucket=obs.bucket,
+                        revision=obs.revision,
+                        contract_revision=obs.contract_revision,
+                        state=PrerequisiteState.COMPLETED_VALID,
+                        detail=f"prerequisite deliverable present on disk for {wo_type} repair ({deliv_str})",
+                    )
+                    remediated_observations.append(remediated_obs)
+                    continue
+            remediated_observations.append(obs)
+        observations = tuple(remediated_observations)
 
     if graph_issues:
         status = DependencyStatus.INVALID

@@ -110,6 +110,36 @@ def repair_unquoted_yaml_scalars(text: str) -> str:
                     out.append(f"{indent}{key}: >-")
                     out.extend(block_lines)
                     continue
+
+        # ponytail: auto-escape nested double quotes or unquoted colons in list items
+        # If the list item starts a mapping (e.g. - revision: 6 or - module: index.html),
+        # do NOT wrap the key in quotes; only escape the value if the value contains unquoted ': '
+        kv_match = re.match(r"^(\s*-\s*)([a-zA-Z0-9_-]+)\s*:\s*(.*)$", line)
+        if kv_match:
+            prefix, k, v = kv_match.groups()
+            stripped_v = v.strip()
+            if ": " in stripped_v and not (stripped_v.startswith('"') or stripped_v.startswith("'")):
+                escaped = stripped_v.replace('"', '\\"')
+                line = f'{prefix}{k}: "{escaped}"'
+        else:
+            list_item_match = re.match(r"^(\s*-\s*)(.*)$", line)
+            if list_item_match:
+                prefix, val = list_item_match.groups()
+                stripped_val = val.strip()
+                if stripped_val and not stripped_val.startswith(("> ", "| ", "---")):
+                    if '"' in val:
+                        if stripped_val.startswith('"') and stripped_val.endswith('"') and len(stripped_val) >= 2:
+                            inner = stripped_val[1:-1]
+                            if '"' in inner:
+                                inner_escaped = re.sub(r'(?<!\\)"', r'\"', inner)
+                                line = f'{prefix}"{inner_escaped}"'
+                        else:
+                            val_escaped = re.sub(r'(?<!\\)"', r'\"', stripped_val)
+                            line = f'{prefix}"{val_escaped}"'
+                    elif ":" in val and not (stripped_val.startswith('"') or stripped_val.startswith("'")):
+                        escaped = stripped_val.replace('"', '\\"')
+                        line = f'{prefix}"{escaped}"'
+
         out.append(line)
         i += 1
     return "\n".join(out)
@@ -199,11 +229,115 @@ def normalize_work_order_data(
     if not isinstance(data, dict):
         return data
 
+    # Normalize work-order type
+    WO_TYPE_MAP = {
+        "QA": "VALIDATION",
+        "TEST": "VALIDATION",
+        "TESTING": "VALIDATION",
+        "VERIFICATION": "VALIDATION",
+        "REVIEW": "VALIDATION",
+    }
+    raw_type = data.get("type")
+    if isinstance(raw_type, str):
+        cleaned_type = raw_type.strip().upper()
+        if cleaned_type in WO_TYPE_MAP:
+            data["type"] = WO_TYPE_MAP[cleaned_type]
+        else:
+            data["type"] = cleaned_type
+    elif not raw_type:
+        data["type"] = "FEATURE"
+
+    # Normalize deliverable.type and deliverables[].type
+    DELIVERABLE_TYPE_MAP = {
+        "report": "doc",
+        "documentation": "doc",
+        "document": "doc",
+        "markdown": "doc",
+        "audit": "doc",
+        "review": "doc",
+        "test": "code",
+        "tests": "code",
+        "testing": "code",
+        "script": "code",
+        "scripts": "code",
+        "configuration": "config",
+        "conf": "config",
+    }
+    raw_deliv = data.get("deliverable")
+    if isinstance(raw_deliv, str) and raw_deliv.strip():
+        p = raw_deliv.strip()
+        dtype = "doc" if p.endswith((".md", ".txt", ".rst")) else ("config" if p.endswith((".json", ".yaml", ".yml", ".toml")) else "code")
+        data["deliverable"] = {
+            "path": p,
+            "type": dtype,
+            "description": data.get("description") or f"Deliverable {p} for {data.get('title', 'work order')}",
+        }
+    elif isinstance(raw_deliv, dict):
+        deliv = raw_deliv
+        dtype = deliv.get("type")
+        if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+            deliv["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+        elif not dtype or not isinstance(dtype, str):
+            p = str(deliv.get("path", "")).strip()
+            deliv["type"] = "doc" if p.endswith((".md", ".txt", ".rst")) else ("config" if p.endswith((".json", ".yaml", ".yml", ".toml")) else "code")
+        if not deliv.get("description") or not str(deliv.get("description")).strip():
+            deliv["description"] = data.get("description") or f"Deliverable for {data.get('title', data.get('id', 'work order'))}"
+    elif not raw_deliv:
+        # Preserve deliverable from existing work order on disk (e.g. during amendment)
+        prior_deliv = None
+        wo_id = data.get("id")
+        if project_root and wo_id:
+            for bucket in ("ACTIVE", "COMPLETED"):
+                cand = Path(project_root) / ".sync" / "work-orders" / bucket / f"{wo_id}.yaml"
+                if cand.is_file():
+                    try:
+                        orig = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                        if isinstance(orig, dict) and orig.get("deliverable"):
+                            prior_deliv = orig["deliverable"]
+                            break
+                    except Exception:
+                        pass
+        if prior_deliv:
+            data["deliverable"] = prior_deliv
+        else:
+            delivs = data.get("deliverables")
+            if isinstance(delivs, list) and delivs and isinstance(delivs[0], dict):
+                first = dict(delivs[0])
+                dtype = first.get("type")
+                if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+                    first["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+                elif not dtype:
+                    first["type"] = "code"
+                if not first.get("description"):
+                    first["description"] = data.get("description") or f"Deliverable for {data.get('title', 'work order')}"
+                data["deliverable"] = first
+
+    deliverables = data.get("deliverables")
+    if isinstance(deliverables, list):
+        for item in deliverables:
+            if isinstance(item, dict):
+                dtype = item.get("type")
+                if isinstance(dtype, str) and dtype.lower().strip() in DELIVERABLE_TYPE_MAP:
+                    item["type"] = DELIVERABLE_TYPE_MAP[dtype.lower().strip()]
+
     deliverable = data.get("deliverable")
     if isinstance(deliverable, dict) and "acceptance_criteria" in deliverable:
         crit = deliverable.pop("acceptance_criteria")
         if "acceptance_criteria" not in data or not data["acceptance_criteria"]:
             data["acceptance_criteria"] = crit
+
+    # Reconcile role vs deliverable compatibility
+    assigned = [str(a).lower().strip() for a in (data.get("assigned_agents") or [])]
+    deliv_entry = data.get("deliverable")
+    if isinstance(deliv_entry, dict) and deliv_entry.get("path"):
+        d_path = str(deliv_entry["path"]).strip().lower()
+        if "codex" in assigned and any(d_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+            alt = next((e for e in (data.get("deliverables") or []) if isinstance(e, dict) and not str(e.get("path", "")).lower().endswith((".html", ".htm", ".css"))), None)
+            if alt:
+                data["deliverable"] = alt
+            elif any(w in str(data.get("title", "")).lower() for w in ("scaffold", "dependency", "manifest", "setup")):
+                deliv_entry["path"] = "package.json"
+                deliv_entry["type"] = "config"
 
     # Absorb revision notes / amendment reasons into amendments array
     note = (
@@ -250,15 +384,57 @@ def normalize_work_order_data(
     elif isinstance(ac, list):
         data["acceptance_criteria"] = [str(x).strip() for x in ac if str(x).strip()]
 
-    # Normalize assigned_agents to list[str] if string
+    # Normalize assigned_agents
+    if not data.get("assigned_agents"):
+        for alias_key in ("agent", "assigned_agent", "owner", "assigned_to", "assignee", "assigned"):
+            val = data.get(alias_key)
+            if isinstance(val, str) and val.strip():
+                data["assigned_agents"] = [val.strip()]
+                break
+            elif isinstance(val, list) and val:
+                data["assigned_agents"] = [str(x).strip() for x in val if str(x).strip()]
+                break
     assigned = data.get("assigned_agents")
     if isinstance(assigned, str) and assigned.strip():
         data["assigned_agents"] = [assigned.strip()]
+    elif isinstance(assigned, list):
+        data["assigned_agents"] = [str(x).strip() for x in assigned if str(x).strip()]
+    if not data.get("assigned_agents"):
+        deliv = data.get("deliverable")
+        path_str = str(deliv.get("path") if isinstance(deliv, dict) else (deliv or "")).lower()
+        wo_type = str(data.get("type", "")).upper()
+        if wo_type == "VALIDATION":
+            data["assigned_agents"] = ["gemma"]
+        elif any(ext in path_str for ext in (".html", ".css", "assets/", "style", "ui")):
+            data["assigned_agents"] = ["gemini"]
+        elif wo_type in ("AUDIT", "RESEARCH") or any(ext in path_str for ext in ("version", "changelog", "readme")):
+            data["assigned_agents"] = ["local-llm"]
+        else:
+            data["assigned_agents"] = ["codex"]
 
-    # Normalize dependencies to list[str] if string
+    # Normalize dependencies
     deps = data.get("dependencies")
     if isinstance(deps, str):
         data["dependencies"] = [deps.strip()] if deps.strip() else []
+    elif isinstance(deps, list):
+        data["dependencies"] = [str(x).strip() for x in deps if str(x).strip()]
+
+    # Normalize priority
+    pri = data.get("priority")
+    if isinstance(pri, str):
+        pri_clean = pri.strip().upper()
+        if pri_clean in ("P0", "P1", "P2", "P3"):
+            data["priority"] = pri_clean
+
+    # Normalize status
+    stat = data.get("status")
+    if isinstance(stat, str):
+        stat_clean = stat.strip().upper()
+        if stat_clean == "IN_PROGRESS":
+            stat_clean = "ACTIVE"
+        elif stat_clean == "DONE":
+            stat_clean = "COMPLETED"
+        data["status"] = stat_clean
 
     # Normalize revision to integer if numeric string
     if "revision" in data and not isinstance(data["revision"], int):
@@ -461,6 +637,58 @@ def normalize_contract_data(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def normalize_index_data(
+    data: dict[str, Any], project_root: Path | None = None
+) -> dict[str, Any]:
+    """Normalize common LLM shorthand/structure issues in work order index dictionaries."""
+    if not isinstance(data, dict):
+        return data
+
+    if "schema_version" not in data:
+        data["schema_version"] = 1
+    elif not isinstance(data["schema_version"], int):
+        try:
+            data["schema_version"] = int(data["schema_version"])
+        except Exception:
+            data["schema_version"] = 1
+
+    # Map work_orders / items / orders_list -> orders
+    if "orders" not in data:
+        if isinstance(data.get("work_orders"), list):
+            data["orders"] = data.pop("work_orders")
+        elif isinstance(data.get("items"), list):
+            data["orders"] = data.pop("items")
+        elif isinstance(data.get("orders_list"), list):
+            data["orders"] = data.pop("orders_list")
+        else:
+            data["orders"] = []
+
+    if isinstance(data.get("orders"), list):
+        clean_orders = []
+        for o in data["orders"]:
+            if isinstance(o, dict):
+                o = normalize_work_order_data(o, project_root=project_root)
+                if "id" not in o and "wo_id" in o:
+                    o["id"] = o.pop("wo_id")
+                if "status" not in o:
+                    o["status"] = "READY"
+                if "title" not in o:
+                    o["title"] = f"Work Order {o.get('id', '')}".strip()
+                clean_orders.append(o)
+        data["orders"] = clean_orders
+
+    if "next_id" not in data or not isinstance(data.get("next_id"), int):
+        max_id = 0
+        for o in data.get("orders", []):
+            if isinstance(o, dict) and "id" in o:
+                m = re.search(r"(\d+)", str(o["id"]))
+                if m:
+                    max_id = max(max_id, int(m.group(1)))
+        data["next_id"] = max_id + 1
+
+    return data
+
+
 def validate_artifact_content(
     rel_path: str,
     content: str,
@@ -568,7 +796,12 @@ def validate_artifact_content(
             except Exception:
                 pass
     elif artifact_type == "index":
-        pass
+        data = normalize_index_data(data, project_root=project_root)
+        if not errors:
+            try:
+                normalized_content = yaml.safe_dump(data, sort_keys=False)
+            except Exception:
+                pass
     else:
         pass
 

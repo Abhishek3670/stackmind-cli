@@ -173,3 +173,89 @@ def test_verify_deliverable_catches_broken_media_assets(tmp_path):
     assert len(res["content_issues"]) > 0
     assert any("Unsplash search gallery page" in issue for issue in res["content_issues"])
 
+
+def test_submit_qa_verdict_persists_schema_conforming_json(tmp_path):
+    import json
+    from validators.harness.review_gate import validate_qa_verdict
+
+    # Setup work order with deliverable
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    wo_file = wo_dir / "WO-010.yaml"
+    wo_data = {
+        "id": "WO-010",
+        "type": "FEATURE",
+        "title": "Auth Feature",
+        "status": "PENDING",
+        "priority": "P1",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"path": "src/auth.py", "type": "code"},
+    }
+    wo_file.write_text(yaml.dump(wo_data), encoding="utf-8")
+
+    src_file = tmp_path / "src" / "auth.py"
+    src_file.parent.mkdir(parents=True, exist_ok=True)
+    src_file.write_text("def auth(): return True\n", encoding="utf-8")
+
+    gemma_gw, journal = _setup_gateway(tmp_path, "gemma")
+
+    # Gemma submits verdict via submit_qa_verdict
+    res = gemma_gw.submit_qa_verdict(
+        wo_id="WO-010",
+        verdict="PASS",
+        summary="Verified auth module and return value",
+    )
+    assert res["success"] is True
+    assert res["verdict"] == "PASS"
+    assert res["work_order_id"] == "WO-010"
+    assert res["subject_hash"] != ""
+
+    v_file = tmp_path / ".sync" / "reviews" / "qa" / "WO-010.json"
+    assert v_file.is_file()
+
+    doc = json.loads(v_file.read_text(encoding="utf-8"))
+    assert doc["verdict"] == "PASS"
+    assert doc["reviewer"] == "gemma"
+    assert doc["reviewer_role"] == "qa"
+    assert doc["subject_hash"] == res["subject_hash"]
+    assert doc["revision"] == 1
+    assert "timestamp" in doc
+
+    # Validate against strict schema
+    valid, errors = validate_qa_verdict(doc, tmp_path, "WO-010")
+    assert valid is True, f"Validation errors: {errors}"
+
+
+def test_submit_qa_verdict_role_enforcement(tmp_path):
+    # Setup minimal WO
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text("id: WO-001\ntype: FEATURE\n", encoding="utf-8")
+
+    # Codex cannot invoke submit_qa_verdict
+    codex_gw, _ = _setup_gateway(tmp_path, "codex")
+    with pytest.raises(PermissionError, match="policy denies operation"):
+        codex_gw.submit_qa_verdict("WO-001", "PASS")
+
+    # Claude (architect) CAN invoke submit_qa_verdict for architect recovery turns
+    claude_gw, _ = _setup_gateway(tmp_path, "claude")
+    res = claude_gw.submit_qa_verdict("WO-001", "PASS", summary="Architect repair verdict")
+    assert res["success"] is True
+
+
+def test_compute_file_hash(tmp_path):
+    src_file = tmp_path / "index.html"
+    src_file.write_text("<!DOCTYPE html><html><body>Test</body></html>\n", encoding="utf-8")
+
+    gemma_gw, _ = _setup_gateway(tmp_path, "gemma")
+    res = gemma_gw.compute_file_hash("index.html")
+    assert res["exists"] is True
+    assert len(res["sha256"]) == 64
+    assert res["size_bytes"] > 0
+
+    # Non-existent file
+    res_missing = gemma_gw.compute_file_hash("nonexistent.txt")
+    assert res_missing["exists"] is False
+
+

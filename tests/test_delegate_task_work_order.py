@@ -100,7 +100,7 @@ def test_delegate_task_authors_work_order_and_contract():
         assert wo2_file.is_file()
         wo2_data = yaml.safe_load(wo2_file.read_text(encoding="utf-8"))
         assert wo2_data["id"] == "WO-002"
-        assert wo2_data["type"] == "QA"
+        assert wo2_data["type"] in ("QA", "VALIDATION")
         assert wo2_data["assigned_agents"] == ["gemma"]
 
         # Check INDEX.yaml updated monotonically

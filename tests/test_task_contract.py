@@ -254,3 +254,76 @@ class TestReconcileModifiedFiles:
         assert auto_added == []
         assert "index.html" not in merged.modified_files
         assert "js/main.js" not in merged.modified_files
+
+
+class TestSingleDeliverableOwnershipAndPeerProtection:
+    def test_declared_deliverable_never_hijacked_by_peer(self, tmp_path: Path) -> None:
+        """When a work order explicitly declares a deliverable (e.g. assets/js/app.js),
+        it must NEVER be replaced by an arbitrary fallback (e.g. index.html) even if
+        another peer work order declared the same path."""
+        _write_plan(tmp_path)
+        # WO-016 declares assets/js/app.js
+        _write_wo(tmp_path, "WO-016", "gemini", "assets/js/app.js")
+        # WO-027 also declares assets/js/app.js
+        _write_wo(tmp_path, "WO-027", "gemini", "assets/js/app.js")
+
+        wo_data = yaml.safe_load((tmp_path / ".sync/work-orders/ACTIVE/WO-016.yaml").read_text(encoding="utf-8"))
+        contract_data = {
+            "identity": {"role": "frontend"},
+            "scope": {"allow": [{"module": "assets/js/app.js"}]},
+            "budget": {"max_files_touched": 3},
+        }
+
+        compiled = compile_worker_task_contract(
+            _FakeTask("WO-016", "assets/js/app.js"),
+            wo_data,
+            contract_data,
+            tmp_path,
+        )
+
+        # Must NOT be hijacked to index.html
+        assert compiled["your_deliverable"]["path"] == "assets/js/app.js"
+        # Must NOT put own deliverable into read_only_files
+        assert "assets/js/app.js" not in compiled["read_only_files"]
+
+    def test_task_ownership_always_permits_declared_deliverable(self) -> None:
+        """TaskOwnership.check_write must always allow the worker's declared deliverable,
+        even if read_only_prefixes or read_only_files would otherwise match."""
+        ownership = TaskOwnership.from_contract({
+            "your_deliverable": {"path": "assets/js/app.js"},
+            "read_only_files": ["assets/js/app.js", "src/engine.js"],
+            "read_only_prefixes": ["assets/"],
+            "file_budget": {"max_files_touched": 3},
+        })
+        # Writing own deliverable is always permitted
+        assert ownership.check_write("assets/js/app.js") is None
+        # Peer files remain denied
+        assert ownership.check_write("src/engine.js") is not None
+        assert "owned by another work order" in ownership.check_write("src/engine.js")
+
+    def test_collect_peer_deliverables_ignores_cancelled_and_completed_wos(self, tmp_path: Path) -> None:
+        """collect_peer_deliverables must only collect deliverables from ACTIVE non-cancelled WOs."""
+        _write_plan(tmp_path)
+        # Active WO
+        _write_wo(tmp_path, "WO-010", "codex", "src/engine.js")
+        # Cancelled WO in ACTIVE
+        _write_wo(tmp_path, "WO-011", "gemini", "old.js", status="CANCELLED")
+        # Completed WO
+        comp_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        (comp_dir / "WO-001.yaml").write_text(
+            yaml.dump({
+                "id": "WO-001",
+                "status": "COMPLETED",
+                "deliverable": {"path": "package.json"},
+            }),
+            encoding="utf-8",
+        )
+
+        from validators.harness.task_contract import collect_peer_deliverables
+        peers = collect_peer_deliverables(tmp_path, "WO-016")
+        peer_paths = [p for _, p in peers]
+
+        assert "src/engine.js" in peer_paths
+        assert "old.js" not in peer_paths
+        assert "package.json" not in peer_paths

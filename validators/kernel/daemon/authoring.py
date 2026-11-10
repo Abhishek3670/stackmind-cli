@@ -101,6 +101,30 @@ def _extract_deliverable(data: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _wo_deliverable_paths(wo_data: dict[str, Any]) -> list[str]:
+    """Extract all normalized deliverable file paths declared by a work order."""
+    if not isinstance(wo_data, dict):
+        return []
+    paths: list[str] = []
+    d_spec = wo_data.get("deliverable")
+    if isinstance(d_spec, dict) and d_spec.get("path"):
+        paths.append(str(d_spec["path"]))
+    elif isinstance(d_spec, str) and d_spec.strip():
+        paths.append(str(d_spec))
+    from validators.harness.review_gate import _is_path_like
+    for extra in wo_data.get("deliverables") or []:
+        if isinstance(extra, dict) and extra.get("path"):
+            paths.append(str(extra["path"]))
+        elif isinstance(extra, str) and _is_path_like(extra):
+            paths.append(str(extra))
+    normalized: list[str] = []
+    for p in paths:
+        norm = p.replace("\\", "/").strip().lstrip("/").lower()
+        if norm and norm not in normalized:
+            normalized.append(norm)
+    return normalized
+
+
 def extract_deliverable_spec(
     milestone_title: str,
     tasks: list[str],
@@ -517,7 +541,7 @@ def derive_implementation_estimate(
 
     return {
         "expected_files": expected,
-        "max_files_touched": max(5, len(expected) + 3),
+        "max_files_touched": len(expected),
         "rationale": f"Plan-derived estimate of the files this task creates or modifies: {', '.join(expected)}",
     }
 
@@ -770,7 +794,7 @@ def build_child_contract(
             "write": "read-write",
         },
         "budget": {
-            "max_files_touched": max(5, max_files_touched if max_files_touched and max_files_touched > 0 else 10),
+            "max_files_touched": max_files_touched if max_files_touched and max_files_touched > 0 else 10,
             "max_tokens": 0,
         },
     }
@@ -1110,15 +1134,39 @@ def synthesize_child_work_orders(
     if not proposed_wos:
         raise ValueError("Cannot synthesize child work orders: no milestones or tasks could be parsed from plan")
 
-    # Anti-collision check: if any proposed WO conflicts with existing on-disk work order, remap IDs sequentially
-    existing_on_disk = set()
-    for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+    # Anti-collision check: detect genuine collisions against completed/blocked work orders
+    # or active work orders belonging to unrelated milestones/tasks.
+    # If an active work order matches the milestone (authored by architect in batch write), adopt it without renumbering!
+    from validators.harness.authoring_readiness import _wo_matches_milestone
+
+    immutable_ids = set()
+    for sub in ("COMPLETED", "BLOCKED"):
         d = ws / ".sync" / "work-orders" / sub
         if d.is_dir():
             for f in d.glob("*.yaml"):
-                existing_on_disk.add(f.stem)
+                immutable_ids.add(f.stem)
 
-    if any(w.get("id") in existing_on_disk for w in proposed_wos):
+    colliding_wos = set()
+    for w in proposed_wos:
+        wid = str(w.get("id", ""))
+        if wid in immutable_ids:
+            colliding_wos.add(wid)
+        elif (active_dir / f"{wid}.yaml").is_file():
+            try:
+                existing_data = yaml.safe_load((active_dir / f"{wid}.yaml").read_text(encoding="utf-8"))
+                if isinstance(existing_data, dict):
+                    # If it matches the proposed milestone or title, it is an intended match, not a collision!
+                    is_match = (
+                        _wo_matches_milestone(existing_data, w)
+                        or (existing_data.get("milestone_id") and existing_data.get("milestone_id") == w.get("milestone_id"))
+                        or (str(existing_data.get("title", "")).strip().lower() == str(w.get("title", "")).strip().lower())
+                    )
+                    if not is_match:
+                        colliding_wos.add(wid)
+            except Exception:
+                pass
+
+    if colliding_wos:
         id_map: dict[str, str] = {}
         renumbered_wos: list[dict[str, Any]] = []
         for offset, w in enumerate(proposed_wos):
@@ -1270,10 +1318,27 @@ def synthesize_child_work_orders(
             deliverables=wo.get("deliverables"),
         )
 
+        # If an active work order was already authored by the architect (e.g. via LLM batch write),
+        # preserve its authored details (acceptance criteria, test plan, description) and provenance
+        existing_wo_file = active_dir / f"{wo_id}.yaml"
+        if existing_wo_file.is_file():
+            try:
+                ex_data = yaml.safe_load(existing_wo_file.read_text(encoding="utf-8"))
+                if isinstance(ex_data, dict):
+                    for k in ("acceptance_criteria", "test_plan", "description", "deliverables"):
+                        if ex_data.get(k) and not wo_rec.get(k):
+                            wo_rec[k] = ex_data[k]
+                    if ex_data.get("synthesized_by"):
+                        wo_rec["synthesized_by"] = ex_data["synthesized_by"]
+            except Exception:
+                pass
+
         # Provenance marker: bootstrap-synthesized artifacts are scaffolding an
         # authorized author may supersede via the authoring gate.
-        wo_rec["synthesized_by"] = "bootstrap"
-        contract_rec["synthesized_by"] = "bootstrap"
+        if "synthesized_by" not in wo_rec:
+            wo_rec["synthesized_by"] = "bootstrap"
+        if "synthesized_by" not in contract_rec:
+            contract_rec["synthesized_by"] = "bootstrap"
 
         wo_yaml = yaml.safe_dump(wo_rec, sort_keys=False)
         contract_yaml = yaml.safe_dump(contract_rec, sort_keys=False)
@@ -1471,11 +1536,17 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         except Exception:
             pass
 
-    def _cancel_wo(wo_file: Path, wo_data: dict[str, Any], wo_id: str, reason: str) -> None:
+    def _cancel_wo(wo_file: Path, wo_data: dict[str, Any], wo_id: str, reason: str, superseded_by: str | None = None) -> None:
         now_str = _now()
         wo_data["status"] = "CANCELLED"
         wo_data["error"] = reason
         wo_data["cancellation_reason"] = reason
+        if superseded_by:
+            wo_data["superseded_by"] = superseded_by
+        elif "superseded by" in reason.lower():
+            m = re.search(r'(?:superseded|replaced)\s+by\s+(?:completed\s+)?(WO-\d+)', reason, re.I)
+            if m:
+                wo_data["superseded_by"] = m.group(1).upper()
         wo_data["updated"] = now_str
         durable_write_yaml(wo_file, wo_data)
         _sync_index_status(wo_id, "CANCELLED", now_str)
@@ -1486,13 +1557,30 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     def _wo_precedence(cand: tuple[Path, str, dict[str, Any], Any]) -> tuple[int, int, str]:
         _file, _id, _data, _ = cand
         has_plan_ref = 1 if _data.get("plan_ref") else 0
+        has_completion = 1 if _data.get("completion") else 0
         synth = str(_data.get("synthesized_by", "")).lower()
         is_bootstrap = 1 if synth == "bootstrap" else 0
         is_delegated = 1 if synth in ("architect_delegation", "recovery-repair", "recovery", "qa_defect") else 0
-        type_score = 3 if is_delegated else (2 if has_plan_ref else (0 if is_bootstrap else 1))
+        type_score = 4 if has_completion else (3 if is_delegated else (2 if has_plan_ref else (0 if is_bootstrap else 1)))
         idx = _parse_wo_index(_id) or 0
         ts = str(_data.get("updated") or _data.get("created") or "")
-        return (type_score, idx, ts)
+        return (type_score, -idx, ts)
+
+    # Pass 0: Index all completed work orders and their deliverables
+    completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+    completed_deliverables: dict[str, str] = {}  # norm_p -> completed_wo_id
+    completed_ids: set[str] = set()
+    if completed_dir.is_dir():
+        for comp_file in sorted(completed_dir.glob("*.yaml")):
+            comp_id = comp_file.stem
+            completed_ids.add(comp_id)
+            try:
+                comp_data = yaml.safe_load(comp_file.read_text(encoding="utf-8"))
+                if isinstance(comp_data, dict):
+                    for p in _wo_deliverable_paths(comp_data):
+                        completed_deliverables[p] = comp_id
+            except Exception:
+                pass
 
     active_files = sorted(active_dir.glob("*.yaml"))
 
@@ -1506,6 +1594,23 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if not isinstance(wo_data, dict):
                 continue
             wo_id = str(wo_data.get("id") or wo_file.stem)
+
+            # Auto-promote verified work orders that have completed execution evidence
+            if wo_data.get("completion") and isinstance(wo_data["completion"], dict):
+                wo_data["status"] = "COMPLETED"
+                wo_data.pop("error", None)
+                wo_data.pop("blocked_reason", None)
+                wo_data.pop("cancellation_reason", None)
+                durable_write_yaml(completed_dir / wo_file.name, wo_data)
+                wo_file.unlink(missing_ok=True)
+                _sync_index_status(wo_id, "COMPLETED", _now())
+                completed_ids.add(wo_id)
+                for p in _wo_deliverable_paths(wo_data):
+                    completed_deliverables[p] = wo_id
+                if wo_id not in reconciled_ids:
+                    reconciled_ids.append(wo_id)
+                continue
+
             current_status = str(wo_data.get("status", "")).upper()
             synth = str(wo_data.get("synthesized_by", "")).lower()
             wo_type = str(wo_data.get("type", "")).upper()
@@ -1514,6 +1619,8 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 or wo_type in ("FIX", "BUGFIX", "HOTFIX", "REFACTOR")
                 or any(kw in str(wo_data.get("title", "")).lower() for kw in ("repair ", "rework ", "defect "))
             )
+            wo_paths = _wo_deliverable_paths(wo_data)
+
             if current_status == "CANCELLED":
                 # Check if this work order is actually an approved task in PLAN.md
                 # that was erroneously cancelled by prior deduplication
@@ -1522,14 +1629,27 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     or any(wo_id == r.get("id") for r in plan_milestones)
                     or any(_wo_matches_milestone(wo_data, r) for r in plan_milestones)
                 )
+                cancel_reason = str(wo_data.get("cancellation_reason") or wo_data.get("error") or "").lower()
                 is_dedup_cancel = any(
-                    kw in str(wo_data.get("cancellation_reason") or wo_data.get("error") or "").lower()
+                    kw in cancel_reason
                     for kw in ("duplicate deliverable", "superseded by", "parallel deliverable")
                 )
-                is_erroneous_orphan_cancel = "orphaned work order not present in current plan.md" in str(
-                    wo_data.get("cancellation_reason") or wo_data.get("error") or ""
-                ).lower()
-                if (is_in_plan and (is_dedup_cancel or not wo_data.get("cancellation_reason"))) or (
+                is_erroneous_orphan_cancel = "orphaned work order not present in current plan.md" in cancel_reason
+
+                # Check if the deliverable is already completed by another work order
+                already_completed = any(p in completed_deliverables and completed_deliverables[p] != wo_id for p in wo_paths)
+
+                # Check if the superseding work order actually exists
+                superseder_match = re.search(r"superseded by ([A-Za-z0-9_-]+)", cancel_reason)
+                superseder_id = superseder_match.group(1).upper() if superseder_match else None
+                superseder_exists = superseder_id and (
+                    superseder_id in completed_ids or (active_dir / f"{superseder_id}.yaml").is_file()
+                )
+
+                # A duplicate cancel should ONLY be revived if the superseder was a ghost AND the deliverable is NOT completed
+                can_revive_dedup = is_dedup_cancel and not superseder_exists and not already_completed
+
+                if (is_in_plan and (can_revive_dedup or not wo_data.get("cancellation_reason"))) or (
                     is_delegated_or_repair and is_erroneous_orphan_cancel
                 ):
                     current_status = "ACTIVE"
@@ -1542,8 +1662,24 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     continue
             elif current_status in ("COMPLETED", "FAILED"):
                 continue
+
             if _is_meta_work_order(wo_data):
                 continue
+
+            if any(p.startswith(".sync/") or p.startswith("schemas/") for p in wo_paths):
+                _cancel_wo(wo_file, wo_data, wo_id, "Internal governance artifact not permitted as work order deliverable")
+                superseded_map[wo_id] = None
+                continue
+
+            # Check if an active feature work order claims an already completed deliverable
+            if not is_delegated_or_repair and wo_paths:
+                comp_match = next((p for p in wo_paths if p in completed_deliverables and completed_deliverables[p] != wo_id), None)
+                if comp_match is not None:
+                    comp_owner = completed_deliverables[comp_match]
+                    _cancel_wo(wo_file, wo_data, wo_id, f"Superseded by completed {comp_owner} (deliverable '{comp_match}' already completed)")
+                    superseded_map[wo_id] = comp_owner
+                    continue
+
             if is_delegated_or_repair:
                 delegated_survivors.append((wo_file, wo_id, wo_data, None))
                 continue
@@ -1671,26 +1807,50 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             for other in bucket_sorted:
                 if other[1] == entry[1]:
                     continue
-                # If they are sequential, ensure DAG dependency exists between them
-                if _are_sequential(entry, other):
+                # Check if this is a GitOps / worker sequential pair (e.g. package.json scaffold vs release)
+                agents_entry = [str(a).lower() for a in (entry[2].get("assigned_agents") or [])]
+                agents_other = [str(a).lower() for a in (other[2].get("assigned_agents") or [])]
+                is_gitops_pair = (
+                    (any(a in ("local-llm", "gitops") for a in agents_entry) and not any(a in ("local-llm", "gitops") for a in agents_other))
+                    or (any(a in ("local-llm", "gitops") for a in agents_other) and not any(a in ("local-llm", "gitops") for a in agents_entry))
+                )
+                if is_gitops_pair and _are_sequential(entry, other):
                     # Guarantee the later work order depends on the earlier one
                     m_entry = str(entry[3].get("id") or entry[3].get("title") or "") if isinstance(entry[3], dict) else ""
                     m_other = str(other[3].get("id") or other[3].get("title") or "") if isinstance(other[3], dict) else ""
                     order_entry = milestone_order_map.get(m_entry, 0)
                     order_other = milestone_order_map.get(m_other, 0)
-                    if order_other > order_entry:
+                    if order_other > order_entry and not _has_transitive_dep(other[1], entry[1]):
                         other_deps = other[2].setdefault("dependencies", [])
                         if entry[1] not in other_deps:
                             other_deps.append(entry[1])
                             durable_write_yaml(other[0], other[2])
-                    elif order_entry > order_other:
+                    elif order_entry > order_other and not _has_transitive_dep(entry[1], other[1]):
                         entry_deps = entry[2].setdefault("dependencies", [])
                         if other[1] not in entry_deps:
                             entry_deps.append(other[1])
                             durable_write_yaml(entry[0], entry[2])
                     continue
-                # Truly parallel collision: the higher precedence one survives
-                if _wo_precedence(other) > _wo_precedence(entry):
+                # Worker-worker collision on the same deliverable:
+                # If tier scores differ (e.g. delegated repair vs bootstrap), higher tier wins.
+                # If tier scores are equal, the earlier milestone (or earlier index) is the canonical creator.
+                m_entry = str(entry[3].get("id") or entry[3].get("title") or "") if isinstance(entry[3], dict) else ""
+                m_other = str(other[3].get("id") or other[3].get("title") or "") if isinstance(other[3], dict) else ""
+                order_entry = milestone_order_map.get(m_entry, 0)
+                order_other = milestone_order_map.get(m_other, 0)
+                prec_entry = _wo_precedence(entry)
+                prec_other = _wo_precedence(other)
+                if prec_other[0] != prec_entry[0]:
+                    should_other_win = prec_other[0] > prec_entry[0]
+                else:
+                    if order_other != order_entry and (order_other > 0 and order_entry > 0):
+                        should_other_win = order_other < order_entry
+                    else:
+                        idx_entry = _parse_wo_index(entry[1]) or 0
+                        idx_other = _parse_wo_index(other[1]) or 0
+                        should_other_win = idx_other < idx_entry
+
+                if should_other_win:
                     collided_with = other
                     break
             if collided_with is not None:
@@ -1735,10 +1895,28 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             for d in deps:
                 d_str = str(d).strip()
                 target_d = superseded_map.get(d_str, d_str)
+                if target_d == d_str:
+                    for check_sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+                        c_file = ws / ".sync" / "work-orders" / check_sub / f"{d_str}.yaml"
+                        if c_file.is_file():
+                            try:
+                                c_d = yaml.safe_load(c_file.read_text(encoding="utf-8")) or {}
+                                c_st = str(c_d.get("status", "")).upper()
+                                if c_st in ("CANCELLED", "SUPERSEDED"):
+                                    cand = c_d.get("superseded_by")
+                                    if not cand:
+                                        r_text = str(c_d.get("cancellation_reason") or c_d.get("error") or "")
+                                        m = re.search(r'(?:superseded|replaced)\s+by\s+(?:completed\s+)?(WO-\d+)', r_text, re.I)
+                                        if m:
+                                            cand = m.group(1).upper()
+                                    target_d = cand
+                            except Exception:
+                                pass
+                            break
                 if target_d is None or target_d == wo_id:
                     deps_changed = True
                     continue
-                if target_d in surviving_ids:
+                if target_d in surviving_ids or target_d in completed_ids:
                     # Inverted GitOps check: worker cannot depend on GitOps
                     target_entry = surviving_map.get(target_d)
                     target_agents = [str(a).lower() for a in (target_entry[2].get("assigned_agents") or [])] if target_entry else []
@@ -1746,8 +1924,8 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     if is_worker and is_target_gitops:
                         deps_changed = True
                         continue
-                    # Cycle check
-                    if _would_create_cycle(wo_id, target_d):
+                    # Cycle check (only applicable if target_d is an active survivor)
+                    if target_d in surviving_ids and _would_create_cycle(wo_id, target_d):
                         deps_changed = True
                         continue
 
@@ -1905,6 +2083,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     target_agent = "gemini"
                 else:
                     target_agent = "codex"
+            elif primary_agent == "codex" and deliv_path and any(deliv_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+                target_agent = "gemini"
+            elif primary_agent == "gemini" and deliv_path and not is_test_path and any(deliv_path.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db")):
+                target_agent = "codex"
 
             if target_agent and target_agent != primary_agent:
                 wo_data["assigned_agents"] = [target_agent]
@@ -1987,6 +2169,19 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             except Exception:
                 pass
 
+        existing_deliv_paths: set[str] = set()
+        for w in existing_wos:
+            p = (w.get("deliverable") or {}).get("path")
+            if p:
+                existing_deliv_paths.add(str(p).strip().replace("\\", "/").lstrip("/").lower())
+            for d in w.get("deliverables") or []:
+                if isinstance(d, dict) and d.get("path"):
+                    existing_deliv_paths.add(str(d.get("path")).strip().replace("\\", "/").lstrip("/").lower())
+            impl = w.get("implementation_estimate") or {}
+            for ef in impl.get("expected_files") or []:
+                if ef:
+                    existing_deliv_paths.add(str(ef).strip().replace("\\", "/").lstrip("/").lower())
+
         uncovered_milestones = [
             m for m in plan_milestones
             if not (
@@ -2028,7 +2223,24 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     prev_wo_id=prev_wo_id,
                 )
 
-                for wo in child_wos:
+                filtered_child_wos = []
+                for c_wo in child_wos:
+                    c_deliv = c_wo.get("deliverable") or {}
+                    c_path = str(c_deliv.get("path") or "").strip().replace("\\", "/").lstrip("/").lower()
+                    if c_path and c_path in existing_deliv_paths:
+                        continue
+                    filtered_child_wos.append(c_wo)
+
+                if not filtered_child_wos:
+                    continue
+
+                valid_existing_ids = {str(w.get("id")) for w in existing_wos}
+                chain_prev = prev_wo_id if (prev_wo_id and prev_wo_id in valid_existing_ids) else None
+                for c_wo in filtered_child_wos:
+                    c_wo["dependencies"] = [chain_prev] if chain_prev else []
+                    chain_prev = str(c_wo.get("id"))
+
+                for wo in filtered_child_wos:
                     wo_id = str(wo.get("id"))
                     assigned = wo.get("assigned_agents", ["codex"])
                     primary_agent = assigned[0] if assigned else "codex"
@@ -2107,6 +2319,9 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     durable_write_yaml(wo_file_path, wo_rec)
                     durable_write_yaml(contract_file_path, contract_rec)
                     existing_wos.append(wo_rec)
+                    w_deliv_clean = str((wo.get("deliverable") or {}).get("path") or "").strip().replace("\\", "/").lstrip("/").lower()
+                    if w_deliv_clean:
+                        existing_deliv_paths.add(w_deliv_clean)
                     reconciled_ids.append(wo_id)
 
                     index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"

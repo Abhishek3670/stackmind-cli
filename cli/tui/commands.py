@@ -3067,10 +3067,13 @@ def dispatch_delivery_command(
                 run_phase = str(resumed_run.get('phase', ''))
                 if run_phase == 'COMPLETE':
                     run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' is already COMPLETE (goal delivered)"
+                    state.phase = ProjectPhase.PROJECT_COMPLETE
+                    state.is_complete = True
+                    state.error = None
                 else:
                     run_resumed_msg = f" | Supervisor run '{resumed_run.get('run_id')}' resumed in phase {run_phase}"
-                state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
-                state.error = None
+                    state.phase = ProjectPhase.AUTONOMOUS_EXECUTION
+                    state.error = None
         except Exception as run_err:
             run_resumed_msg = f" (supervisor note: {run_err})"
         try:
@@ -3530,6 +3533,14 @@ def dispatch_delivery_command(
                 "An operation is currently running in the background.",
                 title="OPERATION IN FLIGHT",
                 hint="Wait for the current operation to complete, or use :cancel to abort it.",
+            )
+        elif "budget" in err_str and "exhaust" in err_str:
+            hint = "Global turn budget is exhausted. Run :resume to continue with additional budget."
+            state.add_message("system", f"[ERROR] Could not submit turn: {err}\nHint: {hint}")
+            err_box = render_error_box_str(
+                f"Could not submit turn: {err}",
+                title="BUDGET EXHAUSTED",
+                hint=hint,
             )
         elif is_connection_error(err):
             state.connection_status = "reconnecting"

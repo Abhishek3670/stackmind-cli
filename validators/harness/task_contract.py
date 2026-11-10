@@ -59,24 +59,57 @@ def _is_glob(pattern: str) -> bool:
 
 def collect_peer_deliverables(workspace: Path | str, own_wo_id: str | None) -> list[tuple[str, str]]:
     """Deliverable paths declared by OTHER active work orders: (wo_id, path)."""
-    active_dir = Path(workspace) / ".sync" / "work-orders" / "ACTIVE"
+    ws = Path(workspace)
     peers: list[tuple[str, str]] = []
-    if not active_dir.is_dir():
-        return peers
-    for wo_file in sorted(active_dir.glob("*.yaml")):
-        if wo_file.stem == own_wo_id or wo_file.stem in _PLANNING_WO_IDS:
-            continue
+    seen_pairs: set[tuple[str, str]] = set()
+
+    def _add_deliv(wo_stem: str, d_entry: Any) -> None:
+        if isinstance(d_entry, dict):
+            pv = _norm(d_entry.get("path"))
+            if pv and (wo_stem, pv) not in seen_pairs:
+                peers.append((wo_stem, pv))
+                seen_pairs.add((wo_stem, pv))
+        elif isinstance(d_entry, str) and d_entry.strip():
+            pv = _norm(d_entry.strip())
+            if pv and (wo_stem, pv) not in seen_pairs:
+                peers.append((wo_stem, pv))
+                seen_pairs.add((wo_stem, pv))
+
+    # Read INDEX.yaml if available to determine definitive work order statuses
+    index_status: dict[str, str] = {}
+    index_path = ws / ".sync" / "work-orders" / "INDEX.yaml"
+    if index_path.is_file():
         try:
-            data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            index_data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+            if isinstance(index_data, dict):
+                for order in index_data.get("orders") or []:
+                    if isinstance(order, dict) and order.get("id"):
+                        index_status[str(order["id"])] = str(order.get("status", "")).upper()
         except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        deliverable = data.get("deliverable")
-        if isinstance(deliverable, dict):
-            path_value = _norm(deliverable.get("path"))
-            if path_value:
-                peers.append((wo_file.stem, path_value))
+            pass
+
+    # Scan ACTIVE work orders (completed work orders do not lock deliverables from future tasks)
+    wo_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+    if wo_dir.is_dir():
+        for wo_file in sorted(wo_dir.glob("*.yaml")):
+            wo_stem = wo_file.stem
+            if wo_stem == own_wo_id or wo_stem in _PLANNING_WO_IDS:
+                continue
+            if index_status.get(wo_stem) in ("CANCELLED", "SUPERSEDED", "COMPLETED"):
+                continue
+            try:
+                data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            status = str(data.get("status", "")).upper()
+            if status in ("CANCELLED", "SUPERSEDED", "COMPLETED"):
+                continue
+            _add_deliv(wo_stem, data.get("deliverable"))
+            for extra in (data.get("deliverables") or []):
+                _add_deliv(wo_stem, extra)
+
     return peers
 
 
@@ -447,8 +480,40 @@ def compile_worker_task_contract(
         deliv_wo_path = deliv_from_wo
     else:
         deliv_wo_path = None
-    deliverable = _norm(getattr(task, "deliverable_path", None) or deliv_wo_path)
+
+    assigned_agents = [str(a).lower().strip() for a in ((wo_data or {}).get("assigned_agents") or [])]
+    worker_agent = str(getattr(task, "agent_id", "") or (assigned_agents[0] if assigned_agents else "")).lower()
+    worker_role = str(getattr(task, "role", "") or (contract_data or {}).get("identity", {}).get("role", "")).lower()
+
     peers = collect_peer_deliverables(workspace, getattr(task, "work_order_id", None))
+    peer_dict = {p: wo for wo, p in peers if not _is_glob(p)}
+
+    if deliv_wo_path:
+        # Deliverable explicitly declared in work order definition is authoritative!
+        deliverable = _norm(deliv_wo_path)
+    else:
+        # Fallback to task.deliverable_path, checking for peer deliverable leakage
+        candidate = _norm(getattr(task, "deliverable_path", None))
+        if candidate and candidate in peer_dict:
+            replacement_deliv = None
+            for extra in (wo_data or {}).get("deliverables") or []:
+                ep = _norm(extra.get("path") if isinstance(extra, dict) else extra)
+                if ep and ep not in peer_dict:
+                    replacement_deliv = ep
+                    break
+            if not replacement_deliv:
+                if worker_role in ("backend", "server") or worker_agent == "codex":
+                    replacement_deliv = "package.json" if (Path(workspace) / "package.json").is_file() else "src/backend.py"
+                elif worker_role in ("frontend", "ui") or worker_agent == "gemini":
+                    replacement_deliv = "index.html"
+                elif worker_role in ("qa", "test") or worker_agent == "gemma":
+                    replacement_deliv = "tests/test_qa_verification.py"
+                elif worker_role in ("gitops", "release") or worker_agent == "local-llm":
+                    replacement_deliv = "VERSION.md"
+            deliverable = replacement_deliv or ""
+        else:
+            deliverable = candidate or ""
+
     peer_files = sorted({p for _wo, p in peers if not _is_glob(p) and p != deliverable})
     peer_prefixes = sorted({p.rstrip("/") + "/" for _wo, p in peers if _is_glob(p) or p.endswith("/")})
 
@@ -485,6 +550,13 @@ def compile_worker_task_contract(
     elif task_body and task_body.strip() != str((wo_data or {}).get("description", "")).strip():
         # If task_body contains unique instructions not in the work order description, treat them as turn instructions
         turn_instructions = task_body.strip()
+
+    # Ensure prior verification blockers are prominently highlighted in turn instructions
+    prior_blocker = (wo_data or {}).get("error") or (wo_data or {}).get("blocked_reason")
+    if prior_blocker and "verification" in str(prior_blocker).lower() and not turn_instructions:
+        turn_instructions = f"PREVIOUS ATTEMPT BLOCKED: {prior_blocker}. You must author your deliverable '{deliverable}' using write_file."
+    elif prior_blocker and "verification" in str(prior_blocker).lower() and str(prior_blocker) not in turn_instructions:
+        turn_instructions = f"PREVIOUS ATTEMPT BLOCKED: {prior_blocker}.\n\n{turn_instructions}"
 
     cfg_file = Path(workspace) / ".sync" / "config.yaml"
     env = "development"
@@ -550,7 +622,7 @@ def compile_worker_task_contract(
             "stale": True,
             "revision": stale.get("revision"),
             "invalidated_at": _safe_clip(stale.get("invalidated_at"), 40),
-            "reason": _safe_clip(stale.get("reason"), 200),
+            "reason": _safe_clip(stale.get("reason"), 2000),
             "fields": [
                 _safe_clip(field, 60)
                 for field in (stale.get("fields") or [])[:10]
@@ -746,9 +818,14 @@ class TaskOwnership:
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> "TaskOwnership":
         budget = (contract.get("file_budget") or {}).get("max_files_touched") or 0
+        deliv = _norm((contract.get("your_deliverable") or {}).get("path"))
+        ro_files = tuple(
+            _norm(p) for p in contract.get("read_only_files") or []
+            if _norm(p) and _norm(p) != deliv
+        )
         return cls(
-            deliverable=_norm((contract.get("your_deliverable") or {}).get("path")),
-            read_only_files=tuple(_norm(p) for p in contract.get("read_only_files") or []),
+            deliverable=deliv,
+            read_only_files=ro_files,
             read_only_prefixes=tuple(_norm(p).rstrip("/") + "/" for p in contract.get("read_only_prefixes") or []),
             file_budget=int(budget),
         )
@@ -757,6 +834,9 @@ class TaskOwnership:
         """Return a denial reason for this write, or None when allowed."""
         path = _norm(path_value)
         if not path:
+            return None
+        # Deliverable is ALWAYS allowed to be written by its owner
+        if self.deliverable and path == self.deliverable:
             return None
         if path in self.read_only_files or any(path.startswith(p) for p in self.read_only_prefixes):
             owner_hint = (

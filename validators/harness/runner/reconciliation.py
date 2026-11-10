@@ -131,6 +131,19 @@ class _ReconciliationMixin:
         active_dir = sync_dir / "work-orders" / "ACTIVE"
         if not active_dir.is_dir():
             return
+        # Auto-route work orders staged with status COMPLETED to the COMPLETED directory
+        completed_dir = sync_dir / "work-orders" / "COMPLETED"
+        for wo_file in list(active_dir.glob("*.yaml")):
+            try:
+                wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                if isinstance(wo_data, dict) and str(wo_data.get("status", "")).upper() == "COMPLETED":
+                    completed_dir.mkdir(parents=True, exist_ok=True)
+                    dest = completed_dir / wo_file.name
+                    dest.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                    wo_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         closed_ids: set[str] = set()
         for sub in ("COMPLETED", "BLOCKED"):
             d = sync_dir / "work-orders" / sub
@@ -143,9 +156,21 @@ class _ReconciliationMixin:
         for wo_file in list(active_dir.glob("*.yaml")):
             wo_id = wo_file.stem
             if wo_id in closed_ids:
-                wo_file.unlink(missing_ok=True)
-                if contracts_dir.is_dir():
-                    (contracts_dir / f"{wo_id}.yaml").unlink(missing_ok=True)
+                is_reopened = False
+                try:
+                    wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                    if wo_data.get("reopened") or int(wo_data.get("revision", 1)) > 1:
+                        is_reopened = True
+                except Exception:
+                    pass
+
+                if is_reopened:
+                    for sub in ("COMPLETED", "BLOCKED"):
+                        (sync_dir / "work-orders" / sub / f"{wo_id}.yaml").unlink(missing_ok=True)
+                else:
+                    wo_file.unlink(missing_ok=True)
+                    if contracts_dir.is_dir():
+                        (contracts_dir / f"{wo_id}.yaml").unlink(missing_ok=True)
 
     @staticmethod
     def _sync_index_and_tree_yaml(base_dir: Path) -> None:

@@ -523,6 +523,27 @@ def validate_structure(project_path: Path, sync_path: Path, agents: list[str], r
 
 
 def validate_protocol(sync_path: Path, agents: list[str], result: ValidationResult) -> None:
+    # Check Role & Model Diversity
+    settings_file = sync_path / "settings.json"
+    if not settings_file.is_file():
+        settings_file = sync_path / "setting.json"
+    if settings_file.is_file():
+        try:
+            import json as _json
+            from validators.kernel.settings import check_role_diversity
+            s_data = _json.loads(settings_file.read_text(encoding="utf-8"))
+            for w in check_role_diversity(s_data.get("roles", {})):
+                result.issues.append(
+                    Issue(
+                        layer="protocol",
+                        severity=Severity.WARN,
+                        message=w,
+                        path=str(settings_file.name),
+                    )
+                )
+        except Exception:
+            pass
+
     # Check PROTOCOL_DIGEST.hash matches PROTOCOL_DIGEST.md
     hash_file = sync_path / "PROTOCOL_DIGEST.hash"
     digest_file = sync_path / "PROTOCOL_DIGEST.md"

@@ -135,7 +135,7 @@ class ScratchWorkspace:
                     if name in HEAVY_IGNORE_DIRS or is_dataset_dir(full_item):
                         ignored.add(name)
                         continue
-                    if rel == Path(".sync") and name in ("runtime", "knowledge", "snapshots", "reports", "state", "outbox", "lock", "drafts"):
+                    if rel == Path(".sync") and name in ("runtime", "knowledge", "snapshots", "reports", "state", "outbox", "lock", "drafts", "daemon"):
                         ignored.add(name)
                         continue
                     if _matches_gitignore(rel_item, name, is_dir=True, patterns=gi_patterns):
@@ -143,6 +143,16 @@ class ScratchWorkspace:
                             ignored.add(name)
                             continue
                 else:
+                    name_l = name.lower()
+                    if (
+                        name_l.startswith((".tmp", "tmp", "~"))
+                        or name_l.endswith((".tmp", ".tmp.json", ".bak", ".swp"))
+                        or ".tmp." in name_l
+                        or "_tmp_" in name_l
+                        or "smoke_log" in name_l
+                    ):
+                        ignored.add(name)
+                        continue
                     ext = Path(name).suffix.lower()
                     if ext in HEAVY_BINARY_EXTENSIONS:
                         ignored.add(name)
@@ -159,7 +169,24 @@ class ScratchWorkspace:
                         pass
             return ignored
 
-        shutil.copytree(authoritative, root, dirs_exist_ok=True, ignore=_ignore)
+        def _safe_copy_file(s: str, d: str, *, follow_symlinks: bool = True) -> None:
+            try:
+                shutil.copy2(s, d, follow_symlinks=follow_symlinks)
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
+
+        try:
+            shutil.copytree(authoritative, root, dirs_exist_ok=True, ignore=_ignore, copy_function=_safe_copy_file)
+        except shutil.Error as err:
+            remaining = [
+                e for e in err.args[0]
+                if not any(
+                    term in str(e[2]).lower()
+                    for term in ("no such file or directory", "cannot find the file", "permission denied", "used by another process")
+                )
+            ]
+            if remaining:
+                raise shutil.Error(remaining)
         return cls(authoritative, root.resolve(), attempt_id)
 
     def path_for(self, relative_target: str) -> Path:

@@ -23,6 +23,7 @@ class OperationType(str, Enum):
 
     # Editing
     APPLY_PATCH = "apply_patch"
+    EDIT_FILE = "edit_file"
     WRITE_FILE = "write_file"
     BATCH_WRITE_FILES = "batch_write_files"
     MOVE_FILE = "move_file"
@@ -125,6 +126,8 @@ class OperationType(str, Enum):
     VERIFY_DIFF = "verify_diff"
     VERIFY_PROVENANCE = "verify_provenance"
     SUBMIT_VERDICT = "submit_verdict"
+    SUBMIT_QA_VERDICT = "submit_qa_verdict"
+    COMPUTE_FILE_HASH = "compute_file_hash"
     REQUEST_CHANGES = "request_changes"
     APPROVE_WORK_ORDER = "approve_work_order"
 
@@ -197,6 +200,7 @@ class OperationJournal:
 
 MUTATING_OPERATIONS: frozenset[str] = frozenset({
     OperationType.APPLY_PATCH.value,
+    OperationType.EDIT_FILE.value,
     OperationType.WRITE_FILE.value,
     OperationType.MOVE_FILE.value,
     OperationType.DELETE_FILE.value,
@@ -217,6 +221,7 @@ MUTATING_OPERATIONS: frozenset[str] = frozenset({
     OperationType.CHECKPOINT.value,
     OperationType.RESTORE_CHECKPOINT.value,
     OperationType.SUBMIT_VERDICT.value,
+    OperationType.SUBMIT_QA_VERDICT.value,
     OperationType.REQUEST_CHANGES.value,
     OperationType.APPROVE_WORK_ORDER.value,
     OperationType.SKILL_MINE.value,

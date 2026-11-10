@@ -21,6 +21,7 @@ from .models import (
     AdvanceResult,
     Phase,
     RunState,
+    resolve_next_execution_phase,
 )
 
 logger = logging.getLogger("stackmind.supervisor")
@@ -96,14 +97,25 @@ class _ControlsMixin:
                 if target_id not in candidate_ids:
                     candidate_ids.append(target_id)
 
+        completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+        rework_targets = set()
+        for targets in getattr(state, "qa_rework_targets", {}).values():
+            rework_targets.update(targets)
+
         seen: set[str] = set(state.completed_wo_ids)
         for wo_id in candidate_ids:
             if wo_id in seen:
                 continue
             seen.add(wo_id)
+            if (completed_dir / f"{wo_id}.yaml").is_file() and wo_id not in rework_targets:
+                if wo_id not in state.completed_wo_ids:
+                    state.completed_wo_ids.append(wo_id)
+                continue
             self._unarchive_work_order(ws, wo_id)
             if wo_id in state.blocked_wo_ids:
                 state.blocked_wo_ids.remove(wo_id)
+        state.worker_wo_ids = [w for w in state.worker_wo_ids if w not in state.completed_wo_ids]
+        state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w not in state.completed_wo_ids]
 
     # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
 
@@ -245,11 +257,15 @@ class _ControlsMixin:
             dest_phase = target_phase
         elif state.interrupted_phase and state.interrupted_phase not in (Phase.WAITING_FOR_HUMAN.value, Phase.FAILED.value, Phase.BLOCKED.value):
             try:
-                dest_phase = Phase(state.interrupted_phase)
+                cand = Phase(state.interrupted_phase)
+                if cand == Phase.PLANNING and (getattr(state, "worker_wo_ids", None) or getattr(state, "plan_id", None)):
+                    dest_phase = resolve_next_execution_phase(state)
+                else:
+                    dest_phase = cand
             except ValueError:
-                dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                dest_phase = resolve_next_execution_phase(state)
         else:
-            dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            dest_phase = resolve_next_execution_phase(state)
         if dest_phase == Phase.EXECUTING:
             has_live_op = False
             if hasattr(self, "manager") and self.manager and hasattr(self.manager, "get_operation"):
@@ -261,7 +277,7 @@ class _ControlsMixin:
                             has_live_op = True
                             break
             if not has_live_op:
-                dest_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                dest_phase = resolve_next_execution_phase(state)
 
         self._transition(state, dest_phase, authorized_override=True)
         return AdvanceResult.TRANSITIONED
@@ -366,12 +382,16 @@ class _ControlsMixin:
         resume_phase = target_phase
         if resume_phase is None and state.interrupted_phase:
             try:
-                resume_phase = Phase(state.interrupted_phase)
+                cand = Phase(state.interrupted_phase)
+                if cand == Phase.PLANNING and (getattr(state, "worker_wo_ids", None) or getattr(state, "plan_id", None)):
+                    resume_phase = resolve_next_execution_phase(state)
+                else:
+                    resume_phase = cand
             except ValueError:
                 resume_phase = None
 
         if resume_phase is None or resume_phase == Phase.WAITING_FOR_HUMAN:
-            resume_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+            resume_phase = resolve_next_execution_phase(state)
 
         if resume_phase == Phase.EXECUTING:
             has_live_op = False
@@ -384,17 +404,71 @@ class _ControlsMixin:
                             has_live_op = True
                             break
             if not has_live_op:
-                resume_phase = Phase.DISPATCHING if state.worker_wo_ids else Phase.PLANNING
+                resume_phase = resolve_next_execution_phase(state)
 
-        self._transition(state, resume_phase, authorized_override=True)
+        # If no explicit target provided, restore the recorded interrupted phase directly
+
+        self._transition(state, resume_phase, authorized_override=True, auth_context="re_attest")
         return AdvanceResult.TRANSITIONED
 
-    def escalate_wo_to_recovery(self, state: RunState, wo_id: str, reason: str = "") -> None:
+    def _classify_failure_code(self, reason: str) -> str:
+        """Classify a failure reason string into a typed canonical failure code. Never returns UNKNOWN."""
+        if not reason:
+            return "WORKER_FAILURE"
+        r_lower = reason.lower()
+        if "rework limit" in r_lower or "rework" in r_lower:
+            return "QA_REWORK_LIMIT_EXCEEDED"
+        if "no verdict" in r_lower or "produced no verdict" in r_lower:
+            return "QA_VERDICT_MISSING"
+        if "exhausted its bounded review" in r_lower or "review attempt" in r_lower:
+            return "QA_REVIEW_BUDGET_EXHAUSTED"
+        if "timed out" in r_lower or "timeout" in r_lower:
+            return "TIMEOUT"
+        if "contract_read_only_violation" in r_lower or "read_only" in r_lower:
+            return "CONTRACT_READ_ONLY_VIOLATION"
+        if "contract_validation_error" in r_lower or "owned by another work order" in r_lower:
+            return "CONTRACT_SCOPE_VIOLATION"
+        if "max_files_touched" in r_lower or "file budget" in r_lower:
+            return "CONTRACT_FILE_BUDGET_EXCEEDED"
+        if "plan.md must contain" in r_lower or "checklist item" in r_lower:
+            return "PLAN_CHECKLIST_MISSING"
+        if "code_verified" in r_lower or "syntax" in r_lower:
+            return "CODE_VERIFICATION_FAILED"
+        if "deadlock" in r_lower:
+            return "DEPENDENCY_DEADLOCK"
+        if "dependency" in r_lower:
+            return "DEPENDENCY_ERROR"
+        if "loop guard" in r_lower:
+            return "LOOP_GUARD_TRIPPED"
+        if "no test" in r_lower or "no tests" in r_lower or "exit code 5" in r_lower or "no_test_evidence" in r_lower:
+            return "NO_TEST_EVIDENCE"
+        if "pytest" in r_lower or "test" in r_lower:
+            return "TEST_EXECUTION_FAILED"
+        if "verification gate" in r_lower or "gate failed" in r_lower:
+            return "VERIFICATION_FAILED"
+        return "WORKER_EXECUTION_BLOCKED"
+
+    def escalate_wo_to_recovery(
+        self,
+        state: RunState,
+        wo_id: str,
+        reason: str = "",
+        failure_code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         """Escalate a work order to Architect recovery and update blocked dependents."""
         if wo_id not in state.recovery_attempts:
             state.recovery_attempts[wo_id] = 1
         state.recovery_wo_id = wo_id
         state.repair_context = {"work_order_id": wo_id, "reason": reason}
+        blocker = state.worker_blockers.setdefault(wo_id, {})
+        resolved_code = failure_code or blocker.get("failure_code") or self._classify_failure_code(reason)
+        blocker["failure_code"] = resolved_code
+        blocker["canonical_message"] = blocker.get("canonical_message") or reason or "Work order execution blocked"
+        blocker["raw_reason"] = blocker.get("raw_reason") or reason or blocker["canonical_message"]
+        blocker["work_order_id"] = wo_id
+        if details:
+            blocker.update(details)
         self.evaluate_blocked_by_escalation(state)
 
     def set_wo_dependencies(self, state: RunState, wo_id: str, deps: list[str]) -> None:

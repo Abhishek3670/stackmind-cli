@@ -129,10 +129,11 @@ def verify_post_execution(
             )
 
     # 2. Check files touched budget (excluding internal bookkeeping/protocol files under .sync/)
+    from .contract_gate import _is_ephemeral_test_file
     max_files = contract.budget.get("max_files_touched") if contract.budget else None
     project_files_to_check = tuple(
         f for f in files_to_check
-        if not str(f).replace("\\", "/").startswith(".sync/")
+        if not str(f).replace("\\", "/").startswith(".sync/") and not _is_ephemeral_test_file(str(f))
         and not any(
             str(f).replace("\\", "/").lstrip("/").startswith(p)
             for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")
@@ -156,6 +157,8 @@ def verify_post_execution(
             norm_fp = norm_fp[2:]
 
         if any(norm_fp.startswith(p) for p in ("node_modules/", ".next/", ".turbo/", "dist/", "build/")):
+            continue
+        if _is_ephemeral_test_file(norm_fp):
             continue
 
         # Cross-worker modification guard: workers cannot modify each other's work
@@ -316,18 +319,19 @@ def _collect_peer_owned_deliverables(
             if norm_agent and norm_agent in assigned_norm:
                 continue
             peer_agent = assigned_norm[0] if assigned_norm else "unknown"
+            from .contract_gate import _is_ephemeral_test_file
             deliv = data.get("deliverable")
             if isinstance(deliv, dict) and deliv.get("path"):
                 p = str(deliv["path"]).replace("\\", "/").strip().lstrip("/")
-                if p:
+                if p and not _is_ephemeral_test_file(p):
                     owned[p] = (wo_file.stem, peer_agent)
             for extra in data.get("deliverables") or []:
                 if isinstance(extra, dict) and extra.get("path"):
                     p = str(extra["path"]).replace("\\", "/").strip().lstrip("/")
-                    if p:
+                    if p and not _is_ephemeral_test_file(p):
                         owned[p] = (wo_file.stem, peer_agent)
                 elif isinstance(extra, str) and extra.strip():
                     p = extra.replace("\\", "/").strip().lstrip("/")
-                    if p:
+                    if p and not _is_ephemeral_test_file(p):
                         owned[p] = (wo_file.stem, peer_agent)
     return owned

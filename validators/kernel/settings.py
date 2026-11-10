@@ -601,3 +601,35 @@ def test_provider_connection(
             return False, f"Connection error: {exc}", []
 
     return True, "Configured", list(provider.models)
+
+def check_role_diversity(roles: dict[str, Any] | None) -> list[str]:
+    """Check whether QA role shares the identical model and provider with builder roles.
+
+    Returns a list of human-readable warnings if diversity is compromised.
+    """
+    warnings: list[str] = []
+    if not isinstance(roles, dict):
+        return warnings
+
+    qa_cfg = roles.get("qa")
+    if not isinstance(qa_cfg, dict):
+        return warnings
+
+    qa_prov = str(qa_cfg.get("provider", "")).strip().lower()
+    qa_mod = str(qa_cfg.get("model", "")).strip().lower()
+    if not qa_mod:
+        return warnings
+
+    for b_role in ("frontend", "backend", "architecture"):
+        b_cfg = roles.get(b_role)
+        if not isinstance(b_cfg, dict):
+            continue
+        b_prov = str(b_cfg.get("provider", "")).strip().lower()
+        b_mod = str(b_cfg.get("model", "")).strip().lower()
+        if qa_prov == b_prov and qa_mod == b_mod:
+            warnings.append(
+                f"QA role ('qa') shares identical model '{qa_mod}' from provider '{qa_prov}' "
+                f"with builder role ('{b_role}'). Independent verification is compromised "
+                f"(builder model grading its own work)."
+            )
+    return warnings

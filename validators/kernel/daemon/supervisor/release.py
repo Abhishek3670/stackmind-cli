@@ -6,6 +6,7 @@ Module-level helpers used by the GITOPS phase; re-exported from the package root
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,6 +122,7 @@ def _declared_deliverable_paths(wo_data: Any) -> list[str]:
     """Declared deliverable paths from the authoritative work-order record."""
     if not isinstance(wo_data, dict):
         return []
+    from validators.harness.review_gate import _is_path_like
     entries: list[Any] = [wo_data.get("deliverable")]
     extra = wo_data.get("deliverables")
     if isinstance(extra, list):
@@ -128,7 +130,7 @@ def _declared_deliverable_paths(wo_data: Any) -> list[str]:
     paths: list[str] = []
     for entry in entries:
         raw = entry.get("path") if isinstance(entry, dict) else entry
-        if not isinstance(raw, str):
+        if not isinstance(raw, str) or not _is_path_like(raw):
             continue
         rel = raw.strip().replace("\\", "/")
         if rel and rel not in paths:
@@ -144,6 +146,94 @@ def _contained_deliverable_file(ws: Path, rel_path: str) -> Path | None:
     except (OSError, ValueError):
         return None
     return candidate if candidate.is_file() else None
+
+
+def commit_feature_deliverable(
+    workspace: Path | str,
+    wo_id: str,
+    wo_data: dict[str, Any],
+) -> str | None:
+    """Stage and commit completed product deliverable files into the product git repository.
+
+    Ensures the product repository has an incremental, verifiable commit history
+    reflecting each completed work order, rather than leaving deliverables untracked.
+    """
+    ws = Path(workspace).resolve()
+    git_dir = ws / ".git"
+    if not git_dir.exists():
+        return None
+
+    declared = _declared_deliverable_paths(wo_data)
+    target_files: list[str] = []
+    for rel_path in declared:
+        target = _contained_deliverable_file(ws, rel_path)
+        if target is not None and target.is_file():
+            try:
+                rel = str(target.relative_to(ws)).replace("\\", "/")
+                target_files.append(rel)
+            except ValueError:
+                continue
+
+    if not target_files:
+        return None
+
+    # Stage the deliverable files
+    subprocess.run(
+        ["git", "add", "--", *target_files],
+        cwd=str(ws),
+        check=False,
+        capture_output=True,
+    )
+
+    # Check if there are staged changes relative to index
+    status_proc = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=str(ws),
+        check=False,
+        capture_output=True,
+    )
+    if status_proc.returncode == 0:
+        return None
+
+    title = str(wo_data.get("title", "")).strip() or f"complete {wo_id}"
+    assigned = wo_data.get("assigned_agents") or []
+    agent = str(assigned[0]) if assigned else "worker"
+    milestone_id = str(wo_data.get("milestone_id", "")).strip()
+
+    trailers = [
+        f"Work-Order: {wo_id}",
+        f"Delivered-By: {agent}",
+    ]
+    if milestone_id:
+        trailers.append(f"Milestone: {milestone_id}")
+
+    commit_msg = f"feat({wo_id}): {title}\n\n" + "\n".join(trailers) + "\n"
+
+    env = dict(os.environ)
+    env["GIT_AUTHOR_NAME"] = f"StackMind [{agent}]"
+    env["GIT_AUTHOR_EMAIL"] = f"{agent}@stackmind.dev"
+    env["GIT_COMMITTER_NAME"] = "StackMind Supervisor"
+    env["GIT_COMMITTER_EMAIL"] = "supervisor@stackmind.dev"
+
+    commit_proc = subprocess.run(
+        ["git", "commit", "-m", commit_msg],
+        cwd=str(ws),
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if commit_proc.returncode != 0:
+        return None
+
+    sha_proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(ws),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return sha_proc.stdout.strip() if sha_proc.returncode == 0 else None
 
 
 def _current_contract_revision(ws: Path, wo_id: str) -> int:
@@ -182,13 +272,18 @@ def completion_record_for(
     record["verified_at_contract_revision"] = _current_contract_revision(ws, wo_id)
 
     hashes: dict[str, str] = {}
+    missing_deliverables: list[str] = []
     for rel_path in _declared_deliverable_paths(wo_data):
         resolved = _contained_deliverable_file(ws, rel_path)
-        if resolved is None:
+        if resolved is None or not resolved.is_file() or resolved.stat().st_size == 0:
+            missing_deliverables.append(rel_path)
             continue
         digest = sha256_file(resolved)
         if digest:
             hashes[rel_path] = digest
+
+    if missing_deliverables:
+        record["missing_deliverables"] = missing_deliverables
     record["deliverable_hashes"] = hashes
     record["completed_at"] = timestamp
     return record
@@ -307,6 +402,17 @@ def archive_completed_work_orders(
         except OSError:
             pass
         archived.append(wo_id)
+
+        # Create product repository commit for this completed deliverable
+        try:
+            commit_sha = commit_feature_deliverable(ws, wo_id, wo_data)
+            if commit_sha:
+                completion = wo_data.get("completion")
+                if isinstance(completion, dict):
+                    completion["product_commit_sha"] = commit_sha
+                    durable_write_yaml(target_file, wo_data)
+        except Exception:
+            pass
 
     # Also include any target_ids that are already in completed_dir
     for target_id in target_ids:
@@ -506,3 +612,12 @@ def archive_blocked_work_orders(
         pass
 
     return archived
+
+
+__all__ = [
+    "archive_blocked_work_orders",
+    "archive_completed_work_orders",
+    "commit_feature_deliverable",
+    "create_gitops_commit",
+    "format_release_commit_message",
+]

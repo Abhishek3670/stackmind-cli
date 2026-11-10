@@ -9,7 +9,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any
 
 from ..state_store import (  # noqa: F401  (re-exported for the historical module surface)
@@ -108,6 +108,15 @@ DEFAULT_TIMEOUTS: dict[Any, float] = {
     "ci_wait_timeout": 60.0,
     "ci_run_timeout": 1800.0,
 }
+
+def _sanitize_for_yaml(obj: Any) -> Any:
+    if isinstance(obj, Enum):
+        return obj.value if hasattr(obj, "value") else str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_yaml(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_yaml(item) for item in obj]
+    return obj
 
 @dataclass
 class RunState:
@@ -273,7 +282,7 @@ class RunState:
         return self.wait_registry
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        raw = {
             "run_id": self.run_id,
             "product_goal": self.product_goal,
             "workspace": self.workspace,
@@ -393,6 +402,7 @@ class RunState:
             "deadlock_reports": [dict(d) for d in self.deadlock_reports],
             "reconciliation_history": [dict(rh) for rh in self.reconciliation_history],
         }
+        return _sanitize_for_yaml(raw)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunState":
@@ -590,3 +600,27 @@ _AGENT_ROLE_KEYWORDS = {
     "gemma": ("qa", "test", "verification", "audit", "review"),
     "local-llm": ("release", "git", "deploy", "packaging", "version", "gitops"),
 }
+
+
+def resolve_next_execution_phase(state: Any) -> Phase:
+    """Determine whether to dispatch remaining worker WOs or advance to review/planning."""
+    worker_wos = getattr(state, "worker_wo_ids", None) or []
+    completed_wos = getattr(state, "completed_wo_ids", None) or []
+    gitops_wo = getattr(state, "gitops_wo_id", None)
+    non_gitops_workers = [wid for wid in worker_wos if wid != gitops_wo]
+
+    pending_workers = [wid for wid in non_gitops_workers if wid not in completed_wos]
+    if pending_workers:
+        return Phase.DISPATCHING
+
+    if completed_wos:
+        int_wo = getattr(state, "integration_wo_id", None)
+        if int_wo and int_wo in completed_wos:
+            return Phase.FINAL_REVIEW
+        return Phase.INTEGRATION_REVIEW
+
+    if getattr(state, "plan_id", None):
+        return Phase.AUTHORING
+
+    return Phase.PLANNING
+

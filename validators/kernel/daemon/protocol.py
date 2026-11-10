@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
 from cli import __version__
+
+logger = logging.getLogger(__name__)
 
 from .manager import SessionManager
 
@@ -69,13 +72,24 @@ class JsonRpcProtocol:
             err_msg = str(error).strip()
             if "active operation" in err_msg.lower() or "contention" in err_msg.lower():
                 return self._error(request_id, -32002, err_msg)
+            if "budget" in err_msg.lower() and "exhaust" in err_msg.lower():
+                return self._error(request_id, -32002, f"Global turn budget exhausted: {err_msg}. Run :resume to continue.")
             if isinstance(error, TypeError):
                 return self._error(request_id, -32602, "Invalid params")
             if err_msg and not any(k in err_msg.lower() for k in ("missing", "required", "positional", "unexpected")):
                 return self._error(request_id, -32602, err_msg)
             return self._error(request_id, -32602, "Invalid params")
-        except Exception:  # pragma: no cover - defensive protocol boundary
-            return self._error(request_id, -32603, "Internal error")
+        except RuntimeError as error:
+            err_msg = str(error).strip()
+            if "budget" in err_msg.lower() and "exhaust" in err_msg.lower():
+                return self._error(request_id, -32002, f"Global turn budget exhausted: {err_msg}. Run :resume to continue.")
+            return self._error(request_id, -32002, err_msg or "Runtime error")
+        except Exception as error:  # pragma: no cover - defensive protocol boundary
+            err_str = str(error).strip()
+            if "budget" in err_str.lower() and "exhaust" in err_str.lower():
+                return self._error(request_id, -32002, f"Global turn budget exhausted: {err_str}. Run :resume to continue.")
+            logger.exception("Internal error executing JSON-RPC method '%s'", request.get("method"))
+            return self._error(request_id, -32603, f"Internal error: {error}" if err_str else "Internal error")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     @staticmethod

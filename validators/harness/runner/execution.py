@@ -497,12 +497,14 @@ class _ExecutionMixin:
                     curr_diff = before_snapshot.diff(curr_snap)
                     bookkeeping_prefixes = ('.sync/inbox/', '.sync/state/', '.sync/reports/', '.sync/runtime/')
                     bookkeeping_exact = ('.sync/work-orders/INDEX.yaml', 'work-orders/INDEX.yaml', '.sync/runtime/TREE.yaml')
+                    from validators.harness.contract_gate import _is_ephemeral_test_file
                     dec_norm_gate = {Path(p).as_posix().lstrip('/') for p in getattr(decision, 'modified_files', ()) if p}
                     observed_files_for_gate = tuple(
                         norm_p for path in curr_diff.all_changed_files
                         if (norm_p := Path(path).as_posix().lstrip('/'))
                         and not any(norm_p.startswith(prefix) for prefix in bookkeeping_prefixes)
                         and not (norm_p in bookkeeping_exact and norm_p not in dec_norm_gate)
+                        and not _is_ephemeral_test_file(norm_p)
                     )
                 verify_post_execution(
                     self.project_path,
@@ -637,12 +639,8 @@ class _ExecutionMixin:
                 with staging_context as staging_path:
                     staged_root = Path(staging_path) if tool_runtime is not None else Path(staging_path) / self.project_path.name
                     if tool_runtime is None:
-                        shutil.copytree(
-                            self.project_path,
-                            staged_root,
-                            dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns('.git', '__pycache__', '.pytest_cache', '.ruff_cache'),
-                        )
+                        from .staging import copy_workspace_for_staging
+                        copy_workspace_for_staging(self.project_path, staged_root)
                     self._apply_non_report_writes(stage_inputs, base_path=staged_root)
                     command_results: list[subprocess.CompletedProcess[str]] = []
                     for cmd in decision.commands:
@@ -720,7 +718,12 @@ class _ExecutionMixin:
                     # controls there).
                     declared_missing = dec_effective - set(observed_task_files)
                     declaration_matches = not declared_missing
-                    if getattr(task, 'is_authoring', False):
+                    is_arch = (
+                        getattr(task, 'is_authoring', False)
+                        or str(getattr(self, 'agent', '')).lower().strip() in ('claude', 'architecture', 'architect')
+                        or str(getattr(task, 'role', '')).lower().strip() in ('architecture', 'architect')
+                    )
+                    if is_arch:
                         declaration_matches = True
                     mismatch_reason = (
                         None if declaration_matches
@@ -779,6 +782,14 @@ class _ExecutionMixin:
                                 f" (declared {evidence['declared']}; "
                                 f"observed {evidence['observed']})"
                             )
+                        if not dimensions.outcome_verified and task.deliverable_path:
+                            norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
+                            stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
+                            stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
+                            if norm_del not in stg_added and norm_del not in stg_mod:
+                                diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
+                                reason_msg += f" ({diag})"
+                                meta_dict['blocker'] = diag
                         if not dimensions.outcome_verified and task.work_order_id and str(task.work_order_id) != "WO-000" and not getattr(task, 'is_authoring', False) and str(self.agent).lower().strip() not in ('claude', 'architecture', 'architect'):
                             meta_dict['failure'] = {
                                 'failure_code': 'OUTCOME_NOT_VERIFIED',
@@ -786,14 +797,6 @@ class _ExecutionMixin:
                                 'canonical_message': reason_msg,
                                 'verification_evidence': stage_inputs.get('verification_evidence'),
                             }
-                            if task.deliverable_path:
-                                norm_del = Path(task.deliverable_path).as_posix().lstrip('/')
-                                stg_added = {Path(p).as_posix().lstrip('/') for p in diff.added}
-                                stg_mod = {Path(p).as_posix().lstrip('/') for p in diff.modified}
-                                if norm_del not in stg_added and norm_del not in stg_mod:
-                                    diag = f"declared deliverable '{task.deliverable_path}' was not added or modified in this turn"
-                                    reason_msg += f" ({diag})"
-                                    meta_dict['blocker'] = diag
                         return HarnessRunResult(
                             status='blocked',
                             persisted=False,
@@ -806,6 +809,8 @@ class _ExecutionMixin:
                 # `.sync` is excluded from workspace snapshots, so commit the
                 # harness-owned bookkeeping only after the staged verification passes.
                 self._apply_non_report_writes(stage_inputs)
+                self._reconcile_staged_work_order_collisions(self.project_path)
+                self._sync_index_and_tree_yaml(self.project_path)
 
                 write_ms = int((time.monotonic() - hold_started) * 1000)
                 hold_ms = write_ms

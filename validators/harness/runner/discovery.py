@@ -19,6 +19,65 @@ from .models import (
 class _DiscoveryMixin:
     """Next-task discovery and tree/session file loading."""
 
+    def _resolve_agent_deliverable(
+        self, wo_id: str, payload: dict[str, Any]
+    ) -> tuple[str | None, tuple[str, ...]]:
+        """Resolve role-appropriate deliverable path, filtering out peer deliverables."""
+        deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
+        deliv_paths: list[str] = []
+        if isinstance(deliverable, dict) and deliverable.get('path'):
+            deliv_paths.append(str(deliverable['path']))
+        elif isinstance(deliverable, str) and deliverable.strip():
+            deliv_paths.append(deliverable.strip())
+        for extra in (payload.get('deliverables') or []) if isinstance(payload, dict) else []:
+            if isinstance(extra, dict) and extra.get('path'):
+                deliv_paths.append(str(extra['path']))
+            elif isinstance(extra, str) and extra.strip():
+                deliv_paths.append(extra.strip())
+
+        norm_deliv_tuple = tuple(dict.fromkeys(Path(p).as_posix().lstrip('/') for p in deliv_paths if p.strip()))
+
+        # Filter out peer-owned deliverables
+        peer_set: set[str] = set()
+        try:
+            from validators.harness.task_contract import collect_peer_deliverables
+            peers = collect_peer_deliverables(self.project_path, wo_id)
+            peer_set = {p.replace("\\", "/").strip().lstrip("/").lower() for _, p in peers}
+        except Exception:
+            pass
+
+        non_peer_delivs = [p for p in norm_deliv_tuple if p.lower() not in peer_set]
+        role_norm = str(getattr(self, "agent", "")).lower().strip()
+
+        deliv_path = None
+        if non_peer_delivs:
+            if role_norm in ("codex", "backend"):
+                backend_cands = [
+                    p for p in non_peer_delivs
+                    if not p.lower().endswith((".html", ".htm", ".css", ".scss", ".sass"))
+                    and not p.lower().startswith(("assets/css", "assets/img", "public/css"))
+                ]
+                deliv_path = backend_cands[0] if backend_cands else non_peer_delivs[0]
+            elif role_norm in ("gemini", "frontend"):
+                frontend_cands = [
+                    p for p in non_peer_delivs
+                    if not p.lower().endswith((".py", ".sql", ".sqlite", ".db"))
+                    and not p.lower().startswith(("models/", "services/", "controllers/", "routes/"))
+                ]
+                deliv_path = frontend_cands[0] if frontend_cands else non_peer_delivs[0]
+            elif role_norm in ("gemma", "qa"):
+                qa_cands = [p for p in non_peer_delivs if "test" in p.lower() or p.startswith("tests/")]
+                deliv_path = qa_cands[0] if qa_cands else non_peer_delivs[0]
+            else:
+                deliv_path = non_peer_delivs[0]
+        elif norm_deliv_tuple:
+            deliv_path = norm_deliv_tuple[0]
+        else:
+            deliv_path = deliverable.get('path') if isinstance(deliverable, dict) else None
+
+        filtered_tuple = tuple(non_peer_delivs) if non_peer_delivs else norm_deliv_tuple
+        return deliv_path, filtered_tuple
+
     def discover_next_task(
         self, tree_data: dict[str, Any], work_order_id: str | None = None
     ) -> HarnessTask | None:
@@ -31,19 +90,8 @@ class _DiscoveryMixin:
                 path = self.sync_path / 'work-orders' / sub / f'{work_order_id}.yaml'
                 if path.exists():
                     payload = self._read_yaml(path)
+                    deliv_path, norm_deliv_tuple = self._resolve_agent_deliverable(work_order_id, payload)
                     deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
-                    deliv_paths = []
-                    if isinstance(deliverable, dict) and deliverable.get('path'):
-                        deliv_paths.append(str(deliverable['path']))
-                    elif isinstance(deliverable, str) and deliverable.strip():
-                        deliv_paths.append(deliverable.strip())
-                    for extra in (payload.get('deliverables') or []) if isinstance(payload, dict) else []:
-                        if isinstance(extra, dict) and extra.get('path'):
-                            deliv_paths.append(str(extra['path']))
-                        elif isinstance(extra, str) and extra.strip():
-                            deliv_paths.append(extra.strip())
-                    norm_deliv_tuple = tuple(dict.fromkeys(Path(p).as_posix().lstrip('/') for p in deliv_paths if p.strip()))
-                    deliv_path = norm_deliv_tuple[0] if norm_deliv_tuple else (deliverable.get('path') if isinstance(deliverable, dict) else None)
                     return HarnessTask(
                         kind='work_order',
                         identifier=work_order_id,
@@ -102,19 +150,8 @@ class _DiscoveryMixin:
             if not path.exists():
                 continue
             payload = self._read_yaml(path)
+            deliv_path, norm_deliv_tuple = self._resolve_agent_deliverable(wo_id, payload)
             deliverable = payload.get('deliverable', {}) if isinstance(payload, dict) else {}
-            deliv_paths = []
-            if isinstance(deliverable, dict) and deliverable.get('path'):
-                deliv_paths.append(str(deliverable['path']))
-            elif isinstance(deliverable, str) and deliverable.strip():
-                deliv_paths.append(deliverable.strip())
-            for extra in (payload.get('deliverables') or []) if isinstance(payload, dict) else []:
-                if isinstance(extra, dict) and extra.get('path'):
-                    deliv_paths.append(str(extra['path']))
-                elif isinstance(extra, str) and extra.strip():
-                    deliv_paths.append(extra.strip())
-            norm_deliv_tuple = tuple(dict.fromkeys(Path(p).as_posix().lstrip('/') for p in deliv_paths if p.strip()))
-            deliv_path = norm_deliv_tuple[0] if norm_deliv_tuple else (deliverable.get('path') if isinstance(deliverable, dict) else None)
             return HarnessTask(
                 kind='work_order',
                 identifier=wo_id,

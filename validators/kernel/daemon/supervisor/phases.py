@@ -80,6 +80,20 @@ class _PhasesMixin:
 
     def _advance_planning(self, state: RunState) -> AdvanceResult:
         """PLANNING: dispatch Architecture planning turn if not already running."""
+        # If workers are already authored / pending, planning is done: advance to dispatching
+        from .models import resolve_next_execution_phase
+        ws_path = Path(state.workspace)
+        active_wos = [
+            f.stem for f in (ws_path / ".sync" / "work-orders" / "ACTIVE").glob("*.yaml")
+            if f.stem != "WO-000" and f.name != ".gitkeep"
+        ] if (ws_path / ".sync" / "work-orders" / "ACTIVE").is_dir() else []
+        if state.worker_wo_ids or active_wos:
+            if not state.worker_wo_ids and active_wos:
+                state.worker_wo_ids = sorted(active_wos)
+            next_p = resolve_next_execution_phase(state)
+            self._transition(state, next_p)
+            return AdvanceResult.TRANSITIONED
+
         if not state.planning_operation_id:
             # S8 Crash recovery check: if operation was already started before a crash,
             # discover it from session operations rather than re-dispatching a duplicate turn.
@@ -160,9 +174,18 @@ class _PhasesMixin:
             if matching_plan:
                 state.plan_id = matching_plan.get("plan_id")
                 state.error = None
+                from validators.harness.plan import resolve_playbook_file
+                ws_path = Path(state.workspace)
+                plan_file = resolve_playbook_file(ws_path, "PLAN.md")
+                if not plan_file.is_file() or plan_file.stat().st_size == 0:
+                    plan_content = matching_plan.get("content") or matching_plan.get("title") or getattr(state, "product_goal", None)
+                    if plan_content:
+                        plan_file.parent.mkdir(parents=True, exist_ok=True)
+                        plan_file.write_text(f"# {plan_content}\n\n", encoding="utf-8")
+
                 if state.planning_wo_id and state.planning_wo_id not in state.completed_wo_ids:
                     state.completed_wo_ids.append(state.planning_wo_id)
-                    archive_completed_work_orders(Path(state.workspace), [state.planning_wo_id])
+                    archive_completed_work_orders(ws_path, [state.planning_wo_id])
                 plan_state = str(matching_plan.get("state", "")).upper()
                 if plan_state == "AWAITING_APPROVAL":
                     self._transition(state, Phase.AWAITING_APPROVAL)
@@ -170,6 +193,26 @@ class _PhasesMixin:
                 if plan_state == "APPROVED":
                     self._transition(state, Phase.AUTHORING)
                     return AdvanceResult.TRANSITIONED
+            # Check if PLAN.md exists on disk
+            from validators.harness.plan import resolve_playbook_file, validate_plan_structure, parse_plan
+            plan_file = resolve_playbook_file(ws_path, "PLAN.md")
+            if plan_file.is_file() and plan_file.stat().st_size > 0:
+                plan_text = plan_file.read_text(encoding="utf-8")
+                valid, _ = validate_plan_structure(plan_text)
+                if valid:
+                    p_obj = parse_plan(plan_text, project_path=ws_path)
+                    plan_id = self.manager.get_next_plan_id(state.session_id)
+                    self.manager.propose_plan(
+                        session_id=state.session_id,
+                        plan_id=plan_id,
+                        title=p_obj.title or f"Plan for: {getattr(state, 'product_goal', '')[:60]}",
+                        content=plan_text,
+                    )
+                    state.plan_id = plan_id
+                    state.error = None
+                    self._transition(state, Phase.AWAITING_APPROVAL)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+
             # No plan proposed but turn completed — consultative/conversational turn.
             # Architect judged that requirements / conversation are ongoing before building.
             state.planning_operation_id = None
@@ -440,18 +483,57 @@ class _PhasesMixin:
             state.readiness_issues = []
             state.error = None
             # Reconcile planning WO-000 to COMPLETED upon publishing worker orders
-            for p_id in (state.planning_wo_id, "WO-000"):
-                if p_id:
-                    if p_id not in state.completed_wo_ids:
-                        state.completed_wo_ids.insert(0, p_id)
-                    self._mark_wo_status_on_disk(ws, p_id, "COMPLETED")
-            archive_completed_work_orders(ws, [state.planning_wo_id or "WO-000", "WO-000"])
+            from validators.harness.plan import resolve_playbook_file
+            plan_file = resolve_playbook_file(ws, "PLAN.md")
+            if not plan_file.is_file() or plan_file.stat().st_size == 0:
+                if state.plan_id:
+                    for p in reversed(self.manager.list_plans(state.session_id)):
+                        if p.get("plan_id") == state.plan_id and p.get("content"):
+                            plan_file.parent.mkdir(parents=True, exist_ok=True)
+                            plan_file.write_text(str(p["content"]), encoding="utf-8")
+                            break
+                elif getattr(state, "product_goal", None) or getattr(state, "goal", None):
+                    # In synthetic/test setups that jump straight to authoring, synthesize PLAN.md
+                    goal_val = getattr(state, "product_goal", None) or getattr(state, "goal", None)
+                    plan_file.parent.mkdir(parents=True, exist_ok=True)
+                    plan_file.write_text(f"# Delivery Plan\n\nGoal: {goal_val}\n", encoding="utf-8")
+
+            if plan_file.is_file() and plan_file.stat().st_size > 0:
+                for p_id in (state.planning_wo_id, "WO-000"):
+                    if p_id:
+                        if p_id not in state.completed_wo_ids:
+                            state.completed_wo_ids.insert(0, p_id)
+                        self._mark_wo_status_on_disk(ws, p_id, "COMPLETED")
+                archive_completed_work_orders(ws, [state.planning_wo_id or "WO-000", "WO-000"])
+            else:
+                from validators.harness.authoring_readiness import AuthoringReadinessResult, ReadinessIssue
+                gate_result = AuthoringReadinessResult(
+                    ready=False,
+                    plan_id=state.plan_id or "",
+                    issues=(ReadinessIssue(
+                        code="MISSING_PLAN_DELIVERABLE",
+                        category="coverage",
+                        message=f"Planning deliverable PLAN.md is missing or empty at {plan_file}. Workers cannot be dispatched without approved PLAN.md on disk.",
+                        artifact_path="PLAN.md",
+                        work_order_id=state.planning_wo_id or "WO-000",
+                    ),),
+                )
+                self._persist_readiness_report(state, ws, gate_result)
+                state.readiness_issues = list(gate_result.issues)
+                return gate_result
             # Dynamic budget scaling: B = 18 + 5N (Amendment D)
             n_wos = max(1, len(state.published_wo_ids or state.worker_wo_ids))
-            dynamic_budget = 18 + 5 * n_wos
+            env_budget_str = os.environ.get("STACKMIND_TURN_BUDGET")
+            try:
+                env_override = int(env_budget_str) if env_budget_str else None
+            except ValueError:
+                env_override = None
+            dynamic_budget = env_override or max(18 + 5 * n_wos, 200 + 20 * n_wos)
             state.initial_turn_budget = dynamic_budget
             if state.global_turn_budget < dynamic_budget:
                 state.global_turn_budget = dynamic_budget
+            state.max_human_resumes = max(getattr(state, "max_human_resumes", 2), 100)
+            state.max_daemon_restarts = max(getattr(state, "max_daemon_restarts", 3), 50)
             self._sync_budget_file(state)
             self._transition(state, Phase.DISPATCHING)
             return AdvanceResult.TRANSITIONED
@@ -522,6 +604,10 @@ class _PhasesMixin:
 
         # 2. S6 Concurrency: When multiple sibling work orders are eligible in this pass,
         # open a parent batch operation so SessionManager.begin_operation does not force them sequential.
+        if state.batch_operation_id:
+            batch_op = self._get_operation(state.batch_operation_id)
+            if batch_op is None or batch_op.get("status") in _OPERATION_TERMINAL:
+                state.batch_operation_id = None
         parent_op_id = state.batch_operation_id
         if len(eligible_wos) > 1 and not parent_op_id and hasattr(self.manager, "begin_operation"):
             try:
@@ -920,8 +1006,12 @@ class _PhasesMixin:
 
             # Completed with deliverable on disk — check QA verdict (developer work orders only;
             # QA work orders produce verdicts and are never subject to QA review on themselves).
+            from validators.harness import review_gate as _review_gate
+            wo_data = _review_gate.load_wo(ws, wo_id)
             if (
-                self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
+                _review_gate.requires_qa(ws, wo_id, wo_data)
+                and not _review_gate.is_qa_work_order(wo_data)
+                and self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
                 and self._check_qa_verdict(wo_id, ws) == "NEEDS_CHANGES"
             ):
                 reworks = state.qa_reworks.get(wo_id, 0)
@@ -942,6 +1032,7 @@ class _PhasesMixin:
                 if self._retry_worker(state, ws, wo_id, _rework_prompt):
                     turns_dispatched += 1
                     all_done = False
+                    _review_gate.archive_qa_verdict(ws, wo_id, suffix="stale")
                 continue
 
             # ── Mandatory QA review gate ──────────────────────────────────

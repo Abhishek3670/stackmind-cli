@@ -35,6 +35,10 @@ from .models import (
 
 class ProviderAdapter(ABC):
     """Abstract interface for LLM provider adapters."""
+    def _extract_tool_calls_from_content(self, content: str | None) -> list[ToolCallRequest]:
+        # Deferred delegation to OllamaAdapter implementation or common extractor
+        return OllamaAdapter._extract_tool_calls_from_content(self, content)  # type: ignore[attr-defined]
+
 
     def __init__(self, provider_name: str, model_name: str) -> None:
         self.provider_name = provider_name
@@ -249,6 +253,9 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             fn_name = fn.get("name") or ""
             fn_args = fn.get("arguments") or {}
             tool_calls.append(ToolCallRequest.from_provider_call(call_id, fn_name, fn_args))
+
+        if not tool_calls and content:
+            tool_calls = self._extract_tool_calls_from_content(content)
 
         response_message = Message.assistant(content=content, tool_calls=tool_calls)
 
@@ -552,6 +559,21 @@ class OllamaAdapter(ProviderAdapter):
             return []
         text = content.strip()
         results: list[ToolCallRequest] = []
+
+        # 0. Bracketed tool use pattern: [Tool Use: function_name ...]
+        bracket_matches = re.finditer(r"\[Tool Use:\s*([a-zA-Z0-9_-]+)(?:\s+(\{.*?\}))?\]", text, re.DOTALL)
+        for bm in bracket_matches:
+            fn_name = bm.group(1).strip()
+            args_raw = bm.group(2)
+            args = {}
+            if args_raw:
+                try:
+                    args = json.loads(args_raw.strip())
+                except Exception:
+                    pass
+            results.append(ToolCallRequest.from_provider_call(f"call_{uuid4().hex[:8]}", fn_name, args))
+        if results:
+            return results
         try:
             from validators.kernel.providers.gateway import STANDARD_KERNEL_TOOLS
             known_tools = {t.name for t in STANDARD_KERNEL_TOOLS}
@@ -561,6 +583,7 @@ class OllamaAdapter(ProviderAdapter):
             "read_file", "write_file", "apply_patch", "move_file", "delete_file",
             "format_file", "list_directory", "inspect_file_lines", "search_code",
             "get_symbol", "run_command", "query_graph", "request_tools",
+            "submit_qa_verdict", "edit_file",
         })
 
         # 1. <tool_call> tags (JSON or XML)

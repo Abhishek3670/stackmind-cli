@@ -241,7 +241,14 @@ class AuthoringGate:
                 except Exception:
                     pass
         elif artifact_type == "index":
+            from .authoring_yaml import normalize_index_data
+            data = normalize_index_data(data, project_root=effective_root)
             self._validate_index(norm_path, data, errors)
+            if not errors:
+                try:
+                    normalized_content = yaml.safe_dump(data, sort_keys=False)
+                except Exception:
+                    pass
         else:
             # Not a governed work-order or contract
             pass
@@ -311,10 +318,35 @@ class AuthoringGate:
                 )
         if isinstance(deliverable, dict):
             deliv_type = deliverable.get("type")
-            if deliv_type not in ("code", "doc", "config", "module"):
-                errors.append(f"Work Order deliverable type '{deliv_type}' invalid; must be code, doc, config, or module")
+            if deliv_type not in ("code", "doc", "config", "module", "report"):
+                errors.append(f"Work Order deliverable type '{deliv_type}' invalid; must be code, doc, config, module, or report")
             if not deliverable.get("description"):
                 errors.append("Work Order deliverable requires a non-empty 'description'")
+
+        # Validate role vs deliverable compatibility
+        assigned_agents = [str(a).lower().strip() for a in (data.get("assigned_agents") or [])]
+        raw_deliv_path = (deliverable or {}).get("path") if isinstance(deliverable, dict) else deliverable
+        deliv_path_val = str(raw_deliv_path).strip().lower() if raw_deliv_path else ""
+        if deliv_path_val:
+            if "codex" in assigned_agents and any(deliv_path_val.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+                errors.append(
+                    f"Work Order '{wo_id}': Role-deliverable mismatch. Backend agent 'codex' cannot be assigned "
+                    f"frontend deliverable '{deliv_path_val}'. Assign frontend UI deliverables to 'gemini'."
+                )
+            elif (
+                "gemini" in assigned_agents
+                and not (deliv_path_val.startswith("tests/") or "test" in deliv_path_val)
+                and any(deliv_path_val.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db"))
+            ):
+                errors.append(
+                    f"Work Order '{wo_id}': Role-deliverable mismatch. Frontend agent 'gemini' cannot be assigned "
+                    f"backend deliverable '{deliv_path_val}'. Assign backend deliverables to 'codex'."
+                )
+            elif "gemma" in assigned_agents and not ("test" in deliv_path_val or deliv_path_val.startswith("tests/")):
+                errors.append(
+                    f"Work Order '{wo_id}': Role-deliverable mismatch. QA agent 'gemma' cannot be assigned "
+                    f"application deliverable '{deliv_path_val}'. QA deliverables must be test suites under 'tests/'."
+                )
 
         # Validate requirement_refs if present
         requirement_refs = data.get("requirement_refs")

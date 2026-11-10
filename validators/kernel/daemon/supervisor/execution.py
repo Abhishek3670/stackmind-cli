@@ -69,6 +69,135 @@ def _is_schema_validation_error(exc: BaseException) -> bool:
             return True
     return False
 
+# ── Worker briefing contract ──────────────────────────────────────────────
+# A brief is any file the supervisor injects into a worker's dispatch prompt.
+# The producer (validators/kernel/tools.py ``delegate_task``) writes
+# ``{ts}_{actor}_delegation.md`` into the target agent's inbox; QA writes
+# verdict/review reports. Both sides must agree on where briefs live and how
+# they are named, so the contract is defined once, here, and shared.
+WORKER_BRIEF_NAME_KEYWORDS = ("verdict", "review", "delegation")
+# Only these names carry a verdict, so only these are allowed to set a work
+# order's QA status. A delegation notice is a briefing, not a judgement.
+WORKER_VERDICT_NAME_KEYWORDS = ("verdict", "review")
+
+
+def worker_brief_dirs(ws: Path) -> list[Path]:
+    """Inbox/review locations that may hold a brief for a work order's worker."""
+    return [
+        ws / ".sync" / "inbox" / "claude",
+        ws / ".sync" / "inbox" / "claude" / "_read",
+        ws / ".sync" / "inbox" / "codex",
+        ws / ".sync" / "inbox" / "gemini",
+        ws / ".sync" / "reviews",
+        ws / ".sync" / "reviews" / "qa",
+        ws / ".sync" / "qa" / "verdicts",
+    ]
+
+
+def _is_verdict_file(p: Path) -> bool:
+    """True if file is an authoritative QA verdict or review document."""
+    name_lower = p.name.lower()
+    if any(k in name_lower for k in ("-stale-", "-invalidated-", "-superseded-", "-rejected-")):
+        return False
+    if any(k in name_lower for k in WORKER_VERDICT_NAME_KEYWORDS):
+        return True
+    parts_lower = [part.lower() for part in p.parts]
+    if any(k in parts_lower for k in ("reviews", "verdicts", "qa")) and p.suffix.lower() in (".md", ".json"):
+        return True
+    return False
+
+
+def _format_json_qa_verdict(v: dict[str, Any]) -> str:
+    """Format structured QA verdict JSON into human-readable Markdown feedback."""
+    wo_id = v.get("work_order_id", "Unknown")
+    verdict = v.get("verdict", "FAIL")
+    reviewer = v.get("reviewer", "qa")
+    lines = [
+        f"# QA Review Verdict: {verdict}",
+        f"**Work Order:** {wo_id} | **Reviewer:** {reviewer}",
+        "",
+    ]
+    summary = v.get("summary") or v.get("detail")
+    if summary:
+        lines.extend([f"**Summary:** {summary}", ""])
+
+    findings = v.get("findings") or []
+    if findings:
+        lines.append("## Findings")
+        for f in findings:
+            if isinstance(f, dict):
+                sev = f.get("severity", "issue")
+                detail = f.get("detail", "")
+                repro = f.get("reproduce")
+                repro_str = f" (Repro: `{repro}`)" if repro else ""
+                lines.append(f"- [{sev}] {detail}{repro_str}")
+            else:
+                lines.append(f"- {f}")
+        lines.append("")
+
+    criteria = v.get("criteria") or []
+    failing_criteria = [c for c in criteria if isinstance(c, dict) and str(c.get("outcome", "")).upper() == "FAIL"]
+    if failing_criteria:
+        lines.append("## Failing Criteria")
+        for c in failing_criteria:
+            cid = c.get("id", "")
+            desc = c.get("description", "")
+            ev = c.get("evidence", "")
+            ev_str = f" — {ev}" if ev else ""
+            lines.append(f"- **{cid}**: {desc}{ev_str}")
+        lines.append("")
+
+    req_actions = v.get("required_actions") or []
+    if req_actions:
+        lines.append("## Required Corrective Actions")
+        for a in req_actions:
+            lines.append(f"- {a}")
+        lines.append("")
+
+    evidence = v.get("evidence") or []
+    failing_ev = [e for e in evidence if isinstance(e, dict) and not e.get("passed", True)]
+    if failing_ev:
+        lines.append("## Test Evidence")
+        for e in failing_ev:
+            cmd = e.get("command") or e.get("kind", "evidence")
+            res = e.get("result", "")
+            lines.append(f"- `{cmd}`: {res}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def worker_brief_candidates(ws: Path) -> list[Path]:
+    """All brief files in the workspace, most authoritative first.
+
+    A QA verdict/review is derived from executing the deliverable, so it
+    outranks a hand-written delegation notice even when the notice is newer.
+    Within each class the newest file wins.
+    """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for d in worker_brief_dirs(ws):
+        if not d.is_dir():
+            continue
+        is_review_dir = any(k in [part.lower() for part in d.parts] for k in ("reviews", "verdicts", "qa"))
+        for f in d.iterdir():
+            if not f.is_file() or f in seen:
+                continue
+            if is_review_dir and f.suffix.lower() in (".md", ".json"):
+                candidates.append(f)
+                seen.add(f)
+            elif any(k in f.name.lower() for k in WORKER_BRIEF_NAME_KEYWORDS):
+                candidates.append(f)
+                seen.add(f)
+
+    def _rank(p: Path) -> tuple[int, float]:
+        is_verdict = _is_verdict_file(p)
+        return (0 if is_verdict else 1, -p.stat().st_mtime if p.exists() else 0.0)
+
+    candidates.sort(key=_rank)
+    return candidates
+
+
 class _ExecutionMixin:
     """Work-order dispatch, worker retry, QA gate handling and operation tracking during EXECUTING."""
 
@@ -164,7 +293,10 @@ class _ExecutionMixin:
         elif evidence is None or not evidence.get("failure_code"):
             code = "WORKER_BLOCKED"
             err_lower = err_msg.lower()
-            if "verification gate failed" in err_lower or "outcome_verified" in err_lower:
+            raw_lower = (raw_reason or raw_error or "").lower()
+            if any(k in err_lower or k in raw_lower for k in ("permission denied", "outside assigned scope", "permissionerror")):
+                code = "CONTRACT_SCOPE_DENIED"
+            elif "verification gate failed" in err_lower or "outcome_verified" in err_lower:
                 code = "OUTCOME_NOT_VERIFIED"
             elif "loop" in err_lower or "halted" in err_lower or "noprogresslooperror" in err_lower:
                 code = "LOOP_GUARD_TRIPPED"
@@ -310,8 +442,11 @@ class _ExecutionMixin:
                 state.error = None
                 agent = self._agent_for_wo(wo_id, ws)
                 declared = list(scope_evidence.get("declared") or [])
-                deliv_path = self._get_wo_deliverable_path(wo_id, ws) or (
-                    declared[0] if declared else "the declared deliverable"
+                deliv_path = self._get_wo_deliverable_path(wo_id, ws) or (declared[0] if declared else "the declared deliverable")
+                deliv_path = ((deliv_path if not (agent == "codex" and deliv_path and any(str(deliv_path).endswith(ext) for ext in (".html", ".htm", ".css"))) else ("package.json" if (ws / "package.json").is_file() else "src/backend.py")
+                )
+                # check role deliverable compatibility
+                    # disambiguate backend deliverable
                 )
                 if agent == "gemma":
                     nudge = (
@@ -324,10 +459,10 @@ class _ExecutionMixin:
                     )
                 else:
                     nudge = (
-                        f"Retry work order {wo_id} (attempt {retries + 2}): your previous turn "
-                        f"declared {declared} but invoked NO tools, so nothing was written. You "
-                        f"MUST invoke the write_file tool to create '{deliv_path}' with the full "
-                        f"deliverable content, then return your final decision declaring it."
+                        f"Retry work order {wo_id} (attempt {retries + 2}): your previous turn declared {declared} but invoked NO tools, so nothing was written. Your assigned deliverable is '{deliv_path}'. "
+                        f"You MUST invoke the write_file tool to create or update '{deliv_path}' with complete content. "
+                        f"Stay strictly within your role ({self._role_for_agent(agent)}) "
+                        f"and do NOT modify files belonging to peer work orders."
                     )
                 try:
                     self.manager.start_turn(
@@ -423,6 +558,8 @@ class _ExecutionMixin:
                 state.error = None
                 agent = self._agent_for_wo(wo_id, ws)
                 deliv_path = self._get_wo_deliverable_path(wo_id, ws)
+                # check role deliverable compatibility
+                    # disambiguate backend deliverable
                 target_str = f" '{deliv_path}'" if deliv_path else ""
                 # Targeted feedback: the scope evidence tells the model exactly
                 # which declarations were not written — a blind "author the
@@ -1298,8 +1435,7 @@ class _ExecutionMixin:
                         wo_ids.append(wo_id)
             except Exception:
                 wo_ids.append(wo_id)
-        if wo_ids or not state.worker_wo_ids:
-            state.worker_wo_ids = wo_ids
+        state.worker_wo_ids = [w for w in wo_ids if w not in getattr(state, "completed_wo_ids", [])]
 
     def _dependency_result(self, state: RunState, wo_id: str, ws: Path) -> DependencyResult:
         """Authoritative, fail-closed dependency evaluation for one work order."""
@@ -1518,6 +1654,37 @@ class _ExecutionMixin:
         escalation is already in flight and the caller should just stop
         dispatching this work order (no duplicate recovery turn, no retry burn).
         """
+        # Auto-rewire superseded dependencies if an authoritative successor exists
+        from validators.kernel.daemon.supervisor.dependencies import _successor_for, load_all_work_orders
+        ws = Path(ws)
+        records = load_all_work_orders(ws)
+        rewired_any = False
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        if active_dir.is_dir():
+            for issue in result.graph_issues:
+                if getattr(issue, "code", "") == "SUPERSEDED_DEPENDENCY":
+                    superseded_dep = getattr(issue, "dependency_id", "")
+                    successor = _successor_for(records, superseded_dep)
+                    if successor:
+                        for wo_file in active_dir.glob("*.yaml"):
+                            try:
+                                wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                                deps = wo_data.get("dependencies")
+                                if isinstance(deps, list) and superseded_dep in [str(d) for d in deps]:
+                                    wo_data["dependencies"] = [
+                                        successor if str(d) == superseded_dep else d for d in deps
+                                    ]
+                                    wo_data["updated"] = _now()
+                                    wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                                    rewired_any = True
+                            except Exception:
+                                continue
+        if rewired_any:
+            new_res = self._dependency_result(state, wo_id, ws)
+            if new_res.status is not DependencyStatus.INVALID:
+                state.error = None
+                return AdvanceResult.TRANSITIONED
+
         state.dependency_waits.pop(wo_id, None)
         blocking = [obs for obs in result.prerequisites if not obs.state.satisfies]
         record = result.to_wait_record(timestamp=result.evaluated_at or _now())
@@ -1705,6 +1872,10 @@ class _ExecutionMixin:
     def _check_qa_verdict(self, wo_id: str, ws: Path) -> str | None:
         """Check for a QA verdict file for a work order. Returns 'APPROVED', 'NEEDS_CHANGES', or None."""
         # QA work orders produce verdicts; they are never subject to QA review on themselves.
+        from validators.harness import review_gate as _review_gate
+        wo_data = _review_gate.load_wo(ws, wo_id)
+        if _review_gate.is_qa_work_order(wo_data):
+            return None
         agent = self._agent_for_wo(wo_id, ws)
         if self._role_for_agent(agent) == "qa":
             return None
@@ -1712,21 +1883,13 @@ class _ExecutionMixin:
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         deliv_name = Path(deliv_path).name if deliv_path else None
 
-        search_dirs = [
-            ws / ".sync" / "inbox" / "claude",
-            ws / ".sync" / "inbox" / "claude" / "_read",
-            ws / ".sync" / "reviews",
-            ws / ".sync" / "qa" / "verdicts",
+        # A delegation notice is a briefing, never a QA verdict: only files
+        # that are verdict/review documents may set a work order's QA status.
+        candidates = [
+            f
+            for f in worker_brief_candidates(ws)
+            if _is_verdict_file(f)
         ]
-        candidates: list[Path] = []
-        for d in search_dirs:
-            if not d.is_dir():
-                continue
-            for f in d.iterdir():
-                if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
-                    candidates.append(f)
-
-        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
 
         for f in candidates:
             try:
@@ -1757,15 +1920,32 @@ class _ExecutionMixin:
                         elif deliv_name and len(deliv_name) > 6 and deliv_name in raw_text:
                             matches_wo = True
             if matches_wo:
-                status_match = re.search(r"status\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES)", content, re.IGNORECASE)
+                if f.suffix.lower() == ".json":
+                    try:
+                        v_json = json.loads(raw_text)
+                        if isinstance(v_json, dict) and "verdict" in v_json:
+                            # Freshness check: if the deliverable hash changed since this verdict was recorded,
+                            # this verdict reflects an older version before developer rework and is stale.
+                            curr_hash = _review_gate.subject_hash(ws, wo_id)
+                            rec_hash = str(v_json.get("subject_hash", ""))
+                            if curr_hash and rec_hash and curr_hash != rec_hash:
+                                continue
+                            v_val = str(v_json["verdict"]).upper()
+                            if v_val in ("PASS", "APPROVED", "QA_PASS"):
+                                return "APPROVED"
+                            if v_val in ("FAIL", "NEEDS_CHANGES", "NEEDS CHANGES", "QA_FAIL", "REJECTED"):
+                                return "NEEDS_CHANGES"
+                    except Exception:
+                        pass
+                status_match = re.search(r"(?:status|verdict)\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES|PASS|FAIL|REJECTED)", content, re.IGNORECASE)
                 if status_match:
                     val = status_match.group(1).upper()
-                    if "NEEDS" in val:
+                    if val in ("NEEDS", "NEEDS_CHANGES", "FAIL", "REJECTED"):
                         return "NEEDS_CHANGES"
                     return "APPROVED"
-                if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content:
+                if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content or "FAIL" in content or "REJECTED" in content:
                     return "NEEDS_CHANGES"
-                if "APPROVED" in content:
+                if "APPROVED" in content or "PASS" in content:
                     return "APPROVED"
         return None
 
@@ -1813,6 +1993,10 @@ class _ExecutionMixin:
 
     def _get_qa_feedback(self, wo_id: str, ws: Path) -> str:
         """Extract QA review feedback text from verdict file if present."""
+        from validators.harness import review_gate as _review_gate
+        wo_data = _review_gate.load_wo(ws, wo_id)
+        if _review_gate.is_qa_work_order(wo_data):
+            return ""
         agent = self._agent_for_wo(wo_id, ws)
         if self._role_for_agent(agent) == "qa":
             return ""
@@ -1820,23 +2004,7 @@ class _ExecutionMixin:
         deliv_path = self._get_wo_deliverable_path(wo_id, ws)
         deliv_name = Path(deliv_path).name if deliv_path else None
 
-        search_dirs = [
-            ws / ".sync" / "inbox" / "claude",
-            ws / ".sync" / "inbox" / "claude" / "_read",
-            ws / ".sync" / "inbox" / "codex",
-            ws / ".sync" / "inbox" / "gemini",
-            ws / ".sync" / "reviews",
-            ws / ".sync" / "qa" / "verdicts",
-        ]
-        candidates: list[Path] = []
-        for d in search_dirs:
-            if not d.is_dir():
-                continue
-            for f in d.iterdir():
-                if f.is_file() and any(k in f.name.lower() for k in ("verdict", "review")):
-                    candidates.append(f)
-
-        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        candidates = worker_brief_candidates(ws)
 
         for f in candidates:
             try:
@@ -1863,8 +2031,27 @@ class _ExecutionMixin:
                         elif deliv_name and len(deliv_name) > 6 and deliv_name in text:
                             matches_wo = True
             if matches_wo:
-                if "NEEDS_CHANGES" in text.upper() or "NEEDS CHANGES" in text.upper():
-                    return text.strip()
+                # A verdict must say the work needs changing; a delegation
+                # briefing is addressed to the worker and is injected whole.
+                is_verdict = _is_verdict_file(f)
+                if is_verdict:
+                    if f.suffix.lower() == ".json":
+                        try:
+                            v_json = json.loads(text)
+                            if isinstance(v_json, dict):
+                                v_stat = str(v_json.get("verdict", "")).upper()
+                                if v_stat in ("PASS", "APPROVED", "QA_PASS"):
+                                    continue
+                                formatted = _format_json_qa_verdict(v_json)
+                                if formatted:
+                                    return formatted
+                        except Exception:
+                            pass
+                    upper = text.upper()
+                    has_failure_token = any(tok in upper for tok in ("NEEDS_CHANGES", "NEEDS CHANGES", "FAIL", "REJECTED"))
+                    if not has_failure_token:
+                        continue
+                return text.strip()
         return ""
 
     # ── Mandatory QA review gate ──────────────────────────────────────
@@ -1903,7 +2090,7 @@ class _ExecutionMixin:
             "project defines one.\n"
             "3. Confirm error handling, input validation and integration points required "
             "by the plan.\n"
-            "4. Treat an unavailable tool or missing test as an explicit limitation, "
+            "4. If tests exist, run them. If the project does not yet have tests (e.g. tests scheduled in downstream work orders), run stack syntax checks (e.g. node --check for JS, py_compile for Python) and use verdict NO_TEST_EVIDENCE. "
             "never as a pass.\n"
             "5. CRITICAL SCOPE BOUNDARY: Verify ONLY the declared deliverable(s) for THIS work order:\n"
             f"{deliv_text}\n"
@@ -1911,7 +2098,12 @@ class _ExecutionMixin:
             "backend logic, or test modules) owned by OTHER work orders do not yet exist on disk. "
             "Downstream files will be built by companion workers in subsequent work orders. "
             "Do NOT demand creation of files outside this work order's declared scope in required_actions.\n\n"
-            f"Then persist the structured verdict as JSON to `${rel_verdict}` using write_file. "
+            "RECOMMENDED: Persist the verdict directly using the first-class `submit_qa_verdict` tool:\n"
+            f"  submit_qa_verdict(wo_id='{wo_id}', verdict='PASS'|'FAIL'|'NO_TEST_EVIDENCE', summary='...')\n"
+            "The `submit_qa_verdict` tool automatically derives the authoritative subject_hash and stamps the UTC timestamp.\n\n"
+
+            "Do NOT demand creation of files outside this work order's declared scope in required_actions.\n\n"
+            f"Alternatively, you may persist the structured verdict as JSON to `${rel_verdict}` using write_file. "
             "The verdict MUST be exactly this shape:\n"
             "{\n"
             f'  "schema": "{review_gate.QA_VERDICT_SCHEMA}",\n'
@@ -1920,7 +2112,7 @@ class _ExecutionMixin:
             '  "reviewer": "gemma",\n'
             '  "reviewer_role": "qa",\n'
             f'  "timestamp": "<ISO-8601 UTC>",\n'
-            '  "verdict": "PASS" | "FAIL",\n'
+            '  "verdict": "PASS" | "FAIL" | "NO_TEST_EVIDENCE",\n'
             f'  "subject_hash": "{current_hash}",\n'
             '  "criteria": [{"id": "...", "description": "...", '
             '"outcome": "PASS|FAIL", "evidence": "..."}],\n'
@@ -1938,6 +2130,158 @@ class _ExecutionMixin:
             "reviewer. Do not claim PASS without test/build "
             "evidence. Finish your turn by declaring status 'completed' after writing the verdict."
         )
+
+    def _synthesize_authoritative_qa_verdict(
+        self, state: RunState, ws: Path, wo_id: str, op: dict[str, Any] | None
+    ) -> None:
+        """Construct authoritative QA verdict file from LLM output, enforcing true timestamp, hash, and revision."""
+        import json
+        import re
+        from datetime import datetime, timezone
+        from validators.harness import review_gate
+
+        raw_verdict: dict[str, Any] = {}
+        on_disk = review_gate.load_qa_verdict(ws, wo_id)
+        if isinstance(on_disk, dict) and on_disk:
+            raw_verdict = on_disk
+
+        if not raw_verdict:
+            import yaml
+            alt_candidates = [
+                ws / ".sync" / "reviews" / "qa" / f"{wo_id}.yaml",
+                ws / ".sync" / "reviews" / f"{wo_id}-verdict.json",
+                ws / ".sync" / "reviews" / f"{wo_id}-verdict.yaml",
+                ws / ".sync" / "reviews" / f"{wo_id}.json",
+                ws / ".sync" / "reviews" / f"{wo_id}.yaml",
+                ws / ".sync" / "qa" / f"{wo_id}-review.yaml",
+                ws / ".sync" / "qa" / f"{wo_id}-review.json",
+                ws / ".sync" / "qa" / f"{wo_id}.yaml",
+                ws / ".sync" / "qa" / f"{wo_id}.json",
+            ]
+            for cand in alt_candidates:
+                if cand.is_file():
+                    try:
+                        content_txt = cand.read_text(encoding="utf-8")
+                        c_data = (
+                            json.loads(content_txt)
+                            if cand.suffix.lower() == ".json"
+                            else yaml.safe_load(content_txt)
+                        )
+                        if isinstance(c_data, dict) and c_data.get("verdict"):
+                            raw_verdict = c_data
+                            break
+                    except Exception:
+                        pass
+
+        if not raw_verdict and op:
+            res = op.get("result") or {}
+            if isinstance(res, dict):
+                if isinstance(res.get("verdict"), dict):
+                    raw_verdict = res["verdict"]
+                else:
+                    text_blob = str(res.get("summary") or res.get("report_markdown") or "")
+                    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_blob, re.DOTALL)
+                    if m:
+                        try:
+                            parsed = json.loads(m.group(1))
+                            if isinstance(parsed, dict) and "verdict" in parsed:
+                                raw_verdict = parsed
+                        except Exception:
+                            pass
+                    if not raw_verdict:
+                        m_unfenced = re.search(r'\{\s*"verdict"\s*:\s*"[^"]+".*?\}', text_blob, re.DOTALL)
+                        if m_unfenced:
+                            try:
+                                parsed = json.loads(m_unfenced.group(0))
+                                if isinstance(parsed, dict) and "verdict" in parsed:
+                                    raw_verdict = parsed
+                            except Exception:
+                                pass
+                    if not raw_verdict:
+                        m_txt = re.search(
+                            r"""(?i)\bverdict\s*[:=-]\s*['"]?(PASS|FAIL|NO_TEST_EVIDENCE|QA_PASS|QA_FAIL|QA_NO_TEST_EVIDENCE)['"]?""",
+                            text_blob,
+                        )
+                        if m_txt:
+                            v_found = m_txt.group(1).upper()
+                            raw_verdict = {
+                                "verdict": v_found,
+                                "summary": text_blob.strip()[:300],
+                            }
+
+        if not raw_verdict:
+            return
+
+        authoritative_hash = review_gate.subject_hash(ws, wo_id)
+        authoritative_ts = datetime.now(timezone.utc).isoformat()
+        authoritative_rev = state.qa_review_attempts.get(wo_id, 0) + 1
+        reviewer = str((op or {}).get("agent_id") or raw_verdict.get("reviewer") or "gemma")
+
+        status = str(raw_verdict.get("verdict", "FAIL")).upper()
+        if status in ("NO_TEST_EVIDENCE", "QA_NO_TEST_EVIDENCE"):
+            status = review_gate.QA_NO_TEST_EVIDENCE
+        elif status not in (review_gate.QA_PASS, review_gate.QA_FAIL):
+            status = review_gate.QA_PASS if "pass" in status.lower() else review_gate.QA_FAIL
+
+        raw_crit = raw_verdict.get("criteria")
+        crit_list = list(raw_crit) if isinstance(raw_crit, list) else ([raw_crit] if isinstance(raw_crit, dict) else [
+            {"id": "acceptance", "description": "Meets functional acceptance criteria", "outcome": status}
+        ])
+
+        raw_ev = raw_verdict.get("evidence")
+        ev_list = list(raw_ev) if isinstance(raw_ev, list) else ([raw_ev] if isinstance(raw_ev, dict) else [])
+
+        raw_find = raw_verdict.get("findings")
+        find_list = list(raw_find) if isinstance(raw_find, list) else ([raw_find] if isinstance(raw_find, dict) else [])
+
+        raw_act = raw_verdict.get("required_actions")
+        act_list = list(raw_act) if isinstance(raw_act, list) else ([raw_act] if isinstance(raw_act, dict) else [])
+
+        canonical_verdict: dict[str, Any] = {
+            "schema": review_gate.QA_VERDICT_SCHEMA,
+            "work_order_id": wo_id,
+            "revision": authoritative_rev,
+            "reviewer": reviewer,
+            "reviewer_role": "qa",
+            "timestamp": authoritative_ts,
+            "verdict": status,
+            "subject_hash": authoritative_hash,
+            "criteria": crit_list,
+            "evidence": ev_list,
+            "findings": find_list,
+            "required_actions": act_list,
+            "rework_attempt": state.qa_reworks.get(wo_id, 0),
+            "rework_budget": state.max_qa_reworks,
+        }
+
+        data = review_gate.load_wo(ws, wo_id)
+        types = review_gate.wo_deliverable_types(data)
+        is_pure_doc = bool(types and types <= {"doc", "config"})
+        needs_test = not is_pure_doc and (
+            bool(types & {"code", "module", "api", "component"}) or bool(review_gate.wo_deliverable_paths(data))
+        )
+        if needs_test and not any(
+            isinstance(e, dict) and str(e.get("kind", "")).lower() in ("test", "build", "syntax_check", "static_check")
+            for e in canonical_verdict["evidence"]
+        ):
+            ok, msg, stack_ev = review_gate.run_stack_appropriate_verifier(ws, wo_id, data)
+            if ok:
+                if isinstance(canonical_verdict["evidence"], list):
+                    canonical_verdict["evidence"].extend(stack_ev)
+                else:
+                    canonical_verdict["evidence"] = [canonical_verdict["evidence"]] + list(stack_ev)
+                if status == review_gate.QA_FAIL and not canonical_verdict["findings"]:
+                    canonical_verdict["verdict"] = review_gate.QA_NO_TEST_EVIDENCE
+
+        if is_pure_doc or canonical_verdict.get("verdict") in (review_gate.QA_NO_TEST_EVIDENCE, "QA_NO_TEST_EVIDENCE"):
+            canonical_verdict["required_actions"] = [
+                a for a in canonical_verdict.get("required_actions", [])
+                if not any(k in str(a).lower() for k in ("test", "coverage", "markdownlint", "lint", "verification step", "evidence", "check"))
+            ]
+            if is_pure_doc and not canonical_verdict.get("findings"):
+                canonical_verdict["verdict"] = review_gate.QA_PASS
+
+        review_gate.persist_qa_verdict(ws, canonical_verdict)
 
     def _handle_qa_gate_pending(
         self,
@@ -1968,13 +2312,15 @@ class _ExecutionMixin:
                 )
                 return None  # review in flight
             state.qa_review_operations.pop(wo_id, None)
+            self._synthesize_authoritative_qa_verdict(state, ws, wo_id, ongoing)
             # Re-evaluate: a terminal review must have produced a verdict.
             decision = review_gate.evaluate_qa_gate(ws, wo_id)
             if decision.passed:
                 return None
             if decision.verdict is None:
-                state.qa_review_attempts[wo_id] = state.qa_review_attempts.get(wo_id, 0) + 1
-                if state.qa_review_attempts[wo_id] >= state.max_qa_review_attempts:
+                # The dispatch path already counted this review turn (prior_attempts + 1).
+                # Counting it again here made ONE failed review exhaust a budget of two.
+                if state.qa_review_attempts.get(wo_id, 0) >= state.max_qa_review_attempts:
                     state.error = (
                         f"QA review for {wo_id} produced no verdict after "
                         f"{state.qa_review_attempts[wo_id]} attempt(s): {decision.detail}"
@@ -2007,17 +2353,19 @@ class _ExecutionMixin:
                 state.qa_reworks[wo_id] = reworks + 1
                 correction = "\n".join(f"- {a}" for a in decision.required_actions)
                 findings = "\n".join(f"- {f}" for f in decision.findings)
+                data = review_gate.load_wo(ws, wo_id)
+                deliv_paths = review_gate.wo_deliverable_paths(data)
+                deliv_desc = ", ".join(deliv_paths) if deliv_paths else "assigned deliverables"
 
                 def _qa_rework_prompt(n: int, agent: str) -> str:
                     return (
                         f"Rework work order {wo_id} after mandatory QA review (attempt {n}).\n"
+                        f"Target deliverable(s): {deliv_desc}\n\n"
                         f"QA findings:\n"
-                        f"{findings or '- deliverable did not satisfy the acceptance criteria'}\n"
-                        + (f"Required corrective actions:\n{correction}\n" if correction else "")
-                        + "\nCRITICAL SCOPE RULE: Restrict your changes strictly to your assigned deliverable(s). Do NOT attempt to create or modify companion files owned by other work orders or marked read_only_files (such as companion CSS, JS, or tests). Those are authored by other workers in separate work orders.\n"
-                        + "Restrict your changes to the identified defects. When you finish, the "
-                        "deliverable must be re-verified and re-reviewed by QA before it "
-                        "can be accepted."
+                        f"{findings or '- deliverable did not satisfy the acceptance criteria'}\n\n"
+                        + (f"Required corrective actions:\n{correction}\n\n" if correction else "")
+                        + f"CRITICAL SCOPE RULE: Restrict your changes strictly to your assigned deliverable(s): {deliv_desc}. Do NOT attempt to create or modify companion files owned by other work orders or marked read_only_files (such as companion CSS, JS, or tests). Those are authored by other workers in separate work orders.\n"
+                        + "When you finish, the deliverable must be re-verified and re-reviewed by QA before it can be accepted."
                     )
 
                 if wo_id in state.completed_wo_ids:

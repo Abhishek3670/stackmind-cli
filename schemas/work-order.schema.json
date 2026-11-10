@@ -207,7 +207,9 @@
             "code",
             "doc",
             "config",
-            "module"
+            "module",
+            "test",
+            "report"
           ]
         },
         "path": {

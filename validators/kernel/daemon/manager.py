@@ -884,15 +884,26 @@ class SessionManager:
     def _persist_event(self, event: RuntimeEvent) -> None:
         # Event listeners may publish from runner threads; serialize persistence
         # with all session/operation transitions to avoid competing temp-file replaces.
-        if getattr(event, "name", None) in {"token.delta", "reasoning.delta"}:
+        ev_name = getattr(event, "name", None) or ""
+        if ev_name in {"token.delta", "reasoning.delta"}:
             return
-        with self._lock:
-            self._save()
+        # ponytail: throttle event-driven saves; major lifecycle events save immediately, noisy tool telemetry debounced
+        now = time.monotonic()
+        is_major = any(k in ev_name for k in ("started", "completed", "failed", "cancelled", "recovered", "blocked", "recorded", "approved"))
+        last = getattr(self, "_last_event_save_time", 0.0)
+        if is_major or (now - last) >= 1.0:
+            self._last_event_save_time = now
+            with self._lock:
+                self._save()
 
     def _save(self) -> None:
+        # ponytail: cap in-memory event dump in state file to 500 recent events; prevents multi-megabyte daemon-state bloat
+        events_dump = self.events.dump()
+        if len(events_dump) > 500:
+            events_dump = events_dump[-500:]
         self.storage.save({
             "sessions": self._sessions,
-            "events": self.events.dump(),
+            "events": events_dump,
             "roles": self._roles,
         })
 
@@ -1227,10 +1238,14 @@ class SessionManager:
         with self._lock:
             try:
                 view = self._view(self._sessions[session_id])
-                active_run = self.get_active_run(session_id)
-                if active_run:
-                    view["run"] = active_run
-                    view["phase"] = active_run.get("phase")
+                latest_run = self.get_active_run(session_id) or self.get_latest_run(session_id)
+                if latest_run:
+                    view["run"] = latest_run
+                    view["phase"] = latest_run.get("phase")
+                    if latest_run.get("error"):
+                        view["error"] = latest_run.get("error")
+                    elif str(latest_run.get("phase", "")).upper() == "COMPLETE":
+                        view["error"] = None
                 return view
             except KeyError as error:
                 raise KeyError("unknown session") from error
@@ -1572,30 +1587,52 @@ class SessionManager:
                             t = w.get("title", "") if isinstance(w, dict) else str(w)
                             allocated_mapping_lines.append(f"  - Milestone {i+1}: {wo_id} ('{t}')")
 
+                    allocated_already_on_disk = [
+                        wid for wid in allocated_ids
+                        if (workspace / ".sync" / "work-orders" / "ACTIVE" / f"{wid}.yaml").is_file()
+                        and (workspace / ".sync" / "contracts" / f"{wid}.yaml").is_file()
+                    ]
+                    if allocated_already_on_disk and len(allocated_already_on_disk) == len(allocated_ids):
+                        status_guidance = (
+                            f"\nEXISTING AUTHORING RECOGNIZED: All approved milestones already have corresponding Work Orders and Contracts on disk ({', '.join(allocated_already_on_disk)}).\n"
+                            "Inspect them if needed. If any require refinement, use update_work_order or write_file; otherwise return your final HarnessDecision JSON declaring status 'completed'."
+                        )
+                    elif allocated_already_on_disk:
+                        status_guidance = (
+                            f"\nPARTIAL AUTHORING DETECTED: The following work orders and contracts are already on disk: {', '.join(allocated_already_on_disk)}.\n"
+                            f"Please ensure the remaining allocated work orders are authored using write_file or batch_write_files."
+                        )
+                    else:
+                        status_guidance = (
+                            "Call write_file or batch_write_files to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                            "and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas."
+                        )
+
                     allocated_block = ""
                     if allocated_mapping_lines:
                         allocated_block = (
                             f"\nAllocated Work Order IDs for approved milestones:\n"
                             + "\n".join(allocated_mapping_lines)
                             + f"\n\nCRITICAL ANTI-COLLISION RULE: You MUST author using ONLY the allocated IDs above ({allocated_list_str}). "
-                            f"Do NOT reuse earlier or completed Work Order IDs (e.g. WO-001).\n"
+                            f"Do NOT reuse completed Work Order IDs.\n"
                         )
 
                     authoring_prompt = (
                         f"The architecture plan '{plan_id}' has been approved by the operator (reason: {reason or 'Approved by operator'}).\n\n"
-                        "Your task now as Senior Architect is to author the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
+                        "Your task now as Senior Architect is to finalize the implementation Work Orders and Contracts for the tasks in PLAN.md:\n"
                         f"{allocated_block}\n"
+                        f"{status_guidance}\n\n"
                         "1. Review PLAN.md for the approved milestones and tasks.\n"
-                        f"2. For each task, call write_file to write a Work Order YAML file to .sync/work-orders/ACTIVE/<WO-ID>.yaml "
+                        f"2. Ensure each allocated task has a valid Work Order YAML in .sync/work-orders/ACTIVE/<WO-ID>.yaml "
                         f"(e.g. {example_id}.yaml) conforming to schemas/work-order.schema.json.\n"
-                        f"3. For each Work Order, call write_file to write a corresponding Contract YAML file to .sync/contracts/<WO-ID>.yaml "
+                        f"3. Ensure each Work Order has a corresponding Contract YAML in .sync/contracts/<WO-ID>.yaml "
                         f"(e.g. {example_id}.yaml) conforming to schemas/contract.schema.json.\n"
                         "4. Do NOT explicitly specify or force TDD companion test deliverables on Backend or Frontend work orders. "
                         "Let Backend and Frontend focus on their assigned deliverables according to their work orders (they are permitted to author "
                         "unit tests if they wish to self-verify). QA/verification Work Orders (assigned to gemma) MUST declare an "
                         "executable code deliverable under tests/ — when QA's turn arrives, QA will inspect the deliverables and any "
                         "existing unit tests, then author an independent end-to-end test suite for comprehensive code quality and verification.\n"
-                        "5. When all work orders and contracts are written, return the final HarnessDecision JSON declaring status 'completed' "
+                        "5. When all work orders and contracts are finalized, return the final HarnessDecision JSON declaring status 'completed' "
                         "and modified_files listing all authored files."
                     )
                     turn_wo_id = plan.get("metadata", {}).get("work_order_id") or "WO-000"
@@ -1763,14 +1800,24 @@ class SessionManager:
         state.planning_retries = 0
         state.daemon_restarts = 0
         state.budget_exhausted = False
-        if getattr(state, "global_turn_budget", 0) <= 10:
-            state.global_turn_budget = max(getattr(state, "initial_turn_budget", 0) or 38, 50)
+        # ponytail: eliminate repetitive budget pauses on resume by granting a generous turn budget (default 500, configurable via STACKMIND_TURN_BUDGET)
+        env_budget_str = os.environ.get("STACKMIND_TURN_BUDGET")
+        try:
+            default_grant = int(env_budget_str) if env_budget_str else 500
+        except ValueError:
+            default_grant = 500
+        if getattr(state, "global_turn_budget", 0) <= 50:
+            state.global_turn_budget = max(getattr(state, "initial_turn_budget", 0) or 100, default_grant)
+        state.human_resumes_used = 0
+        state.max_human_resumes = max(getattr(state, "max_human_resumes", 2), 100)
+        state.max_daemon_restarts = max(getattr(state, "max_daemon_restarts", 3), 50)
         state.run_started_at = time.monotonic()
         state.turn_deadline = None
         state.waiting_for_human_entered_at = None
         state.dependency_escalation_retries.clear()
         state.integration_retries = 0
         state.worker_blockers.clear()
+        state.integration_blockers.clear()
         if session.get("state") != "COMPLETED":
             session["state"] = "RUNNING"
             session["updated_at"] = _now()
@@ -1785,6 +1832,20 @@ class SessionManager:
         state.integration_rework_rounds = 0
         state.authoring_repair_attempts = 0
         state.final_prerequisite_rounds = 0
+        # ponytail: reset final review rounds and history so human :resume does not immediately fail with FINAL_REVIEW_BUDGET_EXHAUSTED
+        state.final_review_rounds = 0
+        if hasattr(state, "final_review_history"):
+            state.final_review_history.clear()
+        if hasattr(state, "budget_usage") and isinstance(state.budget_usage, dict):
+            for k in ("FINAL_REVIEW", "final_review"):
+                if k in state.budget_usage:
+                    state.budget_usage[k].clear()
+        if not getattr(state, "plan_id", None):
+            plans = self.list_plans(state.session_id)
+            if plans:
+                state.plan_id = plans[-1].get("plan_id") or "PLAN-001"
+            elif (ws / ".sync" / "playbook" / "PLAN.md").is_file() or (ws / "PLAN.md").is_file():
+                state.plan_id = "PLAN-001"
         # Held-back QA re-dispatch is likewise released: the fresh QA turn
         # re-evaluates the deliverables and re-routes defects if they persist.
         if hasattr(state, "qa_rework_targets"):
@@ -1792,7 +1853,11 @@ class SessionManager:
 
         # Archive any pre-existing unconsumed QA verdicts so freshly resumed worker turns
         # are not immediately failed by obsolete findings from prior sessions.
+        # Completed work orders must preserve their authoritative passing QA verdicts.
+        completed_wos = set(getattr(state, "completed_wo_ids", []))
         for wo in getattr(state, "worker_wo_ids", []):
+            if wo in completed_wos:
+                continue
             try:
                 self.supervisor._archive_verdicts_for_wo(wo, ws)
             except Exception:
@@ -1835,10 +1900,8 @@ class SessionManager:
                 if t is None or not t.is_alive():
                     session["active_operation"] = None
 
-        # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
-        self.supervisor.unblock_in_flight_work_orders(state)
-
         # Clean up any stale active duplicates for work orders that are already completed
+        # and populate state.completed_wo_ids from disk before unblocking in-flight work orders
         active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
         completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
         if active_dir.is_dir() and completed_dir.is_dir():
@@ -1851,6 +1914,40 @@ class SessionManager:
                         pass
                 if comp_file.stem not in getattr(state, "completed_wo_ids", []):
                     state.completed_wo_ids.append(comp_file.stem)
+                if state.planning_wo_id == comp_file.stem:
+                    state.planning_wo_id = None
+
+        # Check ACTIVE directory for work orders that already completed
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        if active_dir.is_dir():
+            for act_file in list(active_dir.glob("*.yaml")):
+                try:
+                    adata = yaml.safe_load(act_file.read_text(encoding="utf-8"))
+                    if isinstance(adata, dict) and adata.get("completion") and isinstance(adata["completion"], dict):
+                        comp = adata["completion"]
+                        from validators.harness.review_gate import _is_path_like
+                        if isinstance(comp.get("missing_deliverables"), list):
+                            comp["missing_deliverables"] = [
+                                m for m in comp["missing_deliverables"]
+                                if _is_path_like(str(m))
+                            ]
+                            if not comp["missing_deliverables"]:
+                                comp.pop("missing_deliverables", None)
+                        if comp.get("deliverable_hashes") and not comp.get("missing_deliverables"):
+                            adata["status"] = "COMPLETED"
+                            adata.pop("error", None)
+                            adata.pop("blocked_reason", None)
+                            adata.pop("cancellation_reason", None)
+                            dest = completed_dir / act_file.name
+                            dest.write_text(yaml.safe_dump(adata, sort_keys=False), encoding="utf-8")
+                            act_file.unlink(missing_ok=True)
+                            if act_file.stem not in getattr(state, "completed_wo_ids", []):
+                                state.completed_wo_ids.append(act_file.stem)
+                except Exception:
+                    pass
+
+        # Unblock non-completed work orders on disk (resetting status to ACTIVE and clearing errors)
+        self.supervisor.unblock_in_flight_work_orders(state)
 
         # Synchronize INDEX.yaml and TREE.yaml with the unblocked work orders
         try:
@@ -1877,14 +1974,32 @@ class SessionManager:
         except Exception:
             pass
 
-        # Reset exhausted authoring repair counters so resumed runs have a fresh chance
+        # Reset exhausted authoring repair, recovery, and retry counters so resumed runs have a fresh chance
         state.authoring_repair_attempts = 0
         state.authoring_operation_failed = False
         if hasattr(state, "dependency_escalation_retries") and isinstance(state.dependency_escalation_retries, dict):
             state.dependency_escalation_retries.clear()
+        if hasattr(state, "recovery_attempts") and isinstance(state.recovery_attempts, dict):
+            state.recovery_attempts.clear()
+        if hasattr(state, "worker_retries") and isinstance(state.worker_retries, dict):
+            state.worker_retries.clear()
+        if hasattr(state, "worker_blockers") and isinstance(state.worker_blockers, dict):
+            state.worker_blockers.clear()
+        if hasattr(state, "dispatch_failures") and isinstance(state.dispatch_failures, dict):
+            state.dispatch_failures.clear()
+        state.recovery_wo_id = None
+        state.recovery_decision_operation_id = None
         state.integration_retries = 0
         if state.error and ("exhausted" in state.error or "blocked" in state.error.lower() or "failed" in state.error.lower()):
             state.error = None
+
+        # Clean up stale superseded_wo_ids: any work order that is active or completed on disk is not superseded
+        if hasattr(state, "superseded_wo_ids") and isinstance(state.superseded_wo_ids, list):
+            state.superseded_wo_ids = [
+                wid for wid in state.superseded_wo_ids
+                if wid not in getattr(state, "completed_wo_ids", [])
+                and not (active_dir / f"{wid}.yaml").is_file()
+            ]
 
         self.supervisor._discover_worker_wos(state)
 
@@ -1969,15 +2084,68 @@ class SessionManager:
                         candidate = Phase(p_from) if p_from else None
                     except ValueError:
                         candidate = None
-                    if candidate and candidate not in (Phase.FAILED, Phase.BLOCKED, Phase.ARCHITECT_REPAIR, Phase.INIT):
+                    if candidate and candidate not in (
+                        Phase.FAILED,
+                        Phase.BLOCKED,
+                        Phase.ARCHITECT_REPAIR,
+                        Phase.ARCHITECT_RECOVERY_DECISION,
+                        Phase.WAITING_FOR_HUMAN,
+                        Phase.INIT,
+                    ):
+                        if getattr(state, "completed_wo_ids", None) and candidate in (Phase.PLANNING, Phase.AUTHORING, Phase.AUTHORING_READINESS_GATE):
+                            continue
                         prev_phase = candidate
                         break
-            target_phase = prev_phase or (
-                Phase.DISPATCHING if state.worker_wo_ids
-                else Phase.AUTHORING if state.plan_id
-                else Phase.PLANNING
-            )
+
+            pending_workers = [
+                wid for wid in getattr(state, "worker_wo_ids", [])
+                if wid not in getattr(state, "completed_wo_ids", [])
+                and wid != getattr(state, "gitops_wo_id", None)
+            ]
+            if pending_workers and prev_phase in (Phase.FINAL_REVIEW, Phase.GITOPS, Phase.INTEGRATION_REVIEW):
+                target_phase = Phase.DISPATCHING
+            elif prev_phase:
+                target_phase = prev_phase
+            else:
+                non_gitops_workers = [
+                    wid for wid in getattr(state, "worker_wo_ids", [])
+                    if wid != getattr(state, "gitops_wo_id", None)
+                ]
+                if hasattr(self.supervisor, "_role_for_agent") and hasattr(self.supervisor, "_agent_for_wo"):
+                    non_gitops_workers = [
+                        wid for wid in non_gitops_workers
+                        if self.supervisor._role_for_agent(self.supervisor._agent_for_wo(wid, ws)) != "gitops"
+                    ]
+
+                all_workers_done = bool(non_gitops_workers and all(wid in getattr(state, "completed_wo_ids", []) for wid in non_gitops_workers))
+
+                if all_workers_done:
+                    int_wo = getattr(state, "integration_wo_id", None)
+                    if int_wo and int_wo in getattr(state, "completed_wo_ids", []):
+                        target_phase = Phase.GITOPS
+                    else:
+                        target_phase = Phase.INTEGRATION_REVIEW
+                else:
+                    from .supervisor.models import resolve_next_execution_phase
+                    target_phase = resolve_next_execution_phase(state)
+
+        if target_phase == Phase.EXECUTING:
+            has_live_op = False
+            if hasattr(self, "list_operations"):
+                try:
+                    for op in self.list_operations(state.session_id):
+                        st = str(op.get("status", "")).upper()
+                        if st not in _OPERATION_TERMINAL and st not in ("CANCELLED", "CANCEL_REQUESTED"):
+                            has_live_op = True
+                            break
+                except Exception:
+                    pass
+            if not has_live_op:
+                from .supervisor.models import resolve_next_execution_phase
+                target_phase = resolve_next_execution_phase(state)
+
         state.error = None
+        state.interrupted_phase = None
         _reset_phase_operation_id(state, target_phase)
         self.supervisor._transition(state, target_phase, authorized_override=True)
         return target_phase
@@ -2071,12 +2239,43 @@ class SessionManager:
                     self.supervisor.save_run_state(state, ws)
                 except Exception:
                     pass
+            # If active work orders exist on disk, populate worker_wo_ids before re-attest
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+            if active_dir.is_dir():
+                for wo_file in sorted(active_dir.glob("*.yaml")):
+                    wo_id = wo_file.stem
+                    if completed_dir.is_dir() and (completed_dir / wo_file.name).is_file():
+                        try:
+                            wo_file.unlink()
+                        except OSError:
+                            pass
+                        continue
+                    if wo_id in state.completed_wo_ids:
+                        state.completed_wo_ids.remove(wo_id)
+                    if wo_id not in state.worker_wo_ids:
+                        state.worker_wo_ids.append(wo_id)
+            if state.phase == Phase.COMPLETE and state.worker_wo_ids:
+                state.phase = Phase.DISPATCHING
+                state.exit_code = 0
+                state.error = None
+            elif state.phase == Phase.COMPLETE and not state.worker_wo_ids:
+                state.exit_code = 0
+                state.error = None
+
+            target_phase = None
+            if state.phase != Phase.COMPLETE:
+                target_phase = self._prepare_run_for_resume(state, session, ws)
+            else:
+                self._cleanup_orphaned_operations(state, session)
+
             if hasattr(self.supervisor, "re_attest_run"):
                 try:
                     self.supervisor.re_attest_run(
                         state,
                         human_signature="operator",
-                        confirmed_budget=state.global_turn_budget or 50,
+                        confirmed_budget=state.global_turn_budget or 500,
+                        target_phase=target_phase,
                     )
                 except Exception:
                     pass
@@ -2086,11 +2285,6 @@ class SessionManager:
                     self.supervisor.state_manager.re_attest_run(state.run_id, "Human re-attestation by operator")
                 except Exception:
                     pass
-
-            if state.phase != Phase.COMPLETE:
-                self._prepare_run_for_resume(state, session, ws)
-            else:
-                self._cleanup_orphaned_operations(state, session)
 
             self._active_runs[target_run_id] = state
             try:
@@ -2227,18 +2421,33 @@ class SessionManager:
                             active_rec = r
                             break
 
-                    if (
-                        active_rec is None
-                        or active_rec.get("status") in _OPERATION_TERMINAL
-                        or active_rec.get("status") == "CANCEL_REQUESTED"
-                        or not is_thread_alive
-                    ):
-                        if active_rec and active_rec.get("status") not in _OPERATION_TERMINAL:
+                    try:
+                        grace = float(os.environ.get("STALE_OPERATION_GRACE_SECONDS", "15"))
+                    except ValueError:
+                        grace = 15.0
+
+                    now_dt = datetime.now(timezone.utc)
+                    op_age = 999.0
+                    if active_rec:
+                        try:
+                            started_dt = datetime.fromisoformat(str(active_rec.get("started_at")))
+                            if started_dt.tzinfo is None:
+                                started_dt = started_dt.replace(tzinfo=timezone.utc)
+                            op_age = (now_dt - started_dt).total_seconds()
+                        except (TypeError, ValueError, AttributeError):
+                            op_age = grace
+
+                    is_terminal = active_rec and active_rec.get("status") in _OPERATION_TERMINAL
+                    is_cancel_req = active_rec and active_rec.get("status") == "CANCEL_REQUESTED"
+                    is_truly_orphaned = not is_thread_alive and op_age >= grace
+
+                    if active_rec is None or is_terminal or is_cancel_req or is_truly_orphaned:
+                        if active_rec and not is_terminal:
                             self.complete_operation(
                                 session_id,
                                 active_op_id,
                                 {"reason": "Orphaned operation cleaned up on new turn"},
-                                status="CANCELLED" if active_rec.get("status") == "CANCEL_REQUESTED" else "FAILED",
+                                status="CANCELLED" if is_cancel_req else "FAILED",
                             )
                         session["active_operation"] = None
                     else:
@@ -2504,18 +2713,23 @@ class SessionManager:
             if final_status == "CANCELLED":
                 ws_path = Path(session.get("workspace", "."))
                 wo_id = record.get("work_order_id") or record.get("work_order")
-                try:
-                    from validators.kernel.work_order_ops import cleanup_cancelled_operation
-                    cleanup_cancelled_operation(
-                        ws_path,
-                        operation_id=target_op_id,
-                        work_order_id=wo_id,
-                        reason=str((result or {}).get("reason") or "Cancelled by operator") if isinstance(result, Mapping) else "Cancelled by operator",
-                        actor=record.get("role") or session.get("role") or "operator",
-                        session_id=session.get("session_id"),
-                    )
-                except Exception:
-                    pass
+                is_internal_cleanup = any(
+                    kw in str((result or {}).get("reason") or "").lower()
+                    for kw in ("contention", "cleared by supervisor", "cleared by orchestrator", "turn reset", "operation cleared", "invalidated_on_resume")
+                ) if isinstance(result, Mapping) else False
+                if not is_internal_cleanup:
+                    try:
+                        from validators.kernel.work_order_ops import cleanup_cancelled_operation
+                        cleanup_cancelled_operation(
+                            ws_path,
+                            operation_id=target_op_id,
+                            work_order_id=wo_id,
+                            reason=str((result or {}).get("reason") or "Cancelled by operator") if isinstance(result, Mapping) else "Cancelled by operator",
+                            actor=record.get("role") or session.get("role") or "operator",
+                            session_id=session.get("session_id"),
+                        )
+                    except Exception:
+                        pass
             if final_status in ("FAILED", "BLOCKED") and not record.get("error"):
                 if isinstance(result, Mapping):
                     raw_e = result.get("error") or result.get("reason") or result.get("message")
@@ -3076,6 +3290,24 @@ class SessionManager:
                         return persisted.to_dict()
         return None
 
+    def get_latest_run(self, session_id: str) -> dict[str, Any] | None:
+        """Get the latest run state for a session, including completed runs."""
+        for state in self._active_runs.values():
+            if state.session_id == session_id:
+                return state.to_dict()
+        session = self._sessions.get(session_id)
+        if session:
+            ws = Path(session.get("workspace", ""))
+            sup_dir = ws / ".sync" / "runtime" / "supervisor"
+            if sup_dir.is_dir():
+                run_files = sorted(sup_dir.glob("run-*.yaml"), key=os.path.getmtime, reverse=True)
+                for rf in run_files:
+                    persisted = self.supervisor.load_run_state(rf.stem, ws)
+                    if persisted and persisted.session_id == session_id:
+                        self._active_runs[rf.stem] = persisted
+                        return persisted.to_dict()
+        return None
+
     def get_run_reviews(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Authoritative review state (QA gate + Architect final acceptance).
 
@@ -3321,25 +3553,88 @@ class SessionManager:
                         is_valid, _ = validate_plan_structure(plan_content)
                         if is_valid:
                             parsed_plan = parse_plan(plan_content, project_path=ws_path)
-                            from .authoring import get_next_work_order_int, determine_assigned_agent, extract_deliverable_spec
-                            start_idx = get_next_work_order_int(ws_path)
+                            from .authoring import determine_assigned_agent, extract_deliverable_spec
+                            from validators.harness.authoring_readiness import _wo_matches_milestone, _parse_wo_index
+
+                            # Harmonize with existing active work orders authored by Architect (e.g. via LLM batch write)
+                            active_dir = ws_path / ".sync" / "work-orders" / "ACTIVE"
+                            existing_active_wos: list[dict[str, Any]] = []
+                            if active_dir.is_dir():
+                                for f in sorted(active_dir.glob("*.yaml")):
+                                    try:
+                                        data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                                        if isinstance(data, dict) and data.get("id"):
+                                            st = str(data.get("status", "")).upper()
+                                            if st not in ("CANCELLED", "CANCELED"):
+                                                existing_active_wos.append(data)
+                                    except Exception:
+                                        pass
+
+                            all_taken_indices: set[int] = set()
+                            for sub in ("COMPLETED", "BLOCKED"):
+                                d = ws_path / ".sync" / "work-orders" / sub
+                                if d.is_dir():
+                                    for f in d.glob("*.yaml"):
+                                        idx_val = _parse_wo_index(f.stem)
+                                        if idx_val:
+                                            all_taken_indices.add(idx_val)
+                            for w in existing_active_wos:
+                                idx_val = _parse_wo_index(str(w.get("id", "")))
+                                if idx_val:
+                                    all_taken_indices.add(idx_val)
+
+                            def _get_next_free_wo_id(current_free: int) -> tuple[str, int]:
+                                while current_free in all_taken_indices:
+                                    current_free += 1
+                                all_taken_indices.add(current_free)
+                                return f"WO-{current_free:03d}", current_free + 1
+
+                            claimed_wo_ids: set[str] = set()
                             proposed_wos = []
+                            allocated_idx = 1
                             for offset, m in enumerate(parsed_plan.milestones):
-                                idx = start_idx + offset
-                                wo_id = f"WO-{idx:03d}"
-                                agent_id, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
-                                deliv = extract_deliverable_spec(m.title, m.tasks, role, stack=parsed_plan.tech_stack, project_path=ws_path)
-                                proposed_wos.append({
-                                    "id": wo_id,
-                                    "title": m.title,
-                                    "type": "FEATURE",
-                                    "priority": "P1" if offset > 0 else "P0",
-                                    "assigned_agents": [agent_id],
-                                    "dependencies": [f"WO-{idx-1:03d}"] if offset > 0 else [],
-                                    "deliverable": deliv,
-                                    "description": "\n".join(m.tasks) if m.tasks else m.title,
-                                    "milestone_id": m.id,
-                                })
+                                # Check if an existing active work order authored by the architect matches this milestone
+                                matched_wo = next(
+                                    (
+                                        w for w in existing_active_wos
+                                        if str(w.get("id")) not in claimed_wo_ids and _wo_matches_milestone(w, m)
+                                    ),
+                                    None
+                                )
+                                if matched_wo is not None:
+                                    wo_id = str(matched_wo["id"])
+                                    claimed_wo_ids.add(wo_id)
+                                    agent_id = (matched_wo.get("assigned_agents") or ["codex"])[0]
+                                    deliv = matched_wo.get("deliverable") or extract_deliverable_spec(m.title, m.tasks, agent_id, stack=parsed_plan.tech_stack, project_path=ws_path)
+                                    prev_id = proposed_wos[-1]["id"] if proposed_wos else None
+                                    deps = matched_wo.get("dependencies") or ([prev_id] if prev_id else [])
+                                    proposed_wos.append({
+                                        "id": wo_id,
+                                        "title": matched_wo.get("title") or m.title,
+                                        "type": matched_wo.get("type", "FEATURE"),
+                                        "priority": matched_wo.get("priority", "P1" if offset > 0 else "P0"),
+                                        "assigned_agents": matched_wo.get("assigned_agents") or [agent_id],
+                                        "dependencies": deps,
+                                        "deliverable": deliv,
+                                        "description": matched_wo.get("description") or ("\n".join(m.tasks) if m.tasks else m.title),
+                                        "milestone_id": matched_wo.get("milestone_id") or m.id,
+                                    })
+                                else:
+                                    wo_id, allocated_idx = _get_next_free_wo_id(allocated_idx)
+                                    agent_id, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
+                                    deliv = extract_deliverable_spec(m.title, m.tasks, role, stack=parsed_plan.tech_stack, project_path=ws_path)
+                                    prev_id = proposed_wos[-1]["id"] if proposed_wos else None
+                                    proposed_wos.append({
+                                        "id": wo_id,
+                                        "title": m.title,
+                                        "type": "FEATURE",
+                                        "priority": "P1" if offset > 0 else "P0",
+                                        "assigned_agents": [agent_id],
+                                        "dependencies": [prev_id] if prev_id else [],
+                                        "deliverable": deliv,
+                                        "description": "\n".join(m.tasks) if m.tasks else m.title,
+                                        "milestone_id": m.id,
+                                    })
                             plan_meta = {
                                 "work_orders": proposed_wos,
                                 "plan_structure": parsed_plan.to_dict(),
@@ -3479,7 +3774,11 @@ class SessionManager:
                             self.events.publish("error", session_id, message=f"Failed to auto-dispatch delegated task: {e}")
             elif res_status == "blocked":
                 err_text = str(computed_err or "")
-                is_plan_gate_failure = "PLAN.md" in err_text and "verification gate failed" in err_text.lower()
+                wo_id_str = str(op_rec.get("work_order_id") or "")
+                is_plan_gate_failure = (
+                    ("PLAN.md" in err_text or wo_id_str == "WO-000")
+                    and any(k in err_text.lower() for k in ("verification gate failed", "declared deliverable", "without authoring", "not added or modified"))
+                )
                 retry_count = int((op_rec.get("metadata") or {}).get("plan_repair_attempt", 0))
                 is_wo_gate_failure = (
                     any(k in err_text.lower() for k in ("work-orders", "contracts", "index.yaml"))
@@ -3531,48 +3830,59 @@ class SessionManager:
                         self.events.publish("error", session_id, message=f"Failed to auto-revert plan to architect: {repair_exc}")
                         return
                 elif is_wo_gate_failure and wo_retry_count < 2:
-                    self.events.publish(
-                        "work_order.auto_repair_requested",
-                        session_id,
-                        attempt=wo_retry_count + 1,
-                        errors=computed_err,
-                        operation_id=operation_id,
+                    has_supervisor = any(
+                        getattr(r, "session_id", None) == session_id
+                        for r in self._active_runs.values()
                     )
-                    wo_repair_prompt = (
-                        f"CRITICAL ARCHITECTURE INSTRUCTION: Your authored Work Order, Contract, or Index YAML was REJECTED by StackMind runtime validation with the following errors:\n"
-                        f"{computed_err}\n\n"
-                        f"Please immediately repair and re-author the offending YAML file(s) in .sync/work-orders/ or .sync/contracts/ using write_file conforming to StackMind schemas:\n"
-                        f"1. Allowed 'type' enums for Work Orders and INDEX.yaml:\n"
-                        f"   ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']\n"
-                        f"   *GUIDANCE: For QA/verification tasks, declare type: 'VALIDATION' (NEVER 'QA' or 'TEST'). QA is an assigned agent/role, not a work-order type.*\n"
-                        f"2. Allowed 'deliverable.type' enums for Work Orders:\n"
-                        f"   ['code', 'doc', 'config', 'module']\n"
-                        f"   *GUIDANCE: For test suites use deliverable.type: 'code' (with path under tests/); for reviews/reports use deliverable.type: 'doc' (NEVER 'test' or 'report').*\n"
-                        f"3. Priorities and Statuses:\n"
-                        f"   - priority must be 'P0', 'P1', 'P2', or 'P3'\n"
-                        f"   - status must be 'ACTIVE', 'PENDING', 'READY', 'BLOCKED', or 'COMPLETED'\n"
-                        f"4. Dependencies: list of existing WO IDs, e.g. ['WO-001'] or []\n"
-                        f"5. All entries in .sync/work-orders/INDEX.yaml must match the corresponding .sync/work-orders/ACTIVE/<WO-ID>.yaml files.\n\n"
-                        f"Re-author the valid YAML file(s) now."
-                    )
-                    self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
-                    self.events.tool_result(
-                        session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
-                        result=result_data, role=op_role, agent_id=agent,
-                    )
-                    try:
-                        self.start_turn(
+                    if not has_supervisor:
+                        self.events.publish(
+                            "work_order.auto_repair_requested",
                             session_id,
-                            wo_repair_prompt,
-                            role="architecture",
-                            agent_id="claude",
-                            is_authoring=True,
-                            wo_repair_attempt=wo_retry_count + 1,
+                            attempt=wo_retry_count + 1,
+                            errors=computed_err,
+                            operation_id=operation_id,
                         )
-                        return
-                    except Exception as repair_exc:
-                        self.events.publish("error", session_id, message=f"Failed to auto-revert work order repair to architect: {repair_exc}")
-                        return
+                        wo_repair_prompt = (
+                            f"CRITICAL ARCHITECTURE INSTRUCTION: Your authored Work Order, Contract, or Index YAML was REJECTED by StackMind runtime validation with the following errors:\n"
+                            f"{computed_err}\n\n"
+                            f"Please immediately repair and re-author the offending YAML file(s) in .sync/work-orders/ or .sync/contracts/ using write_file conforming to StackMind schemas:\n"
+                            f"1. Allowed 'type' enums for Work Orders and INDEX.yaml:\n"
+                            f"   ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']\n"
+                            f"   *GUIDANCE: For QA/verification tasks, declare type: 'VALIDATION' (NEVER 'QA' or 'TEST'). QA is an assigned agent/role, not a work-order type.*\n"
+                            f"2. Allowed 'deliverable.type' enums for Work Orders:\n"
+                            f"   ['code', 'doc', 'config', 'module', 'test']\n"
+                            f"   *GUIDANCE: For test suites use deliverable.type: 'test' or 'code' (with path under tests/); for reviews/reports use deliverable.type: 'doc'.*\n"
+                            f"3. Priorities and Statuses:\n"
+                            f"   - priority must be 'P0', 'P1', 'P2', or 'P3'\n"
+                            f"   - status must be 'ACTIVE', 'PENDING', 'READY', 'BLOCKED', or 'COMPLETED'\n"
+                            f"4. Dependencies: list of existing WO IDs, e.g. ['WO-001'] or []\n"
+                            f"5. All entries in .sync/work-orders/INDEX.yaml must match the corresponding .sync/work-orders/ACTIVE/<WO-ID>.yaml files.\n\n"
+                            f"Re-author the valid YAML file(s) now."
+                        )
+                        self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
+                        self.events.tool_result(
+                            session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                            result=result_data, role=op_role, agent_id=agent,
+                        )
+                        try:
+                            self.start_turn(
+                                session_id,
+                                wo_repair_prompt,
+                                role="architecture",
+                                agent_id="claude",
+                                is_authoring=True,
+                                wo_repair_attempt=wo_retry_count + 1,
+                            )
+                            return
+                        except Exception as repair_exc:
+                            self.events.publish("error", session_id, message=f"Failed to auto-revert work order repair to architect: {repair_exc}")
+                            return
+                    else:
+                        self.events.tool_result(
+                            session_id, tool_name, operation_id, "blocked", operation_id=operation_id,
+                            result=result_data, role=op_role, agent_id=agent,
+                        )
+                        self.complete_operation(session_id, operation_id, result_data, status="BLOCKED")
                 else:
                     self.events.tool_result(
                         session_id, tool_name, operation_id, "blocked", operation_id=operation_id,

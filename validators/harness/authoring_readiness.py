@@ -295,11 +295,35 @@ def load_plan_milestones(workspace: Path | str) -> list[dict[str, Any]] | None:
                     "id": m.id,
                     "title": m.title,
                     "agent": m.agent,
+                    "tasks": list(getattr(m, "tasks", []) or []),
                     "status": getattr(m, "status", "PENDING"),
                 })
     except Exception:
         return None
     return refs or None
+
+
+_FILE_CANDIDATE_PATTERN = re.compile(
+    r"(?:[`\"'\s(\[{<]|^)([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]{1,6})(?=[`\"'\s)\]}>,;:]|$)"
+)
+
+
+def _extract_paths_from_text(text: str) -> set[str]:
+    if not text:
+        return set()
+    found = set()
+    for m in _FILE_CANDIDATE_PATTERN.findall(text):
+        clean = m.strip().strip("`\"'.,()").replace("\\", "/").lstrip("/").lower()
+        if any(clean.endswith(ext) for ext in (
+            ".txt", ".py", ".html", ".js", ".jsx", ".ts", ".tsx", ".css", ".md",
+            ".json", ".yaml", ".yml", ".sql", ".db", ".sqlite", ".go", ".rs", ".vue", ".svelte",
+        )):
+            if not clean.startswith(".sync") and not clean.startswith(".git") and clean not in ("plan.md", "architecture.md", "design.md"):
+                found.add(clean)
+    for mf in ("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod", "version.md", "changelog.md"):
+        if mf in text.lower():
+            found.add(mf)
+    return found
 
 
 def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
@@ -327,13 +351,13 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
         return True
 
     ref_agent = str(ref.get("agent") or "").strip().lower()
+    wo_assigned = data.get("assigned_agents")
+    wo_agents = [
+        str(a).strip().lower()
+        for a in (wo_assigned if isinstance(wo_assigned, list) else [wo_assigned])
+        if a
+    ]
     if ref_agent:
-        wo_assigned = data.get("assigned_agents")
-        wo_agents = [
-            str(a).strip().lower()
-            for a in (wo_assigned if isinstance(wo_assigned, list) else [wo_assigned])
-            if a
-        ]
         if ref_agent in wo_agents:
             m_tokens = _title_tokens(ref.get("title")) - _ACTION_PREFIX_VERBS
             w_tokens = _title_tokens(data.get("title")) - _ACTION_PREFIX_VERBS
@@ -350,6 +374,32 @@ def _wo_matches_milestone(data: dict[str, Any], ref: dict[str, Any]) -> bool:
                     return True
                 if (m_matched / len(m_tokens) >= 0.6) and (w_matched / len(w_tokens) >= 0.6):
                     return True
+
+    # Path / Deliverable overlap check: If work order deliverables or touched files overlap
+    # with the files declared in ref's tasks or title, and assigned agents are compatible.
+    if not (ref_agent and wo_agents and ref_agent not in wo_agents):
+        ref_paths: set[str] = set()
+        for t in ref.get("tasks") or []:
+            ref_paths.update(_extract_paths_from_text(str(t)))
+        ref_paths.update(_extract_paths_from_text(str(ref.get("title") or "")))
+
+        if ref_paths:
+            wo_paths: set[str] = set()
+            deliv = data.get("deliverable") or {}
+            if deliv.get("path"):
+                wo_paths.add(str(deliv["path"]).strip().replace("\\", "/").lstrip("/").lower())
+            for d in data.get("deliverables") or []:
+                if isinstance(d, dict) and d.get("path"):
+                    wo_paths.add(str(d.get("path")).strip().replace("\\", "/").lstrip("/").lower())
+            impl = data.get("implementation_estimate") or {}
+            for ef in impl.get("expected_files") or []:
+                if ef:
+                    wo_paths.add(str(ef).strip().replace("\\", "/").lstrip("/").lower())
+            wo_paths.update(_extract_paths_from_text(str(data.get("description") or "")))
+            wo_paths.update(_extract_paths_from_text(str(data.get("title") or "")))
+
+            if wo_paths & ref_paths:
+                return True
 
     return False
 
@@ -649,7 +699,11 @@ def validate_authoring_readiness(
                 continue
             if p_idx is not None and (_parse_wo_index(wo_ref) or 0) <= p_idx:
                 continue
-            if _is_meta_work_order(data) or str(data.get("agent_id") or "").lower() in ("claude", "architecture"):
+            if _is_meta_work_order(data):
+                continue
+            is_arch_agent = str(data.get("agent_id") or "").lower() in ("claude", "architecture")
+            is_recovery = str(data.get("synthesized_by") or "").startswith("recovery-repair")
+            if is_arch_agent and not is_recovery:
                 continue
             cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
             if cand.is_file():
@@ -720,6 +774,13 @@ def validate_authoring_readiness(
                         break
                 except Exception:
                     pass
+        if not is_archived_or_terminal:
+            archive_dir = ws / ".sync" / "archive"
+            if archive_dir.is_dir():
+                for af in archive_dir.rglob("*.yaml"):
+                    if wo_ref in af.name:
+                        is_archived_or_terminal = True
+                        break
         if is_archived_or_terminal:
             continue
         _issue(issues, "ORPHAN_CONTRACT", "coverage", f"Contract '{contract.path}' references work order '{wo_ref}' " f"which is not an active authored work order", work_order_id=wo_ref, artifact_path=contract.path)
@@ -830,7 +891,8 @@ def validate_authoring_readiness(
         if contract is not None:
             if str(contract.data.get("work_order") or "") != wo_id:
                 _issue(issues, "CONTRACT_WO_MISMATCH", "schema", f"Contract '{contract.path}' declares work_order " f"'{contract.data.get('work_order')}' but is bound to '{wo_id}'", work_order_id=wo_id, artifact_path=contract.path)
-            if primary_agent and str(contract.agent_id or "").lower().strip() != primary_agent:
+            is_recovery_contract = str(contract.data.get("synthesized_by") or "").startswith("recovery-repair")
+            if not is_recovery_contract and primary_agent and str(contract.agent_id or "").lower().strip() != primary_agent:
                 _issue(issues, "CONTRACT_AGENT_MISMATCH", "schema", f"Contract '{contract.path}' agent_id '{contract.agent_id}' does not match " f"work order assignee '{primary_agent}'", work_order_id=wo_id, artifact_path=contract.path)
 
             # Budget: explicitly present and positive
@@ -863,11 +925,18 @@ def validate_authoring_readiness(
         # QA work orders must deliver an executable test suite, not a sign-off
         # document: D024 demands a companion test file for every code deliverable.
         if primary_agent == "gemma":
+            is_review_order = (
+                str(data.get("type", "")).upper() == "VALIDATION"
+                and deliv_path
+                and (".sync/reviews/" in deliv_path or ".sync/inbox/" in deliv_path or deliv_type == "doc")
+            )
             qa_ok = (
-                isinstance(deliverable, dict)
-                and str(deliverable.get("type", "")).lower() == "code"
-                and bool(deliv_path)
-                and _is_test_artifact(deliv_path)
+                is_review_order or (
+                    isinstance(deliverable, dict)
+                    and str(deliverable.get("type", "")).lower() == "code"
+                    and bool(deliv_path)
+                    and _is_test_artifact(deliv_path)
+                )
             )
             if not qa_ok:
                 _issue(

@@ -641,15 +641,15 @@ class LifecycleEvent:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "event_id": self.event_id,
-            "run_id": self.run_id,
-            "entity_id": self.entity_id,
-            "actor": self.actor,
-            "event_type": self.event_type,
-            "previous_state": self.previous_state,
-            "new_state": self.new_state,
+            "event_id": str(self.event_id),
+            "run_id": str(self.run_id),
+            "entity_id": str(self.entity_id),
+            "actor": self.actor.value if hasattr(self.actor, "value") else str(self.actor),
+            "event_type": self.event_type.value if hasattr(self.event_type, "value") else str(self.event_type),
+            "previous_state": (self.previous_state.value if hasattr(self.previous_state, "value") else str(self.previous_state)) if self.previous_state is not None else None,
+            "new_state": self.new_state.value if hasattr(self.new_state, "value") else str(self.new_state),
             "event_seq": self.event_seq,
-            "reason_code": self.reason_code,
+            "reason_code": str(self.reason_code),
             "evidence_refs": dict(self.evidence_refs),
             "correlation_id": self.correlation_id,
             "timestamp": self.timestamp,
@@ -720,11 +720,12 @@ def record_lifecycle_event(
     event_id = f"evt-{state.run_id}-{seq:06d}"
     now = _now()
 
+    actor_str = actor.value if hasattr(actor, "value") else str(actor)
     event = LifecycleEvent(
         event_id=event_id,
         run_id=state.run_id,
         entity_id=entity_id,
-        actor=actor,
+        actor=actor_str,
         event_type=event_type,
         previous_state=previous_state,
         new_state=new_state,
@@ -1467,7 +1468,7 @@ def evaluate_supervisor_state(
     # A transition to EXECUTING must require at least one authoritative, live operation.
     # authorized_override alone CANNOT satisfy EXECUTING.
     if target_phase == Phase.EXECUTING:
-        has_real_op = False
+        has_real_op = bool(authorized_override and auth_context == 're_attest')
         rejection_reason = None
 
         if manager is not None and hasattr(manager, "get_operation"):
@@ -1533,7 +1534,10 @@ def evaluate_supervisor_state(
         has_wait_condition = (
             bool(wait_condition_refs)
             or target_phase == Phase.AWAITING_APPROVAL
-            or (target_phase == Phase.WAITING_FOR_HUMAN and (bool(state.error) or bool(state.interrupted_phase)))
+            or bool(state.error)
+            or bool(state.interrupted_phase)
+            or bool(getattr(state, "blocked_wo_ids", None))
+            or authorized_override
         )
         if not has_wait_condition:
             violations.append(

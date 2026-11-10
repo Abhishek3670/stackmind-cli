@@ -33,3 +33,8 @@ test-memory-project/
 workspace/
 docs/
 STACKMIND_BOOK.md
+apply_review_fixes.py
+gen_review.py
+test_lock.ps1
+test_agent_write.txt
+*.zip

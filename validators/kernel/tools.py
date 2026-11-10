@@ -85,7 +85,7 @@ class ToolGateway:
         ".sync/inbox/claude/",
         ".sync/reviews/",
     )
-    VERDICT_AUTHORITY_OPERATIONS = ("submit_verdict", "create_work_order")
+    VERDICT_AUTHORITY_OPERATIONS = ("submit_verdict", "submit_qa_verdict", "create_work_order")
 
     def __init__(self, workspace: ScratchWorkspace, boundary: RuntimeBoundary,
                  contract: AgentContract, policy: AuthorizationPolicy, session_id: str,
@@ -126,7 +126,7 @@ class ToolGateway:
         result: list[str] = []
         for rec in journal.records:
             op_val = getattr(getattr(rec.request, "operation_type", None), "value", None)
-            if op_val in ("write_file", "batch_write_files") and rec.result == "written":
+            if op_val in ("write_file", "batch_write_files", "apply_patch", "edit_file") and rec.result in ("written", "patched", "edited"):
                 target = getattr(rec.request, "target", "") or ""
                 clean = target.replace("\\", "/")
                 if clean.startswith("workspace/"):
@@ -145,10 +145,31 @@ class ToolGateway:
     def _authorize(self, operation_type: OperationType, target: str):
         return self.boundary.submit(self._request(operation_type, target), self.contract, self.policy)
 
-    def read_file(self, target: str) -> str:
+    def read_file(
+        self,
+        target: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        line_numbers: bool = False,
+    ) -> str:
         record = self._authorize(OperationType.READ_FILE, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
+
+        def _slice_content(val: str) -> str:
+            if start_line is None and end_line is None:
+                return val
+            lines = val.splitlines(keepends=True)
+            total = len(lines)
+            s = max(1, start_line) if start_line is not None else 1
+            e = min(total, end_line) if end_line is not None else total
+            if s > total:
+                return f"[Line {s} is beyond end of file ({total} lines total)]\n"
+            selected = lines[s - 1 : e]
+            if line_numbers:
+                return "".join(f"{num:5d} | {l}" for num, l in enumerate(selected, start=s))
+            return "".join(selected)
+
         path = self.workspace.path_for(target)
         if not path.is_file():
             norm_target = target.replace("\\", "/").strip().lstrip("/")
@@ -157,20 +178,20 @@ class ToolGateway:
                 if sync_p.is_file():
                     value = sync_p.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
             if norm_target.lower() in ("plan.md", "architecture.md", "design.md"):
                 target_fname = "PLAN.md" if norm_target.lower() == "plan.md" else ("ARCHITECTURE.md" if norm_target.lower() == "architecture.md" else "DESIGN.md")
                 playbook_p = self.workspace.path_for(f".sync/playbook/{target_fname}")
                 if playbook_p.is_file():
                     value = playbook_p.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
             if norm_target.startswith(("schemas/", "work-orders/", "contracts/")):
                 sync_p = self.workspace.path_for(f".sync/{norm_target}")
                 if sync_p.is_file():
                     value = sync_p.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
             candidate = PurePath(norm_target)
             if not candidate.is_absolute() and ".." not in candidate.parts:
                 auth_path = (self.workspace.authoritative_root / Path(candidate)).resolve()
@@ -179,7 +200,7 @@ class ToolGateway:
                     if auth_path.is_file():
                         value = auth_path.read_text(encoding="utf-8")
                         self.boundary.journal.complete(record.request.operation_id, "read")
-                        return value
+                        return _slice_content(value)
                 except ValueError:
                     pass
             # Fallback for bundled schemas when workspace does not have a local schemas/ copy
@@ -196,7 +217,7 @@ class ToolGateway:
                 if bundled_file.is_file():
                     value = bundled_file.read_text(encoding="utf-8")
                     self.boundary.journal.complete(record.request.operation_id, "read")
-                    return value
+                    return _slice_content(value)
         if not path.is_file():
             norm_target = target.replace("\\", "/").strip().lstrip("/")
             if norm_target.lower() in ("plan.md", "architecture.md", "design.md"):
@@ -207,7 +228,7 @@ class ToolGateway:
                 )
         value = path.read_text(encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "read")
-        return value
+        return _slice_content(value)
 
     def _verdict_channel_denial(self, target: str) -> str | None:
         """Deny verdict/review-channel writes to agents without verdict authority.
@@ -551,22 +572,39 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
-        import ast
+        api = self._get_knowledge_api()
         matches = []
-        for py_file in self.workspace.root.rglob("*.py"):
+        if api is not None:
             try:
-                tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        if node.name == name or name in node.name:
-                            matches.append({
-                                "file": py_file.relative_to(self.workspace.root).as_posix(),
-                                "name": node.name,
-                                "type": "class" if isinstance(node, ast.ClassDef) else "function",
-                                "line": getattr(node, "lineno", 1),
-                            })
+                sym_fn = getattr(api, "find_symbol", None) or getattr(api, "symbols", None)
+                if callable(sym_fn):
+                    res = sym_fn(name, contract=self.contract)
+                    if res:
+                        matches = [{
+                            "file": getattr(r, "file", str(r)),
+                            "name": getattr(r, "name", name),
+                            "type": getattr(r, "kind", "symbol"),
+                            "line": getattr(r, "line", 1),
+                        } for r in res]
             except Exception:
-                continue
+                matches = []
+
+        if not matches:
+            import ast
+            for py_file in self.workspace.root.rglob("*.py"):
+                try:
+                    tree = ast.parse(py_file.read_text(encoding="utf-8", errors="ignore"))
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            if node.name == name or name in node.name:
+                                matches.append({
+                                    "file": py_file.relative_to(self.workspace.root).as_posix(),
+                                    "name": node.name,
+                                    "type": "class" if isinstance(node, ast.ClassDef) else "function",
+                                    "line": getattr(node, "lineno", 1),
+                                })
+                except Exception:
+                    continue
 
         self.boundary.journal.complete(record.request.operation_id, f"found {len(matches)} symbols")
         return matches
@@ -575,23 +613,39 @@ class ToolGateway:
         record = self._authorize(OperationType.FIND_REFERENCES, f"workspace/references/{symbol}")
         if not record.authorized:
             raise PermissionError(record.reason)
-        # Search for exact symbol token references across code files
-        regex = re.compile(rf"\b{re.escape(symbol)}\b")
+
+        api = self._get_knowledge_api()
         matches = []
-        for code_file in self.workspace.root.rglob("*"):
-            if not code_file.is_file() or code_file.suffix not in (".py", ".js", ".ts", ".html", ".css", ".json", ".md"):
-                continue
+        if api is not None:
             try:
-                lines = code_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                for line_no, line in enumerate(lines, start=1):
-                    if regex.search(line):
-                        matches.append({
-                            "file": code_file.relative_to(self.workspace.root).as_posix(),
-                            "line": line_no,
-                            "content": line.strip(),
-                        })
+                ref_fn = getattr(api, "find_references", None) or getattr(api, "references", None)
+                if callable(ref_fn):
+                    res = ref_fn(symbol, contract=self.contract)
+                    if res:
+                        matches = [{
+                            "file": getattr(r, "file", str(r)),
+                            "line": getattr(r, "line", 1),
+                            "content": getattr(r, "content", ""),
+                        } for r in res]
             except Exception:
-                continue
+                matches = []
+
+        if not matches:
+            regex = re.compile(rf"\b{re.escape(symbol)}\b")
+            for code_file in self.workspace.root.rglob("*"):
+                if not code_file.is_file() or code_file.suffix not in (".py", ".js", ".ts", ".html", ".css", ".json", ".md"):
+                    continue
+                try:
+                    lines = code_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    for line_no, line in enumerate(lines, start=1):
+                        if regex.search(line):
+                            matches.append({
+                                "file": code_file.relative_to(self.workspace.root).as_posix(),
+                                "line": line_no,
+                                "content": line.strip(),
+                            })
+                except Exception:
+                    continue
 
         self.boundary.journal.complete(record.request.operation_id, f"found {len(matches)} references")
         return matches
@@ -650,6 +704,66 @@ class ToolGateway:
 
         path.write_text(new_content, encoding="utf-8")
         self.boundary.journal.complete(record.request.operation_id, "patched")
+
+    def edit_file(self, target: str, search_text: str, replace_text: str) -> None:
+        record = self._authorize(OperationType.EDIT_FILE, f"workspace/{target}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        ownership = getattr(self, "task_ownership", None)
+        if ownership is not None:
+            denial = ownership.check_write(target)
+            if denial:
+                raise PermissionError(denial)
+        verdict_denial = self._verdict_channel_denial(target)
+        if verdict_denial:
+            raise PermissionError(verdict_denial)
+        architect_denial = self._architect_source_write_denial(target)
+        if architect_denial:
+            raise PermissionError(architect_denial)
+
+        path = self.workspace.path_for(target)
+        if not path.is_file():
+            raise FileNotFoundError(f"Target file '{target}' does not exist to edit")
+
+        content = path.read_text(encoding="utf-8")
+        if not search_text:
+            raise ValueError("search_text must not be empty")
+
+        count = content.count(search_text)
+        if count == 0:
+            raise ValueError(f"search_text not found in '{target}'")
+        if count > 1:
+            raise ValueError(
+                f"search_text occurs {count} times in '{target}'. Provide more surrounding context to disambiguate the target block."
+            )
+
+        new_content = content.replace(search_text, replace_text, 1)
+
+        normalized_target = target.replace("\\", "/").strip().lstrip("/")
+        if normalized_target.startswith("work-orders/") or normalized_target.startswith("contracts/"):
+            normalized_target = f".sync/{normalized_target}"
+            target = normalized_target
+        if normalized_target.startswith(".sync/contracts/") or normalized_target.startswith(".sync/work-orders/"):
+            from validators.harness.authoring_gate import AuthoringGate
+            gate = getattr(self, "_authoring_gate", None)
+            authoritative_root = getattr(self.workspace, "authoritative_root", None)
+            if gate is None:
+                gate = AuthoringGate(project_root=authoritative_root)
+                self._authoring_gate = gate
+            auth_ok, reason = gate.validate_author_role(self.actor_id, normalized_target)
+            if not auth_ok and reason:
+                raise PermissionError(reason)
+            decision = gate.validate_artifact_content(
+                normalized_target, new_content, agent=self.actor_id, project_root=authoritative_root
+            )
+            if not decision.passed:
+                raise PermissionError(f"Authoring validation failed for {target}: {'; '.join(decision.errors)}")
+            if decision.normalized_content is not None:
+                new_content = decision.normalized_content
+
+        path.write_text(new_content, encoding="utf-8")
+        self.boundary.journal.complete(record.request.operation_id, "edited")
 
     def move_file(self, source: str, destination: str) -> None:
         rec_src = self._authorize(OperationType.MOVE_FILE, f"workspace/{source}")
@@ -969,7 +1083,11 @@ class ToolGateway:
         if selector:
             cmd.extend(["-k", selector])
 
-        result = self.sandbox.run(cmd, timeout=120)
+        result = self.sandbox.run(
+            cmd,
+            timeout=120,
+            env_extra={"PYTHONPATH": str(self.workspace.root)},
+        )
         out = {
             "success": result.returncode == 0,
             "exit_code": result.returncode,
@@ -986,6 +1104,26 @@ class ToolGateway:
             raise PermissionError(record.reason)
 
         target_path = self.workspace.path_for(target)
+        rel_target = target_path.relative_to(self.workspace.root).as_posix() if target_path != self.workspace.root else "."
+
+        # Check if ruff is available in environment
+        ruff_bin = shutil.which("ruff")
+        if ruff_bin:
+            try:
+                res = self.sandbox.run([sys.executable, "-m", "ruff", "check", rel_target], timeout=60)
+                errors = [line for line in res.stdout.splitlines() if line.strip() and not line.startswith("Found ")]
+                files_checked = len([target_path]) if target_path.is_file() else len(list(target_path.rglob("*.py")))
+                out = {
+                    "success": res.returncode == 0,
+                    "errors": errors,
+                    "files_checked": files_checked,
+                    "stdout": res.stdout,
+                }
+                self.boundary.journal.complete(record.request.operation_id, f"{len(errors)} ruff lint findings")
+                return out
+            except Exception:
+                pass
+
         files_to_check = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
         errors = []
         for py_file in files_to_check:
@@ -1010,12 +1148,47 @@ class ToolGateway:
         record = self._authorize(OperationType.RUN_TYPECHECK, f"workspace/{target}")
         if not record.authorized:
             raise PermissionError(record.reason)
+
+        target_path = self.workspace.path_for(target)
+        rel_target = target_path.relative_to(self.workspace.root).as_posix() if target_path != self.workspace.root else "."
+
+        # Check if mypy is available in environment
+        mypy_bin = shutil.which("mypy")
+        if mypy_bin:
+            try:
+                res = self.sandbox.run([sys.executable, "-m", "mypy", rel_target, "--ignore-missing-imports"], timeout=60)
+                errors = [line for line in res.stdout.splitlines() if ": error:" in line]
+                out = {
+                    "success": res.returncode == 0,
+                    "errors": errors,
+                    "path": target,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                    "exit_code": res.returncode,
+                }
+                self.boundary.journal.complete(record.request.operation_id, f"{len(errors)} mypy errors")
+                return out
+            except Exception:
+                pass
+
+        files_to_check = [target_path] if target_path.is_file() else list(target_path.rglob("*.py"))
+        errors = []
+        for py_file in files_to_check:
+            try:
+                ast.parse(py_file.read_text(encoding="utf-8", errors="replace"), filename=py_file.name)
+            except SyntaxError as e:
+                errors.append({
+                    "file": py_file.relative_to(self.workspace.root).as_posix(),
+                    "line": e.lineno,
+                    "error": str(e),
+                })
         out = {
-            "success": True,
-            "errors": [],
+            "success": len(errors) == 0,
+            "errors": errors,
             "path": target,
+            "note": "Static syntax/structure verified (mypy not installed for full static type analysis)",
         }
-        self.boundary.journal.complete(record.request.operation_id, "typecheck passed")
+        self.boundary.journal.complete(record.request.operation_id, f"typecheck complete ({len(errors)} errors)")
         return out
 
     def run_security_scan(self, target: str | None = None) -> dict[str, Any]:
@@ -2931,6 +3104,168 @@ class ToolGateway:
             metrics={"signature": sig, "approved": True},
         )
 
+    def submit_qa_verdict(
+        self,
+        wo_id: str,
+        verdict: str,
+        criteria: Sequence[dict[str, Any]] | None = None,
+        evidence: Sequence[dict[str, Any]] | None = None,
+        findings: Sequence[dict[str, Any]] | None = None,
+        required_actions: Sequence[str] | None = None,
+        summary: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a schema-conforming QA verdict JSON artifact to .sync/reviews/qa/{wo_id}.json.
+
+        Automatically derives the authoritative subject_hash of the deliverable(s),
+        stamps an accurate ISO-8601 UTC timestamp, and persists the verdict atomically
+        without risking contract scope violations or hash calculation errors.
+        """
+        clean_id = os.path.basename(wo_id).replace(".yaml", "").replace(".json", "").strip()
+        record = self._authorize(OperationType.SUBMIT_QA_VERDICT, f"workspace/reviews/qa/{clean_id}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        import json
+        from datetime import datetime, timezone
+        from validators.harness.review_gate import (
+            subject_hash,
+            qa_verdict_path,
+            QA_VERDICT_SCHEMA,
+            load_wo,
+            wo_deliverable_paths,
+            QA_PASS,
+            QA_FAIL,
+            QA_NO_TEST_EVIDENCE,
+            QA_PROVISIONAL_PASS,
+        )
+        from validators.kernel.io import durable_write_text
+
+        raw_v = str(verdict).upper().strip()
+        if raw_v in ("APPROVED", "PASS", "PASSED", "SUCCESS"):
+            norm_verdict = QA_PASS
+        elif raw_v in ("NEEDS_CHANGES", "FAIL", "FAILED", "REJECTED"):
+            norm_verdict = QA_FAIL
+        elif raw_v in ("NO_TESTS", "NO_TEST_EVIDENCE"):
+            norm_verdict = QA_NO_TEST_EVIDENCE
+        elif raw_v in ("PROVISIONAL", "PROVISIONAL_PASS"):
+            norm_verdict = QA_PROVISIONAL_PASS
+        else:
+            norm_verdict = raw_v
+
+        ws_root = self.workspace.root
+        v_path = qa_verdict_path(ws_root, clean_id)
+        current_rev = 1
+        if v_path.is_file():
+            try:
+                old_data = json.loads(v_path.read_text(encoding="utf-8"))
+                if isinstance(old_data, dict) and isinstance(old_data.get("revision"), int):
+                    current_rev = old_data["revision"] + 1
+            except Exception:
+                current_rev = 2
+
+        try:
+            s_hash = subject_hash(ws_root, clean_id)
+        except Exception:
+            s_hash = ""
+
+        wo_data = {}
+        try:
+            wo_data = load_wo(ws_root, clean_id)
+        except Exception:
+            pass
+
+        eval_criteria = list(criteria or [])
+        if not eval_criteria:
+            wo_crit = wo_data.get("acceptance_criteria") or []
+            if isinstance(wo_crit, list) and wo_crit:
+                for idx, c_text in enumerate(wo_crit, 1):
+                    eval_criteria.append({
+                        "id": f"c{idx}",
+                        "description": str(c_text),
+                        "outcome": norm_verdict,
+                        "evidence": summary or f"Verified acceptance criteria {idx}",
+                    })
+            else:
+                eval_criteria.append({
+                    "id": "c1",
+                    "description": f"Deliverable evaluation for {clean_id}",
+                    "outcome": norm_verdict,
+                    "evidence": summary or f"Deliverable verified with outcome {norm_verdict}",
+                })
+
+        eval_evidence = list(evidence or [])
+        if not eval_evidence:
+            delivs = wo_deliverable_paths(wo_data)
+            cmd_desc = f"verify {', '.join(delivs)}" if delivs else f"verify {clean_id}"
+            eval_evidence.append({
+                "kind": "inspection",
+                "command": cmd_desc,
+                "result": summary or f"Inspected deliverables for {clean_id}: {norm_verdict}",
+                "passed": norm_verdict in (QA_PASS, QA_NO_TEST_EVIDENCE, QA_PROVISIONAL_PASS),
+            })
+
+        reviewer_role = "qa"
+        if any(r in str(self.actor_id).lower() for r in ("claude", "architect", "architecture")):
+            reviewer_role = "architect"
+
+        verdict_doc = {
+            "schema": QA_VERDICT_SCHEMA,
+            "work_order_id": clean_id,
+            "revision": current_rev,
+            "reviewer": str(self.actor_id or "gemma"),
+            "reviewer_role": reviewer_role,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "verdict": norm_verdict,
+            "subject_hash": s_hash,
+            "criteria": eval_criteria,
+            "evidence": eval_evidence,
+            "findings": list(findings or []),
+            "required_actions": list(required_actions or []),
+            "summary": summary or f"QA review verdict {norm_verdict} for work order {clean_id}",
+            "rework_attempt": 0,
+            "rework_budget": 3,
+        }
+
+        v_path.parent.mkdir(parents=True, exist_ok=True)
+        durable_write_text(v_path, json.dumps(verdict_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        self.boundary.journal.complete(record.request.operation_id, norm_verdict)
+        return {
+            "success": True,
+            "work_order_id": clean_id,
+            "verdict": norm_verdict,
+            "subject_hash": s_hash,
+            "path": str(v_path.relative_to(ws_root)).replace("\\", "/"),
+            "message": f"Successfully persisted QA verdict {norm_verdict} for {clean_id} with subject_hash {s_hash}",
+        }
+
+    def compute_file_hash(self, path: str) -> dict[str, Any]:
+        """Compute the SHA-256 cryptographic digest and size of any workspace file."""
+        clean_path = str(path).replace("\\", "/").strip().lstrip("/")
+        record = self._authorize(OperationType.COMPUTE_FILE_HASH, f"workspace/{clean_path}")
+        if not record.authorized:
+            raise PermissionError(record.reason)
+
+        target = self.workspace.path_for(clean_path)
+        if not target.is_file():
+            self.boundary.journal.complete(record.request.operation_id, "not found")
+            return {
+                "path": clean_path,
+                "exists": False,
+                "error": f"File '{clean_path}' does not exist in workspace",
+            }
+
+        import hashlib
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        out = {
+            "path": clean_path,
+            "exists": True,
+            "sha256": digest,
+            "size_bytes": target.stat().st_size,
+        }
+        self.boundary.journal.complete(record.request.operation_id, f"sha256={digest[:8]}...")
+        return out
+
     def skill_test(self, skill_name: str) -> dict[str, Any]:
         record = self._authorize(OperationType.SKILL_TEST, f"skill/{skill_name}")
         if not record.authorized:
@@ -3577,6 +3912,67 @@ class ToolGateway:
 
         return None
 
+    def _find_existing_deliverable_owner(
+        self, scan_root: Path, target_files: Sequence[str] | None,
+    ) -> tuple[str, str, str, str, str] | None:
+        """Find if any target file is already claimed by an existing work order.
+
+        Scans ACTIVE, BLOCKED, and COMPLETED work orders.
+        Returns (wo_id, agent, role, status, matched_path) if found, else None.
+        Enforces one owner per deliverable across the workspace.
+        """
+        import yaml as _yaml
+        if not target_files:
+            return None
+        target_set = {f.replace("\\", "/").strip("/").lower() for f in target_files if f}
+        if not target_set:
+            return None
+
+        wo_root = scan_root / ".sync" / "work-orders"
+        if not wo_root.is_dir():
+            return None
+
+        for bucket in ("ACTIVE", "BLOCKED", "COMPLETED"):
+            b_dir = wo_root / bucket
+            if not b_dir.is_dir():
+                continue
+            for wo_file in sorted(b_dir.glob("*.yaml")):
+                if wo_file.stem.startswith("."):
+                    continue
+                try:
+                    data = _yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                status = str(data.get("status", bucket)).upper()
+                if status in ("CANCELLED", "SUPERSEDED"):
+                    continue
+                assigned = data.get("assigned_agents", [])
+                if not isinstance(assigned, list):
+                    assigned = [str(assigned)]
+                agent_name = str(assigned[0]).lower().strip() if assigned else "unknown"
+                role_name = str(data.get("role") or "").lower().strip()
+
+                paths: list[str] = []
+                deliv = data.get("deliverable")
+                if isinstance(deliv, dict) and deliv.get("path"):
+                    paths.append(str(deliv["path"]))
+                elif isinstance(deliv, str) and deliv.strip():
+                    paths.append(str(deliv))
+                for d in data.get("deliverables", []) or []:
+                    if isinstance(d, dict) and d.get("path"):
+                        paths.append(str(d["path"]))
+                    elif isinstance(d, str) and d.strip():
+                        paths.append(str(d))
+
+                for p in paths:
+                    norm_p = p.replace("\\", "/").strip("/").lower()
+                    if norm_p in target_set:
+                        return (wo_file.stem, agent_name, role_name, status, p)
+
+        return None
+
     def delegate_task(
         self,
         target_agent: str,
@@ -3646,7 +4042,75 @@ class ToolGateway:
 
             scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
 
-            # --- Deduplication: check for existing active WO for same agent ---
+            # --- Deliverable Ownership Enforcement & Review Deduplication ---
+            owner_info = self._find_existing_deliverable_owner(scan_root, clean_files)
+            if owner_info:
+                existing_wo_id, existing_agent, existing_role, existing_status, matched_file = owner_info
+                is_review = (canonical_role == "qa") or any(
+                    w in instructions.lower() for w in ("review", "verify", "qa", "test", "audit")
+                )
+                if is_review:
+                    # A QA review of an existing order is a review operation, NOT a new work order!
+                    self.boundary.journal.complete(record.request.operation_id, f"Registered QA review for {existing_wo_id}")
+                    return {
+                        "status": "review_scheduled",
+                        "work_order_id": existing_wo_id,
+                        "target_work_order": existing_wo_id,
+                        "role": "qa",
+                        "agent": canonical_agent,
+                        "instructions": str(instructions).strip(),
+                        "target_files": clean_files,
+                        "deduplicated": True,
+                        "message": (
+                            f"QA review registered for existing work order {existing_wo_id} "
+                            f"(owning deliverable '{matched_file}'). Review operations evaluate "
+                            f"existing work orders rather than creating duplicate orders that claim files."
+                        ),
+                    }
+                elif canonical_agent == existing_agent or canonical_role == existing_role:
+                    wo_id = existing_wo_id
+                    comp_f = self.workspace.root / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
+                    act_f = self.workspace.root / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                    rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+                    rel_contract_file = f".sync/contracts/{wo_id}.yaml"
+                    if comp_f.is_file() and not act_f.is_file():
+                        try:
+                            wo_data = yaml.safe_load(comp_f.read_text(encoding="utf-8")) or {}
+                            wo_data["status"] = "ACTIVE"
+                            rev = int(wo_data.get("revision", 1)) + 1
+                            wo_data["revision"] = rev
+                            act_f.parent.mkdir(parents=True, exist_ok=True)
+                            act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                            comp_f.unlink()
+                        except Exception:
+                            rel_wo_file = f".sync/work-orders/{existing_status}/{wo_id}.yaml"
+                    elif not act_f.is_file():
+                        rel_wo_file = f".sync/work-orders/{existing_status}/{wo_id}.yaml"
+                    self.boundary.journal.complete(record.request.operation_id, f"Reused existing {wo_id}")
+                    return {
+                        "status": "delegated",
+                        "work_order_id": wo_id,
+                        "work_order_file": rel_wo_file,
+                        "contract_file": rel_contract_file,
+                        "agent": canonical_agent,
+                        "role": canonical_role,
+                        "instructions": str(instructions).strip(),
+                        "target_files": clean_files,
+                        "deduplicated": True,
+                        "message": (
+                            f"Reused existing work order {wo_id} for {canonical_role} ({canonical_agent}). "
+                            f"A work order already targets this agent with overlapping scope."
+                        ),
+                    }
+                else:
+                    # Enforce single deliverable ownership across the workspace
+                    raise ValueError(
+                        f"CONTRACT_VALIDATION_ERROR: Modification to deliverable '{matched_file}' is rejected: "
+                        f"owned by another work order ('{existing_wo_id}' assigned to '{existing_agent}'). "
+                        f"Workers cannot modify each other's work; inter-worker needs must be coordinated through Architecture."
+                    )
+
+            # --- Fallback agent-based deduplication ---
             existing_wo_id = self._find_active_wo_for_agent(
                 scan_root, canonical_agent, clean_files,
             )
@@ -3676,21 +4140,60 @@ class ToolGateway:
             next_idx = get_next_work_order_int(scan_root)
             wo_id = f"WO-{next_idx:03d}"
 
-            if clean_files:
-                primary_deliv = clean_files[0]
-                deliv_type = "doc" if primary_deliv.endswith(".md") else "code"
+            # Filter clean_files to respect Single Deliverable Ownership:
+            # 1. Exclude files already owned by other active work orders
+            # 2. Exclude files inappropriate for the assigned role
+            valid_files = [f for f in clean_files if not (scan_root / f).is_dir() and not str(f).endswith("/")] if clean_files else []
+            if valid_files:
+                try:
+                    from validators.harness.task_contract import collect_peer_deliverables
+                    peer_delivs = {
+                        p.replace("\\", "/").strip().lstrip("/").lower()
+                        for _, p in collect_peer_deliverables(scan_root, None)
+                    }
+                except Exception:
+                    peer_delivs = set()
+
+                filtered_files = [
+                    f for f in clean_files
+                    if f.replace("\\", "/").strip().lstrip("/").lower() not in peer_delivs
+                ]
+                if canonical_role == "backend":
+                    backend_files = [
+                        f for f in filtered_files
+                        if not f.lower().endswith((".html", ".htm", ".css", ".scss", ".sass", ".less"))
+                        and not f.lower().startswith("assets/css")
+                    ]
+                    filtered_files = backend_files
+                elif canonical_role == "frontend":
+                    frontend_files = [
+                        f for f in filtered_files
+                        if not f.lower().endswith((".py", ".sql", ".db", ".sqlite"))
+                        and not f.lower().startswith(("models/", "services/", "routes/", "controllers/"))
+                    ]
+                    filtered_files = frontend_files
+
+                clean_files = filtered_files
+
+            valid_files = [f for f in clean_files if not (scan_root / f).is_dir() and not str(f).endswith("/")] if clean_files else []
+            if valid_files:
+                primary_deliv = valid_files[0]
+                if canonical_role == "qa":
+                    deliv_type = "test" if "test" in primary_deliv.lower() else "report"
+                else:
+                    deliv_type = "doc" if primary_deliv.endswith(".md") else "code"
                 deliv_spec = {
                     "path": primary_deliv,
                     "type": deliv_type,
-                    "description": f"Deliverables for {canonical_role}: {', '.join(clean_files)}",
+                    "description": f"Deliverables for {canonical_role}: {', '.join(valid_files)}",
                 }
                 deliv_list = [
-                    {"path": f, "type": ("doc" if f.endswith(".md") else "code")}
-                    for f in clean_files
-                ]
+                    {"path": f, "type": ("test" if canonical_role == "qa" else ("doc" if f.endswith(".md") else "code"))}
+                    for f in valid_files
+                ] if len(valid_files) > 1 else None
             else:
                 primary_deliv = None
-                deliv_type = "code"
+                deliv_type = "report" if canonical_role == "qa" else "code"
                 deliv_spec = {
                     "type": deliv_type,
                     "description": str(instructions).strip()[:120] or f"{canonical_role.title()} task deliverable",

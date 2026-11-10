@@ -674,6 +674,45 @@ def test_check_qa_verdict_ignores_verdicts_explicitly_targeting_other_wos(tmp_pa
     assert "Fix the database schema" in supervisor._get_qa_feedback("WO-002", tmp_path)
 
 
+def test_delegation_brief_reaches_the_worker_dispatch_prompt(tmp_path: Path) -> None:
+    """A ``delegate_task`` briefing must be injected into the worker's prompt.
+
+    ``delegate_task`` writes ``{ts}_{actor}_delegation.md`` into the target
+    agent's inbox, but the supervisor only accepted ``verdict``/``review``
+    filenames, so a hand-authored defect brief never reached its worker. A
+    briefing is addressed to the worker and is injected whole, without needing
+    a verdict token.
+    """
+    _write_worker_yaml(tmp_path, "WO-008", "gemini", "script.js")
+    inbox = tmp_path / ".sync" / "inbox" / "gemini"
+    inbox.mkdir(parents=True, exist_ok=True)
+    brief = inbox / "20261105_131910_claude_delegation.md"
+    brief.write_text(
+        "# Delegated Task: Frontend\n\n"
+        "**To:** gemini (frontend)\n\n"
+        "### Instructions\n"
+        "You are fixing Work Order WO-008 targeting script.js.\n"
+        "Repro: 2, +, 3, = displays 25 (expected 5).\n",
+        encoding="utf-8",
+    )
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    feedback = supervisor._get_qa_feedback("WO-008", tmp_path)
+    assert "displays 25 (expected 5)" in feedback
+
+    # A briefing is not a judgement: it must not set the work order's QA status.
+    assert supervisor._check_qa_verdict("WO-008", tmp_path) is None
+
+    # A QA verdict derived from running the deliverable outranks the briefing,
+    # even when the briefing was written later.
+    verdict = tmp_path / ".sync" / "reviews" / "WO-008-review.md"
+    verdict.parent.mkdir(parents=True, exist_ok=True)
+    verdict.write_text("Status: NEEDS_CHANGES\n2 + 3 = returns 25, expected 5\n", encoding="utf-8")
+    assert "returns 25, expected 5" in supervisor._get_qa_feedback("WO-008", tmp_path)
+
+
 def test_task_contract_extracts_and_renders_critical_turn_instructions(tmp_path: Path) -> None:
     """When a task includes Turn Instructions, compile_worker_task_contract extracts them and renders the directive banner."""
     from validators.harness.task_contract import compile_worker_task_contract, render_task_block, render_worker_system
@@ -798,3 +837,158 @@ def test_handle_qa_evidence_gap_contention_error_does_not_fail_work_order(tmp_pa
     assert res == AdvanceResult.WAITING_FOR_OPERATION
     assert "WO-004" not in state.failed_wo_ids
     assert state.retry_counts.get("WO-004", 0) == 0  # Rolled back!
+
+
+def test_qa_json_verdict_ingestion_and_formatting(tmp_path: Path) -> None:
+    """A structured JSON QA verdict (.sync/reviews/qa/{wo_id}.json) must be
+    ingested and formatted into human-readable Markdown for worker dispatch."""
+    import json
+    _write_worker_yaml(tmp_path, "WO-002", "gemini", "script.js")
+    qa_dir = tmp_path / ".sync" / "reviews" / "qa"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    verdict_json = qa_dir / "WO-002.json"
+    verdict_json.write_text(
+        json.dumps({
+            "schema": "stackmind.qa-verdict.v1",
+            "work_order_id": "WO-002",
+            "verdict": "FAIL",
+            "reviewer": "gemma",
+            "findings": [
+                {
+                    "severity": "major",
+                    "detail": "Operator evaluation broken: 2+3 evaluates to 25 instead of 5",
+                    "reproduce": "test_behavioral_case[addition]",
+                }
+            ],
+            "criteria": [
+                {
+                    "id": "CR-2",
+                    "description": "Add/subtract/multiply/divide pass",
+                    "outcome": "FAIL",
+                    "evidence": "addition got '25' expected '5'",
+                }
+            ],
+            "required_actions": [
+                "Fix arithmetic evaluation in script.js",
+            ],
+            "evidence": [
+                {
+                    "command": "run_tests tests/test_qa_verification.py",
+                    "passed": False,
+                    "result": "25 collected, 16 passed, 9 failed",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    # 1. Verdict checking recognises JSON verdict as NEEDS_CHANGES
+    assert supervisor._check_qa_verdict("WO-002", tmp_path) == "NEEDS_CHANGES"
+
+    # 2. Worker feedback extraction formats JSON into rich Markdown
+    feedback = supervisor._get_qa_feedback("WO-002", tmp_path)
+    assert "# QA Review Verdict: FAIL" in feedback
+    assert "Operator evaluation broken: 2+3 evaluates to 25 instead of 5" in feedback
+    assert "(Repro: `test_behavioral_case[addition]`)" in feedback
+    assert "CR-2" in feedback
+    assert "Fix arithmetic evaluation in script.js" in feedback
+    assert "run_tests tests/test_qa_verification.py" in feedback
+
+
+def test_qa_markdown_verdict_with_fail_token_ingested(tmp_path: Path) -> None:
+    """A Markdown QA review (.sync/reviews/{wo_id}.md) with Verdict: FAIL
+    must be recognized as NEEDS_CHANGES and returned in feedback."""
+    _write_worker_yaml(tmp_path, "WO-002", "gemini", "script.js")
+    reviews_dir = tmp_path / ".sync" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    review_file = reviews_dir / "WO-002.md"
+    review_file.write_text(
+        "# QA Review — WO-002\n\n"
+        "## Verdict: FAIL\n\n"
+        "### Reproducible failures\n"
+        "- addition: '25' vs '5'\n"
+        "- divide_by_zero: '0.1' vs 'Error'\n",
+        encoding="utf-8",
+    )
+
+    mock_mgr = MockSessionManager(tmp_path)
+    supervisor = LifecycleSupervisor(mock_mgr)
+
+    assert supervisor._check_qa_verdict("WO-002", tmp_path) == "NEEDS_CHANGES"
+    feedback = supervisor._get_qa_feedback("WO-002", tmp_path)
+    assert "Verdict: FAIL" in feedback
+    assert "addition: '25' vs '5'" in feedback
+
+
+def test_is_qa_work_order_validation_and_test_paths(tmp_path: Path) -> None:
+    """is_qa_work_order must recognize type: VALIDATION, type: TEST, and test paths."""
+    from validators.harness.review_gate import is_qa_work_order, requires_qa
+
+    wo_val = {
+        "id": "WO-002",
+        "type": "VALIDATION",
+        "assigned_agents": ["gemini"],
+        "deliverable": {"type": "code", "path": "tests/test_qa_verification.py"},
+    }
+    assert is_qa_work_order(wo_val) is True
+    assert requires_qa(tmp_path, "WO-002", wo_val) is False
+
+    wo_test = {
+        "id": "WO-005",
+        "type": "FEATURE",
+        "assigned_agents": ["gemini"],
+        "deliverable": {"type": "code", "path": "tests/test_something.py"},
+    }
+    assert is_qa_work_order(wo_test) is True
+    assert requires_qa(tmp_path, "WO-005", wo_test) is False
+
+    wo_app = {
+        "id": "WO-004",
+        "type": "FEATURE",
+        "assigned_agents": ["gemini"],
+        "deliverable": {"type": "code", "path": "script.js"},
+    }
+    assert is_qa_work_order(wo_app) is False
+    assert requires_qa(tmp_path, "WO-004", wo_app) is True
+
+
+def test_bugfix_order_prerequisite_unblocked_when_deliverable_present_on_disk(tmp_path: Path) -> None:
+    """A BUGFIX work order depending on a blocked prerequisite can be satisfied
+    when the prerequisite's deliverable is already present on disk to be repaired."""
+    from validators.kernel.daemon.supervisor.dependencies import evaluate_dependencies, DependencyStatus
+
+    # Create predecessor WO-004 (BLOCKED) with deliverable script.js
+    (tmp_path / "script.js").write_text("broken code", encoding="utf-8")
+    _write_worker_yaml(tmp_path, "WO-004", "gemini", "script.js")
+
+    # Create bugfix WO-008 depending on WO-004
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    wo_file = wo_dir / "WO-008.yaml"
+    wo_file.write_text(
+        "id: WO-008\n"
+        "type: BUGFIX\n"
+        "title: Fix script.js defects\n"
+        "dependencies:\n"
+        "  - WO-004\n"
+        "assigned_agents:\n"
+        "  - gemini\n"
+        "deliverable:\n"
+        "  type: code\n"
+        "  path: script.js\n",
+        encoding="utf-8",
+    )
+
+    res = evaluate_dependencies(
+        tmp_path,
+        "WO-008",
+        completed_ids=[],
+        blocked_ids=["WO-004"],
+        failed_ids=[],
+        superseded_ids=[],
+    )
+    assert res.status == DependencyStatus.SATISFIED
+    assert "deliverable present on disk for BUGFIX repair" in res.prerequisites[0].detail

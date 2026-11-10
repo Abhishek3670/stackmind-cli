@@ -32,7 +32,7 @@ class DaemonClient:
         self._request_id = 0
         self._opener = build_opener(ProxyHandler({}))
 
-    def call(self, method: str, **params: Any) -> Any:
+    def call(self, method: str, timeout: float = 10.0, **params: Any) -> Any:
         if self.auth_token and method in self.ADMIN_METHODS and "auth_token" not in params:
             params["auth_token"] = self.auth_token
         self._request_id += 1
@@ -43,7 +43,8 @@ class DaemonClient:
             f"{self.url}/rpc", data=payload, headers={"Content-Type": "application/json"}
         )
         try:
-            with self._opener.open(request) as response:
+            # ponytail: enforce 10s socket timeout so TUI never blocks indefinitely on daemon locks
+            with self._opener.open(request, timeout=timeout) as response:
                 body = json.loads(response.read())
         except HTTPError as err:
             try:

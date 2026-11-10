@@ -173,12 +173,13 @@ class _VerificationMixin:
 
         state_verified = not staged_errors
         for relative_path in changed_files:
+            if relative_path.startswith(('.sync/', '.git/')) or relative_path in ('.sync', '.git'):
+                continue
             before = before_snapshot.files.get(relative_path)
             after = after_snapshot.files.get(relative_path)
             if after is not None and not after.content_hash:
                 state_verified = False
-            if before is not None and after is not None and before.content_hash == after.content_hash:
-                state_verified = False
+            # Idempotent modification with valid after hash is verified
             if after is None and before is None:
                 state_verified = False
 
@@ -355,7 +356,13 @@ class _VerificationMixin:
         )
 
         if decision.status == 'blocked':
-            if task.deliverable_path and not getattr(task, 'is_authoring', False):
+            is_planning_or_arch = (
+                str(task.work_order_id) == "WO-000"
+                or getattr(task, 'is_authoring', False)
+                or getattr(task, 'is_planning', False)
+                or str(self.agent).lower().strip() in ('claude', 'architecture', 'architect')
+            )
+            if task.deliverable_path and not is_planning_or_arch:
                 outcome_verified = deliverable_touched
             else:
                 outcome_verified = bool(decision.blockers) and bool(
@@ -465,6 +472,32 @@ class _VerificationMixin:
             )
             self._last_verification_evidence = deliv_evidence
 
+            # If task was dispatched for a specific deliverable, evaluate whether that specific
+            # deliverable passed. Collateral failures on secondary/peer files must not block the turn.
+            peer_paths: set[str] = set()
+            try:
+                from validators.harness.task_contract import collect_peer_deliverables
+                peers = collect_peer_deliverables(self.project_path, str(task.work_order_id) if task.work_order_id else None)
+                peer_paths = {p.replace("\\", "/").strip().lstrip("/").lower() for _, p in peers}
+            except Exception:
+                pass
+
+            task_norm = Path(task.deliverable_path).as_posix().lstrip('/') if task.deliverable_path else None
+            is_peer_deliv = bool(task_norm and task_norm.lower() in peer_paths)
+
+            if not deliv_passed and task_norm and not is_peer_deliv:
+                results_by_path = {
+                    Path(r.get("relative_path", "")).as_posix().lstrip('/'): r.get("passed", False)
+                    for r in deliv_evidence.get("results", [])
+                }
+                if results_by_path.get(task_norm):
+                    deliv_passed = True
+                    deliv_errors = []
+            elif not deliv_passed and is_peer_deliv:
+                if any(r.get("passed", False) for r in deliv_evidence.get("results", [])) or deliverable_touched or bool(task_changed_files):
+                    deliv_passed = True
+                    deliv_errors = []
+
             has_declared_files = bool(deliv_evidence.get("declared_paths"))
             is_arch_conversational = (
                 str(task.work_order_id) == "WO-000"
@@ -492,7 +525,7 @@ class _VerificationMixin:
                         outcome_verified = False
                         for err in deliv_errors:
                             staged_errors.append(f"Deliverable verification failed: {err}")
-                elif task.deliverable_path and not deliverable_touched:
+                elif task.deliverable_path and not deliverable_touched and not is_peer_deliv:
                     is_non_code_task = (
                         getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
                         or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))

@@ -329,7 +329,15 @@ def format_work_orders(
     if not work_orders:
         return [Text("  No active orders", style="dim #475569")]
 
-    total_count = len(work_orders)
+    # Filter out cancelled / superseded orders from active runtime panel view to avoid confusing duplicates
+    effective_work_orders = [
+        wo for wo in work_orders
+        if str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper() not in {"CANCELLED", "CANCELED", "SUPERSEDED"}
+    ]
+    if not effective_work_orders:
+        effective_work_orders = list(work_orders)
+
+    total_count = len(effective_work_orders)
     inner_w = max(10, (width or 36) - 4)
 
     earlier_count = 0
@@ -349,17 +357,17 @@ def format_work_orders(
             end_idx = max(capacity, total_count - min(scroll.scroll_offset, max_offset))
             start_idx = max(0, end_idx - capacity)
         else:
-            active = next((i for i, w in reversed(list(enumerate(work_orders))) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
+            active = next((i for i, w in reversed(list(enumerate(effective_work_orders))) if str(w.get("status", "") if isinstance(w, Mapping) else getattr(w, "status", "")).upper() in {"RUNNING", "ACTIVE", "IN_PROGRESS", "BLOCKED"}), None)
             if active is not None:
                 end_idx = min(total_count, max(capacity, active + max(1, capacity // 2) + 1))
                 start_idx = max(0, end_idx - capacity)
             else:
                 start_idx, end_idx = max(0, total_count - capacity), total_count
 
-        display_orders = work_orders[start_idx:end_idx]
+        display_orders = effective_work_orders[start_idx:end_idx]
         earlier_count, later_count = start_idx, total_count - end_idx
     else:
-        display_orders = work_orders
+        display_orders = effective_work_orders
 
     lines: list[Text] = []
 
@@ -430,23 +438,39 @@ def format_current_operation(
     """Format current operation section into compact display."""
     if not current_operation:
         err = getattr(state, "error", None) if state is not None else None
-        if state is not None and getattr(state, "phase", None) in ("BLOCKED", "FAILED"):
+        if state is not None and (
+            getattr(state, "phase", None) in ("BLOCKED", "FAILED", "WAITING_FOR_HUMAN")
+            or getattr(state, "budget_exhausted", False)
+        ):
             st_phase = getattr(state, "phase")
             phase_val = st_phase.value if hasattr(st_phase, "value") else str(st_phase)
-            st_text = "Blocked" if phase_val.upper() == "BLOCKED" else "Failed"
-            st_color = "#f43f5e" if phase_val.upper() == "FAILED" else "#f59e0b"
+            phase_upper = phase_val.upper()
+            if phase_upper == "FAILED":
+                st_text = "Failed"
+                st_color = "#f43f5e"
+            elif phase_upper == "WAITING_FOR_HUMAN" or getattr(state, "budget_exhausted", False):
+                st_text = "Waiting for Human"
+                st_color = "#f59e0b"
+            else:
+                st_text = "Blocked"
+                st_color = "#f59e0b"
+
             res_lines = [Text(f"  ⊘ {st_text}", style=f"bold {st_color}")]
-            if err:
+            if getattr(state, "budget_exhausted", False):
+                res_lines.append(Text("    Global turn budget exhausted", style="dim #ef4444"))
+            elif err:
                 from cli.tui.events import clean_error_message
                 short_err = clean_error_message(err)
                 max_len = max((width - 4), 20) if width else 35
                 if len(short_err) > max_len:
                     short_err = short_err[:max_len - 1] + "…"
                 res_lines.append(Text(f"    {short_err}", style="dim #ef4444"))
-            if phase_val.upper() == "BLOCKED":
+            if phase_upper == "BLOCKED":
                 res_lines.append(Text("    Run :resume to retry", style="dim #fbbf24"))
-            elif phase_val.upper() == "FAILED":
+            elif phase_upper == "FAILED":
                 res_lines.append(Text("    Run :resume to recover", style="dim #fbbf24"))
+            else:
+                res_lines.append(Text("    Run :resume to continue", style="dim #fbbf24"))
             return res_lines
 
         if state is not None:
@@ -460,7 +484,8 @@ def format_current_operation(
                     Text("    Run :approve to execute", style="dim #fbbf24"),
                 ]
 
-        if err and state is not None and getattr(state, "phase", None) not in ("PROJECT_COMPLETE",):
+        from cli.tui.state import ProjectPhase
+        if err and state is not None and getattr(state, "phase", None) not in ("PROJECT_COMPLETE", ProjectPhase.PROJECT_COMPLETE) and not getattr(state, "is_complete", False):
             from cli.tui.events import clean_error_message
             short_err = clean_error_message(err)
             max_len = max((width - 4), 20) if width else 35
@@ -632,8 +657,14 @@ def render_runtime_panel(
     # 4. Section: WORK ORDERS
     is_focused = state is not None and getattr(state, "scroll_focus", "") == "work_orders"
     wo_title = Text("WORK ORDERS", style="bold #38bdf8" if is_focused else "bold #60a5fa")
-    if work_orders and max_wo_items is not None and len(work_orders) > max_wo_items:
-        wo_title.append(f" ({len(work_orders)})", style="dim #64748b")
+    eff_wos = [
+        wo for wo in (work_orders or [])
+        if str(wo.get("status", "") if isinstance(wo, Mapping) else getattr(wo, "status", "")).upper() not in {"CANCELLED", "CANCELED", "SUPERSEDED"}
+    ]
+    if not eff_wos and work_orders:
+        eff_wos = list(work_orders)
+    if eff_wos and max_wo_items is not None and len(eff_wos) > max_wo_items:
+        wo_title.append(f" ({len(eff_wos)})", style="dim #64748b")
         if is_focused:
             wo_title.append(" [scroll active]", style="bold #38bdf8")
     items.append(wo_title)
