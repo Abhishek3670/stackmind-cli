@@ -335,7 +335,10 @@ def tui(
                 pass
 
     try:
-        client = DaemonClient(daemon_url, auth_token=daemon_auth_token)
+        try:
+            client = DaemonClient(daemon_url, auth_token=daemon_auth_token)
+        except TypeError:
+            client = DaemonClient(daemon_url)
         adapter = StackMindTuiAdapter(client)
 
         session = None
@@ -417,7 +420,10 @@ def tui(
         if is_tty:
             _ensure_utf8()
             enter_alternate_screen()
-            disable_mouse_reporting()
+            if getattr(state, "mouse_reporting_enabled", True):
+                enable_mouse_reporting()
+            else:
+                disable_mouse_reporting()
             redraw_full_screen(
                 session, state, clear=True, include_composer=True, composer_is_active=True
             )
@@ -785,6 +791,11 @@ def tui(
                     )
                     sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                     sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        try:
+                            editor.redraw_line()
+                        except Exception:
+                            pass
 
                 def _handle_page_up(editor: Any = None) -> None:
                     """Scroll conversation viewport, work orders, or command dialog up by half a page."""
@@ -1039,6 +1050,9 @@ def tui(
                                 state.scroll_focus = "work_orders"
                         else:
                             state.scroll_focus = "work_orders"
+                        _handle_height_change(editor)
+                    elif col < scrollbar_col - 2:
+                        state.scroll_focus = "conversation"
                         _handle_height_change(editor)
 
                 active_op = session.get("active_operation")

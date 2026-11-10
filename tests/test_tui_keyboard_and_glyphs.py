@@ -1479,12 +1479,14 @@ def test_agent_action_renders_role_badge_never_bare_agent():
 
     # 1. Action with explicit role
     act1 = TurnAction("h1", "Agent", status="RUNNING", tool_name="harness.run_once", role="Backend")
+    act1.sub_actions = [TurnAction("s1", "Read", status="COMPLETED", tool_name="read_file", target="file.py")]
     group1 = ActionsGroup(actions=[act1])
     out1 = render_actions_group_str(group1, width=80)
     assert "● Agent(Backend)" in out1 or "● Agent (Backend)" in out1
 
     # 2. Action without explicit role falls back to Worker
     act2 = TurnAction("h2", "Agent", status="RUNNING", tool_name="harness.run_once")
+    act2.sub_actions = [TurnAction("s2", "Read", status="COMPLETED", tool_name="read_file", target="file.py")]
     group2 = ActionsGroup(actions=[act2])
     out2 = render_actions_group_str(group2, width=80)
     assert "● Agent(Worker)" in out2 or "● Agent (Worker)" in out2

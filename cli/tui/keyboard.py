@@ -116,7 +116,7 @@ class Key:
 
 
 # SGR Extended Mouse Mode control sequences (WO-054)
-ENABLE_MOUSE_REPORTING_SEQ = ""
+ENABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
 DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 
 
@@ -165,8 +165,11 @@ class TerminalStateRestorer:
             self.is_tty = False
 
         if self.is_tty:
-            mouse_enabled = getattr(self.state, "mouse_reporting_enabled", False) if self.state is not None else False
-            if os.environ.get("STACKMIND_MOUSE", "").strip().lower() in ("1", "true", "yes"):
+            mouse_enabled = getattr(self.state, "mouse_reporting_enabled", True) if self.state is not None else True
+            env_mouse = os.environ.get("STACKMIND_MOUSE", "").strip().lower()
+            if env_mouse in ("0", "false", "no", "off"):
+                mouse_enabled = False
+            elif env_mouse in ("1", "true", "yes", "on"):
                 mouse_enabled = True
             if mouse_enabled:
                 enable_mouse_reporting(sys.stdout)
@@ -186,9 +189,14 @@ class TerminalStateRestorer:
                     mode = ctypes.c_uint32()
                     if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
                         self.old_win_mode = mode.value
-                        # Ensure QuickEdit mode (0x0040) and extended flags (0x0080) are enabled
-                        # so native terminal text selection & copy always works smoothly without Shift.
-                        new_mode = mode.value | 0x0040 | 0x0080
+                        if mouse_enabled:
+                            # Enable mouse input (0x0010), window input (0x0008), extended flags (0x0080),
+                            # virtual terminal input (0x0200) and clear QuickEdit (0x0040)
+                            # so mouse clicks, wheel, and drags reach the application.
+                            new_mode = (mode.value | 0x0010 | 0x0008 | 0x0080 | 0x0200) & ~0x0040
+                        else:
+                            # QuickEdit mode (0x0040) and extended flags (0x0080) for native terminal text selection
+                            new_mode = (mode.value | 0x0040 | 0x0080) & ~0x0010
                         kernel32.SetConsoleMode(h, new_mode)
             except Exception:
                 pass
@@ -2450,10 +2458,9 @@ def poll_stream_key() -> str | None:
     Does not consume/discard non-scroll keys.
     """
     if os.name == "nt":
-        import msvcrt
-        if not msvcrt.kbhit():
+        if not has_pending_input():
             return None
-        return _read_raw_key_windows(timeout=0.01)
+        return read_next_key(timeout=0.01)
     else:
         import select
         fd = sys.stdin.fileno()

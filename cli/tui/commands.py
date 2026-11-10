@@ -652,6 +652,7 @@ def get_help_str() -> str:
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
         "  :copy [goal|all]  Copy latest assistant response, suggested goal, or transcript to clipboard\n"
+        "  :mouse [cmd]      Enable, disable, or toggle terminal mouse tracking (on|off|toggle)\n"
         "  :help             Show this help menu\n"
         "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
@@ -660,7 +661,10 @@ def get_help_str() -> str:
         "  Tab / Ctrl+G      Auto-fill Architect's suggested goal into input box\n"
         "  Ctrl+O            Toggle thinking block expansion\n"
         "  Ctrl+C            Cancel active turn or abort\n"
-        "  Ctrl+V            Paste clipboard content into input composer"
+        "  Ctrl+V            Paste clipboard content into input composer\n"
+        "  Mouse Wheel       Scroll conversation or runtime work orders\n"
+        "  Mouse Drag        Drag conversation scrollbar thumb\n"
+        "  Right Click       Paste clipboard content into input composer"
     )
 
 
@@ -3256,6 +3260,39 @@ def dispatch_delivery_command(
             output_str = render_actions_group_str(target_group)
         else:
             output_str = "No actions to toggle."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if normalized == ":mouse" or normalized.startswith(":mouse "):
+        _, _, mouse_arg = normalized.partition(" ")
+        clean_mouse = mouse_arg.strip().lower()
+        if clean_mouse in {"on", "enable", "true", "1"}:
+            state.mouse_reporting_enabled = True
+            from cli.tui.keyboard import enable_mouse_reporting
+            enable_mouse_reporting(sys.stdout)
+            output_str = "✓ Mouse reporting enabled (mouse wheel scrolling, click & drag active)."
+        elif clean_mouse in {"off", "disable", "false", "0"}:
+            state.mouse_reporting_enabled = False
+            from cli.tui.keyboard import disable_mouse_reporting
+            disable_mouse_reporting(sys.stdout)
+            output_str = "✓ Mouse reporting disabled (native terminal text selection active)."
+        elif clean_mouse in {"toggle", ""}:
+            new_val = not getattr(state, "mouse_reporting_enabled", True)
+            state.mouse_reporting_enabled = new_val
+            if new_val:
+                from cli.tui.keyboard import enable_mouse_reporting
+                enable_mouse_reporting(sys.stdout)
+                output_str = "✓ Mouse reporting toggled ON (mouse wheel scrolling, click & drag active)."
+            else:
+                from cli.tui.keyboard import disable_mouse_reporting
+                disable_mouse_reporting(sys.stdout)
+                output_str = "✓ Mouse reporting toggled OFF (native terminal text selection active)."
+        else:
+            curr = "ON" if getattr(state, "mouse_reporting_enabled", True) else "OFF"
+            output_str = f"Current mouse reporting: {curr}\nUsage: :mouse [on|off|toggle]"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

@@ -77,8 +77,8 @@ def test_enable_and_disable_mouse_reporting():
 
     buf = io.StringIO()
     enable_mouse_reporting(stream=buf)
-    assert ENABLE_MOUSE_REPORTING_SEQ == ""
-    assert buf.getvalue() == ""
+    assert ENABLE_MOUSE_REPORTING_SEQ == "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+    assert buf.getvalue() == ENABLE_MOUSE_REPORTING_SEQ
 
     buf2 = io.StringIO()
     disable_mouse_reporting(stream=buf2)

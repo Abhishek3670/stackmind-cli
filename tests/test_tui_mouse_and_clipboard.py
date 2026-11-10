@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+import io
 import pytest
 
 from cli.tui.clipboard import get_clipboard_text, set_clipboard_text
@@ -319,6 +320,108 @@ def test_ctrl_b_toggles_runtime_panel_in_editor():
 
     editor.handle_key(Key.CTRL_B)
     assert state.runtime_panel_visible is True
+
+
+def test_mouse_command_toggles_and_sets_mode():
+    """Verify :mouse slash command configures mouse_reporting_enabled and emits SGR controls."""
+    state = AutonomousDeliveryState(session_id="test-session")
+    state.mouse_reporting_enabled = True
+
+    mock_adapter = MagicMock()
+    mock_client = MagicMock()
+
+    # 1. :mouse off
+    with patch("sys.stdout", io.StringIO()) as buf:
+        session, should_exit = dispatch_delivery_command(
+            mock_adapter, mock_client, {"session_id": "test-session"}, ":mouse off", state
+        )
+        assert should_exit is False
+        assert state.mouse_reporting_enabled is False
+        assert "disabled" in state.messages[-1].content
+        assert "\x1b[?1000l" in buf.getvalue()
+
+    # 2. :mouse on
+    with patch("sys.stdout", io.StringIO()) as buf:
+        session, should_exit = dispatch_delivery_command(
+            mock_adapter, mock_client, {"session_id": "test-session"}, ":mouse on", state
+        )
+        assert should_exit is False
+        assert state.mouse_reporting_enabled is True
+        assert "enabled" in state.messages[-1].content
+        assert "\x1b[?1000h" in buf.getvalue()
+
+    # 3. :mouse toggle
+    with patch("sys.stdout", io.StringIO()) as buf:
+        session, should_exit = dispatch_delivery_command(
+            mock_adapter, mock_client, {"session_id": "test-session"}, ":mouse", state
+        )
+        assert should_exit is False
+        assert state.mouse_reporting_enabled is False
+        assert "OFF" in state.messages[-1].content
+
+        session, should_exit = dispatch_delivery_command(
+            mock_adapter, mock_client, {"session_id": "test-session"}, ":mouse", state
+        )
+        assert state.mouse_reporting_enabled is True
+        assert "ON" in state.messages[-1].content
+
+
+def test_terminal_state_restorer_windows_console_modes():
+    """Verify Windows console input mode correctly enables mouse input and disables quick-edit."""
+    import ctypes
+    from cli.tui.keyboard import TerminalStateRestorer
+
+    mock_kernel32 = MagicMock()
+    # Initial mode with QuickEdit mode (0x0040)
+    initial_mode = 0x0040 | 0x0001 | 0x0002
+
+    def fake_get_console_mode(h, ref):
+        ref._obj.value = initial_mode
+        return 1
+
+    mock_kernel32.GetStdHandle.return_value = 100
+    mock_kernel32.GetConsoleMode.side_effect = fake_get_console_mode
+
+    # Test with mouse enabled
+    state_mouse_on = AutonomousDeliveryState(session_id="test-s1")
+    state_mouse_on.mouse_reporting_enabled = True
+
+    with patch("os.name", "nt"), patch("sys.stdin.isatty", return_value=True), patch("ctypes.WinDLL", return_value=mock_kernel32):
+        with TerminalStateRestorer(state=state_mouse_on):
+            # Check SetConsoleMode was called with ENABLE_MOUSE_INPUT (0x0010) set and QuickEdit (0x0040) cleared
+            set_call = mock_kernel32.SetConsoleMode.call_args[0]
+            new_mode = set_call[1]
+            assert new_mode & 0x0010 != 0  # ENABLE_MOUSE_INPUT
+            assert new_mode & 0x0040 == 0  # ENABLE_QUICK_EDIT_MODE cleared
+
+        # On exit, original mode restored
+        restore_call = mock_kernel32.SetConsoleMode.call_args[0]
+        assert restore_call[1] == initial_mode
+
+    # Test with mouse disabled
+    state_mouse_off = AutonomousDeliveryState(session_id="test-s2")
+    state_mouse_off.mouse_reporting_enabled = False
+
+    with patch("os.name", "nt"), patch("sys.stdin.isatty", return_value=True), patch("ctypes.WinDLL", return_value=mock_kernel32):
+        with TerminalStateRestorer(state=state_mouse_off):
+            set_call = mock_kernel32.SetConsoleMode.call_args[0]
+            new_mode = set_call[1]
+            assert new_mode & 0x0010 == 0  # ENABLE_MOUSE_INPUT cleared
+            assert new_mode & 0x0040 != 0  # ENABLE_QUICK_EDIT_MODE preserved
+
+
+def test_poll_stream_key_mouse_events_windows():
+    """Verify poll_stream_key correctly yields mouse wheel events on Windows."""
+    from cli.tui.keyboard import Key, poll_stream_key
+
+    with patch("os.name", "nt"):
+        with patch("cli.tui.keyboard.has_pending_input", return_value=True):
+            with patch("cli.tui.keyboard.read_next_key", return_value=Key.MOUSE_WHEEL_UP):
+                assert poll_stream_key() == Key.MOUSE_WHEEL_UP
+
+        with patch("cli.tui.keyboard.has_pending_input", return_value=False):
+            assert poll_stream_key() is None
+
 
 
 
