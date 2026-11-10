@@ -757,11 +757,16 @@ def render_workspace_layout(
         active_scroll = getattr(state, "conversation_scroll")
 
     conv_w = layout.conversation_width if layout.show_runtime else width
+    show_sb = (
+        not layout.show_runtime
+        and state is not None
+        and getattr(state, "show_collapsed_scrollbar", False)
+    )
     conv_column = render_conversation_column(
         conversation_renderable,
         scroll=active_scroll,
         state=state,
-        show_scrollbar=(not layout.show_runtime),
+        show_scrollbar=show_sb,
         viewport_height=height,
         width=conv_w,
     )

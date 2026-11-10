@@ -48,6 +48,7 @@ COMMAND_NAMES: dict[str, str] = {
     ":panel": "Toggle Side Panel",
     ":collapse": "Collapse Side Panel",
     ":sidebar": "Toggle Side Panel",
+    ":scrollbar": "Toggle Edge Scrollbar",
     ":reviews": "Review Gates",
     ":events": "Event Stream",
     ":reconnect": "Reconnect",

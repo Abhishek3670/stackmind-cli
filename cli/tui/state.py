@@ -685,11 +685,17 @@ class AutonomousDeliveryState:
         self.command_dialog_title: str = ""
         self._last_command_str: str | None = None
         self.runtime_panel_visible: bool = True
+        self.show_collapsed_scrollbar: bool = False
 
     def toggle_runtime_panel(self) -> bool:
         """Toggle visibility of the persistent runtime sidebar panel (Ctrl+B)."""
         self.runtime_panel_visible = not self.runtime_panel_visible
         return self.runtime_panel_visible
+
+    def toggle_collapsed_scrollbar(self) -> bool:
+        """Toggle right-edge scrollbar visibility when the runtime panel is collapsed (:scrollbar)."""
+        self.show_collapsed_scrollbar = not self.show_collapsed_scrollbar
+        return self.show_collapsed_scrollbar
 
     def get_latest_suggested_goal(self) -> str | None:
         """Extract the most recently proposed :goal command from assistant messages."""

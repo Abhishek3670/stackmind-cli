@@ -981,6 +981,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":panel", "Toggle runtime sidebar panel (Ctrl+B)", False),
     (":collapse", "Collapse or expand runtime side panel (Ctrl+B)", False),
     (":sidebar", "Toggle runtime sidebar panel (Ctrl+B)", False),
+    (":scrollbar", "Toggle right-edge scrollbar when panel is collapsed", False),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
     (":roles", "Interactive Agent Roles & Execution Backend bindings panel", False),

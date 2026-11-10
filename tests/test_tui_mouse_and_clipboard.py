@@ -610,6 +610,71 @@ def test_collapsed_badge_bar_includes_expand_button():
     assert "[+ Expand]" in badge.plain
 
 
+def test_collapsed_layout_excludes_scrollbar_edge_bars():
+    """Verify collapsing the runtime panel with Ctrl+B completely eliminates trailing scrollbar │ and █ glyphs."""
+    from cli.tui.layout import render_workspace_layout_str
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="test-clean-collapse")
+    state.runtime_panel_visible = False
+    state.show_collapsed_scrollbar = False
+
+    conv_text = "Line 1: Verification Summary\nLine 2: 1 Deliverable Inspection\nLine 3: 3 Security Scan: Clean\nLine 4: Verdict: PASS"
+
+    # Render full-width layout with height=10
+    output = render_workspace_layout_str(conv_text, width=120, state=state, height=10)
+
+    # Every rendered conversation line must NOT have the trailing │ or █ scrollbar
+    for line in output.splitlines():
+        # Strip ANSI to inspect glyphs
+        clean_line = Text.from_ansi(line).plain if "\x1b[" in line else line
+        assert not clean_line.endswith("│"), f"Found trailing scrollbar glyph '│' in line: {clean_line}"
+        assert not clean_line.endswith("█"), f"Found trailing scrollbar thumb '█' in line: {clean_line}"
+
+
+def test_scrollbar_slash_command_toggles_collapsed_scrollbar():
+    """Verify :scrollbar command toggles and configures show_collapsed_scrollbar."""
+    from cli.tui.commands import dispatch_delivery_command
+    from cli.tui.command_dialog import COMMAND_NAMES
+    from cli.tui.keyboard import DEFAULT_COMMANDS
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="test-sb-cmd")
+    assert state.show_collapsed_scrollbar is False
+
+    mock_adapter = MagicMock()
+    mock_client = MagicMock()
+
+    # 1. Turn on
+    dispatch_delivery_command(mock_adapter, mock_client, {"session_id": "test-sb-cmd"}, ":scrollbar on", state)
+    assert state.show_collapsed_scrollbar is True
+
+    # 2. Turn off
+    dispatch_delivery_command(mock_adapter, mock_client, {"session_id": "test-sb-cmd"}, ":scrollbar off", state)
+    assert state.show_collapsed_scrollbar is False
+
+    # 3. Toggle
+    dispatch_delivery_command(mock_adapter, mock_client, {"session_id": "test-sb-cmd"}, ":scrollbar", state)
+    assert state.show_collapsed_scrollbar is True
+
+    # 4. In commands and dialog
+    assert ":scrollbar" in [c[0] for c in DEFAULT_COMMANDS]
+    assert ":scrollbar" in COMMAND_NAMES
+
+
+def test_pad_frame_to_width_uses_ansi_erase_to_line_end():
+    """Verify _pad_frame_to_width appends \\x1b[K without padding dozens of literal space characters."""
+    from cli.tui.terminal import _pad_frame_to_width
+
+    raw_frame = "Line 1: Hello World"
+    padded = _pad_frame_to_width(raw_frame, width=120)
+
+    assert "\x1b[K" in padded
+    # Must NOT have 100 trailing space characters
+    assert " " * 30 not in padded
+
+
+
 
 
 

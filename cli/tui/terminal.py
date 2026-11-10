@@ -705,13 +705,20 @@ def redraw_full_screen(
 
 
 def _pad_frame_to_width(frame: str, width: int) -> str:
-    """Pad every frame line to ``width`` display cells without touching ANSI styles."""
+    """Pad every frame line to ``width`` display cells without touching ANSI styles.
+
+    Uses \\x1b[K (erase to end of line) so that unwritten cells are cleared without
+    filling the terminal grid with trailing space characters that pollute clipboard selections.
+    """
     if width <= 0:
         return frame
     padded: list[str] = []
     for line in frame.split("\n"):
         visible = Text.from_ansi(line).cell_len
-        padded.append(line + " " * max(0, width - visible))
+        if visible < width:
+            padded.append(line + "\x1b[K")
+        else:
+            padded.append(line)
     return "\n".join(padded)
 
 

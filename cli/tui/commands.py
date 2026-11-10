@@ -2063,6 +2063,28 @@ def dispatch_delivery_command(
             click.echo(status_text)
         return session, False
 
+    if normalized == ":scrollbar" or normalized.startswith(":scrollbar "):
+        _, _, arg = normalized.partition(" ")
+        clean_arg = arg.strip().lower()
+        if clean_arg in {"on", "enable", "true", "1"}:
+            state.show_collapsed_scrollbar = True
+            msg_str = "✓ Right-edge scrollbar enabled when runtime panel is collapsed."
+        elif clean_arg in {"off", "disable", "false", "0"}:
+            state.show_collapsed_scrollbar = False
+            msg_str = "✓ Right-edge scrollbar disabled (clean edge-to-edge text copying without trailing │ lines)."
+        else:
+            is_active = state.toggle_collapsed_scrollbar() if hasattr(state, "toggle_collapsed_scrollbar") else False
+            msg_str = (
+                "✓ Right-edge scrollbar enabled when panel is collapsed."
+                if is_active
+                else "✓ Right-edge scrollbar disabled (clean edge-to-edge text copying without trailing │ lines)."
+            )
+        state.add_message("user", normalized)
+        state.add_message("system", msg_str)
+        if not is_tty:
+            click.echo(msg_str)
+        return session, False
+
     # Auto-approve pending plan if operator intuitively enters 'continue', 'proceed', or ':adopt'
     is_awaiting_plan = (
         getattr(state, "phase", None) == ProjectPhase.AWAITING_APPROVAL
