@@ -2325,6 +2325,9 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, f"spawned ({backend})", wo_id or "")
 
         elif name in {"operation.started", "turn.started"}:
+            if name == "turn.started":
+                self.current_turn_actions = ActionsGroup()
+                self.current_turn_thinking = ""
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role

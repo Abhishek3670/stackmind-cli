@@ -426,11 +426,21 @@ def tui(
                 enable_mouse_reporting()
             else:
                 disable_mouse_reporting()
+            term_size = shutil.get_terminal_size(fallback=(80, 24))
+            current_cols = term_size.columns
+            current_lines = term_size.lines
+            layout_info = compute_layout(current_cols, state=state)
+            comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, current_cols - 1)
             redraw_full_screen(
-                session, state, clear=True, include_composer=True, composer_is_active=True
+                session,
+                state,
+                width=current_cols,
+                height=current_lines,
+                clear=True,
+                include_composer=True,
+                composer_is_active=True,
             )
-            current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-            c_row = compute_composer_cursor_row(current_lines, state=state)
+            c_row = compute_composer_cursor_row(current_lines, state=state, width=comp_width)
             # WO-022: fixed column — layout is flush at column 0 across all tiers.
             sys.stdout.write(f"\x1b[{c_row};5H")
             sys.stdout.flush()
@@ -1201,10 +1211,17 @@ def tui(
                 else:
                     comp_placeholder = "Type a message..."
 
+                term_size = shutil.get_terminal_size(fallback=(80, 24))
+                term_cols = term_size.columns
+                current_lines = term_size.lines
+                layout_info = compute_layout(term_cols, state=state)
+                comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, term_cols - 1)
+
                 text = prompt_composer_input(
                     placeholder=comp_placeholder,
                     width=comp_width,
                     terminal_width=term_cols,
+                    terminal_height=current_lines,
                     state=state,
                     session=session,
                     on_ctrl_k=_handle_ctrl_k,
@@ -1247,7 +1264,8 @@ def tui(
             except (EOFError, KeyboardInterrupt):
                 if live_ws is not None:
                     live_ws.stop()
-                click.echo()
+                if not is_tty:
+                    click.echo()
                 break
             try:
                 state.scroll_conversation_to_bottom()
@@ -1265,19 +1283,26 @@ def tui(
                         live_ws.stop()
                     break
             except KeyboardInterrupt:
-                click.echo()
+                if not is_tty:
+                    click.echo()
                 continue
             if is_tty:
+                term_size = shutil.get_terminal_size(fallback=(80, 24))
+                term_cols = term_size.columns
+                current_lines = term_size.lines
+                layout_info = compute_layout(term_cols, state=state)
+                comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, term_cols - 1)
                 redraw_full_screen(
                     session,
                     state,
+                    width=term_cols,
+                    height=current_lines,
                     clear=False,
                     include_composer=True,
                     composer_is_active=True,
                     live_manager=live_ws,
                 )
-                current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                c_row = compute_composer_cursor_row(current_lines, state=state)
+                c_row = compute_composer_cursor_row(current_lines, state=state, width=comp_width)
                 sys.stdout.write(f"\x1b[{c_row};5H")
                 sys.stdout.flush()
     finally:

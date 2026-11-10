@@ -960,6 +960,7 @@ def prompt_composer_input(
     live_manager: Any | None = None,
     session: Mapping[str, Any] | None = None,
     terminal_width: int | None = None,
+    terminal_height: int | None = None,
     full_screen: bool = False,
     key_stream: Optional[Iterator[str]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
@@ -975,7 +976,7 @@ def prompt_composer_input(
     if width != term_width:
         comp_width = width
     else:
-        comp_width = layout.conversation_width if layout.show_runtime else term_width
+        comp_width = layout.conversation_width if layout.show_runtime else max(10, term_width - 1)
 
     if show_footer is None:
         show_footer = True
@@ -1155,10 +1156,12 @@ def prompt_composer_input(
             _raw_prompt_fn = getattr(
                 sys.modules.get("cli.tui.app"), "raw_prompt_input", raw_prompt_input
             )
+            term_lines = terminal_height or shutil.get_terminal_size(fallback=(80, 24)).lines
             val = _raw_prompt_fn(
                 placeholder=placeholder,
                 shortcuts=shortcuts,
                 width=comp_width,
+                height=term_lines,
                 initial_text=initial_text,
                 history=history,
                 state=state,

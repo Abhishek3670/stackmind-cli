@@ -1228,6 +1228,7 @@ class RawLineEditor:
         on_wheel_down: Optional[Callable[[], None]] = None,
         on_transition: Optional[Callable[[bool], None]] = None,
         width: int = 80,
+        height: Optional[int] = None,
         right_border: Optional[str] = None,
         commands: Optional[list[tuple[str, str, bool]]] = None,
         on_clear_dropdown: Optional[Callable[[], Any]] = None,
@@ -1247,6 +1248,7 @@ class RawLineEditor:
         self.history_index: int = len(self.history)
         self.temp_buffer: str = initial_text
         self.state = state
+        self.height: Optional[int] = height
         self.on_ctrl_k = on_ctrl_k
         self.on_ctrl_l = on_ctrl_l
         self.on_ctrl_o = on_ctrl_o
@@ -1511,6 +1513,27 @@ class RawLineEditor:
             except Exception:
                 pass
         if not cleared_via_callback:
+            if getattr(self, "state", None) is not None:
+                try:
+                    term_lines = getattr(self, "height", None) or shutil.get_terminal_size(fallback=(self.width, 24)).lines
+                    from cli.tui.layout import compute_composer_cursor_row
+                    c_row = compute_composer_cursor_row(
+                        term_lines,
+                        state=self.state,
+                        composer_content=self.text,
+                        cursor_line=0,
+                        width=self.width,
+                    )
+                    top_border_row = c_row - 1
+                    for r in range(max(1, top_border_row - H), top_border_row):
+                        target.write(f"\x1b[{r};1H\x1b[2K")
+                    visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+                    cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+                    target.write(f"\x1b[{c_row};{cursor_col}H")
+                    target.flush()
+                    return
+                except Exception:
+                    pass
             offset_up = H + (1 if self.has_borders else 0)
             try:
                 target.write(f"\x1b[{offset_up}A")
@@ -1529,7 +1552,22 @@ class RawLineEditor:
             try:
                 visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
                 cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
-                target.write(f"\x1b[{cursor_col}G")
+                if getattr(self, "state", None) is not None:
+                    try:
+                        term_lines = getattr(self, "height", None) or shutil.get_terminal_size(fallback=(self.width, 24)).lines
+                        from cli.tui.layout import compute_composer_cursor_row
+                        c_row = compute_composer_cursor_row(
+                            term_lines,
+                            state=self.state,
+                            composer_content=self.text,
+                            cursor_line=0,
+                            width=self.width,
+                        )
+                        target.write(f"\x1b[{c_row};{cursor_col}H")
+                    except Exception:
+                        target.write(f"\x1b[{cursor_col}G")
+                else:
+                    target.write(f"\x1b[{cursor_col}G")
                 target.flush()
             except Exception:
                 pass
@@ -2075,6 +2113,22 @@ class RawLineEditor:
         except Exception:
             return
 
+        if getattr(self, "state", None) is not None:
+            try:
+                term_lines = getattr(self, "height", None) or shutil.get_terminal_size(fallback=(self.width, 24)).lines
+                from cli.tui.layout import compute_composer_cursor_row
+                c_row = compute_composer_cursor_row(
+                    term_lines,
+                    state=self.state,
+                    composer_content=self.text,
+                    cursor_line=0,
+                    width=self.width,
+                )
+                target.write(f"\x1b[{c_row + 1};1H\r{border_str}\x1b[{c_row};{cursor_col}H")
+                return
+            except Exception:
+                pass
+
         # Deterministic relative move down, write border, move back up, and reset column
         target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
 
@@ -2093,6 +2147,23 @@ class RawLineEditor:
         buf_str = "".join(self.buffer)
         v_lines, _, c_line, c_col = self._get_visual_lines()
         self.displayed_cursor = c_col
+
+        # In full-screen state mode, compute exact cursor row and anchor cursor to it FIRST
+        c_row = None
+        if getattr(self, "state", None) is not None:
+            try:
+                term_lines = getattr(self, "height", None) or shutil.get_terminal_size(fallback=(self.width, 24)).lines
+                from cli.tui.layout import compute_composer_cursor_row
+                c_row = compute_composer_cursor_row(
+                    term_lines,
+                    state=self.state,
+                    composer_content=self.text,
+                    cursor_line=c_line,
+                    width=self.width,
+                )
+                target.write(f"\x1b[{c_row};1H")
+            except Exception:
+                pass
 
         # If multiline or wrapped, trigger full-screen height handler if available
         if len(v_lines) > 1:
@@ -2116,24 +2187,11 @@ class RawLineEditor:
             line_out = f"\r{prefix}{displayed}{' ' * spaces_count}{self.right_border}"
             target.write(line_out)
             cursor_col = visible_prefix_len + c_col + 1
-            target.write(f"\x1b[{cursor_col}G")
-            self._update_bottom_border(target, cursor_col)
-            if getattr(self, "state", None) is not None:
-                try:
-                    from cli.tui.layout import compute_composer_cursor_row
-                    term_lines = shutil.get_terminal_size(fallback=(self.width, 24)).lines
-                    c_row = compute_composer_cursor_row(
-                        term_lines,
-                        state=self.state,
-                        composer_content=self.text,
-                        cursor_line=c_line,
-                        width=self.width,
-                    )
-                    target.write(f"\x1b[{c_row};{cursor_col}H")
-                except Exception:
-                    target.write(f"\x1b[{cursor_col}G")
+            if c_row is not None:
+                target.write(f"\x1b[{c_row};{cursor_col}H")
             else:
                 target.write(f"\x1b[{cursor_col}G")
+            self._update_bottom_border(target, cursor_col)
             target.flush()
             return
 
@@ -2159,7 +2217,10 @@ class RawLineEditor:
 
         # Move cursor to active edit position inside composer box
         cursor_col = visible_prefix_len + self.displayed_cursor + 1
-        target.write(f"\x1b[{cursor_col}G")
+        if c_row is not None:
+            target.write(f"\x1b[{c_row};{cursor_col}H")
+        else:
+            target.write(f"\x1b[{cursor_col}G")
 
         # Update bottom border only if alert or attachments changed
         self._update_bottom_border(target, cursor_col)
@@ -2180,44 +2241,38 @@ class RawLineEditor:
                 new_H = len(dropdown_lines)
                 self._last_dropdown_lines_count = new_H
                 try:
-                    # If previous dropdown was taller, clear the excess top lines first
-                    if prev_H > new_H:
-                        offset_top = prev_H + (1 if self.has_borders else 0)
-                        target.write(f"\x1b[{offset_top}A")
-                        excess = prev_H - new_H
-                        for _ in range(excess):
-                            target.write("\r\x1b[2K\x1b[1B")
+                    if c_row is not None:
+                        top_border_row = c_row - 1
+                        for i, d_line in enumerate(dropdown_lines):
+                            d_row = top_border_row - new_H + i
+                            target.write(f"\x1b[{d_row};1H\r{d_line}\x1b[K")
+                        target.write(f"\x1b[{c_row};{cursor_col}H")
                     else:
-                        offset_up = new_H + (1 if self.has_borders else 0)
-                        target.write(f"\x1b[{offset_up}A")
+                        if prev_H > new_H:
+                            offset_top = prev_H + (1 if self.has_borders else 0)
+                            target.write(f"\x1b[{offset_top}A")
+                            excess = prev_H - new_H
+                            for _ in range(excess):
+                                target.write("\r\x1b[2K\x1b[1B")
+                        else:
+                            offset_up = new_H + (1 if self.has_borders else 0)
+                            target.write(f"\x1b[{offset_up}A")
 
-                    for d_line in dropdown_lines:
-                        target.write(f"\r{d_line}\x1b[K\x1b[1B")
+                        for d_line in dropdown_lines:
+                            target.write(f"\r{d_line}\x1b[K\x1b[1B")
 
-                    down_steps = 1 if self.has_borders else 0
-                    if down_steps > 0:
-                        target.write(f"\x1b[{down_steps}B")
-                    target.write(f"\x1b[{cursor_col}G")
+                        down_steps = 1 if self.has_borders else 0
+                        if down_steps > 0:
+                            target.write(f"\x1b[{down_steps}B")
+                        target.write(f"\x1b[{cursor_col}G")
                 except Exception:
                     pass
             elif prev_H > 0:
                 self._erase_dropdown(target)
 
         # Anchor cursor strictly inside the composer box
-        if getattr(self, "state", None) is not None:
-            try:
-                from cli.tui.layout import compute_composer_cursor_row
-                term_lines = shutil.get_terminal_size(fallback=(self.width, 24)).lines
-                c_row = compute_composer_cursor_row(
-                    term_lines,
-                    state=self.state,
-                    composer_content=self.text,
-                    cursor_line=0,
-                    width=self.width,
-                )
-                target.write(f"\x1b[{c_row};{cursor_col}H")
-            except Exception:
-                pass
+        if c_row is not None:
+            target.write(f"\x1b[{c_row};{cursor_col}H")
 
         target.flush()
 
@@ -2229,6 +2284,7 @@ def raw_prompt_input(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    height: Optional[int] = None,
     initial_text: str = "",
     history: Optional[list[str]] = None,
     state: Optional[Any] = None,
@@ -2293,15 +2349,18 @@ def raw_prompt_input(
                 border_str = top_border_renderer(has_content)
                 visible_prefix_len = len(_ANSI_STRIP_RE.sub("", prompt_prefix))
                 cursor_col = visible_prefix_len + getattr(editor, "displayed_cursor", getattr(editor, "cursor", 0)) + 1
-                sys.stdout.write(f"\x1b7\x1b[s\x1b[1A\r{border_str}\x1b[1B\r\x1b[{cursor_col}G\x1b8\x1b[u")
                 if state is not None:
                     try:
                         from cli.tui.layout import compute_composer_cursor_row
-                        term_lines = shutil.get_terminal_size(fallback=(width, 24)).lines
+                        term_lines = getattr(editor, "height", None) or shutil.get_terminal_size(fallback=(width, 24)).lines
                         c_row = compute_composer_cursor_row(term_lines, state=state, composer_content=editor.text, cursor_line=0, width=width)
-                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                        top_border_row = c_row - 1
+                        sys.stdout.write(f"\x1b[{top_border_row};1H\r{border_str}\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+                        return
                     except Exception:
                         pass
+                sys.stdout.write(f"\x1b7\x1b[s\x1b[1A\r{border_str}\x1b[1B\r\x1b[{cursor_col}G\x1b8\x1b[u")
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -2448,6 +2507,7 @@ def raw_prompt_input(
         on_mouse_release=wrapped_mouse_release,
         on_transition=handle_transition,
         width=width,
+        height=height,
         commands=commands,
         on_clear_dropdown=on_clear_dropdown,
         bottom_border_renderer=bottom_border_renderer,
@@ -2479,6 +2539,7 @@ def raw_prompt_input(
                                 pass
                         else:
                             editor.width = term_size.columns
+                            editor.height = term_size.lines
                             editor.redraw_line()
 
                     if k is None:
@@ -2504,16 +2565,18 @@ def raw_prompt_input(
                     if done:
                         if editor._last_dropdown_lines_count > 0:
                             editor._erase_dropdown()
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if state is None:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         break
                     editor.redraw_line()
                 except KeyboardInterrupt:
                     if getattr(editor, "_confirmed_exit", False):
                         if editor._last_dropdown_lines_count > 0:
                             editor._erase_dropdown()
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if state is None:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         raise
                     try:
                         editor.handle_key(Key.CTRL_C)
@@ -2522,14 +2585,16 @@ def raw_prompt_input(
                     except KeyboardInterrupt:
                         if editor._last_dropdown_lines_count > 0:
                             editor._erase_dropdown()
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if state is None:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         raise
                 except EOFError:
                     if editor._last_dropdown_lines_count > 0:
                         editor._erase_dropdown()
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
+                    if state is None:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
                     raise
     finally:
         if state is not None:

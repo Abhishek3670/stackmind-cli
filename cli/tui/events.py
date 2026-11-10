@@ -133,6 +133,9 @@ def clean_error_message(err: Any, max_len: int = 160) -> str:
             msg = msg[: msg.index(cut_marker)].rstrip(" .")
             break
 
+    if "filenotfounderror" in lower_msg and len(msg) > 60:
+        msg = msg[:57] + "..."
+
     # Strip after first sentence boundary in *Error messages to avoid leaking implementation details
     if re.match(r"^\w*Error:", msg):
         sent_match = re.search(r"(?<=\.)\s", msg)
