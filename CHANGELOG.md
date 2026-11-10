@@ -5,6 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.15.0] - 2026-11-11
+
+### Added
+- **Terminal Mouse Interaction & SGR Extended Reporting**:
+  - Enabled standard terminal SGR mouse reporting (`\x1b[?1000h\x1b[?1002h\x1b[?1006h`) in `cli/tui/keyboard.py` and `cli/tui/terminal.py`.
+  - Added Windows Console QuickEdit mode synchronization: automatically clears `ENABLE_QUICK_EDIT_MODE` when mouse reporting is enabled so clicks, drags, and wheel events route directly to the TUI; safely restores QuickEdit on exit or when mouse reporting is disabled.
+  - Added `:mouse [on|off]` slash command to toggle mouse reporting at runtime, registered in autocomplete dropdown and command palette.
+- **Collapsible Runtime Side Panel (`Ctrl+B`)**:
+  - Added sidebar toggle support via keyboard shortcut (`Ctrl+B`), clickable header button (`[–]` to collapse, `[+ Expand]` to restore), divider click (`│`), or slash commands (`:collapse`, `:panel`, `:sidebar`).
+  - Added `:scrollbar [on|off]` command to control right-edge scrollbar visibility when the side panel is collapsed.
+- **Column-Isolated In-App Drag-to-Copy**:
+  - Added `_handle_mouse_release` in `cli/tui/app.py` to extract conversation text cleanly without selecting sidebar widgets, divider characters, or prompt input.
+  - Preserves 100% of leading indentation, nested bullet points (`•`), list markers (` 1 `), and blank separator lines.
+  - Automatically trims outer conversation margin padding (`Padding((0, 1))`) so top-level headings are flush while relative list indentation is preserved.
+- **Pristine Markdown Copying in `:copy`**:
+  - Integrated `strip_internal_reasoning` and `format_contract_payload` in `cli/tui/commands.py` (`:copy`) so raw contract JSON and `<think>` tags are formatted into clean Markdown with original code backticks, indentation, and line spacing.
+- **Edge-to-Edge True ANSI Clearing**:
+  - Replaced space padding with `\x1b[K` (*Erase to Line End*) in `_pad_frame_to_width` in `cli/tui/terminal.py` and stripped trailing spaces in `slice_conversation_viewport` in `cli/tui/layout.py`. Eliminates hundreds of trailing space characters from terminal cells and guarantees native terminal selections copy clean empty newlines without full-width space blocks.
+
+### Fixed
+- **Read-Write Contract Auto-Defaulting on Recovery**:
+  - In `validators/kernel/contract.py`, worker contracts declaring authorable files default to read-write mode to prevent unauthorized write attempts during recovery cycles.
+- **Sanitized Null Work Orders in Recovery Decisions**:
+  - In `validators/kernel/daemon/supervisor/recovery.py`, sanitized null or missing `replacement_work_orders` and contract revisions, preventing validation crashes on autonomous repair application.
+
+### Performance
+- **Ponytail Ladder Optimizations**:
+  - Consolidated duplicate trailing whitespace regex passes into shared `_strip_trailing_spaces` helper across layout and terminal rendering.
+  - Compacted `_pad_frame_to_width` and `:scrollbar` command parsing.
+
 ## [3.14.1] - 2026-11-10
 
 ### Added

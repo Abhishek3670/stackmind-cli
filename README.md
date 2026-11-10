@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.14.1` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.15.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -95,6 +95,10 @@ Authority is `CEO → Claude (architect, sole writer of TREE.yaml/boot) → Gemm
 `validators/kernel/daemon/` is a local JSON-RPC server (default `127.0.0.1:8765`, state in `.sync/runtime/daemon/`). The `LifecycleSupervisor` drives `INIT → PLANNING → AWAITING_APPROVAL → AUTHORING → DISPATCHING → EXECUTING → INTEGRATION_REVIEW → PRODUCT_READY → GITOPS → COMPLETE` (`BLOCKED`/`FAILED` on unrecoverable gates), with DAG ordering, concurrent sibling dispatch, retry/contention bounds, and crash recovery.
 
 The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:status`, `:approve`/`:reject`, `:resume`, streamed output — not a second source of truth.
+- **Terminal Mouse Interaction & SGR Reporting**: Native terminal mouse wheel scrolling, drag-to-copy, and click navigation via SGR extended mouse reporting (`\x1b[?1000h\x1b[?1002h\x1b[?1006h`) with automatic Windows Console QuickEdit management. Configure via `:mouse [on|off]` or toggle.
+- **Collapsible Side Panel**: Press `Ctrl+B`, click the header `[–]` button, click the vertical divider `│`, or type `:collapse` to toggle the right-hand StackMind Runtime sidebar between 2-column split and 100% full-width view.
+- **Clean Edge-to-Edge Drag-to-Copy**: Column-isolated mouse selection extracts conversation text without polluting clipboard with sidebar widgets, scrollbars, or trailing spaces. Preserves 100% of bullet hierarchy, leading indentation, and blank separator lines.
+- **Pristine Markdown Copying**: `:copy` formats technical contract payloads and copies raw Markdown with original formatting and code backticks directly to the system clipboard.
 
 ## Harness & Governance
 
@@ -137,6 +141,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.14.1`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.15.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

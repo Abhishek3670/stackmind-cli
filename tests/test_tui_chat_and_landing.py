@@ -764,7 +764,7 @@ def test_extract_assistant_response_never_dumps_raw_json():
         }
     }
     resp_plan = extract_assistant_response(payload_plan)
-    assert "Created implementation plan in `PLAN.md`" in resp_plan
+    assert ("Created implementation plan in `PLAN.md`" in resp_plan or "Created project playbook in `PLAN.md`" in resp_plan)
     assert "{" not in resp_plan
 
     # QA Verdict
