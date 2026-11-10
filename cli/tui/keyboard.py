@@ -1302,6 +1302,7 @@ class RawLineEditor:
         self.in_bracketed_paste: bool = False
         self._last_was_cr: bool = False
         self._last_line_count: int = max(1, "".join(self.buffer).count("\n") + 1)
+        self._last_bottom_state: Optional[tuple[Any, tuple[str, ...]]] = None
 
         self._update_state()
         self._update_dropdown()
@@ -1672,22 +1673,9 @@ class RawLineEditor:
                     self.on_alert(None)
                 except Exception:
                     pass
-            if self.bottom_border_renderer and self.has_borders:
-                try:
-                    border_str = self.bottom_border_renderer(None, self.attached_images)
-                    target = getattr(self, "out", sys.stdout)
-                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                    target.flush()
-                except TypeError:
-                    try:
-                        border_str = self.bottom_border_renderer(None)
-                        target = getattr(self, "out", sys.stdout)
-                        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                        target.flush()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+            cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+            self._update_bottom_border(getattr(self, "out", sys.stdout), cursor_col, force=True)
 
         if key == Key.CTRL_D:
             if not self.buffer:
@@ -2067,6 +2055,29 @@ class RawLineEditor:
             _log_debug_key(f"[handle_key] UNHANDLED key ignored: {repr(key)}")
         return False
 
+    def _update_bottom_border(self, target: Any, cursor_col: int, force: bool = False) -> None:
+        """Update bottom border only when content (alert/attachments) changed, preserving cursor position."""
+        if not getattr(self, "bottom_border_renderer", None) or not getattr(self, "has_borders", False):
+            return
+
+        state_key = (self.alert, tuple(self.attached_images) if self.attached_images else ())
+        if not force and getattr(self, "_last_bottom_state", None) == state_key:
+            return
+
+        self._last_bottom_state = state_key
+        try:
+            border_str = self.bottom_border_renderer(self.alert, self.attached_images)
+        except TypeError:
+            try:
+                border_str = self.bottom_border_renderer(self.alert)
+            except Exception:
+                return
+        except Exception:
+            return
+
+        # Deterministic relative move down, write border, move back up, and reset column
+        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+
     def redraw_line(self, out: Any = None) -> None:
         """Redraw current line with exact cursor placement and composer border preservation."""
         if getattr(self, "_in_redraw", False):
@@ -2106,18 +2117,23 @@ class RawLineEditor:
             target.write(line_out)
             cursor_col = visible_prefix_len + c_col + 1
             target.write(f"\x1b[{cursor_col}G")
-            if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
+            self._update_bottom_border(target, cursor_col)
+            if getattr(self, "state", None) is not None:
                 try:
-                    border_str = self.bottom_border_renderer(self.alert, self.attached_images)
-                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                except TypeError:
-                    try:
-                        border_str = self.bottom_border_renderer(self.alert)
-                        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                    except Exception:
-                        pass
+                    from cli.tui.layout import compute_composer_cursor_row
+                    term_lines = shutil.get_terminal_size(fallback=(self.width, 24)).lines
+                    c_row = compute_composer_cursor_row(
+                        term_lines,
+                        state=self.state,
+                        composer_content=self.text,
+                        cursor_line=c_line,
+                        width=self.width,
+                    )
+                    target.write(f"\x1b[{c_row};{cursor_col}H")
                 except Exception:
-                    pass
+                    target.write(f"\x1b[{cursor_col}G")
+            else:
+                target.write(f"\x1b[{cursor_col}G")
             target.flush()
             return
 
@@ -2145,18 +2161,8 @@ class RawLineEditor:
         cursor_col = visible_prefix_len + self.displayed_cursor + 1
         target.write(f"\x1b[{cursor_col}G")
 
-        if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
-            try:
-                border_str = self.bottom_border_renderer(self.alert, self.attached_images)
-                target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-            except TypeError:
-                try:
-                    border_str = self.bottom_border_renderer(self.alert)
-                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        # Update bottom border only if alert or attachments changed
+        self._update_bottom_border(target, cursor_col)
 
         # Dropdown management
         prev_H = self._last_dropdown_lines_count
@@ -2196,6 +2202,22 @@ class RawLineEditor:
                     pass
             elif prev_H > 0:
                 self._erase_dropdown(target)
+
+        # Anchor cursor strictly inside the composer box
+        if getattr(self, "state", None) is not None:
+            try:
+                from cli.tui.layout import compute_composer_cursor_row
+                term_lines = shutil.get_terminal_size(fallback=(self.width, 24)).lines
+                c_row = compute_composer_cursor_row(
+                    term_lines,
+                    state=self.state,
+                    composer_content=self.text,
+                    cursor_line=0,
+                    width=self.width,
+                )
+                target.write(f"\x1b[{c_row};{cursor_col}H")
+            except Exception:
+                pass
 
         target.flush()
 
@@ -2268,9 +2290,18 @@ def raw_prompt_input(
         """Dynamically update top border when typing begins or buffer is emptied."""
         if top_border_renderer and is_tty:
             try:
-                # Save cursor (\x1b[s), move up 1 row (\x1b[1A), rewrite border, restore cursor (\x1b[u)
                 border_str = top_border_renderer(has_content)
-                sys.stdout.write(f"\x1b[s\x1b[1A\r{border_str}\x1b[u")
+                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", prompt_prefix))
+                cursor_col = visible_prefix_len + getattr(editor, "displayed_cursor", getattr(editor, "cursor", 0)) + 1
+                sys.stdout.write(f"\x1b7\x1b[s\x1b[1A\r{border_str}\x1b[1B\r\x1b[{cursor_col}G\x1b8\x1b[u")
+                if state is not None:
+                    try:
+                        from cli.tui.layout import compute_composer_cursor_row
+                        term_lines = shutil.get_terminal_size(fallback=(width, 24)).lines
+                        c_row = compute_composer_cursor_row(term_lines, state=state, composer_content=editor.text, cursor_line=0, width=width)
+                        sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
+                    except Exception:
+                        pass
                 sys.stdout.flush()
             except Exception:
                 pass
