@@ -3273,26 +3273,34 @@ def dispatch_delivery_command(
             state.mouse_reporting_enabled = True
             from cli.tui.keyboard import enable_mouse_reporting
             enable_mouse_reporting(sys.stdout)
-            output_str = "✓ Mouse reporting enabled (mouse wheel scrolling, click & drag active)."
+            output_str = (
+                "✓ Mouse reporting enabled (wheel scroll, click & drag active).\n"
+                "  • Tip: Hold Shift while dragging to select & copy text natively.\n"
+                "  • Run :mouse off to restore direct drag-to-copy without Shift."
+            )
         elif clean_mouse in {"off", "disable", "false", "0"}:
             state.mouse_reporting_enabled = False
             from cli.tui.keyboard import disable_mouse_reporting
             disable_mouse_reporting(sys.stdout)
-            output_str = "✓ Mouse reporting disabled (native terminal text selection active)."
+            output_str = "✓ Mouse reporting disabled (native terminal drag-to-copy text selection active)."
         elif clean_mouse in {"toggle", ""}:
             new_val = not getattr(state, "mouse_reporting_enabled", True)
             state.mouse_reporting_enabled = new_val
             if new_val:
                 from cli.tui.keyboard import enable_mouse_reporting
                 enable_mouse_reporting(sys.stdout)
-                output_str = "✓ Mouse reporting toggled ON (mouse wheel scrolling, click & drag active)."
+                output_str = (
+                    "✓ Mouse reporting toggled ON (wheel scroll, click & drag active).\n"
+                    "  • Tip: Hold Shift while dragging to select & copy text natively."
+                )
             else:
                 from cli.tui.keyboard import disable_mouse_reporting
                 disable_mouse_reporting(sys.stdout)
-                output_str = "✓ Mouse reporting toggled OFF (native terminal text selection active)."
+                output_str = "✓ Mouse reporting toggled OFF (native terminal drag-to-copy text selection active)."
         else:
             curr = "ON" if getattr(state, "mouse_reporting_enabled", True) else "OFF"
-            output_str = f"Current mouse reporting: {curr}\nUsage: :mouse [on|off|toggle]"
+            tip = "Hold Shift while dragging to select text natively." if curr == "ON" else "Run :mouse on for wheel scrolling."
+            output_str = f"Current mouse reporting: {curr} ({tip})\nUsage: :mouse [on|off|toggle]"
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

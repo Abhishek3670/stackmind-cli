@@ -132,6 +132,17 @@ def enable_mouse_reporting(stream: Any = None) -> None:
             target.flush()
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = kernel32.GetStdHandle(-10)
+            if h not in (0, -1):
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                    new_mode = (mode.value | 0x0010 | 0x0008 | 0x0080 | 0x0200) & ~0x0040
+                    kernel32.SetConsoleMode(h, new_mode)
+        except Exception:
+            pass
 
 
 def disable_mouse_reporting(stream: Any = None) -> None:
@@ -146,6 +157,17 @@ def disable_mouse_reporting(stream: Any = None) -> None:
             target.flush()
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = kernel32.GetStdHandle(-10)
+            if h not in (0, -1):
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                    new_mode = (mode.value | 0x0040 | 0x0080) & ~0x0010
+                    kernel32.SetConsoleMode(h, new_mode)
+        except Exception:
+            pass
 
 
 class TerminalStateRestorer:
@@ -221,6 +243,14 @@ class TerminalStateRestorer:
             except Exception:
                 pass
 
+        # Unconditionally disable mouse reporting, disable bracketed paste, restore cursor visibility, and reset ANSI attributes
+        disable_mouse_reporting(sys.stdout)
+        try:
+            sys.stdout.write("\x1b[?2004l\x1b[?25h\x1b[0m")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
         if self.is_tty and os.name == "nt" and self.old_win_mode is not None:
             try:
                 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -229,14 +259,6 @@ class TerminalStateRestorer:
                     kernel32.SetConsoleMode(h, self.old_win_mode)
             except Exception:
                 pass
-
-        # Unconditionally disable mouse reporting, disable bracketed paste, restore cursor visibility, and reset ANSI attributes
-        disable_mouse_reporting(sys.stdout)
-        try:
-            sys.stdout.write("\x1b[?2004l\x1b[?25h\x1b[0m")
-            sys.stdout.flush()
-        except Exception:
-            pass
 
 
 def _parse_escape_sequence(seq: str) -> str:
