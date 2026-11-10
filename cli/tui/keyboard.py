@@ -971,6 +971,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":contract", "Display Contract Boundary HUD & permissions", False),
     (":diff", "Display Unified Diff viewer", False),
     (":matrix", "Display 6-Dimensional Verification Matrix", False),
+    (":mouse", "Configure terminal mouse tracking (on | off | toggle)", False),
     (":reviews", "Display QA and Architect final-acceptance gate state", False),
     (":events", "Stream incremental sequenced events", False),
     (":reconnect", "Reconnect to daemon & replay missed events", False),

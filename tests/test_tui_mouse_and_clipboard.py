@@ -423,5 +423,29 @@ def test_poll_stream_key_mouse_events_windows():
             assert poll_stream_key() is None
 
 
+def test_mouse_command_in_dropdown_and_command_dialog():
+    """Verify :mouse appears in autocomplete dropdown and command dialog."""
+    from cli.tui.command_dialog import COMMAND_NAMES
+    from cli.tui.keyboard import DEFAULT_COMMANDS, RawLineEditor
+
+    # 1. Verify in COMMAND_NAMES
+    assert ":mouse" in COMMAND_NAMES
+    assert COMMAND_NAMES[":mouse"] == "Mouse Tracking"
+
+    # 2. Verify in DEFAULT_COMMANDS
+    cmd_names = [c[0] for c in DEFAULT_COMMANDS]
+    assert ":mouse" in cmd_names
+
+    # 3. Verify dropdown matching when user types ':m'
+    editor = RawLineEditor()
+    editor.insert_char(":")
+    editor.insert_char("m")
+    assert editor.dropdown_active is True
+    matches = [c[0] for c in editor.dropdown_matches]
+    assert ":matrix" in matches
+    assert ":mouse" in matches
+
+
+
 
 
