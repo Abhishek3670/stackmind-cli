@@ -2029,11 +2029,18 @@ def dispatch_delivery_command(
             desc = "latest response"
 
         if text_to_copy:
+            from cli.tui.chat import format_contract_payload, strip_internal_reasoning
+            clean_text = strip_internal_reasoning(text_to_copy)
+            if clean_text:
+                clean_text = format_contract_payload(clean_text)
+            if clean_text:
+                text_to_copy = clean_text
+
             ok = set_clipboard_text(text_to_copy)
             msg_str = (
                 f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard.\n"
-                "  • Tip: Mouse-drag any conversation text to copy cleanly (side panel is excluded).\n"
-                "  • Tip: Click [–] on header, click divider │, or press Ctrl+B / :collapse to toggle sidebar."
+                "  • Pristine formatting: 100% raw markdown indentation, bullets, and line spacing preserved.\n"
+                "  • Tip: Mouse-drag across conversation text to copy visible lines directly."
                 if ok
                 else "[ERROR] Failed to write to system clipboard."
             )

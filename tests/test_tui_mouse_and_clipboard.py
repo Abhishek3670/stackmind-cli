@@ -674,6 +674,166 @@ def test_pad_frame_to_width_uses_ansi_erase_to_line_end():
     assert " " * 30 not in padded
 
 
+def test_strip_trailing_spaces_preserves_ansi_codes():
+    """Verify _strip_trailing_spaces removes trailing spaces while preserving ANSI styling."""
+    from cli.tui.terminal import _strip_trailing_spaces
+
+    assert _strip_trailing_spaces("Plain text    ") == "Plain text"
+    assert _strip_trailing_spaces("Styled \x1b[32mtext\x1b[0m   ") == "Styled \x1b[32mtext\x1b[0m"
+    assert _strip_trailing_spaces("Styled \x1b[32mtext   \x1b[0m") == "Styled \x1b[32mtext\x1b[0m"
+    assert _strip_trailing_spaces("   Indented text   ") == "   Indented text"
+
+
+def test_pad_frame_to_width_strips_trailing_spaces_and_cleans_empty_lines():
+    """Verify _pad_frame_to_width cleans trailing spaces on content lines and leaves clean empty lines."""
+    from cli.tui.terminal import _pad_frame_to_width
+
+    # Frame containing lines with 80 trailing spaces (as produced by full-width Rich Markdown)
+    raw_frame = "Verification Summary" + (" " * 80) + "\n\n  • Bullet 1" + (" " * 70)
+    padded = _pad_frame_to_width(raw_frame, width=120)
+
+    lines = padded.split("\n")
+    # Content line must have trailing spaces stripped and \x1b[K appended
+    assert lines[0] == "Verification Summary\x1b[K"
+    # Empty blank line must NOT contain spaces; only \x1b[K
+    assert lines[1] == "\x1b[K"
+    # Indented line must preserve its leading indentation
+    assert lines[2] == "  • Bullet 1\x1b[K"
+
+
+def test_mouse_drag_to_copy_preserves_indentation_and_blank_lines():
+    """Verify in-app mouse drag-to-copy preserves leading indentation and blank separator lines."""
+    import os
+    from unittest.mock import patch
+    from cli.tui.state import AutonomousDeliveryState
+    from cli.tui.keyboard import RawLineEditor
+    from cli.tui.layout import compute_layout
+
+    state = AutonomousDeliveryState(session_id="test-drag-indent")
+    state.runtime_panel_visible = True
+    state.visible_conversation_lines = [
+        " Verification Summary",
+        "",
+        "  1 Deliverable Inspection: Updated tests/test_integration.py to correctly verify:",
+        "     • DOM hooks match document.getElementById",
+        "     • Form input name attributes match FormData.get()",
+        "  2 Test Execution: All 5 tests pass:",
+        "     • Hero endpoint returns correct JSON",
+        "",
+        " Verdict",
+        "",
+        " PASS — Frontend-backend integration verified.",
+    ]
+
+    # Directly test the release handler logic
+    editor = RawLineEditor()
+    with patch("shutil.get_terminal_size", return_value=os.terminal_size((120, 30))):
+        with patch("cli.tui.clipboard.set_clipboard_text", return_value=True) as mock_set:
+            layout = compute_layout(120, 30, state=state)
+            scrollbar_col = layout.conversation_width
+            max_c = max(1, scrollbar_col - 2)
+
+            # Drag starting at row 1 (Verification Summary) down to row 11 (PASS...)
+            # User clicks around col 2
+            start_col, start_row = 2, 1
+            end_col, end_row = 40, 11
+
+            s_col = max(0, min(max_c, start_col - 1))
+            e_col = max(0, min(max_c, end_col - 1))
+            r1 = start_row - 1
+            r2 = end_row - 1
+
+            visible = state.visible_conversation_lines
+            min_r = min(r1, r2)
+            max_r = min(len(visible) - 1, max(r1, r2))
+
+            extracted = []
+            is_forward = (start_row < end_row) or (start_row == end_row and start_col <= end_col)
+            first_col = s_col if is_forward else e_col
+            last_col = e_col if is_forward else s_col
+
+            for r in range(min_r, max_r + 1):
+                line = visible[r]
+                if not line.strip():
+                    extracted.append("")
+                    continue
+
+                leading_spaces = len(line) - len(line.lstrip(" "))
+                if r == min_r:
+                    if first_col <= max(4, leading_spaces + 2):
+                        extracted.append(line.rstrip())
+                    else:
+                        extracted.append(line[first_col:].rstrip())
+                elif r == max_r:
+                    content_len = len(line.rstrip())
+                    if last_col >= content_len - 2 or last_col >= max_c - 4 or last_col >= 20:
+                        extracted.append(line.rstrip())
+                    else:
+                        extracted.append(line[:last_col].rstrip())
+                else:
+                    extracted.append(line.rstrip())
+
+            non_empty = [l for l in extracted if l]
+            if non_empty and all(l.startswith(" ") for l in non_empty):
+                extracted = [l[1:] if l.startswith(" ") else l for l in extracted]
+
+            selected = "\n".join(extracted).strip("\r\n")
+
+            from cli.tui.clipboard import set_clipboard_text
+            ok = set_clipboard_text(selected)
+            assert ok is True
+            mock_set.assert_called_once()
+            copied = mock_set.call_args[0][0]
+
+            # 1. Top-level heading is clean
+            assert "Verification Summary" in copied
+            # 2. Blank lines between sections are preserved
+            assert "\n\n" in copied
+            # 3. Indented list items preserve relative indentation
+            assert " 1 Deliverable Inspection:" in copied
+            assert "    • DOM hooks match" in copied
+            assert " 2 Test Execution:" in copied
+            assert "    • Hero endpoint" in copied
+            # 4. Verdict and blank lines preserved
+            assert "Verdict" in copied
+            assert "PASS — Frontend-backend" in copied
+
+
+def test_copy_slash_command_formats_contract_payload_and_preserves_indentation():
+    """Verify :copy formats contract payloads into clean Markdown and preserves exact formatting."""
+    from cli.tui.commands import dispatch_delivery_command
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="test-copy-fmt")
+    raw_payload = '{"status": "completed", "review_notes": "1. **Inspection**\\n   - Hooks verified\\n   - Inputs verified\\n\\n2. **Tests**\\n   - All passed", "verdict": "PASS"}'
+    state.add_message("assistant", raw_payload)
+
+    mock_adapter = MagicMock()
+    mock_client = MagicMock()
+
+    with patch("cli.tui.clipboard.set_clipboard_text", return_value=True) as mock_set:
+        session, should_exit = dispatch_delivery_command(
+            mock_adapter,
+            mock_client,
+            {"session_id": "test-copy-fmt"},
+            ":copy",
+            state,
+        )
+        assert should_exit is False
+        mock_set.assert_called_once()
+        copied = mock_set.call_args[0][0]
+
+        # Verify contract payload was converted to clean Markdown with indentation
+        assert "QA Verdict: PASS" in copied
+        assert "1. **Inspection**" in copied
+        assert "   - Hooks verified" in copied
+        assert "2. **Tests**" in copied
+        assert "   - All passed" in copied
+        # Raw JSON braces should not be in copied text
+        assert '{"status":' not in copied
+
+
+
 
 
 

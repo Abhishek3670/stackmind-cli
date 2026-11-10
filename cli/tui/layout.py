@@ -13,6 +13,7 @@ Layout spec (IMPLEMENTATION_PLAN_TUI.md §6, §12):
 from __future__ import annotations
 
 import io
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -647,24 +648,29 @@ def slice_conversation_viewport(
             if not raw_line:
                 visual_lines.append("")
                 continue
-            t = Text.from_ansi(raw_line) if "\x1b[" in raw_line else Text(raw_line)
+            stripped_line = re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", raw_line.rstrip(" "))
+            if not stripped_line:
+                visual_lines.append("")
+                continue
+            t = Text.from_ansi(stripped_line) if "\x1b[" in stripped_line else Text(stripped_line)
             if t.cell_len <= avail_width:
-                visual_lines.append(raw_line)
+                visual_lines.append(stripped_line)
             else:
                 parts = t.wrap(c, avail_width)
                 if not parts:
                     visual_lines.append("")
                 else:
                     for part in parts:
-                        if "\x1b[" in raw_line:
+                        if "\x1b[" in stripped_line:
                             cap, _ = _make_capture_console(width=avail_width, force_color=True)
                             cap.print(part, end="")
-                            visual_lines.append(cap.export_text(styles=True))
+                            p_clean = re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", cap.export_text(styles=True).rstrip(" "))
+                            visual_lines.append(p_clean)
                         else:
-                            visual_lines.append(part.plain)
+                            visual_lines.append(part.plain.rstrip(" "))
         lines = visual_lines
     else:
-        lines = content.split("\n")
+        lines = [re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", l.rstrip(" ")) for l in content.split("\n")]
 
     total_lines = len(lines)
 
@@ -698,7 +704,7 @@ def slice_conversation_viewport(
         if state is not None:
             try:
                 state.visible_conversation_lines = [
-                    Text.from_ansi(l).plain if "\x1b[" in l else l
+                    (Text.from_ansi(l).plain if "\x1b[" in l else l).rstrip(" ")
                     for l in lines
                 ]
             except Exception:
@@ -719,7 +725,7 @@ def slice_conversation_viewport(
     if state is not None:
         try:
             state.visible_conversation_lines = [
-                Text.from_ansi(l).plain if "\x1b[" in l else l
+                (Text.from_ansi(l).plain if "\x1b[" in l else l).rstrip(" ")
                 for l in visible
             ]
         except Exception:

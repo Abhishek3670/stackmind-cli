@@ -1124,21 +1124,47 @@ def tui(
                         line = visible_lines[min_r] if min_r < len(visible_lines) else ""
                         c_start = min(s_col, e_col)
                         c_end = max(s_col, e_col)
-                        selected_text = line[c_start:c_end].strip()
+                        leading_sp = len(line) - len(line.lstrip(" "))
+                        if c_start <= max(4, leading_sp + 2):
+                            selected_text = line[:c_end].rstrip()
+                        else:
+                            selected_text = line[c_start:c_end].rstrip()
                     else:
                         extracted = []
                         is_forward = (start_row < end_row) or (start_row == end_row and start_col <= end_col)
+                        first_col = s_col if is_forward else e_col
+                        last_col = e_col if is_forward else s_col
+
                         for r in range(min_r, max_r + 1):
                             if r >= len(visible_lines):
                                 break
                             line = visible_lines[r]
+                            if not line.strip():
+                                extracted.append("")
+                                continue
+
+                            leading_spaces = len(line) - len(line.lstrip(" "))
                             if r == min_r:
-                                extracted.append(line[s_col:].rstrip() if is_forward else line[e_col:].rstrip())
+                                if first_col <= max(4, leading_spaces + 2):
+                                    extracted.append(line.rstrip())
+                                else:
+                                    extracted.append(line[first_col:].rstrip())
                             elif r == max_r:
-                                extracted.append(line[:e_col].rstrip() if is_forward else line[:s_col].rstrip())
+                                content_len = len(line.rstrip())
+                                if last_col >= content_len - 2 or last_col >= max_c - 4 or last_col >= 20:
+                                    extracted.append(line.rstrip())
+                                else:
+                                    extracted.append(line[:last_col].rstrip())
                             else:
                                 extracted.append(line.rstrip())
-                        selected_text = "\n".join(extracted).strip()
+
+                        # If all non-empty lines have at least 1 common leading space (from Padding((0, 1))),
+                        # strip 1 leading space so top-level text is flush and lists keep relative indentation
+                        non_empty = [l for l in extracted if l]
+                        if non_empty and all(l.startswith(" ") for l in non_empty):
+                            extracted = [l[1:] if l.startswith(" ") else l for l in extracted]
+
+                        selected_text = "\n".join(extracted).strip("\r\n")
 
                     if selected_text:
                         from cli.tui.clipboard import set_clipboard_text

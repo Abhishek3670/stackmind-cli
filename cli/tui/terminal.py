@@ -704,21 +704,29 @@ def redraw_full_screen(
     return frame
 
 
+def _strip_trailing_spaces(line: str) -> str:
+    """Remove trailing space characters while preserving trailing ANSI formatting sequences."""
+    cleaned = line.rstrip(" ")
+    return re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", cleaned)
+
+
 def _pad_frame_to_width(frame: str, width: int) -> str:
     """Pad every frame line to ``width`` display cells without touching ANSI styles.
 
-    Uses \\x1b[K (erase to end of line) so that unwritten cells are cleared without
-    filling the terminal grid with trailing space characters that pollute clipboard selections.
+    Strips trailing spaces and uses \\x1b[K (erase to end of line) so that unwritten cells
+    are cleared cleanly without filling the terminal grid with space characters that pollute
+    clipboard selections or break indentation.
     """
     if width <= 0:
         return frame
     padded: list[str] = []
     for line in frame.split("\n"):
-        visible = Text.from_ansi(line).cell_len
+        cleaned = _strip_trailing_spaces(line)
+        visible = Text.from_ansi(cleaned).cell_len
         if visible < width:
-            padded.append(line + "\x1b[K")
+            padded.append(cleaned + "\x1b[K")
         else:
-            padded.append(line)
+            padded.append(cleaned)
     return "\n".join(padded)
 
 
