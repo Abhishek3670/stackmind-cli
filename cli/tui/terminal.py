@@ -523,6 +523,12 @@ def enable_mouse_reporting(stream: Any = None) -> None:
 
 def disable_mouse_reporting(stream: Any = None) -> None:
     """Disable terminal SGR mouse reporting (WO-054)."""
+    try:
+        from cli.tui.keyboard import disable_mouse_reporting as _kb_disable
+        _kb_disable(stream)
+        return
+    except Exception:
+        pass
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):

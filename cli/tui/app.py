@@ -39,10 +39,12 @@ from cli.tui.commands import (
     _compute_run_state,
     _dispatch_command,
     _show_status,
+    _stream_turn_execution,
     dispatch_delivery_command,
     get_help_str,
     get_status_str,
     reconnect_and_sync,
+    resolve_turn_model_attribution,
 )
 from cli.tui.events import recover_transcript_from_events
 from cli.tui.keyboard import raw_prompt_input
@@ -531,7 +533,6 @@ def tui(
 
                 active_op = session.get("active_operation")
                 if active_op:
-                    from cli.tui.commands import _stream_turn_execution, resolve_turn_model_attribution
                     cur_op = state.get_current_operation() or {}
                     active_role = cur_op.get("role") or session.get("active_role") or "Agent"
                     model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
@@ -577,7 +578,6 @@ def tui(
                         conv_content = None
                         has_in_progress = getattr(state, "has_in_progress_turn", False)
                         if has_in_progress:
-                            from cli.tui.commands import _build_in_progress_turn_content, resolve_turn_model_attribution
                             layout_info = compute_layout(current_cols, state=state)
                             cur_op = state.get_current_operation() or {}
                             active_role = cur_op.get("role") or session.get("active_role") or "Agent"
@@ -754,7 +754,6 @@ def tui(
                     conv_content = None
                     has_in_progress = getattr(state, "has_in_progress_turn", False)
                     if has_in_progress:
-                        from cli.tui.commands import _build_in_progress_turn_content, resolve_turn_model_attribution
                         layout_info = compute_layout(term_cols, state=state)
                         cur_op = state.get_current_operation() or {}
                         active_role = cur_op.get("role") or session.get("active_role") or "Agent"
@@ -1226,7 +1225,6 @@ def tui(
                     full_screen=is_tty,
                 )
             except _ActiveOperationDetected as aod:
-                from cli.tui.commands import _stream_turn_execution, resolve_turn_model_attribution
                 cur_op = state.get_current_operation() or {}
                 active_role = cur_op.get("role") or session.get("active_role") or "Agent"
                 model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role

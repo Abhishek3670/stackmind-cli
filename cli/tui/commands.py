@@ -64,10 +64,13 @@ from cli.tui.state import (
     OperationNode,
     ProjectPhase,
 )
+from cli.tui.keyboard import (
+    disable_mouse_reporting,
+    enable_mouse_reporting,
+)
 from cli.tui.terminal import (
     _wrap_text_to_width,
     check_terminal_resize,
-    disable_mouse_reporting,
     install_resize_handler,
     redraw_full_screen as _terminal_redraw_full_screen,
     render_top_header_bar_str,
@@ -2316,7 +2319,6 @@ def dispatch_delivery_command(
         or normalized in {":role"}
     ):
         from cli.tui.settings_panel import (
-            render_roles_panel,
             run_interactive_roles_panel,
         )
         from validators.kernel.settings import load_settings
@@ -2499,8 +2501,6 @@ def dispatch_delivery_command(
 
                     output_str = render_settings_overview_str(settings_obj, width=term_cols)
                 elif scmd in ("roles", "role"):
-                    from cli.tui.settings_panel import render_roles_panel
-
                     output_str = render_roles_panel(state, detailed=True)
                 else:
                     output_str = render_stackmind_settings_str(settings_obj, width=term_cols)
@@ -3299,7 +3299,6 @@ def dispatch_delivery_command(
         clean_mouse = mouse_arg.strip().lower()
         if clean_mouse in {"on", "enable", "true", "1"}:
             state.mouse_reporting_enabled = True
-            from cli.tui.keyboard import enable_mouse_reporting
             enable_mouse_reporting(sys.stdout)
             output_str = (
                 "✓ Mouse reporting enabled (wheel scroll, drag-to-copy & click active).\n"
@@ -3308,7 +3307,6 @@ def dispatch_delivery_command(
             )
         elif clean_mouse in {"off", "disable", "false", "0"}:
             state.mouse_reporting_enabled = False
-            from cli.tui.keyboard import disable_mouse_reporting
             disable_mouse_reporting(sys.stdout)
             output_str = (
                 "✓ Mouse reporting disabled (native terminal drag-to-copy text selection active).\n"
@@ -3318,14 +3316,12 @@ def dispatch_delivery_command(
             new_val = not getattr(state, "mouse_reporting_enabled", True)
             state.mouse_reporting_enabled = new_val
             if new_val:
-                from cli.tui.keyboard import enable_mouse_reporting
                 enable_mouse_reporting(sys.stdout)
                 output_str = (
                     "✓ Mouse reporting toggled ON (wheel scroll, drag-to-copy & click active).\n"
                     "  • Direct drag-to-copy: Drag across conversation text to copy cleanly (side panel is excluded)."
                 )
             else:
-                from cli.tui.keyboard import disable_mouse_reporting
                 disable_mouse_reporting(sys.stdout)
                 output_str = (
                     "✓ Mouse reporting toggled OFF (native terminal drag-to-copy text selection active).\n"
