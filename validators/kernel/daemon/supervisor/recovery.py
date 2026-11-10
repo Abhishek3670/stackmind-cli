@@ -1706,8 +1706,10 @@ class _RecoveryMixin:
                 data.pop("synthesized_by", None)
             data["normalized_by"] = "recovery-redispatch"
 
-        # 3. Ensure work order deliverables and expected files are in scope.allow
+        # 3. Ensure work order deliverables and expected files are in scope.allow and write is read-write
         scope = data.setdefault("scope", {})
+        if "write" not in scope and "write_mode" not in data:
+            scope["write"] = "read-write"
         allow_list = scope.setdefault("allow", [])
         existing_modules = {r.get("module") for r in allow_list if isinstance(r, dict)}
 

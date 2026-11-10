@@ -426,6 +426,32 @@ completion:
     assert res.code == "DEPENDENCIES_SATISFIED"
 
 
+def test_contract_without_explicit_write_mode_defaults_to_read_write_for_authorable_files():
+    """Contracts with authorable files (e.g. tests/**) but omitting write: read-write must not lock workers out."""
+    from validators.kernel.contract import ContractNormalizer, ContractEvaluator
+
+    raw = {
+        "schema_version": 1,
+        "agent_id": "gemma",
+        "work_order": "WO-052",
+        "identity": {"role": "qa", "reports_to": "claude"},
+        "scope": {
+            "allow": [{"module": "tests/test_integration.py"}, {"module": ".sync/reviews/qa/WO-052.json"}],
+            "deny": [{"module": "src/**"}],
+        },
+        "budget": {"max_files_touched": 5, "max_tokens": 30000},
+    }
+
+    norm = ContractNormalizer.normalize(raw)
+    assert norm.write_mode == "read-write"
+
+    evaluator = ContractEvaluator()
+    ok, reason = evaluator.authorize(norm, "write_file", "tests/test_integration.py")
+    assert ok is True
+    assert reason == "authorized"
+
+
+
 
 
 
