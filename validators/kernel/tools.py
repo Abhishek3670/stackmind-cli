@@ -1083,7 +1083,11 @@ class ToolGateway:
         if selector:
             cmd.extend(["-k", selector])
 
-        result = self.sandbox.run(cmd, timeout=120)
+        result = self.sandbox.run(
+            cmd,
+            timeout=120,
+            env_extra={"PYTHONPATH": str(self.workspace.root)},
+        )
         out = {
             "success": result.returncode == 0,
             "exit_code": result.returncode,

@@ -386,6 +386,47 @@ def test_state_verified_allows_sync_directory_writes(tmp_path: Path):
     assert dims.state_verified is True
 
 
+def test_completed_work_order_bypasses_graph_validation(tmp_path: Path):
+    """Completed work orders with missing/pruned dependencies must not fail graph validation."""
+    sync_dir = tmp_path / ".sync"
+    wo_completed = sync_dir / "work-orders" / "COMPLETED"
+    wo_completed.mkdir(parents=True, exist_ok=True)
+
+    wo_file = wo_completed / "WO-016.yaml"
+    wo_file.write_text(
+        """id: WO-016
+milestone_id: M3
+type: FEATURE
+title: Integration Review
+status: COMPLETED
+priority: P1
+assigned_agents:
+- gemini
+dependencies:
+- WO-015
+deliverable:
+  type: code
+  path: main.js
+description: Integration script
+acceptance_criteria:
+- main.js exists
+completion:
+  summary: Completed
+  timestamp: '2026-11-10T00:00:00Z'
+""",
+        encoding="utf-8",
+    )
+
+    issues = validate_dependency_graph(tmp_path)
+    # WO-015 is missing, but since WO-016 is COMPLETED, no issue should be flagged
+    assert not any(i.code == "DEPENDENCY_MISSING" for i in issues)
+
+    res = evaluate_dependencies(tmp_path, "WO-016")
+    assert res.status == DependencyStatus.SATISFIED
+    assert res.code == "DEPENDENCIES_SATISFIED"
+
+
+
 
 
 

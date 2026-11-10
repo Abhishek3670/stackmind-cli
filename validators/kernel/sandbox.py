@@ -29,6 +29,7 @@ from .workspace import ScratchWorkspace, WorkspaceEscapeError
 #   PATHEXT, APPDATA, LOCALAPPDATA, PROGRAMFILES, ALLUSERSPROFILE, PUBLIC.
 DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
     "PATH",
+    "PYTHONPATH",
     "HOME",
     "USERPROFILE",
     "HOMEDRIVE",
@@ -375,6 +376,18 @@ class ProcessSandbox:
             existing_path = env.get(path_key, "")
             if venv_bin.lower() not in existing_path.lower():
                 env[path_key] = f"{venv_bin}{os.pathsep}{existing_path}"
+
+        # Ensure workspace root is in PYTHONPATH so project packages/modules (e.g. src) resolve
+        if "PYTHONPATH" in allowed or (extra and any(k.upper() == "PYTHONPATH" for k in extra)):
+            pp_key = "PYTHONPATH"
+            for k in env:
+                if k.upper() == "PYTHONPATH":
+                    pp_key = k
+                    break
+            existing_pp = env.get(pp_key, "")
+            ws_root = str(self.workspace.root)
+            if ws_root.lower() not in existing_pp.lower():
+                env[pp_key] = f"{ws_root}{os.pathsep}{existing_pp}" if existing_pp else ws_root
         return env
 
     @staticmethod

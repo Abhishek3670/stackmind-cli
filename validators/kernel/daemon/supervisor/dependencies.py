@@ -389,6 +389,14 @@ def validate_dependency_graph(
     }
 
     for wo_id in sorted(graph):
+        wo_ref = records.get(wo_id)
+        if wo_ref is not None and (
+            wo_ref.bucket == "COMPLETED"
+            or str(wo_ref.data.get("status", "")).upper() == "COMPLETED"
+            or bool(wo_ref.data.get("completion"))
+        ):
+            # Completed work orders were already satisfied; do not fail graph validation retrospectively
+            continue
         for dep in graph[wo_id]:
             if not _WO_ID_RE.match(dep):
                 issues.append(
@@ -919,6 +927,20 @@ def evaluate_dependencies(
 
     records = load_all_work_orders(root)
     ref = records.get(wo_id)
+    if ref is not None and (
+        ref.bucket == "COMPLETED"
+        or str(ref.data.get("status", "")).upper() == "COMPLETED"
+        or bool(ref.data.get("completion"))
+    ):
+        return DependencyResult(
+            work_order_id=wo_id,
+            status=DependencyStatus.SATISFIED,
+            code="DEPENDENCIES_SATISFIED",
+            detail="work order is already completed",
+            evaluated_at=evaluated_at,
+            dependencies=declaration.dependencies,
+            fingerprint=_fingerprint({"wo": wo_id, "status": "completed"}),
+        )
     revision = ref.revision if ref is not None else None
     contract_rev = contract_revision(root, wo_id)
 

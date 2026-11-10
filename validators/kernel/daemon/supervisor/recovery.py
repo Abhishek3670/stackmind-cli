@@ -167,7 +167,8 @@ class _RecoveryMixin:
                     if not check_passed:
                         state.repair_context["post_check_error"] = f"Verification check failed: {check_msg}"
 
-                can_close = deliv_on_disk and check_passed and not unmet_deps
+                is_already_completed = bool(wo_data.get("completion")) or str(wo_data.get("status", "")).upper() == "COMPLETED"
+                can_close = (deliv_on_disk and check_passed and not unmet_deps) or is_already_completed
 
                 if can_close:
                     # Deliverable fix verified on disk — complete the work order and return to execution!
@@ -290,7 +291,8 @@ class _RecoveryMixin:
                         if not check_passed:
                             state.repair_context["post_check_error"] = f"Verification check failed: {check_msg}"
 
-                    can_close = deliv_on_disk and check_passed and not unmet_deps
+                    is_already_completed = bool(wo_data.get("completion")) or str(wo_data.get("status", "")).upper() == "COMPLETED"
+                    can_close = (deliv_on_disk and check_passed and not unmet_deps) or is_already_completed
 
                     if can_close:
                         self._archive_recovery_artifact(ws, state.run_id, f".sync/decisions/recovery/{wo_id}.decision.json")
@@ -1880,7 +1882,25 @@ class _RecoveryMixin:
             if prior_decision_op is None or str(prior_decision_op.get("status", "")).upper() in _OPERATION_TERMINAL:
                 state.recovery_decision_operation_id = None
         self._archive_verdicts_for_wo(wo_id, ws)
-        self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+        wo_data = None
+        try:
+            from validators.harness import review_gate
+            wo_data = review_gate.load_wo(ws, wo_id)
+        except Exception:
+            pass
+        is_already_completed = (
+            isinstance(wo_data, dict)
+            and (bool(wo_data.get("completion")) or str(wo_data.get("status", "")).upper() == "COMPLETED")
+        )
+        if is_already_completed:
+            self._mark_wo_status_on_disk(ws, wo_id, "COMPLETED", clear_error=True)
+            if wo_id not in state.completed_wo_ids:
+                state.completed_wo_ids.append(wo_id)
+            if wo_id in state.worker_wo_ids:
+                state.worker_wo_ids.remove(wo_id)
+            redispatch = False
+        else:
+            self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         if redispatch:
             self._restore_worker_contract_after_recovery(ws, wo_id, state)
             agent = self._agent_for_wo(wo_id, ws)

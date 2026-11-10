@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.14.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.14.1` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -121,16 +121,22 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 - **Authoring Gate & Report Deliverable Support**: First-class support for `deliverable.type: report` in `authoring_gate.py` and `work-order.schema.json`, plus normalized null path checks to avoid role-mismatch false positives.
 - **Autonomous Recovery Loop Resolution**: Immediate archival of consumed recovery decisions and automatic normalization of `SUPERSEDED_DEPENDENCY` / `INVALID_DEPENDENCY` actions from `amend_contract` to `architect_fix`, preventing contention cancellations and infinite recovery loops.
 - **Plan Auto-Attestation on Resume**: Automatically defaults `plan_id = "PLAN-001"` on resume when `PLAN.md` exists, eliminating false `FINAL_ACCEPTANCE_BLOCKED` rejections.
+- **Retrospective Dependency Graph Validation Exemption**: Exempts completed work orders from retrospective graph validation and prerequisite re-evaluation, preventing circular dependency deadlocks when historical work orders are pruned.
+- **Deterministic Work Order Completion in Autonomous Recovery**: Automatically marks verified completed orders on disk as `COMPLETED` during recovery to skip worker redispatch and prevent 40+ turn spinning loops.
+- **Dynamic `PYTHONPATH` Workspace Root Injection**: Automatically injects project workspace root into `PYTHONPATH` for sandboxed test runner execution, ensuring local source packages resolve seamlessly.
+- **Snapshot State Verification Exemption for Governance Files**: Excludes `.sync/` and `.git/` directories from state snapshot hashing in `verification.py`, allowing governance files to be safely authored without false-positive verification errors.
+- **Turn 1 Planning Deliverable Auto-Synthesis**: Auto-synthesizes `PLAN.md` from the turn's planning output when the model omits explicit file write tool calls.
 
 ## Docs
 
 - Architecture handbook: [`docs/architectures/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md)
 - RFCs: [`docs/rfcs/`](docs/rfcs/) (RFC-001 identity → RFC-006 harness)
 - Harness evaluation: [`docs/governance/HARNESS-ENGINEERING-EVALUATION.md`](docs/governance/HARNESS-ENGINEERING-EVALUATION.md)
+- Orchestration deep study: [`reports/STACKMIND_ORCHESTRATION_DEEP_STUDY.md`](reports/STACKMIND_ORCHESTRATION_DEEP_STUDY.md)
 - Migration guide: [`docs/roadmap/migration-guide.md`](docs/roadmap/migration-guide.md)
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.14.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.14.1`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

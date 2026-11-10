@@ -5,6 +5,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.14.1] - 2026-11-10
+
+### Added
+- **Multi-Agent Orchestration Empirical Study & Evaluation**:
+  - Published comprehensive empirical telemetry and analysis report across 204 journal turns, 6.06M tokens, and 4 specialized agents in `reports/STACKMIND_ORCHESTRATION_DEEP_STUDY.md`.
+  - Details behavioral profiles, security audit routing, token expenditure patterns, and architectural recommendations for future engine releases.
+
+### Fixed
+- **Retrospective Dependency Graph Validation Exemption**:
+  - In `validators/kernel/daemon/supervisor/dependencies.py`, completed work orders (`bucket == "COMPLETED"`, `status == "COMPLETED"`, or declared `completion`) are now exempt from retrospective dependency graph validation and re-evaluation.
+  - Fixes critical deadlock where pruning an obsolete prerequisite caused subsequent completed tasks declaring it to fail graph validation and trigger infinite recovery loops.
+- **Deterministic Work Order Completion in Autonomous Recovery**:
+  - In `validators/kernel/daemon/supervisor/recovery.py` (`_clear_worker_blocker`, `_advance_repair`), work orders that already have verified completion on disk are automatically marked `COMPLETED`, added to `completed_wo_ids`, removed from `worker_wo_ids`, and skip worker redispatch.
+- **Dynamic `PYTHONPATH` Workspace Root Injection & Allowlist**:
+  - Added `PYTHONPATH` to `DEFAULT_ENV_ALLOWLIST` in `validators/kernel/sandbox.py`.
+  - Automatically injected project workspace root into `PYTHONPATH` for sandboxed test runner execution (`run_tests` in `validators/kernel/tools.py`), resolving `ModuleNotFoundError` for local project modules (e.g. `src/`) during QA verification.
+- **Snapshot State Verification Exemption for Governance Artifacts**:
+  - Excluded `.sync/` and `.git/` directories from state snapshot hashing in `validators/harness/runner/verification.py`, allowing governance files (e.g. recovery decisions, inbox notifications) to be safely authored without tripping false-positive verification errors.
+- **Turn 1 Planning Deliverable Auto-Synthesis**:
+  - Synthesized `PLAN.md` directly from planning turn output in `validators/harness/runner/completion.py` when the architectural lead model completes planning without explicit file creation tool calls.
+- **Direct Resume Dispatching for Active Runs**:
+  - In `validators/kernel/daemon/supervisor/phases.py`, `:resume` now checks `worker_wo_ids` and advances directly to `DISPATCHING`/`EXECUTING`, preventing erroneous reversions to `PLANNING`.
+
 ## [3.14.0] - 2026-11-09
 
 ### Added
