@@ -503,6 +503,25 @@ class LifecycleSupervisor(
                 ),
             )
             if attempts >= state.max_retries or timeout_recovery_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
+                # Before halting in WAITING_FOR_HUMAN, let Decision Specialist (Laya) formulate a safe fallback
+                try:
+                    from validators.routing.laya_adapter import LayaDecisionAdapter
+                    laya = LayaDecisionAdapter()
+                    evidence = state.worker_blockers.get(wo_id, {})
+                    f_code = evidence.get("failure_code") or "RECOVERY_TIMEOUT"
+                    final_decision = laya.decide_recovery_action(
+                        wo_id=wo_id,
+                        error_message=f"Recovery decision timed out after {timeout_val:.1f}s",
+                        failure_code=f_code,
+                        evidence=evidence,
+                    )
+                    advance, apply_error = self._apply_recovery_decision(state, Path(state.workspace), wo_id, final_decision)
+                    if apply_error is None:
+                        logger.info("Decision Specialist (Laya) rescued recovery timeout for %s: %s", wo_id, final_decision.get("action"))
+                        return advance if advance is not None else AdvanceResult.WAITING_FOR_OPERATION
+                except Exception as exc:
+                    logger.warning("Laya timeout recovery rescue failed: %s", exc)
+
                 state.error = f"MAX_RECOVERY_ATTEMPTS_EXHAUSTED: Recovery decision for {wo_id} timed out after {timeout_val:.1f}s"
                 state.exit_code = EXIT_RETRIES_EXHAUSTED
                 self._transition(state, Phase.WAITING_FOR_HUMAN)
