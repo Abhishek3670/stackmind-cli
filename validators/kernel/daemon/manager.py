@@ -672,6 +672,12 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
             state.planning_wo_id = None
     elif phase == Phase.AUTHORING:
         state.authoring_operation_id = None
+    elif phase == Phase.EXECUTING:
+        if getattr(state, "dependency_escalation_op_id", None):
+            state.dependency_escalation_op_id = None
+            state.dependency_escalation_wo_id = None
+        state.recovery_decision_operation_id = None
+        state.architect_repair_operation_id = None
     state.batch_operation_id = None
 
     ignored = set(getattr(state, "ignored_operation_ids", []) or [])
@@ -683,6 +689,13 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
         state.authoring_operation_id = None
     if getattr(state, "gitops_operation_id", None) in ignored:
         state.gitops_operation_id = None
+    if getattr(state, "dependency_escalation_op_id", None) in ignored:
+        state.dependency_escalation_op_id = None
+        state.dependency_escalation_wo_id = None
+    if getattr(state, "recovery_decision_operation_id", None) in ignored:
+        state.recovery_decision_operation_id = None
+    if getattr(state, "architect_repair_operation_id", None) in ignored:
+        state.architect_repair_operation_id = None
     if getattr(state, "batch_operation_id", None) in ignored:
         state.batch_operation_id = None
 
@@ -2188,15 +2201,28 @@ class SessionManager:
                     session["active_operation"] = None
 
         # Only clear phase operation ID if it is dead or ignored, never if actively running
-        for attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id", "gitops_operation_id", "batch_operation_id"):
+        for attr in (
+            "planning_operation_id",
+            "authoring_operation_id",
+            "integration_operation_id",
+            "gitops_operation_id",
+            "batch_operation_id",
+            "dependency_escalation_op_id",
+            "recovery_decision_operation_id",
+            "architect_repair_operation_id",
+        ):
             phase_op_id = getattr(state, attr, None)
             if phase_op_id:
                 if phase_op_id in getattr(state, "ignored_operation_ids", []):
                     setattr(state, attr, None)
+                    if attr == "dependency_escalation_op_id":
+                        state.dependency_escalation_wo_id = None
                 else:
                     t = self._turn_threads.get(phase_op_id)
                     if t is None or not t.is_alive():
                         setattr(state, attr, None)
+                        if attr == "dependency_escalation_op_id":
+                            state.dependency_escalation_wo_id = None
 
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""

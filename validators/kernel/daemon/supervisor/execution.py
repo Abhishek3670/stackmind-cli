@@ -227,8 +227,15 @@ class _ExecutionMixin:
         else:
             err_detail = esc_result.get("error") or esc_result.get("reason") or "turn failed"
             state.error = f"Architecture escalation failed to resolve dependency for {target_wo}: {err_detail}"
-            if target_wo and target_wo not in state.blocked_wo_ids:
-                state.blocked_wo_ids.append(target_wo)
+            logger.warning(
+                "Architecture dependency escalation failed for %s (%s); escalating to autonomous recovery decision",
+                target_wo,
+                err_detail,
+            )
+            if target_wo:
+                self.escalate_wo_to_recovery(state, target_wo, reason=state.error)
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
             self._transition(state, Phase.BLOCKED)
             return AdvanceResult.BLOCKED
         return None
@@ -391,6 +398,54 @@ class _ExecutionMixin:
         # Check if this blockage is caused by an undeclared third-party dependency
         dep_info = self._parse_undeclared_dependency_error(err_msg, result)
         if dep_info:
+            # If the specialist worker's contract permits writing dependency manifests,
+            # this is a transient authoring omission. Nudge the worker directly with the
+            # exact requirement instead of halting or escalating to Architecture.
+            if dep_info.get("manifest_permitted") is True:
+                retries = state.retry_counts.get(wo_id, 0)
+                retry_decision = evaluate_retry_budget(
+                    state,
+                    RetryContext(
+                        budget=BudgetKey.WORKER_TASK,
+                        scope=wo_id,
+                        failure_class=FailureClass.TRANSIENT,
+                        failure_code=failure_code or "DEPENDENCY_ERROR",
+                    ),
+                )
+                if retries < state.max_retries and retry_decision.allowed:
+                    state.retry_counts[wo_id] = retries + 1
+                    op_id = op.get("operation_id")
+                    if op_id and op_id not in state.ignored_operation_ids:
+                        state.ignored_operation_ids.append(str(op_id))
+                    if wo_id in state.blocked_wo_ids:
+                        state.blocked_wo_ids.remove(wo_id)
+                    self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
+                    state.error = None
+                    agent = self._agent_for_wo(wo_id, ws)
+                    modules = dep_info.get("modules") or []
+                    modules_str = ", ".join(modules) if modules else "the imported external module(s)"
+                    deliv = dep_info.get("deliverable") or self._get_wo_deliverable_path(wo_id, ws) or "your deliverable"
+                    nudge = (
+                        f"Retry work order {wo_id} (attempt {retries + 2}): Your deliverable '{deliv}' imports external module(s) [{modules_str}], "
+                        f"but no dependency manifest was found in the project. Your contract explicitly permits writing dependency manifests. "
+                        f"You MUST use write_file to create requirements.txt (or pyproject.toml / package.json) declaring these dependencies, "
+                        f"alongside '{deliv}'."
+                    )
+                    try:
+                        self.manager.start_turn(
+                            state.session_id,
+                            nudge,
+                            role=self._role_for_agent(agent),
+                            agent_id=agent,
+                            work_order_id=wo_id,
+                        )
+                        return None  # retry dispatched — keep executing
+                    except OperationContentionError:
+                        state.retry_counts[wo_id] = retries
+                        raise
+                    except Exception as e:
+                        logger.error(f"Failed to retry {wo_id} for manifest: {e}", exc_info=True)
+
             esc_retries = state.dependency_escalation_retries.get(wo_id, 0)
             if esc_retries < state.max_retries:
                 state.dependency_escalation_retries[wo_id] = esc_retries + 1
@@ -406,14 +461,13 @@ class _ExecutionMixin:
                     state.dependency_escalation_wo_id = wo_id
                     return AdvanceResult.WAITING_FOR_OPERATION
             else:
-                if wo_id not in state.blocked_wo_ids:
-                    state.blocked_wo_ids.append(wo_id)
                 state.error = (
                     f"Work order {wo_id} blocked: {err_msg} — dependency escalation "
                     f"retries exhausted ({esc_retries}/{state.max_retries})"
                 )
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                self.escalate_wo_to_recovery(state, wo_id, reason=state.error)
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
 
         # A turn that declared writes but produced none is a lazy model turn:
         # bounded retry with an explicit write instruction instead of a
@@ -625,6 +679,12 @@ class _ExecutionMixin:
         if wo_id not in state.blocked_wo_ids:
             state.blocked_wo_ids.append(wo_id)
         state.error = f"Work order {wo_id} blocked: {err_msg}"
+        attempts = state.recovery_attempts.get(wo_id, 0)
+        if attempts < state.max_retries:
+            logger.info("Autonomous recovery escalation for blocked work order %s: %s", wo_id, err_msg)
+            self.escalate_wo_to_recovery(state, wo_id, reason=err_msg)
+            self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+            return AdvanceResult.TRANSITIONED
         self._transition(state, Phase.BLOCKED)
         return AdvanceResult.BLOCKED
 

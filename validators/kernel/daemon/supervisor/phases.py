@@ -726,6 +726,15 @@ class _PhasesMixin:
         if valid_wait:
             return AdvanceResult.WAITING_FOR_OPERATION
         # No worker was dispatched, no operation is awaiting, and work remains:
+        # Check if any pending work order can be escalated to autonomous recovery decision
+        for p_wo in pending:
+            p_attempts = state.recovery_attempts.get(p_wo, 0)
+            if p_attempts < state.max_retries:
+                logger.info("Autonomous recovery escalation for stalled dispatch on work order %s", p_wo)
+                self.escalate_wo_to_recovery(state, p_wo, reason=f"Dispatch stalled for {p_wo}")
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
+
         # entering EXECUTING would falsely claim that work is underway.
         self._transition(state, Phase.BLOCKED)
         state.error = (
