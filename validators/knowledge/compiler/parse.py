@@ -298,13 +298,24 @@ def _call_name(node: ast.AST) -> str | None:
     return None
 
 
-def _location(node: ast.AST) -> dict[str, int]:
+def location(node: ast.AST) -> dict[str, int]:
     return {
         "column": int(getattr(node, "col_offset", 0)),
         "end_column": int(getattr(node, "end_col_offset", 0) or 0),
         "end_line": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
         "line": int(getattr(node, "lineno", 1) or 1),
     }
+
+
+_location = location
+
+
+def safe_unparse(node: ast.AST) -> str:
+    """Safely unparse an AST node to source text, falling back to ast.dump."""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return ast.dump(node, include_attributes=False)
 
 
 def _content_hash(content: str) -> str:

@@ -32,18 +32,7 @@ CONTRACT_FAILURE_CODES = {
 }
 
 
-def _contract_file_sha256(project_path: Path, work_order_id: str | None) -> str | None:
-    """Hash the raw contract artifact so retries can verify the contract is unchanged."""
-    if not work_order_id:
-        return None
-    try:
-        from cli.contract import find_contract
-        path = find_contract(work_order_id, project_path)
-        if path.is_file():
-            return hashlib.sha256(path.read_bytes()).hexdigest()
-    except Exception:
-        pass
-    return None
+from validators.harness.contract_hash import _contract_file_sha256
 
 
 def build_contract_failure_evidence(
