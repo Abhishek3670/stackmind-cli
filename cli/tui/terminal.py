@@ -485,6 +485,11 @@ def _compute_cursor_col(editor: Any, default: int = 5) -> int:
 
 def restore_composer_focus(state: Any | None = None) -> bool:
     """Restore terminal focus to the composer after an operation completes."""
+    try:
+        from cli.tui.keyboard import drain_console_input
+        drain_console_input()
+    except Exception:
+        pass
     if state is None:
         return True
     if getattr(state, "is_typing", False):
@@ -998,6 +1003,11 @@ def prompt_composer_input(
         is_tty = key_stream is not None
 
     if is_tty:
+        try:
+            from cli.tui.keyboard import drain_console_input
+            drain_console_input()
+        except Exception:
+            pass
         if is_live_active:
             live_manager.update(
                 composer_content=initial_text,
@@ -1061,7 +1071,8 @@ def prompt_composer_input(
                     )
                     term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
                     c_row = compute_composer_cursor_row(term_lines, state=state, width=comp_width)
-                    sys.stdout.write(f"\x1b[{c_row};1H")
+                    c_col = 5 + len(getattr(state, "composer_buffer", ""))
+                    sys.stdout.write(f"\x1b[{c_row};{c_col}H")
                     sys.stdout.flush()
                     return True
                 except Exception:
@@ -1091,7 +1102,7 @@ def prompt_composer_input(
                 pass
 
             layout = compute_layout(new_cols)
-            comp_width = layout.conversation_width if layout.show_runtime else new_cols
+            comp_width = layout.conversation_width if layout.show_runtime else max(10, new_cols - 1)
             if ed is not None:
                 ed.width = comp_width
 

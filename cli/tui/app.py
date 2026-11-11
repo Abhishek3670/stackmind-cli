@@ -707,7 +707,7 @@ def tui(
                     nonlocal comp_width, layout_info
                     state.toggle_runtime_panel()
                     layout_info = compute_layout(term_cols, state=state)
-                    comp_width = layout_info.conversation_width if layout_info.show_runtime else term_cols
+                    comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, term_cols - 1)
                     if editor is not None:
                         editor.width = comp_width
                     if is_tty:
@@ -1256,6 +1256,11 @@ def tui(
                     model_name=model_label,
                     initial_activity_desc=f"{active_role} running",
                 )
+                try:
+                    from cli.tui.keyboard import drain_console_input
+                    drain_console_input()
+                except Exception:
+                    pass
                 if should_exit:
                     if live_ws is not None:
                         live_ws.stop()
@@ -1278,6 +1283,11 @@ def tui(
                     client_timeout=state.client_timeout,
                     live_manager=live_ws,
                 )
+                try:
+                    from cli.tui.keyboard import drain_console_input
+                    drain_console_input()
+                except Exception:
+                    pass
                 if should_exit:
                     if live_ws is not None:
                         live_ws.stop()

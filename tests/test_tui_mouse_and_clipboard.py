@@ -833,6 +833,62 @@ def test_copy_slash_command_formats_contract_payload_and_preserves_indentation()
         assert '{"status":' not in copied
 
 
+def test_mouse_escape_sequences_never_pollute_composer_text():
+    """Verify raw SGR mouse escape sequences (both VT \x1b and ConPTY ^[[< format) are filtered from editor buffer."""
+    from cli.tui.keyboard import RawLineEditor, Key
+
+    editor = RawLineEditor(width=80, initial_text="")
+
+    # Simulate raw ConPTY mouse press and drag sequences
+    editor.handle_key("^[[<0;101;34M")
+    editor.handle_key("^[[<32;178;38M")
+    editor.handle_key("^[[<0;101;34m")
+    assert editor.text == ""
+
+    # Simulate concatenated mouse sequences
+    editor.handle_key("^[[<0;101;34M^[[<0;101;34M")
+    assert editor.text == ""
+
+    # Simulate raw VT mouse escape sequences
+    editor.handle_key("\x1b[<0;101;34M")
+    editor.handle_key("[<0;101;34M")
+    assert editor.text == ""
+
+    # Normal typing after mouse events should work perfectly
+    for ch in ":resume":
+        editor.handle_key(ch)
+    assert editor.text == ":resume"
+
+    # Any interspersed mouse tracking events while typing must be discarded
+    editor.handle_key("^[[<32;100;30M")
+    editor.handle_key("\x1b[<32;100;30M")
+    assert editor.text == ":resume"
+
+
+def test_composer_clamped_width_never_touches_term_cols():
+    """Verify RawLineEditor clamps line_out width to term_cols - 1 so ConPTY never triggers margin auto-wrap."""
+    import io
+    import os
+    from unittest.mock import patch
+    from cli.tui.keyboard import RawLineEditor
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="test-clamp")
+    buf = io.StringIO()
+    with patch("shutil.get_terminal_size", return_value=os.terminal_size((80, 24))):
+        editor = RawLineEditor(width=80, height=24, initial_text=":resume", state=state, out=buf)
+        editor.redraw_line()
+        out = buf.getvalue()
+
+        # Visual line written must not exceed 79 columns
+        from rich.text import Text
+        for line in out.split("\r"):
+            if "│" in line:
+                plain_len = Text.from_ansi(line).cell_len
+                assert plain_len <= 79, f"Line cell_len {plain_len} exceeded margin 79"
+
+
+
 
 
 
