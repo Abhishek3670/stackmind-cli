@@ -772,10 +772,29 @@ class AutonomousDeliveryState:
 
         return self.retry_status_display or ""
 
+    def _finalize_last_thinking_segment(self) -> None:
+        """Finalize the elapsed duration of the currently active thinking segment if open."""
+        if not hasattr(self, "current_turn_segments") or not self.current_turn_segments:
+            self.current_turn_thinking_start_time = None
+            return
+        last_seg = self.current_turn_segments[-1]
+        if last_seg.get("kind") == "thinking" and "elapsed" not in last_seg:
+            import time
+            st = last_seg.get("start_time")
+            now = time.monotonic()
+            if st is not None:
+                last_seg["end_time"] = now
+                last_seg["elapsed"] = max(0.1, round(now - st, 1))
+            else:
+                toks = len(last_seg.get("content", "").split())
+                last_seg["elapsed"] = max(0.1, round(toks / 35.0, 1))
+        self.current_turn_thinking_start_time = None
+
     def record_turn_text(self, delta: str) -> None:
         """Record live text stream chunk in the chronological turn segments."""
         if not delta:
             return
+        self._finalize_last_thinking_segment()
         if not hasattr(self, "current_turn_segments"):
             self.current_turn_segments = []
         if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "text":
@@ -790,10 +809,12 @@ class AutonomousDeliveryState:
         if not hasattr(self, "current_turn_segments"):
             self.current_turn_segments = []
         import time
+        now = time.monotonic()
         if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "thinking":
             self.current_turn_segments[-1]["content"] += text
         else:
-            self.current_turn_segments.append({"kind": "thinking", "content": text, "start_time": time.monotonic()})
+            self.current_turn_thinking_start_time = now
+            self.current_turn_segments.append({"kind": "thinking", "content": text, "start_time": now})
 
     def record_turn_thinking(self, text: str) -> None:
         """Record live thinking chunk in the chronological turn segments."""
@@ -1077,11 +1098,12 @@ class AutonomousDeliveryState:
             self._last_command_str = None
             self.show_command_dialog(cmd_name, content)
         key = (role, clean)
+        self._finalize_last_thinking_segment()
 
         # Suppress duplicate messages (check immediate last message or recent assistant/system window)
         search_window = (
             reversed(self.messages[-8:])
-            if role in ("assistant", "system")
+            if (role in ("assistant", "system") and not is_command)
             else ([self.messages[-1]] if self.messages else [])
         )
         for prev_msg in search_window:
@@ -1118,7 +1140,17 @@ class AutonomousDeliveryState:
                 if msg_thinking_tokens is None:
                     msg_thinking_tokens = len(msg_thinking.split())
                 if msg_thinking_elapsed is None:
-                    msg_thinking_elapsed = getattr(self, "current_turn_thinking_elapsed", None)
+                    sum_elapsed = 0.0
+                    if hasattr(self, "current_turn_segments") and self.current_turn_segments:
+                        for s in self.current_turn_segments:
+                            if s.get("kind") == "thinking":
+                                s_el = s.get("elapsed")
+                                if s_el is not None and s_el > 0.0:
+                                    sum_elapsed += s_el
+                    if sum_elapsed > 0.0:
+                        msg_thinking_elapsed = round(sum_elapsed, 1)
+                    else:
+                        msg_thinking_elapsed = getattr(self, "current_turn_thinking_elapsed", None)
             self.current_turn_thinking = ""
             self.current_turn_thinking_start_time = None
             self.current_turn_thinking_elapsed = None
@@ -1309,6 +1341,7 @@ class AutonomousDeliveryState:
         parent_id: str | None = None,
     ) -> TurnAction:
         """Record or update a turn action in-place (§21)."""
+        self._finalize_last_thinking_segment()
         if not self.current_turn_actions.active:
             self.current_turn_actions.active = True
         self.current_turn_actions.verbosity = self.govern_verbosity

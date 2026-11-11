@@ -671,23 +671,49 @@ def get_help_str() -> str:
     )
 
 
-def _render_live_thinking_block(state: Any, think_text: str, layout_width: int) -> str | None:
+def _render_live_thinking_block(
+    state: Any,
+    think_text: str,
+    layout_width: int,
+    *,
+    seg: dict[str, Any] | None = None,
+    is_active: bool = False,
+) -> str | None:
     """Render live thinking block for active turn stream."""
     clean = think_text.strip()
     if not clean:
         return None
     from cli.tui.chat import render_thinking_block_str
-    live_elapsed = None
-    if getattr(state, "current_turn_thinking_start_time", None) is not None:
-        live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
-    elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
-        live_elapsed = state.current_turn_thinking_elapsed
+
+    tok_val = max(1, len(clean.split()))
+    live_elapsed: float | None = None
+
+    if seg is not None:
+        if seg.get("elapsed") is not None and seg.get("elapsed") > 0.0:
+            live_elapsed = seg["elapsed"]
+        elif seg.get("start_time") is not None:
+            if seg.get("end_time") is not None:
+                live_elapsed = max(0.1, round(seg["end_time"] - seg["start_time"], 1))
+            elif is_active:
+                live_elapsed = max(0.1, round(time.monotonic() - seg["start_time"], 1))
+            else:
+                live_elapsed = max(0.1, round(tok_val / 35.0, 1))
+        else:
+            live_elapsed = max(0.1, round(tok_val / 35.0, 1))
+    else:
+        if is_active and getattr(state, "current_turn_thinking_start_time", None) is not None:
+            live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
+        elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
+            live_elapsed = state.current_turn_thinking_elapsed
+        else:
+            live_elapsed = max(0.1, round(tok_val / 35.0, 1))
+
     return render_thinking_block_str(
         clean,
         expanded=getattr(state, "live_thinking_expanded", True),
-        in_progress=True,
+        in_progress=is_active,
         elapsed=live_elapsed,
-        tokens=len(clean.split()),
+        tokens=tok_val,
         width=layout_width,
     )
 
@@ -726,7 +752,15 @@ def _build_in_progress_turn_content(
             seg = segs[idx]
             kind = seg.get("kind")
             if kind == "thinking":
-                t_str = _render_live_thinking_block(state, seg.get("content", ""), layout_width)
+                is_last_seg = (idx == len(segs) - 1)
+                is_active = is_last_seg and getattr(state, "current_turn_thinking_start_time", None) is not None
+                t_str = _render_live_thinking_block(
+                    state,
+                    seg.get("content", ""),
+                    layout_width,
+                    seg=seg,
+                    is_active=is_active,
+                )
                 if t_str:
                     parts.append(t_str)
                 idx += 1
@@ -767,7 +801,13 @@ def _build_in_progress_turn_content(
             if act_str:
                 parts.append(act_str)
 
-        t_str = _render_live_thinking_block(state, getattr(state, "current_turn_thinking", "") or "", layout_width)
+        is_active = getattr(state, "current_turn_thinking_start_time", None) is not None
+        t_str = _render_live_thinking_block(
+            state,
+            getattr(state, "current_turn_thinking", "") or "",
+            layout_width,
+            is_active=is_active,
+        )
         if t_str:
             parts.append(t_str)
 
@@ -1284,6 +1324,8 @@ def _stream_turn_execution(
                     state.current_turn_thinking_elapsed = max(
                         0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1)
                     )
+                if hasattr(state, "_finalize_last_thinking_segment"):
+                    state._finalize_last_thinking_segment()
                 if not streaming_active:
                     streaming_active = True
                     if not model_name or str(model_name).lower() in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
@@ -1909,6 +1951,8 @@ def _stream_turn_execution(
         if state.current_turn_actions:
             state.current_turn_actions.complete_all()
         state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
+    if hasattr(state, "_finalize_last_thinking_segment"):
+        state._finalize_last_thinking_segment()
     state.current_turn_segments = []
     state.current_turn_thinking = ""
     state.current_turn_thinking_start_time = None
