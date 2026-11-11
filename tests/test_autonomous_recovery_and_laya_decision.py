@@ -239,3 +239,70 @@ def test_cleanup_orphaned_operations_clears_dead_escalation_and_recovery_operati
     assert state.dependency_escalation_wo_id is None
     assert state.recovery_decision_operation_id is None
     assert state.architect_repair_operation_id is None
+
+
+def test_review_gate_python_syntax_verifier_avoids_pycompile_errno13(tmp_path: Path):
+    """Test that Python syntax verification uses in-memory compilation without disk pyc permission issues."""
+    from validators.harness import review_gate
+
+    py_file = tmp_path / "src" / "backend.py"
+    py_file.parent.mkdir(parents=True, exist_ok=True)
+    py_file.write_text("import os\nprint('hello world')\n", encoding="utf-8")
+
+    wo_data = {
+        "id": "WO-003",
+        "deliverable": {"path": "src/backend.py"},
+    }
+
+    passed, msg, evidence = review_gate.run_stack_appropriate_verifier(tmp_path, "WO-003", wo_data)
+    assert passed is True
+    assert "Stack-appropriate verification passed" in msg
+    assert evidence[0]["passed"] is True
+    assert "python compile" in evidence[0]["command"]
+
+    # Invalid syntax must fail cleanly
+    py_file.write_text("def broken_syntax(:\n", encoding="utf-8")
+    passed, msg, evidence = review_gate.run_stack_appropriate_verifier(tmp_path, "WO-003", wo_data)
+    assert passed is False
+    assert "Python syntax compile failed" in msg
+
+
+def test_delegate_task_does_not_convert_backend_worker_to_qa_review(tmp_path: Path):
+    """Test that delegating to a backend/frontend worker never schedules a QA review even with 'verify' in text."""
+    from validators.kernel.tools import ToolGateway
+    from unittest.mock import MagicMock
+
+    ws_mock = MagicMock()
+    ws_mock.root = tmp_path
+    boundary_mock = MagicMock()
+    record_mock = MagicMock()
+    record_mock.authorized = True
+    record_mock.request.operation_id = "op-1"
+
+    # Setup active WO-003 and completed WO-001
+    act_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    act_dir.mkdir(parents=True, exist_ok=True)
+    (act_dir / "WO-003.yaml").write_text(
+        "id: WO-003\nstatus: ACTIVE\nassigned_agents: [codex]\ndeliverable: {path: src/backend.py}\n",
+        encoding="utf-8",
+    )
+
+    gateway = ToolGateway.__new__(ToolGateway)
+    gateway.workspace = ws_mock
+    gateway.boundary = boundary_mock
+    gateway.actor_id = "claude"
+    gateway._authorize = MagicMock(return_value=record_mock)
+
+    # Instructions contain 'verify', but target is backend worker -> must NOT be review_scheduled
+    res = gateway.delegate_task(
+        target_agent="backend",
+        instructions="Fix the security vulnerability and verify syntax for WO-003",
+        target_files=["src/backend.py"],
+    )
+
+    assert res["status"] == "delegated"
+    assert res["role"] == "backend"
+    assert res["agent"] == "codex"
+    assert res["work_order_id"] == "WO-003"
+    assert res.get("target_work_order") != "WO-001"
+
