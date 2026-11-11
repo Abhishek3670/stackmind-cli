@@ -287,3 +287,29 @@ def test_adhoc_mode_filters_out_colon_commands_from_history(tmp_path: Path):
     assert ":roles" not in received_user_texts
     assert "hello world" in received_user_texts
     assert "let's start" in received_user_texts
+
+
+def test_adhoc_mode_filters_out_system_errors_and_billing_notices_from_history(tmp_path: Path):
+    """Verify system errors, operation failures, and billing credit notices are never fed to the model."""
+    project = _init_dummy_project(tmp_path)
+    adapter = RecordingProviderAdapter("Understood.")
+    runner = AgentRunner(project, "claude")
+    runner.provider_adapter = adapter
+
+    history = [
+        {"role": "user", "content": "Hey"},
+        {"role": "assistant", "content": "✗ [Architecture] Operation failed: [402] Add usage credits or subscribe: https://ollama.com/plans"},
+        {"role": "user", "content": "hey"},
+    ]
+
+    result = runner.run_once(
+        prompt="what should we build?",
+        session_history=history,
+    )
+
+    assert result.status == "completed"
+    received_assistant_texts = [m.content for m in adapter.received_messages if m.role == "assistant"]
+    for msg_text in received_assistant_texts:
+        assert "Operation failed" not in msg_text
+        assert "402" not in msg_text
+        assert "Add usage credits" not in msg_text

@@ -3528,11 +3528,15 @@ def dispatch_delivery_command(
             for msg in state.messages:
                 if getattr(msg, "is_command", False) or getattr(msg, "_is_command_output", False):
                     continue
+                if getattr(msg, "is_error", False):
+                    continue
                 m_role = getattr(msg, "role", getattr(msg, "sender", None))
                 m_content = getattr(msg, "content", getattr(msg, "text", None))
                 if m_role in ("user", "assistant") and m_content and isinstance(m_content, str):
                     clean = m_content.strip()
                     if not clean or clean.startswith(":"):
+                        continue
+                    if clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in clean:
                         continue
                     c_hist.append({"role": m_role, "content": clean})
             if c_hist:

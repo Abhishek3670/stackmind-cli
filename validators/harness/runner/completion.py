@@ -518,6 +518,8 @@ class _CompletionMixin:
                     if role in ("user", "human"):
                         messages.append(Message.user(content))
                     elif role in ("assistant", "agent", "model"):
+                        if content.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in content:
+                            continue
                         messages.append(Message.assistant(content))
             messages.append(Message.user(user_content))
         from validators.kernel.providers.errors import (

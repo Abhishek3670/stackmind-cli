@@ -477,6 +477,7 @@ class ChatMessage:
     turn_id: str | None = None
     thinking_expanded: bool = False
     is_command: bool = False
+    is_error: bool = False
     thinking_elapsed: float | None = None
     thinking_tokens: int | None = None
     model: str | None = None
@@ -1058,6 +1059,7 @@ class AutonomousDeliveryState:
         thinking: str | None = None,
         turn_id: str | None = None,
         is_command: bool = False,
+        is_error: bool = False,
         thinking_elapsed: float | None = None,
         thinking_tokens: int | None = None,
         model: str | None = None,
@@ -1181,6 +1183,7 @@ class AutonomousDeliveryState:
             turn_id=turn_id,
             thinking_expanded=self.thinking_expanded,
             is_command=is_command,
+            is_error=is_error,
             thinking_elapsed=msg_thinking_elapsed,
             thinking_tokens=msg_thinking_tokens,
             model=model,
@@ -2452,7 +2455,7 @@ class AutonomousDeliveryState:
             formatted_fail = f"✗ [{role_label}] Operation failed: {err_msg}"
             last_msg = self.messages[-1].content if self.messages else ""
             if last_msg != formatted_fail:
-                self.add_message("assistant", formatted_fail)
+                self.add_message("assistant", formatted_fail, is_error=True)
 
         elif name in {"operation.blocked", "turn.blocked"}:
             self.active_working_status = None
@@ -2481,7 +2484,7 @@ class AutonomousDeliveryState:
                 formatted_block = f"⊘ [{role_label}] Blocked: {block_msg}"
                 last_msg = self.messages[-1].content if self.messages else ""
                 if last_msg != formatted_block:
-                    self.add_message("assistant", formatted_block)
+                    self.add_message("assistant", formatted_block, is_error=True)
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")
