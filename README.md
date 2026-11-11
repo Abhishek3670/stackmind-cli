@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.15.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.16.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -130,6 +130,10 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 - **Dynamic `PYTHONPATH` Workspace Root Injection**: Automatically injects project workspace root into `PYTHONPATH` for sandboxed test runner execution, ensuring local source packages resolve seamlessly.
 - **Snapshot State Verification Exemption for Governance Files**: Excludes `.sync/` and `.git/` directories from state snapshot hashing in `verification.py`, allowing governance files to be safely authored without false-positive verification errors.
 - **Turn 1 Planning Deliverable Auto-Synthesis**: Auto-synthesizes `PLAN.md` from the turn's planning output when the model omits explicit file write tool calls.
+- **Autonomous Uninterrupted Orchestration (Laya Decision Specialist)**: Integrated fallback recovery decision provider (`LayaDecisionAdapter`) in `validators/kernel/daemon/supervisor/laya_adapter.py`. Automatically synthesizes compliant recovery decisions when timeouts or deadlocks occur during architecture repair decisions, eliminating manual `:resume` interruptions and infinite recovery halts.
+- **In-Memory Python Syntax Verification**: Replaced external `py_compile` subprocess execution with in-memory `compile()` in `validators/harness/review_gate.py`, eliminating Windows file-locking `[Errno 13] Permission denied` errors when writing `.pyc` files into `__pycache__`.
+- **Active Work Order Ownership & Safe Delegation**: In `delegate_task` (`validators/kernel/tools.py`), prevented QA review hijacking for worker agents and added explicit work order binding (`work_order_id` / `WO-xxx`), ensuring delegations route directly to active fix work orders rather than completed predecessor tasks.
+- **TUI Cursor Drift Elimination & History Sanitization**: Anchored cursor row coordinates inside composer bounds, drained trailing mouse escape sequences, and sanitized raw LLM transport errors and billing alerts from chat history.
 
 ## Docs
 
@@ -141,6 +145,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.15.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.16.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

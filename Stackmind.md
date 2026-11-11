@@ -71,4 +71,4 @@
 ## Project metrics (as of today, 2026-11-10)
 - **Commits**: 414 (first: 2026-09-07, last: 2026-11-10)
 - **Contributors**: Abhishek Sharma (434 commits); 2 `stackmind-init` entries
-- **Tags/versions**: `3.15.0` (package), `3.1.0` (runtime protocol, `.sync/RUNTIME_VERSION`)
+- **Tags/versions**: `3.16.0` (package), `3.1.0` (runtime protocol, `.sync/RUNTIME_VERSION`)

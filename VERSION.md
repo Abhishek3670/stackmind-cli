@@ -1,6 +1,6 @@
 # Version
 
-**StackMind Platform Version:** `3.15.0`
+**StackMind Platform Version:** `3.16.0`
 **Release Stage:** General Availability (GA)
 **Target Python Version:** `>=3.10`
 **Architecture:** Agent Runtime Kernel

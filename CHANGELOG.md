@@ -5,6 +5,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.16.0] - 2026-11-12
+
+### Added
+- **Autonomous Uninterrupted Orchestration with Laya Decision Specialist**:
+  - Implemented `LayaDecisionAdapter` in `validators/kernel/daemon/supervisor/laya_adapter.py` providing deterministic, schema-compliant fallback recovery decisions when architecture repair turns fail, time out, or stall.
+  - Added autonomous recovery decision fallback into `_load_recovery_decision` and `_advance_recovery_decision` in `recovery.py` and `phases.py`, eliminating manual `:resume` interruptions and avoiding `MAX_RECOVERY_ATTEMPTS_EXHAUSTED` loops.
+  - Added turn timeout rescue for `Phase.ARCHITECT_RECOVERY_DECISION` in `validators/kernel/daemon/supervisor/core.py`, preventing runner timeouts from forcing the session into `WAITING_FOR_HUMAN` or `BLOCKED`.
+  - Added comprehensive test coverage in `tests/test_autonomous_recovery_and_laya_decision.py` verifying synthetic decision generation, schema compliance, and timeout recovery.
+
+### Fixed
+- **In-Memory Python Syntax Verification in Review Gate**:
+  - In `validators/harness/review_gate.py` (`run_stack_appropriate_verifier`), replaced external `subprocess.run([sys.executable, "-m", "py_compile", ...])` with in-memory Python syntax compilation using `compile(content, str(target), "exec")`.
+  - Resolves Windows filesystem locking issues (`[Errno 13] Permission denied`) caused by concurrent processes writing into `.pyc` caches in `__pycache__` directories.
+- **Delegation Routing & QA Review Hijacking Prevention**:
+  - In `validators/kernel/tools.py` (`delegate_task`), constrained `is_review` to only match when `canonical_role == "qa"` or `canonical_agent in ("gemma", "qa")`. Prevents worker instructions that mention words like "verify" from inadvertently hijacking active worker delegations into predecessor QA review operations.
+  - Added explicit `work_order_id` argument and `\b(WO-\d{3})\b` regex parsing to `delegate_task` to ensure worker re-dispatch binds directly to existing active repair work orders (e.g. `WO-003`).
+  - In `_find_existing_deliverable_owner`, prioritized active work orders over completed predecessor tasks even when work orders are momentarily transitioning.
+- **Supervisor Operation Cleanup & Re-blocking Prevention**:
+  - Cleaned up stale `dependency_escalation_op_id` in `_reset_phase_operation_id()` and `_cleanup_orphaned_operations()` in `manager.py`, preventing cancelled turns from immediately re-blocking the supervisor loop in 25ms.
+  - Routed failed dependency escalations to `Phase.ARCHITECT_RECOVERY_DECISION` rather than immediately transitioning to `Phase.BLOCKED`.
+- **TUI Cursor Drift Elimination & Composer Margins**:
+  - In `cli/tui/app.py` and `cli/tui/terminal.py`, clamped composer cursor row and column coordinates strictly within layout bounds, eliminating cursor drift during typing, command execution, and viewport shifts.
+  - Drained trailing mouse escape sequences from input buffers to prevent escape sequences from leaking into composer text.
+  - Hoisted mouse reporting imports in `cli/tui/terminal.py`, fixing `UnboundLocalError` on `:exit`.
+  - Excluded internal work-order and QA reports from conversational transcript recovery in `cli/tui/app.py`.
+- **LLM Chat History Error Sanitization**:
+  - Sanitized raw transport errors (e.g. Ollama 402 billing notices) and internal system notices from agent chat histories in `validators/harness/` and `cli/tui/app.py`, preventing transient server messages from polluting LLM context windows.
+
+### Refactored
+- **Ponytail Compiler AST Helper Deduplication**:
+  - Added canonical `safe_unparse()` and `location()` implementations to `validators/knowledge/compiler/parse.py`.
+  - Deduplicated repeated AST unparsing and node location helper routines across Alembic, Celery, Django, FastAPI, Pydantic, and SQLAlchemy compilers, cutting boilerplate and ensuring uniform error handling.
+- **Contract SHA-256 Hash Deduplication**:
+  - In `validators/harness/contract_gate.py`, replaced internal `_contract_file_sha256` implementation by directly importing and reusing `validators/harness/contract_hash.py`.
+
 ## [3.15.0] - 2026-11-11
 
 ### Added
