@@ -69,8 +69,14 @@ class ContractNormalizer:
         work_order = raw.get("work_order") or raw.get("workOrder") or raw.get("wo")
         allow_rules_list = list(rules(scope.get("allow", scope.get("allowed"))))
         deny = rules(scope.get("deny", scope.get("denied")))
-        raw_write = scope.get("write", raw.get("write_mode", "read-only"))
-        if isinstance(raw_write, list):
+        raw_write = scope.get("write", raw.get("write_mode"))
+        if raw_write is None:
+            has_authorable_files = any(
+                not r.startswith((".sync/", ".git/")) and not r.endswith((".log",))
+                for r in allow_rules_list
+            )
+            write_mode = "read-write" if has_authorable_files else "read-only"
+        elif isinstance(raw_write, list):
             write_mode = "read-write" if len(raw_write) > 0 else "read-only"
             for w in raw_write:
                 w_str = (w.get("module") or w.get("target")) if isinstance(w, Mapping) else w

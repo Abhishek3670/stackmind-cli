@@ -64,10 +64,13 @@ from cli.tui.state import (
     OperationNode,
     ProjectPhase,
 )
+from cli.tui.keyboard import (
+    disable_mouse_reporting,
+    enable_mouse_reporting,
+)
 from cli.tui.terminal import (
     _wrap_text_to_width,
     check_terminal_resize,
-    disable_mouse_reporting,
     install_resize_handler,
     redraw_full_screen as _terminal_redraw_full_screen,
     render_top_header_bar_str,
@@ -652,6 +655,7 @@ def get_help_str() -> str:
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
         "  :landing          Display branded landing block\n"
         "  :copy [goal|all]  Copy latest assistant response, suggested goal, or transcript to clipboard\n"
+        "  :mouse [cmd]      Enable, disable, or toggle terminal mouse tracking (on|off|toggle)\n"
         "  :help             Show this help menu\n"
         "  :exit             Gracefully stop daemon and exit\n"
         "  <prompt text>     Submit a governed turn to the agent\n\n"
@@ -660,27 +664,56 @@ def get_help_str() -> str:
         "  Tab / Ctrl+G      Auto-fill Architect's suggested goal into input box\n"
         "  Ctrl+O            Toggle thinking block expansion\n"
         "  Ctrl+C            Cancel active turn or abort\n"
-        "  Ctrl+V            Paste clipboard content into input composer"
+        "  Ctrl+V            Paste clipboard content into input composer\n"
+        "  Mouse Wheel       Scroll conversation or runtime work orders\n"
+        "  Mouse Drag        Drag conversation scrollbar thumb\n"
+        "  Right Click       Paste clipboard content into input composer"
     )
 
 
-def _render_live_thinking_block(state: Any, think_text: str, layout_width: int) -> str | None:
+def _render_live_thinking_block(
+    state: Any,
+    think_text: str,
+    layout_width: int,
+    *,
+    seg: dict[str, Any] | None = None,
+    is_active: bool = False,
+) -> str | None:
     """Render live thinking block for active turn stream."""
     clean = think_text.strip()
     if not clean:
         return None
     from cli.tui.chat import render_thinking_block_str
-    live_elapsed = None
-    if getattr(state, "current_turn_thinking_start_time", None) is not None:
-        live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
-    elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
-        live_elapsed = state.current_turn_thinking_elapsed
+
+    tok_val = max(1, len(clean.split()))
+    live_elapsed: float | None = None
+
+    if seg is not None:
+        if seg.get("elapsed") is not None and seg.get("elapsed") > 0.0:
+            live_elapsed = seg["elapsed"]
+        elif seg.get("start_time") is not None:
+            if seg.get("end_time") is not None:
+                live_elapsed = max(0.1, round(seg["end_time"] - seg["start_time"], 1))
+            elif is_active:
+                live_elapsed = max(0.1, round(time.monotonic() - seg["start_time"], 1))
+            else:
+                live_elapsed = max(0.1, round(tok_val / 35.0, 1))
+        else:
+            live_elapsed = max(0.1, round(tok_val / 35.0, 1))
+    else:
+        if is_active and getattr(state, "current_turn_thinking_start_time", None) is not None:
+            live_elapsed = max(0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1))
+        elif getattr(state, "current_turn_thinking_elapsed", None) is not None:
+            live_elapsed = state.current_turn_thinking_elapsed
+        else:
+            live_elapsed = max(0.1, round(tok_val / 35.0, 1))
+
     return render_thinking_block_str(
         clean,
         expanded=getattr(state, "live_thinking_expanded", True),
-        in_progress=True,
+        in_progress=is_active,
         elapsed=live_elapsed,
-        tokens=len(clean.split()),
+        tokens=tok_val,
         width=layout_width,
     )
 
@@ -719,7 +752,15 @@ def _build_in_progress_turn_content(
             seg = segs[idx]
             kind = seg.get("kind")
             if kind == "thinking":
-                t_str = _render_live_thinking_block(state, seg.get("content", ""), layout_width)
+                is_last_seg = (idx == len(segs) - 1)
+                is_active = is_last_seg and getattr(state, "current_turn_thinking_start_time", None) is not None
+                t_str = _render_live_thinking_block(
+                    state,
+                    seg.get("content", ""),
+                    layout_width,
+                    seg=seg,
+                    is_active=is_active,
+                )
                 if t_str:
                     parts.append(t_str)
                 idx += 1
@@ -760,7 +801,13 @@ def _build_in_progress_turn_content(
             if act_str:
                 parts.append(act_str)
 
-        t_str = _render_live_thinking_block(state, getattr(state, "current_turn_thinking", "") or "", layout_width)
+        is_active = getattr(state, "current_turn_thinking_start_time", None) is not None
+        t_str = _render_live_thinking_block(
+            state,
+            getattr(state, "current_turn_thinking", "") or "",
+            layout_width,
+            is_active=is_active,
+        )
         if t_str:
             parts.append(t_str)
 
@@ -1277,6 +1324,8 @@ def _stream_turn_execution(
                     state.current_turn_thinking_elapsed = max(
                         0.1, round(time.monotonic() - state.current_turn_thinking_start_time, 1)
                     )
+                if hasattr(state, "_finalize_last_thinking_segment"):
+                    state._finalize_last_thinking_segment()
                 if not streaming_active:
                     streaming_active = True
                     if not model_name or str(model_name).lower() in ("stackmind-echo-v1", "echo-agent", "echo", "default"):
@@ -1902,6 +1951,8 @@ def _stream_turn_execution(
         if state.current_turn_actions:
             state.current_turn_actions.complete_all()
         state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
+    if hasattr(state, "_finalize_last_thinking_segment"):
+        state._finalize_last_thinking_segment()
     state.current_turn_segments = []
     state.current_turn_thinking = ""
     state.current_turn_thinking_start_time = None
@@ -2025,9 +2076,18 @@ def dispatch_delivery_command(
             desc = "latest response"
 
         if text_to_copy:
+            from cli.tui.chat import format_contract_payload, strip_internal_reasoning
+            clean_text = strip_internal_reasoning(text_to_copy)
+            if clean_text:
+                clean_text = format_contract_payload(clean_text)
+            if clean_text:
+                text_to_copy = clean_text
+
             ok = set_clipboard_text(text_to_copy)
             msg_str = (
-                f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard."
+                f"[CLIPBOARD] Copied {len(text_to_copy):,} characters ({desc}) to system clipboard.\n"
+                "  • Pristine formatting: 100% raw markdown indentation, bullets, and line spacing preserved.\n"
+                "  • Tip: Mouse-drag across conversation text to copy visible lines directly."
                 if ok
                 else "[ERROR] Failed to write to system clipboard."
             )
@@ -2044,7 +2104,7 @@ def dispatch_delivery_command(
             click.echo(msg_str)
         return session, False
 
-    if normalized in (":panel", ":sidebar", ":side", ":toggle panel", ":panel toggle"):
+    if normalized in (":panel", ":sidebar", ":side", ":collapse", ":toggle panel", ":panel toggle"):
         is_now_visible = state.toggle_runtime_panel() if hasattr(state, "toggle_runtime_panel") else True
         status_text = (
             "[SIDEBAR] Runtime panel restored (2-column split layout)."
@@ -2055,6 +2115,25 @@ def dispatch_delivery_command(
         state.add_message("system", status_text)
         if not is_tty:
             click.echo(status_text)
+        return session, False
+
+    if normalized == ":scrollbar" or normalized.startswith(":scrollbar "):
+        clean_arg = normalized.partition(" ")[2].strip().lower()
+        if clean_arg in {"on", "enable", "true", "1"}:
+            state.show_collapsed_scrollbar = True
+        elif clean_arg in {"off", "disable", "false", "0"}:
+            state.show_collapsed_scrollbar = False
+        elif hasattr(state, "toggle_collapsed_scrollbar"):
+            state.toggle_collapsed_scrollbar()
+        msg_str = (
+            "✓ Right-edge scrollbar enabled when panel is collapsed."
+            if getattr(state, "show_collapsed_scrollbar", False)
+            else "✓ Right-edge scrollbar disabled (clean edge-to-edge text copying without trailing │ lines)."
+        )
+        state.add_message("user", normalized)
+        state.add_message("system", msg_str)
+        if not is_tty:
+            click.echo(msg_str)
         return session, False
 
     # Auto-approve pending plan if operator intuitively enters 'continue', 'proceed', or ':adopt'
@@ -2284,7 +2363,6 @@ def dispatch_delivery_command(
         or normalized in {":role"}
     ):
         from cli.tui.settings_panel import (
-            render_roles_panel,
             run_interactive_roles_panel,
         )
         from validators.kernel.settings import load_settings
@@ -2467,8 +2545,6 @@ def dispatch_delivery_command(
 
                     output_str = render_settings_overview_str(settings_obj, width=term_cols)
                 elif scmd in ("roles", "role"):
-                    from cli.tui.settings_panel import render_roles_panel
-
                     output_str = render_roles_panel(state, detailed=True)
                 else:
                     output_str = render_stackmind_settings_str(settings_obj, width=term_cols)
@@ -3262,6 +3338,49 @@ def dispatch_delivery_command(
             click.echo(output_str)
         return session, False
 
+    if normalized == ":mouse" or normalized.startswith(":mouse "):
+        _, _, mouse_arg = normalized.partition(" ")
+        clean_mouse = mouse_arg.strip().lower()
+        if clean_mouse in {"on", "enable", "true", "1"}:
+            state.mouse_reporting_enabled = True
+            enable_mouse_reporting(sys.stdout)
+            output_str = (
+                "✓ Mouse reporting enabled (wheel scroll, drag-to-copy & click active).\n"
+                "  • Direct drag-to-copy: Drag across conversation text to copy cleanly (side panel is excluded).\n"
+                "  • Collapse side panel: Click [–] on header, click divider │, or press Ctrl+B / :collapse."
+            )
+        elif clean_mouse in {"off", "disable", "false", "0"}:
+            state.mouse_reporting_enabled = False
+            disable_mouse_reporting(sys.stdout)
+            output_str = (
+                "✓ Mouse reporting disabled (native terminal drag-to-copy text selection active).\n"
+                "  • Tip: Press Ctrl+B or click [–] to collapse the side panel for full-width native selection."
+            )
+        elif clean_mouse in {"toggle", ""}:
+            new_val = not getattr(state, "mouse_reporting_enabled", True)
+            state.mouse_reporting_enabled = new_val
+            if new_val:
+                enable_mouse_reporting(sys.stdout)
+                output_str = (
+                    "✓ Mouse reporting toggled ON (wheel scroll, drag-to-copy & click active).\n"
+                    "  • Direct drag-to-copy: Drag across conversation text to copy cleanly (side panel is excluded)."
+                )
+            else:
+                disable_mouse_reporting(sys.stdout)
+                output_str = (
+                    "✓ Mouse reporting toggled OFF (native terminal drag-to-copy text selection active).\n"
+                    "  • Tip: Press Ctrl+B or click [–] to collapse the side panel for full-width native selection."
+                )
+        else:
+            curr = "ON" if getattr(state, "mouse_reporting_enabled", True) else "OFF"
+            tip = "Hold Shift while dragging to select text natively." if curr == "ON" else "Run :mouse on for wheel scrolling."
+            output_str = f"Current mouse reporting: {curr} ({tip})\nUsage: :mouse [on|off|toggle]"
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
     if normalized == ":govern" or normalized.startswith(":govern "):
         _, _, mode = normalized.partition(" ")
         clean_mode = mode.strip().lower()
@@ -3453,11 +3572,15 @@ def dispatch_delivery_command(
             for msg in state.messages:
                 if getattr(msg, "is_command", False) or getattr(msg, "_is_command_output", False):
                     continue
+                if getattr(msg, "is_error", False):
+                    continue
                 m_role = getattr(msg, "role", getattr(msg, "sender", None))
                 m_content = getattr(msg, "content", getattr(msg, "text", None))
                 if m_role in ("user", "assistant") and m_content and isinstance(m_content, str):
                     clean = m_content.strip()
                     if not clean or clean.startswith(":"):
+                        continue
+                    if clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in clean:
                         continue
                     c_hist.append({"role": m_role, "content": clean})
             if c_hist:

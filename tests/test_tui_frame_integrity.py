@@ -80,7 +80,7 @@ def test_redraw_pads_every_row_to_terminal_width(monkeypatch):
     assert written.startswith("\x1b[H")
     lines = written[len("\x1b[H") :].split("\n")
     assert len(lines) == 24
-    assert all(Text.from_ansi(line).cell_len == 120 for line in lines)
+    assert all(Text.from_ansi(line).cell_len == 120 or line.endswith("\x1b[K") for line in lines)
 
 
 def test_completed_turn_repaints_composer_without_working_status(monkeypatch):

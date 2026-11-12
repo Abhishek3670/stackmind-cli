@@ -13,6 +13,7 @@ Layout spec (IMPLEMENTATION_PLAN_TUI.md §6, §12):
 from __future__ import annotations
 
 import io
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -500,7 +501,13 @@ def render_runtime_badge_bar(
     res.append(op_str, style="dim white")
 
     plain_len = len(res.plain)
-    if plain_len < width:
+    expand_tag = "[+ Expand]"
+    if plain_len + len(expand_tag) + 2 <= width:
+        padding = width - plain_len - len(expand_tag) - 1
+        res.append(" " * padding)
+        res.append(expand_tag, style="bold dim cyan")
+        res.append(" ")
+    elif plain_len < width:
         res.append(" " * (width - plain_len))
     return res
 
@@ -617,12 +624,19 @@ def render_conversation_column(
 
 # ── Viewport Slicing & Scroll Offset ──────────────────────────────────────────
 
+def _strip_trailing_spaces(line: str) -> str:
+    """Remove trailing space characters while preserving trailing ANSI formatting sequences."""
+    cleaned = line.rstrip(" ")
+    return re.sub(r" +((?:\x1b\[[0-9;]*[a-zA-Z])+)\Z", r"\1", cleaned)
+
+
 def slice_conversation_viewport(
     content: str,
     viewport_height: int,
     scroll: ConversationScroll | int | None = None,
     pad: bool = True,
     avail_width: int | None = None,
+    state: Any | None = None,
 ) -> str:
     """Slice conversation text to fit the viewport height based on scroll offset (§31).
 
@@ -637,27 +651,28 @@ def slice_conversation_viewport(
         c, _ = _make_capture_console(width=avail_width)
         visual_lines: list[str] = []
         for raw_line in content.split("\n"):
-            if not raw_line:
+            stripped_line = _strip_trailing_spaces(raw_line)
+            if not stripped_line:
                 visual_lines.append("")
                 continue
-            t = Text.from_ansi(raw_line) if "\x1b[" in raw_line else Text(raw_line)
+            t = Text.from_ansi(stripped_line) if "\x1b[" in stripped_line else Text(stripped_line)
             if t.cell_len <= avail_width:
-                visual_lines.append(raw_line)
+                visual_lines.append(stripped_line)
             else:
                 parts = t.wrap(c, avail_width)
                 if not parts:
                     visual_lines.append("")
                 else:
                     for part in parts:
-                        if "\x1b[" in raw_line:
+                        if "\x1b[" in stripped_line:
                             cap, _ = _make_capture_console(width=avail_width, force_color=True)
                             cap.print(part, end="")
-                            visual_lines.append(cap.export_text(styles=True))
+                            visual_lines.append(_strip_trailing_spaces(cap.export_text(styles=True)))
                         else:
-                            visual_lines.append(part.plain)
+                            visual_lines.append(part.plain.rstrip(" "))
         lines = visual_lines
     else:
-        lines = content.split("\n")
+        lines = [_strip_trailing_spaces(l) for l in content.split("\n")]
 
     total_lines = len(lines)
 
@@ -688,6 +703,14 @@ def slice_conversation_viewport(
     if total_lines <= viewport_height:
         if pad:
             lines = lines + [""] * (viewport_height - total_lines)
+        if state is not None:
+            try:
+                state.visible_conversation_lines = [
+                    (Text.from_ansi(l).plain if "\x1b[" in l else l).rstrip(" ")
+                    for l in lines
+                ]
+            except Exception:
+                pass
         return "\n".join(lines)
 
     # Content exceeds viewport height
@@ -700,6 +723,15 @@ def slice_conversation_viewport(
         end_idx = total_lines - effective_offset
         start_idx = max(0, end_idx - viewport_height)
         visible = lines[start_idx:end_idx]
+
+    if state is not None:
+        try:
+            state.visible_conversation_lines = [
+                (Text.from_ansi(l).plain if "\x1b[" in l else l).rstrip(" ")
+                for l in visible
+            ]
+        except Exception:
+            pass
 
     return "\n".join(visible)
 
@@ -733,11 +765,16 @@ def render_workspace_layout(
         active_scroll = getattr(state, "conversation_scroll")
 
     conv_w = layout.conversation_width if layout.show_runtime else width
+    show_sb = (
+        not layout.show_runtime
+        and state is not None
+        and getattr(state, "show_collapsed_scrollbar", False)
+    )
     conv_column = render_conversation_column(
         conversation_renderable,
         scroll=active_scroll,
         state=state,
-        show_scrollbar=(not layout.show_runtime),
+        show_scrollbar=show_sb,
         viewport_height=height,
         width=conv_w,
     )
@@ -844,6 +881,7 @@ def render_workspace_layout_str(
                 scroll=active_scroll,
                 pad=True,
                 avail_width=conv_w,
+                state=state,
             )
             conversation_text = f"{conversation_text}\n{dialog_str}"
         else:
@@ -853,6 +891,7 @@ def render_workspace_layout_str(
                 scroll=active_scroll,
                 pad=True,
                 avail_width=conv_w,
+                state=state,
             )
 
     console, use_ansi = _make_capture_console(

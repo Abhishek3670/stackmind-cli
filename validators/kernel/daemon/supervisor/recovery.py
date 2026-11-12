@@ -392,11 +392,34 @@ class _RecoveryMixin:
             )
 
             decision, decision_error = self._load_recovery_decision(
-                ws, str(wo_id), result if isinstance(result, dict) else {}
+                ws, str(wo_id), result if isinstance(result, dict) else {}, state=state
             )
 
-            if op_failed:
-                decision, decision_error = None, f"recovery decision turn failed ({status})"
+            if op_failed and decision is None:
+                # Decision Specialist (Laya) autonomous fallback
+                try:
+                    from validators.routing.laya_adapter import LayaDecisionAdapter
+                    laya = LayaDecisionAdapter()
+                    evidence = state.worker_blockers.get(str(wo_id), {})
+                    f_code = evidence.get("failure_code") or getattr(state, "error", "")
+                    err_msg = str(evidence.get("canonical_message") or evidence.get("raw_reason") or state.error or f"turn failed ({status})")
+                    decision = laya.decide_recovery_action(
+                        wo_id=str(wo_id),
+                        error_message=err_msg,
+                        failure_code=f_code,
+                        evidence=evidence,
+                    )
+                    decision_error = None
+                    logger.info(
+                        "Decision Specialist (Laya) formulated autonomous recovery decision for %s: %s",
+                        wo_id,
+                        decision.get("action"),
+                    )
+                except Exception as laya_exc:
+                    logger.warning("Laya decision specialist fallback failed: %s", laya_exc)
+                    decision, decision_error = None, f"recovery decision turn failed ({status})"
+            elif op_failed and decision is not None:
+                decision_error = None
 
             if decision_error is None:
                 advance, apply_error = self._apply_recovery_decision(
@@ -418,6 +441,26 @@ class _RecoveryMixin:
                 ),
             )
             if attempts >= state.max_retries or re_dispatch_decision.outcome is RetryOutcome.BUDGET_EXHAUSTED:
+                # Before halting in BLOCKED, try Decision Specialist (Laya) for autonomous resolution
+                try:
+                    from validators.routing.laya_adapter import LayaDecisionAdapter
+                    laya = LayaDecisionAdapter()
+                    evidence = state.worker_blockers.get(str(wo_id), {})
+                    f_code = evidence.get("failure_code") or getattr(state, "error", "")
+                    err_msg = str(evidence.get("canonical_message") or evidence.get("raw_reason") or state.error or "")
+                    final_decision = laya.decide_recovery_action(
+                        wo_id=str(wo_id),
+                        error_message=err_msg,
+                        failure_code=f_code,
+                        evidence=evidence,
+                    )
+                    advance, apply_error = self._apply_recovery_decision(state, ws, str(wo_id), final_decision)
+                    if apply_error is None:
+                        logger.info("Decision Specialist (Laya) applied fallback decision for %s: %s", wo_id, final_decision.get("action"))
+                        return advance if advance is not None else AdvanceResult.WAITING_FOR_OPERATION
+                except Exception as laya_exc:
+                    logger.warning("Final Laya recovery decision fallback failed: %s", laya_exc)
+
                 state.error = (
                     f"Architect recovery decision for {wo_id} could not be obtained "
                     f"({decision_error}); recovery attempts exhausted with evidence retained"
@@ -1119,9 +1162,9 @@ class _RecoveryMixin:
         )
 
     def _load_recovery_decision(
-        self, ws: Path, wo_id: str, result: dict[str, Any],
+        self, ws: Path, wo_id: str, result: dict[str, Any], state: RunState | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        """Load and schema-validate the recovery decision (file first, summary fallback)."""
+        """Load and schema-validate the recovery decision (file first, summary fallback, Laya fallback)."""
         import json as _json
 
         from jsonschema import Draft7Validator
@@ -1132,6 +1175,11 @@ class _RecoveryMixin:
         validator = Draft7Validator(schema) if schema else None
 
         def _validate(decision: dict[str, Any]) -> str | None:
+            # Sanitize null fields that LLMs commonly emit when no replacements/revisions apply
+            if decision.get("replacement_work_orders") is None:
+                decision.pop("replacement_work_orders", None)
+            if decision.get("contract_revision") is None:
+                decision.pop("contract_revision", None)
             if validator is not None:
                 errors = sorted(validator.iter_errors(decision), key=lambda e: str(e.path))
                 if errors:
@@ -1182,6 +1230,35 @@ class _RecoveryMixin:
                 if err is None:
                     return parsed, None
                 return None, f"recovery decision from summary rejected: {err}"
+
+        # Autonomous Decision Specialist (Laya) Fallback:
+        # If neither the decision file nor valid summary JSON was produced, invoke the
+        # decision specialist to formulate a valid recovery decision instead of hard-blocking.
+        if state is not None:
+            try:
+                from validators.routing.laya_adapter import LayaDecisionAdapter
+                laya = LayaDecisionAdapter()
+                evidence = state.worker_blockers.get(wo_id, {})
+                f_code = evidence.get("failure_code") or getattr(state, "error", "")
+                err_msg = str(evidence.get("canonical_message") or evidence.get("raw_reason") or state.error or "")
+                decision = laya.decide_recovery_action(
+                    wo_id=wo_id,
+                    error_message=err_msg,
+                    failure_code=f_code,
+                    evidence=evidence,
+                )
+                err = _validate(decision)
+                if err is None:
+                    logger.info(
+                        "Decision Specialist (Laya) synthesized autonomous recovery decision for %s: %s (%s)",
+                        wo_id,
+                        decision.get("action"),
+                        decision.get("reason"),
+                    )
+                    return decision, None
+            except Exception as laya_exc:
+                logger.debug("Laya decision fallback failed: %s", laya_exc)
+
         return None, f"no recovery decision found for {wo_id} (expected {decision_file.name} or decision JSON in the turn summary)"
 
     def _apply_recovery_decision(
@@ -1706,8 +1783,10 @@ class _RecoveryMixin:
                 data.pop("synthesized_by", None)
             data["normalized_by"] = "recovery-redispatch"
 
-        # 3. Ensure work order deliverables and expected files are in scope.allow
+        # 3. Ensure work order deliverables and expected files are in scope.allow and write is read-write
         scope = data.setdefault("scope", {})
+        if "write" not in scope and "write_mode" not in data:
+            scope["write"] = "read-write"
         allow_list = scope.setdefault("allow", [])
         existing_modules = {r.get("module") for r in allow_list if isinstance(r, dict)}
 

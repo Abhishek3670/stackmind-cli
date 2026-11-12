@@ -1479,16 +1479,60 @@ def test_agent_action_renders_role_badge_never_bare_agent():
 
     # 1. Action with explicit role
     act1 = TurnAction("h1", "Agent", status="RUNNING", tool_name="harness.run_once", role="Backend")
+    act1.sub_actions = [TurnAction("s1", "Read", status="COMPLETED", tool_name="read_file", target="file.py")]
     group1 = ActionsGroup(actions=[act1])
     out1 = render_actions_group_str(group1, width=80)
     assert "● Agent(Backend)" in out1 or "● Agent (Backend)" in out1
 
     # 2. Action without explicit role falls back to Worker
     act2 = TurnAction("h2", "Agent", status="RUNNING", tool_name="harness.run_once")
+    act2.sub_actions = [TurnAction("s2", "Read", status="COMPLETED", tool_name="read_file", target="file.py")]
     group2 = ActionsGroup(actions=[act2])
     out2 = render_actions_group_str(group2, width=80)
     assert "● Agent(Worker)" in out2 or "● Agent (Worker)" in out2
     assert "● Agent (ctrl+o to expand)" not in out2
+
+
+def test_raw_line_editor_with_state_anchors_cursor_absolutely_and_never_emits_newline_on_enter():
+    """Verify RawLineEditor with state uses absolute cursor row anchoring and raw_prompt_input never emits newline on Enter in full screen."""
+    import io
+    from cli.tui.keyboard import RawLineEditor, raw_prompt_input, Key
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState()
+    buf = io.StringIO()
+    editor = RawLineEditor(width=80, height=24, initial_text="test", state=state, out=buf)
+    editor.redraw_line()
+    out = buf.getvalue()
+
+    # Must anchor to absolute line c_row=22, column 1 first, then cursor at col 9
+    assert "\x1b[22;1H" in out
+    assert "\x1b[22;9H" in out
+
+    # Test bottom border alert anchoring directly to c_row + 1 (23) and back to (22, 9)
+    buf.seek(0)
+    buf.truncate(0)
+    editor.bottom_border_renderer = lambda alert, atts=None: f"╰─ [{alert}] ─╯"
+    editor.alert = "press ctrl + C again"
+    editor._update_bottom_border(buf, 9, force=True)
+    b_out = buf.getvalue()
+    assert "\x1b[23;1H" in b_out
+    assert "╰─ [press ctrl + C again] ─╯" in b_out
+    assert "\x1b[22;9H" in b_out
+
+    # Test raw_prompt_input with state does NOT emit \n on Enter
+    key_stream = iter([Key.ENTER])
+    captured_stdout = io.StringIO()
+    import sys
+    orig_stdout = sys.stdout
+    sys.stdout = captured_stdout
+    try:
+        res = raw_prompt_input(width=80, height=24, state=state, key_stream=key_stream, initial_text="hello")
+    finally:
+        sys.stdout = orig_stdout
+    assert res == "hello"
+    assert "\n" not in captured_stdout.getvalue()
+
 
 
 

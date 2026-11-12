@@ -626,7 +626,10 @@ def render_runtime_panel(
     items: list[RenderableType] = []
 
     # 1. Heading
-    items.append(Text(RUNTIME_HEADING, style="bold dim white", justify="center"))
+    hdr_text = Text(justify="center")
+    hdr_text.append(RUNTIME_HEADING, style="bold dim white")
+    hdr_text.append("  [–]", style="bold dim cyan")
+    items.append(hdr_text)
     items.append(Text(""))
 
     # 2. Section: AGENTS

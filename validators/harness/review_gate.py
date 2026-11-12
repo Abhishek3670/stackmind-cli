@@ -398,28 +398,16 @@ def run_stack_appropriate_verifier(
                 })
         elif suffix == ".py":
             try:
-                res = subprocess.run(
-                    [sys.executable, "-m", "py_compile", str(target)],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if res.returncode == 0:
-                    evidence.append({
-                        "kind": "syntax_check",
-                        "command": f"python -m py_compile {rel_path}",
-                        "passed": True,
-                        "result": "Python py_compile check passed cleanly",
-                    })
-                else:
-                    err = (res.stderr or res.stdout or "").strip()
-                    evidence.append({
-                        "kind": "syntax_check",
-                        "command": f"python -m py_compile {rel_path}",
-                        "passed": False,
-                        "result": f"Compile error: {err[:500]}",
-                    })
-                    return False, f"Python syntax compile failed for {rel_path}: {err[:200]}", evidence
+                content = target.read_text(encoding="utf-8", errors="replace")
+                compile(content, str(target), "exec")
+                evidence.append({
+                    "kind": "syntax_check",
+                    "command": f"python compile({rel_path})",
+                    "passed": True,
+                    "result": "Python syntax compile passed cleanly",
+                })
+            except SyntaxError as se:
+                return False, f"Python syntax compile failed for {rel_path}: {se}", evidence
             except Exception as e:
                 return False, f"Python check failed for {rel_path}: {e}", evidence
         elif suffix in (".html", ".htm"):

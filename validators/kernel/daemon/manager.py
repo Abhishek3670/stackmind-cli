@@ -672,6 +672,12 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
             state.planning_wo_id = None
     elif phase == Phase.AUTHORING:
         state.authoring_operation_id = None
+    elif phase == Phase.EXECUTING:
+        if getattr(state, "dependency_escalation_op_id", None):
+            state.dependency_escalation_op_id = None
+            state.dependency_escalation_wo_id = None
+        state.recovery_decision_operation_id = None
+        state.architect_repair_operation_id = None
     state.batch_operation_id = None
 
     ignored = set(getattr(state, "ignored_operation_ids", []) or [])
@@ -683,6 +689,13 @@ def _reset_phase_operation_id(state: Any, phase: Any) -> None:
         state.authoring_operation_id = None
     if getattr(state, "gitops_operation_id", None) in ignored:
         state.gitops_operation_id = None
+    if getattr(state, "dependency_escalation_op_id", None) in ignored:
+        state.dependency_escalation_op_id = None
+        state.dependency_escalation_wo_id = None
+    if getattr(state, "recovery_decision_operation_id", None) in ignored:
+        state.recovery_decision_operation_id = None
+    if getattr(state, "architect_repair_operation_id", None) in ignored:
+        state.architect_repair_operation_id = None
     if getattr(state, "batch_operation_id", None) in ignored:
         state.batch_operation_id = None
 
@@ -2188,15 +2201,28 @@ class SessionManager:
                     session["active_operation"] = None
 
         # Only clear phase operation ID if it is dead or ignored, never if actively running
-        for attr in ("planning_operation_id", "authoring_operation_id", "integration_operation_id", "gitops_operation_id", "batch_operation_id"):
+        for attr in (
+            "planning_operation_id",
+            "authoring_operation_id",
+            "integration_operation_id",
+            "gitops_operation_id",
+            "batch_operation_id",
+            "dependency_escalation_op_id",
+            "recovery_decision_operation_id",
+            "architect_repair_operation_id",
+        ):
             phase_op_id = getattr(state, attr, None)
             if phase_op_id:
                 if phase_op_id in getattr(state, "ignored_operation_ids", []):
                     setattr(state, attr, None)
+                    if attr == "dependency_escalation_op_id":
+                        state.dependency_escalation_wo_id = None
                 else:
                     t = self._turn_threads.get(phase_op_id)
                     if t is None or not t.is_alive():
                         setattr(state, attr, None)
+                        if attr == "dependency_escalation_op_id":
+                            state.dependency_escalation_wo_id = None
 
     def resume_run(self, session_id: str, run_id: str | None = None) -> dict[str, Any]:
         """Resume an active, paused, or failed supervisor run."""
@@ -3418,7 +3444,8 @@ class SessionManager:
                     if isinstance(h, dict) and "role" in h and "content" in h:
                         h_content = str(h["content"]).strip()
                         if h_content and not h_content.startswith(":"):
-                            session_history.append({"role": str(h["role"]).lower(), "content": h_content})
+                            if not (h_content.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in h_content):
+                                session_history.append({"role": str(h["role"]).lower(), "content": h_content})
             else:
                 with self._lock:
                     for r in session.get("journal", []):
@@ -3430,9 +3457,10 @@ class SessionManager:
                             a_r = res.get("summary") or res.get("report_markdown")
                             if u_p and a_r and isinstance(a_r, str) and a_r.strip():
                                 u_clean = str(u_p).strip()
-                                if not u_clean.startswith(":"):
+                                a_clean = str(a_r).strip()
+                                if not u_clean.startswith(":") and not (a_clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in a_clean):
                                     session_history.append({"role": "user", "content": u_clean})
-                                    session_history.append({"role": "assistant", "content": str(a_r).strip()})
+                                    session_history.append({"role": "assistant", "content": a_clean})
 
             if len(session_history) > 12:
                 session_history = session_history[-12:]

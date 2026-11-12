@@ -42,7 +42,7 @@ from cli.tui.terminal import (
 
 def test_mouse_reporting_sequences_and_restorer():
     """Verify SGR mouse reporting sequence is active and enabled by default in TerminalStateRestorer."""
-    assert ENABLE_MOUSE_REPORTING_SEQ == ""
+    assert ENABLE_MOUSE_REPORTING_SEQ == "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
     assert DISABLE_MOUSE_REPORTING_SEQ == "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 
     state = AutonomousDeliveryState()

@@ -477,6 +477,7 @@ class ChatMessage:
     turn_id: str | None = None
     thinking_expanded: bool = False
     is_command: bool = False
+    is_error: bool = False
     thinking_elapsed: float | None = None
     thinking_tokens: int | None = None
     model: str | None = None
@@ -685,11 +686,17 @@ class AutonomousDeliveryState:
         self.command_dialog_title: str = ""
         self._last_command_str: str | None = None
         self.runtime_panel_visible: bool = True
+        self.show_collapsed_scrollbar: bool = False
 
     def toggle_runtime_panel(self) -> bool:
         """Toggle visibility of the persistent runtime sidebar panel (Ctrl+B)."""
         self.runtime_panel_visible = not self.runtime_panel_visible
         return self.runtime_panel_visible
+
+    def toggle_collapsed_scrollbar(self) -> bool:
+        """Toggle right-edge scrollbar visibility when the runtime panel is collapsed (:scrollbar)."""
+        self.show_collapsed_scrollbar = not self.show_collapsed_scrollbar
+        return self.show_collapsed_scrollbar
 
     def get_latest_suggested_goal(self) -> str | None:
         """Extract the most recently proposed :goal command from assistant messages."""
@@ -765,10 +772,31 @@ class AutonomousDeliveryState:
 
         return self.retry_status_display or ""
 
+    def _finalize_last_thinking_segment(self) -> None:
+        """Finalize the elapsed duration of the currently active thinking segment if open."""
+        if not hasattr(self, "current_turn_segments") or not self.current_turn_segments:
+            self.current_turn_thinking_start_time = None
+            return
+        import time
+        now = time.monotonic()
+        for seg in reversed(self.current_turn_segments):
+            if seg.get("kind") == "thinking":
+                if "elapsed" not in seg:
+                    st = seg.get("start_time")
+                    if st is not None:
+                        seg["end_time"] = now
+                        seg["elapsed"] = max(0.1, round(now - st, 1))
+                    else:
+                        toks = len(seg.get("content", "").split())
+                        seg["elapsed"] = max(0.1, round(toks / 35.0, 1))
+                break
+        self.current_turn_thinking_start_time = None
+
     def record_turn_text(self, delta: str) -> None:
         """Record live text stream chunk in the chronological turn segments."""
         if not delta:
             return
+        self._finalize_last_thinking_segment()
         if not hasattr(self, "current_turn_segments"):
             self.current_turn_segments = []
         if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "text":
@@ -783,10 +811,16 @@ class AutonomousDeliveryState:
         if not hasattr(self, "current_turn_segments"):
             self.current_turn_segments = []
         import time
-        if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "thinking":
+        now = time.monotonic()
+        if (
+            self.current_turn_segments
+            and self.current_turn_segments[-1].get("kind") == "thinking"
+            and "elapsed" not in self.current_turn_segments[-1]
+        ):
             self.current_turn_segments[-1]["content"] += text
         else:
-            self.current_turn_segments.append({"kind": "thinking", "content": text, "start_time": time.monotonic()})
+            self.current_turn_thinking_start_time = now
+            self.current_turn_segments.append({"kind": "thinking", "content": text, "start_time": now})
 
     def record_turn_thinking(self, text: str) -> None:
         """Record live thinking chunk in the chronological turn segments."""
@@ -1052,6 +1086,7 @@ class AutonomousDeliveryState:
         thinking: str | None = None,
         turn_id: str | None = None,
         is_command: bool = False,
+        is_error: bool = False,
         thinking_elapsed: float | None = None,
         thinking_tokens: int | None = None,
         model: str | None = None,
@@ -1069,11 +1104,12 @@ class AutonomousDeliveryState:
             self._last_command_str = None
             self.show_command_dialog(cmd_name, content)
         key = (role, clean)
+        self._finalize_last_thinking_segment()
 
         # Suppress duplicate messages (check immediate last message or recent assistant/system window)
         search_window = (
             reversed(self.messages[-8:])
-            if role in ("assistant", "system")
+            if (role in ("assistant", "system") and not is_command)
             else ([self.messages[-1]] if self.messages else [])
         )
         for prev_msg in search_window:
@@ -1110,7 +1146,17 @@ class AutonomousDeliveryState:
                 if msg_thinking_tokens is None:
                     msg_thinking_tokens = len(msg_thinking.split())
                 if msg_thinking_elapsed is None:
-                    msg_thinking_elapsed = getattr(self, "current_turn_thinking_elapsed", None)
+                    sum_elapsed = 0.0
+                    if hasattr(self, "current_turn_segments") and self.current_turn_segments:
+                        for s in self.current_turn_segments:
+                            if s.get("kind") == "thinking":
+                                s_el = s.get("elapsed")
+                                if s_el is not None and s_el > 0.0:
+                                    sum_elapsed += s_el
+                    if sum_elapsed > 0.0:
+                        msg_thinking_elapsed = round(sum_elapsed, 1)
+                    else:
+                        msg_thinking_elapsed = getattr(self, "current_turn_thinking_elapsed", None)
             self.current_turn_thinking = ""
             self.current_turn_thinking_start_time = None
             self.current_turn_thinking_elapsed = None
@@ -1175,6 +1221,7 @@ class AutonomousDeliveryState:
             turn_id=turn_id,
             thinking_expanded=self.thinking_expanded,
             is_command=is_command,
+            is_error=is_error,
             thinking_elapsed=msg_thinking_elapsed,
             thinking_tokens=msg_thinking_tokens,
             model=model,
@@ -1300,6 +1347,7 @@ class AutonomousDeliveryState:
         parent_id: str | None = None,
     ) -> TurnAction:
         """Record or update a turn action in-place (§21)."""
+        self._finalize_last_thinking_segment()
         if not self.current_turn_actions.active:
             self.current_turn_actions.active = True
         self.current_turn_actions.verbosity = self.govern_verbosity
@@ -2319,6 +2367,9 @@ class AutonomousDeliveryState:
             self.add_activity(normalized_role, f"spawned ({backend})", wo_id or "")
 
         elif name in {"operation.started", "turn.started"}:
+            if name == "turn.started":
+                self.current_turn_actions = ActionsGroup()
+                self.current_turn_thinking = ""
             op_name = payload.get("operation") or payload.get("name") or ""
             role = (payload.get("role") or self._infer_role_from_op(op_name)).title()
             normalized_role = "Q/A" if role.upper() in {"QA", "Q/A"} else role
@@ -2443,7 +2494,7 @@ class AutonomousDeliveryState:
             formatted_fail = f"✗ [{role_label}] Operation failed: {err_msg}"
             last_msg = self.messages[-1].content if self.messages else ""
             if last_msg != formatted_fail:
-                self.add_message("assistant", formatted_fail)
+                self.add_message("assistant", formatted_fail, is_error=True)
 
         elif name in {"operation.blocked", "turn.blocked"}:
             self.active_working_status = None
@@ -2472,7 +2523,7 @@ class AutonomousDeliveryState:
                 formatted_block = f"⊘ [{role_label}] Blocked: {block_msg}"
                 last_msg = self.messages[-1].content if self.messages else ""
                 if last_msg != formatted_block:
-                    self.add_message("assistant", formatted_block)
+                    self.add_message("assistant", formatted_block, is_error=True)
 
         elif name.startswith("tool_call.") or name == "tool.call":
             tool_name = name.partition(".")[2] if "." in name else payload.get("tool", "tool")

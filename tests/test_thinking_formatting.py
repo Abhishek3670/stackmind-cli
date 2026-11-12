@@ -194,6 +194,113 @@ class TestDetokenizationAndTimer:
         assert msg.thinking_elapsed == 2.4
         assert msg.thinking_tokens == 15
 
+    def test_distinct_thinking_timers_across_multiple_segments(self):
+        """Verify that multiple thinking segments in a turn do not share identical timers."""
+        import time
+        from cli.tui.state import AutonomousDeliveryState
+        from cli.tui.commands import _build_in_progress_turn_content
+
+        state = AutonomousDeliveryState()
+
+        # Step 1: First thinking block (takes ~0.2s)
+        t0 = time.monotonic()
+        state.record_turn_thinking("First analysis of the project layout and architecture.")
+        state.current_turn_segments[-1]["start_time"] = t0 - 10.0
+        state.current_turn_segments[-1]["end_time"] = t0 - 8.5
+        state.current_turn_segments[-1]["elapsed"] = 1.5
+
+        # Step 2: First tool action runs
+        state.record_turn_action("call-1", "Read(src/backend.py)", status="COMPLETED", tool_name="read_file")
+
+        # Step 3: Second thinking block (takes ~0.8s)
+        state.record_turn_thinking("Now evaluating the endpoints in backend.py for security vulnerabilities.")
+        state.current_turn_segments[-1]["start_time"] = t0 - 5.0
+        state.current_turn_segments[-1]["end_time"] = t0 - 4.2
+        state.current_turn_segments[-1]["elapsed"] = 0.8
+
+        # Step 4: Second tool action runs
+        state.record_turn_action("call-2", "Bash(python -m pytest)", status="COMPLETED", tool_name="run_command")
+
+        # Step 5: Third thinking block (active in progress)
+        state.record_turn_thinking("Tests completed. Preparing final response.")
+        state.current_turn_segments[-1]["start_time"] = time.monotonic() - 0.4
+        state.current_turn_thinking_start_time = state.current_turn_segments[-1]["start_time"]
+
+        content = _build_in_progress_turn_content(
+            state,
+            model_name="Claude 3.5 Sonnet",
+            streamed_chunks=[],
+            latest_act_desc="Testing",
+            start_time=time.time() - 532.0,
+            max_wait=600.0,
+            layout_width=100,
+        )
+
+        # First thinking block must show its own 1.5s duration
+        assert "Thought for 1.5s" in content
+        # Second thinking block must show its own 0.8s duration
+        assert "Thought for 0.8s" in content
+        # Active thinking block must NOT show 532.0s
+        assert "Thought for 532.0s" not in content
+
+    def test_finalization_of_thinking_segments_on_action_and_text(self):
+        """Verify record_turn_action and record_turn_text finalize preceding thinking segments."""
+        import time
+        from cli.tui.state import AutonomousDeliveryState
+
+        state = AutonomousDeliveryState()
+
+        # Start thinking segment
+        state.record_turn_thinking("Analyzing the bug.")
+        assert len(state.current_turn_segments) == 1
+        seg = state.current_turn_segments[0]
+        assert seg["kind"] == "thinking"
+        assert "elapsed" not in seg
+        st = seg["start_time"]
+
+        # Simulate small delay
+        time.sleep(0.05)
+
+        # Action starts -> should finalize thinking segment
+        state.record_turn_action("call-1", "Read(file.py)")
+        assert "elapsed" in seg
+        assert seg["elapsed"] >= 0.05
+        assert "end_time" in seg
+        assert state.current_turn_thinking_start_time is None
+
+        # Start second thinking segment
+        state.record_turn_thinking("Thinking about the edit.")
+        assert len(state.current_turn_segments) == 3  # thinking, action, thinking
+        seg2 = state.current_turn_segments[2]
+        assert seg2["kind"] == "thinking"
+        assert "elapsed" not in seg2
+
+        time.sleep(0.05)
+
+        # Text starts -> should finalize second thinking segment
+        state.record_turn_text("Here is the solution")
+        assert "elapsed" in seg2
+        assert seg2["elapsed"] >= 0.05
+        assert state.current_turn_thinking_start_time is None
+
+    def test_add_message_sums_individual_thinking_segment_durations(self):
+        """Verify add_message aggregates thinking elapsed times across all segments."""
+        from cli.tui.state import AutonomousDeliveryState
+
+        state = AutonomousDeliveryState()
+        state.current_turn_segments = [
+            {"kind": "thinking", "content": "Thought 1", "elapsed": 1.2},
+            {"kind": "action", "action_id": "c1"},
+            {"kind": "thinking", "content": "Thought 2", "elapsed": 2.3},
+            {"kind": "action", "action_id": "c2"},
+            {"kind": "thinking", "content": "Thought 3", "elapsed": 0.5},
+        ]
+        state.current_turn_thinking = "Thought 1\nThought 2\nThought 3"
+
+        msg = state.add_message("assistant", "Final response text")
+        # 1.2 + 2.3 + 0.5 = 4.0s
+        assert msg.thinking_elapsed == 4.0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

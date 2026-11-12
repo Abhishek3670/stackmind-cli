@@ -34,6 +34,7 @@ from cli.tui.keyboard import (
     wrap_composer_text,
 )
 from cli.tui.layout import (
+    _strip_trailing_spaces,
     compute_composer_cursor_row,
     compute_layout,
     format_responsive_path,
@@ -484,6 +485,11 @@ def _compute_cursor_col(editor: Any, default: int = 5) -> int:
 
 def restore_composer_focus(state: Any | None = None) -> bool:
     """Restore terminal focus to the composer after an operation completes."""
+    try:
+        from cli.tui.keyboard import drain_console_input
+        drain_console_input()
+    except Exception:
+        pass
     if state is None:
         return True
     if getattr(state, "is_typing", False):
@@ -522,6 +528,12 @@ def enable_mouse_reporting(stream: Any = None) -> None:
 
 def disable_mouse_reporting(stream: Any = None) -> None:
     """Disable terminal SGR mouse reporting (WO-054)."""
+    try:
+        from cli.tui.keyboard import disable_mouse_reporting as _kb_disable
+        _kb_disable(stream)
+        return
+    except Exception:
+        pass
     target = stream or sys.stdout
     try:
         if target and hasattr(target, "write"):
@@ -705,14 +717,18 @@ def redraw_full_screen(
 
 
 def _pad_frame_to_width(frame: str, width: int) -> str:
-    """Pad every frame line to ``width`` display cells without touching ANSI styles."""
+    """Pad every frame line to ``width`` display cells without touching ANSI styles.
+
+    Strips trailing spaces and uses \\x1b[K (erase to end of line) so that unwritten cells
+    are cleared cleanly without filling the terminal grid with space characters that pollute
+    clipboard selections or break indentation.
+    """
     if width <= 0:
         return frame
-    padded: list[str] = []
-    for line in frame.split("\n"):
-        visible = Text.from_ansi(line).cell_len
-        padded.append(line + " " * max(0, width - visible))
-    return "\n".join(padded)
+    return "\n".join(
+        (c := _strip_trailing_spaces(l)) + ("\x1b[K" if Text.from_ansi(c).cell_len < width else "")
+        for l in frame.split("\n")
+    )
 
 
 def render_composer_top_border(
@@ -949,11 +965,13 @@ def prompt_composer_input(
     live_manager: Any | None = None,
     session: Mapping[str, Any] | None = None,
     terminal_width: int | None = None,
+    terminal_height: int | None = None,
     full_screen: bool = False,
     key_stream: Optional[Iterator[str]] = None,
     on_idle: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
     on_mouse_click: Optional[Callable[..., None]] = None,
+    on_mouse_release: Optional[Callable[..., None]] = None,
     force_color: bool | None = None,
     no_color: bool | None = None,
 ) -> str:
@@ -963,7 +981,7 @@ def prompt_composer_input(
     if width != term_width:
         comp_width = width
     else:
-        comp_width = layout.conversation_width if layout.show_runtime else term_width
+        comp_width = layout.conversation_width if layout.show_runtime else max(10, term_width - 1)
 
     if show_footer is None:
         show_footer = True
@@ -985,6 +1003,11 @@ def prompt_composer_input(
         is_tty = key_stream is not None
 
     if is_tty:
+        try:
+            from cli.tui.keyboard import drain_console_input
+            drain_console_input()
+        except Exception:
+            pass
         if is_live_active:
             live_manager.update(
                 composer_content=initial_text,
@@ -1048,7 +1071,8 @@ def prompt_composer_input(
                     )
                     term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
                     c_row = compute_composer_cursor_row(term_lines, state=state, width=comp_width)
-                    sys.stdout.write(f"\x1b[{c_row};1H")
+                    c_col = 5 + len(getattr(state, "composer_buffer", ""))
+                    sys.stdout.write(f"\x1b[{c_row};{c_col}H")
                     sys.stdout.flush()
                     return True
                 except Exception:
@@ -1078,7 +1102,7 @@ def prompt_composer_input(
                 pass
 
             layout = compute_layout(new_cols)
-            comp_width = layout.conversation_width if layout.show_runtime else new_cols
+            comp_width = layout.conversation_width if layout.show_runtime else max(10, new_cols - 1)
             if ed is not None:
                 ed.width = comp_width
 
@@ -1143,10 +1167,12 @@ def prompt_composer_input(
             _raw_prompt_fn = getattr(
                 sys.modules.get("cli.tui.app"), "raw_prompt_input", raw_prompt_input
             )
+            term_lines = terminal_height or shutil.get_terminal_size(fallback=(80, 24)).lines
             val = _raw_prompt_fn(
                 placeholder=placeholder,
                 shortcuts=shortcuts,
                 width=comp_width,
+                height=term_lines,
                 initial_text=initial_text,
                 history=history,
                 state=state,
@@ -1184,6 +1210,7 @@ def prompt_composer_input(
                 on_height_change=on_height_change,
                 on_resize=_handle_prompt_resize,
                 on_mouse_click=on_mouse_click,
+                on_mouse_release=on_mouse_release,
             )
         finally:
             if state is not None:

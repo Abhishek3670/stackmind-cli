@@ -39,10 +39,12 @@ from cli.tui.commands import (
     _compute_run_state,
     _dispatch_command,
     _show_status,
+    _stream_turn_execution,
     dispatch_delivery_command,
     get_help_str,
     get_status_str,
     reconnect_and_sync,
+    resolve_turn_model_attribution,
 )
 from cli.tui.events import recover_transcript_from_events
 from cli.tui.keyboard import raw_prompt_input
@@ -335,7 +337,10 @@ def tui(
                 pass
 
     try:
-        client = DaemonClient(daemon_url, auth_token=daemon_auth_token)
+        try:
+            client = DaemonClient(daemon_url, auth_token=daemon_auth_token)
+        except TypeError:
+            client = DaemonClient(daemon_url)
         adapter = StackMindTuiAdapter(client)
 
         session = None
@@ -417,12 +422,25 @@ def tui(
         if is_tty:
             _ensure_utf8()
             enter_alternate_screen()
-            disable_mouse_reporting()
+            if getattr(state, "mouse_reporting_enabled", True):
+                enable_mouse_reporting()
+            else:
+                disable_mouse_reporting()
+            term_size = shutil.get_terminal_size(fallback=(80, 24))
+            current_cols = term_size.columns
+            current_lines = term_size.lines
+            layout_info = compute_layout(current_cols, state=state)
+            comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, current_cols - 1)
             redraw_full_screen(
-                session, state, clear=True, include_composer=True, composer_is_active=True
+                session,
+                state,
+                width=current_cols,
+                height=current_lines,
+                clear=True,
+                include_composer=True,
+                composer_is_active=True,
             )
-            current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-            c_row = compute_composer_cursor_row(current_lines, state=state)
+            c_row = compute_composer_cursor_row(current_lines, state=state, width=comp_width)
             # WO-022: fixed column — layout is flush at column 0 across all tiers.
             sys.stdout.write(f"\x1b[{c_row};5H")
             sys.stdout.flush()
@@ -525,7 +543,6 @@ def tui(
 
                 active_op = session.get("active_operation")
                 if active_op:
-                    from cli.tui.commands import _stream_turn_execution, resolve_turn_model_attribution
                     cur_op = state.get_current_operation() or {}
                     active_role = cur_op.get("role") or session.get("active_role") or "Agent"
                     model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
@@ -571,7 +588,6 @@ def tui(
                         conv_content = None
                         has_in_progress = getattr(state, "has_in_progress_turn", False)
                         if has_in_progress:
-                            from cli.tui.commands import _build_in_progress_turn_content, resolve_turn_model_attribution
                             layout_info = compute_layout(current_cols, state=state)
                             cur_op = state.get_current_operation() or {}
                             active_role = cur_op.get("role") or session.get("active_role") or "Agent"
@@ -691,7 +707,7 @@ def tui(
                     nonlocal comp_width, layout_info
                     state.toggle_runtime_panel()
                     layout_info = compute_layout(term_cols, state=state)
-                    comp_width = layout_info.conversation_width if layout_info.show_runtime else term_cols
+                    comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, term_cols - 1)
                     if editor is not None:
                         editor.width = comp_width
                     if is_tty:
@@ -748,7 +764,6 @@ def tui(
                     conv_content = None
                     has_in_progress = getattr(state, "has_in_progress_turn", False)
                     if has_in_progress:
-                        from cli.tui.commands import _build_in_progress_turn_content, resolve_turn_model_attribution
                         layout_info = compute_layout(term_cols, state=state)
                         cur_op = state.get_current_operation() or {}
                         active_role = cur_op.get("role") or session.get("active_role") or "Agent"
@@ -785,6 +800,11 @@ def tui(
                     )
                     sys.stdout.write(f"\x1b[{c_row};{cursor_col}H")
                     sys.stdout.flush()
+                    if editor is not None and hasattr(editor, "redraw_line"):
+                        try:
+                            editor.redraw_line()
+                        except Exception:
+                            pass
 
                 def _handle_page_up(editor: Any = None) -> None:
                     """Scroll conversation viewport, work orders, or command dialog up by half a page."""
@@ -978,7 +998,7 @@ def tui(
                         pass
 
                 def _handle_mouse_click(col: int, row: int, button: int, editor: Any = None) -> None:
-                    """Handle mouse clicks: clicking on the scrollbar track or dragging to scroll."""
+                    """Handle mouse clicks: clicking on the scrollbar track, collapsing the runtime sidebar, or dragging to scroll."""
                     if button not in (0, 1, 32):
                         return
                     term_size = shutil.get_terminal_size(fallback=(80, current_lines))
@@ -991,6 +1011,16 @@ def tui(
 
                     scrollbar_col = layout.conversation_width
                     header_h = 1
+
+                    # Click on collapsed top badge bar (row 0 or 1) -> expand runtime panel
+                    if not layout.show_runtime and layout.show_runtime_badge and row <= 1:
+                        _handle_ctrl_b(editor)
+                        return
+
+                    # Click on runtime panel header row (row <= 2) -> collapse runtime panel
+                    if layout.show_runtime and col > scrollbar_col + 2 and row <= 2:
+                        _handle_ctrl_b(editor)
+                        return
 
                     if scrollbar_col - 2 <= col <= scrollbar_col + 2:
                         active_scroll = state.conversation_scroll
@@ -1027,6 +1057,10 @@ def tui(
                                 state.set_conversation_scroll_offset(target_off)
 
                             _handle_height_change(editor)
+                        else:
+                            # Click on divider when no scrollbar is needed -> toggle sidebar collapse
+                            _handle_ctrl_b(editor)
+                            return
                     elif layout.show_runtime and col > scrollbar_col + 2:
                         total_wo = len(getattr(state, "work_orders", []))
                         cap = getattr(state.scroll, "viewport_height", 8) or 8
@@ -1040,6 +1074,126 @@ def tui(
                         else:
                             state.scroll_focus = "work_orders"
                         _handle_height_change(editor)
+                    elif col < scrollbar_col - 2:
+                        state.scroll_focus = "conversation"
+                        _handle_height_change(editor)
+
+                def _handle_mouse_release(start_col: int, start_row: int, end_col: int, end_row: int, editor: Any = None) -> None:
+                    """Handle mouse drag release: extract conversation text cleanly and copy to clipboard."""
+                    term_size = shutil.get_terminal_size(fallback=(80, current_lines))
+                    term_cols, term_lines = term_size.columns, term_size.lines
+                    layout = compute_layout(
+                        term_cols,
+                        term_lines,
+                        show_runtime=getattr(state, "runtime_panel_visible", False),
+                    )
+                    scrollbar_col = layout.conversation_width
+
+                    # If drag was inside the sidebar or scrollbar track, do not copy
+                    if start_col >= scrollbar_col - 1 and end_col >= scrollbar_col - 1:
+                        return
+
+                    # Verify that an actual drag occurred (different rows or moved >= 3 columns)
+                    if start_row == end_row and abs(end_col - start_col) < 3:
+                        return
+
+                    # Clamp columns to conversation pane boundary (exclude divider and sidebar)
+                    max_c = max(1, scrollbar_col - 2)
+                    s_col = max(0, min(max_c, start_col - 1))
+                    e_col = max(0, min(max_c, end_col - 1))
+
+                    header_h = 1 if (not layout.show_runtime and layout.show_runtime_badge) else 0
+                    vp_h = compute_viewport_height(term_lines, state=state)
+                    r1 = max(0, min(vp_h - 1, start_row - 1 - header_h))
+                    r2 = max(0, min(vp_h - 1, end_row - 1 - header_h))
+
+                    visible_lines = getattr(state, "visible_conversation_lines", [])
+                    if not visible_lines:
+                        # Fallback: compute from state messages
+                        from cli.tui.chat import render_chat_transcript_str
+                        from cli.tui.layout import slice_conversation_viewport
+                        active_scroll = getattr(state, "conversation_scroll", None)
+                        conv_text = render_chat_transcript_str(getattr(state, "messages", []), width=layout.conversation_width)
+                        sliced = slice_conversation_viewport(
+                            conv_text,
+                            viewport_height=vp_h,
+                            scroll=active_scroll,
+                            pad=False,
+                            avail_width=layout.conversation_width,
+                        )
+                        visible_lines = [Text.from_ansi(l).plain if "\x1b[" in l else l for l in sliced.split("\n")]
+
+                    if not visible_lines:
+                        return
+
+                    min_r = min(r1, r2)
+                    max_r = min(len(visible_lines) - 1, max(r1, r2))
+
+                    if min_r == max_r:
+                        line = visible_lines[min_r] if min_r < len(visible_lines) else ""
+                        c_start = min(s_col, e_col)
+                        c_end = max(s_col, e_col)
+                        leading_sp = len(line) - len(line.lstrip(" "))
+                        if c_start <= max(4, leading_sp + 2):
+                            selected_text = line[:c_end].rstrip()
+                        else:
+                            selected_text = line[c_start:c_end].rstrip()
+                    else:
+                        extracted = []
+                        is_forward = (start_row < end_row) or (start_row == end_row and start_col <= end_col)
+                        first_col = s_col if is_forward else e_col
+                        last_col = e_col if is_forward else s_col
+
+                        for r in range(min_r, max_r + 1):
+                            if r >= len(visible_lines):
+                                break
+                            line = visible_lines[r]
+                            if not line.strip():
+                                extracted.append("")
+                                continue
+
+                            leading_spaces = len(line) - len(line.lstrip(" "))
+                            if r == min_r:
+                                if first_col <= max(4, leading_spaces + 2):
+                                    extracted.append(line.rstrip())
+                                else:
+                                    extracted.append(line[first_col:].rstrip())
+                            elif r == max_r:
+                                content_len = len(line.rstrip())
+                                if last_col >= content_len - 2 or last_col >= max_c - 4 or last_col >= 20:
+                                    extracted.append(line.rstrip())
+                                else:
+                                    extracted.append(line[:last_col].rstrip())
+                            else:
+                                extracted.append(line.rstrip())
+
+                        # If all non-empty lines have at least 1 common leading space (from Padding((0, 1))),
+                        # strip 1 leading space so top-level text is flush and lists keep relative indentation
+                        non_empty = [l for l in extracted if l]
+                        if non_empty and all(l.startswith(" ") for l in non_empty):
+                            extracted = [l[1:] if l.startswith(" ") else l for l in extracted]
+
+                        selected_text = "\n".join(extracted).strip("\r\n")
+
+                    if selected_text:
+                        from cli.tui.clipboard import set_clipboard_text
+                        ok = set_clipboard_text(selected_text)
+                        if ok:
+                            lines_cnt = len(selected_text.splitlines())
+                            chars_cnt = len(selected_text)
+                            u = "line" if lines_cnt == 1 else "lines"
+                            alert = f"[CLIPBOARD] Copied {lines_cnt} {u} ({chars_cnt:,} chars) to system clipboard."
+                            if editor is not None:
+                                editor.alert = alert
+                                if hasattr(editor, "on_alert") and editor.on_alert:
+                                    try:
+                                        editor.on_alert(alert)
+                                    except Exception:
+                                        pass
+                                if hasattr(editor, "bottom_border_renderer") and editor.has_borders:
+                                    editor.redraw_line()
+                            elif state is not None:
+                                state.composer_alert = alert
 
                 active_op = session.get("active_operation")
                 is_awaiting_plan = (
@@ -1057,10 +1211,17 @@ def tui(
                 else:
                     comp_placeholder = "Type a message..."
 
+                term_size = shutil.get_terminal_size(fallback=(80, 24))
+                term_cols = term_size.columns
+                current_lines = term_size.lines
+                layout_info = compute_layout(term_cols, state=state)
+                comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, term_cols - 1)
+
                 text = prompt_composer_input(
                     placeholder=comp_placeholder,
                     width=comp_width,
                     terminal_width=term_cols,
+                    terminal_height=current_lines,
                     state=state,
                     session=session,
                     on_ctrl_k=_handle_ctrl_k,
@@ -1072,6 +1233,7 @@ def tui(
                     on_wheel_up=_handle_wheel_up,
                     on_wheel_down=_handle_wheel_down,
                     on_mouse_click=_handle_mouse_click,
+                    on_mouse_release=_handle_mouse_release,
                     on_height_change=_handle_height_change,
                     on_idle=_handle_idle,
                     on_resize=_handle_resize,
@@ -1080,7 +1242,6 @@ def tui(
                     full_screen=is_tty,
                 )
             except _ActiveOperationDetected as aod:
-                from cli.tui.commands import _stream_turn_execution, resolve_turn_model_attribution
                 cur_op = state.get_current_operation() or {}
                 active_role = cur_op.get("role") or session.get("active_role") or "Agent"
                 model_label = resolve_turn_model_attribution(state, session, role=active_role) or active_role
@@ -1095,6 +1256,11 @@ def tui(
                     model_name=model_label,
                     initial_activity_desc=f"{active_role} running",
                 )
+                try:
+                    from cli.tui.keyboard import drain_console_input
+                    drain_console_input()
+                except Exception:
+                    pass
                 if should_exit:
                     if live_ws is not None:
                         live_ws.stop()
@@ -1103,7 +1269,8 @@ def tui(
             except (EOFError, KeyboardInterrupt):
                 if live_ws is not None:
                     live_ws.stop()
-                click.echo()
+                if not is_tty:
+                    click.echo()
                 break
             try:
                 state.scroll_conversation_to_bottom()
@@ -1116,24 +1283,36 @@ def tui(
                     client_timeout=state.client_timeout,
                     live_manager=live_ws,
                 )
+                try:
+                    from cli.tui.keyboard import drain_console_input
+                    drain_console_input()
+                except Exception:
+                    pass
                 if should_exit:
                     if live_ws is not None:
                         live_ws.stop()
                     break
             except KeyboardInterrupt:
-                click.echo()
+                if not is_tty:
+                    click.echo()
                 continue
             if is_tty:
+                term_size = shutil.get_terminal_size(fallback=(80, 24))
+                term_cols = term_size.columns
+                current_lines = term_size.lines
+                layout_info = compute_layout(term_cols, state=state)
+                comp_width = layout_info.conversation_width if layout_info.show_runtime else max(10, term_cols - 1)
                 redraw_full_screen(
                     session,
                     state,
+                    width=term_cols,
+                    height=current_lines,
                     clear=False,
                     include_composer=True,
                     composer_is_active=True,
                     live_manager=live_ws,
                 )
-                current_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
-                c_row = compute_composer_cursor_row(current_lines, state=state)
+                c_row = compute_composer_cursor_row(current_lines, state=state, width=comp_width)
                 sys.stdout.write(f"\x1b[{c_row};5H")
                 sys.stdout.flush()
     finally:

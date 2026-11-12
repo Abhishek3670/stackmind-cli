@@ -575,6 +575,109 @@ class LayaDecisionAdapter:
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
         return [item[2] for item in scored[:max_skills]]
 
+    def decide_recovery_action(
+        self,
+        wo_id: str,
+        error_message: str = "",
+        failure_code: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Autonomously decide the recovery action for a blocked or failing work order.
+
+        Acts as the fast Decision Specialist to prevent orchestration halts:
+        - Evaluates transient execution/verification failures -> 'retry_unchanged'
+        - Evaluates structural/governance/defect failures -> 'architect_fix'
+        - Evaluates scope/budget exceedance -> 'amend_contract'
+        Conforms strictly to schemas/recovery-decision.schema.json.
+        """
+        err_lower = (error_message or "").lower()
+        code_upper = (failure_code or "").upper()
+        ev = dict(evidence or {})
+
+        transient_codes = {
+            "OUTCOME_NOT_VERIFIED",
+            "CODE_NOT_VERIFIED",
+            "STATE_NOT_VERIFIED",
+            "SECURITY_NOT_VERIFIED",
+            "VERIFICATION_GATE_FAILED",
+            "IMPORT_SATISFIABILITY_FAILED",
+            "TOOL_LOOP_HALTED",
+            "HARNESS_DECISION_INVALID",
+            "DELIVERABLE_NOT_WRITTEN",
+            "WORKER_BLOCKED",
+            "LOOP_GUARD_TRIPPED",
+            "EXECUTION_ERROR",
+            "PROCESS_FAILED",
+            "DEPENDENCY_ERROR",
+        }
+        is_transient = (
+            code_upper in transient_codes
+            or any(kw in err_lower for kw in (
+                "verification gate failed",
+                "outcome_verified",
+                "code_verified",
+                "state_verified",
+                "security_verified",
+                "dependency manifest",
+                "requirements.txt",
+                "package.json",
+                "pyproject.toml",
+                "timed out",
+                "loop guard",
+                "consecutive tool failures",
+                "tool loop exhausted",
+            ))
+        )
+
+        is_governance = (
+            code_upper in {
+                "CONTRACT_FILE_BUDGET_EXCEEDED",
+                "CONTRACT_SCOPE_VIOLATION",
+                "CONTRACT_SCOPE_DENIED",
+                "CONTRACT_READ_ONLY_VIOLATION",
+                "CONTRACT_EXPIRED",
+                "CONTRACT_VALIDATION_ERROR",
+                "DEPENDENCY_DEADLOCK",
+                "INVALID_DEPENDENCY",
+                "SUPERSEDED_DEPENDENCY",
+            }
+            or "permission denied" in err_lower
+            or "outside assigned scope" in err_lower
+        )
+
+        if is_governance:
+            if "scope" in err_lower or "budget" in err_lower or "file_budget" in code_upper:
+                curr_rev = int(ev.get("contract_revision") or 1)
+                return {
+                    "work_order": wo_id,
+                    "action": "amend_contract",
+                    "reason": f"Decision Specialist (Laya): Scope/budget expansion required for {wo_id} ({code_upper or 'SCOPE_VIOLATION'})",
+                    "contract_revision": curr_rev + 1,
+                    "failure_code": code_upper or "CONTRACT_SCOPE_VIOLATION",
+                }
+            return {
+                "work_order": wo_id,
+                "action": "architect_fix",
+                "reason": f"Decision Specialist (Laya): Governance/dependency issue ({code_upper or 'GOVERNANCE'}); escalating to Architect repair",
+                "failure_code": code_upper or "GOVERNANCE_BLOCKED",
+            }
+
+        if is_transient:
+            return {
+                "work_order": wo_id,
+                "action": "retry_unchanged",
+                "transient": True,
+                "reason": f"Decision Specialist (Laya): Transient verification/execution issue ({code_upper or 'TRANSIENT'}); auto-clearing blocker for targeted specialist retry",
+                "failure_code": code_upper or "TRANSIENT_RETRYABLE",
+            }
+
+        return {
+            "work_order": wo_id,
+            "action": "architect_fix",
+            "reason": f"Decision Specialist (Laya): Unclassified worker blocker; routing to Architect repair for autonomous resolution",
+            "failure_code": code_upper or "UNKNOWN_BLOCKER",
+        }
+
 
 def classify_task_category(
     title: str,

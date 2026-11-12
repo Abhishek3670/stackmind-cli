@@ -116,7 +116,7 @@ class Key:
 
 
 # SGR Extended Mouse Mode control sequences (WO-054)
-ENABLE_MOUSE_REPORTING_SEQ = ""
+ENABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
 DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 
 
@@ -132,6 +132,17 @@ def enable_mouse_reporting(stream: Any = None) -> None:
             target.flush()
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = kernel32.GetStdHandle(-10)
+            if h not in (0, -1):
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                    new_mode = (mode.value | 0x0010 | 0x0008 | 0x0080 | 0x0200) & ~0x0040
+                    kernel32.SetConsoleMode(h, new_mode)
+        except Exception:
+            pass
 
 
 def disable_mouse_reporting(stream: Any = None) -> None:
@@ -146,6 +157,46 @@ def disable_mouse_reporting(stream: Any = None) -> None:
             target.flush()
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = kernel32.GetStdHandle(-10)
+            if h not in (0, -1):
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                    new_mode = (mode.value | 0x0040 | 0x0080) & ~0x0010
+                    kernel32.SetConsoleMode(h, new_mode)
+        except Exception:
+            pass
+
+
+def drain_console_input() -> None:
+    """Flush pending keyboard and mouse input from the console input queue.
+
+    Prevents accumulated mouse motion/click tracking artifacts that occurred while
+    the engine was busy streaming turns from spilling into the composer prompt.
+    """
+    if os.name == "nt":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = kernel32.GetStdHandle(-10)
+            if h and h not in (0, -1):
+                kernel32.FlushConsoleInputBuffer(h)
+        except Exception:
+            pass
+    else:
+        try:
+            import select
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0.0)
+                if not r:
+                    break
+                os.read(sys.stdin.fileno(), 4096)
+        except Exception:
+            pass
 
 
 class TerminalStateRestorer:
@@ -165,8 +216,11 @@ class TerminalStateRestorer:
             self.is_tty = False
 
         if self.is_tty:
-            mouse_enabled = getattr(self.state, "mouse_reporting_enabled", False) if self.state is not None else False
-            if os.environ.get("STACKMIND_MOUSE", "").strip().lower() in ("1", "true", "yes"):
+            mouse_enabled = getattr(self.state, "mouse_reporting_enabled", True) if self.state is not None else True
+            env_mouse = os.environ.get("STACKMIND_MOUSE", "").strip().lower()
+            if env_mouse in ("0", "false", "no", "off"):
+                mouse_enabled = False
+            elif env_mouse in ("1", "true", "yes", "on"):
                 mouse_enabled = True
             if mouse_enabled:
                 enable_mouse_reporting(sys.stdout)
@@ -186,9 +240,14 @@ class TerminalStateRestorer:
                     mode = ctypes.c_uint32()
                     if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
                         self.old_win_mode = mode.value
-                        # Ensure QuickEdit mode (0x0040) and extended flags (0x0080) are enabled
-                        # so native terminal text selection & copy always works smoothly without Shift.
-                        new_mode = mode.value | 0x0040 | 0x0080
+                        if mouse_enabled:
+                            # Enable mouse input (0x0010), window input (0x0008), extended flags (0x0080),
+                            # virtual terminal input (0x0200) and clear QuickEdit (0x0040)
+                            # so mouse clicks, wheel, and drags reach the application.
+                            new_mode = (mode.value | 0x0010 | 0x0008 | 0x0080 | 0x0200) & ~0x0040
+                        else:
+                            # QuickEdit mode (0x0040) and extended flags (0x0080) for native terminal text selection
+                            new_mode = (mode.value | 0x0040 | 0x0080) & ~0x0010
                         kernel32.SetConsoleMode(h, new_mode)
             except Exception:
                 pass
@@ -213,6 +272,14 @@ class TerminalStateRestorer:
             except Exception:
                 pass
 
+        # Unconditionally disable mouse reporting, disable bracketed paste, restore cursor visibility, and reset ANSI attributes
+        disable_mouse_reporting(sys.stdout)
+        try:
+            sys.stdout.write("\x1b[?2004l\x1b[?25h\x1b[0m")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
         if self.is_tty and os.name == "nt" and self.old_win_mode is not None:
             try:
                 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -222,23 +289,21 @@ class TerminalStateRestorer:
             except Exception:
                 pass
 
-        # Unconditionally disable mouse reporting, disable bracketed paste, restore cursor visibility, and reset ANSI attributes
-        disable_mouse_reporting(sys.stdout)
-        try:
-            sys.stdout.write("\x1b[?2004l\x1b[?25h\x1b[0m")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
 
 def _parse_escape_sequence(seq: str) -> str:
     """Parse an escape sequence (content following \x1b) into a Key code."""
     if not seq:
         return Key.ESCAPE
 
+    clean_seq = seq
+    if clean_seq.startswith("^[[<"):
+        clean_seq = clean_seq[2:]
+    elif clean_seq.startswith("\x1b[<"):
+        clean_seq = clean_seq[1:]
+
     # SGR Mouse mode: [<Cb;Cx;CyM (press) or [<Cb;Cx;Cym (release)
-    if seq.startswith("[<"):
-        match = re.match(r"^\[<(\d+);(\d+);(\d+)([Mm])", seq)
+    if clean_seq.startswith("[<"):
+        match = re.search(r"\[<(\d+);(\d+);(\d+)([Mm])", clean_seq)
         if match:
             btn = int(match.group(1))
             col = int(match.group(2))
@@ -249,6 +314,7 @@ def _parse_escape_sequence(seq: str) -> str:
             elif btn == 65:
                 return Key.MOUSE_WHEEL_DOWN
             return f"<MOUSE_{btn}_{col}_{row}_{action}>"
+        return "<MOUSE_IGNORE>"
 
     # Legacy X10 / Xterm 1000 mouse: [M<btn+32><col+32><row+32>
     if seq.startswith("[M") and len(seq) >= 5:
@@ -445,6 +511,17 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
             res = _parse_escape_sequence(seq)
         else:
             res = Key.ESCAPE
+    elif ch == "^" and msvcrt.kbhit():
+        ch2 = msvcrt.getwch()
+        if ch2 == "[":
+            seq = _read_escape_sequence_windows()
+            full_seq = "^[[" + seq
+            res = _parse_escape_sequence(full_seq)
+            if res == "<MOUSE_IGNORE>":
+                res = None
+        else:
+            _win32_reader._pending_keys.append(ch2)
+            res = ch
     elif ch == Key.CTRL_V:
         res = Key.CTRL_V
     elif ch == Key.CTRL_B:
@@ -570,6 +647,9 @@ class Win32ConsoleReader:
                 btn = 32
             else:
                 btn = mouse.dwButtonState
+            action_suffix = "_m" if mouse.dwButtonState == 0 and (mouse.dwEventFlags & 0x0001 == 0) else ""
+            if action_suffix:
+                return f"<MOUSE_{btn}_{mouse.dwMousePosition.X}_{mouse.dwMousePosition.Y}{action_suffix}>"
             return f"<MOUSE_{btn}_{mouse.dwMousePosition.X}_{mouse.dwMousePosition.Y}>"
 
         # Key Events (EventType == 0x0001)
@@ -792,6 +872,15 @@ class Win32ConsoleReader:
                             if seq:
                                 _log_debug_key(f"[Win32ConsoleReader.read_key] esc_seq={repr(seq)}")
                                 parsed = _parse_escape_sequence(seq)
+                        elif parsed == "^":
+                            seq = self._read_escape_sequence(h)
+                            if seq and seq.startswith(("[<", "[[<")):
+                                parsed = _parse_escape_sequence("^" + seq)
+                            elif seq:
+                                for sc in seq:
+                                    self._pending_keys.append(sc)
+                        if parsed == "<MOUSE_IGNORE>":
+                            parsed = None
                         if parsed is not None:
                             _log_debug_key(f"[Win32ConsoleReader.read_key] returning parsed={repr(parsed)}")
                             return parsed
@@ -946,7 +1035,9 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":goal", "Submit product goal to Architecture (or adopt suggested goal)", True),
     (":adopt", "Adopt suggested goal from Architecture", False),
     (":panel", "Toggle runtime sidebar panel (Ctrl+B)", False),
+    (":collapse", "Collapse or expand runtime side panel (Ctrl+B)", False),
     (":sidebar", "Toggle runtime sidebar panel (Ctrl+B)", False),
+    (":scrollbar", "Toggle right-edge scrollbar when panel is collapsed", False),
     (":approve", "Submit Plan approval or HITL approval", False),
     (":reject", "Submit Plan rejection feedback", False),
     (":roles", "Interactive Agent Roles & Execution Backend bindings panel", False),
@@ -963,6 +1054,7 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":contract", "Display Contract Boundary HUD & permissions", False),
     (":diff", "Display Unified Diff viewer", False),
     (":matrix", "Display 6-Dimensional Verification Matrix", False),
+    (":mouse", "Configure terminal mouse tracking (on | off | toggle)", False),
     (":reviews", "Display QA and Architect final-acceptance gate state", False),
     (":events", "Stream incremental sequenced events", False),
     (":reconnect", "Reconnect to daemon & replay missed events", False),
@@ -1192,6 +1284,7 @@ class RawLineEditor:
         on_wheel_down: Optional[Callable[[], None]] = None,
         on_transition: Optional[Callable[[bool], None]] = None,
         width: int = 80,
+        height: Optional[int] = None,
         right_border: Optional[str] = None,
         commands: Optional[list[tuple[str, str, bool]]] = None,
         on_clear_dropdown: Optional[Callable[[], Any]] = None,
@@ -1200,6 +1293,7 @@ class RawLineEditor:
         on_alert: Optional[Callable[[Optional[str]], None]] = None,
         on_height_change: Optional[Callable[[Any], None]] = None,
         on_mouse_click: Optional[Callable[[int, int, int], None]] = None,
+        on_mouse_release: Optional[Callable[..., None]] = None,
     ) -> None:
         self.out = out or sys.stdout
         self.prompt_prefix = prompt_prefix
@@ -1210,6 +1304,7 @@ class RawLineEditor:
         self.history_index: int = len(self.history)
         self.temp_buffer: str = initial_text
         self.state = state
+        self.height: Optional[int] = height
         self.on_ctrl_k = on_ctrl_k
         self.on_ctrl_l = on_ctrl_l
         self.on_ctrl_o = on_ctrl_o
@@ -1227,6 +1322,10 @@ class RawLineEditor:
         self.on_wheel_up = on_wheel_up
         self.on_wheel_down = on_wheel_down
         self.on_mouse_click = on_mouse_click
+        self.on_mouse_release = on_mouse_release
+        self._mouse_drag_start: Optional[tuple[int, int]] = None
+        self._mouse_drag_current: Optional[tuple[int, int]] = None
+        self._is_mouse_dragging: bool = False
         self.on_transition = on_transition
         self.on_height_change = on_height_change
         self.width = width
@@ -1261,6 +1360,7 @@ class RawLineEditor:
         self.in_bracketed_paste: bool = False
         self._last_was_cr: bool = False
         self._last_line_count: int = max(1, "".join(self.buffer).count("\n") + 1)
+        self._last_bottom_state: Optional[tuple[Any, tuple[str, ...]]] = None
 
         self._update_state()
         self._update_dropdown()
@@ -1353,10 +1453,12 @@ class RawLineEditor:
         return "".join(self.buffer)
 
     def _get_wrap_width(self) -> int:
+        term_cols = shutil.get_terminal_size(fallback=(self.width, 24)).columns
+        clamped_width = max(10, min(self.width, term_cols - 1))
         visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
         visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
-        inner_available = max(1, self.width - visible_prefix_len - visible_right_len)
-        return max(1, min(inner_available, self.width - 6)) if self.has_borders else max(10, self.width - 6)
+        inner_available = max(1, clamped_width - visible_prefix_len - visible_right_len)
+        return max(1, min(inner_available, clamped_width - 6)) if self.has_borders else max(10, clamped_width - 6)
 
     def _get_visual_lines(self) -> tuple[list[str], list[int], int, int]:
         wrap_width = self._get_wrap_width()
@@ -1438,6 +1540,11 @@ class RawLineEditor:
         return False
 
     def _update_state(self) -> None:
+        if "<" in self.text and any(m in self.text for m in ("[<", "^[[<", "\x1b[<")):
+            cleaned = re.sub(r"(?:\x1b|\^\[)?\[<\d+;\d+;\d+[Mm]", "", self.text)
+            if cleaned != self.text:
+                self.buffer = list(cleaned)
+                self.cursor = min(self.cursor, len(self.buffer))
         if self.state is not None and hasattr(self.state, "composer_buffer"):
             self.state.composer_buffer = self.text
 
@@ -1468,34 +1575,63 @@ class RawLineEditor:
                 cleared_via_callback = (res is True)
             except Exception:
                 pass
-        if not cleared_via_callback:
-            offset_up = H + (1 if self.has_borders else 0)
+
+        term_size = shutil.get_terminal_size(fallback=(self.width, 24))
+        term_cols = term_size.columns
+        term_lines = getattr(self, "height", None) or term_size.lines
+        clamped_width = max(10, min(self.width, term_cols - 1))
+        visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+        cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+
+        c_row = None
+        if getattr(self, "state", None) is not None:
             try:
-                target.write(f"\x1b[{offset_up}A")
-                for _ in range(H):
-                    target.write("\r\x1b[2K\x1b[1B")
-                down_steps = 1 if self.has_borders else 0
-                if down_steps > 0:
-                    target.write(f"\x1b[{down_steps}B")
-                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
-                cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
-                target.write(f"\x1b[{cursor_col}G")
-                target.flush()
-            except Exception:
-                pass
-        else:
-            try:
-                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
-                cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
-                target.write(f"\x1b[{cursor_col}G")
-                target.flush()
+                from cli.tui.layout import compute_composer_cursor_row
+                c_row = compute_composer_cursor_row(
+                    term_lines,
+                    state=self.state,
+                    composer_content=self.text,
+                    cursor_line=0,
+                    width=clamped_width,
+                )
             except Exception:
                 pass
 
+        if not cleared_via_callback:
+            if c_row is not None:
+                top_border_row = c_row - 1
+                for r in range(max(1, top_border_row - H), top_border_row):
+                    target.write(f"\x1b[{r};1H\x1b[2K")
+            else:
+                offset_up = H + (1 if self.has_borders else 0)
+                try:
+                    target.write(f"\x1b[{offset_up}A")
+                    for _ in range(H):
+                        target.write("\r\x1b[2K\x1b[1B")
+                    down_steps = 1 if self.has_borders else 0
+                    if down_steps > 0:
+                        target.write(f"\x1b[{down_steps}B")
+                except Exception:
+                    pass
+
+        # Anchor cursor strictly inside the composer box
+        if c_row is not None:
+            target.write(f"\x1b[{c_row};{cursor_col}H")
+        else:
+            target.write(f"\x1b[{cursor_col}G")
+        target.flush()
+
     def insert_char(self, ch: str) -> None:
+        if not ch or ch in ("\x1b", "\x00"):
+            return
         was_empty = len(self.buffer) == 0
         self.buffer.insert(self.cursor, ch)
         self.cursor += 1
+        if "<" in self.text and any(m in self.text for m in ("[<", "^[[<", "\x1b[<")):
+            cleaned = re.sub(r"(?:\x1b|\^\[)?\[<\d+;\d+;\d+[Mm]", "", self.text)
+            if cleaned != self.text:
+                self.buffer = list(cleaned)
+                self.cursor = min(self.cursor, len(self.buffer))
         self._update_state()
         self._dropdown_dismissed = False
         self._update_dropdown()
@@ -1631,22 +1767,9 @@ class RawLineEditor:
                     self.on_alert(None)
                 except Exception:
                     pass
-            if self.bottom_border_renderer and self.has_borders:
-                try:
-                    border_str = self.bottom_border_renderer(None, self.attached_images)
-                    target = getattr(self, "out", sys.stdout)
-                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                    target.flush()
-                except TypeError:
-                    try:
-                        border_str = self.bottom_border_renderer(None)
-                        target = getattr(self, "out", sys.stdout)
-                        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                        target.flush()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
+            cursor_col = visible_prefix_len + getattr(self, "displayed_cursor", self.cursor) + 1
+            self._update_bottom_border(getattr(self, "out", sys.stdout), cursor_col, force=True)
 
         if key == Key.CTRL_D:
             if not self.buffer:
@@ -1934,7 +2057,21 @@ class RawLineEditor:
             self.paste_from_clipboard()
             return False
 
+        # Intercept any raw SGR mouse escape sequences in any encoding (e.g. ^[[<0;101;34M, \x1b[<0;101;34M, [<0;101;34M)
+        if isinstance(key, str) and ("<" in key and ";" in key and (key.endswith("M") or key.endswith("m"))):
+            mouse_matches = list(re.finditer(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)([Mm])", key))
+            if mouse_matches:
+                for match in mouse_matches:
+                    btn = int(match.group(1))
+                    col = int(match.group(2))
+                    row = int(match.group(3))
+                    action = match.group(4)
+                    self.handle_key(f"<MOUSE_{btn}_{col}_{row}_{action}>")
+                return False
+
         if key.startswith("<MOUSE_"):
+            if key == "<MOUSE_IGNORE>":
+                return False
             parts = key.strip("<>").split("_")
             if len(parts) >= 4:
                 try:
@@ -1944,11 +2081,40 @@ class RawLineEditor:
                     self.last_mouse_col = col
                     self.last_mouse_row = row
                     action = parts[4] if len(parts) > 4 else "M"
-                    if action not in ("m",):
-                        # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
-                        if btn == 2 or (btn & 0x0002 != 0):
-                            self.paste_from_clipboard()
-                            return False
+
+                    # Mouse release event (SGR action 'm' or 4-part release)
+                    if action in ("m",) or (len(parts) == 4 and btn == 0 and self._is_mouse_dragging):
+                        if self._is_mouse_dragging and self._mouse_drag_start is not None:
+                            start_col, start_row = self._mouse_drag_start
+                            if self.on_mouse_release:
+                                try:
+                                    self.on_mouse_release(start_col, start_row, col, row, self)
+                                except TypeError:
+                                    self.on_mouse_release(start_col, start_row, col, row)
+                        self._mouse_drag_start = None
+                        self._mouse_drag_current = None
+                        self._is_mouse_dragging = False
+                        return False
+
+                    # Right click (button 2 in SGR or flag 0x0002 in Win32) -> paste from clipboard
+                    if btn == 2 or (btn & 0x0002 != 0):
+                        self.paste_from_clipboard()
+                        return False
+
+                    if btn == 0:
+                        # Left button press
+                        self._mouse_drag_start = (col, row)
+                        self._mouse_drag_current = (col, row)
+                        self._is_mouse_dragging = False
+                        if self.on_mouse_click:
+                            self.on_mouse_click(col, row, btn)
+                    elif btn == 32:
+                        # Left button drag / motion
+                        self._is_mouse_dragging = True
+                        self._mouse_drag_current = (col, row)
+                        if self.on_mouse_click:
+                            self.on_mouse_click(col, row, btn)
+                    else:
                         if self.on_mouse_click:
                             self.on_mouse_click(col, row, btn)
                 except Exception:
@@ -1958,7 +2124,10 @@ class RawLineEditor:
             return False
 
         if len(key) > 1 and not key.startswith(("<", "\x1b")):
-            for ch in key:
+            clean_key = re.sub(r"(?:\x1b|\^\[)?\[<\d+;\d+;\d+[Mm]", "", key)
+            if not clean_key:
+                return False
+            for ch in clean_key:
                 if ch == "\r":
                     self._last_was_cr = True
                     self.insert_char("\n")
@@ -1997,6 +2166,49 @@ class RawLineEditor:
             _log_debug_key(f"[handle_key] UNHANDLED key ignored: {repr(key)}")
         return False
 
+    def _update_bottom_border(self, target: Any, cursor_col: int, force: bool = False) -> None:
+        """Update bottom border only when content (alert/attachments) changed, preserving cursor position."""
+        if not getattr(self, "bottom_border_renderer", None) or not getattr(self, "has_borders", False):
+            return
+
+        state_key = (self.alert, tuple(self.attached_images) if self.attached_images else ())
+        if not force and getattr(self, "_last_bottom_state", None) == state_key:
+            return
+
+        self._last_bottom_state = state_key
+        try:
+            border_str = self.bottom_border_renderer(self.alert, self.attached_images)
+        except TypeError:
+            try:
+                border_str = self.bottom_border_renderer(self.alert)
+            except Exception:
+                return
+        except Exception:
+            return
+
+        term_size = shutil.get_terminal_size(fallback=(self.width, 24))
+        term_cols = term_size.columns
+        term_lines = getattr(self, "height", None) or term_size.lines
+        clamped_width = max(10, min(self.width, term_cols - 1))
+
+        if getattr(self, "state", None) is not None:
+            try:
+                from cli.tui.layout import compute_composer_cursor_row
+                c_row = compute_composer_cursor_row(
+                    term_lines,
+                    state=self.state,
+                    composer_content=self.text,
+                    cursor_line=0,
+                    width=clamped_width,
+                )
+                target.write(f"\x1b[{c_row + 1};1H\r{border_str}\x1b[{c_row};{cursor_col}H")
+                return
+            except Exception:
+                pass
+
+        # Deterministic relative move down, write border, move back up, and reset column
+        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
+
     def redraw_line(self, out: Any = None) -> None:
         """Redraw current line with exact cursor placement and composer border preservation."""
         if getattr(self, "_in_redraw", False):
@@ -2009,9 +2221,35 @@ class RawLineEditor:
 
     def _do_redraw_line(self, out: Any = None) -> None:
         target = out if out is not None else getattr(self, "out", sys.stdout)
+        if "<" in self.text and any(m in self.text for m in ("[<", "^[[<", "\x1b[<")):
+            cleaned = re.sub(r"(?:\x1b|\^\[)?\[<\d+;\d+;\d+[Mm]", "", self.text)
+            if cleaned != self.text:
+                self.buffer = list(cleaned)
+                self.cursor = min(self.cursor, len(self.buffer))
         buf_str = "".join(self.buffer)
         v_lines, _, c_line, c_col = self._get_visual_lines()
         self.displayed_cursor = c_col
+
+        term_size = shutil.get_terminal_size(fallback=(self.width, 24))
+        term_cols = term_size.columns
+        term_lines = getattr(self, "height", None) or term_size.lines
+        clamped_width = max(10, min(self.width, term_cols - 1))
+
+        # In full-screen state mode, compute exact cursor row and anchor cursor to it FIRST
+        c_row = None
+        if getattr(self, "state", None) is not None:
+            try:
+                from cli.tui.layout import compute_composer_cursor_row
+                c_row = compute_composer_cursor_row(
+                    term_lines,
+                    state=self.state,
+                    composer_content=self.text,
+                    cursor_line=c_line,
+                    width=clamped_width,
+                )
+                target.write(f"\x1b[{c_row};1H")
+            except Exception:
+                pass
 
         # If multiline or wrapped, trigger full-screen height handler if available
         if len(v_lines) > 1:
@@ -2028,26 +2266,18 @@ class RawLineEditor:
             )
             visible_prefix_len = len(_ANSI_STRIP_RE.sub("", prefix))
             visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
-            inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
+            inner_available = max(0, clamped_width - visible_prefix_len - visible_right_len)
             displayed = cur_line_text
             self.displayed_cursor = c_col
             spaces_count = max(0, inner_available - len(displayed))
             line_out = f"\r{prefix}{displayed}{' ' * spaces_count}{self.right_border}"
             target.write(line_out)
             cursor_col = visible_prefix_len + c_col + 1
-            target.write(f"\x1b[{cursor_col}G")
-            if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
-                try:
-                    border_str = self.bottom_border_renderer(self.alert, self.attached_images)
-                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                except TypeError:
-                    try:
-                        border_str = self.bottom_border_renderer(self.alert)
-                        target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            if c_row is not None:
+                target.write(f"\x1b[{c_row};{cursor_col}H")
+            else:
+                target.write(f"\x1b[{cursor_col}G")
+            self._update_bottom_border(target, cursor_col)
             target.flush()
             return
 
@@ -2062,7 +2292,7 @@ class RawLineEditor:
 
         visible_prefix_len = len(_ANSI_STRIP_RE.sub("", self.prompt_prefix))
         visible_right_len = len(_ANSI_STRIP_RE.sub("", self.right_border))
-        inner_available = max(0, self.width - visible_prefix_len - visible_right_len)
+        inner_available = max(0, clamped_width - visible_prefix_len - visible_right_len)
 
         displayed = buf_str
         self.displayed_cursor = self.cursor
@@ -2073,20 +2303,13 @@ class RawLineEditor:
 
         # Move cursor to active edit position inside composer box
         cursor_col = visible_prefix_len + self.displayed_cursor + 1
-        target.write(f"\x1b[{cursor_col}G")
+        if c_row is not None:
+            target.write(f"\x1b[{c_row};{cursor_col}H")
+        else:
+            target.write(f"\x1b[{cursor_col}G")
 
-        if getattr(self, "bottom_border_renderer", None) and getattr(self, "has_borders", False):
-            try:
-                border_str = self.bottom_border_renderer(self.alert, self.attached_images)
-                target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-            except TypeError:
-                try:
-                    border_str = self.bottom_border_renderer(self.alert)
-                    target.write(f"\x1b[s\x1b[1B\r{border_str}\x1b[u")
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        # Update bottom border only if alert or attachments changed
+        self._update_bottom_border(target, cursor_col)
 
         # Dropdown management
         prev_H = self._last_dropdown_lines_count
@@ -2098,34 +2321,44 @@ class RawLineEditor:
             dropdown_lines = format_dropdown_lines(
                 self.dropdown_matches,
                 self.dropdown_index,
-                width=self.width,
+                width=clamped_width,
             )
             if dropdown_lines:
                 new_H = len(dropdown_lines)
                 self._last_dropdown_lines_count = new_H
                 try:
-                    # If previous dropdown was taller, clear the excess top lines first
-                    if prev_H > new_H:
-                        offset_top = prev_H + (1 if self.has_borders else 0)
-                        target.write(f"\x1b[{offset_top}A")
-                        excess = prev_H - new_H
-                        for _ in range(excess):
-                            target.write("\r\x1b[2K\x1b[1B")
+                    if c_row is not None:
+                        top_border_row = c_row - 1
+                        for i, d_line in enumerate(dropdown_lines):
+                            d_row = top_border_row - new_H + i
+                            target.write(f"\x1b[{d_row};1H\r{d_line}\x1b[K")
+                        target.write(f"\x1b[{c_row};{cursor_col}H")
                     else:
-                        offset_up = new_H + (1 if self.has_borders else 0)
-                        target.write(f"\x1b[{offset_up}A")
+                        if prev_H > new_H:
+                            offset_top = prev_H + (1 if self.has_borders else 0)
+                            target.write(f"\x1b[{offset_top}A")
+                            excess = prev_H - new_H
+                            for _ in range(excess):
+                                target.write("\r\x1b[2K\x1b[1B")
+                        else:
+                            offset_up = new_H + (1 if self.has_borders else 0)
+                            target.write(f"\x1b[{offset_up}A")
 
-                    for d_line in dropdown_lines:
-                        target.write(f"\r{d_line}\x1b[K\x1b[1B")
+                        for d_line in dropdown_lines:
+                            target.write(f"\r{d_line}\x1b[K\x1b[1B")
 
-                    down_steps = 1 if self.has_borders else 0
-                    if down_steps > 0:
-                        target.write(f"\x1b[{down_steps}B")
-                    target.write(f"\x1b[{cursor_col}G")
+                        down_steps = 1 if self.has_borders else 0
+                        if down_steps > 0:
+                            target.write(f"\x1b[{down_steps}B")
+                        target.write(f"\x1b[{cursor_col}G")
                 except Exception:
                     pass
             elif prev_H > 0:
                 self._erase_dropdown(target)
+
+        # Anchor cursor strictly inside the composer box
+        if c_row is not None:
+            target.write(f"\x1b[{c_row};{cursor_col}H")
 
         target.flush()
 
@@ -2137,6 +2370,7 @@ def raw_prompt_input(
     placeholder: str = "Type a message...",
     shortcuts: str = "Ctrl+K commands | Ctrl+L clear",
     width: int = 80,
+    height: Optional[int] = None,
     initial_text: str = "",
     history: Optional[list[str]] = None,
     state: Optional[Any] = None,
@@ -2164,6 +2398,7 @@ def raw_prompt_input(
     on_height_change: Optional[Callable[[Any], None]] = None,
     on_resize: Optional[Callable[..., None]] = None,
     on_mouse_click: Optional[Callable[..., None]] = None,
+    on_mouse_release: Optional[Callable[..., None]] = None,
 ) -> str:
     """Prompt user using low-level raw keyboard interception.
 
@@ -2197,9 +2432,24 @@ def raw_prompt_input(
         """Dynamically update top border when typing begins or buffer is emptied."""
         if top_border_renderer and is_tty:
             try:
-                # Save cursor (\x1b[s), move up 1 row (\x1b[1A), rewrite border, restore cursor (\x1b[u)
                 border_str = top_border_renderer(has_content)
-                sys.stdout.write(f"\x1b[s\x1b[1A\r{border_str}\x1b[u")
+                term_size = shutil.get_terminal_size(fallback=(width, 24))
+                term_cols = term_size.columns
+                term_lines = getattr(editor, "height", None) or term_size.lines
+                clamped_width = max(10, min(width, term_cols - 1))
+                visible_prefix_len = len(_ANSI_STRIP_RE.sub("", prompt_prefix))
+                cursor_col = visible_prefix_len + getattr(editor, "displayed_cursor", getattr(editor, "cursor", 0)) + 1
+                if state is not None:
+                    try:
+                        from cli.tui.layout import compute_composer_cursor_row
+                        c_row = compute_composer_cursor_row(term_lines, state=state, composer_content=editor.text, cursor_line=0, width=clamped_width)
+                        top_border_row = c_row - 1
+                        sys.stdout.write(f"\x1b[{top_border_row};1H\r{border_str}\x1b[{c_row};{cursor_col}H")
+                        sys.stdout.flush()
+                        return
+                    except Exception:
+                        pass
+                sys.stdout.write(f"\r\x1b[1A{border_str}\x1b[1B\r\x1b[{cursor_col}G")
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -2315,6 +2565,14 @@ def raw_prompt_input(
             except TypeError:
                 on_mouse_click(col, row, button)
 
+    def wrapped_mouse_release(start_col: int, start_row: int, end_col: int, end_row: int) -> None:
+        """Handle mouse drag release for text selection and copying."""
+        if on_mouse_release:
+            try:
+                on_mouse_release(start_col, start_row, end_col, end_row, editor)
+            except TypeError:
+                on_mouse_release(start_col, start_row, end_col, end_row)
+
     editor = RawLineEditor(
         prompt_prefix=prompt_prefix,
         initial_text=initial_text,
@@ -2335,8 +2593,10 @@ def raw_prompt_input(
         on_wheel_up=wrapped_wheel_up,
         on_wheel_down=wrapped_wheel_down,
         on_mouse_click=wrapped_mouse_click,
+        on_mouse_release=wrapped_mouse_release,
         on_transition=handle_transition,
         width=width,
+        height=height,
         commands=commands,
         on_clear_dropdown=on_clear_dropdown,
         bottom_border_renderer=bottom_border_renderer,
@@ -2346,6 +2606,8 @@ def raw_prompt_input(
 
     try:
         with TerminalStateRestorer(state=state):
+            if key_stream is None:
+                drain_console_input()
             editor.redraw_line()
             last_term_size = shutil.get_terminal_size(fallback=(width, 24))
             while True:
@@ -2367,7 +2629,8 @@ def raw_prompt_input(
                             except Exception:
                                 pass
                         else:
-                            editor.width = term_size.columns
+                            editor.width = max(10, term_size.columns - 1)
+                            editor.height = term_size.lines
                             editor.redraw_line()
 
                     if k is None:
@@ -2393,16 +2656,18 @@ def raw_prompt_input(
                     if done:
                         if editor._last_dropdown_lines_count > 0:
                             editor._erase_dropdown()
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if state is None:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         break
                     editor.redraw_line()
                 except KeyboardInterrupt:
                     if getattr(editor, "_confirmed_exit", False):
                         if editor._last_dropdown_lines_count > 0:
                             editor._erase_dropdown()
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if state is None:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         raise
                     try:
                         editor.handle_key(Key.CTRL_C)
@@ -2411,14 +2676,16 @@ def raw_prompt_input(
                     except KeyboardInterrupt:
                         if editor._last_dropdown_lines_count > 0:
                             editor._erase_dropdown()
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if state is None:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         raise
                 except EOFError:
                     if editor._last_dropdown_lines_count > 0:
                         editor._erase_dropdown()
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
+                    if state is None:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
                     raise
     finally:
         if state is not None:
@@ -2450,10 +2717,9 @@ def poll_stream_key() -> str | None:
     Does not consume/discard non-scroll keys.
     """
     if os.name == "nt":
-        import msvcrt
-        if not msvcrt.kbhit():
+        if not has_pending_input():
             return None
-        return _read_raw_key_windows(timeout=0.01)
+        return read_next_key(timeout=0.01)
     else:
         import select
         fd = sys.stdin.fileno()

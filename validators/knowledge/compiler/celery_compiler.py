@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .parse import ParsedFile, ParsedRelation, ParsedSymbol, node_hash as _node_hash
+from .parse import ParsedFile, ParsedRelation, ParsedSymbol, node_hash as _node_hash, safe_unparse as _safe_unparse, location as _location
 
 
 def augment_parsed_files(parsed_files: list[ParsedFile]) -> None:
@@ -389,18 +389,8 @@ def _safe_key(value: str) -> str:
     return ''.join(character if character.isalnum() else '_' for character in value).strip('_') or 'item'
 
 
-def _location(node: ast.AST) -> dict[str, int]:
-    return {
-        'column': int(getattr(node, 'col_offset', 0)),
-        'end_column': int(getattr(node, 'end_col_offset', 0) or 0),
-        'end_line': int(getattr(node, 'end_lineno', getattr(node, 'lineno', 1)) or 1),
-        'line': int(getattr(node, 'lineno', 1) or 1),
-    }
 
 
 
-def _safe_unparse(node: ast.AST) -> str:
-    try:
-        return ast.unparse(node)
-    except Exception:
-        return ast.dump(node, include_attributes=False)
+
+

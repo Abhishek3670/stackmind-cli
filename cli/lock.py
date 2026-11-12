@@ -16,12 +16,92 @@ Lock file format (YAML):
     acquired_at: 2026-06-10T09:14:00+05:30
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import time
+import uuid
 
 import yaml
 
 LOCK_REL = "runtime/LOCK"
+
+
+@contextmanager
+def _lock_gate(sync_path: Path, timeout: float = 10.0):
+    """Acquire an exclusive OS-level gate lock around critical lock file mutations.
+
+    Uses kernel-managed locks (msvcrt on Windows, fcntl on POSIX) on a dedicated
+    `.sync/runtime/.LOCK.gate` file. If a process terminates abruptly, the OS kernel
+    automatically releases the gate lock without leaving stale state.
+    """
+    runtime_dir = sync_path / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    gate_path = runtime_dir / ".LOCK.gate"
+
+    fd = os.open(str(gate_path), os.O_RDWR | os.O_CREAT, 0o666)
+    locked = False
+    start_time = time.monotonic()
+    try:
+        if os.name == "nt":
+            import msvcrt
+            # Ensure at least 1 byte exists in gate file for byte 0 locking
+            try:
+                if os.path.getsize(str(gate_path)) == 0:
+                    os.write(fd, b"L")
+                    os.fsync(fd)
+            except OSError:
+                pass
+
+            while time.monotonic() - start_time < timeout:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except (OSError, PermissionError):
+                    time.sleep(0.02)
+        else:
+            import fcntl
+            while time.monotonic() - start_time < timeout:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except (OSError, BlockingIOError):
+                    time.sleep(0.02)
+
+        if not locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+            except OSError:
+                pass
+
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def get_lock_path(sync_path: Path) -> Path:
@@ -44,13 +124,18 @@ def read_lock(sync_path: Path) -> dict | None:
     lock_path = get_lock_path(sync_path)
     if not lock_path.exists():
         return None
-    try:
-        data = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
-    except (yaml.YAMLError, OSError):
-        return None
-    if not isinstance(data, dict) or "held_by" not in data:
-        return None
-    return data
+    for attempt in range(3):
+        try:
+            data = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or "held_by" not in data:
+                return None
+            return data
+        except (yaml.YAMLError, OSError):
+            if attempt < 2:
+                time.sleep(0.01)
+                continue
+            return None
+    return None
 
 
 def lock_is_malformed(sync_path: Path) -> bool:
@@ -67,7 +152,7 @@ def acquire_lock(
     session_id: str | int | None = None,
     force: bool = False,
 ) -> tuple[bool, str]:
-    """Acquire the write lock for ``agent`` with atomic creation to prevent TOCTOU races.
+    """Acquire the write lock for ``agent`` with cross-process serialization to prevent races.
 
     Args:
         sync_path: Path to the .sync/ runtime directory.
@@ -80,7 +165,6 @@ def acquire_lock(
         the lock and ``force`` is not set. Re-acquiring a lock already held by
         the same agent succeeds and refreshes the timestamp.
     """
-    import os
     runtime_dir = sync_path / "runtime"
     if not runtime_dir.is_dir():
         return False, f"runtime directory not found at {runtime_dir}"
@@ -93,64 +177,56 @@ def acquire_lock(
     }
     payload = yaml.dump(lock_data, default_flow_style=False, sort_keys=False).encode("utf-8")
 
-    # Atomic creation attempt (O_CREAT | O_EXCL)
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
+    with _lock_gate(sync_path):
+        existing = read_lock(sync_path)
+        stolen = False
+        previous_holder = None
+        if existing is not None:
+            holder = existing.get("held_by")
+            if holder != agent:
+                if not force:
+                    return (
+                        False,
+                        f"LOCK held by '{holder}' (session {existing.get('session_id')}, "
+                        f"acquired {existing.get('acquired_at')}). "
+                        f"Use --force to override or wait for '{holder}' to shut down.",
+                    )
+                else:
+                    stolen = True
+                    previous_holder = holder
+
+        # Update/create lock atomically via unique PID/UUID temporary file
+        tmp_path = lock_path.with_name(f".LOCK.{os.getpid()}_{uuid.uuid4().hex[:8]}.tmp")
+        tmp_path.write_bytes(payload)
+        try:
+            os.replace(tmp_path, lock_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+
+        if stolen:
+            receipts_dir = sync_path / "runtime" / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            timestamp_str = datetime.now(timezone.utc).isoformat()
+            filename_timestamp = timestamp_str.replace(":", "-").replace(".", "-")
+            event_file = receipts_dir / f"LOCK_STOLEN_{agent}_{filename_timestamp}.yaml"
+            event_data = {
+                "event_type": "LOCK_STOLEN",
+                "agent": agent,
+                "session_id": session_id,
+                "stolen_from": previous_holder,
+                "timestamp": timestamp_str,
+            }
+            event_file.write_text(
+                yaml.dump(event_data, default_flow_style=False, sort_keys=False),
+                encoding="utf-8",
+            )
+            return True, f"LOCK forcibly acquired by '{agent}' (was held by '{previous_holder}')"
         return True, f"LOCK acquired by '{agent}'"
-    except FileExistsError:
-        pass  # Lock file already exists; inspect it
-
-    existing = read_lock(sync_path)
-    stolen = False
-    previous_holder = None
-    if existing is not None:
-        holder = existing.get("held_by")
-        if holder != agent:
-            if not force:
-                return (
-                    False,
-                    f"LOCK held by '{holder}' (session {existing.get('session_id')}, "
-                    f"acquired {existing.get('acquired_at')}). "
-                    f"Use --force to override or wait for '{holder}' to shut down.",
-                )
-            else:
-                stolen = True
-                previous_holder = holder
-
-    # Update/steal existing lock atomically via temporary file and atomic replace
-    tmp_path = lock_path.with_suffix(".tmp")
-    tmp_path.write_bytes(payload)
-    try:
-        os.replace(tmp_path, lock_path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-    if stolen:
-        receipts_dir = sync_path / "runtime" / "receipts"
-        receipts_dir.mkdir(parents=True, exist_ok=True)
-        timestamp_str = datetime.now(timezone.utc).isoformat()
-        filename_timestamp = timestamp_str.replace(":", "-").replace(".", "-")
-        event_file = receipts_dir / f"LOCK_STOLEN_{agent}_{filename_timestamp}.yaml"
-        event_data = {
-            "event_type": "LOCK_STOLEN",
-            "agent": agent,
-            "session_id": session_id,
-            "stolen_from": previous_holder,
-            "timestamp": timestamp_str,
-        }
-        event_file.write_text(
-            yaml.dump(event_data, default_flow_style=False, sort_keys=False),
-            encoding="utf-8",
-        )
-        return True, f"LOCK forcibly acquired by '{agent}' (was held by '{previous_holder}')"
-    return True, f"LOCK acquired by '{agent}'"
 
 
 def release_lock(sync_path: Path, agent: str, force: bool = False) -> tuple[bool, str]:
-    """Release the write lock held by ``agent``.
+    """Release the write lock held by ``agent`` under cross-process gate serialization.
 
     Args:
         sync_path: Path to the .sync/ runtime directory.
@@ -162,27 +238,33 @@ def release_lock(sync_path: Path, agent: str, force: bool = False) -> tuple[bool
         (idempotent). Releasing a lock held by a different agent fails unless
         ``force`` is set.
     """
-    lock_path = get_lock_path(sync_path)
-    existing = read_lock(sync_path)
-
-    if existing is None:
-        # No well-formed lock. If a malformed file exists, clean it up.
-        if lock_path.exists():
-            lock_path.unlink()
-            return True, "Removed malformed LOCK file"
+    runtime_dir = sync_path / "runtime"
+    if not runtime_dir.is_dir():
         return True, "No LOCK held; nothing to release"
 
-    holder = existing.get("held_by")
-    if holder != agent and not force:
-        return (
-            False,
-            f"LOCK held by '{holder}', not '{agent}'. Use --force to override.",
-        )
+    lock_path = get_lock_path(sync_path)
 
-    lock_path.unlink(missing_ok=True)
-    if holder != agent:
-        return True, f"LOCK forcibly released (was held by '{holder}')"
-    return True, f"LOCK released by '{agent}'"
+    with _lock_gate(sync_path):
+        existing = read_lock(sync_path)
+
+        if existing is None:
+            # No well-formed lock. If a malformed file exists, clean it up.
+            if lock_path.exists():
+                lock_path.unlink(missing_ok=True)
+                return True, "Removed malformed LOCK file"
+            return True, "No LOCK held; nothing to release"
+
+        holder = existing.get("held_by")
+        if holder != agent and not force:
+            return (
+                False,
+                f"LOCK held by '{holder}', not '{agent}'. Use --force to override.",
+            )
+
+        lock_path.unlink(missing_ok=True)
+        if holder != agent:
+            return True, f"LOCK forcibly released (was held by '{holder}')"
+        return True, f"LOCK released by '{agent}'"
 
 
 def lock_held_by_other(sync_path: Path, agent: str) -> bool:

@@ -426,6 +426,71 @@ completion:
     assert res.code == "DEPENDENCIES_SATISFIED"
 
 
+def test_contract_without_explicit_write_mode_defaults_to_read_write_for_authorable_files():
+    """Contracts with authorable files (e.g. tests/**) but omitting write: read-write must not lock workers out."""
+    from validators.kernel.contract import ContractNormalizer, ContractEvaluator
+
+    raw = {
+        "schema_version": 1,
+        "agent_id": "gemma",
+        "work_order": "WO-052",
+        "identity": {"role": "qa", "reports_to": "claude"},
+        "scope": {
+            "allow": [{"module": "tests/test_integration.py"}, {"module": ".sync/reviews/qa/WO-052.json"}],
+            "deny": [{"module": "src/**"}],
+        },
+        "budget": {"max_files_touched": 5, "max_tokens": 30000},
+    }
+
+    norm = ContractNormalizer.normalize(raw)
+    assert norm.write_mode == "read-write"
+
+    evaluator = ContractEvaluator()
+    ok, reason = evaluator.authorize(norm, "write_file", "tests/test_integration.py")
+    assert ok is True
+    assert reason == "authorized"
+
+
+def test_recovery_decision_sanitizes_null_replacement_work_orders(tmp_path: Path):
+    """LLMs emitting 'replacement_work_orders': null must be sanitized so schema validation passes."""
+    import json
+    from validators.kernel.daemon.supervisor.recovery import _RecoveryMixin
+
+    mixin = _RecoveryMixin()
+    mixin.ws = tmp_path
+
+    # AuthoringGate schema lookup expects schemas/ in workspace or repo
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    repo_schema = Path(__file__).parent.parent / "schemas" / "recovery-decision.schema.json"
+    (schema_dir / "recovery-decision.schema.json").write_text(repo_schema.read_text(encoding="utf-8"), encoding="utf-8")
+
+    rec_dir = tmp_path / ".sync" / "decisions" / "recovery"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+
+    dec_file = rec_dir / "WO-052.decision.json"
+    dec_file.write_text(
+        json.dumps({
+            "work_order": "WO-052",
+            "action": "architect_fix",
+            "reason": "Resolving dependency deadlock",
+            "failure_code": "DEPENDENCY_DEADLOCK",
+            "transient": False,
+            "contract_revision": 2,
+            "replacement_work_orders": None,
+        }),
+        encoding="utf-8",
+    )
+
+    loaded, err = mixin._load_recovery_decision(tmp_path, "WO-052", {})
+    assert err is None
+    assert loaded is not None
+    assert loaded["work_order"] == "WO-052"
+    assert "replacement_work_orders" not in loaded
+
+
+
+
 
 
 

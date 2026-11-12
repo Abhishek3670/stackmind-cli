@@ -5,6 +5,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.17.0] - 2026-11-12
+
+### Fixed
+- **TUI Thinking Timer Isolation**:
+  - Each `▼ Thought for Xs` segment now tracks its own independent start time instead of sharing a single cumulative timer. Fixed `_append_thinking_segment()` in `cli/tui/state.py` to never append to already-finalized segments (those with an `elapsed` field), and `_finalize_last_thinking_segment()` to iterate in reverse and finalize only the last unfinalized thinking segment.
+- **Cross-Process Lock Race Condition** (`cli/lock.py`):
+  - Concurrent `acquire_lock` / `release_lock` calls can no longer overwrite each other. Introduced `_lock_gate()` context manager using OS-level file locking (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX) around `.sync/runtime/.LOCK.gate` to serialize all lock mutations as a single atomic read-decide-replace operation.
+  - PID+UUID-isolated temporary files prevent collisions between concurrent writers.
+  - Retry loop in `read_lock()` handles transient Windows `PermissionError` during file replacement.
+- **Daemon State Truncation on Failed Save** (`validators/kernel/daemon/storage.py`):
+  - Removed dangerous direct-write fallback (`open("w")`) that could truncate the state file to 0 bytes on crash. Replaced with 10-retry progressive backoff (`0.02 * (attempt + 1)`), automatic `.bak` backup before replacement, and `.pending.json` fallback path.
+  - `load()` now recovers from `.pending.json` or `.json.bak` if the primary state file is corrupt or missing.
+- **Daemon Request Size & Concurrency Limits** (`validators/kernel/daemon/server.py`):
+  - Added `MAX_REQUEST_BODY_SIZE` (16 MB, configurable via `STACKMIND_MAX_REQUEST_BODY_SIZE`) with `Content-Length` validation (411/400/413 responses).
+  - Added `BoundedSemaphore(64)` concurrency cap (configurable via `STACKMIND_MAX_CONCURRENT_REQUESTS`) with 503 rejection for excess connections.
+  - Added 30s client socket timeout (configurable via `STACKMIND_CLIENT_SOCKET_TIMEOUT`) for slowloris protection.
+
+## [3.16.0] - 2026-11-12
+
+### Added
+- **Autonomous Uninterrupted Orchestration with Laya Decision Specialist**:
+  - Implemented `LayaDecisionAdapter` in `validators/kernel/daemon/supervisor/laya_adapter.py` providing deterministic, schema-compliant fallback recovery decisions when architecture repair turns fail, time out, or stall.
+  - Added autonomous recovery decision fallback into `_load_recovery_decision` and `_advance_recovery_decision` in `recovery.py` and `phases.py`, eliminating manual `:resume` interruptions and avoiding `MAX_RECOVERY_ATTEMPTS_EXHAUSTED` loops.
+  - Added turn timeout rescue for `Phase.ARCHITECT_RECOVERY_DECISION` in `validators/kernel/daemon/supervisor/core.py`, preventing runner timeouts from forcing the session into `WAITING_FOR_HUMAN` or `BLOCKED`.
+  - Added comprehensive test coverage in `tests/test_autonomous_recovery_and_laya_decision.py` verifying synthetic decision generation, schema compliance, and timeout recovery.
+
+### Fixed
+- **In-Memory Python Syntax Verification in Review Gate**:
+  - In `validators/harness/review_gate.py` (`run_stack_appropriate_verifier`), replaced external `subprocess.run([sys.executable, "-m", "py_compile", ...])` with in-memory Python syntax compilation using `compile(content, str(target), "exec")`.
+  - Resolves Windows filesystem locking issues (`[Errno 13] Permission denied`) caused by concurrent processes writing into `.pyc` caches in `__pycache__` directories.
+- **Delegation Routing & QA Review Hijacking Prevention**:
+  - In `validators/kernel/tools.py` (`delegate_task`), constrained `is_review` to only match when `canonical_role == "qa"` or `canonical_agent in ("gemma", "qa")`. Prevents worker instructions that mention words like "verify" from inadvertently hijacking active worker delegations into predecessor QA review operations.
+  - Added explicit `work_order_id` argument and `\b(WO-\d{3})\b` regex parsing to `delegate_task` to ensure worker re-dispatch binds directly to existing active repair work orders (e.g. `WO-003`).
+  - In `_find_existing_deliverable_owner`, prioritized active work orders over completed predecessor tasks even when work orders are momentarily transitioning.
+- **Supervisor Operation Cleanup & Re-blocking Prevention**:
+  - Cleaned up stale `dependency_escalation_op_id` in `_reset_phase_operation_id()` and `_cleanup_orphaned_operations()` in `manager.py`, preventing cancelled turns from immediately re-blocking the supervisor loop in 25ms.
+  - Routed failed dependency escalations to `Phase.ARCHITECT_RECOVERY_DECISION` rather than immediately transitioning to `Phase.BLOCKED`.
+- **TUI Cursor Drift Elimination & Composer Margins**:
+  - In `cli/tui/app.py` and `cli/tui/terminal.py`, clamped composer cursor row and column coordinates strictly within layout bounds, eliminating cursor drift during typing, command execution, and viewport shifts.
+  - Drained trailing mouse escape sequences from input buffers to prevent escape sequences from leaking into composer text.
+  - Hoisted mouse reporting imports in `cli/tui/terminal.py`, fixing `UnboundLocalError` on `:exit`.
+  - Excluded internal work-order and QA reports from conversational transcript recovery in `cli/tui/app.py`.
+- **LLM Chat History Error Sanitization**:
+  - Sanitized raw transport errors (e.g. Ollama 402 billing notices) and internal system notices from agent chat histories in `validators/harness/` and `cli/tui/app.py`, preventing transient server messages from polluting LLM context windows.
+
+### Refactored
+- **Ponytail Compiler AST Helper Deduplication**:
+  - Added canonical `safe_unparse()` and `location()` implementations to `validators/knowledge/compiler/parse.py`.
+  - Deduplicated repeated AST unparsing and node location helper routines across Alembic, Celery, Django, FastAPI, Pydantic, and SQLAlchemy compilers, cutting boilerplate and ensuring uniform error handling.
+- **Contract SHA-256 Hash Deduplication**:
+  - In `validators/harness/contract_gate.py`, replaced internal `_contract_file_sha256` implementation by directly importing and reusing `validators/harness/contract_hash.py`.
+
+## [3.15.0] - 2026-11-11
+
+### Added
+- **Terminal Mouse Interaction & SGR Extended Reporting**:
+  - Enabled standard terminal SGR mouse reporting (`\x1b[?1000h\x1b[?1002h\x1b[?1006h`) in `cli/tui/keyboard.py` and `cli/tui/terminal.py`.
+  - Added Windows Console QuickEdit mode synchronization: automatically clears `ENABLE_QUICK_EDIT_MODE` when mouse reporting is enabled so clicks, drags, and wheel events route directly to the TUI; safely restores QuickEdit on exit or when mouse reporting is disabled.
+  - Added `:mouse [on|off]` slash command to toggle mouse reporting at runtime, registered in autocomplete dropdown and command palette.
+- **Collapsible Runtime Side Panel (`Ctrl+B`)**:
+  - Added sidebar toggle support via keyboard shortcut (`Ctrl+B`), clickable header button (`[–]` to collapse, `[+ Expand]` to restore), divider click (`│`), or slash commands (`:collapse`, `:panel`, `:sidebar`).
+  - Added `:scrollbar [on|off]` command to control right-edge scrollbar visibility when the side panel is collapsed.
+- **Column-Isolated In-App Drag-to-Copy**:
+  - Added `_handle_mouse_release` in `cli/tui/app.py` to extract conversation text cleanly without selecting sidebar widgets, divider characters, or prompt input.
+  - Preserves 100% of leading indentation, nested bullet points (`•`), list markers (` 1 `), and blank separator lines.
+  - Automatically trims outer conversation margin padding (`Padding((0, 1))`) so top-level headings are flush while relative list indentation is preserved.
+- **Pristine Markdown Copying in `:copy`**:
+  - Integrated `strip_internal_reasoning` and `format_contract_payload` in `cli/tui/commands.py` (`:copy`) so raw contract JSON and `<think>` tags are formatted into clean Markdown with original code backticks, indentation, and line spacing.
+- **Edge-to-Edge True ANSI Clearing**:
+  - Replaced space padding with `\x1b[K` (*Erase to Line End*) in `_pad_frame_to_width` in `cli/tui/terminal.py` and stripped trailing spaces in `slice_conversation_viewport` in `cli/tui/layout.py`. Eliminates hundreds of trailing space characters from terminal cells and guarantees native terminal selections copy clean empty newlines without full-width space blocks.
+
+### Fixed
+- **Read-Write Contract Auto-Defaulting on Recovery**:
+  - In `validators/kernel/contract.py`, worker contracts declaring authorable files default to read-write mode to prevent unauthorized write attempts during recovery cycles.
+- **Sanitized Null Work Orders in Recovery Decisions**:
+  - In `validators/kernel/daemon/supervisor/recovery.py`, sanitized null or missing `replacement_work_orders` and contract revisions, preventing validation crashes on autonomous repair application.
+
+### Performance
+- **Ponytail Ladder Optimizations**:
+  - Consolidated duplicate trailing whitespace regex passes into shared `_strip_trailing_spaces` helper across layout and terminal rendering.
+  - Compacted `_pad_frame_to_width` and `:scrollbar` command parsing.
+
 ## [3.14.1] - 2026-11-10
 
 ### Added

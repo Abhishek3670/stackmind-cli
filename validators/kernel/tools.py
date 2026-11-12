@@ -3946,7 +3946,7 @@ class ToolGateway:
                 if not isinstance(data, dict):
                     continue
                 status = str(data.get("status", bucket)).upper()
-                if status in ("CANCELLED", "SUPERSEDED"):
+                if bucket != "ACTIVE" and status in ("CANCELLED", "SUPERSEDED"):
                     continue
                 assigned = data.get("assigned_agents", [])
                 if not isinstance(assigned, list):
@@ -3978,6 +3978,7 @@ class ToolGateway:
         target_agent: str,
         instructions: str,
         target_files: Sequence[str] | str | None = None,
+        work_order_id: str | None = None,
     ) -> dict[str, Any]:
         clean_target = str(target_agent).lower().strip()
         if clean_target in ("frontend", "ui", "web", "design", "gemini"):
@@ -4030,6 +4031,7 @@ class ToolGateway:
         rel_wo_file: str | None = None
         rel_contract_file: str | None = None
         try:
+            import re as _re
             from validators.kernel.daemon.authoring import (
                 get_next_work_order_int,
                 build_child_work_order,
@@ -4042,13 +4044,50 @@ class ToolGateway:
 
             scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
 
+            # Check if an explicit active work order was requested or referenced in instructions
+            explicit_wo_id = work_order_id
+            if not explicit_wo_id and instructions:
+                match = _re.search(r"\b(WO-\d{3})\b", str(instructions))
+                if match:
+                    candidate = match.group(1)
+                    if (scan_root / ".sync" / "work-orders" / "ACTIVE" / f"{candidate}.yaml").is_file():
+                        explicit_wo_id = candidate
+
+            if explicit_wo_id:
+                wo_id = explicit_wo_id
+                rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
+                rel_contract_file = f".sync/contracts/{wo_id}.yaml"
+                act_f = self.workspace.root / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                if act_f.is_file():
+                    try:
+                        wo_data = yaml.safe_load(act_f.read_text(encoding="utf-8")) or {}
+                        if str(wo_data.get("status", "")).upper() != "ACTIVE":
+                            wo_data["status"] = "ACTIVE"
+                            act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
+                self.boundary.journal.complete(record.request.operation_id, f"Delegated to existing active {wo_id}")
+                return {
+                    "status": "delegated",
+                    "work_order_id": wo_id,
+                    "work_order_file": rel_wo_file,
+                    "contract_file": rel_contract_file,
+                    "agent": canonical_agent,
+                    "role": canonical_role,
+                    "instructions": str(instructions).strip(),
+                    "target_files": clean_files,
+                    "deduplicated": True,
+                    "message": (
+                        f"Delegated task to active work order {wo_id} for {canonical_role} ({canonical_agent})."
+                    ),
+                }
+
             # --- Deliverable Ownership Enforcement & Review Deduplication ---
             owner_info = self._find_existing_deliverable_owner(scan_root, clean_files)
             if owner_info:
                 existing_wo_id, existing_agent, existing_role, existing_status, matched_file = owner_info
-                is_review = (canonical_role == "qa") or any(
-                    w in instructions.lower() for w in ("review", "verify", "qa", "test", "audit")
-                )
+                # A review is ONLY registered if the delegated agent is QA. Backend/Frontend are implementers.
+                is_review = (canonical_role == "qa") or (canonical_agent in ("gemma", "qa"))
                 if is_review:
                     # A QA review of an existing order is a review operation, NOT a new work order!
                     self.boundary.journal.complete(record.request.operation_id, f"Registered QA review for {existing_wo_id}")
