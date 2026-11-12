@@ -223,3 +223,48 @@ class TestValidateLock:
         result = validate(fresh_project)
         lock_issues = [i for i in result.issues if "LOCK" in i.message]
         assert len(lock_issues) == 0
+
+
+class TestConcurrentLockAcquisition:
+    def test_concurrent_unforced_acquisitions_allow_only_one_winner(self, sync_path):
+        import concurrent.futures
+        agents = [f"agent-{i}" for i in range(10)]
+        results = []
+
+        def _try_acquire(agent_name):
+            return agent_name, acquire_lock(sync_path, agent_name, force=False)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(_try_acquire, a) for a in agents]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        successes = [r for r in results if r[1][0] is True]
+        failures = [r for r in results if r[1][0] is False]
+
+        assert len(successes) == 1
+        assert len(failures) == 9
+        winner = successes[0][0]
+        assert read_lock(sync_path)["held_by"] == winner
+
+    def test_concurrent_forced_acquisitions_serialize_cleanly(self, sync_path):
+        import concurrent.futures
+        # Pre-seed initial lock
+        acquire_lock(sync_path, "seed-agent", force=False)
+        agents = [f"force-agent-{i}" for i in range(8)]
+        results = []
+
+        def _try_force(agent_name):
+            return agent_name, acquire_lock(sync_path, agent_name, force=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_try_force, a) for a in agents]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        # All forced acquisitions must succeed in serialized sequence
+        assert all(r[1][0] is True for r in results)
+        current = read_lock(sync_path)["held_by"]
+        assert current in agents
+        receipts = list((sync_path / "runtime" / "receipts").glob("LOCK_STOLEN_*.yaml"))
+        assert len(receipts) == 8

@@ -777,17 +777,19 @@ class AutonomousDeliveryState:
         if not hasattr(self, "current_turn_segments") or not self.current_turn_segments:
             self.current_turn_thinking_start_time = None
             return
-        last_seg = self.current_turn_segments[-1]
-        if last_seg.get("kind") == "thinking" and "elapsed" not in last_seg:
-            import time
-            st = last_seg.get("start_time")
-            now = time.monotonic()
-            if st is not None:
-                last_seg["end_time"] = now
-                last_seg["elapsed"] = max(0.1, round(now - st, 1))
-            else:
-                toks = len(last_seg.get("content", "").split())
-                last_seg["elapsed"] = max(0.1, round(toks / 35.0, 1))
+        import time
+        now = time.monotonic()
+        for seg in reversed(self.current_turn_segments):
+            if seg.get("kind") == "thinking":
+                if "elapsed" not in seg:
+                    st = seg.get("start_time")
+                    if st is not None:
+                        seg["end_time"] = now
+                        seg["elapsed"] = max(0.1, round(now - st, 1))
+                    else:
+                        toks = len(seg.get("content", "").split())
+                        seg["elapsed"] = max(0.1, round(toks / 35.0, 1))
+                break
         self.current_turn_thinking_start_time = None
 
     def record_turn_text(self, delta: str) -> None:
@@ -810,7 +812,11 @@ class AutonomousDeliveryState:
             self.current_turn_segments = []
         import time
         now = time.monotonic()
-        if self.current_turn_segments and self.current_turn_segments[-1].get("kind") == "thinking":
+        if (
+            self.current_turn_segments
+            and self.current_turn_segments[-1].get("kind") == "thinking"
+            and "elapsed" not in self.current_turn_segments[-1]
+        ):
             self.current_turn_segments[-1]["content"] += text
         else:
             self.current_turn_thinking_start_time = now

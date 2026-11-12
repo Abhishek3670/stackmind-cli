@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Thread
+from threading import BoundedSemaphore, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -16,18 +17,74 @@ from .manager import SessionManager
 from .protocol import JsonRpcProtocol
 from .storage import DaemonStorage
 
+DEFAULT_MAX_REQUEST_BODY_SIZE = 16 * 1024 * 1024  # 16 MB
+DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+DEFAULT_CLIENT_SOCKET_TIMEOUT = 30.0  # seconds
+
+MAX_REQUEST_BODY_SIZE = int(os.environ.get("STACKMIND_MAX_REQUEST_BODY_SIZE", DEFAULT_MAX_REQUEST_BODY_SIZE))
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("STACKMIND_MAX_CONCURRENT_REQUESTS", DEFAULT_MAX_CONCURRENT_REQUESTS))
+CLIENT_SOCKET_TIMEOUT = float(os.environ.get("STACKMIND_CLIENT_SOCKET_TIMEOUT", DEFAULT_CLIENT_SOCKET_TIMEOUT))
+
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
-    """Threading HTTPServer that gracefully handles errors and isolates logs."""
+    """Threading HTTPServer that gracefully handles errors, caps concurrency, and isolates logs."""
 
     def __init__(
         self,
         server_address: tuple[str, int],
         RequestHandlerClass: type[BaseHTTPRequestHandler],
         state_dir: Path | None = None,
+        max_concurrent_requests: int | None = None,
+        socket_timeout: float | None = None,
     ) -> None:
         super().__init__(server_address, RequestHandlerClass)
         self.state_dir = Path(state_dir) if state_dir is not None else None
+        max_conn = max_concurrent_requests or MAX_CONCURRENT_REQUESTS
+        self._concurrency_semaphore = BoundedSemaphore(max_conn)
+        self._socket_timeout = socket_timeout if socket_timeout is not None else CLIENT_SOCKET_TIMEOUT
+
+    def get_request(self) -> tuple[Any, Any]:
+        sock, addr = super().get_request()
+        if self._socket_timeout > 0:
+            try:
+                sock.settimeout(self._socket_timeout)
+            except Exception:
+                pass
+        return sock, addr
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._concurrency_semaphore.acquire(blocking=False):
+            try:
+                body = (
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 65\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b'{"error":"server overloaded, too many concurrent requests"}\n'
+                )
+                request.sendall(body)
+            except Exception:
+                pass
+            self.shutdown_request(request)
+            return
+
+        t = Thread(
+            target=self._process_request_thread_with_semaphore,
+            args=(request, client_address),
+            daemon=True,
+        )
+        t.start()
+
+    def _process_request_thread_with_semaphore(self, request: Any, client_address: Any) -> None:
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            try:
+                self.shutdown_request(request)
+            finally:
+                self._concurrency_semaphore.release()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc_type, _, _ = sys.exc_info()
@@ -58,6 +115,7 @@ class LocalDaemon:
         mcp_protocol: Any | None = None,
         runner_factory: Any | None = None,
         auth_token: str | None = None,
+        max_concurrent_requests: int | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +137,12 @@ class LocalDaemon:
         self.manager = SessionManager(DaemonStorage(state_dir), runner_factory=runner_factory)
         self.protocol = JsonRpcProtocol(self.manager, auth_token=self.auth_token)
         self.mcp_protocol = mcp_protocol
-        self._server = _DaemonHTTPServer((host, port), self._handler(), state_dir=Path(state_dir))
+        self._server = _DaemonHTTPServer(
+            (host, port),
+            self._handler(),
+            state_dir=Path(state_dir),
+            max_concurrent_requests=max_concurrent_requests,
+        )
         self._thread: Thread | None = None
 
     @property
@@ -178,9 +241,27 @@ class LocalDaemon:
                 if self.path not in {"/rpc", "/mcp"}:
                     self._send(404, {"error": "not found"})
                     return
+                content_len_hdr = self.headers.get("Content-Length")
+                if content_len_hdr is None:
+                    self._send(411, {"error": "Content-Length header required"})
+                    return
                 try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    request = json.loads(self.rfile.read(length))
+                    length = int(content_len_hdr)
+                    if length < 0:
+                        self._send(400, {"error": "Content-Length cannot be negative"})
+                        return
+                except ValueError:
+                    self._send(400, {"error": "invalid Content-Length header"})
+                    return
+                if length > MAX_REQUEST_BODY_SIZE:
+                    self._send(413, {"error": f"request body exceeds maximum limit of {MAX_REQUEST_BODY_SIZE} bytes"})
+                    return
+                try:
+                    raw_body = self.rfile.read(length)
+                    if len(raw_body) < length:
+                        self._send(400, {"error": "unexpected EOF reading request body"})
+                        return
+                    request = json.loads(raw_body)
                 except (ValueError, json.JSONDecodeError):
                     self._send(400, {"error": "invalid json"})
                     return
