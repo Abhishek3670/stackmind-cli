@@ -5,6 +5,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.17.0] - 2026-11-12
+
+### Fixed
+- **TUI Thinking Timer Isolation**:
+  - Each `▼ Thought for Xs` segment now tracks its own independent start time instead of sharing a single cumulative timer. Fixed `_append_thinking_segment()` in `cli/tui/state.py` to never append to already-finalized segments (those with an `elapsed` field), and `_finalize_last_thinking_segment()` to iterate in reverse and finalize only the last unfinalized thinking segment.
+- **Cross-Process Lock Race Condition** (`cli/lock.py`):
+  - Concurrent `acquire_lock` / `release_lock` calls can no longer overwrite each other. Introduced `_lock_gate()` context manager using OS-level file locking (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX) around `.sync/runtime/.LOCK.gate` to serialize all lock mutations as a single atomic read-decide-replace operation.
+  - PID+UUID-isolated temporary files prevent collisions between concurrent writers.
+  - Retry loop in `read_lock()` handles transient Windows `PermissionError` during file replacement.
+- **Daemon State Truncation on Failed Save** (`validators/kernel/daemon/storage.py`):
+  - Removed dangerous direct-write fallback (`open("w")`) that could truncate the state file to 0 bytes on crash. Replaced with 10-retry progressive backoff (`0.02 * (attempt + 1)`), automatic `.bak` backup before replacement, and `.pending.json` fallback path.
+  - `load()` now recovers from `.pending.json` or `.json.bak` if the primary state file is corrupt or missing.
+- **Daemon Request Size & Concurrency Limits** (`validators/kernel/daemon/server.py`):
+  - Added `MAX_REQUEST_BODY_SIZE` (16 MB, configurable via `STACKMIND_MAX_REQUEST_BODY_SIZE`) with `Content-Length` validation (411/400/413 responses).
+  - Added `BoundedSemaphore(64)` concurrency cap (configurable via `STACKMIND_MAX_CONCURRENT_REQUESTS`) with 503 rejection for excess connections.
+  - Added 30s client socket timeout (configurable via `STACKMIND_CLIENT_SOCKET_TIMEOUT`) for slowloris protection.
+
 ## [3.16.0] - 2026-11-12
 
 ### Added

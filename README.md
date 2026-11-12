@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.16.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.17.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -145,6 +145,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.16.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.17.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect
