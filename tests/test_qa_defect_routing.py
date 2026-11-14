@@ -992,3 +992,36 @@ def test_bugfix_order_prerequisite_unblocked_when_deliverable_present_on_disk(tm
     )
     assert res.status == DependencyStatus.SATISFIED
     assert "deliverable present on disk for BUGFIX repair" in res.prerequisites[0].detail
+
+
+def test_qa_passing_glyph_does_not_route_false_defect(tmp_path: Path) -> None:
+    """When QA reports passing checkmarks/exit 0 on a deliverable (e.g. node --check ✅),
+    it must NOT be treated as an active defect finding routing developer rework."""
+    _write_worker_yaml(tmp_path, "WO-001", "codex", "src/server.js")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_api.py")
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-004", "WO-001"])
+    state.completed_wo_ids = ["WO-001"]
+    wo1_op = mock_mgr.start_turn("sess-001", "Build server", work_order_id="WO-001", agent_id="codex")
+    mock_mgr.complete_operation(wo1_op["operation_id"], "COMPLETED")
+    wo4_op = mock_mgr.start_turn("sess-001", "QA server", work_order_id="WO-004", agent_id="gemma")
+    mock_mgr.complete_operation(
+        wo4_op["operation_id"], "BLOCKED",
+        result={
+            "status": "blocked",
+            "summary": "QA syntax checks complete: - src/server.js: node --check ✅ (passed exit 0)",
+            "blockers": ["General verification gate blocked on environment setup"],
+        },
+    )
+
+    res = supervisor.advance(state)
+
+    # WO-001 must NOT be routed as a defect rework target because src/server.js passed!
+    assert state.qa_rework_targets.get("WO-004") is None
+    rework_ops = [
+        op for op in mock_mgr.list_operations()
+        if op.get("work_order_id") == "WO-001" and op["operation_id"] != wo1_op["operation_id"]
+    ]
+    assert len(rework_ops) == 0
+    assert "WO-001" in state.completed_wo_ids
+

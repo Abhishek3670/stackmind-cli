@@ -50,6 +50,39 @@ class _ReviewMixin:
 
     _PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_][\w./\\-]*\.[A-Za-z0-9]{1,6}")
 
+    _PASS_INDICATORS = (
+        "✅", "✔", "pass", "passed", "exit 0", "exit code 0", "0 errors",
+        "status: ok", "no issues", "confirmed", "verified complete",
+    )
+    _FAIL_INDICATORS = (
+        "❌", "fail", "failed", "failure", "error", "defect", "broken",
+        "needs_changes", "violation", "rework", "re-open", "reopen", "assertionerror",
+    )
+
+    @classmethod
+    def _path_has_defect(cls, text: str, ref: str) -> bool:
+        """Return True if text contains an active failure/defect finding for ref."""
+        ref_clean = ref.replace("\\", "/").lower()
+        ref_name = Path(ref_clean).name.lower()
+        matching_lines = [
+            ln.strip() for ln in text.splitlines()
+            if ref_clean in ln.replace("\\", "/").lower() or ref_name in ln.lower()
+        ]
+        if not matching_lines:
+            return False
+        for ln in matching_lines:
+            l_lower = ln.lower()
+            has_fail = any(f in l_lower for f in cls._FAIL_INDICATORS)
+            has_pass = any(p in l_lower for p in cls._PASS_INDICATORS)
+            if has_fail:
+                return True
+            if has_pass and not has_fail:
+                continue
+        has_any_pass = any(any(p in ln.lower() for p in cls._PASS_INDICATORS) for ln in matching_lines)
+        if has_any_pass:
+            return False
+        return True
+
     def _route_qa_defect_to_developers(
         self, state: RunState, ws: Path, qa_wo_id: str, op: dict[str, Any],
         err_msg: str, blocker_text: str,
@@ -92,10 +125,13 @@ class _ReviewMixin:
                 if not ref or ref in seen:
                     continue
                 seen.add(ref)
+                if not self._path_has_defect(evidence_text, ref):
+                    continue
                 owner = self._reworkable_wo_for_path(state, ws, qa_wo_id, ref)
                 if owner is not None:
                     snippet = next(
-                        (ln.strip() for ln in evidence_text.splitlines() if ref in ln and ln.strip()),
+                        (ln.strip() for ln in evidence_text.splitlines()
+                         if ref in ln and ln.strip() and self._path_has_defect(ln, ref)),
                         f"QA reported a failing check against '{ref}'",
                     )
                     targets.setdefault(owner, snippet)
@@ -274,6 +310,8 @@ class _ReviewMixin:
                         if not ref or ref in seen_refs:
                             continue
                         seen_refs.add(ref)
+                        if not self._path_has_defect(text, ref):
+                            continue
                         owner = self._reworkable_wo_for_path(state, ws, qa_wo_id, ref)
                         if owner is not None and owner not in deliverable_targets:
                             deliverable_targets.append(owner)

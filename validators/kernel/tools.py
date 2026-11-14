@@ -3917,6 +3917,11 @@ class ToolGateway:
             if not target_set:
                 return wo_file.stem
 
+            # For GitOps / release agents, documentation, manifest, or graph requests map to existing active GitOps WO
+            if agent.lower() in ("local-llm", "gitops") or "gitops" in str(data.get("role", "")).lower():
+                if any(f.endswith(".md") or "doc" in f or "graph" in f or "version" in f for f in target_set):
+                    return wo_file.stem
+
             # Check for overlapping deliverable paths
             existing_paths = set()
             deliv = data.get("deliverable")
@@ -4063,21 +4068,63 @@ class ToolGateway:
 
             scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
 
-            # Check if an explicit active work order was requested or referenced in instructions
+            # Check if an explicit work order was requested or referenced in instructions
             explicit_wo_id = work_order_id
+            target_bucket = "ACTIVE"
             if not explicit_wo_id and instructions:
                 match = _re.search(r"\b(WO-\d{3})\b", str(instructions))
                 if match:
                     candidate = match.group(1)
-                    if (scan_root / ".sync" / "work-orders" / "ACTIVE" / f"{candidate}.yaml").is_file():
-                        explicit_wo_id = candidate
+                    for r in ws_roots:
+                        for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+                            if (r / ".sync" / "work-orders" / sub / f"{candidate}.yaml").is_file():
+                                explicit_wo_id = candidate
+                                target_bucket = sub
+                                break
+                        if explicit_wo_id:
+                            break
 
             if explicit_wo_id:
+                # If target is already COMPLETED or BLOCKED, and instructions are review/verification/reopen/recovery:
+                is_review = (
+                    (canonical_role == "qa")
+                    or (canonical_agent in ("gemma", "qa"))
+                    or any(k in str(instructions).lower() for k in ("review", "verify", "reopen", "audit", "recovery"))
+                )
+                if is_review:
+                    self.boundary.journal.complete(record.request.operation_id, f"Registered review/recovery for {explicit_wo_id}")
+                    return {
+                        "status": "review_scheduled",
+                        "work_order_id": explicit_wo_id,
+                        "target_work_order": explicit_wo_id,
+                        "role": canonical_role,
+                        "agent": canonical_agent,
+                        "instructions": str(instructions).strip(),
+                        "target_files": clean_files,
+                        "deduplicated": True,
+                        "message": (
+                            f"Review/recovery instruction registered for existing work order {explicit_wo_id}. "
+                            f"Operations evaluate/coordinate existing work orders rather than creating duplicate orders."
+                        ),
+                    }
+
                 wo_id = explicit_wo_id
                 rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
                 rel_contract_file = f".sync/contracts/{wo_id}.yaml"
                 act_f = self.workspace.root / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
-                if act_f.is_file():
+                comp_f = self.workspace.root / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
+                if comp_f.is_file() and not act_f.is_file():
+                    try:
+                        wo_data = yaml.safe_load(comp_f.read_text(encoding="utf-8")) or {}
+                        wo_data["status"] = "ACTIVE"
+                        rev = int(wo_data.get("revision", 1)) + 1
+                        wo_data["revision"] = rev
+                        act_f.parent.mkdir(parents=True, exist_ok=True)
+                        act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                        comp_f.unlink()
+                    except Exception:
+                        pass
+                elif act_f.is_file():
                     try:
                         wo_data = yaml.safe_load(act_f.read_text(encoding="utf-8")) or {}
                         if str(wo_data.get("status", "")).upper() != "ACTIVE":
@@ -4085,7 +4132,7 @@ class ToolGateway:
                             act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
                     except Exception:
                         pass
-                self.boundary.journal.complete(record.request.operation_id, f"Delegated to existing active {wo_id}")
+                self.boundary.journal.complete(record.request.operation_id, f"Delegated to existing {target_bucket.lower()} {wo_id}")
                 return {
                     "status": "delegated",
                     "work_order_id": wo_id,
@@ -4097,7 +4144,7 @@ class ToolGateway:
                     "target_files": clean_files,
                     "deduplicated": True,
                     "message": (
-                        f"Delegated task to active work order {wo_id} for {canonical_role} ({canonical_agent})."
+                        f"Delegated task to work order {wo_id} for {canonical_role} ({canonical_agent})."
                     ),
                 }
 
