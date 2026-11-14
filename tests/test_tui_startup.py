@@ -23,7 +23,8 @@ def test_empty_project_is_initialized_validated_and_graph_prepared(tmp_path, mon
     assert (tmp_path / ".sync" / "runtime" / "TREE.yaml").is_file()
     # AGENTS.md is internal runtime metadata, not in product root
     assert not (tmp_path / "AGENTS.md").is_file()
-    assert (tmp_path / "README.md").is_file()
+    assert not (tmp_path / "README.md").is_file()
+    assert (tmp_path / ".gitignore").is_file()
 
 
 def test_adoption_preserves_existing_project_files_and_is_idempotent(tmp_path, monkeypatch):
@@ -416,8 +417,10 @@ def test_empty_project_tui_creates_git_repo_with_initial_commit(tmp_path, monkey
     assert log.endswith("Initial stackmind runtime")
     code, files = _git(["show", "--name-only", "--format="], tmp_path)
     committed = set(files.splitlines())
-    assert {".gitignore", "PLAN.md", "CHANGELOG.md", "VERSION"} <= committed
-    assert "README.md" in committed
+    assert ".gitignore" in committed
+    assert "README.md" not in committed
+    assert "CHANGELOG.md" not in committed
+    assert "VERSION" not in committed
     # .sync has its own repository and is never tracked by the outer one
     assert not any(name.startswith(".sync/") for name in committed)
     assert (_git(["-C", ".sync", "log", "--oneline"], tmp_path)[0]) == 0

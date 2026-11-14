@@ -652,6 +652,7 @@ class _ReviewMixin:
                             "changelog" in b_lower
                             or "readme" in b_lower
                             or "wo-000" in b_lower
+                            or "version" in b_lower
                             or "worker_timeout" in b_lower
                             or "timeout (retry" in b_lower
                             or "packaging" in b_lower
@@ -683,7 +684,7 @@ class _ReviewMixin:
                         self._ensure_release_documentation(ws, state)
                         blockers = [b for b in blockers if not _is_governance_or_packaging_blocker(b)]
                         detail_paths = [p for p in detail_paths if not any(
-                            doc in p.lower() for doc in ("changelog", "readme", "wo-000")
+                            doc in p.lower() for doc in ("changelog", "readme", "wo-000", "version")
                         )]
 
                 if not blockers:

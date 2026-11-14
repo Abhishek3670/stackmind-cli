@@ -42,6 +42,7 @@ from validators.harness.authoring_readiness import (
     _title_tokens,
     milestone_matches,
     _wo_matches_milestone,
+    _is_meta_work_order,
 )
 
 _NORMALIZED_BY = f"authoring-compiler/{POLICY_VERSION}"
@@ -185,6 +186,8 @@ def compile_authoring_artifacts(
         if status in ("COMPLETED", "CANCELLED", "FAILED"):
             continue
         if p_idx is not None and (_parse_wo_index(data.get("id") or wo_id) or 0) <= p_idx:
+            continue
+        if _is_meta_work_order(data):
             continue
         wo_records.append((rel, wo_path, data))
 

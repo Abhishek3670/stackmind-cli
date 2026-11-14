@@ -359,7 +359,10 @@ def extract_deliverable_spec(
 
 
 def determine_assigned_agent(
-    title: str, tasks: list[str], agent_hint: str | None = None
+    title: str,
+    tasks: list[str],
+    agent_hint: str | None = None,
+    project_goal: str | None = None,
 ) -> tuple[str, str]:
     """Determine (agent_id, role) from milestone title and tasks.
 
@@ -380,6 +383,13 @@ def determine_assigned_agent(
 
     combined = (f"{title} " + " ".join(tasks)).lower()
     title_lower = title.lower()
+    goal_lower = (project_goal or "").lower().strip()
+    is_generic = (
+        any(kw in title_lower for kw in ("core implementation", "implementation tasks", "milestone 1", "milestone:", "core features"))
+        or not tasks
+    )
+    if is_generic and goal_lower:
+        combined = f"{combined} {goal_lower}"
 
     # 1. Top priority: Explicit agent designation by the Architect in title or tasks
     # Patterns: (Agent: codex), [Agent: codex], Agent: codex, Assigned: codex, Owner: codex,
@@ -415,7 +425,7 @@ def determine_assigned_agent(
     # 3. Fallback: Semantic heuristics based on title and task keywords
     # Frontend checks: explicit UI files or keywords
     if re.search(r"\b[a-zA-Z0-9_\-\.\/]+\.(?:html|css|jsx|tsx)\b", combined) or re.search(
-        r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|client|landing page|login page)\b", combined
+        r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|vue|svelte|client|landing page|login page|webpage|website|web app|portfolio|design|interface|animated)\b", combined
     ):
         return "gemini", "frontend"
 
@@ -878,6 +888,7 @@ def decompose_milestone(
     stack: TechStack | None = None,
     project_path: Path | str | None = None,
     prev_wo_id: str | None = None,
+    project_goal: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Decompose a milestone into one or more validated child work orders.
 
@@ -892,7 +903,22 @@ def decompose_milestone(
     Returns:
         (list of work order dictionaries, last_wo_id)
     """
-    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
+    goal = project_goal
+    if not goal and project_path:
+        try:
+            pp = Path(project_path).resolve()
+            for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+                w0 = pp / ".sync" / "work-orders" / sub / "WO-000.yaml"
+                if w0.is_file():
+                    import yaml as _yaml_mod
+                    d = _yaml_mod.safe_load(w0.read_text(encoding="utf-8"))
+                    if isinstance(d, dict) and d.get("description"):
+                        goal = str(d["description"])
+                        break
+        except Exception:
+            pass
+
+    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent, project_goal=goal)
 
     # Analyze tasks for distinct non-test deliverables
     task_deliverables: list[tuple[str, str, dict[str, Any]]] = []
@@ -2169,18 +2195,42 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             except Exception:
                 pass
 
+        def _clean_deliv_p(p_str: Any) -> str:
+            return str(p_str or "").strip().replace("\\", "/").lstrip("./").lstrip("/").lower()
+
         existing_deliv_paths: set[str] = set()
+        for c_path in completed_deliverables:
+            clean_cp = _clean_deliv_p(c_path)
+            if clean_cp:
+                existing_deliv_paths.add(clean_cp)
+
         for w in existing_wos:
-            p = (w.get("deliverable") or {}).get("path")
+            p = _clean_deliv_p((w.get("deliverable") or {}).get("path"))
             if p:
-                existing_deliv_paths.add(str(p).strip().replace("\\", "/").lstrip("/").lower())
+                existing_deliv_paths.add(p)
             for d in w.get("deliverables") or []:
                 if isinstance(d, dict) and d.get("path"):
-                    existing_deliv_paths.add(str(d.get("path")).strip().replace("\\", "/").lstrip("/").lower())
+                    dp = _clean_deliv_p(d.get("path"))
+                    if dp:
+                        existing_deliv_paths.add(dp)
             impl = w.get("implementation_estimate") or {}
             for ef in impl.get("expected_files") or []:
                 if ef:
-                    existing_deliv_paths.add(str(ef).strip().replace("\\", "/").lstrip("/").lower())
+                    efp = _clean_deliv_p(ef)
+                    if efp:
+                        existing_deliv_paths.add(efp)
+
+        def _milestone_deliverables_satisfied(m_ref: dict[str, Any]) -> bool:
+            cand_paths = extract_candidate_paths(f"{m_ref.get('title', '')}\n{' '.join(m_ref.get('tasks') or [])}")
+            clean_cands = [_clean_deliv_p(cp) for cp in cand_paths if _clean_deliv_p(cp)]
+            if not clean_cands:
+                return False
+            return all(
+                cp in existing_deliv_paths
+                or cp in completed_deliverables
+                or ((ws / cp).is_file() and (ws / cp).stat().st_size > 0)
+                for cp in clean_cands
+            )
 
         uncovered_milestones = [
             m for m in plan_milestones
@@ -2188,6 +2238,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 _is_architecture_or_meta_milestone(m)
                 or str(m.get("status") or "").strip().upper() == "COMPLETED"
                 or any(_wo_matches_milestone(w, m) for w in existing_wos)
+                or _milestone_deliverables_satisfied(m)
             )
         ]
 
@@ -2226,8 +2277,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 filtered_child_wos = []
                 for c_wo in child_wos:
                     c_deliv = c_wo.get("deliverable") or {}
-                    c_path = str(c_deliv.get("path") or "").strip().replace("\\", "/").lstrip("/").lower()
-                    if c_path and c_path in existing_deliv_paths:
+                    c_path = _clean_deliv_p(c_deliv.get("path"))
+                    if c_path and (
+                        c_path in existing_deliv_paths
+                        or c_path in completed_deliverables
+                        or ((ws / c_path).is_file() and (ws / c_path).stat().st_size > 0)
+                    ):
                         continue
                     filtered_child_wos.append(c_wo)
 

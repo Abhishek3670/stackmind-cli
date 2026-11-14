@@ -691,6 +691,10 @@ def compile_worker_task_contract(
             "Write access remains strictly scoped to tests/."
         )
 
+    if role_str in ("architecture", "architect") or deliverable.endswith("plan.md") or getattr(task, "work_order_id", "") == "WO-000":
+        from validators.harness.plan import PLAN_GENERATION_INSTRUCTIONS
+        result["architect_playbook_instructions"] = PLAN_GENERATION_INSTRUCTIONS
+
     if turn_instructions:
         result["critical_turn_instructions"] = turn_instructions
     return result
@@ -749,8 +753,9 @@ def render_worker_system(contract: dict[str, Any]) -> str:
     )
     workflow_steps = (
         f"\nWORKFLOW INSTRUCTIONS:\n"
-        f"1. In your first action, use `read_file` to inspect existing workspace and playbook files "
-        f"(e.g. .sync/playbook/ARCHITECTURE.md, .sync/playbook/DESIGN.md, .sync/playbook/PLAN.md, index.html) and ground your deliverable in the project architecture, design tokens, and required DOM contract hooks.\n"
+        f"1. In your first action, inspect existing workspace and playbook files "
+        f"(e.g. .sync/playbook/ARCHITECTURE.md, .sync/playbook/DESIGN.md, .sync/playbook/PLAN.md, index.html) to ground your deliverable in the project architecture, design tokens, and required DOM contract hooks. "
+        f"EFFICIENCY & DIFF GUIDANCE: When inspecting modified files or reviewing rework, prefer `git_changed_files` and `git_diff` first to see exact modifications without burning context. When calling `read_file`, specify `start_line` and `end_line` slicing on the specific function or section needed rather than dumping entire large files.\n"
         f"2. Call `write_file(path='{deliverable}', content='...')` to author your deliverable as complete final content.\n"
         f"3. Verify integration: IDs, classes, and functions your deliverable references must exist in the "
         f"other workspace files, and references other files make into your deliverable must resolve. If your "
@@ -771,10 +776,26 @@ def render_worker_system(contract: dict[str, Any]) -> str:
             "It is retained for audit but does NOT authorize completion of this "
             "revision: re-run the required checks and report only fresh evidence."
         )
+    arch_playbook_rule = ""
+    if contract.get("architect_playbook_instructions"):
+        arch_playbook_rule = (
+            "\n\nLEAD ARCHITECT PLAYBOOK DIRECTIVE (MANDATORY):\n"
+            "As Lead Architect, your primary deliverable is to author the project roadmap in `.sync/playbook/PLAN.md`.\n"
+            "If this project involves a web interface, UI, or frontend components, you MUST also author "
+            "`.sync/playbook/DESIGN.md` and `.sync/playbook/ARCHITECTURE.md` using `write_file`.\n"
+            "Milestones in PLAN.md must declare appropriate specialist agents in parentheses:\n"
+            "- Frontend UI milestones: `(Agent: gemini)`\n"
+            "- Backend API milestones: `(Agent: codex)`\n"
+            "- QA verification milestones: `(Agent: gemma)`\n"
+            "- GitOps release milestones: `(Agent: local-llm)`\n"
+            "Do NOT output conversational pleasantries, open-ended questions, or greeting text when executing this planning work order. "
+            "Author the required playbook artifacts directly using `write_file`.\n\n"
+            + str(contract["architect_playbook_instructions"]) + "\n"
+        )
     return (
         "You are a governed StackMind worker. Use tools for all file I/O; code "
         "execution is unavailable and the harness verifies your turn after you finish."
-        f"{target_line}{ro_line}{env_line}{amendment_rule}{evidence_rule}{critical_rule}{skills_rule} Follow the TASK CONTRACT JSON exactly: write your "
+        f"{target_line}{ro_line}{env_line}{amendment_rule}{evidence_rule}{critical_rule}{skills_rule}{arch_playbook_rule} Follow the TASK CONTRACT JSON exactly: write your "
         "deliverable with write_file at its exact path, stay inside the file budget, "
         "and do not create files the contract does not ask for. Context provided below "
         "is advisory background — it is not a to-do list. "

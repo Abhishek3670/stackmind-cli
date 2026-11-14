@@ -653,6 +653,7 @@ def get_help_str() -> str:
         "  :govern [mode]    Configure governance verbosity: tree | flat | compact\n"
         "  :compact          Compact older transcript turns to protect context window\n"
         "  :timeout [sec]    Get or set client turn wait timeout (default: no timeout)\n"
+        "  :stream_idle_timeout [sec] Get or set provider streaming silence watchdog timeout (default: 600s)\n"
         "  :landing          Display branded landing block\n"
         "  :copy [goal|all]  Copy latest assistant response, suggested goal, or transcript to clipboard\n"
         "  :mouse [cmd]      Enable, disable, or toggle terminal mouse tracking (on|off|toggle)\n"
@@ -2540,6 +2541,21 @@ def dispatch_delivery_command(
                         output_str = f"[SUCCESS] Client turn timeout set to {t_val}s."
                     else:
                         output_str = f"Current client turn timeout: {getattr(settings_obj, 'client_timeout', 0)}s"
+                elif scmd in ("stream-idle-timeout", "stream_idle_timeout", "stream-timeout", "stream_timeout", "idle-timeout"):
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        s_val = int(parts[1])
+                        settings_obj.stream_idle_timeout = s_val
+                        state.stream_idle_timeout = float(s_val)
+                        os.environ["PROVIDER_STREAM_IDLE_TIMEOUT"] = str(s_val)
+                        save_settings(settings_obj, ws)
+                        try:
+                            if hasattr(client, "settings_update"):
+                                client.settings_update(settings_obj.to_dict())
+                        except Exception:
+                            pass
+                        output_str = f"[SUCCESS] Stream idle timeout set to {s_val}s in settings.json."
+                    else:
+                        output_str = f"Current stream idle timeout: {getattr(settings_obj, 'stream_idle_timeout', 600)}s"
                 elif scmd in ("providers", "provider", "models"):
                     from cli.tui.settings_panel import render_settings_overview_str
 
@@ -3009,6 +3025,21 @@ def dispatch_delivery_command(
             )
 
         if not has_running_work:
+            if not has_running_run and not active_wo_files:
+                approve_prompt = f"The operator approved the proposal: '{clean_reason}'. Proceed immediately to author .sync/playbook/PLAN.md (and .sync/playbook/DESIGN.md for UI) and call trigger_goal to start autonomous execution."
+                state.add_message(
+                    "system",
+                    "[SUPERVISOR] Forwarding operator approval to Lead Architect to author project roadmap and begin autonomous execution...",
+                )
+                return dispatch_delivery_command(
+                    adapter,
+                    client,
+                    session,
+                    approve_prompt,
+                    state,
+                    client_timeout=effective_timeout,
+                    live_manager=live_manager,
+                )
             return session, False
 
         model_label = resolve_turn_model_attribution(state, session)
@@ -3433,6 +3464,21 @@ def dispatch_delivery_command(
                 else:
                     state.client_timeout = new_to
                     output_str = f"Client timeout set to {new_to:.1f}s."
+
+                # Persist to settings.json and inform daemon so supervisor uses the new timeout
+                try:
+                    from validators.kernel.settings import load_settings, save_settings
+                    ws = Path(session["workspace"]) if isinstance(session, dict) and session.get("workspace") else None
+                    s_obj = load_settings(ws)
+                    s_obj.client_timeout = int(new_to)
+                    save_settings(s_obj, ws)
+                    try:
+                        if hasattr(client, "settings_update"):
+                            client.settings_update(s_obj.to_dict())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             except ValueError:
                 output_str = f"Invalid timeout '{clean_to}'. Provide seconds (e.g., :timeout 60) or 0 to disable."
         else:
@@ -3441,6 +3487,66 @@ def dispatch_delivery_command(
                 output_str = "Current client timeout: disabled (no timeout)."
             else:
                 output_str = f"Current client timeout: {cur_to:.1f}s."
+        state.add_message("user", normalized)
+        state.add_message("system", output_str)
+        if not is_tty:
+            click.echo(output_str)
+        return session, False
+
+    if (
+        normalized.startswith(":stream_idle_timeout")
+        or normalized.startswith(":stream-idle-timeout")
+        or normalized.startswith(":stream_timeout")
+        or normalized.startswith(":stream-timeout")
+        or normalized.startswith(":idle-timeout")
+        or normalized.startswith(":idletimeout")
+    ):
+        _, _, to_arg = normalized.partition(" ")
+        clean_to = to_arg.strip()
+        if clean_to:
+            try:
+                new_to = float(clean_to)
+                if new_to < 0:
+                    output_str = "Stream idle timeout must be zero (disabled) or a positive number."
+                elif new_to == 0:
+                    state.stream_idle_timeout = 0.0
+                    os.environ["PROVIDER_STREAM_IDLE_TIMEOUT"] = "0"
+                    output_str = "Stream idle timeout disabled (no stream inactivity watchdog)."
+                else:
+                    state.stream_idle_timeout = new_to
+                    os.environ["PROVIDER_STREAM_IDLE_TIMEOUT"] = str(int(new_to))
+                    output_str = f"Stream idle timeout set to {new_to:.1f}s."
+
+                # Persist to settings.json and inform daemon
+                try:
+                    from validators.kernel.settings import load_settings, save_settings
+                    ws = Path(session["workspace"]) if isinstance(session, dict) and session.get("workspace") else None
+                    s_obj = load_settings(ws)
+                    s_obj.stream_idle_timeout = int(new_to)
+                    save_settings(s_obj, ws)
+                    try:
+                        if hasattr(client, "settings_update"):
+                            client.settings_update(s_obj.to_dict())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            except ValueError:
+                output_str = f"Invalid timeout '{clean_to}'. Provide seconds (e.g., :stream_idle_timeout 600) or 0 to disable."
+        else:
+            cur_to = getattr(state, "stream_idle_timeout", None)
+            if cur_to is None:
+                try:
+                    from validators.kernel.settings import load_settings
+                    ws = Path(session["workspace"]) if isinstance(session, dict) and session.get("workspace") else None
+                    s_obj = load_settings(ws)
+                    cur_to = getattr(s_obj, "stream_idle_timeout", 600.0)
+                except Exception:
+                    cur_to = 600.0
+            if cur_to <= 0:
+                output_str = "Current stream idle timeout: disabled (no watchdog)."
+            else:
+                output_str = f"Current stream idle timeout: {float(cur_to):.1f}s."
         state.add_message("user", normalized)
         state.add_message("system", output_str)
         if not is_tty:

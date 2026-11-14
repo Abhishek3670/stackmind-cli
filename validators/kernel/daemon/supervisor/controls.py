@@ -342,6 +342,13 @@ class _ControlsMixin:
         state.error = None
         state.exit_code = EXIT_SUCCESS
         state.stall_ticks = 0
+        state.blocked_wo_ids.clear()
+        state.worker_blockers.clear()
+        state.failed_wo_ids.clear()
+        try:
+            self._discover_worker_wos(state)
+        except Exception:
+            pass
 
         # Human supplies authoritative budget:
         state.global_turn_budget = confirmed_budget

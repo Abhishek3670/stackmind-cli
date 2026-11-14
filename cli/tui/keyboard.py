@@ -1064,6 +1064,8 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":govern", "Configure governance verbosity: tree | flat | compact", False),
     (":compact", "Compact older transcript turns", False),
     (":timeout", "Get or set client turn wait timeout", False),
+    (":stream_idle_timeout", "Get or set streaming silence watchdog timeout (default: 600s)", False),
+    (":stream-timeout", "Alias for :stream_idle_timeout", False),
     (":landing", "Display branded landing block", False),
     (":skills", "Display available procedural skills & runbooks", False),
     (":skill", "Display available procedural skills & runbooks", False),
@@ -1571,8 +1573,14 @@ class RawLineEditor:
         cleared_via_callback = False
         if getattr(self, "on_clear_dropdown", None):
             try:
-                res = self.on_clear_dropdown()
+                res = self.on_clear_dropdown(target)
                 cleared_via_callback = (res is True)
+            except TypeError:
+                try:
+                    res = self.on_clear_dropdown()
+                    cleared_via_callback = (res is True)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -2329,6 +2337,23 @@ class RawLineEditor:
                 try:
                     if c_row is not None:
                         top_border_row = c_row - 1
+                        if prev_H > new_H:
+                            cleared_via_callback = False
+                            if getattr(self, "on_clear_dropdown", None):
+                                try:
+                                    res = self.on_clear_dropdown(target)
+                                    cleared_via_callback = (res is True)
+                                except TypeError:
+                                    try:
+                                        res = self.on_clear_dropdown()
+                                        cleared_via_callback = (res is True)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            if not cleared_via_callback:
+                                for r in range(max(1, top_border_row - prev_H), max(1, top_border_row - new_H)):
+                                    target.write(f"\x1b[{r};1H\x1b[2K")
                         for i, d_line in enumerate(dropdown_lines):
                             d_row = top_border_row - new_H + i
                             target.write(f"\x1b[{d_row};1H\r{d_line}\x1b[K")

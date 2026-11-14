@@ -378,6 +378,18 @@ def repair_plan_structure(content: str, default_name: str = "Project") -> str:
         )
 
     text = content.strip()
+    chat_greeting_phrases = (
+        "hey!", "hey there", "hello!", "good to meet you",
+        "what's on your mind", "what would you like to build",
+        "i'd love to hear", "before we dive into anything",
+    )
+    content_lower = text.lower()
+    has_chat_greetings = any(g in content_lower for g in chat_greeting_phrases)
+    has_milestone_checklist = bool(re.search(r"-\s*\[[ xX]\]\s+milestone", text, re.IGNORECASE))
+    has_plan_title = bool(re.search(r"^#\s+.*plan", text, re.IGNORECASE | re.MULTILINE))
+    if has_chat_greetings and not has_milestone_checklist and not has_plan_title:
+        return content
+
     title_match = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
     if not title_match:
         text = f"# Project Plan: {default_name}\n\n{text}"
@@ -417,7 +429,10 @@ def repair_plan_structure(content: str, default_name: str = "Project") -> str:
         if sub_m:
             text = text.replace(sub_m.group(0), "## Milestones & Roadmap", 1)
         else:
-            text += "\n\n## Milestones & Roadmap\n- [ ] Milestone 1: Core Implementation"
+            is_ui = bool(re.search(r"\b(?:ui|frontend|web|html|css|react|vue|svelte|landing|login page|website|portfolio|animated)\b", text, re.IGNORECASE))
+            default_agent = "(Agent: gemini)" if is_ui else "(Agent: codex)"
+            default_title = "Frontend Interface & User Experience" if is_ui else "Core Implementation"
+            text += f"\n\n## Milestones & Roadmap\n- [ ] Milestone 1: {default_title} {default_agent}"
 
     checklist_match = re.search(r"^\s*-\s*\[([ xX])\]\s+(.+)$", text, re.MULTILINE)
     if not checklist_match:
@@ -431,7 +446,10 @@ def repair_plan_structure(content: str, default_name: str = "Project") -> str:
         if re.search(r"^\s*-\s*\[([ xX])\]\s+(.+)$", new_text, re.MULTILINE):
             text = new_text
         else:
-            text += "\n- [ ] Milestone 1: Implementation Tasks"
+            is_ui = bool(re.search(r"\b(?:ui|frontend|web|html|css|react|vue|svelte|landing|login page|website|portfolio|animated)\b", text, re.IGNORECASE))
+            default_agent = "(Agent: gemini)" if is_ui else "(Agent: codex)"
+            default_title = "Frontend Implementation Tasks" if is_ui else "Implementation Tasks"
+            text += f"\n- [ ] Milestone 1: {default_title} {default_agent}"
 
     return text
 

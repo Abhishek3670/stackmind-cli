@@ -411,10 +411,20 @@ def _is_meta_work_order(data: dict[str, Any]) -> bool:
         return True
     wo_type = str(data.get("type") or "").upper()
     title = str(data.get("title") or "").lower()
-    if wo_type in ("VALIDATION", "QA", "TEST") and "integration review" in title:
+    if wo_type in ("VALIDATION", "QA", "TEST", "AUDIT") and "integration review" in title:
         return True
-    if wo_type == "RESEARCH" and "system architecture" in title:
+    if wo_type in ("AUDIT", "PHASE"):
         return True
+    if "integration review" in title:
+        return True
+    if wo_type in ("RESEARCH", "PHASE") and ("architecture" in title or "planning" in title or "enhancement" in title):
+        return True
+    assigned = data.get("assigned_agents") or []
+    if isinstance(assigned, list) and assigned and all(str(a).lower() in ("claude", "architecture") for a in assigned):
+        deliv = _extract_deliverable(data) or {}
+        deliv_path = str(deliv.get("path") or "").lower()
+        if "plan.md" in deliv_path or not deliv_path:
+            return True
     return False
 
 

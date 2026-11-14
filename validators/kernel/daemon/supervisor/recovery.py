@@ -1121,13 +1121,12 @@ class _RecoveryMixin:
             if len(observed) > len(preview) else ""
         )
         current_rev = state.contract_revisions.get(wo_id, 1)
-        is_deadlock = (evidence.get("failure_code") == "DEPENDENCY_DEADLOCK")
+        is_deadlock = (evidence.get("failure_code") in ("DEPENDENCY_DEADLOCK", "INVALID_DEPENDENCY"))
         deadlock_note = (
-            "\nCRITICAL: A DEPENDENCY DEADLOCK occurred. As Senior Architect you can:\n"
-            "- architect_fix or resolve_blocker: Author repair to .sync/work-orders/ACTIVE/ (and INDEX.yaml) "
-            "to remove inverted or circular dependencies or update prerequisite references, unblocking the worker.\n"
-            "- cancel_work_order: Cancel an orphaned or obsolete work order.\n"
-            "- split_work_order: Decompose the blocked work order into independent tasks.\n\n"
+            "\nCRITICAL: A DEPENDENCY DEFECT or DEADLOCK occurred. As Senior Architect you can:\n"
+            "- cancel_work_order: Return action 'cancel_work_order' if this work order is obsolete, duplicate, or superseded.\n"
+            "- architect_fix or resolve_blocker: Update .sync/work-orders/ACTIVE/ to prune or correct missing dependency references directly.\n"
+            "- NEVER author new child work orders to cancel or patch existing work orders.\n\n"
             if is_deadlock else ""
         )
         return (
@@ -1479,25 +1478,44 @@ class _RecoveryMixin:
         if action in ("cancel_work_order", "cancel", "prune_untracked"):
             target_wo = str(decision.get("work_order") or wo_id)
             cancel_reason = reason or "Cancelled by Architect recovery decision"
-            self._mark_wo_status_on_disk(ws, target_wo, "CANCELLED", error=cancel_reason)
-            self._archive_recovery_artifact(ws, state.run_id, f".sync/contracts/{target_wo}.yaml")
-            if target_wo not in state.superseded_wo_ids:
-                state.superseded_wo_ids.append(target_wo)
-            if target_wo in state.worker_wo_ids:
-                state.worker_wo_ids.remove(target_wo)
-            if target_wo in state.published_wo_ids:
-                state.published_wo_ids.remove(target_wo)
-            if target_wo in state.blocked_wo_ids:
-                state.blocked_wo_ids.remove(target_wo)
-            if target_wo in state.failed_wo_ids:
-                state.failed_wo_ids.remove(target_wo)
-            evidence = state.worker_blockers.pop(target_wo, None) or {}
-            old_op_id = evidence.get("operation_id")
-            if old_op_id and old_op_id not in state.ignored_operation_ids:
-                state.ignored_operation_ids.append(str(old_op_id))
+            targets_to_cancel = [target_wo]
+            for extra in (decision.get("cancelled_work_orders") or decision.get("replacement_work_orders") or []):
+                if str(extra) not in targets_to_cancel:
+                    targets_to_cancel.append(str(extra))
+
+            for t_wo in targets_to_cancel:
+                self._mark_wo_status_on_disk(ws, t_wo, "CANCELLED", error=cancel_reason)
+                self._archive_recovery_artifact(ws, state.run_id, f".sync/contracts/{t_wo}.yaml")
+                if t_wo not in state.superseded_wo_ids:
+                    state.superseded_wo_ids.append(t_wo)
+                if t_wo in state.worker_wo_ids:
+                    state.worker_wo_ids.remove(t_wo)
+                if t_wo in state.published_wo_ids:
+                    state.published_wo_ids.remove(t_wo)
+                if t_wo in state.blocked_wo_ids:
+                    state.blocked_wo_ids.remove(t_wo)
+                if t_wo in state.failed_wo_ids:
+                    state.failed_wo_ids.remove(t_wo)
+                evidence = state.worker_blockers.pop(t_wo, None) or {}
+                old_op_id = evidence.get("operation_id")
+                if old_op_id and old_op_id not in state.ignored_operation_ids:
+                    state.ignored_operation_ids.append(str(old_op_id))
+
+            # Synchronize state.worker_wo_ids with actual active work orders on disk
+            try:
+                self._discover_worker_wos(state)
+            except Exception:
+                pass
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            active_stems = {f.stem for f in active_dir.glob("*.yaml")} if active_dir.is_dir() else set()
+            state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w in state.worker_wo_ids and w in active_stems]
+            state.worker_wo_ids = [w for w in state.worker_wo_ids if w in active_stems and w not in getattr(state, "completed_wo_ids", [])]
+
             state.recovery_decisions.append({**record, "applied": True})
             state.error = None
             dest = resolve_next_execution_phase(state)
+            if dest == Phase.DISPATCHING and state.worker_wo_ids and all(wo in state.blocked_wo_ids for wo in state.worker_wo_ids):
+                dest = Phase.ARCHITECT_RECOVERY_DECISION
             self._transition(state, dest, authorized_override=True)
             return AdvanceResult.TRANSITIONED, None
 

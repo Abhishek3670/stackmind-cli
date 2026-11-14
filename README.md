@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.17.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.18.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -134,6 +134,11 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 - **In-Memory Python Syntax Verification**: Replaced external `py_compile` subprocess execution with in-memory `compile()` in `validators/harness/review_gate.py`, eliminating Windows file-locking `[Errno 13] Permission denied` errors when writing `.pyc` files into `__pycache__`.
 - **Active Work Order Ownership & Safe Delegation**: In `delegate_task` (`validators/kernel/tools.py`), prevented QA review hijacking for worker agents and added explicit work order binding (`work_order_id` / `WO-xxx`), ensuring delegations route directly to active fix work orders rather than completed predecessor tasks.
 - **TUI Cursor Drift Elimination & History Sanitization**: Anchored cursor row coordinates inside composer bounds, drained trailing mouse escape sequences, and sanitized raw LLM transport errors and billing alerts from chat history.
+- **Provider Streaming Silence Watchdog**: Watchdog timer (`stream_idle_timeout`, default 600s, configurable via `:stream_idle_timeout` or `settings.json`) detects hanging provider stream silence and aborts without user stalling.
+- **Lead Architect Playbook Grounding & Conversational Rejection**: Rejects conversational chat/greeting text mistakenly written to `PLAN.md`; infers frontend milestones from UI keywords; extracts `project_goal` from `WO-000.yaml` for milestone decomposition.
+- **Test Suite Dual-Syntax Verification**: Python test suite compilation and JavaScript block-comment stripping for `.test.js` files containing Python/pytest suites.
+- **Supervisor Recovery Decision & Invariant 4 Hardening**: Clears stale blockers, prunes cancelled ghost IDs (`WO-007`..`WO-010`), and rediscovers work orders on resume.
+- **Meta-Work Order & Roadmap Classification**: Classifies architecture planning, post-release roadmaps, and audit orders as meta-work orders, eliminating false contract and role rejections for `claude`.
 
 ## Docs
 
@@ -145,6 +150,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.17.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.18.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect

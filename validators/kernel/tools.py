@@ -308,6 +308,25 @@ class ToolGateway:
         if normalized_target == "PLAN.md" or normalized_target.endswith("/PLAN.md"):
             if not content or not content.strip():
                 raise PermissionError("Cannot write empty content to PLAN.md. A valid Project Plan with Architecture and Milestones is required.")
+            import re
+            content_lower = content.lower().strip()
+            # Reject conversational chat or greeting text accidentally written to PLAN.md
+            has_chat_greetings = any(
+                g in content_lower
+                for g in (
+                    "hey!", "hey there", "hello!", "good to meet you",
+                    "what's on your mind", "what would you like to build",
+                    "i'd love to hear", "before we dive into anything",
+                )
+            )
+            has_milestone_checklist = bool(re.search(r"-\s*\[[ xX]\]\s+milestone", content, re.IGNORECASE))
+            has_plan_title = bool(re.search(r"^#\s+.*plan", content, re.IGNORECASE | re.MULTILINE))
+            if has_chat_greetings and not has_milestone_checklist and not has_plan_title:
+                raise PermissionError(
+                    "Cannot write conversational greeting text to PLAN.md. "
+                    "PLAN.md must be a technical roadmap authored with '# Project Plan: <Name>', "
+                    "'## Current Architecture', and '## Milestones & Roadmap' (- [ ] Milestone 1: ... (Agent: <role>))."
+                )
             from validators.harness.plan import repair_plan_structure, validate_plan_structure
             repaired = repair_plan_structure(content)
             valid, _ = validate_plan_structure(repaired)
@@ -4333,7 +4352,8 @@ class ToolGateway:
                     logging.getLogger(__name__).debug("Failed to write work order to %s: %s", target_ws, ws_err)
         except Exception as wo_err:
             import logging
-            logging.getLogger(__name__).warning("Failed to author child work order: %s", wo_err, exc_info=True)
+            is_contract_error = "CONTRACT_VALIDATION_ERROR" in str(wo_err) or isinstance(wo_err, ValueError)
+            logging.getLogger(__name__).warning("Failed to author child work order: %s", wo_err, exc_info=not is_contract_error)
 
         task_payload = {
             "agent": canonical_agent,

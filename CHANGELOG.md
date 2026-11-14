@@ -5,6 +5,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.18.0] - 2026-11-14
+
+### Added
+- **Provider Streaming Silence Watchdog**:
+  - Added `stream_idle_timeout` setting (default: 600s, configurable via `:stream_idle_timeout` or `settings.json`) to `StackMindSettings` in `validators/kernel/settings.py`.
+  - Added `:stream_idle_timeout` (`:stream-timeout`, `:idle-timeout`) command in `cli/tui/commands.py` and `cli/tui/command_dialog.py`.
+  - Integrated streaming watchdog timer into `ProviderGateway` (`validators/kernel/providers/gateway.py`) to detect and abort hanging SSE/streaming connections without user stalling.
+- **Lead Architect Playbook Grounding & Chat Rejection**:
+  - In `validators/kernel/tools.py` (`write_file`), added strict validation rejecting conversational greetings or informal chat text accidentally written to `PLAN.md`.
+  - In `validators/harness/plan.py` (`repair_plan_structure`), added automatic detection of UI/frontend keywords (`webpage`, `landing`, `ui`, `frontend`, `portfolio`, `html`, `css`) to infer and assign frontend milestones to `gemini` rather than defaulting to `codex`.
+  - In `validators/kernel/daemon/authoring.py` (`determine_assigned_agent`, `decompose_milestone`), grounded generic milestones in project goal keywords and extracted goal metadata from `WO-000.yaml`.
+  - In `validators/harness/task_contract.py`, injected specialized Lead Architect playbook instructions for `WO-000` turns.
+  - Added unit test suite in `tests/test_playbook_grounding_and_chat_rejection.py`.
+
+### Fixed
+- **Test Suite Dual-Syntax Verification**:
+  - In `validators/harness/review_gate.py`, added Python syntax compilation and JavaScript comment stripping (`re.sub(r'^\s*/\*.*?\*/', '', content, flags=re.DOTALL)`) for test files ending in `.js` containing Python test suites, resolving dual syntax check rejections between Node.js and Python compilers.
+- **Meta-Work Order & Roadmap Classification**:
+  - In `validators/harness/authoring_compiler.py` and `validators/harness/authoring_readiness.py`, expanded `_is_meta_work_order` to classify architecture planning, research, post-release roadmap orders (such as `WO-025`, `WO-036`), and audit orders as meta-work orders, eliminating `MISSING_CONTRACT` and `WORKER_ROLE_NOT_PERMITTED` errors for `claude`.
+  - In `validators/harness/authoring_semantic.py`, disallowed `.sync/` and `schemas/` paths as work order deliverables and rejected meta-order titles attempting to patch existing tasks through child orders.
+- **Supervisor Recovery Decision & Invariant 4 Hardening**:
+  - In `validators/kernel/daemon/supervisor/recovery.py` and `controls.py`, hardened transition checks to prune cancelled ghost work orders (`WO-007`, `WO-008`, `WO-009`, `WO-010`) before verifying Invariant 4, preventing `StateIntegrityError` during `ARCHITECT_RECOVERY_DECISION -> DISPATCHING`.
+  - In `controls.py` (`resume_run_with_human_override`, `re_attest_run`), automatically cleared stale blockers and rediscovered worker work orders directly from disk.
+- **False Architect Completion Nudge Elimination**:
+  - In `validators/harness/runner/completion.py` and `validators/kernel/providers/gateway.py`, recognized `.sync/decisions/recovery/`, `INDEX.yaml`, and `PLAN.md` as valid architectural deliverables so valid recovery turns are not misclassified as empty completions.
+- **TUI Dropdown Artifact Clearing**:
+  - In `cli/tui/keyboard.py` and `cli/tui/terminal.py`, added clean line-clearing when dropdown height shrinks (`prev_H > new_H`) and fixed stream passing in `_clear_dropdown`, eliminating ghost suggestion lines on the terminal screen.
+
+### Changed
+- **Repository Scaffold Hygiene**:
+  - In `cli/init.py`, removed automatic generation of boilerplate `README.md`, `CHANGELOG.md`, and `VERSION` files during `stackmind init`, reserving their authoring for specialist agents (Lead Architect, GitOps) as functional project milestones.
+
 ## [3.17.0] - 2026-11-12
 
 ### Fixed

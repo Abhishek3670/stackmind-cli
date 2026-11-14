@@ -242,7 +242,7 @@ QA_SYSTEM_PROMPT = (
     "If semantic requirements are missing or unimplemented, your tests MUST fail — then record the defect as "
     "a NEEDS_CHANGES verdict so the supervisor routes rework back to the developer.\n"
     "Workflow instructions:\n"
-    "1. Use `read_file` or `list_directory` to inspect deliverables.\n"
+    "1. Inspect deliverables efficiently: call `git_changed_files` and `git_diff` (or `verify_diff`) to see what modified lines were introduced by the developer. When using `read_file`, specify `start_line` and `end_line` slicing to target specific sections rather than dumping entire large files.\n"
     "2. Author executable test suites under tests/ using standard Python libraries (e.g. `pytest`, `html.parser`, `re`, `pathlib`, `ast`, `urllib`). "
     "Do NOT import or depend on external browser automation tools like `playwright` or `selenium` unless they are already installed in the environment.\n"
     "3. Call `run_tests` (or `verify_tests`) to execute pytest against the test suite and verify test results.\n"

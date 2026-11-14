@@ -549,6 +549,7 @@ class AutonomousDeliveryState:
         scroll: RuntimePanelScroll | None = None,
         conversation_scroll: ConversationScroll | None = None,
         client_timeout: float = 0.0,
+        stream_idle_timeout: float = 600.0,
         context_window_tokens: int = 32_768,
         compaction_threshold: float = 0.85,
         compaction_keep_recent: int = 6,
@@ -649,6 +650,7 @@ class AutonomousDeliveryState:
         self.last_tool_code: str | None = None
         self.last_tool_status: str | None = None
         self.client_timeout: float = client_timeout
+        self.stream_idle_timeout: float = stream_idle_timeout
         self.context_window_tokens = max(1, context_window_tokens)
         self.compaction_threshold = min(max(compaction_threshold, 0.1), 1.0)
         self.compaction_keep_recent = max(1, compaction_keep_recent)

@@ -1714,31 +1714,92 @@ class _ExecutionMixin:
         escalation is already in flight and the caller should just stop
         dispatching this work order (no duplicate recovery turn, no retry burn).
         """
-        # Auto-rewire superseded dependencies if an authoritative successor exists
+        # Auto-rewire superseded dependencies or auto-heal missing dependencies
         from validators.kernel.daemon.supervisor.dependencies import _successor_for, load_all_work_orders
         ws = Path(ws)
         records = load_all_work_orders(ws)
         rewired_any = False
         active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+
+        # Index completed deliverable paths -> completed wo_id
+        completed_deliverable_map: dict[str, str] = {}
+        for c_id, c_ref in records.items():
+            if c_ref.bucket == "COMPLETED" or str(c_ref.data.get("status", "")).upper() == "COMPLETED":
+                deliv = c_ref.data.get("deliverable") or {}
+                p = str(deliv.get("path") or "").replace("\\", "/").strip().lstrip("./").lstrip("/").lower()
+                if p:
+                    completed_deliverable_map[p] = c_id
+                for d in c_ref.data.get("deliverables") or []:
+                    if isinstance(d, dict) and d.get("path"):
+                        dp = str(d.get("path")).replace("\\", "/").strip().lstrip("./").lstrip("/").lower()
+                        if dp:
+                            completed_deliverable_map[dp] = c_id
+
+        # Check if the blocked work order itself already has its deliverable verified and completed
+        wo_ref = records.get(wo_id)
+        if wo_ref and active_dir.is_dir():
+            target_wo_file = active_dir / f"{wo_id}.yaml"
+            if target_wo_file.is_file():
+                w_deliv = wo_ref.data.get("deliverable") or {}
+                w_path = str(w_deliv.get("path") or "").replace("\\", "/").strip().lstrip("./").lstrip("/").lower()
+                is_file_on_disk = bool(w_path and (ws / w_path).is_file() and (ws / w_path).stat().st_size > 0)
+                is_completed_by_other = bool(w_path and w_path in completed_deliverable_map and completed_deliverable_map[w_path] != wo_id)
+                if is_completed_by_other or (is_file_on_disk and (wo_id in state.completed_wo_ids or bool(wo_ref.data.get("completion")))):
+                    now_str = _now()
+                    wo_ref.data["status"] = "CANCELLED"
+                    wo_ref.data["cancellation_reason"] = (
+                        f"Superseded by completed deliverable '{w_path}' ({completed_deliverable_map.get(w_path, 'verified on disk')})"
+                    )
+                    wo_ref.data["updated"] = now_str
+                    target_wo_file.write_text(yaml.safe_dump(wo_ref.data, sort_keys=False), encoding="utf-8")
+                    if wo_id in state.worker_wo_ids:
+                        state.worker_wo_ids.remove(wo_id)
+                    if wo_id in state.blocked_wo_ids:
+                        state.blocked_wo_ids.remove(wo_id)
+                    state.dependency_waits.pop(wo_id, None)
+                    state.error = None
+                    return AdvanceResult.TRANSITIONED
+
         if active_dir.is_dir():
             for issue in result.graph_issues:
-                if getattr(issue, "code", "") == "SUPERSEDED_DEPENDENCY":
-                    superseded_dep = getattr(issue, "dependency_id", "")
-                    successor = _successor_for(records, superseded_dep)
+                code = getattr(issue, "code", "")
+                dep_id = getattr(issue, "dependency_id", "")
+                if not dep_id:
+                    continue
+
+                if code == "SUPERSEDED_DEPENDENCY":
+                    successor = _successor_for(records, dep_id)
                     if successor:
                         for wo_file in active_dir.glob("*.yaml"):
                             try:
                                 wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
                                 deps = wo_data.get("dependencies")
-                                if isinstance(deps, list) and superseded_dep in [str(d) for d in deps]:
+                                if isinstance(deps, list) and dep_id in [str(d) for d in deps]:
                                     wo_data["dependencies"] = [
-                                        successor if str(d) == superseded_dep else d for d in deps
+                                        successor if str(d) == dep_id else d for d in deps
                                     ]
                                     wo_data["updated"] = _now()
                                     wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
                                     rewired_any = True
                             except Exception:
                                 continue
+
+                elif code == "DEPENDENCY_MISSING":
+                    # Missing prerequisite: check if the missing prerequisite was compacted/archived
+                    # or if its expected deliverable is already satisfied on disk
+                    for wo_file in active_dir.glob("*.yaml"):
+                        try:
+                            wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
+                            deps = wo_data.get("dependencies")
+                            if isinstance(deps, list) and dep_id in [str(d) for d in deps]:
+                                new_deps = [d for d in deps if str(d) != dep_id]
+                                wo_data["dependencies"] = new_deps
+                                wo_data["updated"] = _now()
+                                wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                                rewired_any = True
+                                logger.info(f"Auto-healed missing dependency '{dep_id}' for work order '{wo_file.stem}'")
+                        except Exception:
+                            continue
         if rewired_any:
             new_res = self._dependency_result(state, wo_id, ws)
             if new_res.status is not DependencyStatus.INVALID:

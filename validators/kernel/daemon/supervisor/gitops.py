@@ -443,9 +443,21 @@ class _GitopsMixin:
         goal = state.product_goal or "Product delivery"
         version = "0.1.0"
         v_file = ws / "VERSION.md"
+        if not v_file.is_file():
+            v_file = ws / "VERSION"
         if v_file.is_file():
             try:
                 version = v_file.read_text(encoding="utf-8").strip() or version
+            except Exception:
+                pass
+        else:
+            try:
+                (ws / "VERSION").write_text(f"{version}\n", encoding="utf-8")
+            except Exception:
+                pass
+        if not (ws / "VERSION.md").is_file():
+            try:
+                (ws / "VERSION.md").write_text(f"# Version\n\n{version}\n", encoding="utf-8")
             except Exception:
                 pass
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
