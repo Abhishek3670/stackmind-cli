@@ -389,6 +389,11 @@ class ProcessSandbox:
             ws_root = str(self.workspace.root)
             if ws_root.lower() not in existing_pp.lower():
                 env[pp_key] = f"{ws_root}{os.pathsep}{existing_pp}" if existing_pp else ws_root
+
+        # Ensure non-interactive execution for package tools to prevent prompt hangs (e.g. npx ok to proceed?)
+        env["CI"] = "true"
+        env["npm_config_yes"] = "true"
+        env["NONINTERACTIVE"] = "1"
         return env
 
     @staticmethod
