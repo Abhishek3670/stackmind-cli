@@ -983,13 +983,14 @@ class _ExecutionMixin:
                 f"Execute work order {wo_id} as the QA worker.\n"
                 f"1. Inspect existing workspace deliverables (e.g. server/, src/, index.html) with read_file and list_directory to ground your test assertions.{os_note}\n"
                 f"   CRITICAL INTERFACE CONTRACT INVARIANT: Your test assertions MUST strictly verify against the actual exported public signatures, function return types, error return conventions, and DOM hooks as implemented in the deliverables under test and specified in .sync/playbook/ and .sync/contracts/. Do not invent contradictory return shapes, token types, or incompatible signatures.\n"
-                f"2. Author the declared test suite '{deliv_path}' with write_file — thorough "
+                f"2. PACKAGE & DEPENDENCY INTEGRITY (Testing Prerequisite): Verify that project dependencies install and resolve cleanly. Ensure package manifests (e.g. package.json) do not include broken, unused, or failing native C++ dependencies that crash on the host environment (such as better-sqlite3 when @libsql/client is used), and verify all imported modules are properly declared in dependencies. If package issues exist, report them as blockers naming package.json so the manifest can be amended.\n"
+                f"3. Author the declared test suite '{deliv_path}' with write_file — thorough "
                 f"semantic end-to-end coverage of the deliverables produced by the other work orders, verifying user-requested content and element IDs.{criteria_section}\n"
-                f"3. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
-                f"4. Run the run_security_scan tool over the deliverables and triage the output; "
+                f"4. Execute the suite end-to-end with the run_tests tool (pytest) and review the results.\n"
+                f"5. Run the run_security_scan tool over the deliverables and triage the output; "
                 f"report every unresolved finding as a blocker.\n"
-                f"5. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
-                f"6. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
+                f"6. Do not modify application code; if the suite or the scan exposes defects, report them as blockers.\n"
+                f"7. If you write a QA verdict file to .sync/inbox/claude/ (e.g. .sync/inbox/claude/{wo_id}-verdict.txt) with write_file, declare it along with '{deliv_path}' in modified_files. Declare in modified_files ONLY files you actually wrote with write_file.\n"
                 "Review against the security checklist: no hardcoded secrets or env-fallback defaults, "
                 "debug flags disabled, authentication logic free of obvious flaws, and forms protected "
                 "against CSRF/replay where applicable."
@@ -1008,7 +1009,7 @@ class _ExecutionMixin:
             deps_note = "\nEnvironment note: Dependencies are already installed in node_modules. Do not run 'npm install'. Focus directly on authoring and verifying your declared deliverable."
         return f"Execute work order {wo_id}{deps_note}"
 
-    def _ensure_project_dependencies(self, ws: Path) -> bool:
+    def _ensure_project_dependencies(self, ws: Path, state: Any = None) -> bool:
         """Pre-flight check: if package.json has dependencies but node_modules is missing,
         install them once at the supervisor level before downstream workers run."""
         pkg_json = ws / "package.json"
@@ -1021,9 +1022,15 @@ class _ExecutionMixin:
                     from validators.kernel.sandbox import ProcessSandbox
                     sandbox = ProcessSandbox(SimpleNamespace(root=Path(ws).resolve()))
                     res = sandbox.run(["npm", "install", "--prefer-offline", "--no-audit"], timeout=300.0)
-                    return res.returncode == 0
-            except Exception:
-                pass
+                    if res.returncode != 0:
+                        if state is not None:
+                            setattr(state, "last_package_error", (res.stderr or res.stdout or "").strip())
+                        return False
+                    return True
+            except Exception as exc:
+                if state is not None:
+                    setattr(state, "last_package_error", str(exc))
+                return False
         return True
 
     def _qa_execution_evidence_gap(self, wo_id: str, op: dict[str, Any], ws: Path) -> str | None:
@@ -2225,6 +2232,13 @@ class _ExecutionMixin:
         attempt = state.qa_review_attempts.get(wo_id, 0)
         budget = state.max_qa_reworks
 
+        pkg_err = getattr(state, "last_package_error", None)
+        pkg_err_section = (
+            f"\n[ALERT] Package installation defect detected:\n{pkg_err[:400]}\n"
+            "Report this critical package defect naming package.json in your findings and required_actions.\n\n"
+            if pkg_err else ""
+        )
+
         return (
             f"Mandatory QA review for work order {wo_id}.\n\n"
             "The worker declared completion, but completion claims are not evidence. "
@@ -2232,6 +2246,7 @@ class _ExecutionMixin:
             "work-order acceptance criteria "
             f"and the contract:\n{deliv_text}\n\n"
             f"Acceptance criteria:\n{criteria_text}\n\n"
+            f"{pkg_err_section}"
             "Required checks (use the real tools, do not infer):\n"
             "1. Read the deliverable files and confirm they implement the declared behaviour.\n"
             "2. Run the relevant test suite with run_tests; run the build/static check when the "
@@ -2240,7 +2255,8 @@ class _ExecutionMixin:
             "by the plan.\n"
             "4. If tests exist, run them. If the project does not yet have tests (e.g. tests scheduled in downstream work orders), run stack syntax checks (e.g. node --check for JS, py_compile for Python) and use verdict NO_TEST_EVIDENCE. "
             "never as a pass.\n"
-            "5. CRITICAL SCOPE BOUNDARY: Verify ONLY the declared deliverable(s) for THIS work order:\n"
+            "5. PACKAGE & DEPENDENCY ENSURANCE (Testing Prerequisite): Verify that the project's package manifest (e.g. package.json) installs and resolves cleanly on the host environment without compiler crashes. Verify all third-party modules imported in the deliverables are declared in dependencies, and no unused/incompatible native C++ dependencies fail installation. If package installation fails or required dependencies are missing, record a critical defect naming package.json in findings and required_actions with verdict FAIL.\n"
+            "6. CRITICAL SCOPE BOUNDARY: Verify ONLY the declared deliverable(s) for THIS work order:\n"
             f"{deliv_text}\n"
             "Do NOT fail this work order because downstream companion deliverables (such as companion CSS, JS, "
             "backend logic, or test modules) owned by OTHER work orders do not yet exist on disk. "

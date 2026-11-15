@@ -2118,7 +2118,7 @@ class _RecoveryMixin:
             self._archive_verdicts_for_wo(wo_id, ws)
             self._restore_worker_contract_after_recovery(ws, wo_id, state)
             if hasattr(self, "_ensure_project_dependencies"):
-                self._ensure_project_dependencies(ws)
+                self._ensure_project_dependencies(ws, state)
             agent = self._agent_for_wo(wo_id, ws)
             try:
                 self.manager.start_turn(

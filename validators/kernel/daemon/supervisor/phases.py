@@ -886,7 +886,7 @@ class _PhasesMixin:
                             all_done = False
                             continue
                         if wo_id not in ("WO-001", "WO-000", getattr(state, "planning_wo_id", None)):
-                            self._ensure_project_dependencies(ws)
+                            self._ensure_project_dependencies(ws, state)
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
                             op = self.manager.start_turn(

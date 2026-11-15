@@ -214,3 +214,35 @@ def test_background_task_dynamic_tiering_and_timeout(tmp_path: Path):
     status_timed_out = proc_obj.status()
     assert status_timed_out["status"] == "timed_out"
 
+
+def test_qa_package_and_dependency_ensurance(tmp_path: Path):
+    """QA worker dispatch and review prompts must mandate package and dependency ensurance
+    and propagate package installation defect alerts."""
+    sup = LifecycleSupervisor(MagicMock())
+    state = sup.start_run("run-test", "Product Goal", tmp_path, "session-test")
+    state.last_package_error = "error C1189: C++20 or later required (better-sqlite3)"
+
+    # QA worker dispatch prompt includes package integrity
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    import yaml
+    (wo_dir / "WO-022.yaml").write_text(
+        yaml.safe_dump({
+            "id": "WO-022",
+            "title": "QA Test Suite",
+            "assigned_agents": ["gemma"],
+            "deliverable": {"path": "tests/e2e.test.ts", "type": "test"},
+        }),
+        encoding="utf-8"
+    )
+
+    dispatch_prompt = sup._worker_dispatch_prompt(state, "WO-022", tmp_path)
+    assert "PACKAGE & DEPENDENCY INTEGRITY" in dispatch_prompt
+    assert "package.json" in dispatch_prompt
+
+    # QA review prompt includes package error alert and check 5
+    review_prompt = sup._qa_review_prompt(state, tmp_path, "WO-022")
+    assert "PACKAGE & DEPENDENCY ENSURANCE" in review_prompt
+    assert "Package installation defect detected" in review_prompt
+    assert "better-sqlite3" in review_prompt
+
