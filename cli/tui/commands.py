@@ -2012,7 +2012,8 @@ def dispatch_delivery_command(
     # Clear thinking buffer and turn actions at start of new turn to prevent stale state from previous turn
     state.current_turn_thinking = ""
     state.current_turn_actions = ActionsGroup(active=False, verbosity=state.govern_verbosity)
-    normalized = text.strip()
+    text_clean = re.sub(r"(?:\x1b|\^\[)?\[<?[0-9;]*[a-zA-Z]", "", text).strip()
+    normalized = text_clean if text_clean else text.strip()
     if not normalized:
         return session, False
 

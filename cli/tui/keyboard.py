@@ -2066,7 +2066,7 @@ class RawLineEditor:
             return False
 
         # Intercept any raw SGR mouse escape sequences in any encoding (e.g. ^[[<0;101;34M, \x1b[<0;101;34M, [<0;101;34M)
-        if isinstance(key, str) and ("<" in key and ";" in key and (key.endswith("M") or key.endswith("m"))):
+        if isinstance(key, str) and "<" in key and ";" in key and ("[<" in key or "\x1b" in key or "^[" in key):
             mouse_matches = list(re.finditer(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)([Mm])", key))
             if mouse_matches:
                 for match in mouse_matches:
@@ -2075,7 +2075,10 @@ class RawLineEditor:
                     row = int(match.group(3))
                     action = match.group(4)
                     self.handle_key(f"<MOUSE_{btn}_{col}_{row}_{action}>")
-                return False
+                clean_key = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)([Mm])", "", key)
+                if not clean_key:
+                    return False
+                key = clean_key
 
         if key.startswith("<MOUSE_"):
             if key == "<MOUSE_IGNORE>":
