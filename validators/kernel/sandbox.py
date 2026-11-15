@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -410,6 +411,22 @@ class ProcessSandbox:
     ) -> CommandResult:
         self._validate(command)
 
+        effective_timeout = timeout
+        if effective_timeout == 30:
+            cmd0 = str(command[0]).lower() if command else ""
+            cmd_joined = " ".join(str(c).lower() for c in command)
+            long_running_bins = {
+                "npm", "pnpm", "yarn", "npx", "pip", "pip3", "cargo",
+                "pytest", "vitest", "playwright", "tsc", "dotnet", "mvn", "gradle",
+            }
+            long_running_subcmds = {
+                "install", "update", "add", "build", "compile", "test",
+                "generate", "migrate", "db:generate", "seed", "ci",
+            }
+            bin_name = Path(cmd0).stem.lower()
+            if bin_name in long_running_bins or any(sub in cmd_joined for sub in long_running_subcmds):
+                effective_timeout = 300.0
+
         mem_limit = (
             self.memory_limit_bytes
             if memory_limit_bytes is _SENTINEL
@@ -442,6 +459,15 @@ class ProcessSandbox:
                 limit_env["STACKMIND_RLIMIT_CPU"] = str(int(max(1, cpu_limit)))
 
         argv = [shim, *command] if shim is not None else list(command)
+
+        # Windows: resolve executable through PATH/PATHEXT (e.g. npm -> npm.cmd) when not explicit
+        if sys.platform == "win32" and argv:
+            exe0 = argv[0]
+            has_ext = os.path.splitext(exe0)[1].lower() in (".exe", ".cmd", ".bat", ".com")
+            if not (os.path.isabs(exe0) and has_ext):
+                resolved = shutil.which(exe0)
+                if resolved:
+                    argv = [resolved] + list(argv[1:])
 
         # Windows: create the child SUSPENDED so the Job Object (with its
         # memory/CPU limits) is attached before the first instruction runs.
@@ -488,7 +514,7 @@ class ProcessSandbox:
                 )
 
             try:
-                stdout, stderr = proc.communicate(timeout=timeout)
+                stdout, stderr = proc.communicate(timeout=effective_timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 if sys.platform != "win32":

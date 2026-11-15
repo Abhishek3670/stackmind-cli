@@ -1003,7 +1003,28 @@ class _ExecutionMixin:
                 f"Execute work order {wo_id} to resolve integration review blockers:\n"
                 f"{blockers_str}"
             )
-        return f"Execute work order {wo_id}"
+        deps_note = ""
+        if (ws / "node_modules").is_dir() and not (wo_id in ("WO-001", "WO-000")):
+            deps_note = "\nEnvironment note: Dependencies are already installed in node_modules. Do not run 'npm install'. Focus directly on authoring and verifying your declared deliverable."
+        return f"Execute work order {wo_id}{deps_note}"
+
+    def _ensure_project_dependencies(self, ws: Path) -> bool:
+        """Pre-flight check: if package.json has dependencies but node_modules is missing,
+        install them once at the supervisor level before downstream workers run."""
+        pkg_json = ws / "package.json"
+        if pkg_json.is_file() and not (ws / "node_modules").is_dir():
+            try:
+                import json
+                data = json.loads(pkg_json.read_text(encoding="utf-8"))
+                if data.get("dependencies") or data.get("devDependencies"):
+                    from types import SimpleNamespace
+                    from validators.kernel.sandbox import ProcessSandbox
+                    sandbox = ProcessSandbox(SimpleNamespace(root=Path(ws).resolve()))
+                    res = sandbox.run(["npm", "install", "--prefer-offline", "--no-audit"], timeout=300.0)
+                    return res.returncode == 0
+            except Exception:
+                pass
+        return True
 
     def _qa_execution_evidence_gap(self, wo_id: str, op: dict[str, Any], ws: Path) -> str | None:
         """Detect a QA turn that completed without authoring/running its test suite.

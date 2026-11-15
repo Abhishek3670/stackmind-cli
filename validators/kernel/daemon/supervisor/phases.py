@@ -885,6 +885,8 @@ class _PhasesMixin:
                         if active_in_flight_ops >= max_c:
                             all_done = False
                             continue
+                        if wo_id not in ("WO-001", "WO-000", getattr(state, "planning_wo_id", None)):
+                            self._ensure_project_dependencies(ws)
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
                             op = self.manager.start_turn(

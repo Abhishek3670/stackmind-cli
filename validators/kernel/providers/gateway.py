@@ -2914,6 +2914,26 @@ class ProviderGateway:
                     continue
                 raise NoProgressLoopError(cycle_err, pattern=cycle_err)
 
+            # 1b. Anti-Stagnation Circuit Breaker: detect consecutive passive inspection/reads
+            READ_TOOLS = {"read_file", "list_directory", "glob", "grep", "read_many_files", "get_symbol"}
+            if len(recent_signatures) >= 4:
+                last_4_tools = [s[0] for s in recent_signatures[-4:]]
+                if all(t in READ_TOOLS for t in last_4_tools):
+                    if loop_nudges < max_loop_nudges:
+                        loop_nudges += 1
+                        recent_signatures = recent_signatures[:-2]
+                        messages.append(Message.user(
+                            "[SYSTEM WARNING: Anti-Stagnation Circuit Breaker triggered. "
+                            "You have performed 4 consecutive passive read/inspection tool calls without mutating code or progressing execution. "
+                            "Stop repeating file inspections. If an earlier command or dependency failed, resolve it, write your assigned deliverable with write_file, "
+                            "or finalize your turn declaring status 'BLOCKED' detailing the blocker.]"
+                        ))
+                        continue
+                    raise NoProgressLoopError(
+                        "Pathological loop: 4 consecutive passive read/inspection tool calls without progress",
+                        pattern="consecutive_reads",
+                    )
+
             # 2. Check consecutive identical tool calls
             if len(recent_signatures) >= DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:
                 last_sig = recent_signatures[-1]

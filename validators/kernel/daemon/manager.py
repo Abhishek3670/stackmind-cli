@@ -3438,29 +3438,40 @@ class SessionManager:
             is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
             is_delivery_status_param = bool(op_rec.get("metadata", {}).get("is_delivery_status"))
             session_history: list[dict[str, str]] = []
-            client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
-            if isinstance(client_hist, list) and client_hist:
-                for h in client_hist:
-                    if isinstance(h, dict) and "role" in h and "content" in h:
-                        h_content = str(h["content"]).strip()
-                        if h_content and not h_content.startswith(":"):
-                            if not (h_content.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in h_content):
-                                session_history.append({"role": str(h["role"]).lower(), "content": h_content})
-            else:
-                with self._lock:
-                    for r in session.get("journal", []):
-                        if r.get("operation_id") == operation_id:
-                            continue
-                        if r.get("operation") == "turn" and not r.get("work_order_id") and not (r.get("metadata") or {}).get("is_authoring"):
-                            u_p = (r.get("metadata") or {}).get("prompt") or r.get("prompt")
-                            res = r.get("result") or {}
-                            a_r = res.get("summary") or res.get("report_markdown")
-                            if u_p and a_r and isinstance(a_r, str) and a_r.strip():
-                                u_clean = str(u_p).strip()
-                                a_clean = str(a_r).strip()
-                                if not u_clean.startswith(":") and not (a_clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in a_clean):
-                                    session_history.append({"role": "user", "content": u_clean})
-                                    session_history.append({"role": "assistant", "content": a_clean})
+            if not wo_id_param and not is_authoring_param:
+                # Conversational / ad-hoc turn: inherit chat history
+                client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
+                if isinstance(client_hist, list) and client_hist:
+                    for h in client_hist:
+                        if isinstance(h, dict) and "role" in h and "content" in h:
+                            h_content = str(h["content"]).strip()
+                            if h_content and not h_content.startswith(":"):
+                                if not (h_content.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in h_content):
+                                    session_history.append({"role": str(h["role"]).lower(), "content": h_content})
+                else:
+                    with self._lock:
+                        for r in session.get("journal", []):
+                            if r.get("operation_id") == operation_id:
+                                continue
+                            if r.get("operation") == "turn" and not r.get("work_order_id") and not (r.get("metadata") or {}).get("is_authoring"):
+                                u_p = (r.get("metadata") or {}).get("prompt") or r.get("prompt")
+                                res = r.get("result") or {}
+                                a_r = res.get("summary") or res.get("report_markdown")
+                                if u_p and a_r and isinstance(a_r, str) and a_r.strip():
+                                    u_clean = str(u_p).strip()
+                                    a_clean = str(a_r).strip()
+                                    if not u_clean.startswith(":") and not (a_clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in a_clean):
+                                        session_history.append({"role": "user", "content": u_clean})
+                                        session_history.append({"role": "assistant", "content": a_clean})
+            elif wo_id_param:
+                # Governed work order turn: isolate context to prevent cross-role/cross-WO contamination
+                client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
+                if isinstance(client_hist, list) and client_hist:
+                    for h in client_hist:
+                        if isinstance(h, dict) and str(h.get("work_order_id", "")) == str(wo_id_param):
+                            h_content = str(h.get("content", "")).strip()
+                            if h_content and not h_content.startswith(":"):
+                                session_history.append({"role": str(h.get("role", "user")).lower(), "content": h_content})
 
             if len(session_history) > 12:
                 session_history = session_history[-12:]
