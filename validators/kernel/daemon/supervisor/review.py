@@ -608,7 +608,7 @@ class _ReviewMixin:
             gate_decision = gate.evaluate(state=state, integration_op=op, extra_telemetry=extra_telemetry)
             state.integration_evidence = gate_decision.to_dict()
 
-            llm_blocked = (status == "BLOCKED" or result_status == "blocked")
+            llm_blocked = (status in ("BLOCKED", "FAILED") or result_status in ("blocked", "failed", "rejected"))
             deterministic_blocked = not gate_decision.passed
 
             if llm_blocked or deterministic_blocked:
@@ -639,6 +639,9 @@ class _ReviewMixin:
                     for raw in op_result.get("blockers") or []:
                         if str(raw) not in blockers:
                             blockers.append(str(raw))
+                    for f in op_result.get("findings") or []:
+                        if str(f).strip() and str(f).strip() not in blockers:
+                            blockers.append(str(f).strip())
                     if not blockers and op_result.get("reason"):
                         blockers = [op_result["reason"]]
 
@@ -738,9 +741,32 @@ class _ReviewMixin:
                     else _strip_code_fences(str(op_result.get("summary", "Blockers reported during integration review")))
                 )
 
-                reworkable = self._reworkable_integration_wos(
+                blocker_text = " ".join(str(b) for b in (blockers + detail_paths)).lower()
+                is_plan_deviation = any(
+                    kw in blocker_text
+                    for kw in (
+                        "plan deviation", "plan adherence", "unimplemented",
+                        "missing work order", "no work order", "not authored",
+                        "plan mismatch", "scope gap", "missing requirement"
+                    )
+                )
+
+                reworkable = [] if is_plan_deviation else self._reworkable_integration_wos(
                     state, ws, blockers + detail_paths
                 )
+                if not reworkable:
+                    rec_attempts = state.recovery_attempts.get("PLAN_DEVIATION", 0)
+                    if rec_attempts < state.max_retries and state.global_turn_budget > 0:
+                        state.recovery_attempts["PLAN_DEVIATION"] = rec_attempts + 1
+                        state.recovery_wo_id = "PLAN_DEVIATION"
+                        state.error = f"INTEGRATION_PLAN_DEVIATION: {err_msg}"
+                        self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                        return AdvanceResult.TRANSITIONED
+                    state.error = f"Integration review blocked: {err_msg} (no authorized work order could be linked to findings)"
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+
                 if state.integration_rework_rounds < state.max_retries and reworkable:
                     state.integration_rework_rounds += 1
                     if state.integration_operation_id and state.integration_operation_id not in state.ignored_operation_ids:
@@ -826,9 +852,10 @@ class _ReviewMixin:
                     self._transition(state, Phase.EXECUTING)
                     return AdvanceResult.WAITING_FOR_OPERATION
 
-                state.error = f"Integration review blocked: {err_msg}"
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.error = f"Integration review blocked: {err_msg} — rework rounds exhausted ({state.integration_rework_rounds}/{state.max_retries})"
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
 
             # Both deterministic checks and review completed cleanly
             state.integration_blockers = []

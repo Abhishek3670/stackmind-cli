@@ -2850,6 +2850,22 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
+        # Idempotency check: if tag already exists and points to HEAD commit, succeed idempotently
+        check_proc = self._run_git(["rev-parse", "-q", "--verify", f"refs/tags/{tag_name}"])
+        if check_proc.returncode == 0:
+            existing_tag = check_proc.stdout.strip()
+            head_proc = self._run_git(["rev-parse", "HEAD"])
+            head_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+            peeled_proc = self._run_git(["rev-parse", "-q", "--verify", f"refs/tags/{tag_name}^{{commit}}"])
+            tag_commit = peeled_proc.stdout.strip() if peeled_proc.returncode == 0 else existing_tag
+            if head_sha and tag_commit == head_sha:
+                self.boundary.journal.complete(record.request.operation_id, f"tag {tag_name} (already at HEAD)")
+                return tag_name
+            raise RuntimeError(
+                f"git tag failed: tag '{tag_name}' already exists pointing to commit {tag_commit}, "
+                f"which does not match current HEAD ({head_sha})"
+            )
+
         cmd = ["tag", "-a", tag_name, "-m", message or tag_name]
         proc = self._run_git(cmd)
         if proc.returncode != 0:

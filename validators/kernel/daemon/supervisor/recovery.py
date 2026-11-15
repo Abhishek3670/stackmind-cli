@@ -45,6 +45,16 @@ class _RecoveryMixin:
 
     def _advance_architect_repair(self, state: RunState) -> AdvanceResult:
         """ARCHITECT_REPAIR: wait for the bounded Architect repair turn, then revalidate."""
+        if state.authoring_repair_attempts >= state.max_authoring_repairs:
+            state.error = (
+                f"Architect repair attempts exhausted "
+                f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
+                f"operator intervention required"
+            )
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
         if state.architect_repair_operation_id:
             op = self._get_operation(state.architect_repair_operation_id)
             if op is None:
@@ -97,8 +107,9 @@ class _RecoveryMixin:
                         f"Architect repair outcome invalid ({post_check_error}) and repair attempts "
                         f"are exhausted; operator intervention required"
                     )
-                    self._transition(state, Phase.BLOCKED)
-                    return AdvanceResult.BLOCKED
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
                 state.repair_context["post_check_error"] = post_check_error
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
@@ -197,8 +208,9 @@ class _RecoveryMixin:
                         if state.authoring_repair_attempts > state.max_authoring_repairs:
                             issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5])
                             state.error = f"Authoring readiness gate failed after recovery ({issue_summary}) and repair attempts exhausted"
-                            self._transition(state, Phase.BLOCKED)
-                            return AdvanceResult.BLOCKED
+                            state.exit_code = 3
+                            self._transition(state, Phase.WAITING_FOR_HUMAN)
+                            return AdvanceResult.WAITING_FOR_HUMAN
                         issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5])
                         state.repair_context["post_check_error"] = f"Authoring readiness gate failed: {issue_summary}"
                         state.architect_repair_operation_id = None
@@ -238,8 +250,9 @@ class _RecoveryMixin:
                         f"Authoring readiness gate still failing after repair "
                         f"({issue_summary}); repair attempts exhausted, operator intervention required"
                     )
-                    self._transition(state, Phase.BLOCKED)
-                    return AdvanceResult.BLOCKED
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
                 state.readiness_issues = [i.to_dict() for i in gate_result.issues]
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
@@ -393,6 +406,16 @@ class _RecoveryMixin:
         """
         ws = Path(state.workspace)
         wo_id = state.recovery_wo_id
+        attempts = state.recovery_attempts.get(str(wo_id), 0)
+        if attempts >= state.max_retries:
+            state.error = (
+                f"Architect recovery attempts for {wo_id} exhausted "
+                f"({attempts}/{state.max_retries}); operator intervention required"
+            )
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
         self._current_recovery_failure_code = (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code")
 
         if state.recovery_decision_operation_id:
@@ -484,8 +507,9 @@ class _RecoveryMixin:
                     f"Architect recovery decision for {wo_id} could not be obtained "
                     f"({decision_error}); recovery attempts exhausted with evidence retained"
                 )
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
             state.recovery_attempts[str(wo_id)] = attempts + 1
             state.recovery_decision_operation_id = None
             new_op = self._dispatch_recovery_decision(state, ws, str(wo_id), decision_error)
@@ -494,8 +518,9 @@ class _RecoveryMixin:
                     f"Architect recovery decision for {wo_id} failed ({decision_error}) "
                     f"and the decision turn could not be re-dispatched"
                 )
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
             state.recovery_decision_operation_id = new_op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
 
@@ -587,8 +612,9 @@ class _RecoveryMixin:
                 f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
                 f"operator intervention required"
             )
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
         state.error = reason
         if issues is not None:
             state.readiness_issues = [
@@ -1333,6 +1359,16 @@ class _RecoveryMixin:
             }
             return self._enter_recovery_repair(state, ws, record)
 
+        if action in ("add_work_order", "decompose_work_orders", "amend_plan"):
+            state.repair_context = {
+                "source": "recovery",
+                "action": action,
+                "work_order": wo_id,
+                "decision": decision,
+                "evidence": evidence,
+            }
+            return self._enter_recovery_repair(state, ws, record)
+
         if action == "retry_unchanged":
             failure_code = evidence.get("failure_code") or decision.get("failure_code")
             transient_ok = bool(decision.get("transient")) and (
@@ -1342,6 +1378,13 @@ class _RecoveryMixin:
             hash_ok = (
                 not evidence.get("contract_hash")
                 or current_hash == evidence.get("contract_hash")
+            )
+            from validators.harness.review_gate import subject_hash
+            current_subject_hash = subject_hash(ws, wo_id)
+            rec_subject_hash = evidence.get("subject_hash")
+            deliv_ok = (
+                not rec_subject_hash
+                or current_subject_hash == rec_subject_hash
             )
             if not transient_ok:
                 state.recovery_decisions.append({
@@ -1358,6 +1401,12 @@ class _RecoveryMixin:
                     "rejected_reason": "contract hash changed since the blocker",
                 })
                 return None, "retry_unchanged requires an unchanged contract hash"
+            if not deliv_ok:
+                state.recovery_decisions.append({
+                    **record, "applied": False,
+                    "rejected_reason": "deliverable hash changed on disk; retry_unchanged requires unchanged deliverable bytes",
+                })
+                return None, "retry_unchanged requires an unchanged deliverable subject hash"
             state.recovery_decisions.append({**record, "applied": True})
             return self._resume_worker_after_recovery(state, ws, wo_id), None
 
@@ -2105,7 +2154,14 @@ class _RecoveryMixin:
     def _resume_worker_after_recovery(
         self, state: RunState, ws: Path, wo_id: str,
     ) -> AdvanceResult:
-        """Backward-compatible alias: clear the blocker and re-dispatch the worker."""
+        """Clear the blocker and resume execution. If the blocker was from QA, re-run QA instead of authoring worker."""
+        evidence = state.worker_blockers.get(str(wo_id), {})
+        f_code = str(evidence.get("failure_code", "")).lower()
+        src = str(evidence.get("source", "")).lower()
+        is_qa_failure = src == "qa" or "qa" in f_code or "test" in f_code
+        if is_qa_failure:
+            # Re-dispatch QA review rather than authoring worker rework
+            return self._clear_worker_blocker(state, ws, wo_id, redispatch=False)
         return self._clear_worker_blocker(state, ws, wo_id, redispatch=True)
 
     # ── Helpers ───────────────────────────────────────────────────────

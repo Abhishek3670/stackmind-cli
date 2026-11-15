@@ -166,3 +166,119 @@ def test_final_review_plan_deviation_escalates_to_architect_recovery(tmp_path: P
     assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
     assert state.recovery_wo_id == "PLAN_DEVIATION"
     assert "FINAL_REVIEW_PLAN_DEVIATION" in state.error
+
+
+def test_authoring_repair_exhaustion_halts_at_waiting_for_human(tmp_path: Path) -> None:
+    """When authoring repairs exceed max_authoring_repairs, supervisor halts at WAITING_FOR_HUMAN with exit_code=3."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.phase = Phase.ARCHITECT_REPAIR
+    state.max_authoring_repairs = 2
+    state.authoring_repair_attempts = 3  # exceeded
+
+    res = supervisor._advance_architect_repair(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 3
+    assert "exhausted" in (state.error or "").lower()
+
+
+def test_recovery_attempts_exhaustion_halts_at_waiting_for_human(tmp_path: Path) -> None:
+    """When recovery attempts for a blocked work order exceed max_retries, it halts at WAITING_FOR_HUMAN with exit_code=3."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.phase = Phase.ARCHITECT_RECOVERY_DECISION
+    state.recovery_wo_id = "WO-001"
+    state.max_retries = 2
+    state.recovery_attempts["WO-001"] = 2  # at max limit
+
+    res = supervisor._advance_recovery_decision(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 3
+    assert "exhausted" in (state.error or "").lower()
+
+
+def test_integration_plan_deviation_escalates_to_architect_recovery(tmp_path: Path) -> None:
+    """When integration review detects plan deviation / missing work orders, it routes to ARCHITECT_RECOVERY_DECISION."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.integration_wo_id = "WO-020"
+    state.completed_wo_ids = ["WO-001"]
+    state.max_retries = 3
+    state.global_turn_budget = 20
+
+    # Mock completed review op with plan deviation blocker
+    op = mock_mgr.start_turn("sess-test-arch", "Run review", work_order_id="WO-020")
+    state.integration_operation_id = op["operation_id"]
+    mock_mgr.complete_operation(
+        op["operation_id"],
+        status="COMPLETED",
+        result={
+            "status": "failed",
+            "findings": ["Plan requires database migrations but no work order was authored for migrations"],
+        },
+    )
+
+    res = supervisor._advance_integration_review(state)
+    assert res == AdvanceResult.TRANSITIONED
+    assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+    assert state.recovery_wo_id == "PLAN_DEVIATION"
+
+
+def test_qa_infra_error_preserves_rework_budget(tmp_path: Path) -> None:
+    """QA harness/environment errors (ERROR, BLOCKED, FLAKY) must NOT increment developer qa_reworks budget."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.phase = Phase.EXECUTING
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "main.py"}
+    }), encoding="utf-8")
+    (tmp_path / "main.py").write_text("print(1)", encoding="utf-8")
+
+    # Write a QA verdict with ERROR (test runner crashed / infra failure)
+    reviews_dir = tmp_path / ".sync" / "reviews" / "qa"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "WO-001.json").write_text(yaml.safe_dump({
+        "schema": "stackmind.qa-verdict.v1",
+        "work_order_id": "WO-001",
+        "verdict": "ERROR",
+        "reason": "Vitest crashed: out of memory (exit code 137)",
+    }), encoding="utf-8")
+
+    # Check verdict recognized as INFRA_ERROR
+    verdict = supervisor._check_qa_verdict("WO-001", tmp_path)
+    assert verdict == "INFRA_ERROR"
+
+    # Advance executing must not increment qa_reworks
+    supervisor._advance_executing(state)
+    assert state.qa_reworks.get("WO-001", 0) == 0
+
+
+def test_retry_unchanged_rejects_modified_deliverable(tmp_path: Path) -> None:
+    """retry_unchanged must reject when the deliverable on disk does not match the evidence subject_hash."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "main.py"}
+    }), encoding="utf-8")
+    (tmp_path / "main.py").write_text("print('modified')", encoding="utf-8")
+
+    record = {
+        "work_order": "WO-001",
+        "action": "retry_unchanged",
+        "transient": True,
+        "failure_code": "WORKER_BLOCKED",
+    }
+    # Provide a mismatched subject hash in evidence
+    evidence = {
+        "failure_code": "WORKER_BLOCKED",
+        "subject_hash": "different_older_hash_12345",
+    }
+    state.worker_blockers["WO-001"] = evidence
+
+    advance, err = supervisor._apply_recovery_decision(state, tmp_path, "WO-001", record)
+    assert advance is None
+    assert "unchanged deliverable subject hash" in (err or "").lower()
+

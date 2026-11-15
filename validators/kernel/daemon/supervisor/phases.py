@@ -1045,6 +1045,18 @@ class _PhasesMixin:
                     _review_gate.archive_qa_verdict(ws, wo_id, suffix="stale")
                 continue
 
+            if (
+                _review_gate.requires_qa(ws, wo_id, wo_data)
+                and not _review_gate.is_qa_work_order(wo_data)
+                and self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
+                and self._check_qa_verdict(wo_id, ws) == "INFRA_ERROR"
+            ):
+                # Environment or harness failure (ERROR, BLOCKED, FLAKY, TIMEOUT):
+                # Archive verdict for retry, but do NOT increment developer qa_reworks counter!
+                _review_gate.archive_qa_verdict(ws, wo_id, suffix="infra_retry")
+                all_done = False
+                continue
+
             # ── Mandatory QA review gate ──────────────────────────────────
             # A backend/frontend deliverable that produces application code or
             # user-facing behaviour is NEVER accepted on the worker's completion
