@@ -1005,15 +1005,29 @@ class _ExecutionMixin:
                 f"{blockers_str}"
             )
         deps_note = ""
-        if (ws / "node_modules").is_dir() and not (wo_id in ("WO-001", "WO-000")):
+        nm = ws / "node_modules"
+        has_deps = False
+        if nm.is_dir():
+            try:
+                has_deps = any(nm.iterdir())
+            except Exception:
+                has_deps = True
+        if has_deps and not (wo_id in ("WO-001", "WO-000")):
             deps_note = "\nEnvironment note: Dependencies are already installed in node_modules. Do not run 'npm install'. Focus directly on authoring and verifying your declared deliverable."
         return f"Execute work order {wo_id}{deps_note}"
 
     def _ensure_project_dependencies(self, ws: Path, state: Any = None) -> bool:
-        """Pre-flight check: if package.json has dependencies but node_modules is missing,
+        """Pre-flight check: if package.json has dependencies but node_modules is missing or empty,
         install them once at the supervisor level before downstream workers run."""
         pkg_json = ws / "package.json"
-        if pkg_json.is_file() and not (ws / "node_modules").is_dir():
+        nm = ws / "node_modules"
+        has_deps = False
+        if nm.is_dir():
+            try:
+                has_deps = any(nm.iterdir())
+            except Exception:
+                has_deps = True
+        if pkg_json.is_file() and not has_deps:
             try:
                 import json
                 data = json.loads(pkg_json.read_text(encoding="utf-8"))

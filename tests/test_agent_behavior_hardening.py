@@ -92,7 +92,8 @@ def test_ensure_project_dependencies_and_prompt_notice(tmp_path: Path):
     )
 
     # 1. Dispatch prompt informs worker dependencies are already installed
-    (tmp_path / "node_modules").mkdir(parents=True, exist_ok=True)
+    nm_dir = tmp_path / "node_modules" / "express"
+    nm_dir.mkdir(parents=True, exist_ok=True)
     prompt = supervisor._worker_dispatch_prompt(state, "WO-002", tmp_path)
     assert "Dependencies are already installed in node_modules" in prompt
     assert "Do not run 'npm install'" in prompt
