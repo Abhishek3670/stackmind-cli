@@ -189,13 +189,32 @@ class _RecoveryMixin:
                     return AdvanceResult.TRANSITIONED
                 else:
                     # Deliverable was not directly authored on disk (e.g. delegated to worker or work order amended)
-                    # Re-discover worker work orders (including any newly delegated ones) and re-dispatch worker!
+                    # Re-discover worker work orders (including any newly delegated ones)
+                    self._discover_worker_wos(state)
+                    gate_result = self._run_readiness_gate(state, ws)
+                    if not gate_result.ready:
+                        state.authoring_repair_attempts += 1
+                        if state.authoring_repair_attempts > state.max_authoring_repairs:
+                            issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5])
+                            state.error = f"Authoring readiness gate failed after recovery ({issue_summary}) and repair attempts exhausted"
+                            self._transition(state, Phase.BLOCKED)
+                            return AdvanceResult.BLOCKED
+                        issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5])
+                        state.repair_context["post_check_error"] = f"Authoring readiness gate failed: {issue_summary}"
+                        state.architect_repair_operation_id = None
+                        new_op = self._dispatch_repair_turn(state, ws)
+                        if new_op is None:
+                            state.error = f"Authoring readiness gate failed after recovery: {issue_summary}"
+                            self._transition(state, Phase.BLOCKED)
+                            return AdvanceResult.BLOCKED
+                        state.architect_repair_operation_id = new_op.get("operation_id")
+                        return AdvanceResult.WAITING_FOR_OPERATION
+
                     state.repair_context = {}
                     state.error = None
                     state.architect_repair_operation_id = None
                     state.authoring_repair_attempts = 0
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
-                    self._discover_worker_wos(state)
                     dest = resolve_next_execution_phase(state)
                     self._transition(state, dest, authorized_override=True)
                     return AdvanceResult.TRANSITIONED
@@ -1501,6 +1520,41 @@ class _RecoveryMixin:
                 if old_op_id and old_op_id not in state.ignored_operation_ids:
                     state.ignored_operation_ids.append(str(old_op_id))
 
+            # Prune or rewire active dependencies on cancelled work orders to prevent DEPENDENCY_WAIT_INVALIDATED deadlocks
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            if active_dir.is_dir():
+                replacements = [str(r) for r in (decision.get("replacement_work_orders") or []) if str(r) not in targets_to_cancel]
+                for wo_file in active_dir.glob("*.yaml"):
+                    if wo_file.stem in targets_to_cancel:
+                        continue
+                    try:
+                        w_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                        if not isinstance(w_data, dict):
+                            continue
+                        deps = w_data.get("dependencies")
+                        if not isinstance(deps, list):
+                            continue
+                        modified_deps = False
+                        new_deps = []
+                        for d in deps:
+                            d_str = str(d)
+                            if d_str in targets_to_cancel:
+                                modified_deps = True
+                                if replacements:
+                                    for r in replacements:
+                                        if r not in new_deps:
+                                            new_deps.append(r)
+                            else:
+                                if d_str not in new_deps:
+                                    new_deps.append(d)
+                        if modified_deps:
+                            w_data["dependencies"] = new_deps
+                            w_data["updated"] = _now()
+                            wo_file.write_text(yaml.safe_dump(w_data, sort_keys=False), encoding="utf-8")
+                            state.wo_dependencies[wo_file.stem] = new_deps
+                    except Exception:
+                        pass
+
             # Synchronize state.worker_wo_ids with actual active work orders on disk
             try:
                 self._discover_worker_wos(state)
@@ -1978,7 +2032,6 @@ class _RecoveryMixin:
             prior_decision_op = self._get_operation(state.recovery_decision_operation_id)
             if prior_decision_op is None or str(prior_decision_op.get("status", "")).upper() in _OPERATION_TERMINAL:
                 state.recovery_decision_operation_id = None
-        self._archive_verdicts_for_wo(wo_id, ws)
         wo_data = None
         try:
             from validators.harness import review_gate
@@ -1999,6 +2052,9 @@ class _RecoveryMixin:
         else:
             self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         if redispatch:
+            # Only archive prior verdicts if redispatching worker for code changes;
+            # preserving valid verdicts for completed unchanged deliverables.
+            self._archive_verdicts_for_wo(wo_id, ws)
             self._restore_worker_contract_after_recovery(ws, wo_id, state)
             agent = self._agent_for_wo(wo_id, ws)
             try:

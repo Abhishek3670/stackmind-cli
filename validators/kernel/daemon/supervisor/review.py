@@ -1330,8 +1330,10 @@ class _ReviewMixin:
                     + "; ".join(report.reasons)
                 )
                 state.exit_code = 3
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
 
         required = review_gate.required_wo_ids_for_run(state, ws)
         verdict = review_gate.load_final_verdict(ws, state.run_id)
@@ -1416,12 +1418,43 @@ class _ReviewMixin:
             return AdvanceResult.WAITING_FOR_HUMAN
         state.final_review_rounds += 1
 
-        reworkable = self._reworkable_integration_wos(state, ws, blockers)
+        blocker_text = " ".join(str(b) for b in blockers).lower()
+        is_plan_deviation = any(
+            kw in blocker_text
+            for kw in (
+                "plan deviation",
+                "plan adherence",
+                "plan requires",
+                "unimplemented",
+                "missing work order",
+                "no work order",
+                "not authored",
+                "plan mismatch",
+                "scope gap",
+                "missing requirement",
+            )
+        )
+
+        reworkable = [] if is_plan_deviation else self._reworkable_integration_wos(state, ws, blockers)
         reworkable = [
             w for w in reworkable
             if w not in (state.integration_wo_id, state.gitops_wo_id)
         ]
         if not reworkable:
+            # Plan deviation or unmapped findings: findings could not be mapped to existing work orders.
+            # Escalate to ARCHITECT_RECOVERY_DECISION if recovery budget remains,
+            # enabling the Architect to author new work orders or amend the plan.
+            rec_attempts = state.recovery_attempts.get("PLAN_DEVIATION", 0)
+            if rec_attempts < state.max_retries and state.global_turn_budget > 0:
+                state.recovery_attempts["PLAN_DEVIATION"] = rec_attempts + 1
+                state.recovery_wo_id = "PLAN_DEVIATION"
+                state.error = (
+                    f"FINAL_REVIEW_PLAN_DEVIATION: Findings not linked to existing work orders: "
+                    + "; ".join(blockers[:3])
+                )
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
+
             state.error += " (no authorized work order could be linked to the findings)"
             state.exit_code = 3
             self._transition(state, Phase.WAITING_FOR_HUMAN)

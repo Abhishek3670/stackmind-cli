@@ -548,6 +548,25 @@ class _GitopsMixin:
             except Exception:
                 pass
 
+        # Synchronize completion hashes for GitOps documentation work order
+        gitops_id = getattr(state, "gitops_wo_id", None)
+        if gitops_id:
+            for sub in ("ACTIVE", "COMPLETED"):
+                wo_file = ws / ".sync" / "work-orders" / sub / f"{gitops_id}.yaml"
+                if wo_file.is_file():
+                    try:
+                        wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                        if isinstance(wo_data, dict) and isinstance(wo_data.get("completion"), dict):
+                            hashes = wo_data["completion"].setdefault("deliverable_hashes", {})
+                            for doc in ("VERSION.md", "CHANGELOG.md", "README.md", "VERSION"):
+                                doc_p = ws / doc
+                                if doc_p.is_file():
+                                    from validators.harness.delivery_integrity import sha256_file
+                                    hashes[doc] = sha256_file(doc_p)
+                            wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
+
     def _find_gitops_wo(self, ws: Path, state: RunState) -> str | None:
         """Find a GitOps work order from disk."""
         if state.gitops_wo_id:

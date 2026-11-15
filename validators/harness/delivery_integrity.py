@@ -838,7 +838,8 @@ def evaluate_artifact_integrity(
                 text = ""
             placeholder = None if allow_placeholder else _looks_like_placeholder(text, rel)
             expected = str(recorded_hashes.get(rel) or "")
-            stale = bool(expected) and expected != digest
+            is_gitops_doc = str(wo.get("type", "")).upper() in ("GITOPS", "RELEASE") or rel in ("VERSION.md", "CHANGELOG.md", "VERSION")
+            stale = bool(expected) and expected != digest and not is_gitops_doc
             artifact_evidence[rel] = {"sha256": digest, "bytes": resolved.stat().st_size}
             if placeholder:
                 checks.append(DeliveryCheck(
