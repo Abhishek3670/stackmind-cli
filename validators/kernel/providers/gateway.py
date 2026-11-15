@@ -277,6 +277,52 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
         },
     ),
     ToolDefinition(
+        name="task_start",
+        description="Start a long-running background task (e.g. npm install, build) with dynamic timeout tiering.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}, "description": "Command arguments (e.g. ['npm', 'install'])"}
+            },
+            "required": ["command"],
+        },
+    ),
+    ToolDefinition(
+        name="task_status",
+        description="Check status, uptime, and remaining timeout budget of an ongoing background task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string", "description": "Task ID handle (e.g. proc-1)"}
+            },
+            "required": ["process_id"],
+        },
+    ),
+    ToolDefinition(
+        name="task_output",
+        description="Read latest standard output lines from an ongoing background task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string", "description": "Task ID handle"},
+                "tail_lines": {"type": "integer", "description": "Max lines to return", "default": 100},
+            },
+            "required": ["process_id"],
+        },
+    ),
+    ToolDefinition(
+        name="task_stop",
+        description="Stop an ongoing background task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string", "description": "Task ID handle"},
+                "timeout": {"type": "number", "description": "Timeout in seconds", "default": 5.0},
+            },
+            "required": ["process_id"],
+        },
+    ),
+    ToolDefinition(
         name="run_tests",
         description="Run test suite using pytest inside the scratch workspace.",
         parameters={
@@ -2178,6 +2224,8 @@ class ProviderGateway:
                     "search": {"grep", "glob", "semantic_search", "search_docs", "web_search", "image_search", "web_fetch"},
                     "browser": {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "inspect_screenshot"},
                     "process": {"process_start", "process_status", "process_output", "process_stop"},
+                    "task": {"task_start", "task_status", "task_output", "task_stop", "process_start", "process_status", "process_output", "process_stop"},
+                    "tasks": {"task_start", "task_status", "task_output", "task_stop", "process_start", "process_status", "process_output", "process_stop"},
                     "testing": {"run_tests", "run_lint", "run_typecheck", "run_security_scan", "verify_deliverable", "verify_tests"},
                 }
 

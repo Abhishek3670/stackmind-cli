@@ -156,3 +156,61 @@ def test_anti_stagnation_circuit_breaker_intercepts_consecutive_reads():
     ]
     assert len(warning_msgs) >= 1
     assert "consecutive passive read/inspection tool calls" in warning_msgs[0]
+
+
+def test_background_task_dynamic_tiering_and_timeout(tmp_path: Path):
+    """ProcessManager executes background tasks with dynamic timeout tiering,
+    provides uptime / remaining budget metrics, and auto-reaps timed-out tasks."""
+    from validators.kernel.process import ProcessManager, compute_task_timeout
+    from types import SimpleNamespace
+
+    authoritative = tmp_path / "authoritative"
+    authoritative.mkdir(parents=True, exist_ok=True)
+    workspace = ScratchWorkspace.create(authoritative, "attempt-task-test")
+    pm = ProcessManager(workspace)
+
+    # 1. Tiering calculation
+    assert compute_task_timeout(["npm", "install"]) == 300.0
+    assert compute_task_timeout(["npx", "drizzle-kit", "db:generate"]) == 300.0
+    assert compute_task_timeout(["pytest"]) == 300.0
+    assert compute_task_timeout(["git", "status"]) == 30.0
+
+    # 2. Run a fast background task
+    completed_event = []
+    def on_complete_cb(proc):
+        completed_event.append(proc.process_id)
+
+    script_file = workspace.root / "quick.py"
+    script_file.write_text("print('task_done')", encoding="utf-8")
+
+    proc_id = pm.start_process(["python", "quick.py"], on_complete=on_complete_cb)
+    status = pm.get_status(proc_id)
+    assert status["task_id"] == proc_id
+    assert status["status"] in ("running", "completed")
+    assert status["timeout_budget_seconds"] == 30.0
+
+    # Wait for completion
+    for _ in range(50):
+        status = pm.get_status(proc_id)
+        if status["status"] == "completed":
+            break
+        import time; time.sleep(0.05)
+
+    assert status["status"] == "completed"
+    assert status["exit_code"] == 0
+    assert "task_done" in pm.get_output(proc_id)
+    assert proc_id in completed_event
+
+    # 3. Verify timeout enforcement
+    proc_obj = pm._processes[proc_id]
+    proc_obj.timeout_budget = 0.01  # set tiny budget
+    proc_obj.started_at = time.time() - 10.0  # simulate old start
+    proc_obj._stopped = False
+    proc_obj._timed_out = False
+    proc_obj.proc.poll = MagicMock(return_value=None)  # simulate still running process
+
+    assert proc_obj.is_alive is False
+    assert proc_obj.exit_code == -1
+    status_timed_out = proc_obj.status()
+    assert status_timed_out["status"] == "timed_out"
+

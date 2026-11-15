@@ -1058,13 +1058,18 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, f"{len(py_files)} files")
         return out
 
-    def process_start(self, command: Sequence[str], env: Mapping[str, str] | None = None) -> str:
+    def process_start(self, command: Sequence[str], env: Mapping[str, str] | None = None, timeout: float | None = None) -> str:
         record = self._authorize(OperationType.PROCESS_START, "workspace/process")
         if not record.authorized:
             raise PermissionError(record.reason)
-        proc_id = self.process_manager.start_process(command, env)
+        proc_id = self.process_manager.start_process(command, env, timeout=timeout)
         self.boundary.journal.complete(record.request.operation_id, f"started {proc_id}")
         return proc_id
+
+    def task_start(self, command: Sequence[str], env: Mapping[str, str] | None = None, timeout: float | None = None) -> dict[str, Any]:
+        """Start a governed background sandbox task with dynamic timeout tiering."""
+        proc_id = self.process_start(command, env=env, timeout=timeout)
+        return self.process_status(proc_id)
 
     def process_status(self, process_id: str) -> dict[str, Any]:
         record = self._authorize(OperationType.PROCESS_STATUS, f"workspace/process/{process_id}")
@@ -1089,6 +1094,10 @@ class ToolGateway:
         success = self.process_manager.stop_process(process_id, timeout=timeout)
         self.boundary.journal.complete(record.request.operation_id, "stopped" if success else "failed")
         return success
+
+    task_status = process_status
+    task_output = process_output
+    task_stop = process_stop
 
     def run_tests(self, test_path: str | None = None, selector: str | None = None) -> dict[str, Any]:
         target = test_path or "tests"

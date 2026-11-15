@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -29,22 +30,57 @@ class ProcessError(RuntimeError):
     pass
 
 
+def compute_task_timeout(command: Sequence[str], default_timeout: float | None = None) -> float:
+    """Compute dynamic timeout budget: 300s for builds/package managers, 30s for inspection."""
+    if default_timeout is not None and default_timeout > 0 and default_timeout != 30.0:
+        return float(default_timeout)
+    cmd0 = str(command[0]).lower() if command else ""
+    cmd_joined = " ".join(str(c).lower() for c in command)
+    long_running_bins = {
+        "npm", "pnpm", "yarn", "npx", "pip", "pip3", "cargo",
+        "pytest", "vitest", "playwright", "tsc", "dotnet", "mvn", "gradle",
+    }
+    long_running_subcmds = {
+        "install", "update", "add", "build", "compile", "test",
+        "generate", "migrate", "db:generate", "seed", "ci",
+    }
+    bin_name = Path(cmd0).stem.lower()
+    if bin_name in long_running_bins or any(sub in cmd_joined for sub in long_running_subcmds):
+        return 300.0
+    return 30.0
+
+
 @dataclass
 class ManagedProcess:
     process_id: str
     command: list[str]
     proc: subprocess.Popen
     started_at: float
+    timeout_budget: float = 300.0
     output_buffer: deque[str] = field(default_factory=lambda: deque(maxlen=2000))
     reader_thread: threading.Thread | None = None
     _stopped: bool = False
+    _timed_out: bool = False
+    on_complete: Any = None
 
     @property
     def is_alive(self) -> bool:
-        return self.proc.poll() is None
+        if self._stopped or self._timed_out:
+            return False
+        alive = self.proc.poll() is None
+        if alive and (time.time() - self.started_at) > self.timeout_budget:
+            self._timed_out = True
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            return False
+        return alive
 
     @property
     def exit_code(self) -> int | None:
+        if self._timed_out:
+            return -1
         return self.proc.poll()
 
     @property
@@ -53,13 +89,25 @@ class ManagedProcess:
 
     def status(self) -> dict[str, Any]:
         alive = self.is_alive
-        status_str = "running" if alive else ("stopped" if self._stopped else "exited")
+        if self._timed_out:
+            status_str = "timed_out"
+        elif alive:
+            status_str = "running"
+        elif self._stopped:
+            status_str = "stopped"
+        elif self.exit_code == 0:
+            status_str = "completed"
+        else:
+            status_str = "failed"
         return {
+            "task_id": self.process_id,
             "process_id": self.process_id,
             "pid": self.proc.pid,
             "status": status_str,
             "exit_code": self.exit_code,
             "uptime_seconds": round(self.uptime_seconds, 2),
+            "timeout_budget_seconds": self.timeout_budget,
+            "remaining_seconds": max(0.0, round(self.timeout_budget - self.uptime_seconds, 2)),
             "command": list(self.command),
         }
 
@@ -84,8 +132,10 @@ class ProcessManager:
         self,
         command: Sequence[str],
         env_extra: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        on_complete: Any = None,
     ) -> str:
-        """Start a managed background process.
+        """Start a managed background process with dynamic timeout tiering.
         
         Enforces workspace confinement and interpreter denylist.
         """
@@ -95,6 +145,15 @@ class ProcessManager:
         denial_reason = check_command(cmd_list)
         if denial_reason is not None:
             raise PermissionError(denial_reason)
+
+        # Windows: resolve bare executable through PATH/PATHEXT (e.g. npm -> npm.cmd)
+        if sys.platform == "win32" and cmd_list:
+            exe0 = cmd_list[0]
+            has_ext = os.path.splitext(exe0)[1].lower() in (".exe", ".cmd", ".bat", ".com")
+            if not (os.path.isabs(exe0) and has_ext):
+                resolved = shutil.which(exe0)
+                if resolved:
+                    cmd_list = [resolved] + list(cmd_list[1:])
 
         with self._lock:
             self._counter += 1
@@ -145,11 +204,14 @@ class ProcessManager:
                     pass
                 raise ProcessError("Failed to attach background process to Windows job object limits")
 
+        timeout_budget = compute_task_timeout(cmd_list, timeout)
         managed = ManagedProcess(
             process_id=proc_id,
             command=cmd_list,
             proc=proc,
             started_at=time.time(),
+            timeout_budget=timeout_budget,
+            on_complete=on_complete,
         )
 
         def _drain_output():
@@ -162,6 +224,11 @@ class ProcessManager:
             finally:
                 if proc.stdout:
                     proc.stdout.close()
+                if managed.on_complete:
+                    try:
+                        managed.on_complete(managed)
+                    except Exception:
+                        pass
 
         thread = threading.Thread(target=_drain_output, daemon=True)
         managed.reader_thread = thread
