@@ -87,6 +87,7 @@ class Key:
     CTRL_K = "\x0b"  # Command palette
     CTRL_L = "\x0c"  # Clear / redraw screen
     CTRL_O = "\x0f"  # Toggle thinking block
+    CTRL_U = "\x15"  # Clear input line / kill line
     ESCAPE = "\x1b"
 
     UP = "<UP>"
@@ -528,6 +529,8 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
         res = Key.CTRL_B
     elif ch == Key.CTRL_G:
         res = Key.CTRL_G
+    elif ch == Key.CTRL_U:
+        res = Key.CTRL_U
     elif ch in ("\r", "\n"):
         try:
             import ctypes
@@ -708,6 +711,7 @@ class Win32ConsoleReader:
                     0x43: Key.CTRL_C,  # VK_C -> '\x03' (Cancel / exit)
                     0x44: Key.CTRL_D,  # VK_D -> '\x04' (EOF / exit)
                     0x56: Key.CTRL_V,  # VK_V -> '\x16' (Paste clipboard)
+                    0x55: Key.CTRL_U,  # VK_U -> '\x15' (Kill / clear line)
                     0x57: Key.CTRL_W,  # VK_W -> '\x17' (Toggle scroll focus)
                     0x0D: Key.CTRL_ENTER,  # VK_RETURN
                     0x0A: Key.CTRL_ENTER,  # VK_RETURN (LF)
@@ -2063,6 +2067,14 @@ class RawLineEditor:
 
         if key == Key.CTRL_V:
             self.paste_from_clipboard()
+            return False
+
+        if key == Key.CTRL_U:
+            self.buffer = []
+            self.cursor = 0
+            self._update_state()
+            self._update_dropdown()
+            self._notify_height_change()
             return False
 
         # Intercept any raw SGR mouse escape sequences in any encoding (e.g. ^[[<0;101;34M, \x1b[<0;101;34M, [<0;101;34M)

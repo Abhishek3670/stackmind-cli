@@ -1614,6 +1614,23 @@ def test_raw_line_editor_with_state_anchors_cursor_absolutely_and_never_emits_ne
     assert "\n" not in captured_stdout.getvalue()
 
 
+def test_ctrl_u_clears_buffer():
+    """Verify Key.CTRL_U clears the editor buffer and resets cursor position."""
+    import io
+    from cli.tui.keyboard import Key, RawLineEditor
+
+    buf = io.StringIO()
+    editor = RawLineEditor(width=80, initial_text="some corrupted ^[[<35;175;51M input", out=buf)
+    assert len(editor.buffer) > 0
+    assert editor.cursor > 0
+
+    editor.handle_key(Key.CTRL_U)
+    assert editor.buffer == []
+    assert editor.cursor == 0
+    assert editor.text == ""
+
+
+
 
 
 
