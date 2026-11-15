@@ -123,6 +123,14 @@ class _RecoveryMixin:
                 state.architect_repair_operation_id = new_op.get("operation_id")
                 return AdvanceResult.WAITING_FOR_OPERATION
 
+            if source == "recovery" and action == "amend_plan":
+                state.repair_context = {}
+                state.architect_repair_operation_id = None
+                state.authoring_repair_attempts = 0
+                state.error = None
+                self._transition(state, Phase.AWAITING_APPROVAL)
+                return AdvanceResult.WAITING_FOR_HUMAN
+
             if source == "recovery" and action in ("architect_fix", "resolve_blocker"):
                 is_deadlock = (
                     state.repair_context.get("is_dependency_deadlock")
@@ -367,6 +375,10 @@ class _RecoveryMixin:
                         self._add_work_order_dependency(ws, str(wo_id), str(dep))
                     state.repair_context = {}
                     return self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
+                if action == "amend_plan":
+                    state.repair_context = {}
+                    self._transition(state, Phase.AWAITING_APPROVAL)
+                    return AdvanceResult.WAITING_FOR_HUMAN
                 state.repair_context = {}
                 return self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
             state.repair_context = {}

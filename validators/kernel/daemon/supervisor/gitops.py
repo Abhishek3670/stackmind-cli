@@ -560,7 +560,7 @@ class _GitopsMixin:
                             hashes = wo_data["completion"].setdefault("deliverable_hashes", {})
                             declared_deliv = wo_data.get("deliverable")
                             deliv_path = str(declared_deliv.get("path", "")).replace("\\", "/").strip().lstrip("./") if isinstance(declared_deliv, dict) else ""
-                            allowed_docs = {"VERSION.md", "CHANGELOG.md", "README.md", "VERSION"}
+                            allowed_docs = {"VERSION.md", "CHANGELOG.md", "VERSION"}
                             target_docs = [deliv_path] if deliv_path in allowed_docs else list(allowed_docs)
                             for doc in target_docs:
                                 doc_p = ws / doc

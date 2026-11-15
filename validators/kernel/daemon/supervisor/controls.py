@@ -124,6 +124,13 @@ class _ControlsMixin:
         "qa_reworks",
         "worker_retries",
         "global_turn_budget",
+        "authoring_repair_attempts",
+        "recovery_attempts",
+        "integration_rework_rounds",
+        "final_prerequisite_rounds",
+        "final_review_rounds",
+        "infra_retries",
+        "qa_review_attempts",
     }
 
     def reject_plan(self, state: RunState, reason: str = "") -> AdvanceResult:
@@ -212,6 +219,34 @@ class _ControlsMixin:
             elif c == "global_turn_budget":
                 state.global_turn_budget = budget_grant if budget_grant > 0 else (new_budget or state.initial_turn_budget)
                 state.budget_exhausted = False
+            elif c == "authoring_repair_attempts":
+                state.authoring_repair_attempts = 0
+            elif c == "recovery_attempts":
+                state.recovery_attempts.clear()
+            elif c == "integration_rework_rounds":
+                state.integration_rework_rounds = 0
+                setattr(state, "integration_retries", 0)
+            elif c == "final_prerequisite_rounds":
+                state.final_prerequisite_rounds = 0
+            elif c == "final_review_rounds":
+                state.final_review_rounds = 0
+            elif c == "infra_retries":
+                if hasattr(state, "infra_retries"):
+                    state.infra_retries.clear()
+            elif c == "qa_review_attempts":
+                state.qa_review_attempts.clear()
+
+        # If no specific reset_counters declared, auto-reset the counter of the tripping breaker
+        if not counters:
+            state.authoring_repair_attempts = 0
+            state.recovery_attempts.clear()
+            state.integration_rework_rounds = 0
+            setattr(state, "integration_retries", 0)
+            state.final_prerequisite_rounds = 0
+            state.final_review_rounds = 0
+            state.gitops_retries = 0
+            if hasattr(state, "infra_retries"):
+                state.infra_retries.clear()
 
         if budget_grant > 0:
             if "global_turn_budget" not in counters:
@@ -283,6 +318,7 @@ class _ControlsMixin:
         return AdvanceResult.TRANSITIONED
 
     human_resume = resume_run_with_human_override
+    resume_run = resume_run_with_human_override
 
     def re_attest_run(
         self,

@@ -206,6 +206,8 @@ class RunState:
     max_gitops_retries: int = 2
     max_worker_retries: int = 2
     max_qa_reworks: int = 2
+    infra_retries: dict[str, int] = field(default_factory=dict)
+    max_infra_retries: int = 3
     global_turn_budget: int = 50
     initial_turn_budget: int = 50
     budget_exhausted: bool = False

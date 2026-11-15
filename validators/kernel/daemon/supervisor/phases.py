@@ -1051,8 +1051,18 @@ class _PhasesMixin:
                 and self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
                 and self._check_qa_verdict(wo_id, ws) == "INFRA_ERROR"
             ):
-                # Environment or harness failure (ERROR, BLOCKED, FLAKY, TIMEOUT):
-                # Archive verdict for retry, but do NOT increment developer qa_reworks counter!
+                # Environment or harness failure (test runner crash, OOM, runner timeout):
+                retries = state.infra_retries.get(wo_id, 0)
+                max_infra = getattr(state, "max_infra_retries", 3)
+                if retries >= max_infra:
+                    state.error = (
+                        f"QA infrastructure / test harness failure on {wo_id} exceeded retry limit "
+                        f"({retries}/{max_infra}); human intervention required"
+                    )
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+                state.infra_retries[wo_id] = retries + 1
                 _review_gate.archive_qa_verdict(ws, wo_id, suffix="infra_retry")
                 all_done = False
                 continue

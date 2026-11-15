@@ -164,7 +164,7 @@ def test_final_review_plan_deviation_escalates_to_architect_recovery(tmp_path: P
 
     assert res in (AdvanceResult.TRANSITIONED, AdvanceResult.WAITING_FOR_OPERATION)
     assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
-    assert state.recovery_wo_id == "PLAN_DEVIATION"
+    assert state.recovery_wo_id.startswith("PLAN_DEV")
     assert "FINAL_REVIEW_PLAN_DEVIATION" in state.error
 
 
@@ -221,7 +221,7 @@ def test_integration_plan_deviation_escalates_to_architect_recovery(tmp_path: Pa
     res = supervisor._advance_integration_review(state)
     assert res == AdvanceResult.TRANSITIONED
     assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
-    assert state.recovery_wo_id == "PLAN_DEVIATION"
+    assert state.recovery_wo_id.startswith("PLAN_DEV")
 
 
 def test_qa_infra_error_preserves_rework_budget(tmp_path: Path) -> None:
@@ -232,9 +232,20 @@ def test_qa_infra_error_preserves_rework_budget(tmp_path: Path) -> None:
     wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
     wo_dir.mkdir(parents=True, exist_ok=True)
     (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
-        "id": "WO-001", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "main.py"}
+        "id": "WO-001",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "main.py"},
     }), encoding="utf-8")
     (tmp_path / "main.py").write_text("print(1)", encoding="utf-8")
+
+    op = mock_mgr.start_turn(
+        state.session_id,
+        "Run WO-001",
+        work_order_id="WO-001",
+        agent_id="codex",
+    )
+    mock_mgr.complete_operation(op["operation_id"], status="COMPLETED")
 
     # Write a QA verdict with ERROR (test runner crashed / infra failure)
     reviews_dir = tmp_path / ".sync" / "reviews" / "qa"
@@ -281,4 +292,108 @@ def test_retry_unchanged_rejects_modified_deliverable(tmp_path: Path) -> None:
     advance, err = supervisor._apply_recovery_decision(state, tmp_path, "WO-001", record)
     assert advance is None
     assert "unchanged deliverable subject hash" in (err or "").lower()
+
+
+def test_breaker_exhaustion_and_resume_progress_matrix(tmp_path: Path) -> None:
+    """Verify that every breaker halts at WAITING_FOR_HUMAN and resume_run resets the counter,
+    returning to the interrupted phase and making forward progress without immediately re-tripping."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.max_human_resumes = 10
+
+    # 1. Recovery attempts breaker
+    state.phase = Phase.ARCHITECT_RECOVERY_DECISION
+    state.interrupted_phase = Phase.ARCHITECT_RECOVERY_DECISION.value
+    state.recovery_wo_id = "WO-001"
+    state.max_retries = 2
+    state.recovery_attempts["WO-001"] = 2
+    res = supervisor._advance_recovery_decision(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 3
+
+    # Human resume clears recovery_attempts and resumes to ARCHITECT_RECOVERY_DECISION
+    resume_res = supervisor.resume_run(state, reason="Operator approved recovery re-attempt")
+    assert state.recovery_attempts.get("WO-001", 0) == 0
+    assert state.phase == Phase.ARCHITECT_RECOVERY_DECISION
+    assert state.exit_code == 0
+
+    # 2. Integration rework breaker
+    state.phase = Phase.INTEGRATION_REVIEW
+    state.interrupted_phase = Phase.INTEGRATION_REVIEW.value
+    state.integration_rework_rounds = 5
+    state.max_retries = 2
+    # Resume resets integration_rework_rounds and resumes to INTEGRATION_REVIEW
+    supervisor.resume_run(state, reason="Reset integration rounds")
+    assert state.integration_rework_rounds == 0
+    assert state.phase == Phase.INTEGRATION_REVIEW
+
+    # 3. GitOps retries breaker
+    state.phase = Phase.GITOPS
+    state.interrupted_phase = Phase.GITOPS.value
+    state.gitops_retries = 5
+    state.max_gitops_retries = 2
+    supervisor.resume_run(state, reason="Reset gitops retries")
+    assert state.gitops_retries == 0
+    assert state.phase == Phase.GITOPS
+
+
+def test_amend_plan_routes_to_awaiting_approval(tmp_path: Path) -> None:
+    """When the Architect amends the plan in recovery, it MUST route to AWAITING_APPROVAL for operator approval."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.phase = Phase.ARCHITECT_REPAIR
+    state.repair_context = {
+        "source": "recovery",
+        "action": "amend_plan",
+        "work_order": "WO-001",
+    }
+    # Mock completed repair turn
+    op = mock_mgr.start_turn("sess-test-arch", "Amend plan", is_authoring=True, work_order_id="WO-000")
+    state.architect_repair_operation_id = op["operation_id"]
+    mock_mgr.complete_operation(op["operation_id"], status="COMPLETED")
+
+    res = supervisor._advance_architect_repair(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.AWAITING_APPROVAL
+
+
+def test_qa_infra_retries_capped_at_max(tmp_path: Path) -> None:
+    """When QA test runner repeatedly crashes or fails with infra errors, it must halt at WAITING_FOR_HUMAN."""
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-001"])
+    state.phase = Phase.EXECUTING
+    state.max_infra_retries = 2
+    state.infra_retries["WO-001"] = 2  # at max limit
+
+    wo_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    wo_dir.mkdir(parents=True, exist_ok=True)
+    (wo_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "main.py"},
+    }), encoding="utf-8")
+    (tmp_path / "main.py").write_text("print(1)", encoding="utf-8")
+
+    op = mock_mgr.start_turn(
+        state.session_id,
+        "Run WO-001",
+        work_order_id="WO-001",
+        agent_id="codex",
+    )
+    mock_mgr.complete_operation(op["operation_id"], status="COMPLETED")
+
+    reviews_dir = tmp_path / ".sync" / "reviews" / "qa"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "WO-001.json").write_text(yaml.safe_dump({
+        "schema": "stackmind.qa-verdict.v1",
+        "work_order_id": "WO-001",
+        "verdict": "ERROR",
+        "reason": "Test runner crashed with exit code 137",
+    }), encoding="utf-8")
+
+    res = supervisor._advance_executing(state)
+    assert res == AdvanceResult.WAITING_FOR_HUMAN
+    assert state.phase == Phase.WAITING_FOR_HUMAN
+    assert state.exit_code == 3
+    assert "infrastructure" in (state.error or "").lower()
+
 

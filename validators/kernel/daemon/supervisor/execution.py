@@ -2052,22 +2052,22 @@ class _ExecutionMixin:
                             if curr_hash and rec_hash and curr_hash != rec_hash:
                                 continue
                             v_val = str(v_json["verdict"]).upper()
-                            if v_val in ("ERROR", "BLOCKED", "FLAKY", "INFRA_ERROR", "TIMEOUT"):
+                            if v_val in ("ERROR", "INFRA_ERROR", "TIMEOUT", "CRASH"):
                                 return "INFRA_ERROR"
                             if v_val in ("PASS", "APPROVED", "QA_PASS"):
                                 return "APPROVED"
-                            if v_val in ("FAIL", "NEEDS_CHANGES", "NEEDS CHANGES", "QA_FAIL", "REJECTED"):
+                            if v_val in ("FAIL", "NEEDS_CHANGES", "NEEDS CHANGES", "QA_FAIL", "REJECTED", "BLOCKED"):
                                 return "NEEDS_CHANGES"
                     except Exception:
                         pass
-                if any(k in content for k in ("QA_ERROR", "QA_BLOCKED", "QA_FLAKY", "INFRA_ERROR")):
+                if any(k in content for k in ("QA_ERROR", "INFRA_ERROR")):
                     return "INFRA_ERROR"
                 status_match = re.search(r"(?:status|verdict)\s*:\s*(APPROVED|NEEDS_CHANGES|NEEDS\s+CHANGES|PASS|FAIL|REJECTED|ERROR|BLOCKED|FLAKY)", content, re.IGNORECASE)
                 if status_match:
                     val = status_match.group(1).upper()
-                    if val in ("ERROR", "BLOCKED", "FLAKY"):
+                    if val in ("ERROR", "TIMEOUT"):
                         return "INFRA_ERROR"
-                    if val in ("NEEDS", "NEEDS_CHANGES", "FAIL", "REJECTED"):
+                    if val in ("NEEDS", "NEEDS_CHANGES", "FAIL", "REJECTED", "BLOCKED"):
                         return "NEEDS_CHANGES"
                     return "APPROVED"
                 if "NEEDS_CHANGES" in content or "NEEDS CHANGES" in content or "FAIL" in content or "REJECTED" in content:

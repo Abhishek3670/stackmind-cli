@@ -755,10 +755,11 @@ class _ReviewMixin:
                     state, ws, blockers + detail_paths
                 )
                 if not reworkable:
-                    rec_attempts = state.recovery_attempts.get("PLAN_DEVIATION", 0)
+                    dev_id = f"PLAN_DEV_INT_{state.integration_rework_rounds}"
+                    rec_attempts = state.recovery_attempts.get(dev_id, 0)
                     if rec_attempts < state.max_retries and state.global_turn_budget > 0:
-                        state.recovery_attempts["PLAN_DEVIATION"] = rec_attempts + 1
-                        state.recovery_wo_id = "PLAN_DEVIATION"
+                        state.recovery_attempts[dev_id] = rec_attempts + 1
+                        state.recovery_wo_id = dev_id
                         state.error = f"INTEGRATION_PLAN_DEVIATION: {err_msg}"
                         self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
                         return AdvanceResult.TRANSITIONED
@@ -1471,10 +1472,11 @@ class _ReviewMixin:
             # Plan deviation or unmapped findings: findings could not be mapped to existing work orders.
             # Escalate to ARCHITECT_RECOVERY_DECISION if recovery budget remains,
             # enabling the Architect to author new work orders or amend the plan.
-            rec_attempts = state.recovery_attempts.get("PLAN_DEVIATION", 0)
+            dev_id = f"PLAN_DEV_FINAL_{state.final_review_rounds}"
+            rec_attempts = state.recovery_attempts.get(dev_id, 0)
             if rec_attempts < state.max_retries and state.global_turn_budget > 0:
-                state.recovery_attempts["PLAN_DEVIATION"] = rec_attempts + 1
-                state.recovery_wo_id = "PLAN_DEVIATION"
+                state.recovery_attempts[dev_id] = rec_attempts + 1
+                state.recovery_wo_id = dev_id
                 state.error = (
                     f"FINAL_REVIEW_PLAN_DEVIATION: Findings not linked to existing work orders: "
                     + "; ".join(blockers[:3])
