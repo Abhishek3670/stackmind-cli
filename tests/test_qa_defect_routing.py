@@ -1025,3 +1025,35 @@ def test_qa_passing_glyph_does_not_route_false_defect(tmp_path: Path) -> None:
     assert len(rework_ops) == 0
     assert "WO-001" in state.completed_wo_ids
 
+
+def test_qa_verdict_contradictory_pass_with_failed_criteria_routed_as_defect(tmp_path: Path) -> None:
+    """A QA review JSON with verdict: PASS but criteria.outcome: FAIL must be routed as a defect."""
+    _write_worker_yaml(tmp_path, "WO-001", "codex", "src/server.js")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_api.py")
+
+    review_dir = tmp_path / ".sync" / "reviews" / "qa"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    verdict_payload = {
+        "work_order_id": "WO-001",
+        "verdict": "PASS",
+        "reviewer": "gemma",
+        "criteria": [
+            {"id": "syntax", "description": "Syntax check src/server.js", "outcome": "FAIL", "evidence": "Unexpected token"}
+        ],
+        "findings": [],
+    }
+    (review_dir / "WO-001.json").write_text(json.dumps(verdict_payload), encoding="utf-8")
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-004", "WO-001"])
+    state.completed_wo_ids = ["WO-001"]
+    wo1_op = mock_mgr.start_turn("sess-001", "Build server", work_order_id="WO-001", agent_id="codex")
+    mock_mgr.complete_operation(wo1_op["operation_id"], "COMPLETED")
+    wo4_op = mock_mgr.start_turn("sess-001", "QA server", work_order_id="WO-004", agent_id="gemma")
+    mock_mgr.complete_operation(wo4_op["operation_id"], "BLOCKED", result={"status": "blocked", "blockers": ["Syntax check failed"]})
+
+    res = supervisor.advance(state)
+
+    # Must identify WO-001 as a defect rework target despite verdict: PASS because criteria outcome was FAIL
+    assert state.qa_rework_targets.get("WO-004") == ["WO-001"]
+
+

@@ -1186,6 +1186,13 @@ class _RecoveryMixin:
             "- NEVER author new child work orders to cancel or patch existing work orders.\n\n"
             if is_deadlock else ""
         )
+        findings_list = (
+            evidence.get("qa_findings")
+            or evidence.get("findings")
+            or evidence.get("critical_errors")
+            or evidence.get("deliverable_failures")
+            or ([evidence.get("error")] if evidence.get("error") else [])
+        )
         return (
             f"ARCHITECT RECOVERY DECISION required for work order {wo_id}.\n\n"
             + deadlock_note
@@ -1198,7 +1205,7 @@ class _RecoveryMixin:
             f"- file budget: {evidence.get('file_budget')} ; observed changed files: "
             f"{evidence.get('observed_file_count', len(observed))}\n"
             f"- observed files:\n" + "".join(f"  - {p}\n" for p in preview) + more + "\n\n"
-            + ("- QA findings:\n" + "".join(f"  * {f}\n" for f in (evidence.get("qa_findings") or evidence.get("findings") or [])) + "\n" if (evidence.get("qa_findings") or evidence.get("findings")) else "")
+            + ("- QA / Verification findings:\n" + "".join(f"  * {f}\n" for f in findings_list) + "\n" if findings_list else "")
             + ("- Required corrective actions:\n" + "".join(f"  * {a}\n" for a in (evidence.get("qa_required_actions") or evidence.get("required_actions") or [])) + "\n" if (evidence.get("qa_required_actions") or evidence.get("required_actions")) else "")
             + (f"- Full verification report:\n{evidence.get('qa_report') or evidence.get('report')}\n\n" if (evidence.get("qa_report") or evidence.get("report")) else "")
             + (f"Your previous decision was rejected: {corrective}\n\n" if corrective else "")

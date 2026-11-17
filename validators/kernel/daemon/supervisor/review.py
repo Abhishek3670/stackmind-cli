@@ -274,7 +274,12 @@ class _ReviewMixin:
                     if not isinstance(json_data, dict):
                         continue
                     v_val = str(json_data.get("verdict", "")).upper()
-                    if v_val not in ("FAIL", "NEEDS_CHANGES", "FAILED", "REJECTED"):
+                    criteria_fails = [
+                        c for c in json_data.get("criteria", [])
+                        if isinstance(c, dict) and str(c.get("outcome", "")).upper() in ("FAIL", "FAILED", "NEEDS_CHANGES")
+                    ]
+                    # Treat as defect if verdict indicates failure OR if any acceptance criterion failed (catches contradictory PASS verdicts)
+                    if v_val not in ("FAIL", "NEEDS_CHANGES", "FAILED", "REJECTED") and not criteria_fails:
                         continue
                     text_parts = []
                     if json_data.get("required_action"):
@@ -284,11 +289,15 @@ class _ReviewMixin:
                             det = finding.get("detail") or ""
                             rep = finding.get("reproduce") or ""
                             text_parts.append(f"{det}\n{rep}".strip())
-                    for crit in json_data.get("criteria", []):
-                        if isinstance(crit, dict):
-                            c_out = str(crit.get("outcome", "")).upper()
-                            if c_out in ("FAIL", "FAILED"):
-                                text_parts.append(f"{crit.get('description', '')}: {crit.get('evidence', '')}")
+                        elif isinstance(finding, str) and finding.strip():
+                            text_parts.append(finding.strip())
+                    for crit in criteria_fails:
+                        desc = crit.get('description') or crit.get('id') or 'Acceptance criterion'
+                        ev = crit.get('evidence') or 'failed'
+                        text_parts.append(f"{desc}: {ev}")
+                    if not text_parts:
+                        wo_field = json_data.get("work_order_id") or json_data.get("work_order") or "work order"
+                        text_parts.append(f"QA review for {wo_field} rejected with outcome FAIL/NEEDS_CHANGES")
                     text = "\n".join(text_parts) or f.read_text(encoding="utf-8")
                 else:
                     if not any(k in name.lower() for k in ("verdict", "review")):
@@ -316,12 +325,17 @@ class _ReviewMixin:
                         if owner is not None and owner not in deliverable_targets:
                             deliverable_targets.append(owner)
 
-                # 2. Target named in filename (e.g. WO-001-qa-verdict.md)
+                # 2. Target named in structured JSON, filename (e.g. WO-001-qa-verdict.md), or text
                 named_target = None
-                for target in self._WO_ID_RE.findall(name):
-                    if target != qa_wo_id and target != "WO-000":
-                        named_target = target
-                        break
+                if is_json and isinstance(json_data, dict):
+                    raw_wo_field = json_data.get("work_order_id") or json_data.get("work_order")
+                    if raw_wo_field and self._WO_ID_RE.match(str(raw_wo_field).strip()):
+                        named_target = str(raw_wo_field).strip()
+                if not named_target:
+                    for target in self._WO_ID_RE.findall(name):
+                        if target != qa_wo_id and target != "WO-000":
+                            named_target = target
+                            break
                 # 3. Target named in text body (e.g. file named WO-004-qa-verdict.md
                 # but text discusses WO-001)
                 if not named_target:
