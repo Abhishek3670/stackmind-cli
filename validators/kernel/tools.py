@@ -415,8 +415,12 @@ class ToolGateway:
             raise PermissionError(denial_reason)
 
         # Host OS awareness (Windows): handle common Unix file-inspection utilities natively
-        # so agents calling 'ls', 'ls -la', or 'pwd' receive clean output rather than tripping
+        # so agents calling 'ls', 'ls -la', 'pwd', or 'grep' receive clean output rather than tripping
         # consecutive tool failures due to missing Windows binaries.
+        # Normalize npx tsc to package typescript to avoid npm's deprecated dummy stub tsc@2.0.4
+        if len(command) >= 2 and str(command[0]).lower().strip() == "npx" and str(command[1]).lower().strip() == "tsc":
+            command = ["npx", "-p", "typescript", "tsc", *command[2:]]
+
         if sys.platform == "win32" and command:
             cmd0 = str(command[0]).lower().strip()
             if cmd0 in ("ls", "dir"):
@@ -447,6 +451,15 @@ class ToolGateway:
 
             if cmd0 == "pwd":
                 res = CommandResult(0, f"{self.workspace.root}\n", "")
+                self.boundary.journal.complete(record.request.operation_id, res)
+                return res
+
+            if cmd0 == "grep":
+                pattern = command[1] if len(command) > 1 else ""
+                files = [str(arg) for arg in command[2:] if not str(arg).startswith("-")]
+                matches = self.grep(pattern, paths=files if files else None)
+                lines = [f"{m['file']}:{m['line']}:{m['content']}" for m in matches]
+                res = CommandResult(0 if lines else 1, "\n".join(lines) + ("\n" if lines else ""), "")
                 self.boundary.journal.complete(record.request.operation_id, res)
                 return res
         env_extra = {}

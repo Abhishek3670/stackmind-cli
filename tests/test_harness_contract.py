@@ -473,19 +473,22 @@ def test_narrower_ignore_list_no_false_positive_declaration_matches_for_ordinary
     if not (project / "schemas").exists():
         shutil.copytree(src_schemas, project / "schemas")
 
+    from validators.kernel.providers import OpenAICompatibleAdapter
     import json
 
-    # Write deliverable directly to project (simulating harness promoted write after verification)
-    # This test verifies that .sync bookkeeping changes don't cause false-positive declaration mismatches
-    (project / "src").mkdir(parents=True, exist_ok=True)
-    (project / "src" / "auth.py").write_text("def authenticate(): return True\n", encoding="utf-8")
-
-    # Use transport to return a simple ad-hoc completion (no work order task execution)
-    # The deliverable already exists on disk from our setup
+    calls = 0
     def transport(payload, stream, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "w_auth", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({"path": "src/auth.py", "content": "def authenticate(): return True\n"}),
+                },
+            }]}, "finish_reason": "tool_calls"}], "usage": {"total_tokens": 10}}
         return {"choices": [{"message": {"role": "assistant", "content": json.dumps({
-            "status": "completed", "summary": "Setup done", "report_markdown": "auth.py ready.",
-            "blockers": [], "modified_files": [], "release_target": None,
+            "status": "completed", "summary": "Implemented auth service", "report_markdown": "Auth service done.",
+            "blockers": [], "modified_files": ["src/auth.py"], "release_target": "v1.1.0",
             "retrieval_queries": [], "uncertainty": [], "commands": [],
         })}, "finish_reason": "stop"}], "usage": {"total_tokens": 10}}
 
