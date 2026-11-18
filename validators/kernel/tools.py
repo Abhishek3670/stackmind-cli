@@ -4055,6 +4055,9 @@ class ToolGateway:
         elif clean_target in ("gitops", "git", "release", "local-llm", "localllm"):
             canonical_agent = "local-llm"
             canonical_role = "gitops"
+        elif clean_target in ("architecture", "architect", "lead", "claude"):
+            canonical_agent = "claude"
+            canonical_role = "architecture"
         else:
             canonical_agent = clean_target
             canonical_role = clean_target

@@ -169,7 +169,15 @@ class _ReviewMixin:
             if rework_count > 1:
                 # If worker already attempted rework once and QA is still failing,
                 # escalate to the Lead Architect for direct resolution fix!
-                self.escalate_wo_to_recovery(state, target_id, reason=f"QA defect unresolved after worker rework: {finding}")
+                self.escalate_wo_to_recovery(
+                    state,
+                    target_id,
+                    reason=f"QA defect unresolved after worker rework: {finding}",
+                    details={
+                        "qa_findings": [finding],
+                        "qa_report": feedback,
+                    },
+                )
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
                 return AdvanceResult.TRANSITIONED
             # Rework phase grants a fresh retry budget for fixing defects

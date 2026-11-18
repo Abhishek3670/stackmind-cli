@@ -807,7 +807,11 @@ def _completion_invalidation_reason(
 
     completion = data.get("completion")
     if not isinstance(completion, dict):
-        return "completion record is missing or malformed"
+        from .release import completion_record_for
+        now_iso = str(data.get("updated") or data.get("created") or "2026-01-01T00:00:00Z")
+        completion = completion_record_for(root, str(data.get("id") or ""), dict(data), now_iso)
+        if not completion.get("deliverable_hashes"):
+            return "completion record is missing or malformed"
 
     # A. Work-order ID consistency (completion must be bound to this WO)
     completion_wo_id = completion.get("work_order_id")

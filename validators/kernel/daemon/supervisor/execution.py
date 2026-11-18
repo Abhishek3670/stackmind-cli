@@ -1538,6 +1538,10 @@ class _ExecutionMixin:
             except Exception:
                 wo_ids.append(wo_id)
         state.worker_wo_ids = [w for w in wo_ids if w not in getattr(state, "completed_wo_ids", [])]
+        if getattr(state, "published_wo_ids", None):
+            for w in state.worker_wo_ids:
+                if w not in state.published_wo_ids:
+                    state.published_wo_ids.append(w)
 
     def _dependency_result(self, state: RunState, wo_id: str, ws: Path) -> DependencyResult:
         """Authoritative, fail-closed dependency evaluation for one work order."""
@@ -2529,8 +2533,23 @@ class _ExecutionMixin:
                     self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
                     return AdvanceResult.TRANSITIONED
                 state.qa_reworks[wo_id] = reworks + 1
+                findings_items = list(decision.findings or ())
+                if not findings_items and decision.verdict:
+                    v_summ = decision.verdict.get("summary") or decision.verdict.get("detail")
+                    if v_summ:
+                        findings_items.append(v_summ)
+                    for crit in decision.verdict.get("criteria", []):
+                        if isinstance(crit, dict) and str(crit.get("outcome", "")).upper() in ("FAIL", "FAILED", "NEEDS_CHANGES"):
+                            desc = crit.get("description") or crit.get("id") or "Criterion"
+                            ev = crit.get("evidence") or "failed"
+                            findings_items.append(f"{desc}: {ev}")
+                    for ev_item in decision.verdict.get("evidence", []):
+                        if isinstance(ev_item, dict) and not ev_item.get("passed", True):
+                            cmd = ev_item.get("command") or ev_item.get("kind", "evidence")
+                            res_txt = ev_item.get("result", "")
+                            findings_items.append(f"Test `{cmd}` failed: {res_txt}")
+                findings = "\n".join(f"- {f}" for f in findings_items)
                 correction = "\n".join(f"- {a}" for a in decision.required_actions)
-                findings = "\n".join(f"- {f}" for f in decision.findings)
                 data = review_gate.load_wo(ws, wo_id)
                 deliv_paths = review_gate.wo_deliverable_paths(data)
                 deliv_desc = ", ".join(deliv_paths) if deliv_paths else "assigned deliverables"

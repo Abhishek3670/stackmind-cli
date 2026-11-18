@@ -1057,3 +1057,97 @@ def test_qa_verdict_contradictory_pass_with_failed_criteria_routed_as_defect(tmp
     assert state.qa_rework_targets.get("WO-004") == ["WO-001"]
 
 
+def test_published_wo_ids_sync_for_newly_discovered_wos(tmp_path: Path) -> None:
+    """Newly added active worker work orders must sync into published_wo_ids so they are never skipped."""
+    _write_worker_yaml(tmp_path, "WO-090", "codex", "src/auth.ts")
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "auth.ts").write_text("export const auth = true;\n", encoding="utf-8")
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-090"])
+    state.published_wo_ids = ["WO-001"]  # Stale published snapshot without WO-090
+
+    # Simulate completed codex operation for WO-090
+    op = mock_mgr.start_turn("sess-001", "Build auth", work_order_id="WO-090", agent_id="codex")
+    mock_mgr.complete_operation(op["operation_id"], "COMPLETED", result={"status": "completed"})
+
+    supervisor._advance_executing(state)
+
+    # WO-090 must have been synced into published_wo_ids and not skipped
+    assert "WO-090" in state.published_wo_ids
+
+
+def test_dynamic_completion_record_for_legacy_completed_prerequisite(tmp_path: Path) -> None:
+    """A legacy COMPLETED work order without a completion dict is dynamically satisfied when deliverable exists."""
+    from validators.kernel.daemon.supervisor.dependencies import evaluate_dependencies, DependencyStatus
+
+    # Create completed WO-040 without completion dict
+    comp_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    wo40 = {
+        "id": "WO-040",
+        "status": "COMPLETED",
+        "revision": 1,
+        "dependencies": [],
+        "deliverable": {"path": "src/schema.ts", "type": "code"},
+    }
+    (comp_dir / "WO-040.yaml").write_text(yaml.safe_dump(wo40), encoding="utf-8")
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "schema.ts").write_text("export const schema = {};\n", encoding="utf-8")
+
+    # Create active WO-096 depending on WO-040
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    wo96 = {
+        "id": "WO-096",
+        "status": "ACTIVE",
+        "dependencies": ["WO-040"],
+        "deliverable": {"path": "src/migration.sql", "type": "code"},
+    }
+    (active_dir / "WO-096.yaml").write_text(yaml.safe_dump(wo96), encoding="utf-8")
+
+    dep_res = evaluate_dependencies(tmp_path, "WO-096", completed_ids=["WO-040"])
+    assert dep_res.status == DependencyStatus.SATISFIED
+
+
+def test_delegate_task_resolves_architecture_alias(tmp_path: Path) -> None:
+    """Delegating to 'architecture' or 'architect' must write to claude inbox."""
+    from validators.kernel.tools import ToolGateway
+    from validators.kernel.sandbox import ProcessSandbox
+    from validators.kernel.boundary import RuntimeBoundary
+    from validators.kernel.operations import OperationJournal
+    from validators.kernel.identity import get_role_policy
+    from validators.kernel.contract import AgentContract
+    from validators.kernel.workspace import ScratchWorkspace
+
+    ws = ScratchWorkspace.create(tmp_path, "test-wo-delegation")
+    contract = AgentContract(
+        agent_id="claude",
+        work_order="WO-000",
+        allow=("workspace/**",),
+        deny=(),
+        write_mode="read-write",
+    ).freeze()
+    policy = get_role_policy("claude")
+    boundary = RuntimeBoundary(OperationJournal())
+
+    gw = ToolGateway(
+        workspace=ws,
+        boundary=boundary,
+        contract=contract,
+        policy=policy,
+        session_id="test-session",
+        attempt_id="test-attempt",
+        actor_id="claude",
+        provider_id="custom",
+    )
+    res = gw.delegate_task("architecture", "Please inspect schema", ["src/schema.ts"])
+    assert res.get("status") == "delegated"
+    claude_inbox = ws.root / ".sync" / "inbox" / "claude"
+    assert claude_inbox.is_dir()
+    delegation_files = list(claude_inbox.glob("*_delegation.md"))
+    assert len(delegation_files) == 1
+    content = delegation_files[0].read_text(encoding="utf-8")
+    assert "To:** claude" in content
+
+
+

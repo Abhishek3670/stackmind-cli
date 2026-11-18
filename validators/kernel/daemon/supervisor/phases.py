@@ -560,6 +560,11 @@ class _PhasesMixin:
         if not state.worker_wo_ids:
             self._discover_worker_wos(state)
 
+        if state.published_wo_ids:
+            for wid in state.worker_wo_ids:
+                if wid not in state.published_wo_ids:
+                    state.published_wo_ids.append(wid)
+
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
@@ -815,6 +820,11 @@ class _PhasesMixin:
                         state.published_wo_ids.append(target_id)
                     self._unarchive_work_order(ws, target_id)
 
+        if state.published_wo_ids:
+            for wid in state.worker_wo_ids:
+                if wid not in state.published_wo_ids:
+                    state.published_wo_ids.append(wid)
+
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
@@ -1010,8 +1020,11 @@ class _PhasesMixin:
                 # finalized as 'completed'.
                 verdict_hits = self._find_qa_defect_verdicts(ws, wo_id, state=state)
                 if verdict_hits:
+                    res = op.get("result", {}) or {}
+                    qa_err = str(res.get("report_markdown") or res.get("summary") or "")
+                    qa_blockers = "\n".join(res.get("blockers", [])) if isinstance(res.get("blockers"), list) else str(res.get("blockers") or "")
                     routed = self._route_qa_defect_to_developers(
-                        state, ws, wo_id, op, "", "",
+                        state, ws, wo_id, op, qa_err, qa_blockers,
                     )
                     if routed is not None:
                         return routed
