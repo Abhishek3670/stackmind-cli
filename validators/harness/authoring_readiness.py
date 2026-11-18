@@ -638,6 +638,7 @@ def validate_authoring_readiness(
     expected_milestones: Sequence[str] | None = None,
     planning_wo_id: str = "WO-000",
     completed_wo_ids: Sequence[str] | None = None,
+    superseded_wo_ids: Sequence[str] | None = None,
 ) -> AuthoringReadinessResult:
     """Validate the authored artifact set for atomic publication.
 
@@ -649,12 +650,14 @@ def validate_authoring_readiness(
     warnings: list[str] = []
     artifact_paths: list[str] = []
     skip_ids = _PLANNING_WO_IDS | ({planning_wo_id} if planning_wo_id else set())
+    superseded_set = set(superseded_wo_ids or ())
 
     gate = AuthoringGate(project_root=ws)
 
     # ── 1. Discover and parse artifacts ─────────────────────────────
     active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
     completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+    cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
     contracts_dir = ws / ".sync" / "contracts"
 
     wo_files: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -668,10 +671,12 @@ def validate_authoring_readiness(
             if data is None:
                 continue
             wo_id = str(data.get("id") or f.stem)
-            if wo_id in skip_ids:
+            if wo_id in skip_ids or wo_id in superseded_set:
                 continue
             status = str(data.get("status", "")).upper()
-            if status in ("COMPLETED", "CANCELLED", "FAILED"):
+            if status in ("COMPLETED", "CANCELLED", "FAILED", "SUPERSEDED"):
+                continue
+            if (completed_dir / f"{wo_id}.yaml").is_file() or (cancelled_dir / f"{wo_id}.yaml").is_file():
                 continue
             if p_idx is not None and (_parse_wo_index(wo_id) or 0) <= p_idx:
                 continue

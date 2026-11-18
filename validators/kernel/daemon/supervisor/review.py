@@ -1280,8 +1280,17 @@ class _ReviewMixin:
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
         """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""
+        cancelled = ws / ".sync" / "work-orders" / "CANCELLED" / f"{wo_id}.yaml"
+        if cancelled.is_file():
+            return False  # Never resurrect a cancelled work order
         active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if active.is_file():
+            try:
+                data = yaml.safe_load(active.read_text(encoding="utf-8")) or {}
+                if isinstance(data, dict) and str(data.get("status", "")).upper() in ("CANCELLED", "SUPERSEDED"):
+                    return False
+            except Exception:
+                pass
             return self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         for sub in ("COMPLETED", "BLOCKED"):
             cand = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
@@ -1722,6 +1731,7 @@ class _ReviewMixin:
             expected_milestones=expected,
             planning_wo_id=state.planning_wo_id,
             completed_wo_ids=state.completed_wo_ids,
+            superseded_wo_ids=getattr(state, "superseded_wo_ids", None),
         )
         self._persist_readiness_report(state, ws, result)
         return result

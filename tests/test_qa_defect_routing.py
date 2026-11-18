@@ -1150,4 +1150,73 @@ def test_delegate_task_resolves_architecture_alias(tmp_path: Path) -> None:
     assert "To:** claude" in content
 
 
+def test_authoring_readiness_ignores_cancelled_and_superseded_work_orders(tmp_path: Path):
+    """Verify that cancelled and superseded work orders without contracts do not fail readiness."""
+    from validators.harness.authoring_readiness import validate_authoring_readiness
+    import yaml
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    cancelled_dir = tmp_path / ".sync" / "work-orders" / "CANCELLED"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    cancelled_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-001 is active and has a contract
+    (active_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001", "type": "FEATURE", "status": "ACTIVE", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "src/a.ts"}
+    }), encoding="utf-8")
+    (contracts_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1, "work_order": "WO-001", "agent_id": "codex", "scope": {"allow": [{"module": "src/a.ts"}], "deny": [], "write": "read-write"}
+    }), encoding="utf-8")
+
+    # WO-087 is in CANCELLED/ and also has a zombie copy in ACTIVE/, with NO contract
+    (cancelled_dir / "WO-087.yaml").write_text(yaml.safe_dump({
+        "id": "WO-087", "type": "FEATURE", "status": "CANCELLED", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "src/b.ts"}
+    }), encoding="utf-8")
+    (active_dir / "WO-087.yaml").write_text(yaml.safe_dump({
+        "id": "WO-087", "type": "FEATURE", "status": "ACTIVE", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "src/b.ts"}
+    }), encoding="utf-8")
+
+    res = validate_authoring_readiness(tmp_path, planning_wo_id="WO-000", superseded_wo_ids=["WO-087"])
+    missing_contracts = [i for i in res.issues if i.code == "MISSING_CONTRACT"]
+    assert len(missing_contracts) == 0, f"Expected no MISSING_CONTRACT issues, got: {missing_contracts}"
+
+
+def test_unblock_in_flight_work_orders_purges_zombie_cancelled_active_copies(tmp_path: Path):
+    """Verify that unblock_in_flight_work_orders unlinks zombie active copies and excludes them from worker_wo_ids."""
+    from validators.kernel.daemon.supervisor.controls import _ControlsMixin
+    from validators.kernel.daemon.supervisor.models import RunState, Phase
+    import yaml
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    cancelled_dir = tmp_path / ".sync" / "work-orders" / "CANCELLED"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    cancelled_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-087 exists in CANCELLED/ and as a zombie in ACTIVE/
+    (cancelled_dir / "WO-087.yaml").write_text(yaml.safe_dump({"id": "WO-087", "status": "CANCELLED"}), encoding="utf-8")
+    (active_dir / "WO-087.yaml").write_text(yaml.safe_dump({"id": "WO-087", "status": "ACTIVE"}), encoding="utf-8")
+
+    class DummySupervisor(_ControlsMixin):
+        def _unarchive_work_order(self, ws, wo_id):
+            pass
+
+    sup = DummySupervisor()
+    state = RunState(
+        run_id="run-test",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-test",
+        phase=Phase.WAITING_FOR_HUMAN,
+        worker_wo_ids=["WO-087", "WO-001"],
+        superseded_wo_ids=["WO-087"],
+    )
+
+    sup.unblock_in_flight_work_orders(state)
+    assert not (active_dir / "WO-087.yaml").is_file(), "Zombie active WO-087 copy should have been unlinked"
+    assert "WO-087" not in state.worker_wo_ids, "WO-087 should not be in worker_wo_ids"
+
+
+
 

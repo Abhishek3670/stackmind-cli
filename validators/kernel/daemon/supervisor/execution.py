@@ -1504,7 +1504,11 @@ class _ExecutionMixin:
                 data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     st = str(data.get("status", "")).upper()
-                    if st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                    if st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED", "SUPERSEDED"):
+                        continue
+                    if (ws / ".sync" / "work-orders" / "CANCELLED" / wo_file.name).is_file():
+                        continue
+                    if wo_id in getattr(state, "superseded_wo_ids", []):
                         continue
                     if p_idx is not None:
                         from validators.harness.authoring_readiness import _parse_wo_index

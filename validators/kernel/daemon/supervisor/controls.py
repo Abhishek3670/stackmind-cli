@@ -73,7 +73,7 @@ class _ControlsMixin:
         state.blocked_wo_ids.clear()
         state.recovery_wo_id = None
         state.recovery_decision_operation_id = None
-        if hasattr(self.manager, "_sessions"):
+        if hasattr(self, "manager") and hasattr(self.manager, "_sessions"):
             sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
             if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
                 sess["state"] = "RUNNING"
@@ -98,23 +98,38 @@ class _ControlsMixin:
                     candidate_ids.append(target_id)
 
         completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+        cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
         rework_targets = set()
         for targets in getattr(state, "qa_rework_targets", {}).values():
             rework_targets.update(targets)
 
-        seen: set[str] = set(state.completed_wo_ids)
+        superseded_set = set(getattr(state, "superseded_wo_ids", []))
+        seen: set[str] = set()
         for wo_id in candidate_ids:
             if wo_id in seen:
                 continue
             seen.add(wo_id)
+            if wo_id in state.completed_wo_ids:
+                continue
             if (completed_dir / f"{wo_id}.yaml").is_file() and wo_id not in rework_targets:
                 if wo_id not in state.completed_wo_ids:
                     state.completed_wo_ids.append(wo_id)
                 continue
+            if (cancelled_dir / f"{wo_id}.yaml").is_file() or wo_id in superseded_set:
+                active_copy = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                if active_copy.is_file():
+                    try:
+                        active_copy.unlink()
+                    except OSError:
+                        pass
+                continue
             self._unarchive_work_order(ws, wo_id)
             if wo_id in state.blocked_wo_ids:
                 state.blocked_wo_ids.remove(wo_id)
-        state.worker_wo_ids = [w for w in state.worker_wo_ids if w not in state.completed_wo_ids]
+        state.worker_wo_ids = [
+            w for w in state.worker_wo_ids
+            if w not in state.completed_wo_ids and w not in superseded_set
+        ]
         state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w not in state.completed_wo_ids]
 
     # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
@@ -271,9 +286,17 @@ class _ControlsMixin:
                 for f in list(blocked_dir.glob("*.yaml")):
                     self._unarchive_work_order(ws, f.stem)
             active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
+            superseded_set = set(getattr(state, "superseded_wo_ids", []))
             if active_dir.is_dir():
                 for f in active_dir.glob("*.yaml"):
                     try:
+                        if (cancelled_dir / f.name).is_file() or f.stem in superseded_set:
+                            try:
+                                f.unlink()
+                            except OSError:
+                                pass
+                            continue
                         content = f.read_text(encoding="utf-8")
                         if "Architect repair outcome invalid" in content or "status: BLOCKED" in content or "status: FAILED" in content:
                             import yaml

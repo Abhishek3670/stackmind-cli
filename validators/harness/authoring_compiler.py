@@ -134,9 +134,9 @@ def compile_authoring_artifacts(
             normalized.append(rel)
         injections.setdefault(rel, []).append(what)
 
-    # ── Anti-collision check: detect active work orders colliding with COMPLETED/BLOCKED
+    # ── Anti-collision check: detect active work orders colliding with COMPLETED/BLOCKED/CANCELLED
     closed_ids: set[str] = set()
-    for sub in ("COMPLETED", "BLOCKED"):
+    for sub in ("COMPLETED", "BLOCKED", "CANCELLED"):
         d = ws / ".sync" / "work-orders" / sub
         if d.is_dir():
             closed_ids.update(f.stem for f in d.glob("*.yaml"))

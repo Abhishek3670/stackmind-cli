@@ -1574,7 +1574,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if m:
                 wo_data["superseded_by"] = m.group(1).upper()
         wo_data["updated"] = now_str
-        durable_write_yaml(wo_file, wo_data)
+        cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
+        cancelled_dir.mkdir(parents=True, exist_ok=True)
+        durable_write_yaml(cancelled_dir / wo_file.name, wo_data)
+        wo_file.unlink(missing_ok=True)
         _sync_index_status(wo_id, "CANCELLED", now_str)
         _sync_tree_remove(wo_id)
         if wo_id not in reconciled_ids:
@@ -1594,8 +1597,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
     # Pass 0: Index all completed work orders and their deliverables
     completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+    cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
     completed_deliverables: dict[str, str] = {}  # norm_p -> completed_wo_id
     completed_ids: set[str] = set()
+    cancelled_ids: set[str] = set()
     if completed_dir.is_dir():
         for comp_file in sorted(completed_dir.glob("*.yaml")):
             comp_id = comp_file.stem
@@ -1607,6 +1612,9 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                         completed_deliverables[p] = comp_id
             except Exception:
                 pass
+    if cancelled_dir.is_dir():
+        for canc_file in sorted(cancelled_dir.glob("*.yaml")):
+            cancelled_ids.add(canc_file.stem)
 
     active_files = sorted(active_dir.glob("*.yaml"))
 
@@ -1620,6 +1628,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if not isinstance(wo_data, dict):
                 continue
             wo_id = str(wo_data.get("id") or wo_file.stem)
+
+            # Purge zombie active copies of work orders already in CANCELLED/
+            if wo_id in cancelled_ids or (cancelled_dir / wo_file.name).is_file():
+                wo_file.unlink(missing_ok=True)
+                _sync_index_status(wo_id, "CANCELLED", _now())
+                continue
 
             # Auto-promote verified work orders that have completed execution evidence
             if wo_data.get("completion") and isinstance(wo_data["completion"], dict):
