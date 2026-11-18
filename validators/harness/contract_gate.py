@@ -380,12 +380,30 @@ def verify_post_execution(
                             if a_norm.startswith("./"):
                                 a_norm = a_norm[2:]
                             a_clean = a_norm.rstrip("/*").rstrip("/")
-                            if (norm_fp == a_norm or norm_fp.startswith(a_clean + "/") or fnmatch.fnmatch(norm_fp, a_norm)) and (
-                                (a_clean.startswith(p_clean + "/") or fnmatch.fnmatch(a_clean, p_norm))
-                                and not (p_clean.startswith(a_clean + "/") or fnmatch.fnmatch(p_clean, a_norm))
-                            ):
-                                overridden = True
-                                break
+                            matches_allow = (
+                                norm_fp == a_norm
+                                or norm_fp.startswith(a_clean + "/")
+                                or fnmatch.fnmatch(norm_fp, a_norm)
+                                or module_matches(mod, a_pat)
+                            )
+                            if matches_allow:
+                                is_exact_allow = (norm_fp == a_norm)
+                                is_exact_deny = (norm_fp == p_norm)
+                                if is_exact_allow and not is_exact_deny:
+                                    overridden = True
+                                    break
+                                a_is_sub = (
+                                    a_clean.startswith(p_clean + "/")
+                                    or fnmatch.fnmatch(a_clean, p_norm)
+                                    or module_matches(path_to_module(a_clean), pattern)
+                                )
+                                p_is_sub = (
+                                    p_clean.startswith(a_clean + "/")
+                                    or fnmatch.fnmatch(p_clean, a_norm)
+                                )
+                                if a_is_sub and not p_is_sub:
+                                    overridden = True
+                                    break
                     if not overridden:
                         raise ContractAccessDenied(
                             f"Modification to file {file_path} is explicitly denied by rule: {pattern}"

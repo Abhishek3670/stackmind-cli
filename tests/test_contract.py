@@ -46,6 +46,12 @@ def test_module_matches():
     assert module_matches("billing.invoices", "billing.invoices")
     assert module_matches("billing.invoices.core", "billing.invoices")
     assert not module_matches("auth_helpers", "auth.*")
+    # Dotfiles and files with extensions must not treat dot as module separator
+    assert not module_matches(".env.example", ".env")
+    assert not module_matches(".gitignore", ".git")
+    assert not module_matches("package.json.bak", "package.json")
+    assert module_matches(".env", ".env")
+    assert module_matches(".env.example", ".env.example")
 
 def test_contract_validation(fresh_project):
     contract_data = {

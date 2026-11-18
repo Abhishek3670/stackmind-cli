@@ -512,3 +512,41 @@ def test_contract_scope_permits_path_with_py_extension():
     assert module_matches(mod, "src/*")
     assert module_matches(mod, "src/**")
 
+
+def test_contract_exact_allow_dotfile_overrides_deny(tmp_path):
+    import pytest
+    from validators.harness.contract_gate import verify_post_execution, ContractAccessDenied
+    from validators.knowledge.contract import AgentContract
+
+    contract_data = {
+        "agent_id": "codex",
+        "work_order": "WO-094",
+        "identity": {"role": "backend", "reports_to": "claude"},
+        "scope": {
+            "allow": [{"module": ".env.example"}],
+            "deny": [{"module": ".env"}, {"module": ".git/**"}],
+            "write": "read-write",
+        },
+        "budget": {"max_files_touched": 5, "max_tokens": 30000},
+    }
+    contract = AgentContract(contract_data)
+
+    class DummyTask:
+        work_order_id = "WO-094"
+
+    class DummyDecision:
+        modified_files = []
+
+    # 1. Modifying .env.example must succeed because of exact allow rule
+    verify_post_execution(
+        tmp_path, "codex", DummyTask(), DummyDecision(), observed_files=[".env.example"], contract=contract
+    )
+
+    # 2. Modifying .env must be denied because .env is in deny rules and NOT in allow rules
+    with pytest.raises(ContractAccessDenied) as exc_info:
+        verify_post_execution(
+            tmp_path, "codex", DummyTask(), DummyDecision(), observed_files=[".env"], contract=contract
+        )
+    assert "explicitly denied by rule: .env" in str(exc_info.value)
+
+

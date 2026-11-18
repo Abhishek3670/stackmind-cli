@@ -34,6 +34,13 @@ def path_to_module(path: str) -> str:
         p = p[:-9]
     return p.replace("/", ".")
 
+_FILE_EXTENSIONS = (
+    ".json", ".yaml", ".yml", ".md", ".txt", ".env", ".sql", ".sh",
+    ".html", ".css", ".lock", ".toml", ".bak", ".example",
+    ".js", ".jsx", ".ts", ".tsx", ".cjs", ".mjs",
+    ".dockerignore", ".gitignore"
+)
+
 def module_matches(module_name: str, pattern: str) -> bool:
     """Check if module_name matches the pattern (supporting wildcards like * and path slashes)."""
     p_dot = pattern.replace("/", ".").replace("\\", ".")
@@ -43,13 +50,21 @@ def module_matches(module_name: str, pattern: str) -> bool:
         if p_mod != "*" or pattern == "*":
             matches = matches or fnmatch.fnmatch(module_name, p_mod)
         return matches
+    # Submodule prefix matching (e.g. pattern="auth" matching "auth.session") is only
+    # valid for dotted module identifiers, never for dotfiles (e.g. ".env" matching ".env.example")
+    # or file paths with extensions.
+    submodule_match = False
+    for p in (pattern, p_dot, p_mod):
+        if p and not p.startswith(".") and not any(p.lower().endswith(ext) for ext in _FILE_EXTENSIONS):
+            parts = p.split(".")
+            if all(part.isidentifier() for part in parts) and module_name.startswith(p + "."):
+                submodule_match = True
+                break
     return (
         module_name == pattern
         or module_name == p_dot
         or module_name == p_mod
-        or module_name.startswith(pattern + ".")
-        or module_name.startswith(p_dot + ".")
-        or module_name.startswith(p_mod + ".")
+        or submodule_match
     )
 
 class AgentContract:
