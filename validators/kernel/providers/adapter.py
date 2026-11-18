@@ -204,16 +204,38 @@ class OpenAICompatibleAdapter(ProviderAdapter):
 
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-        try:
-            response = urllib.request.urlopen(req, timeout=actual_timeout)  # noqa: S310
-            return response
-        except urllib.error.HTTPError as ex:
-            body = ex.read().decode("utf-8", errors="replace")
-            raise self._map_http_error(ex.code, body) from ex
-        except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
-            raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
-        except Exception as ex:
-            raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                response = urllib.request.urlopen(req, timeout=actual_timeout)  # noqa: S310
+                return response
+            except urllib.error.HTTPError as ex:
+                body = ex.read().decode("utf-8", errors="replace")
+                if ex.code in (429, 502, 503, 504) and attempt < max_retries:
+                    self._check_cancellation(cancellation_token)
+                    retry_after = ex.headers.get("Retry-After") if hasattr(ex, "headers") and ex.headers else None
+                    delay = None
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except (ValueError, TypeError):
+                            pass
+                    if delay is None:
+                        m = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", body, re.IGNORECASE)
+                        if m:
+                            try:
+                                delay = float(m.group(1)) + 0.5
+                            except (ValueError, TypeError):
+                                pass
+                    if delay is None:
+                        delay = 2.0 * (attempt + 1)
+                    time.sleep(min(max(delay, 0.05), 30.0))
+                    continue
+                raise self._map_http_error(ex.code, body) from ex
+            except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:
+                raise TimeoutError(f"Connection or timeout error: {ex}", provider=self.provider_name) from ex
+            except Exception as ex:
+                raise ProviderError(f"Unexpected provider transport failure: {ex}", provider=self.provider_name) from ex
 
     def complete(
         self,

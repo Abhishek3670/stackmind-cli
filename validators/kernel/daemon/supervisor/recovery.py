@@ -45,7 +45,7 @@ class _RecoveryMixin:
 
     def _advance_architect_repair(self, state: RunState) -> AdvanceResult:
         """ARCHITECT_REPAIR: wait for the bounded Architect repair turn, then revalidate."""
-        if state.authoring_repair_attempts >= state.max_authoring_repairs:
+        if not state.architect_repair_operation_id and state.authoring_repair_attempts >= state.max_authoring_repairs:
             state.error = (
                 f"Architect repair attempts exhausted "
                 f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
