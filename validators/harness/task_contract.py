@@ -717,7 +717,8 @@ def render_worker_system(contract: dict[str, Any]) -> str:
         f" Host OS: {host_os}. "
         + (
             "Unix commands (ls, cat, touch) are not native Windows binaries. "
-            "Use StackMind built-in tools (list_directory, read_file, grep, write_file) or native Windows executables (pytest, python, git)."
+            "Use StackMind built-in tools (list_directory, glob, grep, query_graph, read_file, write_file) or native Windows executables (pytest, python, git). "
+            "Always inspect directory structure using 'list_directory' or 'glob' to verify actual file locations before calling 'read_file'."
             if sys.platform == "win32" else ""
         )
     )

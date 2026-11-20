@@ -1487,6 +1487,7 @@ WORKER_CODE_CORE_TOOL_NAMES = (
     "list_directory",
     "glob",
     "grep",
+    "query_graph",
     "git_diff",
     "git_changed_files",
     "run_command",
@@ -1497,6 +1498,7 @@ WORKER_QA_CORE_TOOL_NAMES = (
     "batch_write_files",
     "list_directory",
     "glob",
+    "query_graph",
     "git_diff",
     "git_changed_files",
     "verify_diff",
@@ -2397,6 +2399,9 @@ class ProviderGateway:
                         pass
                     files_hint = f" Existing workspace files: {', '.join(sorted(existing_files)[:25])}." if existing_files else ""
                     res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace.{files_hint}"
+                    if name == "read_file":
+                        self.consecutive_failures = max(0, self.consecutive_failures - 1)
+                        res += " Use 'list_directory', 'glob', or 'query_graph' to inspect existing files before reading."
             elif isinstance(ex, NotADirectoryError):
                 target_str = args.get("path") or args.get("target") or args.get("file") or "."
                 res = (
