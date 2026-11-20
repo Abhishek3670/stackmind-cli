@@ -684,7 +684,7 @@ def parse_plan(content: str, project_path: Path | str | None = None) -> PlanStru
 
     # Extract Architecture overview
     arch_match = re.search(
-        r"^##\s+.*(?:Architecture|Technical Design|Core Technologies)[^\n]*\n(.*?)(?=^##|\Z)",
+        r"^##\s+[^\n]*(?:Architecture|Technical Design|Core Technologies)[^\n]*\n(.*?)(?=^##\s+|\Z)",
         content,
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
@@ -693,22 +693,46 @@ def parse_plan(content: str, project_path: Path | str | None = None) -> PlanStru
     # Extract Milestones
     milestones: list[PlanMilestone] = []
     milestone_section_match = re.search(
-        r"^##\s+.*(?:Milestones|Roadmap)[^\n]*\n(.*?)(?=^##|\Z)",
+        r"^##\s+[^\n]*(?:Milestones|Roadmap)[^\n]*\n(.*?)(?=^##\s+|\Z)",
         content,
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
     if milestone_section_match:
         section_text = milestone_section_match.group(1)
         current_milestone: PlanMilestone | None = None
+        current_milestone_is_heading = False
         for line in section_text.splitlines():
             line_str = line.rstrip()
             if not line_str.strip():
                 continue
-            # Top-level milestone: starts at column 0 with '- [' or '- **['
-            cb_match = re.match(r"^-\s*(?:\*\*)?\[([ xX])\](?:\*\*)?\s*(.*)$", line_str)
-            if cb_match:
-                checked = cb_match.group(1).lower() == "x"
-                raw_content = cb_match.group(2).strip()
+
+            heading_match = re.match(r"^#{3,4}\s+(?:\[([ xX])\]\s+)?(.*)$", line_str)
+            cb_match = re.match(r"^-\s*(?:\*\*)?\[([ xX])\](?:\*\*)?\s*(.*)$", line_str) if not heading_match else None
+
+            # Subtask under heading milestone (can be column 0 or indented)
+            if current_milestone and current_milestone_is_heading and not heading_match:
+                task_m = re.match(r"^\s*-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str)
+                if task_m:
+                    current_milestone.tasks.append(task_m.group(1).strip())
+                    continue
+
+            # Subtask under bullet milestone (must be indented)
+            if current_milestone and not current_milestone_is_heading and re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str):
+                task_text = re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str).group(1).strip()
+                current_milestone.tasks.append(task_text)
+                continue
+
+            is_match = heading_match or cb_match
+            if is_match:
+                checked = False
+                if heading_match:
+                    checked = (heading_match.group(1) or "").lower() == "x"
+                    raw_content = heading_match.group(2).strip()
+                    current_milestone_is_heading = True
+                else:
+                    checked = cb_match.group(1).lower() == "x"
+                    raw_content = cb_match.group(2).strip()
+                    current_milestone_is_heading = False
 
                 # Clean leading/trailing markdown asterisks from raw content
                 raw_content = re.sub(r"^\*\*", "", raw_content)
@@ -784,9 +808,6 @@ def parse_plan(content: str, project_path: Path | str | None = None) -> PlanStru
                     skills=m_skills,
                 )
                 milestones.append(current_milestone)
-            elif current_milestone and re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str):
-                task_text = re.match(r"^\s{2,}-\s+(?:\[[ xX]\]\s+)?(.*)$", line_str).group(1).strip()
-                current_milestone.tasks.append(task_text)
 
     tech_stack = parse_tech_stack(content, project_path=project_path)
 

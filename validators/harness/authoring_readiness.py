@@ -674,7 +674,9 @@ def validate_authoring_readiness(
             if wo_id in skip_ids or wo_id in superseded_set:
                 continue
             status = str(data.get("status", "")).upper()
-            if status in ("COMPLETED", "CANCELLED", "FAILED", "SUPERSEDED"):
+            if status in ("COMPLETED", "CANCELLED", "FAILED", "SUPERSEDED") or data.get("completion"):
+                if data.get("completion"):
+                    completed_wo_files[wo_id] = (rel, data)
                 continue
             if (completed_dir / f"{wo_id}.yaml").is_file() or (cancelled_dir / f"{wo_id}.yaml").is_file():
                 continue
@@ -720,11 +722,13 @@ def validate_authoring_readiness(
             is_recovery = str(data.get("synthesized_by") or "").startswith("recovery-repair")
             if is_arch_agent and not is_recovery:
                 continue
+            if (completed_dir / f"{wo_ref}.yaml").is_file() or (cancelled_dir / f"{wo_ref}.yaml").is_file() or (wo_ref in superseded_set):
+                continue
             cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
             if cand.is_file():
                 try:
                     c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
-                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "CANCELLED", "FAILED"):
+                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "CANCELLED", "FAILED") or c_data.get("completion"):
                         continue
                 except Exception:
                     pass
@@ -784,7 +788,7 @@ def validate_authoring_readiness(
                 try:
                     c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
                     st = str(c_data.get("status", "")).upper()
-                    if folder in ("BLOCKED", "COMPLETED") or st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                    if folder in ("BLOCKED", "COMPLETED") or st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED") or c_data.get("completion"):
                         is_archived_or_terminal = True
                         break
                 except Exception:
@@ -1054,7 +1058,7 @@ def validate_authoring_readiness(
                             affected_artifacts=(rel,),
                         )
 
-                if dep_str in wo_files or dep_str in completed_wo_files or dep_str in skip_ids:
+                if dep_str in wo_files or dep_str in completed_wo_files or dep_str in skip_ids or dep_str in superseded_set:
                     continue
                 _issue(
                     issues,

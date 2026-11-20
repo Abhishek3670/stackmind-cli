@@ -211,15 +211,21 @@ class _RecoveryMixin:
                     # Re-discover worker work orders (including any newly delegated ones)
                     self._discover_worker_wos(state)
                     gate_result = self._run_readiness_gate(state, ws)
-                    if not gate_result.ready:
+                    relevant_wos = {str(wo_id)} | set(str(w) for w in state.repair_context.get("replacement_work_orders") or ())
+                    recovery_issues = [
+                        i for i in gate_result.issues
+                        if getattr(i, "work_order_id", None) in relevant_wos
+                        or any(rw in (getattr(i, "artifact_path", "") or "") for rw in relevant_wos)
+                    ]
+                    if not gate_result.ready and recovery_issues:
                         state.authoring_repair_attempts += 1
                         if state.authoring_repair_attempts > state.max_authoring_repairs:
-                            issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5])
+                            issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in recovery_issues[:5])
                             state.error = f"Authoring readiness gate failed after recovery ({issue_summary}) and repair attempts exhausted"
                             state.exit_code = 3
                             self._transition(state, Phase.WAITING_FOR_HUMAN)
                             return AdvanceResult.WAITING_FOR_HUMAN
-                        issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5])
+                        issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in recovery_issues[:5])
                         state.repair_context["post_check_error"] = f"Authoring readiness gate failed: {issue_summary}"
                         state.architect_repair_operation_id = None
                         new_op = self._dispatch_repair_turn(state, ws)
@@ -247,11 +253,19 @@ class _RecoveryMixin:
                 pass
             self._discover_worker_wos(state)
             gate_result = self._run_readiness_gate(state, ws)
-            if not gate_result.ready:
+            blocking_issues = gate_result.issues
+            if source == "recovery" and wo_id:
+                relevant_wos = {str(wo_id)} | set(str(w) for w in state.repair_context.get("replacement_work_orders") or ())
+                blocking_issues = [
+                    i for i in gate_result.issues
+                    if getattr(i, "work_order_id", None) in relevant_wos
+                    or any(rw in (getattr(i, "artifact_path", "") or "") for rw in relevant_wos)
+                ]
+            if not gate_result.ready and blocking_issues:
                 issue_summary = "; ".join(
-                    f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5]
+                    f"{issue.code}: {issue.message}" for issue in blocking_issues[:5]
                 )
-                self._archive_rejected_artifacts(state, ws, gate_result.issues)
+                self._archive_rejected_artifacts(state, ws, blocking_issues)
                 state.authoring_repair_attempts += 1
                 if state.authoring_repair_attempts > state.max_authoring_repairs:
                     state.error = (
@@ -261,7 +275,7 @@ class _RecoveryMixin:
                     state.exit_code = 3
                     self._transition(state, Phase.WAITING_FOR_HUMAN)
                     return AdvanceResult.WAITING_FOR_HUMAN
-                state.readiness_issues = [i.to_dict() for i in gate_result.issues]
+                state.readiness_issues = [i.to_dict() for i in blocking_issues]
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:

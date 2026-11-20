@@ -1499,9 +1499,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     from validators.kernel.io import durable_write_yaml
     from cli.init import ensure_canonical_tree
 
-    plan_milestones = load_plan_milestones(ws)
-    if not plan_milestones:
-        return []
+    plan_milestones = load_plan_milestones(ws) or []
 
     from validators.harness.plan import resolve_playbook_file
     plan_file = resolve_playbook_file(ws, "PLAN.md")
@@ -1722,6 +1720,9 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
             if is_delegated_or_repair:
                 delegated_survivors.append((wo_file, wo_id, wo_data, None))
+                continue
+
+            if not plan_milestones:
                 continue
 
             matched_ref = next((r for r in plan_milestones if _wo_matches_milestone(wo_data, r)), None)
