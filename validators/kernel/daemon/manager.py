@@ -2006,6 +2006,13 @@ class SessionManager:
         if state.error and ("exhausted" in state.error or "blocked" in state.error.lower() or "failed" in state.error.lower()):
             state.error = None
 
+        # Prune stale dependency waits for non-active or completed work orders
+        if hasattr(state, "dependency_waits") and isinstance(state.dependency_waits, dict):
+            active_stems = {p.stem for p in active_dir.glob("*.yaml")} if active_dir.is_dir() else set()
+            for wid in list(state.dependency_waits.keys()):
+                if wid not in active_stems or wid in getattr(state, "completed_wo_ids", []):
+                    state.dependency_waits.pop(wid, None)
+
         # Clean up stale superseded_wo_ids: any work order that is active or completed on disk is not superseded
         if hasattr(state, "superseded_wo_ids") and isinstance(state.superseded_wo_ids, list):
             state.superseded_wo_ids = [

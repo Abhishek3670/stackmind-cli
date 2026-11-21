@@ -1608,8 +1608,11 @@ class _ExecutionMixin:
         to_remove: list[str] = []
         to_invalidate: list[str] = []
 
-        for wo_id, wait_record in state.dependency_waits.items():
-            if wo_id in superseded:
+        active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+        active_wos = {p.stem for p in active_dir.glob("*.yaml")} if active_dir.is_dir() else set()
+
+        for wo_id, wait_record in list(state.dependency_waits.items()):
+            if wo_id not in active_wos or wo_id in superseded or wo_id in getattr(state, "completed_wo_ids", []):
                 to_remove.append(wo_id)
                 continue
             if published and wo_id not in published:
