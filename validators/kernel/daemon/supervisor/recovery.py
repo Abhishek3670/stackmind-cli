@@ -94,15 +94,19 @@ class _RecoveryMixin:
                 )
                 if not is_transient:
                     state.authoring_repair_attempts += 1
-                if state.authoring_repair_attempts > state.max_authoring_repairs:
-                    detail = f" [{err_cause}]" if err_cause else f" ({status})"
-                    state.error = (
-                        f"Architect repair turn failed{detail} and repair attempts are exhausted "
-                        f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
-                        f"operator intervention required"
-                    )
-                    self._transition(state, Phase.BLOCKED)
-                    return AdvanceResult.BLOCKED
+                    if state.authoring_repair_attempts > state.max_authoring_repairs:
+                        detail = f" [{err_cause}]" if err_cause else f" ({status})"
+                        state.error = (
+                            f"Architect repair turn failed{detail} and repair attempts are exhausted "
+                            f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
+                            f"operator intervention required"
+                        )
+                        self._transition(state, Phase.BLOCKED)
+                        return AdvanceResult.BLOCKED
+                else:
+                    m = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", str(err_cause), re.IGNORECASE)
+                    backoff = float(m.group(1)) + 1.0 if m else 5.0
+                    time.sleep(min(max(backoff, 1.0), 30.0))
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:
