@@ -75,9 +75,26 @@ class _RecoveryMixin:
             action = state.repair_context.get("action")
 
             if op_failed:
-                state.authoring_repair_attempts += 1
+                err_cause = _extract_op_error(op)
+                is_transient = any(
+                    kw in str(err_cause).lower()
+                    for kw in (
+                        "429",
+                        "too many requests",
+                        "rate limit",
+                        "reset after",
+                        "insufficient_quota",
+                        "prompt_exceeds_quota",
+                        "capacity",
+                        "overloaded",
+                        "service unavailable",
+                        "503",
+                        "502",
+                    )
+                )
+                if not is_transient:
+                    state.authoring_repair_attempts += 1
                 if state.authoring_repair_attempts > state.max_authoring_repairs:
-                    err_cause = _extract_op_error(op)
                     detail = f" [{err_cause}]" if err_cause else f" ({status})"
                     state.error = (
                         f"Architect repair turn failed{detail} and repair attempts are exhausted "

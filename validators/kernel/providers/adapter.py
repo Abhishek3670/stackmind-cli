@@ -204,7 +204,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
 
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-        max_retries = 3
+        max_retries = 6
         for attempt in range(max_retries + 1):
             try:
                 response = urllib.request.urlopen(req, timeout=actual_timeout)  # noqa: S310
@@ -224,12 +224,12 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                         m = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", body, re.IGNORECASE)
                         if m:
                             try:
-                                delay = float(m.group(1)) + 0.5
+                                delay = float(m.group(1)) + 1.0
                             except (ValueError, TypeError):
                                 pass
                     if delay is None:
                         delay = 2.0 * (attempt + 1)
-                    time.sleep(min(max(delay, 0.05), 30.0))
+                    time.sleep(min(max(delay, 0.5), 60.0))
                     continue
                 raise self._map_http_error(ex.code, body) from ex
             except (urllib.error.URLError, TimeoutError, builtins.TimeoutError, socket.timeout) as ex:

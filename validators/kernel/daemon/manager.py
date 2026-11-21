@@ -2236,6 +2236,11 @@ class SessionManager:
                 ensure_workspace_protocol_scaffolding(ws)
             except Exception:
                 pass
+            try:
+                from .authoring import reconcile_active_work_orders_with_plan
+                reconcile_active_work_orders_with_plan(ws)
+            except Exception:
+                pass
             target_run_id = run_id
             if not target_run_id:
                 sup_dir = ws / ".sync" / "runtime" / "supervisor"
