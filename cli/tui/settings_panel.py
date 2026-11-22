@@ -10,6 +10,7 @@ from __future__ import annotations
 import getpass
 import io
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -20,7 +21,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from cli.tui.keyboard import Key, read_next_key
+from cli.tui.keyboard import (
+    Key,
+    disable_mouse_reporting,
+    drain_console_input,
+    enable_mouse_reporting,
+    read_next_key,
+)
 from cli.tui.views import render_roles_panel
 
 from validators.kernel.settings import (
@@ -301,6 +308,114 @@ def render_stackmind_settings_str(
 render_config_str = render_stackmind_settings_str
 
 
+def _read_field_input(
+    prompt_text: str,
+    key_stream: Iterator[str] | None = None,
+    state: Any | None = None,
+    stream: Any = None,
+) -> str | None:
+    """Read a field value safely from key_stream or interactive prompt without mouse escape spam."""
+    if key_stream is not None:
+        try:
+            val = next(key_stream)
+            if not val or val in (Key.ESCAPE, "q"):
+                return None
+            val = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", val)
+            val = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", val)
+            return val.strip() if val.strip() else None
+        except StopIteration:
+            return None
+
+    out = stream or sys.stdout
+    is_tty = False
+    try:
+        is_tty = sys.stdin.isatty() and hasattr(out, "isatty") and out.isatty()
+    except Exception:
+        pass
+
+    if not is_tty:
+        try:
+            if prompt_text:
+                out.write(f"\n\x1b[1;36m{prompt_text}\x1b[0m")
+                out.flush()
+            res = input().strip()
+            res = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", res)
+            res = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", res)
+            return res.strip() if res.strip() else None
+        except Exception:
+            return None
+
+    disable_mouse_reporting(out)
+    drain_console_input()
+
+    buffer: list[str] = []
+    try:
+        if prompt_text:
+            out.write(f"\n\x1b[1;36m{prompt_text}\x1b[0m")
+            out.flush()
+
+        while True:
+            try:
+                k = read_next_key()
+            except (StopIteration, KeyboardInterrupt, EOFError):
+                return None
+
+            if k is None:
+                continue
+
+            if k in (Key.ENTER, Key.NEWLINE, "\r", "\n"):
+                out.write("\n")
+                out.flush()
+                break
+
+            if k in (Key.ESCAPE, Key.CTRL_C):
+                out.write("\n")
+                out.flush()
+                return None
+
+            if k in (Key.BACKSPACE, "\x08", "\x7f"):
+                if buffer:
+                    buffer.pop()
+                    out.write("\b \b")
+                    out.flush()
+                continue
+
+            if (
+                k.startswith(("<MOUSE_", "\x1b[<", "^[[<"))
+                or "<MOUSE_" in k
+                or "[<" in k
+            ):
+                continue
+
+            if k.startswith("\x1b") or (k.startswith("<") and k.endswith(">")):
+                continue
+
+            if len(k) == 1:
+                if k.isprintable():
+                    buffer.append(k)
+                    out.write(k)
+                    out.flush()
+            else:
+                clean_paste = "".join(ch for ch in k if ch.isprintable())
+                if clean_paste:
+                    buffer.extend(clean_paste)
+                    out.write(clean_paste)
+                    out.flush()
+
+        res_str = "".join(buffer)
+        res_str = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", res_str)
+        res_str = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", res_str)
+        res_str = res_str.strip()
+        return res_str if res_str else None
+    except Exception:
+        return None
+    finally:
+        should_re_enable = getattr(state, "mouse_reporting_enabled", True) if state is not None else True
+        if should_re_enable:
+            enable_mouse_reporting(out)
+        drain_console_input()
+
+
 def run_interactive_settings_panel(
     workspace: Path | None = None,
     client: Any | None = None,
@@ -432,13 +547,10 @@ def run_interactive_settings_panel(
                 out.write(f"\x1b[1;33m>> {status_msg}\x1b[0m\n")
                 status_msg = ""
             roles_idx = len(provider_keys) + 1
-            out.write(f"\x1b[1;36mSelect Option [1-{len(provider_keys)} Provider, S Save, Q/Esc Exit]: \x1b[0m")
-            out.flush()
-
-            try:
-                choice = input().strip()
-            except (EOFError, KeyboardInterrupt):
-                break
+            choice = _read_field_input(
+                f"Select Option [1-{len(provider_keys)} Provider, S Save, Q/Esc Exit]: ",
+                stream=out,
+            )
 
             if not choice or choice.lower() in ("q", "quit", "exit", "esc"):
                 break
@@ -472,32 +584,29 @@ def run_interactive_settings_panel(
             detail_text = render_provider_detail_str(prov, width=use_width, status_msg=status_msg)
             status_msg = ""
             out.write(f"\n{detail_text}\n")
-            out.write("\x1b[1;36mSelect Action [E/K/U/M/A/T/B]: \x1b[0m")
-            out.flush()
-
-            try:
-                act = input().strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            act = _read_field_input("Select Action [E/K/U/M/A/T/B]: ", stream=out)
+            if not act or act.lower() in ("b", "back", "q", "exit", "esc"):
                 current_view = "main"
                 continue
+            act = act.lower()
 
-            if act in ("b", "back", "q", "exit", "esc"):
-                current_view = "main"
-            elif act == "e":
+            if act == "e":
                 prov.enabled = not prov.enabled
                 status_msg = f"{prov.display_name} is now {'ENABLED' if prov.enabled else 'DISABLED'}."
             elif act == "k":
-                out.write(f"\nEnter new API Key for {prov.display_name} (press Enter to keep existing): ")
-                out.flush()
-                new_key = input().strip()
+                new_key = _read_field_input(
+                    f"Enter new API Key for {prov.display_name} (press Enter to keep existing): ",
+                    stream=out,
+                )
                 if new_key:
                     prov.api_key = new_key
                     prov.enabled = True
                     status_msg = f"Updated API Key for {prov.display_name}."
             elif act == "u":
-                out.write(f"\nEnter Base URL for {prov.display_name} [{prov.base_url}]: ")
-                out.flush()
-                new_url = input().strip()
+                new_url = _read_field_input(
+                    f"Enter Base URL for {prov.display_name} [{prov.base_url}]: ",
+                    stream=out,
+                )
                 if new_url:
                     prov.base_url = new_url
                     status_msg = f"Updated Base URL for {prov.display_name}."
@@ -505,22 +614,24 @@ def run_interactive_settings_panel(
                 out.write("\nChoose model number (or press Enter to cancel):\n")
                 for i, m in enumerate(prov.models, 1):
                     out.write(f"  [{i}] {m}\n")
-                out.write("Selection: ")
                 out.flush()
-                m_choice = input().strip()
-                if m_choice.isdigit():
+                m_choice = _read_field_input("Selection: ", stream=out)
+                if m_choice and m_choice.isdigit():
                     m_idx = int(m_choice) - 1
                     if 0 <= m_idx < len(prov.models):
                         prov.default_model = prov.models[m_idx]
                         status_msg = f"Active model set to '{prov.default_model}'."
             elif act == "a":
-                out.write(f"\nEnter model name to add to {prov.display_name}: ")
-                out.flush()
-                new_m = input().strip()
-                if new_m and new_m not in prov.models:
-                    prov.models.append(new_m)
-                    prov.default_model = new_m
-                    status_msg = f"Added model '{new_m}' and set as active."
+                new_m = _read_field_input(
+                    f"Enter model name to add to {prov.display_name}: ",
+                    stream=out,
+                )
+                if new_m:
+                    clean_m = sanitize_model_name(new_m, prov.name)
+                    if clean_m and clean_m not in prov.models:
+                        prov.models.append(clean_m)
+                        prov.default_model = clean_m
+                        status_msg = f"Added model '{clean_m}' and set as active."
             elif act == "t":
                 out.write(f"\nTesting connection to {prov.display_name}...\n")
                 out.flush()
@@ -536,14 +647,14 @@ def run_interactive_settings_panel(
             roles_text = render_roles_menu_str(settings, width=use_width, status_msg=status_msg)
             status_msg = ""
             out.write(f"\n{roles_text}\n")
-            out.write("\x1b[1;36mSelect Role to Rebind [1 Architecture, 2 Backend, 3 Frontend, 4 QA, 5 GitOps, B Back]: \x1b[0m")
-            out.flush()
-
-            try:
-                r_act = input().strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            r_act = _read_field_input(
+                "Select Role to Rebind [1 Architecture, 2 Backend, 3 Frontend, 4 QA, 5 GitOps, B Back]: ",
+                stream=out,
+            )
+            if not r_act or r_act.lower() in ("b", "back", "q", "exit", "esc"):
                 current_view = "main"
                 continue
+            r_act = r_act.lower()
 
             roles_map = {"1": "architecture", "2": "backend", "3": "frontend", "4": "qa", "5": "gitops"}
             if r_act in roles_map:
@@ -551,10 +662,9 @@ def run_interactive_settings_panel(
                 out.write(f"\nAssign provider for role '{target_role.title()}':\n")
                 for idx, p in enumerate(provider_keys, 1):
                     out.write(f"  [{idx}] {p}\n")
-                out.write("Select provider: ")
                 out.flush()
-                p_choice = input().strip()
-                if p_choice.isdigit() and 1 <= int(p_choice) <= len(provider_keys):
+                p_choice = _read_field_input("Select provider: ", stream=out)
+                if p_choice and p_choice.isdigit() and 1 <= int(p_choice) <= len(provider_keys):
                     chosen_p = provider_keys[int(p_choice) - 1]
                     prov_obj = settings.providers.get(chosen_p)
                     chosen_m = prov_obj.default_model if prov_obj else "default"
@@ -978,23 +1088,6 @@ def render_anchored_settings_panel_str(
     return "\n".join(lines)
 
 
-def _read_field_input(prompt_text: str, key_stream: Iterator[str] | None = None) -> str | None:
-    """Read a field value safely from key_stream or interactive prompt."""
-    if key_stream is not None:
-        try:
-            val = next(key_stream)
-            return val.strip() if val and val not in (Key.ESCAPE, "q") else None
-        except StopIteration:
-            return None
-    try:
-        sys.stdout.write(f"\n\x1b[1;36m{prompt_text}\x1b[0m")
-        sys.stdout.flush()
-        res = input().strip()
-        return res if res else None
-    except Exception:
-        return None
-
-
 def run_arrow_navigation_settings_loop(
     session: Mapping[str, Any],
     state: Any,
@@ -1351,14 +1444,24 @@ def run_arrow_navigation_settings_loop(
                         state.settings_status_msg = f"{prov.display_name} is now {'ENABLED' if prov.enabled else 'DISABLED'}."
                         _redraw()
                     elif sel == 1:
-                        val = _read_field_input(f"Enter API Key for {prov.display_name}: ", key_stream)
+                        val = _read_field_input(
+                            f"Enter API Key for {prov.display_name}: ",
+                            key_stream=key_stream,
+                            state=state,
+                            stream=stream,
+                        )
                         if val:
                             prov.api_key = val
                             prov.enabled = True
                             state.settings_status_msg = f"Updated API Key for {prov.display_name}."
                         _redraw()
                     elif sel == 2:
-                        val = _read_field_input(f"Enter Base URL for {prov.display_name} [{prov.base_url}]: ", key_stream)
+                        val = _read_field_input(
+                            f"Enter Base URL for {prov.display_name} [{prov.base_url}]: ",
+                            key_stream=key_stream,
+                            state=state,
+                            stream=stream,
+                        )
                         if val:
                             prov.base_url = val
                             state.settings_status_msg = f"Updated Base URL for {prov.display_name}."
@@ -1371,7 +1474,12 @@ def run_arrow_navigation_settings_loop(
                             state.settings_status_msg = f"Default model set to '{prov.default_model}'."
                         _redraw()
                     elif sel == 4:
-                        val = _read_field_input(f"Enter model name to add to {prov.display_name}: ", key_stream)
+                        val = _read_field_input(
+                            f"Enter model name to add to {prov.display_name}: ",
+                            key_stream=key_stream,
+                            state=state,
+                            stream=stream,
+                        )
                         if val:
                             clean_m = sanitize_model_name(val, prov.name)
                             if clean_m and clean_m not in prov.models:

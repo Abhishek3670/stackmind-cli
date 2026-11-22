@@ -17,10 +17,15 @@ from typing import Any, Mapping, Sequence
 
 
 def sanitize_model_name(model: str, provider: str = "") -> str:
-    """Normalize model string: strip whitespace and redundant CLI/provider prefixes."""
+    """Normalize model string: strip whitespace, escape sequences, and redundant CLI/provider prefixes."""
     m = (model or "").strip()
     if not m:
         return ""
+    import re
+
+    m = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", m)
+    m = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", m)
+    m = m.strip()
     for prefix in ("ollama run ", "ollama ", "ollama/"):
         if m.lower().startswith(prefix):
             m = m[len(prefix):].strip()
