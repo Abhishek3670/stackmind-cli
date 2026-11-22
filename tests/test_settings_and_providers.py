@@ -940,6 +940,92 @@ def test_sanitize_model_name_mouse_reporting_sequences():
     noisy_with_prefix = "^[[<35;40;25mollama run llama3:8b"
     assert sanitize_model_name(noisy_with_prefix) == "llama3:8b"
 
+    noisy_wrapped = ";19M^[[<35;77;19M^[[<35;78;19Mqwen2.5-coder:32b"
+    assert sanitize_model_name(noisy_wrapped) == "qwen2.5-coder:32b"
+
+    noisy_triple_bracket = "^[[[<35;40;25Mcustom-model-triple"
+    assert sanitize_model_name(noisy_triple_bracket) == "custom-model-triple"
+
+    noisy_single_bracket = "^[<35;40;25Mcustom-model-single"
+    assert sanitize_model_name(noisy_single_bracket) == "custom-model-single"
+
+
+def test_parse_escape_sequence_all_mouse_variations():
+    """Verify _parse_escape_sequence handles multiple bracket forms and ignores button 35 mouse motion."""
+    from cli.tui.keyboard import _parse_escape_sequence, Key
+
+    # btn=35 (motion without click) -> <MOUSE_IGNORE>
+    assert _parse_escape_sequence("[<35;40;25M") == "<MOUSE_IGNORE>"
+    assert _parse_escape_sequence("^[[<35;40;25M") == "<MOUSE_IGNORE>"
+    assert _parse_escape_sequence("^[<35;40;25M") == "<MOUSE_IGNORE>"
+    assert _parse_escape_sequence("^[[[<35;40;25M") == "<MOUSE_IGNORE>"
+
+    # Wheel buttons
+    assert _parse_escape_sequence("[<64;40;25M") == Key.MOUSE_WHEEL_UP
+    assert _parse_escape_sequence("[<65;40;25M") == Key.MOUSE_WHEEL_DOWN
+    assert _parse_escape_sequence("^[[<64;40;25M") == Key.MOUSE_WHEEL_UP
+
+    # Normal clicks
+    assert _parse_escape_sequence("[<0;10;20M") == "<MOUSE_0_10_20_M>"
+    assert _parse_escape_sequence("^[[<0;10;20M") == "<MOUSE_0_10_20_M>"
+    assert _parse_escape_sequence("^[<0;10;20M") == "<MOUSE_0_10_20_M>"
+
+
+def test_read_field_input_mouse_character_stream(monkeypatch):
+    """Verify _read_field_input correctly filters mouse escape noise arriving as individual characters or chunks."""
+    import io
+    from cli.tui.keyboard import Key
+    from cli.tui.settings_panel import _read_field_input
+    from cli.tui.state import AutonomousDeliveryState
+
+    state = AutonomousDeliveryState(session_id="s_char_stream")
+    state.mouse_reporting_enabled = True
+
+    raw_stream = [
+        "^",
+        "[",
+        "[",
+        "<",
+        "3",
+        "5",
+        ";",
+        "4",
+        "0",
+        ";",
+        "2",
+        "5",
+        "M",
+        "^[[<35;40;24M",
+        "m",
+        "y",
+        "-",
+        "m",
+        "o",
+        "d",
+        "e",
+        "l",
+        Key.ENTER,
+    ]
+    events_left = list(raw_stream)
+
+    def mock_read_key(timeout=None):
+        if not events_left:
+            raise StopIteration
+        return events_left.pop(0)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("cli.tui.settings_panel.disable_mouse_reporting", lambda s: None)
+    monkeypatch.setattr("cli.tui.settings_panel.enable_mouse_reporting", lambda s: None)
+    monkeypatch.setattr("cli.tui.settings_panel.drain_console_input", lambda: None)
+    monkeypatch.setattr("cli.tui.settings_panel.has_pending_input", lambda: len(events_left) > 0)
+    monkeypatch.setattr("cli.tui.settings_panel.read_next_key", mock_read_key)
+
+    buf = io.StringIO()
+    buf.isatty = lambda: True  # type: ignore
+
+    res = _read_field_input("Enter model name: ", key_stream=None, state=state, stream=buf)
+    assert res == "my-model"
+
 
 def test_read_field_input_mouse_sequence_handling(monkeypatch):
     """Verify _read_field_input filters out mouse escape sequences and restores mouse state."""

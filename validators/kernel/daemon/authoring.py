@@ -1733,6 +1733,11 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 continue
 
             if _is_meta_work_order(wo_data):
+                if str(wo_data.get("status", "")).upper() == "BLOCKED" and "role-deliverable mismatch" in str(wo_data.get("blocked_reason") or wo_data.get("error") or "").lower():
+                    wo_data["status"] = "ACTIVE"
+                    wo_data.pop("error", None)
+                    wo_data.pop("blocked_reason", None)
+                    durable_write_yaml(wo_file, wo_data)
                 continue
 
             if any(p.startswith(".sync/") or p.startswith("schemas/") for p in wo_paths):
@@ -2168,19 +2173,33 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             target_agent = None
             if matched_ref and matched_ref.get("agent"):
                 target_agent = matched_ref["agent"].strip().lower()
-            elif primary_agent == "gemma" and deliv_path and not is_test_path:
-                # Non-test code assigned to gemma -> route to gemini or codex
+            else:
+                target_agent = primary_agent
+
+            # Enforce authoritative role-deliverable compatibility invariants
+            effective_agent = target_agent or primary_agent
+            if is_test_path or is_qa_wo:
+                if effective_agent not in ("gemma", "qa"):
+                    target_agent = "gemma"
+            elif effective_agent == "gemma" and deliv_path and not is_test_path:
                 if any(deliv_path.endswith(ext) for ext in (".html", ".css", ".js", ".jsx", ".tsx")):
                     target_agent = "gemini"
                 else:
                     target_agent = "codex"
-            elif primary_agent == "codex" and deliv_path and any(deliv_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+            elif effective_agent == "codex" and deliv_path and any(deliv_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
                 target_agent = "gemini"
-            elif primary_agent == "gemini" and deliv_path and not is_test_path and any(deliv_path.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db")):
+            elif effective_agent == "gemini" and deliv_path and not is_test_path and any(deliv_path.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db")):
                 target_agent = "codex"
 
             if target_agent and target_agent != primary_agent:
                 wo_data["assigned_agents"] = [target_agent]
+                if str(wo_data.get("status", "")).upper() == "BLOCKED" and (
+                    "role-deliverable mismatch" in str(wo_data.get("blocked_reason") or "").lower()
+                    or "role-deliverable mismatch" in str(wo_data.get("error") or "").lower()
+                ):
+                    wo_data["status"] = "ACTIVE"
+                    wo_data.pop("error", None)
+                    wo_data.pop("blocked_reason", None)
                 durable_write_yaml(wo_file, wo_data)
 
                 # Reconcile matching contract

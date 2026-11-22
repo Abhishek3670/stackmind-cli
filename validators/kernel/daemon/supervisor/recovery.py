@@ -107,6 +107,7 @@ class _RecoveryMixin:
                     m = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", str(err_cause), re.IGNORECASE)
                     backoff = float(m.group(1)) + 1.0 if m else 5.0
                     time.sleep(min(max(backoff, 1.0), 30.0))
+                state.repair_context["post_check_error"] = str(err_cause)
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:

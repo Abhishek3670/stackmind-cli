@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -26,6 +27,7 @@ from cli.tui.keyboard import (
     disable_mouse_reporting,
     drain_console_input,
     enable_mouse_reporting,
+    has_pending_input,
     read_next_key,
 )
 from cli.tui.views import render_roles_panel
@@ -320,7 +322,8 @@ def _read_field_input(
             val = next(key_stream)
             if not val or val in (Key.ESCAPE, "q"):
                 return None
-            val = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", val)
+            val = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", val)
+            val = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", val)
             val = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", val)
             return val.strip() if val.strip() else None
         except StopIteration:
@@ -339,20 +342,28 @@ def _read_field_input(
                 out.write(f"\n\x1b[1;36m{prompt_text}\x1b[0m")
                 out.flush()
             res = input().strip()
-            res = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", res)
+            res = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", res)
+            res = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", res)
             res = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", res)
             return res.strip() if res.strip() else None
         except Exception:
             return None
 
     disable_mouse_reporting(out)
+    time.sleep(0.02)
     drain_console_input()
 
     buffer: list[str] = []
+
+    def _render_line() -> None:
+        buf_str = "".join(buffer)
+        out.write(f"\r\x1b[2K\x1b[1;36m{prompt_text}\x1b[0m{buf_str}")
+        out.flush()
+
     try:
         if prompt_text:
-            out.write(f"\n\x1b[1;36m{prompt_text}\x1b[0m")
-            out.flush()
+            out.write("\n")
+            _render_line()
 
         while True:
             try:
@@ -360,7 +371,7 @@ def _read_field_input(
             except (StopIteration, KeyboardInterrupt, EOFError):
                 return None
 
-            if k is None:
+            if k is None or k == "<MOUSE_IGNORE>":
                 continue
 
             if k in (Key.ENTER, Key.NEWLINE, "\r", "\n"):
@@ -376,34 +387,56 @@ def _read_field_input(
             if k in (Key.BACKSPACE, "\x08", "\x7f"):
                 if buffer:
                     buffer.pop()
-                    out.write("\b \b")
-                    out.flush()
+                    _render_line()
                 continue
 
-            if (
-                k.startswith(("<MOUSE_", "\x1b[<", "^[[<"))
+            # Skip all mouse events, escape artifacts, and control sequences
+            if isinstance(k, str) and (
+                k.startswith(("<MOUSE_", "\x1b[<", "^[[<", "^[<", "<ESC_"))
                 or "<MOUSE_" in k
                 or "[<" in k
+                or (k.startswith("<") and k.endswith(">"))
             ):
                 continue
 
-            if k.startswith("\x1b") or (k.startswith("<") and k.endswith(">")):
-                continue
+            # Check if ^ is the start of an incoming escape sequence
+            if k == "^" and has_pending_input():
+                peek_k = read_next_key(timeout=0.02)
+                if peek_k and (peek_k == "[" or str(peek_k).startswith("[") or "<" in str(peek_k)):
+                    # Consume remaining mouse sequence until terminator 'M' or 'm'
+                    while has_pending_input():
+                        consumed = read_next_key(timeout=0.01)
+                        if consumed in ("M", "m") or (isinstance(consumed, str) and (consumed.endswith("M") or consumed.endswith("m"))):
+                            break
+                    continue
+                elif peek_k:
+                    buffer.append(k)
+                    if len(peek_k) == 1 and peek_k.isprintable():
+                        buffer.append(peek_k)
+                    _render_line()
+                    continue
 
             if len(k) == 1:
                 if k.isprintable():
                     buffer.append(k)
-                    out.write(k)
-                    out.flush()
+                    # Sanitize buffer if mouse noise crept in
+                    buf_str = "".join(buffer)
+                    if "<" in buf_str and any(m in buf_str for m in ("[<", "^[[<", "^[<", "\x1b[<")):
+                        buf_str = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", buf_str)
+                        buf_str = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", buf_str)
+                        buffer = list(buf_str)
+                    _render_line()
             else:
                 clean_paste = "".join(ch for ch in k if ch.isprintable())
+                clean_paste = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", clean_paste)
+                clean_paste = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", clean_paste)
                 if clean_paste:
                     buffer.extend(clean_paste)
-                    out.write(clean_paste)
-                    out.flush()
+                    _render_line()
 
         res_str = "".join(buffer)
-        res_str = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", res_str)
+        res_str = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", res_str)
+        res_str = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", res_str)
         res_str = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", res_str)
         res_str = res_str.strip()
         return res_str if res_str else None
@@ -413,6 +446,7 @@ def _read_field_input(
         should_re_enable = getattr(state, "mouse_reporting_enabled", True) if state is not None else True
         if should_re_enable:
             enable_mouse_reporting(out)
+        time.sleep(0.01)
         drain_console_input()
 
 

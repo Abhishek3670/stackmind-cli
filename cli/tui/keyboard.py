@@ -118,7 +118,7 @@ class Key:
 
 # SGR Extended Mouse Mode control sequences (WO-054)
 ENABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
-DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
 
 
 def enable_mouse_reporting(stream: Any = None) -> None:
@@ -177,6 +177,12 @@ def drain_console_input() -> None:
     Prevents accumulated mouse motion/click tracking artifacts that occurred while
     the engine was busy streaming turns from spilling into the composer prompt.
     """
+    global _win32_reader
+    try:
+        if _win32_reader is not None:
+            _win32_reader._pending_keys.clear()
+    except Exception:
+        pass
     if os.name == "nt":
         try:
             import msvcrt
@@ -297,14 +303,11 @@ def _parse_escape_sequence(seq: str) -> str:
         return Key.ESCAPE
 
     clean_seq = seq
-    if clean_seq.startswith("^[[<"):
-        clean_seq = clean_seq[2:]
-    elif clean_seq.startswith("\x1b[<"):
-        clean_seq = clean_seq[1:]
+    clean_seq = re.sub(r"^(?:\x1b|\^\[)+", "", clean_seq)
 
     # SGR Mouse mode: [<Cb;Cx;CyM (press) or [<Cb;Cx;Cym (release)
-    if clean_seq.startswith("[<"):
-        match = re.search(r"\[<(\d+);(\d+);(\d+)([Mm])", clean_seq)
+    if "[<" in clean_seq or (clean_seq.startswith("<") and ";" in clean_seq):
+        match = re.search(r"\[*<(\d+);(\d+);(\d+)([Mm])", clean_seq)
         if match:
             btn = int(match.group(1))
             col = int(match.group(2))
@@ -314,6 +317,8 @@ def _parse_escape_sequence(seq: str) -> str:
                 return Key.MOUSE_WHEEL_UP
             elif btn == 65:
                 return Key.MOUSE_WHEEL_DOWN
+            if btn == 35:
+                return "<MOUSE_IGNORE>"
             return f"<MOUSE_{btn}_{col}_{row}_{action}>"
         return "<MOUSE_IGNORE>"
 
@@ -417,11 +422,11 @@ def _read_escape_sequence_windows() -> str:
         if msvcrt.kbhit():
             c = msvcrt.getwch()
             seq += c
-            if seq.startswith("[<") and c in ("M", "m"):
+            if "[<" in seq and c in ("M", "m"):
                 break
             elif seq.startswith("[M") and len(seq) >= 5:
                 break
-            elif seq.startswith("[") and not seq.startswith(("[<", "[M")) and c in ("~", "A", "B", "C", "D", "H", "F", "u"):
+            elif seq.startswith("[") and not (seq.startswith(("[<", "[M")) or "[<" in seq) and c in ("~", "A", "B", "C", "D", "H", "F", "u"):
                 break
             elif seq in ("\r", "\n", "\r\n", "v", "V"):
                 break
@@ -429,7 +434,7 @@ def _read_escape_sequence_windows() -> str:
             time.sleep(0.005)
             if not msvcrt.kbhit():
                 # If we've started an escape sequence but haven't received the terminator, keep waiting up to timeout
-                if seq.startswith("[<") and not (seq.endswith("M") or seq.endswith("m")):
+                if "[<" in seq and not (seq.endswith("M") or seq.endswith("m")):
                     continue
                 if seq.startswith("[") and not (seq.endswith("~") or seq[-1] in "ABCDHFu"):
                     continue
@@ -512,16 +517,19 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
             res = _parse_escape_sequence(seq)
         else:
             res = Key.ESCAPE
-    elif ch == "^" and msvcrt.kbhit():
-        ch2 = msvcrt.getwch()
-        if ch2 == "[":
-            seq = _read_escape_sequence_windows()
-            full_seq = "^[[" + seq
-            res = _parse_escape_sequence(full_seq)
-            if res == "<MOUSE_IGNORE>":
-                res = None
+    elif ch == "^":
+        if msvcrt.kbhit():
+            ch2 = msvcrt.getwch()
+            if ch2 == "[":
+                seq = _read_escape_sequence_windows()
+                full_seq = "^[" + seq
+                res = _parse_escape_sequence(full_seq)
+                if res in ("<MOUSE_IGNORE>",) or (isinstance(res, str) and res.startswith("<MOUSE_35_")):
+                    res = None
+            else:
+                _win32_reader._pending_keys.append(ch2)
+                res = ch
         else:
-            _win32_reader._pending_keys.append(ch2)
             res = ch
     elif ch == Key.CTRL_V:
         res = Key.CTRL_V
@@ -820,7 +828,7 @@ class Win32ConsoleReader:
                                 if c and c != "\x00":
                                     seq += c
                                     # SGR Mouse mode: [<64;...M or [<65;...m
-                                    if seq.startswith("[<") and c in ("M", "m"):
+                                    if "[<" in seq and c in ("M", "m"):
                                         break
                                     # Arrow keys / Home / End: [A, [B, [C, [D, [H, [F
                                     if len(seq) == 2 and seq[0] == "[" and seq[1] in ("A", "B", "C", "D", "H", "F"):
@@ -878,12 +886,12 @@ class Win32ConsoleReader:
                                 parsed = _parse_escape_sequence(seq)
                         elif parsed == "^":
                             seq = self._read_escape_sequence(h)
-                            if seq and seq.startswith(("[<", "[[<")):
-                                parsed = _parse_escape_sequence("^" + seq)
+                            if seq and ("[<" in seq or seq.startswith(("[<", "[[<"))):
+                                parsed = _parse_escape_sequence("^[" + seq)
                             elif seq:
                                 for sc in seq:
                                     self._pending_keys.append(sc)
-                        if parsed == "<MOUSE_IGNORE>":
+                        if parsed in ("<MOUSE_IGNORE>",) or (isinstance(parsed, str) and parsed.startswith("<MOUSE_35_")):
                             parsed = None
                         if parsed is not None:
                             _log_debug_key(f"[Win32ConsoleReader.read_key] returning parsed={repr(parsed)}")

@@ -23,7 +23,8 @@ def sanitize_model_name(model: str, provider: str = "") -> str:
         return ""
     import re
 
-    m = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)[Mm]", "", m)
+    m = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", m)
+    m = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", m)
     m = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", m)
     m = m.strip()
     for prefix in ("ollama run ", "ollama ", "ollama/"):
