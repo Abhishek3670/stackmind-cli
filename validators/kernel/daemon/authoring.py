@@ -1614,6 +1614,37 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
         for canc_file in sorted(cancelled_dir.glob("*.yaml")):
             cancelled_ids.add(canc_file.stem)
 
+    # Pass 0b: Revive any work orders in CANCELLED/ that were erroneously cancelled as orphans but exist in current PLAN.md
+    if cancelled_dir.is_dir():
+        for canc_file in sorted(cancelled_dir.glob("*.yaml")):
+            try:
+                c_data = yaml.safe_load(canc_file.read_text(encoding="utf-8"))
+                if not isinstance(c_data, dict):
+                    continue
+                c_id = str(c_data.get("id") or canc_file.stem)
+                c_reason = str(c_data.get("cancellation_reason") or c_data.get("error") or "").lower()
+                if "orphaned work order not present in current plan.md" in c_reason:
+                    c_paths = _wo_deliverable_paths(c_data)
+                    already_comp = any(p in completed_deliverables and completed_deliverables[p] != c_id for p in c_paths)
+                    c_in_plan = (
+                        bool(plan_raw_text and re.search(rf"\b{re.escape(c_id)}\b", plan_raw_text))
+                        or any(c_id == r.get("id") for r in plan_milestones)
+                        or any(_wo_matches_milestone(c_data, r) for r in plan_milestones)
+                    )
+                    if c_in_plan and not already_comp:
+                        c_data["status"] = "ACTIVE"
+                        c_data.pop("error", None)
+                        c_data.pop("cancellation_reason", None)
+                        active_target = active_dir / canc_file.name
+                        durable_write_yaml(active_target, c_data)
+                        canc_file.unlink(missing_ok=True)
+                        cancelled_ids.discard(c_id)
+                        _sync_index_status(c_id, "ACTIVE", _now())
+                        if c_id not in reconciled_ids:
+                            reconciled_ids.append(c_id)
+            except Exception:
+                continue
+
     active_files = sorted(active_dir.glob("*.yaml"))
 
     # Pass 1: Parse and categorize all active work orders
@@ -1663,7 +1694,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 # Check if this work order is actually an approved task in PLAN.md
                 # that was erroneously cancelled by prior deduplication
                 is_in_plan = (
-                    bool(plan_raw_text and f"({wo_id})" in plan_raw_text)
+                    bool(plan_raw_text and re.search(rf"\b{re.escape(wo_id)}\b", plan_raw_text))
                     or any(wo_id == r.get("id") for r in plan_milestones)
                     or any(_wo_matches_milestone(wo_data, r) for r in plan_milestones)
                 )
@@ -1687,7 +1718,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 # A duplicate cancel should ONLY be revived if the superseder was a ghost AND the deliverable is NOT completed
                 can_revive_dedup = is_dedup_cancel and not superseder_exists and not already_completed
 
-                if (is_in_plan and (can_revive_dedup or not wo_data.get("cancellation_reason"))) or (
+                if (is_in_plan and (can_revive_dedup or not wo_data.get("cancellation_reason") or (is_erroneous_orphan_cancel and not already_completed))) or (
                     is_delegated_or_repair and is_erroneous_orphan_cancel
                 ):
                     current_status = "ACTIVE"
@@ -1718,6 +1749,14 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     superseded_map[wo_id] = comp_owner
                     continue
 
+            if synth == "reconcile" and wo_paths:
+                p_in_plan = any(p in plan_raw_text.lower() for p in wo_paths) if plan_raw_text else False
+                has_explicit_wos = any(r.get("id", "").startswith("WO-") for r in plan_milestones)
+                if not p_in_plan and has_explicit_wos:
+                    _cancel_wo(wo_file, wo_data, wo_id, "Phantom synthesized work order superseded by canonical PLAN.md work orders")
+                    superseded_map[wo_id] = None
+                    continue
+
             if is_delegated_or_repair:
                 delegated_survivors.append((wo_file, wo_id, wo_data, None))
                 continue
@@ -1727,10 +1766,21 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
             matched_ref = next((r for r in plan_milestones if _wo_matches_milestone(wo_data, r)), None)
             if matched_ref is None:
-                # Rule 1: Orphaned active work order not present in current PLAN.md -> CANCEL
-                _cancel_wo(wo_file, wo_data, wo_id, "Orphaned work order not present in current PLAN.md")
-                superseded_map[wo_id] = None
-                continue
+                in_plan_doc = (
+                    bool(plan_raw_text and re.search(rf"\b{re.escape(wo_id)}\b", plan_raw_text))
+                    or bool(plan_raw_text and wo_data.get("title") and str(wo_data["title"]).lower() in plan_raw_text.lower())
+                )
+                if not in_plan_doc:
+                    # Rule 1: Orphaned active work order not present in current PLAN.md -> CANCEL
+                    _cancel_wo(wo_file, wo_data, wo_id, "Orphaned work order not present in current PLAN.md")
+                    superseded_map[wo_id] = None
+                    continue
+                else:
+                    matched_ref = {
+                        "id": wo_id,
+                        "title": wo_data.get("title", wo_id),
+                        "agent": (wo_data.get("assigned_agents") or ["codex"])[0],
+                    }
 
             m_key = str(matched_ref.get("id") or matched_ref.get("title") or "")
             matched_by_milestone.setdefault(m_key, []).append((wo_file, wo_id, wo_data, matched_ref))

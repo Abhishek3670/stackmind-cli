@@ -478,3 +478,190 @@ def test_authoring_readiness_ignores_contracts_for_archived_work_orders(tmp_path
     res = validate_authoring_readiness(ws)
     orphan_issues = [i for i in res.issues if i.code == "ORPHAN_CONTRACT"]
     assert len(orphan_issues) == 0, f"Expected no ORPHAN_CONTRACT issues, got: {orphan_issues}"
+
+
+def test_load_plan_milestones_parses_work_orders_table(tmp_path: Path) -> None:
+    """Verify load_plan_milestones extracts work orders from ## Work Orders markdown table."""
+    from validators.harness.authoring_readiness import load_plan_milestones
+
+    plan_content = """# Project Plan: Auth App
+
+## Architecture
+Backend FastAPI, Frontend HTML.
+
+## Work Orders
+
+| ID | Type | Title | Agent | Deliverable |
+|----|------|-------|-------|-------------|
+| WO-001 | FEATURE | Backend: FastAPI auth API | codex | `backend/main.py` |
+| WO-002 | FEATURE | Frontend: Login page | gemini | `frontend/login.html` |
+| WO-003 | VALIDATION | QA: Test auth flow | gemma | `tests/test_auth.py` |
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Core System (Agent: codex)
+"""
+    playbook_dir = tmp_path / ".sync" / "playbook"
+    playbook_dir.mkdir(parents=True, exist_ok=True)
+    (playbook_dir / "PLAN.md").write_text(plan_content, encoding="utf-8")
+
+    refs = load_plan_milestones(tmp_path)
+    assert refs is not None
+    ref_ids = [r["id"] for r in refs]
+    assert "Milestone 1" in ref_ids
+    assert "WO-001" in ref_ids
+    assert "WO-002" in ref_ids
+    assert "WO-003" in ref_ids
+
+
+def test_reconcile_active_work_orders_revives_erroneously_cancelled_plan_work_orders(tmp_path: Path) -> None:
+    """Verify reconcile_active_work_orders_with_plan revives work orders cancelled as false orphans."""
+    from validators.kernel.daemon.authoring import reconcile_active_work_orders_with_plan
+
+    sync_dir = tmp_path / ".sync"
+    playbook_dir = sync_dir / "playbook"
+    cancelled_dir = sync_dir / "work-orders" / "CANCELLED"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    contracts_dir = sync_dir / "contracts"
+
+    playbook_dir.mkdir(parents=True, exist_ok=True)
+    cancelled_dir.mkdir(parents=True, exist_ok=True)
+    active_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    plan_content = """# Project Plan: Auth App
+
+## Architecture
+Backend FastAPI.
+
+## Work Orders
+
+| ID | Type | Title | Agent | Deliverable |
+|----|------|-------|-------|-------------|
+| WO-001 | FEATURE | Backend: FastAPI auth API | codex | `backend/main.py` |
+| WO-002 | FEATURE | Frontend: Login page | gemini | `frontend/login.html` |
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Scaffolding (Agent: gemini)
+"""
+    (playbook_dir / "PLAN.md").write_text(plan_content, encoding="utf-8")
+
+    # WO-001 falsely cancelled as orphan
+    wo1_data = {
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Backend: FastAPI auth API",
+        "status": "CANCELLED",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": [],
+        "deliverable": {"type": "code", "path": "backend/main.py"},
+        "cancellation_reason": "Orphaned work order not present in current PLAN.md",
+    }
+    (cancelled_dir / "WO-001.yaml").write_text(yaml.safe_dump(wo1_data), encoding="utf-8")
+    (contracts_dir / "WO-001.yaml").write_text("work_order: WO-001\nagent_id: codex\n", encoding="utf-8")
+
+    # Initial index
+    index_data = {
+        "orders": [
+            {
+                "id": "WO-001",
+                "type": "FEATURE",
+                "title": "Backend: FastAPI auth API",
+                "status": "CANCELLED",
+                "file": "work-orders/CANCELLED/WO-001.yaml",
+            }
+        ]
+    }
+    (sync_dir / "work-orders" / "INDEX.yaml").write_text(yaml.safe_dump(index_data), encoding="utf-8")
+
+    reconcile_active_work_orders_with_plan(tmp_path)
+
+    # WO-001 must be revived to ACTIVE/
+    assert (active_dir / "WO-001.yaml").is_file(), "WO-001.yaml was not moved to ACTIVE/"
+    assert not (cancelled_dir / "WO-001.yaml").exists(), "WO-001.yaml was not removed from CANCELLED/"
+
+    revived_data = yaml.safe_load((active_dir / "WO-001.yaml").read_text(encoding="utf-8"))
+    assert revived_data["status"] == "ACTIVE"
+    assert "cancellation_reason" not in revived_data
+    assert "error" not in revived_data
+
+
+def test_reconcile_cancels_phantom_synthesized_work_order_when_plan_wos_present(tmp_path: Path) -> None:
+    """Verify reconcile_active_work_orders_with_plan cancels phantom synthesized tasks whose deliverables are not in PLAN.md."""
+    from validators.kernel.daemon.authoring import reconcile_active_work_orders_with_plan
+
+    sync_dir = tmp_path / ".sync"
+    playbook_dir = sync_dir / "playbook"
+    cancelled_dir = sync_dir / "work-orders" / "CANCELLED"
+    active_dir = sync_dir / "work-orders" / "ACTIVE"
+    contracts_dir = sync_dir / "contracts"
+
+    playbook_dir.mkdir(parents=True, exist_ok=True)
+    cancelled_dir.mkdir(parents=True, exist_ok=True)
+    active_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    plan_content = """# Project Plan: Auth App
+
+## Architecture
+Backend FastAPI.
+
+## Work Orders
+
+| ID | Type | Title | Agent | Deliverable |
+|----|------|-------|-------|-------------|
+| WO-001 | FEATURE | Backend: FastAPI auth API | codex | `backend/main.py` |
+
+## Milestones & Roadmap
+- [ ] Milestone 1: Scaffolding (Agent: gemini)
+"""
+    (playbook_dir / "PLAN.md").write_text(plan_content, encoding="utf-8")
+
+    # WO-006 phantom synthesized task with index.html not in PLAN.md
+    wo6_data = {
+        "id": "WO-006",
+        "type": "FEATURE",
+        "title": "Frontend Interface & User Experience",
+        "status": "ACTIVE",
+        "priority": "P1",
+        "assigned_agents": ["gemini"],
+        "deliverable": {"type": "code", "path": "index.html"},
+        "synthesized_by": "reconcile",
+    }
+    (active_dir / "WO-006.yaml").write_text(yaml.safe_dump(wo6_data), encoding="utf-8")
+    (contracts_dir / "WO-006.yaml").write_text("work_order: WO-006\nagent_id: gemini\n", encoding="utf-8")
+
+    # Canonical WO-001 in CANCELLED/
+    wo1_data = {
+        "id": "WO-001",
+        "type": "FEATURE",
+        "title": "Backend: FastAPI auth API",
+        "status": "CANCELLED",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "deliverable": {"type": "code", "path": "backend/main.py"},
+        "cancellation_reason": "Orphaned work order not present in current PLAN.md",
+    }
+    (cancelled_dir / "WO-001.yaml").write_text(yaml.safe_dump(wo1_data), encoding="utf-8")
+    (contracts_dir / "WO-001.yaml").write_text("work_order: WO-001\nagent_id: codex\n", encoding="utf-8")
+
+    index_data = {
+        "orders": [
+            {"id": "WO-001", "type": "FEATURE", "title": "Backend: FastAPI auth API", "status": "CANCELLED"},
+            {"id": "WO-006", "type": "FEATURE", "title": "Frontend Interface", "status": "ACTIVE"},
+        ]
+    }
+    (sync_dir / "work-orders" / "INDEX.yaml").write_text(yaml.safe_dump(index_data), encoding="utf-8")
+
+    reconcile_active_work_orders_with_plan(tmp_path)
+
+    # WO-001 revived to ACTIVE/
+    assert (active_dir / "WO-001.yaml").is_file()
+    # WO-006 cancelled to CANCELLED/
+    assert not (active_dir / "WO-006.yaml").exists()
+    assert (cancelled_dir / "WO-006.yaml").is_file()
+    wo6_cancelled = yaml.safe_load((cancelled_dir / "WO-006.yaml").read_text(encoding="utf-8"))
+    assert wo6_cancelled["status"] == "CANCELLED"
+    assert "Phantom synthesized" in wo6_cancelled.get("cancellation_reason", "")
+
+

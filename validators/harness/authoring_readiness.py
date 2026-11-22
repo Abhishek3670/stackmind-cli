@@ -299,7 +299,42 @@ def load_plan_milestones(workspace: Path | str) -> list[dict[str, Any]] | None:
                     "status": getattr(m, "status", "PENDING"),
                 })
     except Exception:
-        return None
+        pass
+
+    # Also parse explicit Work Orders markdown table if present (e.g. ## Work Orders / ## Tasks)
+    try:
+        wo_table_match = re.search(
+            r"^##\s+[^\n]*(?:Work Orders|Tasks|Work-Orders)[^\n]*\n(.*?)(?=^##\s+|\Z)",
+            content,
+            re.MULTILINE | re.DOTALL | re.IGNORECASE,
+        )
+        if wo_table_match:
+            lines = [l.strip() for l in wo_table_match.group(1).splitlines() if l.strip().startswith("|")]
+            if len(lines) >= 3:
+                headers = [h.strip().lower() for h in lines[0].split("|")[1:-1]]
+                id_idx = next((i for i, h in enumerate(headers) if h in ("id", "wo", "wo id", "wo-id", "work order")), None)
+                title_idx = next((i for i, h in enumerate(headers) if h in ("title", "name", "task", "description")), None)
+                agent_idx = next((i for i, h in enumerate(headers) if h in ("agent", "assigned", "assigned agent", "role")), None)
+                for line in lines[2:]:
+                    cols = [c.strip() for c in line.split("|")[1:-1]]
+                    row_id = cols[id_idx] if id_idx is not None and id_idx < len(cols) else ""
+                    row_title = cols[title_idx] if title_idx is not None and title_idx < len(cols) else ""
+                    row_agent = cols[agent_idx] if agent_idx is not None and agent_idx < len(cols) else ""
+                    row_id = re.sub(r"[`*]", "", row_id).strip()
+                    row_title = re.sub(r"[`*]", "", row_title).strip()
+                    row_agent = re.sub(r"[`*]", "", row_agent).strip().lower()
+                    if row_id.startswith("WO-") or row_title:
+                        if not any(r.get("id") == row_id for r in refs):
+                            refs.append({
+                                "id": row_id or f"WO-{len(refs)+1:03d}",
+                                "title": row_title or row_id,
+                                "agent": row_agent or "codex",
+                                "tasks": [],
+                                "status": "PENDING",
+                            })
+    except Exception:
+        pass
+
     return refs or None
 
 
