@@ -336,6 +336,10 @@ def _read_field_input(
     except Exception:
         pass
 
+    disable_mouse_reporting(out)
+    time.sleep(0.02)
+    drain_console_input()
+
     if not is_tty:
         try:
             if prompt_text:
@@ -343,21 +347,36 @@ def _read_field_input(
                 out.flush()
             res = input().strip()
             res = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", res)
+            res = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+.*", "", res)
+            res = re.sub(r"\^\[+.*", "", res)
             res = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", res)
             res = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", res)
             return res.strip() if res.strip() else None
         except Exception:
             return None
-
-    disable_mouse_reporting(out)
-    time.sleep(0.02)
-    drain_console_input()
+        finally:
+            should_re_enable = getattr(state, "mouse_reporting_enabled", True) if state is not None else True
+            if should_re_enable:
+                enable_mouse_reporting(out)
 
     buffer: list[str] = []
 
+    def _clean_buffer() -> None:
+        nonlocal buffer
+        buf_str = "".join(buffer)
+        if any(marker in buf_str for marker in ("<", "[", "^", "\x1b", ";")):
+            buf_str = re.sub(r"(?:\x1b|\^\[)*\[*<.*", "", buf_str)
+            buf_str = re.sub(r"\^.*", "", buf_str)
+            buf_str = re.sub(r"\[<.*", "", buf_str)
+            buf_str = re.sub(r"<.*", "", buf_str)
+            buf_str = re.sub(r"\x1b.*", "", buf_str)
+            buf_str = re.sub(r";\d+.*", "", buf_str)
+            buf_str = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", buf_str)
+            buffer = list(buf_str)
+
     def _render_line() -> None:
         buf_str = "".join(buffer)
-        out.write(f"\r\x1b[2K\x1b[1;36m{prompt_text}\x1b[0m{buf_str}")
+        out.write(f"\r\x1b[2K\x1b[1;36m{prompt_text}\x1b[0m{buf_str}\x1b[K")
         out.flush()
 
     try:
@@ -387,6 +406,7 @@ def _read_field_input(
             if k in (Key.BACKSPACE, "\x08", "\x7f"):
                 if buffer:
                     buffer.pop()
+                    _clean_buffer()
                     _render_line()
                 continue
 
@@ -399,46 +419,42 @@ def _read_field_input(
             ):
                 continue
 
-            # Check if ^ is the start of an incoming escape sequence
-            if k == "^" and has_pending_input():
-                peek_k = read_next_key(timeout=0.02)
+            # Check if ^ or \x1b is the start of an incoming escape sequence
+            if k in ("^", "\x1b"):
+                peek_k = read_next_key(timeout=0.03)
                 if peek_k and (peek_k == "[" or str(peek_k).startswith("[") or "<" in str(peek_k)):
                     # Consume remaining mouse sequence until terminator 'M' or 'm'
-                    while has_pending_input():
+                    seq_start_t = time.monotonic()
+                    while time.monotonic() - seq_start_t < 0.05:
                         consumed = read_next_key(timeout=0.01)
+                        if not consumed:
+                            break
                         if consumed in ("M", "m") or (isinstance(consumed, str) and (consumed.endswith("M") or consumed.endswith("m"))):
                             break
                     continue
-                elif peek_k:
-                    buffer.append(k)
-                    if len(peek_k) == 1 and peek_k.isprintable():
-                        buffer.append(peek_k)
-                    _render_line()
-                    continue
+                elif k == "\x1b":
+                    out.write("\n")
+                    out.flush()
+                    return None
+                continue
 
             if len(k) == 1:
+                # Discard raw mouse noise characters
+                if k in ("<", "[", "^", "\x1b"):
+                    continue
                 if k.isprintable():
                     buffer.append(k)
-                    # Sanitize buffer if mouse noise crept in
-                    buf_str = "".join(buffer)
-                    if "<" in buf_str and any(m in buf_str for m in ("[<", "^[[<", "^[<", "\x1b[<")):
-                        buf_str = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", buf_str)
-                        buf_str = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", buf_str)
-                        buffer = list(buf_str)
+                    _clean_buffer()
                     _render_line()
             else:
-                clean_paste = "".join(ch for ch in k if ch.isprintable())
-                clean_paste = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", clean_paste)
-                clean_paste = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", clean_paste)
+                clean_paste = "".join(ch for ch in k if ch.isprintable() and ch not in ("^", "\x1b", "<"))
                 if clean_paste:
                     buffer.extend(clean_paste)
+                    _clean_buffer()
                     _render_line()
 
-        res_str = "".join(buffer)
-        res_str = re.sub(r"(?:\x1b|\^\[)*\[*<\d+;\d+;\d+[Mm]", "", res_str)
-        res_str = re.sub(r"^(?:;\d+[Mm]|\d+;\d+[Mm])+", "", res_str)
-        res_str = re.sub(r"\x1b\[[0-9;]*[a-zA-Z~]", "", res_str)
-        res_str = res_str.strip()
+        _clean_buffer()
+        res_str = "".join(buffer).strip()
         return res_str if res_str else None
     except Exception:
         return None

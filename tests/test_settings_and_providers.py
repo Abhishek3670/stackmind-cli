@@ -1076,6 +1076,23 @@ def test_read_field_input_mouse_sequence_handling(monkeypatch):
     assert len(enabled_called) == 1
     assert len(drained_called) == 2  # drained before and after prompt
 
+    # 3. Stream of individual characters simulating fragmented SGR mouse sequence
+    seq_events = [
+        "^", "[", "[", "<", "3", "5", ";", "4", "0", ";", "2", "5", "M",
+        "^", "[", "[", "<", "3", "5", ";", "4", "0", ";", "2", "4", "M",
+        "q", "w", "e", "n",
+        Key.ENTER,
+    ]
+    mock_seq = iter(seq_events)
+    monkeypatch.setattr("cli.tui.settings_panel.read_next_key", lambda **kw: next(mock_seq))
+    monkeypatch.setattr("cli.tui.settings_panel.has_pending_input", lambda: False)
+    buf_seq = io.StringIO()
+    buf_seq.isatty = lambda: True  # type: ignore
+    res_seq = _read_field_input("Enter model: ", key_stream=None, state=state, stream=buf_seq)
+    assert res_seq == "qwen"
+    # Ensure buffer output does not contain any mouse tracking escapes
+    assert "<35;" not in buf_seq.getvalue()
+
 
 def test_add_model_with_mouse_noise_in_settings_loop(tmp_path: Path):
     """Verify adding a model with mouse tracking noise in arrow navigation settings loop cleans the model name."""

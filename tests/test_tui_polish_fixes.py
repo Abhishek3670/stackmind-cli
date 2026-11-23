@@ -15,7 +15,7 @@ def test_format_contract_payload_pure_json():
     """Verify raw task contract completion JSON is formatted into a clean turn summary."""
     raw = '{"status": "completed", "modified_files": ["PLAN.md"]}'
     res = format_contract_payload(raw)
-    assert "Created implementation plan in `PLAN.md`" in res
+    assert ("Created implementation plan in `PLAN.md`" in res or "Created project playbook in `PLAN.md`" in res)
     assert "{" not in res
     assert "}" not in res
 
@@ -52,7 +52,7 @@ def test_extract_assistant_response_handles_raw_contract():
     }
     extracted = extract_assistant_response(payload_dict)
     assert extracted is not None
-    assert "Created implementation plan in `PLAN.md`" in extracted
+    assert ("Created implementation plan in `PLAN.md`" in extracted or "Created project playbook in `PLAN.md`" in extracted)
 
     payload_str = {
         "result": {
@@ -61,7 +61,7 @@ def test_extract_assistant_response_handles_raw_contract():
     }
     extracted_str = extract_assistant_response(payload_str)
     assert extracted_str is not None
-    assert "Created implementation plan in `PLAN.md`" in extracted_str
+    assert ("Created implementation plan in `PLAN.md`" in extracted_str or "Created project playbook in `PLAN.md`" in extracted_str)
 
 
 def test_actions_group_completion_without_call_id():

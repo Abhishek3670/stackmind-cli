@@ -161,8 +161,14 @@ def disable_mouse_reporting(stream: Any = None) -> None:
     if os.name == "nt":
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            h = kernel32.GetStdHandle(-10)
-            if h not in (0, -1):
+            handles = []
+            h_std = kernel32.GetStdHandle(-10)
+            if h_std and h_std not in (0, -1):
+                handles.append(h_std)
+            h_reader = getattr(_win32_reader, "handle", None) if _win32_reader is not None else None
+            if h_reader and h_reader not in (0, -1) and h_reader not in handles:
+                handles.append(h_reader)
+            for h in handles:
                 mode = ctypes.c_uint32()
                 if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
                     new_mode = (mode.value | 0x0040 | 0x0080) & ~0x0010
@@ -189,8 +195,14 @@ def drain_console_input() -> None:
             while msvcrt.kbhit():
                 msvcrt.getwch()
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            h = kernel32.GetStdHandle(-10)
-            if h and h not in (0, -1):
+            handles = []
+            h_std = kernel32.GetStdHandle(-10)
+            if h_std and h_std not in (0, -1):
+                handles.append(h_std)
+            h_reader = getattr(_win32_reader, "handle", None) if _win32_reader is not None else None
+            if h_reader and h_reader not in (0, -1) and h_reader not in handles:
+                handles.append(h_reader)
+            for h in handles:
                 kernel32.FlushConsoleInputBuffer(h)
         except Exception:
             pass
@@ -407,18 +419,12 @@ def _parse_escape_sequence(seq: str) -> str:
 
 
 def _read_escape_sequence_windows() -> str:
-    """Read buffered escape sequence characters following \x1b on Windows."""
+    """Read buffered escape sequence characters following \\x1b on Windows."""
     import msvcrt
-
-    if not msvcrt.kbhit():
-        time.sleep(0.015)
-
-    if not msvcrt.kbhit():
-        return ""
 
     seq = ""
     start_time = time.monotonic()
-    while time.monotonic() - start_time < 0.1:
+    while time.monotonic() - start_time < 0.05:
         if msvcrt.kbhit():
             c = msvcrt.getwch()
             seq += c
@@ -432,7 +438,7 @@ def _read_escape_sequence_windows() -> str:
                 break
         else:
             time.sleep(0.005)
-            if not msvcrt.kbhit():
+            if not msvcrt.kbhit() and seq:
                 # If we've started an escape sequence but haven't received the terminator, keep waiting up to timeout
                 if "[<" in seq and not (seq.endswith("M") or seq.endswith("m")):
                     continue
@@ -802,20 +808,15 @@ class Win32ConsoleReader:
         return None
 
     def _read_escape_sequence(self, h: Any) -> str:
-        """Read buffered escape sequence characters following \x1b from Win32 console buffer."""
+        """Read buffered escape sequence characters following \\x1b from Win32 console buffer."""
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         rec = INPUT_RECORD()
         read_count = ctypes.c_uint32()
         num_events = ctypes.c_uint32()
 
-        # Check if events are immediately available in the console queue
-        if kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
-            if num_events.value == 0:
-                time.sleep(0.015)
-
         seq = ""
         start_time = time.monotonic()
-        while time.monotonic() - start_time < 0.1:
+        while time.monotonic() - start_time < 0.05:
             if not kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
                 break
             if num_events.value > 0:
@@ -853,7 +854,13 @@ class Win32ConsoleReader:
                             if m_parsed:
                                 self._pending_keys.append(m_parsed)
             else:
-                time.sleep(0.002)
+                time.sleep(0.003)
+                if seq:
+                    if "[<" in seq and not (seq.endswith("M") or seq.endswith("m")):
+                        continue
+                    if seq.startswith("[") and not (seq.endswith("~") or seq[-1] in "ABCDHFu"):
+                        continue
+                    break
         return seq
 
     def read_key(self, timeout: float = 0.05) -> Optional[str]:
