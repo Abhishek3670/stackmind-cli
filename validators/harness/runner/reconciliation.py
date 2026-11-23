@@ -356,6 +356,27 @@ class _ReconciliationMixin:
                         existing_orders[b_id] = b_entry
                         updated_index = True
 
+            # Prune orphan work orders from INDEX.yaml that have no file in any bucket
+            valid_orders: list[dict[str, Any]] = []
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                o_id = o.get("id")
+                if not o_id:
+                    continue
+                has_file = False
+                for b_name in ("ACTIVE", "COMPLETED", "BLOCKED", "CANCELLED"):
+                    if (sync_dir / "work-orders" / b_name / f"{o_id}.yaml").is_file():
+                        has_file = True
+                        break
+                if has_file:
+                    valid_orders.append(o)
+                else:
+                    updated_index = True
+            if len(valid_orders) != len(orders):
+                orders.clear()
+                orders.extend(valid_orders)
+
             tot_active = sum(
                 1 for o in orders if isinstance(o, dict) and str(o.get("status", "")).upper() == "ACTIVE"
             )

@@ -256,7 +256,7 @@ class _CompletionMixin:
                 "All implementation work orders and QA verifications have completed. "
                 "Your task is to perform the final integration review of all declared deliverables against the original product goal. "
                 "You are solely accountable for ensuring that the assembled deliverables fully satisfy the product goal and integrate cleanly.\n"
-                "You operate in a governed environment with a strictly read-only contract: use `read_file` or `list_directory` to inspect deliverables. "
+                "You operate in a governed environment with a strictly read-only contract: use `git_changed_files` and `git_diff` to review changes across deliverables efficiently, or `read_file` with line range slicing (`start_line`/`end_line`) and `list_directory`. "
                 "Do NOT attempt to write or edit any files.\n"
                 "INTEGRATION REVIEW CHECKLIST (MUST VERIFY BEFORE APPROVING):\n"
                 "1. Product Goal Fulfillment: Inspect the actual content of the files. If the user goal requested specific features, text, or entities, verify they actually exist in the rendered markup/output — not just placeholder scaffolding.\n"
@@ -275,7 +275,8 @@ class _CompletionMixin:
                 "CANONICAL GOVERNANCE RULES FOR WORK ORDERS:\n"
                 "1. QA and Verification: All QA, testing, and verification tasks MUST use `type: 'VALIDATION'`. 'QA' is an assigned agent/role ('gemma'), NEVER a work-order type!\n"
                 "2. Allowed Work Order Types: ['PHASE', 'FEATURE', 'BUGFIX', 'HOTFIX', 'REFACTOR', 'RESEARCH', 'AUDIT', 'VALIDATION', 'FIX']. Values 'QA' and 'TEST' are INVALID and strictly rejected.\n"
-                "3. Allowed Deliverable Types: ['code', 'doc', 'config', 'module']. Test files (under tests/) MUST use `deliverable.type: 'code'`. Test reports/docs use `deliverable.type: 'doc'`. Values 'test' and 'report' are INVALID.\n\n"
+                "3. Allowed Deliverable Types: ['code', 'doc', 'config', 'module']. Test files (under tests/) MUST use `deliverable.type: 'code'`. Test reports/docs use `deliverable.type: 'doc'`. Values 'test' and 'report' are INVALID.\n"
+                "4. ANTI-META-TICKET RULE: Never author work orders whose deliverable is another work order or internal governance file (e.g. under .sync/ or schemas/). Never author work orders with titles like 'Cancel Duplicate...' or 'Declare Deliverables for Integration...'. Apply cancellations or dependency updates directly to existing work order YAML files or through recovery decisions, NEVER as child work orders.\n\n"
                 "DELEGATION & AUTHORING WORKFLOWS:\n"
                 "- AD-HOC DELEGATION: When the operator asks to delegate a verification or implementation task (e.g. delegate verification to the QA agent), invoke `delegate_task(target_agent='qa', instructions='...', target_files=['tests/...'])`. This immediately authors the canonical VALIDATION work order in .sync/work-orders/ACTIVE/ and its contract in .sync/contracts/.\n"
                 "- BATCH / PLAN-BASED AUTHORING: Call `write_file` or `batch_write_files` to write each Work Order YAML to .sync/work-orders/ACTIVE/<WO-ID>.yaml and each Contract YAML to .sync/contracts/<WO-ID>.yaml conforming to the provided schemas.\n\n"
@@ -846,20 +847,6 @@ class _CompletionMixin:
         """Fallback synthesis when model outputs unstructured text or tool loop ends without JSON."""
         written_files = list(written_files or [])
         is_unfulfilled_deliverable = False
-        is_planning_turn = (
-            str(getattr(request.task, 'work_order_id', '') or '') == "WO-000"
-            or getattr(request.task, 'is_planning', False)
-            or str(getattr(self, 'agent', '')).lower().strip() in ('claude', 'architecture', 'architect')
-        )
-        if request.task.deliverable_path and not written_files and not is_planning_turn:
-            deliverable_exists = False
-            try:
-                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
-                deliverable_exists = (target_dir / request.task.deliverable_path).exists()
-            except Exception:
-                pass
-            if not deliverable_exists:
-                is_unfulfilled_deliverable = True
 
         wo_type_upper = str(getattr(request.task, 'work_order_type', '') or '').upper()
         is_validation_or_review = (
@@ -888,6 +875,39 @@ class _CompletionMixin:
 
         effective_raw_text = extracted_report or raw_text
 
+        chat_greeting_phrases = (
+            "hey!", "hey there", "hello!", "good to meet you",
+            "what's on your mind", "what would you like to build",
+            "i'd love to hear", "before we dive into anything",
+        )
+        effective_lower = (effective_raw_text or "").lower()
+        has_chat_greetings = any(g in effective_lower for g in chat_greeting_phrases)
+        has_milestone_checklist = bool(re.search(r"-\s*\[[ xX]\]\s+milestone", effective_raw_text or "", re.IGNORECASE))
+        has_plan_title = bool(re.search(r"^#\s+.*plan", effective_raw_text or "", re.IGNORECASE | re.MULTILINE))
+        is_pure_chat_greeting = has_chat_greetings and not has_milestone_checklist and not has_plan_title
+
+        is_planning_turn = (
+            (
+                str(getattr(request.task, 'work_order_id', '') or '') == "WO-000"
+                or getattr(request.task, 'is_planning', False)
+                or (
+                    str(getattr(self, 'agent', '')).lower().strip() in ('claude', 'architecture', 'architect')
+                    and str(getattr(request.task, 'kind', '') or '').lower() != 'adhoc'
+                    and bool(getattr(request.task, 'deliverable_path', None) or getattr(request.task, 'work_order_id', None))
+                )
+            )
+            and not is_pure_chat_greeting
+        )
+        if request.task.deliverable_path and not written_files and not is_planning_turn:
+            deliverable_exists = False
+            try:
+                target_dir = tool_runtime.workspace.root if tool_runtime is not None else self.project_path
+                deliverable_exists = (target_dir / request.task.deliverable_path).exists()
+            except Exception:
+                pass
+            if not deliverable_exists:
+                is_unfulfilled_deliverable = True
+
         if is_unfulfilled_deliverable:
             payload = {
                 'status': 'blocked',
@@ -901,10 +921,11 @@ class _CompletionMixin:
             plan_rel = request.task.deliverable_path or ".sync/playbook/PLAN.md"
             plan_file = target_dir / plan_rel
             if not plan_file.exists() or plan_file.stat().st_size == 0:
-                plan_file.parent.mkdir(parents=True, exist_ok=True)
-                body_text = effective_raw_text.strip() if effective_raw_text and len(effective_raw_text.strip()) > 30 else f"# Project Plan: {getattr(request.task, 'title', 'System Architecture')}\n\n## Architecture\n{getattr(request.task, 'description', '') or 'System architecture and execution plan'}\n\n## Milestones\n- [ ] Milestone 1: Project Scaffolding & Setup\n- [ ] Milestone 2: Core Implementation\n- [ ] Milestone 3: QA & Verification\n"
-                plan_file.write_text(body_text, encoding="utf-8")
-                written_files = list(dict.fromkeys(written_files + [plan_rel.replace("\\", "/")]))
+                if not is_pure_chat_greeting:
+                    plan_file.parent.mkdir(parents=True, exist_ok=True)
+                    body_text = effective_raw_text.strip() if effective_raw_text and len(effective_raw_text.strip()) > 30 else f"# Project Plan: {getattr(request.task, 'title', 'System Architecture')}\n\n## Architecture\n{getattr(request.task, 'description', '') or 'System architecture and execution plan'}\n\n## Milestones\n- [ ] Milestone 1: Project Scaffolding & Setup\n- [ ] Milestone 2: Core Implementation\n- [ ] Milestone 3: QA & Verification\n"
+                    plan_file.write_text(body_text, encoding="utf-8")
+                    written_files = list(dict.fromkeys(written_files + [plan_rel.replace("\\", "/")]))
             summary_text = extracted_summary or (effective_raw_text[:4000] if effective_raw_text else 'Synthesized architecture and execution plan')
             payload = {
                 'status': 'completed',

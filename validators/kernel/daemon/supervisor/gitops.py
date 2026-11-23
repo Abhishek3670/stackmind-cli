@@ -443,9 +443,21 @@ class _GitopsMixin:
         goal = state.product_goal or "Product delivery"
         version = "0.1.0"
         v_file = ws / "VERSION.md"
+        if not v_file.is_file():
+            v_file = ws / "VERSION"
         if v_file.is_file():
             try:
                 version = v_file.read_text(encoding="utf-8").strip() or version
+            except Exception:
+                pass
+        else:
+            try:
+                (ws / "VERSION").write_text(f"{version}\n", encoding="utf-8")
+            except Exception:
+                pass
+        if not (ws / "VERSION.md").is_file():
+            try:
+                (ws / "VERSION.md").write_text(f"# Version\n\n{version}\n", encoding="utf-8")
             except Exception:
                 pass
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -535,6 +547,29 @@ class _GitopsMixin:
                 readme_file.write_text(readme_text, encoding="utf-8")
             except Exception:
                 pass
+
+        # Synchronize completion hashes for GitOps documentation work order
+        gitops_id = getattr(state, "gitops_wo_id", None)
+        if gitops_id:
+            for sub in ("ACTIVE", "COMPLETED"):
+                wo_file = ws / ".sync" / "work-orders" / sub / f"{gitops_id}.yaml"
+                if wo_file.is_file():
+                    try:
+                        wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                        if isinstance(wo_data, dict) and isinstance(wo_data.get("completion"), dict):
+                            hashes = wo_data["completion"].setdefault("deliverable_hashes", {})
+                            declared_deliv = wo_data.get("deliverable")
+                            deliv_path = str(declared_deliv.get("path", "")).replace("\\", "/").strip().lstrip("./") if isinstance(declared_deliv, dict) else ""
+                            allowed_docs = {"VERSION.md", "CHANGELOG.md", "VERSION"}
+                            target_docs = [deliv_path] if deliv_path in allowed_docs else list(allowed_docs)
+                            for doc in target_docs:
+                                doc_p = ws / doc
+                                if doc_p.is_file():
+                                    from validators.harness.delivery_integrity import sha256_file
+                                    hashes[doc] = sha256_file(doc_p)
+                            wo_file.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                    except Exception:
+                        pass
 
     def _find_gitops_wo(self, ws: Path, state: RunState) -> str | None:
         """Find a GitOps work order from disk."""

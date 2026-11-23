@@ -359,7 +359,10 @@ def extract_deliverable_spec(
 
 
 def determine_assigned_agent(
-    title: str, tasks: list[str], agent_hint: str | None = None
+    title: str,
+    tasks: list[str],
+    agent_hint: str | None = None,
+    project_goal: str | None = None,
 ) -> tuple[str, str]:
     """Determine (agent_id, role) from milestone title and tasks.
 
@@ -380,6 +383,13 @@ def determine_assigned_agent(
 
     combined = (f"{title} " + " ".join(tasks)).lower()
     title_lower = title.lower()
+    goal_lower = (project_goal or "").lower().strip()
+    is_generic = (
+        any(kw in title_lower for kw in ("core implementation", "implementation tasks", "milestone 1", "milestone:", "core features"))
+        or not tasks
+    )
+    if is_generic and goal_lower:
+        combined = f"{combined} {goal_lower}"
 
     # 1. Top priority: Explicit agent designation by the Architect in title or tasks
     # Patterns: (Agent: codex), [Agent: codex], Agent: codex, Assigned: codex, Owner: codex,
@@ -415,7 +425,7 @@ def determine_assigned_agent(
     # 3. Fallback: Semantic heuristics based on title and task keywords
     # Frontend checks: explicit UI files or keywords
     if re.search(r"\b[a-zA-Z0-9_\-\.\/]+\.(?:html|css|jsx|tsx)\b", combined) or re.search(
-        r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|client|landing page|login page)\b", combined
+        r"\b(?:ui|frontend|views?|components?|screens?|css|html|tailwind|react|vue|svelte|client|landing page|login page|webpage|website|web app|portfolio|design|interface|animated)\b", combined
     ):
         return "gemini", "frontend"
 
@@ -878,6 +888,7 @@ def decompose_milestone(
     stack: TechStack | None = None,
     project_path: Path | str | None = None,
     prev_wo_id: str | None = None,
+    project_goal: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Decompose a milestone into one or more validated child work orders.
 
@@ -892,7 +903,22 @@ def decompose_milestone(
     Returns:
         (list of work order dictionaries, last_wo_id)
     """
-    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent)
+    goal = project_goal
+    if not goal and project_path:
+        try:
+            pp = Path(project_path).resolve()
+            for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+                w0 = pp / ".sync" / "work-orders" / sub / "WO-000.yaml"
+                if w0.is_file():
+                    import yaml as _yaml_mod
+                    d = _yaml_mod.safe_load(w0.read_text(encoding="utf-8"))
+                    if isinstance(d, dict) and d.get("description"):
+                        goal = str(d["description"])
+                        break
+        except Exception:
+            pass
+
+    agent, role = determine_assigned_agent(m.title, m.tasks, agent_hint=m.agent, project_goal=goal)
 
     # Analyze tasks for distinct non-test deliverables
     task_deliverables: list[tuple[str, str, dict[str, Any]]] = []
@@ -1473,9 +1499,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
     from validators.kernel.io import durable_write_yaml
     from cli.init import ensure_canonical_tree
 
-    plan_milestones = load_plan_milestones(ws)
-    if not plan_milestones:
-        return []
+    plan_milestones = load_plan_milestones(ws) or []
 
     from validators.harness.plan import resolve_playbook_file
     plan_file = resolve_playbook_file(ws, "PLAN.md")
@@ -1548,7 +1572,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if m:
                 wo_data["superseded_by"] = m.group(1).upper()
         wo_data["updated"] = now_str
-        durable_write_yaml(wo_file, wo_data)
+        cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
+        cancelled_dir.mkdir(parents=True, exist_ok=True)
+        durable_write_yaml(cancelled_dir / wo_file.name, wo_data)
+        wo_file.unlink(missing_ok=True)
         _sync_index_status(wo_id, "CANCELLED", now_str)
         _sync_tree_remove(wo_id)
         if wo_id not in reconciled_ids:
@@ -1568,8 +1595,10 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
 
     # Pass 0: Index all completed work orders and their deliverables
     completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+    cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
     completed_deliverables: dict[str, str] = {}  # norm_p -> completed_wo_id
     completed_ids: set[str] = set()
+    cancelled_ids: set[str] = set()
     if completed_dir.is_dir():
         for comp_file in sorted(completed_dir.glob("*.yaml")):
             comp_id = comp_file.stem
@@ -1581,6 +1610,40 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                         completed_deliverables[p] = comp_id
             except Exception:
                 pass
+    if cancelled_dir.is_dir():
+        for canc_file in sorted(cancelled_dir.glob("*.yaml")):
+            cancelled_ids.add(canc_file.stem)
+
+    # Pass 0b: Revive any work orders in CANCELLED/ that were erroneously cancelled as orphans but exist in current PLAN.md
+    if cancelled_dir.is_dir():
+        for canc_file in sorted(cancelled_dir.glob("*.yaml")):
+            try:
+                c_data = yaml.safe_load(canc_file.read_text(encoding="utf-8"))
+                if not isinstance(c_data, dict):
+                    continue
+                c_id = str(c_data.get("id") or canc_file.stem)
+                c_reason = str(c_data.get("cancellation_reason") or c_data.get("error") or "").lower()
+                if "orphaned work order not present in current plan.md" in c_reason:
+                    c_paths = _wo_deliverable_paths(c_data)
+                    already_comp = any(p in completed_deliverables and completed_deliverables[p] != c_id for p in c_paths)
+                    c_in_plan = (
+                        bool(plan_raw_text and re.search(rf"\b{re.escape(c_id)}\b", plan_raw_text))
+                        or any(c_id == r.get("id") for r in plan_milestones)
+                        or any(_wo_matches_milestone(c_data, r) for r in plan_milestones)
+                    )
+                    if c_in_plan and not already_comp:
+                        c_data["status"] = "ACTIVE"
+                        c_data.pop("error", None)
+                        c_data.pop("cancellation_reason", None)
+                        active_target = active_dir / canc_file.name
+                        durable_write_yaml(active_target, c_data)
+                        canc_file.unlink(missing_ok=True)
+                        cancelled_ids.discard(c_id)
+                        _sync_index_status(c_id, "ACTIVE", _now())
+                        if c_id not in reconciled_ids:
+                            reconciled_ids.append(c_id)
+            except Exception:
+                continue
 
     active_files = sorted(active_dir.glob("*.yaml"))
 
@@ -1594,6 +1657,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             if not isinstance(wo_data, dict):
                 continue
             wo_id = str(wo_data.get("id") or wo_file.stem)
+
+            # Purge zombie active copies of work orders already in CANCELLED/
+            if wo_id in cancelled_ids or (cancelled_dir / wo_file.name).is_file():
+                wo_file.unlink(missing_ok=True)
+                _sync_index_status(wo_id, "CANCELLED", _now())
+                continue
 
             # Auto-promote verified work orders that have completed execution evidence
             if wo_data.get("completion") and isinstance(wo_data["completion"], dict):
@@ -1625,7 +1694,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 # Check if this work order is actually an approved task in PLAN.md
                 # that was erroneously cancelled by prior deduplication
                 is_in_plan = (
-                    bool(plan_raw_text and f"({wo_id})" in plan_raw_text)
+                    bool(plan_raw_text and re.search(rf"\b{re.escape(wo_id)}\b", plan_raw_text))
                     or any(wo_id == r.get("id") for r in plan_milestones)
                     or any(_wo_matches_milestone(wo_data, r) for r in plan_milestones)
                 )
@@ -1649,7 +1718,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 # A duplicate cancel should ONLY be revived if the superseder was a ghost AND the deliverable is NOT completed
                 can_revive_dedup = is_dedup_cancel and not superseder_exists and not already_completed
 
-                if (is_in_plan and (can_revive_dedup or not wo_data.get("cancellation_reason"))) or (
+                if (is_in_plan and (can_revive_dedup or not wo_data.get("cancellation_reason") or (is_erroneous_orphan_cancel and not already_completed))) or (
                     is_delegated_or_repair and is_erroneous_orphan_cancel
                 ):
                     current_status = "ACTIVE"
@@ -1664,6 +1733,11 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 continue
 
             if _is_meta_work_order(wo_data):
+                if str(wo_data.get("status", "")).upper() == "BLOCKED" and "role-deliverable mismatch" in str(wo_data.get("blocked_reason") or wo_data.get("error") or "").lower():
+                    wo_data["status"] = "ACTIVE"
+                    wo_data.pop("error", None)
+                    wo_data.pop("blocked_reason", None)
+                    durable_write_yaml(wo_file, wo_data)
                 continue
 
             if any(p.startswith(".sync/") or p.startswith("schemas/") for p in wo_paths):
@@ -1680,16 +1754,38 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                     superseded_map[wo_id] = comp_owner
                     continue
 
+            if synth == "reconcile" and wo_paths:
+                p_in_plan = any(p in plan_raw_text.lower() for p in wo_paths) if plan_raw_text else False
+                has_explicit_wos = any(r.get("id", "").startswith("WO-") for r in plan_milestones)
+                if not p_in_plan and has_explicit_wos:
+                    _cancel_wo(wo_file, wo_data, wo_id, "Phantom synthesized work order superseded by canonical PLAN.md work orders")
+                    superseded_map[wo_id] = None
+                    continue
+
             if is_delegated_or_repair:
                 delegated_survivors.append((wo_file, wo_id, wo_data, None))
                 continue
 
+            if not plan_milestones:
+                continue
+
             matched_ref = next((r for r in plan_milestones if _wo_matches_milestone(wo_data, r)), None)
             if matched_ref is None:
-                # Rule 1: Orphaned active work order not present in current PLAN.md -> CANCEL
-                _cancel_wo(wo_file, wo_data, wo_id, "Orphaned work order not present in current PLAN.md")
-                superseded_map[wo_id] = None
-                continue
+                in_plan_doc = (
+                    bool(plan_raw_text and re.search(rf"\b{re.escape(wo_id)}\b", plan_raw_text))
+                    or bool(plan_raw_text and wo_data.get("title") and str(wo_data["title"]).lower() in plan_raw_text.lower())
+                )
+                if not in_plan_doc:
+                    # Rule 1: Orphaned active work order not present in current PLAN.md -> CANCEL
+                    _cancel_wo(wo_file, wo_data, wo_id, "Orphaned work order not present in current PLAN.md")
+                    superseded_map[wo_id] = None
+                    continue
+                else:
+                    matched_ref = {
+                        "id": wo_id,
+                        "title": wo_data.get("title", wo_id),
+                        "agent": (wo_data.get("assigned_agents") or ["codex"])[0],
+                    }
 
             m_key = str(matched_ref.get("id") or matched_ref.get("title") or "")
             matched_by_milestone.setdefault(m_key, []).append((wo_file, wo_id, wo_data, matched_ref))
@@ -2077,19 +2173,33 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             target_agent = None
             if matched_ref and matched_ref.get("agent"):
                 target_agent = matched_ref["agent"].strip().lower()
-            elif primary_agent == "gemma" and deliv_path and not is_test_path:
-                # Non-test code assigned to gemma -> route to gemini or codex
+            else:
+                target_agent = primary_agent
+
+            # Enforce authoritative role-deliverable compatibility invariants
+            effective_agent = target_agent or primary_agent
+            if is_test_path or is_qa_wo:
+                if effective_agent not in ("gemma", "qa"):
+                    target_agent = "gemma"
+            elif effective_agent == "gemma" and deliv_path and not is_test_path:
                 if any(deliv_path.endswith(ext) for ext in (".html", ".css", ".js", ".jsx", ".tsx")):
                     target_agent = "gemini"
                 else:
                     target_agent = "codex"
-            elif primary_agent == "codex" and deliv_path and any(deliv_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
+            elif effective_agent == "codex" and deliv_path and any(deliv_path.endswith(ext) for ext in (".html", ".htm", ".css", ".scss")):
                 target_agent = "gemini"
-            elif primary_agent == "gemini" and deliv_path and not is_test_path and any(deliv_path.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db")):
+            elif effective_agent == "gemini" and deliv_path and not is_test_path and any(deliv_path.endswith(ext) for ext in (".py", ".sql", ".sqlite", ".db")):
                 target_agent = "codex"
 
             if target_agent and target_agent != primary_agent:
                 wo_data["assigned_agents"] = [target_agent]
+                if str(wo_data.get("status", "")).upper() == "BLOCKED" and (
+                    "role-deliverable mismatch" in str(wo_data.get("blocked_reason") or "").lower()
+                    or "role-deliverable mismatch" in str(wo_data.get("error") or "").lower()
+                ):
+                    wo_data["status"] = "ACTIVE"
+                    wo_data.pop("error", None)
+                    wo_data.pop("blocked_reason", None)
                 durable_write_yaml(wo_file, wo_data)
 
                 # Reconcile matching contract
@@ -2169,18 +2279,42 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
             except Exception:
                 pass
 
+        def _clean_deliv_p(p_str: Any) -> str:
+            return str(p_str or "").strip().replace("\\", "/").lstrip("./").lstrip("/").lower()
+
         existing_deliv_paths: set[str] = set()
+        for c_path in completed_deliverables:
+            clean_cp = _clean_deliv_p(c_path)
+            if clean_cp:
+                existing_deliv_paths.add(clean_cp)
+
         for w in existing_wos:
-            p = (w.get("deliverable") or {}).get("path")
+            p = _clean_deliv_p((w.get("deliverable") or {}).get("path"))
             if p:
-                existing_deliv_paths.add(str(p).strip().replace("\\", "/").lstrip("/").lower())
+                existing_deliv_paths.add(p)
             for d in w.get("deliverables") or []:
                 if isinstance(d, dict) and d.get("path"):
-                    existing_deliv_paths.add(str(d.get("path")).strip().replace("\\", "/").lstrip("/").lower())
+                    dp = _clean_deliv_p(d.get("path"))
+                    if dp:
+                        existing_deliv_paths.add(dp)
             impl = w.get("implementation_estimate") or {}
             for ef in impl.get("expected_files") or []:
                 if ef:
-                    existing_deliv_paths.add(str(ef).strip().replace("\\", "/").lstrip("/").lower())
+                    efp = _clean_deliv_p(ef)
+                    if efp:
+                        existing_deliv_paths.add(efp)
+
+        def _milestone_deliverables_satisfied(m_ref: dict[str, Any]) -> bool:
+            cand_paths = extract_candidate_paths(f"{m_ref.get('title', '')}\n{' '.join(m_ref.get('tasks') or [])}")
+            clean_cands = [_clean_deliv_p(cp) for cp in cand_paths if _clean_deliv_p(cp)]
+            if not clean_cands:
+                return False
+            return all(
+                cp in existing_deliv_paths
+                or cp in completed_deliverables
+                or ((ws / cp).is_file() and (ws / cp).stat().st_size > 0)
+                for cp in clean_cands
+            )
 
         uncovered_milestones = [
             m for m in plan_milestones
@@ -2188,6 +2322,7 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 _is_architecture_or_meta_milestone(m)
                 or str(m.get("status") or "").strip().upper() == "COMPLETED"
                 or any(_wo_matches_milestone(w, m) for w in existing_wos)
+                or _milestone_deliverables_satisfied(m)
             )
         ]
 
@@ -2226,8 +2361,12 @@ def reconcile_active_work_orders_with_plan(workspace: Path | str) -> list[str]:
                 filtered_child_wos = []
                 for c_wo in child_wos:
                     c_deliv = c_wo.get("deliverable") or {}
-                    c_path = str(c_deliv.get("path") or "").strip().replace("\\", "/").lstrip("/").lower()
-                    if c_path and c_path in existing_deliv_paths:
+                    c_path = _clean_deliv_p(c_deliv.get("path"))
+                    if c_path and (
+                        c_path in existing_deliv_paths
+                        or c_path in completed_deliverables
+                        or ((ws / c_path).is_file() and (ws / c_path).stat().st_size > 0)
+                    ):
                         continue
                     filtered_child_wos.append(c_wo)
 

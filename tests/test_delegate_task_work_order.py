@@ -169,3 +169,52 @@ def test_tui_state_reflects_delegated_work_order():
         assert "WO-001" in plain_text
         assert "No active orders" not in plain_text
 
+
+def test_delegate_task_reuses_completed_wo_for_review_without_minting():
+    """When delegate_task is called referencing a COMPLETED work order (e.g. for review/recovery),
+    it registers a review or reuses the work order instead of minting a duplicate work order."""
+    with TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        ws = ScratchWorkspace.create(tmp_path, "test-wo-reuse")
+        comp_dir = ws.root / ".sync" / "work-orders" / "COMPLETED"
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        (comp_dir / "WO-003.yaml").write_text(
+            yaml.safe_dump({
+                "id": "WO-003",
+                "status": "COMPLETED",
+                "title": "Frontend Auth Page",
+                "assigned_agents": ["gemini"],
+                "deliverable": {"type": "code", "path": "public/index.html"},
+            }),
+            encoding="utf-8",
+        )
+
+        contract = AgentContract(
+            agent_id="claude",
+            work_order="WO-000",
+            allow=("workspace/**",),
+            deny=(),
+            write_mode="read-write",
+        ).freeze()
+        gw = ToolGateway(
+            workspace=ws,
+            boundary=RuntimeBoundary(OperationJournal()),
+            contract=contract,
+            policy=get_role_policy("claude"),
+            session_id="test-session",
+            attempt_id="test-attempt",
+            actor_id="claude",
+            provider_id="anthropic",
+        )
+
+        res = gw.delegate_task(
+            target_agent="qa",
+            instructions="Reopen work order WO-003 for architect fix amendment. Deliverable is complete.",
+        )
+        assert res["status"] in ("review_scheduled", "delegated")
+        assert res["work_order_id"] == "WO-003"
+        # Crucially: it must NOT have minted a new work order like WO-001 or WO-004
+        assert res["work_order_id"] != "WO-001"
+        assert res["work_order_id"] != "WO-004"
+
+

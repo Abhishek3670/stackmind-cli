@@ -41,6 +41,18 @@ def _validate_work_order(
             )
         if not deliverable.get("description"):
             errors.append("Work Order deliverable requires a non-empty 'description'")
+        deliv_path = str(deliverable.get("path") or "").replace("\\", "/").strip().lstrip("./").lstrip("/")
+        if deliv_path.startswith(".sync/") or deliv_path.startswith("schemas/"):
+            errors.append(
+                f"Work Order deliverable path '{deliv_path}' is invalid: internal governance files under .sync/ or schemas/ cannot be declared as work order deliverables"
+            )
+
+    # Validate title: disallow meta-work orders that attempt to cancel/patch other work orders
+    title_lower = str(data.get("title", "")).lower().strip()
+    if any(title_lower.startswith(prefix) for prefix in ("cancel duplicate", "declare deliverables for integration")):
+        errors.append(
+            f"Work Order title '{data.get('title')}' is an invalid meta-order. Governance corrections must be applied directly to existing work orders or through recovery decisions, not as child work orders."
+        )
 
     # Validate requirement_refs if present
     requirement_refs = data.get("requirement_refs")

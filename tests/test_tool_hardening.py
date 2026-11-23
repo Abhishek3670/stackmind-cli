@@ -298,8 +298,8 @@ def test_tool_output_truncation():
     assert len(truncated) < 20_000
     assert "[... TRUNCATED:" in truncated
     assert "characters omitted" in truncated
-    assert truncated.startswith("A" * 500)
-    assert truncated.endswith("A" * 500)
+    assert truncated.startswith("A" * 264)
+    assert truncated.endswith("A" * 616)
 
     # Short output is untouched
     assert truncate_tool_output("short", max_chars=100) == "short"
@@ -726,7 +726,7 @@ def test_replay_run1_consecutive_command_denials_finalizes(tmp_path: Path):
             message=Message(
                 role="assistant",
                 content=None,
-                tool_calls=[ToolCallRequest(id="c4", name="run_command", arguments={"command": ["python", "src/api/auth.py"]})],
+                tool_calls=[ToolCallRequest(id="c4", name="run_command", arguments={"command": ["python", "-c", "import sys"]})],
             ),
             usage=TokenUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
         ),
@@ -744,7 +744,7 @@ def test_replay_run1_consecutive_command_denials_finalizes(tmp_path: Path):
             message=Message(
                 role="assistant",
                 content=None,
-                tool_calls=[ToolCallRequest(id="c6", name="run_command", arguments={"command": ["python", "src/api/auth.py"]})],
+                tool_calls=[ToolCallRequest(id="c6", name="run_command", arguments={"command": ["bash", "-c", "echo 1"]})],
             ),
             usage=TokenUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
         ),

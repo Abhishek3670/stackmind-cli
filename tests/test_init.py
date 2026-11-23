@@ -288,13 +288,17 @@ class TestInit:
                 )
 
     def test_name_defaults_to_directory(self, tmp_project):
-        """When no name is given, use directory name."""
+        """When no name is given, use directory name in .sync/README.md."""
         init(tmp_project, no_git=True)
-        # Verify README was created with project info
-        readme = tmp_project / "README.md"
+        # Verify .sync/README was created with project info
+        readme = tmp_project / ".sync" / "README.md"
         assert readme.exists()
         content = readme.read_text(encoding="utf-8")
         assert tmp_project.name in content
+        # Root README.md, CHANGELOG.md, VERSION are not generated at init time
+        assert not (tmp_project / "README.md").exists()
+        assert not (tmp_project / "CHANGELOG.md").exists()
+        assert not (tmp_project / "VERSION").exists()
 
     def test_rejects_existing_sync(self, tmp_project):
         """Init should refuse if .sync/ already exists."""

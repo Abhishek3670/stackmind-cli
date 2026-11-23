@@ -1175,6 +1175,86 @@ def test_dropdown_height_shrink_clears_excess_top_lines():
     assert len(re.findall(r"\x1b\[2K", step_pl)) == 3
 
 
+def test_dropdown_height_shrink_clears_excess_top_lines_with_state():
+    """Verify typing prefix that narrows command matches clears excess top lines in full-screen state mode."""
+    import io
+    import re
+    from cli.tui.state import AutonomousDeliveryState
+
+    out = io.StringIO()
+    state = AutonomousDeliveryState()
+    test_commands = [
+        (":plan", "desc", False),
+        (":pause", "desc", False),
+        (":providers", "desc", False),
+        (":projects", "desc", False),
+        (":status", "desc", False),
+        (":resume", "desc", False),
+        (":wo", "desc", False),
+    ]
+    editor = RawLineEditor(width=80, out=out, state=state, commands=test_commands)
+
+    # 1. Type ':' (many matches -> max_visible 6 items -> 8 total lines)
+    editor.handle_key(":")
+    editor.redraw_line()
+    assert editor._last_dropdown_lines_count == 8
+
+    # 2. Type 'p' (matches: :plan, :pause, :providers, :projects -> 4 items -> 6 total lines)
+    out.seek(0)
+    out.truncate(0)
+    editor.handle_key("p")
+    editor.redraw_line()
+    step_p = out.getvalue()
+    assert editor._last_dropdown_lines_count == 6
+    # In state mode (c_row=22, top_border_row=21), excess rows are 21-8=13 and 21-7=14 (2 excess lines)
+    assert "\x1b[13;1H\x1b[2K" in step_p
+    assert "\x1b[14;1H\x1b[2K" in step_p
+
+    # 3. Type 'l' (matches: :plan -> 1 item -> 3 total lines)
+    out.seek(0)
+    out.truncate(0)
+    editor.handle_key("l")
+    editor.redraw_line()
+    step_pl = out.getvalue()
+    assert editor._last_dropdown_lines_count == 3
+    # 6 -> 3 total lines (excess lines 15, 16, 17)
+    assert "\x1b[15;1H\x1b[2K" in step_pl
+    assert "\x1b[16;1H\x1b[2K" in step_pl
+    assert "\x1b[17;1H\x1b[2K" in step_pl
+
+
+def test_dropdown_height_shrink_triggers_clear_callback_with_state():
+    """Verify on_clear_dropdown is called on dropdown shrink in full-screen state mode."""
+    import io
+    from cli.tui.state import AutonomousDeliveryState
+
+    out = io.StringIO()
+    state = AutonomousDeliveryState()
+    clears = []
+
+    def mock_clear(target=None):
+        clears.append(True)
+        return True
+
+    editor = RawLineEditor(
+        width=80, out=out, state=state, on_clear_dropdown=mock_clear
+    )
+
+    editor.handle_key(":")
+    editor.redraw_line()
+    assert editor._last_dropdown_lines_count == 8
+
+    editor.handle_key("p")
+    editor.redraw_line()
+    assert editor._last_dropdown_lines_count == 8  # 6 matches for :p still 8 lines
+
+    # Typing 'r' narrows to 3 matches (:provider, :providers, :projects) -> 5 lines
+    editor.handle_key("r")
+    editor.redraw_line()
+    assert editor._last_dropdown_lines_count == 5
+    assert len(clears) == 1
+
+
 def test_dropdown_dismiss_clears_all_lines():
     """Verify Escape dismisses dropdown and clears all active dropdown lines."""
     import io
@@ -1532,6 +1612,23 @@ def test_raw_line_editor_with_state_anchors_cursor_absolutely_and_never_emits_ne
         sys.stdout = orig_stdout
     assert res == "hello"
     assert "\n" not in captured_stdout.getvalue()
+
+
+def test_ctrl_u_clears_buffer():
+    """Verify Key.CTRL_U clears the editor buffer and resets cursor position."""
+    import io
+    from cli.tui.keyboard import Key, RawLineEditor
+
+    buf = io.StringIO()
+    editor = RawLineEditor(width=80, initial_text="some corrupted ^[[<35;175;51M input", out=buf)
+    assert len(editor.buffer) > 0
+    assert editor.cursor > 0
+
+    editor.handle_key(Key.CTRL_U)
+    assert editor.buffer == []
+    assert editor.cursor == 0
+    assert editor.text == ""
+
 
 
 

@@ -455,16 +455,20 @@ class _VerificationMixin:
                 wo_file = self.sync_path / "work-orders" / sub / f"{task.work_order_id}.yaml"
                 if wo_file.is_file():
                     try:
-                        wo_data = self._read_yaml(wo_file) or {}
+                        import yaml
+                        wo_data = yaml.safe_load(wo_file.read_text(encoding="utf-8")) or {}
                     except Exception:
                         pass
                     break
 
             if not wo_data:
+                wo_data = {"id": str(task.work_order_id)}
+                if task.deliverable_path:
+                    wo_data["deliverable"] = {"path": task.deliverable_path, "type": getattr(task, "deliverable_type", "code") or "code"}
                 if getattr(task, 'deliverable_paths', ()):
-                    wo_data = {"deliverables": [{"path": p} for p in task.deliverable_paths]}
-                elif task.deliverable_path:
-                    wo_data = {"deliverable": {"path": task.deliverable_path, "type": task.deliverable_type or "code"}}
+                    wo_data["deliverables"] = [{"path": p} for p in task.deliverable_paths]
+            elif "id" not in wo_data and task.work_order_id:
+                wo_data["id"] = str(task.work_order_id)
 
             from validators.harness.deliverable_verifier import verify_work_order_deliverables
             deliv_passed, deliv_errors, deliv_evidence = verify_work_order_deliverables(
@@ -525,7 +529,7 @@ class _VerificationMixin:
                         outcome_verified = False
                         for err in deliv_errors:
                             staged_errors.append(f"Deliverable verification failed: {err}")
-                elif task.deliverable_path and not deliverable_touched and not is_peer_deliv:
+                elif task.deliverable_path and not deliverable_touched and not is_peer_deliv and not any(r.returncode == 0 for r in command_results):
                     is_non_code_task = (
                         getattr(task, 'deliverable_type', None) in ('doc', 'verification', 'review', 'release', 'research')
                         or any(kw in (task.title or '').lower() for kw in ('qa', 'test', 'verification', 'audit', 'review', 'release', 'doc', 'plan'))
@@ -535,9 +539,6 @@ class _VerificationMixin:
                         or (decision.report_markdown and decision.report_markdown.strip())
                     )
                     if is_non_code_task and has_report:
-                        # Non-code task (e.g. doc, research) with a report/summary can complete
-                        # without touching the deliverable file; governance succeeds based on
-                        # the reported outcome rather than file modifications.
                         outcome_verified = (
                             decision.status == 'completed'
                             and not decision.blockers

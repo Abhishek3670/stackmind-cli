@@ -73,7 +73,7 @@ class _ControlsMixin:
         state.blocked_wo_ids.clear()
         state.recovery_wo_id = None
         state.recovery_decision_operation_id = None
-        if hasattr(self.manager, "_sessions"):
+        if hasattr(self, "manager") and hasattr(self.manager, "_sessions"):
             sess = getattr(self.manager, "_sessions", {}).get(state.session_id)
             if sess and sess.get("state") in {"CANCELLED", "PAUSED", "WAITING", "BLOCKED", "FAILED"}:
                 sess["state"] = "RUNNING"
@@ -98,23 +98,38 @@ class _ControlsMixin:
                     candidate_ids.append(target_id)
 
         completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+        cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
         rework_targets = set()
         for targets in getattr(state, "qa_rework_targets", {}).values():
             rework_targets.update(targets)
 
-        seen: set[str] = set(state.completed_wo_ids)
+        superseded_set = set(getattr(state, "superseded_wo_ids", []))
+        seen: set[str] = set()
         for wo_id in candidate_ids:
             if wo_id in seen:
                 continue
             seen.add(wo_id)
+            if wo_id in state.completed_wo_ids:
+                continue
             if (completed_dir / f"{wo_id}.yaml").is_file() and wo_id not in rework_targets:
                 if wo_id not in state.completed_wo_ids:
                     state.completed_wo_ids.append(wo_id)
                 continue
+            if (cancelled_dir / f"{wo_id}.yaml").is_file() or wo_id in superseded_set:
+                active_copy = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
+                if active_copy.is_file():
+                    try:
+                        active_copy.unlink()
+                    except OSError:
+                        pass
+                continue
             self._unarchive_work_order(ws, wo_id)
             if wo_id in state.blocked_wo_ids:
                 state.blocked_wo_ids.remove(wo_id)
-        state.worker_wo_ids = [w for w in state.worker_wo_ids if w not in state.completed_wo_ids]
+        state.worker_wo_ids = [
+            w for w in state.worker_wo_ids
+            if w not in state.completed_wo_ids and w not in superseded_set
+        ]
         state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w not in state.completed_wo_ids]
 
     # ── P0-5 Human Override, Escalation, and Exit Codes ─────────────────
@@ -124,6 +139,13 @@ class _ControlsMixin:
         "qa_reworks",
         "worker_retries",
         "global_turn_budget",
+        "authoring_repair_attempts",
+        "recovery_attempts",
+        "integration_rework_rounds",
+        "final_prerequisite_rounds",
+        "final_review_rounds",
+        "infra_retries",
+        "qa_review_attempts",
     }
 
     def reject_plan(self, state: RunState, reason: str = "") -> AdvanceResult:
@@ -212,6 +234,34 @@ class _ControlsMixin:
             elif c == "global_turn_budget":
                 state.global_turn_budget = budget_grant if budget_grant > 0 else (new_budget or state.initial_turn_budget)
                 state.budget_exhausted = False
+            elif c == "authoring_repair_attempts":
+                state.authoring_repair_attempts = 0
+            elif c == "recovery_attempts":
+                state.recovery_attempts.clear()
+            elif c == "integration_rework_rounds":
+                state.integration_rework_rounds = 0
+                setattr(state, "integration_retries", 0)
+            elif c == "final_prerequisite_rounds":
+                state.final_prerequisite_rounds = 0
+            elif c == "final_review_rounds":
+                state.final_review_rounds = 0
+            elif c == "infra_retries":
+                if hasattr(state, "infra_retries"):
+                    state.infra_retries.clear()
+            elif c == "qa_review_attempts":
+                state.qa_review_attempts.clear()
+
+        # If no specific reset_counters declared, auto-reset the counter of the tripping breaker
+        if not counters:
+            state.authoring_repair_attempts = 0
+            state.recovery_attempts.clear()
+            state.integration_rework_rounds = 0
+            setattr(state, "integration_retries", 0)
+            state.final_prerequisite_rounds = 0
+            state.final_review_rounds = 0
+            state.gitops_retries = 0
+            if hasattr(state, "infra_retries"):
+                state.infra_retries.clear()
 
         if budget_grant > 0:
             if "global_turn_budget" not in counters:
@@ -236,9 +286,17 @@ class _ControlsMixin:
                 for f in list(blocked_dir.glob("*.yaml")):
                     self._unarchive_work_order(ws, f.stem)
             active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
+            superseded_set = set(getattr(state, "superseded_wo_ids", []))
             if active_dir.is_dir():
                 for f in active_dir.glob("*.yaml"):
                     try:
+                        if (cancelled_dir / f.name).is_file() or f.stem in superseded_set:
+                            try:
+                                f.unlink()
+                            except OSError:
+                                pass
+                            continue
                         content = f.read_text(encoding="utf-8")
                         if "Architect repair outcome invalid" in content or "status: BLOCKED" in content or "status: FAILED" in content:
                             import yaml
@@ -283,6 +341,7 @@ class _ControlsMixin:
         return AdvanceResult.TRANSITIONED
 
     human_resume = resume_run_with_human_override
+    resume_run = resume_run_with_human_override
 
     def re_attest_run(
         self,
@@ -342,6 +401,13 @@ class _ControlsMixin:
         state.error = None
         state.exit_code = EXIT_SUCCESS
         state.stall_ticks = 0
+        state.blocked_wo_ids.clear()
+        state.worker_blockers.clear()
+        state.failed_wo_ids.clear()
+        try:
+            self._discover_worker_wos(state)
+        except Exception:
+            pass
 
         # Human supplies authoritative budget:
         state.global_turn_budget = confirmed_budget

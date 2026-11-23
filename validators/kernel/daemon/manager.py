@@ -1854,10 +1854,13 @@ class SessionManager:
                 if k in state.budget_usage:
                     state.budget_usage[k].clear()
         if not getattr(state, "plan_id", None):
-            plans = self.list_plans(state.session_id)
-            if plans:
-                state.plan_id = plans[-1].get("plan_id") or "PLAN-001"
-            elif (ws / ".sync" / "playbook" / "PLAN.md").is_file() or (ws / "PLAN.md").is_file():
+            try:
+                plans = self.list_plans(state.session_id)
+                if plans:
+                    state.plan_id = plans[-1].get("plan_id") or "PLAN-001"
+            except Exception:
+                pass
+            if not getattr(state, "plan_id", None) and ((ws / ".sync" / "playbook" / "PLAN.md").is_file() or (ws / "PLAN.md").is_file()):
                 state.plan_id = "PLAN-001"
         # Held-back QA re-dispatch is likewise released: the fresh QA turn
         # re-evaluates the deliverables and re-routes defects if they persist.
@@ -2005,6 +2008,13 @@ class SessionManager:
         state.integration_retries = 0
         if state.error and ("exhausted" in state.error or "blocked" in state.error.lower() or "failed" in state.error.lower()):
             state.error = None
+
+        # Prune stale dependency waits for non-active or completed work orders
+        if hasattr(state, "dependency_waits") and isinstance(state.dependency_waits, dict):
+            active_stems = {p.stem for p in active_dir.glob("*.yaml")} if active_dir.is_dir() else set()
+            for wid in list(state.dependency_waits.keys()):
+                if wid not in active_stems or wid in getattr(state, "completed_wo_ids", []):
+                    state.dependency_waits.pop(wid, None)
 
         # Clean up stale superseded_wo_ids: any work order that is active or completed on disk is not superseded
         if hasattr(state, "superseded_wo_ids") and isinstance(state.superseded_wo_ids, list):
@@ -2234,6 +2244,11 @@ class SessionManager:
             try:
                 from cli.init import ensure_workspace_protocol_scaffolding
                 ensure_workspace_protocol_scaffolding(ws)
+            except Exception:
+                pass
+            try:
+                from .authoring import reconcile_active_work_orders_with_plan
+                reconcile_active_work_orders_with_plan(ws)
             except Exception:
                 pass
             target_run_id = run_id
@@ -3438,29 +3453,40 @@ class SessionManager:
             is_authoring_param = bool(op_rec.get("metadata", {}).get("is_authoring"))
             is_delivery_status_param = bool(op_rec.get("metadata", {}).get("is_delivery_status"))
             session_history: list[dict[str, str]] = []
-            client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
-            if isinstance(client_hist, list) and client_hist:
-                for h in client_hist:
-                    if isinstance(h, dict) and "role" in h and "content" in h:
-                        h_content = str(h["content"]).strip()
-                        if h_content and not h_content.startswith(":"):
-                            if not (h_content.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in h_content):
-                                session_history.append({"role": str(h["role"]).lower(), "content": h_content})
-            else:
-                with self._lock:
-                    for r in session.get("journal", []):
-                        if r.get("operation_id") == operation_id:
-                            continue
-                        if r.get("operation") == "turn" and not r.get("work_order_id") and not (r.get("metadata") or {}).get("is_authoring"):
-                            u_p = (r.get("metadata") or {}).get("prompt") or r.get("prompt")
-                            res = r.get("result") or {}
-                            a_r = res.get("summary") or res.get("report_markdown")
-                            if u_p and a_r and isinstance(a_r, str) and a_r.strip():
-                                u_clean = str(u_p).strip()
-                                a_clean = str(a_r).strip()
-                                if not u_clean.startswith(":") and not (a_clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in a_clean):
-                                    session_history.append({"role": "user", "content": u_clean})
-                                    session_history.append({"role": "assistant", "content": a_clean})
+            if not wo_id_param and not is_authoring_param:
+                # Conversational / ad-hoc turn: inherit chat history
+                client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
+                if isinstance(client_hist, list) and client_hist:
+                    for h in client_hist:
+                        if isinstance(h, dict) and "role" in h and "content" in h:
+                            h_content = str(h["content"]).strip()
+                            if h_content and not h_content.startswith(":"):
+                                if not (h_content.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in h_content):
+                                    session_history.append({"role": str(h["role"]).lower(), "content": h_content})
+                else:
+                    with self._lock:
+                        for r in session.get("journal", []):
+                            if r.get("operation_id") == operation_id:
+                                continue
+                            if r.get("operation") == "turn" and not r.get("work_order_id") and not (r.get("metadata") or {}).get("is_authoring"):
+                                u_p = (r.get("metadata") or {}).get("prompt") or r.get("prompt")
+                                res = r.get("result") or {}
+                                a_r = res.get("summary") or res.get("report_markdown")
+                                if u_p and a_r and isinstance(a_r, str) and a_r.strip():
+                                    u_clean = str(u_p).strip()
+                                    a_clean = str(a_r).strip()
+                                    if not u_clean.startswith(":") and not (a_clean.startswith(("✗ ", "⊘ ", "[ERROR]", "Operation failed:")) or "Add usage credits" in a_clean):
+                                        session_history.append({"role": "user", "content": u_clean})
+                                        session_history.append({"role": "assistant", "content": a_clean})
+            elif wo_id_param:
+                # Governed work order turn: isolate context to prevent cross-role/cross-WO contamination
+                client_hist = (op_rec.get("metadata") or {}).get("chat_history") or (op_rec.get("metadata") or {}).get("session_history")
+                if isinstance(client_hist, list) and client_hist:
+                    for h in client_hist:
+                        if isinstance(h, dict) and str(h.get("work_order_id", "")) == str(wo_id_param):
+                            h_content = str(h.get("content", "")).strip()
+                            if h_content and not h_content.startswith(":"):
+                                session_history.append({"role": str(h.get("role", "user")).lower(), "content": h_content})
 
             if len(session_history) > 12:
                 session_history = session_history[-12:]

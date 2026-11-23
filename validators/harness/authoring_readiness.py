@@ -299,7 +299,42 @@ def load_plan_milestones(workspace: Path | str) -> list[dict[str, Any]] | None:
                     "status": getattr(m, "status", "PENDING"),
                 })
     except Exception:
-        return None
+        pass
+
+    # Also parse explicit Work Orders markdown table if present (e.g. ## Work Orders / ## Tasks)
+    try:
+        wo_table_match = re.search(
+            r"^##\s+[^\n]*(?:Work Orders|Tasks|Work-Orders)[^\n]*\n(.*?)(?=^##\s+|\Z)",
+            content,
+            re.MULTILINE | re.DOTALL | re.IGNORECASE,
+        )
+        if wo_table_match:
+            lines = [l.strip() for l in wo_table_match.group(1).splitlines() if l.strip().startswith("|")]
+            if len(lines) >= 3:
+                headers = [h.strip().lower() for h in lines[0].split("|")[1:-1]]
+                id_idx = next((i for i, h in enumerate(headers) if h in ("id", "wo", "wo id", "wo-id", "work order")), None)
+                title_idx = next((i for i, h in enumerate(headers) if h in ("title", "name", "task", "description")), None)
+                agent_idx = next((i for i, h in enumerate(headers) if h in ("agent", "assigned", "assigned agent", "role")), None)
+                for line in lines[2:]:
+                    cols = [c.strip() for c in line.split("|")[1:-1]]
+                    row_id = cols[id_idx] if id_idx is not None and id_idx < len(cols) else ""
+                    row_title = cols[title_idx] if title_idx is not None and title_idx < len(cols) else ""
+                    row_agent = cols[agent_idx] if agent_idx is not None and agent_idx < len(cols) else ""
+                    row_id = re.sub(r"[`*]", "", row_id).strip()
+                    row_title = re.sub(r"[`*]", "", row_title).strip()
+                    row_agent = re.sub(r"[`*]", "", row_agent).strip().lower()
+                    if row_id.startswith("WO-") or row_title:
+                        if not any(r.get("id") == row_id for r in refs):
+                            refs.append({
+                                "id": row_id or f"WO-{len(refs)+1:03d}",
+                                "title": row_title or row_id,
+                                "agent": row_agent or "codex",
+                                "tasks": [],
+                                "status": "PENDING",
+                            })
+    except Exception:
+        pass
+
     return refs or None
 
 
@@ -411,10 +446,20 @@ def _is_meta_work_order(data: dict[str, Any]) -> bool:
         return True
     wo_type = str(data.get("type") or "").upper()
     title = str(data.get("title") or "").lower()
-    if wo_type in ("VALIDATION", "QA", "TEST") and "integration review" in title:
+    if wo_type in ("VALIDATION", "QA", "TEST", "AUDIT") and "integration review" in title:
         return True
-    if wo_type == "RESEARCH" and "system architecture" in title:
+    if wo_type in ("AUDIT", "PHASE"):
         return True
+    if "integration review" in title:
+        return True
+    if wo_type in ("RESEARCH", "PHASE") and ("architecture" in title or "planning" in title or "enhancement" in title):
+        return True
+    assigned = data.get("assigned_agents") or []
+    if isinstance(assigned, list) and assigned and all(str(a).lower() in ("claude", "architecture") for a in assigned):
+        deliv = _extract_deliverable(data) or {}
+        deliv_path = str(deliv.get("path") or "").lower()
+        if "plan.md" in deliv_path or not deliv_path:
+            return True
     return False
 
 
@@ -628,6 +673,7 @@ def validate_authoring_readiness(
     expected_milestones: Sequence[str] | None = None,
     planning_wo_id: str = "WO-000",
     completed_wo_ids: Sequence[str] | None = None,
+    superseded_wo_ids: Sequence[str] | None = None,
 ) -> AuthoringReadinessResult:
     """Validate the authored artifact set for atomic publication.
 
@@ -639,12 +685,14 @@ def validate_authoring_readiness(
     warnings: list[str] = []
     artifact_paths: list[str] = []
     skip_ids = _PLANNING_WO_IDS | ({planning_wo_id} if planning_wo_id else set())
+    superseded_set = set(superseded_wo_ids or ())
 
     gate = AuthoringGate(project_root=ws)
 
     # ── 1. Discover and parse artifacts ─────────────────────────────
     active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
     completed_dir = ws / ".sync" / "work-orders" / "COMPLETED"
+    cancelled_dir = ws / ".sync" / "work-orders" / "CANCELLED"
     contracts_dir = ws / ".sync" / "contracts"
 
     wo_files: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -658,10 +706,14 @@ def validate_authoring_readiness(
             if data is None:
                 continue
             wo_id = str(data.get("id") or f.stem)
-            if wo_id in skip_ids:
+            if wo_id in skip_ids or wo_id in superseded_set:
                 continue
             status = str(data.get("status", "")).upper()
-            if status in ("COMPLETED", "CANCELLED", "FAILED"):
+            if status in ("COMPLETED", "CANCELLED", "FAILED", "SUPERSEDED") or data.get("completion"):
+                if data.get("completion"):
+                    completed_wo_files[wo_id] = (rel, data)
+                continue
+            if (completed_dir / f"{wo_id}.yaml").is_file() or (cancelled_dir / f"{wo_id}.yaml").is_file():
                 continue
             if p_idx is not None and (_parse_wo_index(wo_id) or 0) <= p_idx:
                 continue
@@ -705,11 +757,13 @@ def validate_authoring_readiness(
             is_recovery = str(data.get("synthesized_by") or "").startswith("recovery-repair")
             if is_arch_agent and not is_recovery:
                 continue
+            if (completed_dir / f"{wo_ref}.yaml").is_file() or (cancelled_dir / f"{wo_ref}.yaml").is_file() or (wo_ref in superseded_set):
+                continue
             cand = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_ref}.yaml"
             if cand.is_file():
                 try:
                     c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
-                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "CANCELLED", "FAILED"):
+                    if str(c_data.get("status", "")).upper() in ("COMPLETED", "CANCELLED", "FAILED") or c_data.get("completion"):
                         continue
                 except Exception:
                     pass
@@ -769,7 +823,7 @@ def validate_authoring_readiness(
                 try:
                     c_data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
                     st = str(c_data.get("status", "")).upper()
-                    if folder in ("BLOCKED", "COMPLETED") or st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED"):
+                    if folder in ("BLOCKED", "COMPLETED") or st in ("COMPLETED", "BLOCKED", "FAILED", "CANCELLED") or c_data.get("completion"):
                         is_archived_or_terminal = True
                         break
                 except Exception:
@@ -1039,7 +1093,7 @@ def validate_authoring_readiness(
                             affected_artifacts=(rel,),
                         )
 
-                if dep_str in wo_files or dep_str in completed_wo_files or dep_str in skip_ids:
+                if dep_str in wo_files or dep_str in completed_wo_files or dep_str in skip_ids or dep_str in superseded_set:
                     continue
                 _issue(
                     issues,

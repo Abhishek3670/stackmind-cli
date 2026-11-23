@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -95,7 +97,7 @@ class DeliverableVerifier:
     }
 
     # File types that can be checked
-    CHECKABLE_EXTENSIONS = {".py", ".ts", ".js", ".json", ".yaml", ".yml", ".html", ".css", ".md"}
+    CHECKABLE_EXTENSIONS = {".py", ".ts", ".js", ".mjs", ".cjs", ".json", ".yaml", ".yml", ".html", ".css", ".md"}
 
     def verify(
         self,
@@ -394,7 +396,56 @@ class DeliverableVerifier:
             # Validate media assets (images, videos, pictures, sources)
             checks.extend(self._check_html_media_assets(path, content))
 
-        if ext not in (".json", ".yaml", ".yml", ".py", ".html"):
+        # JavaScript syntax check (.js, .mjs, .cjs)
+        if ext in (".js", ".mjs", ".cjs"):
+            js_syntax_error: str | None = None
+            node_bin = shutil.which("node")
+            if node_bin:
+                try:
+                    proc = subprocess.run(
+                        [node_bin, "--check", str(path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if proc.returncode != 0:
+                        err_out = (proc.stderr or proc.stdout or "").strip()
+                        err_lines = [l.strip() for l in err_out.splitlines() if l.strip() and not l.startswith("Node.js")]
+                        js_syntax_error = "\n".join(err_lines[:4]) if err_lines else f"Syntax error (exit {proc.returncode})"
+                except Exception:
+                    pass
+
+            if not js_syntax_error:
+                # TypeScript annotation/syntax leak detector in plain .js
+                ts_patterns = [
+                    (r"(?m)\b(?:async\s+)?function\s*\w*\s*\([^)]*\)\s*:\s*[A-Za-z_<]", "Function return type annotation"),
+                    (r"(?m)\bfunction\s*\w*\s*\([^)]*:\s*(?:string|number|boolean|any|void|unknown|Promise<)", "Parameter type annotation"),
+                    (r"(?m)^\s*(?:export\s+)?interface\s+[A-Z]\w+\s*[{<]", "TypeScript interface declaration"),
+                    (r"(?m)^\s*(?:export\s+)?type\s+[A-Z]\w+\s*=", "TypeScript type alias declaration"),
+                ]
+                for pat, desc in ts_patterns:
+                    m = re.search(pat, content)
+                    if m:
+                        matched_snippet = m.group(0).strip().replace("\n", " ")
+                        js_syntax_error = f"{desc} in plain JavaScript: '{matched_snippet}'"
+                        break
+
+            if js_syntax_error:
+                checks.append(VerificationCheck(
+                    name="javascript_syntax",
+                    passed=False,
+                    message=f"JavaScript syntax error: {js_syntax_error}",
+                    severity="error",
+                ))
+            else:
+                checks.append(VerificationCheck(
+                    name="javascript_syntax",
+                    passed=True,
+                    message="Valid JavaScript syntax",
+                    severity="info",
+                ))
+
+        if ext not in (".json", ".yaml", ".yml", ".py", ".html", ".js", ".mjs", ".cjs"):
             checks.append(VerificationCheck(
                 name="format_syntax",
                 passed=True,

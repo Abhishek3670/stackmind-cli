@@ -141,8 +141,9 @@ def _declared_deliverable_paths(wo_data: Any) -> list[str]:
 def _contained_deliverable_file(ws: Path, rel_path: str) -> Path | None:
     """Resolve *rel_path* inside *ws*, refusing traversal outside the workspace."""
     try:
-        candidate = (ws / rel_path).resolve()
-        candidate.relative_to(ws)
+        ws_resolved = Path(ws).resolve()
+        candidate = (ws_resolved / rel_path).resolve()
+        candidate.relative_to(ws_resolved)
     except (OSError, ValueError):
         return None
     return candidate if candidate.is_file() else None

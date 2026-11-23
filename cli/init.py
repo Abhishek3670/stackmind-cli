@@ -540,9 +540,7 @@ def ensure_canonical_tree(workspace: Path | str) -> dict[str, Any]:
 
 STACKMIND_ROOT_FILES = (
     ".gitignore",
-    "README.md",
-    "CHANGELOG.md",
-    "VERSION",
+    "PLAN.md",
 )
 
 
@@ -821,31 +819,9 @@ def init(
         "STACKMIND_BIN_PATH": stackmind_bin.replace("\\", "/"),
     }
 
-    # ── Step 4: Render product-facing documentation ─
-    # AGENTS.md is internal runtime metadata, stays in .sync/ only
-    readme_template = templates_dir / "README.template.md"
-    readme_path = project_path / "README.md"
-    if readme_template.exists() and (not preserve_existing or not readme_path.exists()):
-        render_template_file(
-            readme_template,
-            readme_path,
-            context,
-        )
-
-    # Playbook artifacts (ARCHITECTURE.md, DESIGN.md, PLAN.md) authored by Architect into .sync/playbook/
-
-    changelog_template = templates_dir / "CHANGELOG.template.md"
-    if changelog_template.exists() and (
-        not preserve_existing or not (project_path / "CHANGELOG.md").exists()
-    ):
-        render_template_file(changelog_template, project_path / "CHANGELOG.md", context)
-
-    version_template = templates_dir / "VERSION.template"
-    if version_template.exists() and (
-        not preserve_existing or not (project_path / "VERSION").exists()
-    ):
-        render_template_file(version_template, project_path / "VERSION", context)
-
+    # ── Step 4: Configure repository hygiene (.gitignore) ──
+    # Note: README.md, CHANGELOG.md, and VERSION are not created at initialization time;
+    # specialist agents (Lead Architect, GitOps) author and reconcile them when needed during project milestones.
     gitignore_template = templates_dir / ".gitignore.template"
     gitignore_path = project_path / ".gitignore"
     if gitignore_template.exists() and (not preserve_existing or not gitignore_path.exists()):
@@ -859,7 +835,7 @@ def init(
         if ".sync/" not in current_gi:
             gitignore_path.write_text(current_gi.rstrip() + "\n\n# Stackmind runtime\n.sync/\ngraphify-out/\n", encoding="utf-8", newline="\n")
 
-    console.print("[bold green][+][/bold green] Rendered CHANGELOG.md, VERSION, .gitignore")
+    console.print("[bold green][+][/bold green] Configured .gitignore")
 
     # ── Step 5: Create .sync/ structure ───────────────────────
     sync_path.mkdir(parents=True, exist_ok=True)

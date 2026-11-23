@@ -6,6 +6,7 @@ Part of the :mod:`validators.kernel.daemon.supervisor` package.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -559,6 +560,11 @@ class _PhasesMixin:
         if not state.worker_wo_ids:
             self._discover_worker_wos(state)
 
+        if state.published_wo_ids:
+            for wid in state.worker_wo_ids:
+                if wid not in state.published_wo_ids:
+                    state.published_wo_ids.append(wid)
+
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
@@ -814,6 +820,11 @@ class _PhasesMixin:
                         state.published_wo_ids.append(target_id)
                     self._unarchive_work_order(ws, target_id)
 
+        if state.published_wo_ids:
+            for wid in state.worker_wo_ids:
+                if wid not in state.published_wo_ids:
+                    state.published_wo_ids.append(wid)
+
         published = set(state.published_wo_ids)
         superseded = set(state.superseded_wo_ids)
 
@@ -884,6 +895,8 @@ class _PhasesMixin:
                         if active_in_flight_ops >= max_c:
                             all_done = False
                             continue
+                        if wo_id not in ("WO-001", "WO-000", getattr(state, "planning_wo_id", None)):
+                            self._ensure_project_dependencies(ws, state)
                         agent = self._agent_for_wo(wo_id, ws)
                         try:
                             op = self.manager.start_turn(
@@ -1007,8 +1020,11 @@ class _PhasesMixin:
                 # finalized as 'completed'.
                 verdict_hits = self._find_qa_defect_verdicts(ws, wo_id, state=state)
                 if verdict_hits:
+                    res = op.get("result", {}) or {}
+                    qa_err = str(res.get("report_markdown") or res.get("summary") or "")
+                    qa_blockers = "\n".join(res.get("blockers", [])) if isinstance(res.get("blockers"), list) else str(res.get("blockers") or "")
                     routed = self._route_qa_defect_to_developers(
-                        state, ws, wo_id, op, "", "",
+                        state, ws, wo_id, op, qa_err, qa_blockers,
                     )
                     if routed is not None:
                         return routed
@@ -1042,6 +1058,28 @@ class _PhasesMixin:
                     turns_dispatched += 1
                     all_done = False
                     _review_gate.archive_qa_verdict(ws, wo_id, suffix="stale")
+                continue
+
+            if (
+                _review_gate.requires_qa(ws, wo_id, wo_data)
+                and not _review_gate.is_qa_work_order(wo_data)
+                and self._role_for_agent(self._agent_for_wo(wo_id, ws)) != "qa"
+                and self._check_qa_verdict(wo_id, ws) == "INFRA_ERROR"
+            ):
+                # Environment or harness failure (test runner crash, OOM, runner timeout):
+                retries = state.infra_retries.get(wo_id, 0)
+                max_infra = getattr(state, "max_infra_retries", 3)
+                if retries >= max_infra:
+                    state.error = (
+                        f"QA infrastructure / test harness failure on {wo_id} exceeded retry limit "
+                        f"({retries}/{max_infra}); human intervention required"
+                    )
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+                state.infra_retries[wo_id] = retries + 1
+                _review_gate.archive_qa_verdict(ws, wo_id, suffix="infra_retry")
+                all_done = False
                 continue
 
             # ── Mandatory QA review gate ──────────────────────────────────

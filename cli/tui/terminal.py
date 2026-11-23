@@ -1057,13 +1057,15 @@ def prompt_composer_input(
                 sys.stdout.write(f"\n{bottom_border}\x1b[1A\r")
             sys.stdout.flush()
 
-        def _clear_dropdown() -> bool:
+        def _clear_dropdown(stream: Any = None) -> bool:
             if is_full_screen and session is not None and state is not None:
                 try:
+                    target_stream = stream or sys.stdout
                     redraw_full_screen(
                         session,
                         state,
-                        clear=True,
+                        clear=False,
+                        stream=target_stream,
                         include_composer=True,
                         composer_is_active=True,
                         composer_content=getattr(state, "composer_buffer", ""),
@@ -1072,8 +1074,8 @@ def prompt_composer_input(
                     term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
                     c_row = compute_composer_cursor_row(term_lines, state=state, width=comp_width)
                     c_col = 5 + len(getattr(state, "composer_buffer", ""))
-                    sys.stdout.write(f"\x1b[{c_row};{c_col}H")
-                    sys.stdout.flush()
+                    target_stream.write(f"\x1b[{c_row};{c_col}H")
+                    target_stream.flush()
                     return True
                 except Exception:
                     pass

@@ -331,3 +331,130 @@ def test_index_yaml_normalization_and_gate_validation():
     assert "orders" in loaded
     assert len(loaded["orders"]) == 1
     assert loaded["orders"][0]["assigned_agents"] == ["codex"]
+
+
+def test_parse_plan_heading_style_milestones_and_task_lists():
+    """parse_plan must parse heading-style milestones (### Milestone 1: ...) and subtasks."""
+    from validators.harness.plan import parse_plan
+
+    plan_md = """# Project Plan: Secure Auth System
+
+## Current Architecture
+Node.js + Express backend with TypeScript and SQLite.
+
+## Milestones & Roadmap
+
+### Milestone 1: Scaffolding & Config (Agent: codex)
+- [ ] Task 1.1: Init package.json
+- [ ] Task 1.2: Configure TypeScript
+
+### Milestone 2: Database Schema (Agent: codex)
+- [ ] Task 2.1: Implement db connection
+- [ ] Task 2.2: Drizzle schema
+
+### Milestone 3: Frontend Client (Agent: gemini)
+- [ ] Task 3.1: Create design tokens
+
+## Risk Mitigation
+| Risk | Impact |
+| High | High |
+
+## Agent Assignment Summary
+| Agent | Milestones | Focus Area |
+| codex | 1, 2 | Backend |
+| gemini | 3 | Frontend |
+"""
+    parsed = parse_plan(plan_md)
+    assert len(parsed.milestones) == 3
+    assert parsed.milestones[0].id == "Milestone 1"
+    assert parsed.milestones[0].title == "Scaffolding & Config"
+    assert parsed.milestones[0].agent == "codex"
+    assert len(parsed.milestones[0].tasks) == 2
+
+    assert parsed.milestones[1].id == "Milestone 2"
+    assert parsed.milestones[1].title == "Database Schema"
+    assert parsed.milestones[1].agent == "codex"
+    assert len(parsed.milestones[1].tasks) == 2
+
+    assert parsed.milestones[2].id == "Milestone 3"
+    assert parsed.milestones[2].title == "Frontend Client"
+    assert parsed.milestones[2].agent == "gemini"
+    assert len(parsed.milestones[2].tasks) == 1
+
+
+def test_readiness_recognizes_completed_work_orders_and_superseded_deps(tmp_path: Path):
+    """validate_authoring_readiness must recognize orders with completion as completed."""
+    from validators.harness.authoring_readiness import validate_authoring_readiness
+
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    (ws / ".sync" / "playbook").mkdir(parents=True)
+    (ws / ".sync" / "work-orders" / "ACTIVE").mkdir(parents=True)
+    (ws / ".sync" / "work-orders" / "COMPLETED").mkdir(parents=True)
+    (ws / ".sync" / "work-orders" / "CANCELLED").mkdir(parents=True)
+    (ws / ".sync" / "contracts").mkdir(parents=True)
+
+    # Completed order with completion payload sitting in ACTIVE/
+    completed_wo = {
+        "id": "WO-018",
+        "title": "Scaffolding",
+        "type": "FEATURE",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": ["WO-017"],
+        "deliverable": {"path": "package.json", "type": "config"},
+        "completion": {"verified": True},
+    }
+    (ws / ".sync" / "work-orders" / "ACTIVE" / "WO-018.yaml").write_text(yaml.safe_dump(completed_wo), encoding="utf-8")
+
+    # Active order depending on WO-018
+    active_wo = {
+        "id": "WO-096",
+        "title": "DB Migrations",
+        "type": "FEATURE",
+        "status": "ACTIVE",
+        "priority": "P0",
+        "assigned_agents": ["codex"],
+        "dependencies": ["WO-018"],
+        "deliverable": {"path": "src/db.ts", "type": "code"},
+        "test_plan": [{"source": "src/db.ts", "tests": ["tests/test_db.py"]}],
+    }
+    (ws / ".sync" / "work-orders" / "ACTIVE" / "WO-096.yaml").write_text(yaml.safe_dump(active_wo), encoding="utf-8")
+
+    contract = {
+        "work_order": "WO-096",
+        "agent_id": "codex",
+        "budget": {"max_files_touched": 5},
+        "scope": {"allow": ["src/db.ts", "tests/test_db.py"]},
+    }
+    (ws / ".sync" / "contracts" / "WO-096.yaml").write_text(yaml.safe_dump(contract), encoding="utf-8")
+
+    res = validate_authoring_readiness(ws, superseded_wo_ids=["WO-017"])
+    assert res.ready is True, f"Expected readiness to pass, got issues: {[i.message for i in res.issues]}"
+
+
+def test_reconcile_promotes_completed_orders_even_without_plan_milestones(tmp_path: Path):
+    """reconcile_active_work_orders_with_plan must promote completed orders even if no milestones."""
+    from validators.kernel.daemon.authoring import reconcile_active_work_orders_with_plan
+
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    (ws / ".sync" / "work-orders" / "ACTIVE").mkdir(parents=True)
+    (ws / ".sync" / "work-orders" / "COMPLETED").mkdir(parents=True)
+    (ws / ".sync" / "work-orders" / "CANCELLED").mkdir(parents=True)
+
+    completed_wo = {
+        "id": "WO-055",
+        "title": "Auth API",
+        "status": "ACTIVE",
+        "deliverable": {"path": "src/auth.ts", "type": "code"},
+        "completion": {"outcome": "success"},
+    }
+    (ws / ".sync" / "work-orders" / "ACTIVE" / "WO-055.yaml").write_text(yaml.safe_dump(completed_wo), encoding="utf-8")
+
+    reconciled = reconcile_active_work_orders_with_plan(ws)
+    assert "WO-055" in reconciled
+    assert not (ws / ".sync" / "work-orders" / "ACTIVE" / "WO-055.yaml").is_file()
+    assert (ws / ".sync" / "work-orders" / "COMPLETED" / "WO-055.yaml").is_file()
+

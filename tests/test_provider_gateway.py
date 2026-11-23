@@ -809,5 +809,49 @@ def test_gateway_write_file_parameter_resilience_and_deliverable_fallback(tmp_pa
     assert "body { margin: 0; }" in res3
 
 
+def test_openai_compatible_429_retry_success(monkeypatch):
+    """Verify that OpenAICompatibleAdapter retries on HTTP 429 and succeeds."""
+    import io
+    import urllib.error
+    import urllib.request
+    from validators.kernel.providers.adapter import OpenAICompatibleAdapter
+    from validators.kernel.providers.models import Message
+
+    call_count = 0
+
+    class Fake429Error(urllib.error.HTTPError):
+        def __init__(self):
+            super().__init__(
+                url="http://mock/chat/completions",
+                code=429,
+                msg="Too Many Requests",
+                hdrs={"Retry-After": "0.01"},
+                fp=io.BytesIO(b'{"status":429,"title":"Too Many Requests"} (reset after 0.01s)'),
+            )
+
+    class Fake200Response:
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"content": "Success after 429"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }).encode("utf-8")
+
+    def mock_urlopen(req, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise Fake429Error()
+        return Fake200Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    adapter = OpenAICompatibleAdapter(base_url="http://mock", api_key="test")
+    resp = adapter.complete([Message.user("Hello")])
+
+    assert call_count == 2
+    assert resp.message.content == "Success after 429"
+
+
+
 
 

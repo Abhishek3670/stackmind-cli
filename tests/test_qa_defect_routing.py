@@ -992,3 +992,231 @@ def test_bugfix_order_prerequisite_unblocked_when_deliverable_present_on_disk(tm
     )
     assert res.status == DependencyStatus.SATISFIED
     assert "deliverable present on disk for BUGFIX repair" in res.prerequisites[0].detail
+
+
+def test_qa_passing_glyph_does_not_route_false_defect(tmp_path: Path) -> None:
+    """When QA reports passing checkmarks/exit 0 on a deliverable (e.g. node --check ✅),
+    it must NOT be treated as an active defect finding routing developer rework."""
+    _write_worker_yaml(tmp_path, "WO-001", "codex", "src/server.js")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_api.py")
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-004", "WO-001"])
+    state.completed_wo_ids = ["WO-001"]
+    wo1_op = mock_mgr.start_turn("sess-001", "Build server", work_order_id="WO-001", agent_id="codex")
+    mock_mgr.complete_operation(wo1_op["operation_id"], "COMPLETED")
+    wo4_op = mock_mgr.start_turn("sess-001", "QA server", work_order_id="WO-004", agent_id="gemma")
+    mock_mgr.complete_operation(
+        wo4_op["operation_id"], "BLOCKED",
+        result={
+            "status": "blocked",
+            "summary": "QA syntax checks complete: - src/server.js: node --check ✅ (passed exit 0)",
+            "blockers": ["General verification gate blocked on environment setup"],
+        },
+    )
+
+    res = supervisor.advance(state)
+
+    # WO-001 must NOT be routed as a defect rework target because src/server.js passed!
+    assert state.qa_rework_targets.get("WO-004") is None
+    rework_ops = [
+        op for op in mock_mgr.list_operations()
+        if op.get("work_order_id") == "WO-001" and op["operation_id"] != wo1_op["operation_id"]
+    ]
+    assert len(rework_ops) == 0
+    assert "WO-001" in state.completed_wo_ids
+
+
+def test_qa_verdict_contradictory_pass_with_failed_criteria_routed_as_defect(tmp_path: Path) -> None:
+    """A QA review JSON with verdict: PASS but criteria.outcome: FAIL must be routed as a defect."""
+    _write_worker_yaml(tmp_path, "WO-001", "codex", "src/server.js")
+    _write_worker_yaml(tmp_path, "WO-004", "gemma", "tests/test_api.py")
+
+    review_dir = tmp_path / ".sync" / "reviews" / "qa"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    verdict_payload = {
+        "work_order_id": "WO-001",
+        "verdict": "PASS",
+        "reviewer": "gemma",
+        "criteria": [
+            {"id": "syntax", "description": "Syntax check src/server.js", "outcome": "FAIL", "evidence": "Unexpected token"}
+        ],
+        "findings": [],
+    }
+    (review_dir / "WO-001.json").write_text(json.dumps(verdict_payload), encoding="utf-8")
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-004", "WO-001"])
+    state.completed_wo_ids = ["WO-001"]
+    wo1_op = mock_mgr.start_turn("sess-001", "Build server", work_order_id="WO-001", agent_id="codex")
+    mock_mgr.complete_operation(wo1_op["operation_id"], "COMPLETED")
+    wo4_op = mock_mgr.start_turn("sess-001", "QA server", work_order_id="WO-004", agent_id="gemma")
+    mock_mgr.complete_operation(wo4_op["operation_id"], "BLOCKED", result={"status": "blocked", "blockers": ["Syntax check failed"]})
+
+    res = supervisor.advance(state)
+
+    # Must identify WO-001 as a defect rework target despite verdict: PASS because criteria outcome was FAIL
+    assert state.qa_rework_targets.get("WO-004") == ["WO-001"]
+
+
+def test_published_wo_ids_sync_for_newly_discovered_wos(tmp_path: Path) -> None:
+    """Newly added active worker work orders must sync into published_wo_ids so they are never skipped."""
+    _write_worker_yaml(tmp_path, "WO-090", "codex", "src/auth.ts")
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "auth.ts").write_text("export const auth = true;\n", encoding="utf-8")
+
+    supervisor, mock_mgr, state = _make_state(tmp_path, ["WO-090"])
+    state.published_wo_ids = ["WO-001"]  # Stale published snapshot without WO-090
+
+    # Simulate completed codex operation for WO-090
+    op = mock_mgr.start_turn("sess-001", "Build auth", work_order_id="WO-090", agent_id="codex")
+    mock_mgr.complete_operation(op["operation_id"], "COMPLETED", result={"status": "completed"})
+
+    supervisor._advance_executing(state)
+
+    # WO-090 must have been synced into published_wo_ids and not skipped
+    assert "WO-090" in state.published_wo_ids
+
+
+def test_dynamic_completion_record_for_legacy_completed_prerequisite(tmp_path: Path) -> None:
+    """A legacy COMPLETED work order without a completion dict is dynamically satisfied when deliverable exists."""
+    from validators.kernel.daemon.supervisor.dependencies import evaluate_dependencies, DependencyStatus
+
+    # Create completed WO-040 without completion dict
+    comp_dir = tmp_path / ".sync" / "work-orders" / "COMPLETED"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    wo40 = {
+        "id": "WO-040",
+        "status": "COMPLETED",
+        "revision": 1,
+        "dependencies": [],
+        "deliverable": {"path": "src/schema.ts", "type": "code"},
+    }
+    (comp_dir / "WO-040.yaml").write_text(yaml.safe_dump(wo40), encoding="utf-8")
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "schema.ts").write_text("export const schema = {};\n", encoding="utf-8")
+
+    # Create active WO-096 depending on WO-040
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    wo96 = {
+        "id": "WO-096",
+        "status": "ACTIVE",
+        "dependencies": ["WO-040"],
+        "deliverable": {"path": "src/migration.sql", "type": "code"},
+    }
+    (active_dir / "WO-096.yaml").write_text(yaml.safe_dump(wo96), encoding="utf-8")
+
+    dep_res = evaluate_dependencies(tmp_path, "WO-096", completed_ids=["WO-040"])
+    assert dep_res.status == DependencyStatus.SATISFIED
+
+
+def test_delegate_task_resolves_architecture_alias(tmp_path: Path) -> None:
+    """Delegating to 'architecture' or 'architect' must write to claude inbox."""
+    from validators.kernel.tools import ToolGateway
+    from validators.kernel.sandbox import ProcessSandbox
+    from validators.kernel.boundary import RuntimeBoundary
+    from validators.kernel.operations import OperationJournal
+    from validators.kernel.identity import get_role_policy
+    from validators.kernel.contract import AgentContract
+    from validators.kernel.workspace import ScratchWorkspace
+
+    ws = ScratchWorkspace.create(tmp_path, "test-wo-delegation")
+    contract = AgentContract(
+        agent_id="claude",
+        work_order="WO-000",
+        allow=("workspace/**",),
+        deny=(),
+        write_mode="read-write",
+    ).freeze()
+    policy = get_role_policy("claude")
+    boundary = RuntimeBoundary(OperationJournal())
+
+    gw = ToolGateway(
+        workspace=ws,
+        boundary=boundary,
+        contract=contract,
+        policy=policy,
+        session_id="test-session",
+        attempt_id="test-attempt",
+        actor_id="claude",
+        provider_id="custom",
+    )
+    res = gw.delegate_task("architecture", "Please inspect schema", ["src/schema.ts"])
+    assert res.get("status") == "delegated"
+    claude_inbox = ws.root / ".sync" / "inbox" / "claude"
+    assert claude_inbox.is_dir()
+    delegation_files = list(claude_inbox.glob("*_delegation.md"))
+    assert len(delegation_files) == 1
+    content = delegation_files[0].read_text(encoding="utf-8")
+    assert "To:** claude" in content
+
+
+def test_authoring_readiness_ignores_cancelled_and_superseded_work_orders(tmp_path: Path):
+    """Verify that cancelled and superseded work orders without contracts do not fail readiness."""
+    from validators.harness.authoring_readiness import validate_authoring_readiness
+    import yaml
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    cancelled_dir = tmp_path / ".sync" / "work-orders" / "CANCELLED"
+    contracts_dir = tmp_path / ".sync" / "contracts"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    cancelled_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-001 is active and has a contract
+    (active_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "id": "WO-001", "type": "FEATURE", "status": "ACTIVE", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "src/a.ts"}
+    }), encoding="utf-8")
+    (contracts_dir / "WO-001.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1, "work_order": "WO-001", "agent_id": "codex", "scope": {"allow": [{"module": "src/a.ts"}], "deny": [], "write": "read-write"}
+    }), encoding="utf-8")
+
+    # WO-087 is in CANCELLED/ and also has a zombie copy in ACTIVE/, with NO contract
+    (cancelled_dir / "WO-087.yaml").write_text(yaml.safe_dump({
+        "id": "WO-087", "type": "FEATURE", "status": "CANCELLED", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "src/b.ts"}
+    }), encoding="utf-8")
+    (active_dir / "WO-087.yaml").write_text(yaml.safe_dump({
+        "id": "WO-087", "type": "FEATURE", "status": "ACTIVE", "assigned_agents": ["codex"], "deliverable": {"type": "code", "path": "src/b.ts"}
+    }), encoding="utf-8")
+
+    res = validate_authoring_readiness(tmp_path, planning_wo_id="WO-000", superseded_wo_ids=["WO-087"])
+    missing_contracts = [i for i in res.issues if i.code == "MISSING_CONTRACT"]
+    assert len(missing_contracts) == 0, f"Expected no MISSING_CONTRACT issues, got: {missing_contracts}"
+
+
+def test_unblock_in_flight_work_orders_purges_zombie_cancelled_active_copies(tmp_path: Path):
+    """Verify that unblock_in_flight_work_orders unlinks zombie active copies and excludes them from worker_wo_ids."""
+    from validators.kernel.daemon.supervisor.controls import _ControlsMixin
+    from validators.kernel.daemon.supervisor.models import RunState, Phase
+    import yaml
+
+    active_dir = tmp_path / ".sync" / "work-orders" / "ACTIVE"
+    cancelled_dir = tmp_path / ".sync" / "work-orders" / "CANCELLED"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    cancelled_dir.mkdir(parents=True, exist_ok=True)
+
+    # WO-087 exists in CANCELLED/ and as a zombie in ACTIVE/
+    (cancelled_dir / "WO-087.yaml").write_text(yaml.safe_dump({"id": "WO-087", "status": "CANCELLED"}), encoding="utf-8")
+    (active_dir / "WO-087.yaml").write_text(yaml.safe_dump({"id": "WO-087", "status": "ACTIVE"}), encoding="utf-8")
+
+    class DummySupervisor(_ControlsMixin):
+        def _unarchive_work_order(self, ws, wo_id):
+            pass
+
+    sup = DummySupervisor()
+    state = RunState(
+        run_id="run-test",
+        product_goal="Goal",
+        workspace=str(tmp_path),
+        session_id="sess-test",
+        phase=Phase.WAITING_FOR_HUMAN,
+        worker_wo_ids=["WO-087", "WO-001"],
+        superseded_wo_ids=["WO-087"],
+    )
+
+    sup.unblock_in_flight_work_orders(state)
+    assert not (active_dir / "WO-087.yaml").is_file(), "Zombie active WO-087 copy should have been unlinked"
+    assert "WO-087" not in state.worker_wo_ids, "WO-087 should not be in worker_wo_ids"
+
+
+
+

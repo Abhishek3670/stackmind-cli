@@ -45,6 +45,16 @@ class _RecoveryMixin:
 
     def _advance_architect_repair(self, state: RunState) -> AdvanceResult:
         """ARCHITECT_REPAIR: wait for the bounded Architect repair turn, then revalidate."""
+        if not state.architect_repair_operation_id and state.authoring_repair_attempts >= state.max_authoring_repairs:
+            state.error = (
+                f"Architect repair attempts exhausted "
+                f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
+                f"operator intervention required"
+            )
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
         if state.architect_repair_operation_id:
             op = self._get_operation(state.architect_repair_operation_id)
             if op is None:
@@ -65,9 +75,26 @@ class _RecoveryMixin:
             action = state.repair_context.get("action")
 
             if op_failed:
-                state.authoring_repair_attempts += 1
-                if state.authoring_repair_attempts > state.max_authoring_repairs:
-                    err_cause = _extract_op_error(op)
+                err_cause = _extract_op_error(op)
+                is_transient = any(
+                    kw in str(err_cause).lower()
+                    for kw in (
+                        "429",
+                        "too many requests",
+                        "rate limit",
+                        "reset after",
+                        "insufficient_quota",
+                        "prompt_exceeds_quota",
+                        "capacity",
+                        "overloaded",
+                        "service unavailable",
+                        "503",
+                        "502",
+                    )
+                )
+                if not is_transient:
+                    state.authoring_repair_attempts += 1
+                if state.authoring_repair_attempts >= state.max_authoring_repairs:
                     detail = f" [{err_cause}]" if err_cause else f" ({status})"
                     state.error = (
                         f"Architect repair turn failed{detail} and repair attempts are exhausted "
@@ -76,6 +103,11 @@ class _RecoveryMixin:
                     )
                     self._transition(state, Phase.BLOCKED)
                     return AdvanceResult.BLOCKED
+                elif is_transient:
+                    m = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", str(err_cause), re.IGNORECASE)
+                    backoff = float(m.group(1)) + 1.0 if m else 5.0
+                    time.sleep(min(max(backoff, 1.0), 30.0))
+                state.repair_context["post_check_error"] = str(err_cause)
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:
@@ -97,8 +129,9 @@ class _RecoveryMixin:
                         f"Architect repair outcome invalid ({post_check_error}) and repair attempts "
                         f"are exhausted; operator intervention required"
                     )
-                    self._transition(state, Phase.BLOCKED)
-                    return AdvanceResult.BLOCKED
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
                 state.repair_context["post_check_error"] = post_check_error
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
@@ -111,6 +144,14 @@ class _RecoveryMixin:
                     return AdvanceResult.BLOCKED
                 state.architect_repair_operation_id = new_op.get("operation_id")
                 return AdvanceResult.WAITING_FOR_OPERATION
+
+            if source == "recovery" and action == "amend_plan":
+                state.repair_context = {}
+                state.architect_repair_operation_id = None
+                state.authoring_repair_attempts = 0
+                state.error = None
+                self._transition(state, Phase.AWAITING_APPROVAL)
+                return AdvanceResult.WAITING_FOR_HUMAN
 
             if source == "recovery" and action in ("architect_fix", "resolve_blocker"):
                 is_deadlock = (
@@ -189,13 +230,39 @@ class _RecoveryMixin:
                     return AdvanceResult.TRANSITIONED
                 else:
                     # Deliverable was not directly authored on disk (e.g. delegated to worker or work order amended)
-                    # Re-discover worker work orders (including any newly delegated ones) and re-dispatch worker!
+                    # Re-discover worker work orders (including any newly delegated ones)
+                    self._discover_worker_wos(state)
+                    gate_result = self._run_readiness_gate(state, ws)
+                    relevant_wos = {str(wo_id)} | set(str(w) for w in state.repair_context.get("replacement_work_orders") or ())
+                    recovery_issues = [
+                        i for i in gate_result.issues
+                        if getattr(i, "work_order_id", None) in relevant_wos
+                        or any(rw in (getattr(i, "artifact_path", "") or "") for rw in relevant_wos)
+                    ]
+                    if not gate_result.ready and recovery_issues:
+                        state.authoring_repair_attempts += 1
+                        if state.authoring_repair_attempts > state.max_authoring_repairs:
+                            issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in recovery_issues[:5])
+                            state.error = f"Authoring readiness gate failed after recovery ({issue_summary}) and repair attempts exhausted"
+                            state.exit_code = 3
+                            self._transition(state, Phase.WAITING_FOR_HUMAN)
+                            return AdvanceResult.WAITING_FOR_HUMAN
+                        issue_summary = "; ".join(f"{issue.code}: {issue.message}" for issue in recovery_issues[:5])
+                        state.repair_context["post_check_error"] = f"Authoring readiness gate failed: {issue_summary}"
+                        state.architect_repair_operation_id = None
+                        new_op = self._dispatch_repair_turn(state, ws)
+                        if new_op is None:
+                            state.error = f"Authoring readiness gate failed after recovery: {issue_summary}"
+                            self._transition(state, Phase.BLOCKED)
+                            return AdvanceResult.BLOCKED
+                        state.architect_repair_operation_id = new_op.get("operation_id")
+                        return AdvanceResult.WAITING_FOR_OPERATION
+
                     state.repair_context = {}
                     state.error = None
                     state.architect_repair_operation_id = None
                     state.authoring_repair_attempts = 0
                     self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
-                    self._discover_worker_wos(state)
                     dest = resolve_next_execution_phase(state)
                     self._transition(state, dest, authorized_override=True)
                     return AdvanceResult.TRANSITIONED
@@ -208,20 +275,29 @@ class _RecoveryMixin:
                 pass
             self._discover_worker_wos(state)
             gate_result = self._run_readiness_gate(state, ws)
-            if not gate_result.ready:
+            blocking_issues = gate_result.issues
+            if source == "recovery" and wo_id:
+                relevant_wos = {str(wo_id)} | set(str(w) for w in state.repair_context.get("replacement_work_orders") or ())
+                blocking_issues = [
+                    i for i in gate_result.issues
+                    if getattr(i, "work_order_id", None) in relevant_wos
+                    or any(rw in (getattr(i, "artifact_path", "") or "") for rw in relevant_wos)
+                ]
+            if not gate_result.ready and blocking_issues:
                 issue_summary = "; ".join(
-                    f"{issue.code}: {issue.message}" for issue in gate_result.issues[:5]
+                    f"{issue.code}: {issue.message}" for issue in blocking_issues[:5]
                 )
-                self._archive_rejected_artifacts(state, ws, gate_result.issues)
+                self._archive_rejected_artifacts(state, ws, blocking_issues)
                 state.authoring_repair_attempts += 1
                 if state.authoring_repair_attempts > state.max_authoring_repairs:
                     state.error = (
                         f"Authoring readiness gate still failing after repair "
                         f"({issue_summary}); repair attempts exhausted, operator intervention required"
                     )
-                    self._transition(state, Phase.BLOCKED)
-                    return AdvanceResult.BLOCKED
-                state.readiness_issues = [i.to_dict() for i in gate_result.issues]
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+                state.readiness_issues = [i.to_dict() for i in blocking_issues]
                 state.architect_repair_operation_id = None
                 new_op = self._dispatch_repair_turn(state, ws)
                 if new_op is None:
@@ -335,6 +411,10 @@ class _RecoveryMixin:
                         self._add_work_order_dependency(ws, str(wo_id), str(dep))
                     state.repair_context = {}
                     return self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
+                if action == "amend_plan":
+                    state.repair_context = {}
+                    self._transition(state, Phase.AWAITING_APPROVAL)
+                    return AdvanceResult.WAITING_FOR_HUMAN
                 state.repair_context = {}
                 return self._clear_worker_blocker(state, ws, str(wo_id), redispatch=True)
             state.repair_context = {}
@@ -374,6 +454,16 @@ class _RecoveryMixin:
         """
         ws = Path(state.workspace)
         wo_id = state.recovery_wo_id
+        attempts = state.recovery_attempts.get(str(wo_id), 0)
+        if attempts >= state.max_retries:
+            state.error = (
+                f"Architect recovery attempts for {wo_id} exhausted "
+                f"({attempts}/{state.max_retries}); operator intervention required"
+            )
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
+
         self._current_recovery_failure_code = (state.worker_blockers.get(str(wo_id)) or {}).get("failure_code")
 
         if state.recovery_decision_operation_id:
@@ -465,8 +555,9 @@ class _RecoveryMixin:
                     f"Architect recovery decision for {wo_id} could not be obtained "
                     f"({decision_error}); recovery attempts exhausted with evidence retained"
                 )
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
             state.recovery_attempts[str(wo_id)] = attempts + 1
             state.recovery_decision_operation_id = None
             new_op = self._dispatch_recovery_decision(state, ws, str(wo_id), decision_error)
@@ -475,8 +566,9 @@ class _RecoveryMixin:
                     f"Architect recovery decision for {wo_id} failed ({decision_error}) "
                     f"and the decision turn could not be re-dispatched"
                 )
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
             state.recovery_decision_operation_id = new_op.get("operation_id")
             return AdvanceResult.WAITING_FOR_OPERATION
 
@@ -568,8 +660,9 @@ class _RecoveryMixin:
                 f"({state.authoring_repair_attempts}/{state.max_authoring_repairs}); "
                 f"operator intervention required"
             )
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED
+            state.exit_code = 3
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
         state.error = reason
         if issues is not None:
             state.readiness_issues = [
@@ -1121,14 +1214,20 @@ class _RecoveryMixin:
             if len(observed) > len(preview) else ""
         )
         current_rev = state.contract_revisions.get(wo_id, 1)
-        is_deadlock = (evidence.get("failure_code") == "DEPENDENCY_DEADLOCK")
+        is_deadlock = (evidence.get("failure_code") in ("DEPENDENCY_DEADLOCK", "INVALID_DEPENDENCY"))
         deadlock_note = (
-            "\nCRITICAL: A DEPENDENCY DEADLOCK occurred. As Senior Architect you can:\n"
-            "- architect_fix or resolve_blocker: Author repair to .sync/work-orders/ACTIVE/ (and INDEX.yaml) "
-            "to remove inverted or circular dependencies or update prerequisite references, unblocking the worker.\n"
-            "- cancel_work_order: Cancel an orphaned or obsolete work order.\n"
-            "- split_work_order: Decompose the blocked work order into independent tasks.\n\n"
+            "\nCRITICAL: A DEPENDENCY DEFECT or DEADLOCK occurred. As Senior Architect you can:\n"
+            "- cancel_work_order: Return action 'cancel_work_order' if this work order is obsolete, duplicate, or superseded.\n"
+            "- architect_fix or resolve_blocker: Update .sync/work-orders/ACTIVE/ to prune or correct missing dependency references directly.\n"
+            "- NEVER author new child work orders to cancel or patch existing work orders.\n\n"
             if is_deadlock else ""
+        )
+        findings_list = (
+            evidence.get("qa_findings")
+            or evidence.get("findings")
+            or evidence.get("critical_errors")
+            or evidence.get("deliverable_failures")
+            or ([evidence.get("error")] if evidence.get("error") else [])
         )
         return (
             f"ARCHITECT RECOVERY DECISION required for work order {wo_id}.\n\n"
@@ -1142,7 +1241,7 @@ class _RecoveryMixin:
             f"- file budget: {evidence.get('file_budget')} ; observed changed files: "
             f"{evidence.get('observed_file_count', len(observed))}\n"
             f"- observed files:\n" + "".join(f"  - {p}\n" for p in preview) + more + "\n\n"
-            + ("- QA findings:\n" + "".join(f"  * {f}\n" for f in (evidence.get("qa_findings") or evidence.get("findings") or [])) + "\n" if (evidence.get("qa_findings") or evidence.get("findings")) else "")
+            + ("- QA / Verification findings:\n" + "".join(f"  * {f}\n" for f in findings_list) + "\n" if findings_list else "")
             + ("- Required corrective actions:\n" + "".join(f"  * {a}\n" for a in (evidence.get("qa_required_actions") or evidence.get("required_actions") or [])) + "\n" if (evidence.get("qa_required_actions") or evidence.get("required_actions")) else "")
             + (f"- Full verification report:\n{evidence.get('qa_report') or evidence.get('report')}\n\n" if (evidence.get("qa_report") or evidence.get("report")) else "")
             + (f"Your previous decision was rejected: {corrective}\n\n" if corrective else "")
@@ -1315,6 +1414,16 @@ class _RecoveryMixin:
             }
             return self._enter_recovery_repair(state, ws, record)
 
+        if action in ("add_work_order", "decompose_work_orders", "amend_plan"):
+            state.repair_context = {
+                "source": "recovery",
+                "action": action,
+                "work_order": wo_id,
+                "decision": decision,
+                "evidence": evidence,
+            }
+            return self._enter_recovery_repair(state, ws, record)
+
         if action == "retry_unchanged":
             failure_code = evidence.get("failure_code") or decision.get("failure_code")
             transient_ok = bool(decision.get("transient")) and (
@@ -1324,6 +1433,13 @@ class _RecoveryMixin:
             hash_ok = (
                 not evidence.get("contract_hash")
                 or current_hash == evidence.get("contract_hash")
+            )
+            from validators.harness.review_gate import subject_hash
+            current_subject_hash = subject_hash(ws, wo_id)
+            rec_subject_hash = evidence.get("subject_hash")
+            deliv_ok = (
+                not rec_subject_hash
+                or current_subject_hash == rec_subject_hash
             )
             if not transient_ok:
                 state.recovery_decisions.append({
@@ -1340,6 +1456,12 @@ class _RecoveryMixin:
                     "rejected_reason": "contract hash changed since the blocker",
                 })
                 return None, "retry_unchanged requires an unchanged contract hash"
+            if not deliv_ok:
+                state.recovery_decisions.append({
+                    **record, "applied": False,
+                    "rejected_reason": "deliverable hash changed on disk; retry_unchanged requires unchanged deliverable bytes",
+                })
+                return None, "retry_unchanged requires an unchanged deliverable subject hash"
             state.recovery_decisions.append({**record, "applied": True})
             return self._resume_worker_after_recovery(state, ws, wo_id), None
 
@@ -1479,25 +1601,79 @@ class _RecoveryMixin:
         if action in ("cancel_work_order", "cancel", "prune_untracked"):
             target_wo = str(decision.get("work_order") or wo_id)
             cancel_reason = reason or "Cancelled by Architect recovery decision"
-            self._mark_wo_status_on_disk(ws, target_wo, "CANCELLED", error=cancel_reason)
-            self._archive_recovery_artifact(ws, state.run_id, f".sync/contracts/{target_wo}.yaml")
-            if target_wo not in state.superseded_wo_ids:
-                state.superseded_wo_ids.append(target_wo)
-            if target_wo in state.worker_wo_ids:
-                state.worker_wo_ids.remove(target_wo)
-            if target_wo in state.published_wo_ids:
-                state.published_wo_ids.remove(target_wo)
-            if target_wo in state.blocked_wo_ids:
-                state.blocked_wo_ids.remove(target_wo)
-            if target_wo in state.failed_wo_ids:
-                state.failed_wo_ids.remove(target_wo)
-            evidence = state.worker_blockers.pop(target_wo, None) or {}
-            old_op_id = evidence.get("operation_id")
-            if old_op_id and old_op_id not in state.ignored_operation_ids:
-                state.ignored_operation_ids.append(str(old_op_id))
+            targets_to_cancel = [target_wo]
+            for extra in (decision.get("cancelled_work_orders") or decision.get("replacement_work_orders") or []):
+                if str(extra) not in targets_to_cancel:
+                    targets_to_cancel.append(str(extra))
+
+            for t_wo in targets_to_cancel:
+                self._mark_wo_status_on_disk(ws, t_wo, "CANCELLED", error=cancel_reason)
+                self._archive_recovery_artifact(ws, state.run_id, f".sync/contracts/{t_wo}.yaml")
+                if t_wo not in state.superseded_wo_ids:
+                    state.superseded_wo_ids.append(t_wo)
+                if t_wo in state.worker_wo_ids:
+                    state.worker_wo_ids.remove(t_wo)
+                if t_wo in state.published_wo_ids:
+                    state.published_wo_ids.remove(t_wo)
+                if t_wo in state.blocked_wo_ids:
+                    state.blocked_wo_ids.remove(t_wo)
+                if t_wo in state.failed_wo_ids:
+                    state.failed_wo_ids.remove(t_wo)
+                evidence = state.worker_blockers.pop(t_wo, None) or {}
+                old_op_id = evidence.get("operation_id")
+                if old_op_id and old_op_id not in state.ignored_operation_ids:
+                    state.ignored_operation_ids.append(str(old_op_id))
+
+            # Prune or rewire active dependencies on cancelled work orders to prevent DEPENDENCY_WAIT_INVALIDATED deadlocks
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            if active_dir.is_dir():
+                replacements = [str(r) for r in (decision.get("replacement_work_orders") or []) if str(r) not in targets_to_cancel]
+                for wo_file in active_dir.glob("*.yaml"):
+                    if wo_file.stem in targets_to_cancel:
+                        continue
+                    try:
+                        w_data = yaml.safe_load(wo_file.read_text(encoding="utf-8"))
+                        if not isinstance(w_data, dict):
+                            continue
+                        deps = w_data.get("dependencies")
+                        if not isinstance(deps, list):
+                            continue
+                        modified_deps = False
+                        new_deps = []
+                        for d in deps:
+                            d_str = str(d)
+                            if d_str in targets_to_cancel:
+                                modified_deps = True
+                                if replacements:
+                                    for r in replacements:
+                                        if r not in new_deps:
+                                            new_deps.append(r)
+                            else:
+                                if d_str not in new_deps:
+                                    new_deps.append(d)
+                        if modified_deps:
+                            w_data["dependencies"] = new_deps
+                            w_data["updated"] = _now()
+                            wo_file.write_text(yaml.safe_dump(w_data, sort_keys=False), encoding="utf-8")
+                            state.wo_dependencies[wo_file.stem] = new_deps
+                    except Exception:
+                        pass
+
+            # Synchronize state.worker_wo_ids with actual active work orders on disk
+            try:
+                self._discover_worker_wos(state)
+            except Exception:
+                pass
+            active_dir = ws / ".sync" / "work-orders" / "ACTIVE"
+            active_stems = {f.stem for f in active_dir.glob("*.yaml")} if active_dir.is_dir() else set()
+            state.blocked_wo_ids = [w for w in state.blocked_wo_ids if w in state.worker_wo_ids and w in active_stems]
+            state.worker_wo_ids = [w for w in state.worker_wo_ids if w in active_stems and w not in getattr(state, "completed_wo_ids", [])]
+
             state.recovery_decisions.append({**record, "applied": True})
             state.error = None
             dest = resolve_next_execution_phase(state)
+            if dest == Phase.DISPATCHING and state.worker_wo_ids and all(wo in state.blocked_wo_ids for wo in state.worker_wo_ids):
+                dest = Phase.ARCHITECT_RECOVERY_DECISION
             self._transition(state, dest, authorized_override=True)
             return AdvanceResult.TRANSITIONED, None
 
@@ -1960,7 +2136,6 @@ class _RecoveryMixin:
             prior_decision_op = self._get_operation(state.recovery_decision_operation_id)
             if prior_decision_op is None or str(prior_decision_op.get("status", "")).upper() in _OPERATION_TERMINAL:
                 state.recovery_decision_operation_id = None
-        self._archive_verdicts_for_wo(wo_id, ws)
         wo_data = None
         try:
             from validators.harness import review_gate
@@ -1981,7 +2156,12 @@ class _RecoveryMixin:
         else:
             self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         if redispatch:
+            # Only archive prior verdicts if redispatching worker for code changes;
+            # preserving valid verdicts for completed unchanged deliverables.
+            self._archive_verdicts_for_wo(wo_id, ws)
             self._restore_worker_contract_after_recovery(ws, wo_id, state)
+            if hasattr(self, "_ensure_project_dependencies"):
+                self._ensure_project_dependencies(ws, state)
             agent = self._agent_for_wo(wo_id, ws)
             try:
                 self.manager.start_turn(
@@ -2031,7 +2211,14 @@ class _RecoveryMixin:
     def _resume_worker_after_recovery(
         self, state: RunState, ws: Path, wo_id: str,
     ) -> AdvanceResult:
-        """Backward-compatible alias: clear the blocker and re-dispatch the worker."""
+        """Clear the blocker and resume execution. If the blocker was from QA, re-run QA instead of authoring worker."""
+        evidence = state.worker_blockers.get(str(wo_id), {})
+        f_code = str(evidence.get("failure_code", "")).lower()
+        src = str(evidence.get("source", "")).lower()
+        is_qa_failure = src == "qa" or "qa" in f_code or "test" in f_code
+        if is_qa_failure:
+            # Re-dispatch QA review rather than authoring worker rework
+            return self._clear_worker_blocker(state, ws, wo_id, redispatch=False)
         return self._clear_worker_blocker(state, ws, wo_id, redispatch=True)
 
     # ── Helpers ───────────────────────────────────────────────────────

@@ -308,6 +308,25 @@ class ToolGateway:
         if normalized_target == "PLAN.md" or normalized_target.endswith("/PLAN.md"):
             if not content or not content.strip():
                 raise PermissionError("Cannot write empty content to PLAN.md. A valid Project Plan with Architecture and Milestones is required.")
+            import re
+            content_lower = content.lower().strip()
+            # Reject conversational chat or greeting text accidentally written to PLAN.md
+            has_chat_greetings = any(
+                g in content_lower
+                for g in (
+                    "hey!", "hey there", "hello!", "good to meet you",
+                    "what's on your mind", "what would you like to build",
+                    "i'd love to hear", "before we dive into anything",
+                )
+            )
+            has_milestone_checklist = bool(re.search(r"-\s*\[[ xX]\]\s+milestone", content, re.IGNORECASE))
+            has_plan_title = bool(re.search(r"^#\s+.*plan", content, re.IGNORECASE | re.MULTILINE))
+            if has_chat_greetings and not has_milestone_checklist and not has_plan_title:
+                raise PermissionError(
+                    "Cannot write conversational greeting text to PLAN.md. "
+                    "PLAN.md must be a technical roadmap authored with '# Project Plan: <Name>', "
+                    "'## Current Architecture', and '## Milestones & Roadmap' (- [ ] Milestone 1: ... (Agent: <role>))."
+                )
             from validators.harness.plan import repair_plan_structure, validate_plan_structure
             repaired = repair_plan_structure(content)
             valid, _ = validate_plan_structure(repaired)
@@ -396,8 +415,12 @@ class ToolGateway:
             raise PermissionError(denial_reason)
 
         # Host OS awareness (Windows): handle common Unix file-inspection utilities natively
-        # so agents calling 'ls', 'ls -la', or 'pwd' receive clean output rather than tripping
+        # so agents calling 'ls', 'ls -la', 'pwd', or 'grep' receive clean output rather than tripping
         # consecutive tool failures due to missing Windows binaries.
+        # Normalize npx tsc to package typescript to avoid npm's deprecated dummy stub tsc@2.0.4
+        if len(command) >= 2 and str(command[0]).lower().strip() == "npx" and str(command[1]).lower().strip() == "tsc":
+            command = ["npx", "-p", "typescript", "tsc", *command[2:]]
+
         if sys.platform == "win32" and command:
             cmd0 = str(command[0]).lower().strip()
             if cmd0 in ("ls", "dir"):
@@ -428,6 +451,15 @@ class ToolGateway:
 
             if cmd0 == "pwd":
                 res = CommandResult(0, f"{self.workspace.root}\n", "")
+                self.boundary.journal.complete(record.request.operation_id, res)
+                return res
+
+            if cmd0 == "grep":
+                pattern = command[1] if len(command) > 1 else ""
+                files = [str(arg) for arg in command[2:] if not str(arg).startswith("-")]
+                matches = self.grep(pattern, paths=files if files else None)
+                lines = [f"{m['file']}:{m['line']}:{m['content']}" for m in matches]
+                res = CommandResult(0 if lines else 1, "\n".join(lines) + ("\n" if lines else ""), "")
                 self.boundary.journal.complete(record.request.operation_id, res)
                 return res
         env_extra = {}
@@ -1039,13 +1071,18 @@ class ToolGateway:
         self.boundary.journal.complete(record.request.operation_id, f"{len(py_files)} files")
         return out
 
-    def process_start(self, command: Sequence[str], env: Mapping[str, str] | None = None) -> str:
+    def process_start(self, command: Sequence[str], env: Mapping[str, str] | None = None, timeout: float | None = None) -> str:
         record = self._authorize(OperationType.PROCESS_START, "workspace/process")
         if not record.authorized:
             raise PermissionError(record.reason)
-        proc_id = self.process_manager.start_process(command, env)
+        proc_id = self.process_manager.start_process(command, env, timeout=timeout)
         self.boundary.journal.complete(record.request.operation_id, f"started {proc_id}")
         return proc_id
+
+    def task_start(self, command: Sequence[str], env: Mapping[str, str] | None = None, timeout: float | None = None) -> dict[str, Any]:
+        """Start a governed background sandbox task with dynamic timeout tiering."""
+        proc_id = self.process_start(command, env=env, timeout=timeout)
+        return self.process_status(proc_id)
 
     def process_status(self, process_id: str) -> dict[str, Any]:
         record = self._authorize(OperationType.PROCESS_STATUS, f"workspace/process/{process_id}")
@@ -1070,6 +1107,10 @@ class ToolGateway:
         success = self.process_manager.stop_process(process_id, timeout=timeout)
         self.boundary.journal.complete(record.request.operation_id, "stopped" if success else "failed")
         return success
+
+    task_status = process_status
+    task_output = process_output
+    task_stop = process_stop
 
     def run_tests(self, test_path: str | None = None, selector: str | None = None) -> dict[str, Any]:
         target = test_path or "tests"
@@ -2831,6 +2872,22 @@ class ToolGateway:
         if not record.authorized:
             raise PermissionError(record.reason)
 
+        # Idempotency check: if tag already exists and points to HEAD commit, succeed idempotently
+        check_proc = self._run_git(["rev-parse", "-q", "--verify", f"refs/tags/{tag_name}"])
+        if check_proc.returncode == 0:
+            existing_tag = check_proc.stdout.strip()
+            head_proc = self._run_git(["rev-parse", "HEAD"])
+            head_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+            peeled_proc = self._run_git(["rev-parse", "-q", "--verify", f"refs/tags/{tag_name}^{{commit}}"])
+            tag_commit = peeled_proc.stdout.strip() if peeled_proc.returncode == 0 else existing_tag
+            if head_sha and tag_commit == head_sha:
+                self.boundary.journal.complete(record.request.operation_id, f"tag {tag_name} (already at HEAD)")
+                return tag_name
+            raise RuntimeError(
+                f"git tag failed: tag '{tag_name}' already exists pointing to commit {tag_commit}, "
+                f"which does not match current HEAD ({head_sha})"
+            )
+
         cmd = ["tag", "-a", tag_name, "-m", message or tag_name]
         proc = self._run_git(cmd)
         if proc.returncode != 0:
@@ -3898,6 +3955,11 @@ class ToolGateway:
             if not target_set:
                 return wo_file.stem
 
+            # For GitOps / release agents, documentation, manifest, or graph requests map to existing active GitOps WO
+            if agent.lower() in ("local-llm", "gitops") or "gitops" in str(data.get("role", "")).lower():
+                if any(f.endswith(".md") or "doc" in f or "graph" in f or "version" in f for f in target_set):
+                    return wo_file.stem
+
             # Check for overlapping deliverable paths
             existing_paths = set()
             deliv = data.get("deliverable")
@@ -3993,6 +4055,9 @@ class ToolGateway:
         elif clean_target in ("gitops", "git", "release", "local-llm", "localllm"):
             canonical_agent = "local-llm"
             canonical_role = "gitops"
+        elif clean_target in ("architecture", "architect", "lead", "claude"):
+            canonical_agent = "claude"
+            canonical_role = "architecture"
         else:
             canonical_agent = clean_target
             canonical_role = clean_target
@@ -4044,21 +4109,63 @@ class ToolGateway:
 
             scan_root = auth_root if auth_root and auth_root.is_dir() else self.workspace.root
 
-            # Check if an explicit active work order was requested or referenced in instructions
+            # Check if an explicit work order was requested or referenced in instructions
             explicit_wo_id = work_order_id
+            target_bucket = "ACTIVE"
             if not explicit_wo_id and instructions:
                 match = _re.search(r"\b(WO-\d{3})\b", str(instructions))
                 if match:
                     candidate = match.group(1)
-                    if (scan_root / ".sync" / "work-orders" / "ACTIVE" / f"{candidate}.yaml").is_file():
-                        explicit_wo_id = candidate
+                    for r in ws_roots:
+                        for sub in ("ACTIVE", "COMPLETED", "BLOCKED"):
+                            if (r / ".sync" / "work-orders" / sub / f"{candidate}.yaml").is_file():
+                                explicit_wo_id = candidate
+                                target_bucket = sub
+                                break
+                        if explicit_wo_id:
+                            break
 
             if explicit_wo_id:
+                # If target is already COMPLETED or BLOCKED, and instructions are review/verification/reopen/recovery:
+                is_review = (
+                    (canonical_role == "qa")
+                    or (canonical_agent in ("gemma", "qa"))
+                    or any(k in str(instructions).lower() for k in ("review", "verify", "reopen", "audit", "recovery"))
+                )
+                if is_review:
+                    self.boundary.journal.complete(record.request.operation_id, f"Registered review/recovery for {explicit_wo_id}")
+                    return {
+                        "status": "review_scheduled",
+                        "work_order_id": explicit_wo_id,
+                        "target_work_order": explicit_wo_id,
+                        "role": canonical_role,
+                        "agent": canonical_agent,
+                        "instructions": str(instructions).strip(),
+                        "target_files": clean_files,
+                        "deduplicated": True,
+                        "message": (
+                            f"Review/recovery instruction registered for existing work order {explicit_wo_id}. "
+                            f"Operations evaluate/coordinate existing work orders rather than creating duplicate orders."
+                        ),
+                    }
+
                 wo_id = explicit_wo_id
                 rel_wo_file = f".sync/work-orders/ACTIVE/{wo_id}.yaml"
                 rel_contract_file = f".sync/contracts/{wo_id}.yaml"
                 act_f = self.workspace.root / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
-                if act_f.is_file():
+                comp_f = self.workspace.root / ".sync" / "work-orders" / "COMPLETED" / f"{wo_id}.yaml"
+                if comp_f.is_file() and not act_f.is_file():
+                    try:
+                        wo_data = yaml.safe_load(comp_f.read_text(encoding="utf-8")) or {}
+                        wo_data["status"] = "ACTIVE"
+                        rev = int(wo_data.get("revision", 1)) + 1
+                        wo_data["revision"] = rev
+                        act_f.parent.mkdir(parents=True, exist_ok=True)
+                        act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
+                        comp_f.unlink()
+                    except Exception:
+                        pass
+                elif act_f.is_file():
                     try:
                         wo_data = yaml.safe_load(act_f.read_text(encoding="utf-8")) or {}
                         if str(wo_data.get("status", "")).upper() != "ACTIVE":
@@ -4066,7 +4173,7 @@ class ToolGateway:
                             act_f.write_text(yaml.safe_dump(wo_data, sort_keys=False), encoding="utf-8")
                     except Exception:
                         pass
-                self.boundary.journal.complete(record.request.operation_id, f"Delegated to existing active {wo_id}")
+                self.boundary.journal.complete(record.request.operation_id, f"Delegated to existing {target_bucket.lower()} {wo_id}")
                 return {
                     "status": "delegated",
                     "work_order_id": wo_id,
@@ -4078,7 +4185,7 @@ class ToolGateway:
                     "target_files": clean_files,
                     "deduplicated": True,
                     "message": (
-                        f"Delegated task to active work order {wo_id} for {canonical_role} ({canonical_agent})."
+                        f"Delegated task to work order {wo_id} for {canonical_role} ({canonical_agent})."
                     ),
                 }
 
@@ -4333,7 +4440,8 @@ class ToolGateway:
                     logging.getLogger(__name__).debug("Failed to write work order to %s: %s", target_ws, ws_err)
         except Exception as wo_err:
             import logging
-            logging.getLogger(__name__).warning("Failed to author child work order: %s", wo_err, exc_info=True)
+            is_contract_error = "CONTRACT_VALIDATION_ERROR" in str(wo_err) or isinstance(wo_err, ValueError)
+            logging.getLogger(__name__).warning("Failed to author child work order: %s", wo_err, exc_info=not is_contract_error)
 
         task_payload = {
             "agent": canonical_agent,

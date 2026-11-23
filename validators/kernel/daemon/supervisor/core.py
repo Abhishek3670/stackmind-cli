@@ -143,32 +143,52 @@ class LifecycleSupervisor(
 
     def get_timeout_for_phase(self, phase: Phase | str) -> float:
         """Retrieve the configured timeout for a given phase."""
+        base_to: float | None = None
         if phase in self.timeouts:
-            return float(self.timeouts[phase])
-        if isinstance(phase, Phase):
+            base_to = float(self.timeouts[phase])
+        elif isinstance(phase, Phase):
             if phase.value in self.timeouts:
-                return float(self.timeouts[phase.value])
-            if phase.name.lower() in self.timeouts:
-                return float(self.timeouts[phase.name.lower()])
-            env_key = f"SUPERVISOR_TIMEOUT_{phase.name.upper()}"
-            if env_key in os.environ:
-                try:
-                    return float(os.environ[env_key])
-                except ValueError:
-                    pass
+                base_to = float(self.timeouts[phase.value])
+            elif phase.name.lower() in self.timeouts:
+                base_to = float(self.timeouts[phase.name.lower()])
+            else:
+                env_key = f"SUPERVISOR_TIMEOUT_{phase.name.upper()}"
+                if env_key in os.environ:
+                    try:
+                        base_to = float(os.environ[env_key])
+                    except ValueError:
+                        pass
         elif isinstance(phase, str):
             for k, v in self.timeouts.items():
                 if isinstance(k, Phase) and (k.value == phase or k.name.lower() == phase.lower()):
-                    return float(v)
+                    base_to = float(v)
+                    break
                 if isinstance(k, str) and k.lower() == phase.lower():
-                    return float(v)
-            env_key = f"SUPERVISOR_TIMEOUT_{phase.upper()}"
-            if env_key in os.environ:
-                try:
-                    return float(os.environ[env_key])
-                except ValueError:
-                    pass
-        return float(DEFAULT_TIMEOUTS.get(phase, 600.0))
+                    base_to = float(v)
+                    break
+            if base_to is None:
+                env_key = f"SUPERVISOR_TIMEOUT_{phase.upper()}"
+                if env_key in os.environ:
+                    try:
+                        base_to = float(os.environ[env_key])
+                    except ValueError:
+                        pass
+        if base_to is None:
+            base_to = float(DEFAULT_TIMEOUTS.get(phase, 600.0))
+
+        # Dynamically honor client_timeout from settings.json if configured higher
+        try:
+            from validators.kernel.settings import load_settings
+            ws_path = getattr(self.manager, "workspace", None) or (
+                getattr(self, "_current_state", None) and getattr(self._current_state, "workspace", None)
+            )
+            s_obj = load_settings(ws_path)
+            if getattr(s_obj, "client_timeout", 0) and s_obj.client_timeout > 0:
+                base_to = max(base_to, float(s_obj.client_timeout))
+        except Exception:
+            pass
+
+        return base_to
 
     def handle_rejection_without_reworkable(
         self,

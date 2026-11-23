@@ -87,6 +87,7 @@ class Key:
     CTRL_K = "\x0b"  # Command palette
     CTRL_L = "\x0c"  # Clear / redraw screen
     CTRL_O = "\x0f"  # Toggle thinking block
+    CTRL_U = "\x15"  # Clear input line / kill line
     ESCAPE = "\x1b"
 
     UP = "<UP>"
@@ -117,7 +118,7 @@ class Key:
 
 # SGR Extended Mouse Mode control sequences (WO-054)
 ENABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
-DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+DISABLE_MOUSE_REPORTING_SEQ = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
 
 
 def enable_mouse_reporting(stream: Any = None) -> None:
@@ -160,8 +161,14 @@ def disable_mouse_reporting(stream: Any = None) -> None:
     if os.name == "nt":
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            h = kernel32.GetStdHandle(-10)
-            if h not in (0, -1):
+            handles = []
+            h_std = kernel32.GetStdHandle(-10)
+            if h_std and h_std not in (0, -1):
+                handles.append(h_std)
+            h_reader = getattr(_win32_reader, "handle", None) if _win32_reader is not None else None
+            if h_reader and h_reader not in (0, -1) and h_reader not in handles:
+                handles.append(h_reader)
+            for h in handles:
                 mode = ctypes.c_uint32()
                 if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
                     new_mode = (mode.value | 0x0040 | 0x0080) & ~0x0010
@@ -176,14 +183,26 @@ def drain_console_input() -> None:
     Prevents accumulated mouse motion/click tracking artifacts that occurred while
     the engine was busy streaming turns from spilling into the composer prompt.
     """
+    global _win32_reader
+    try:
+        if _win32_reader is not None:
+            _win32_reader._pending_keys.clear()
+    except Exception:
+        pass
     if os.name == "nt":
         try:
             import msvcrt
             while msvcrt.kbhit():
                 msvcrt.getwch()
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            h = kernel32.GetStdHandle(-10)
-            if h and h not in (0, -1):
+            handles = []
+            h_std = kernel32.GetStdHandle(-10)
+            if h_std and h_std not in (0, -1):
+                handles.append(h_std)
+            h_reader = getattr(_win32_reader, "handle", None) if _win32_reader is not None else None
+            if h_reader and h_reader not in (0, -1) and h_reader not in handles:
+                handles.append(h_reader)
+            for h in handles:
                 kernel32.FlushConsoleInputBuffer(h)
         except Exception:
             pass
@@ -296,14 +315,11 @@ def _parse_escape_sequence(seq: str) -> str:
         return Key.ESCAPE
 
     clean_seq = seq
-    if clean_seq.startswith("^[[<"):
-        clean_seq = clean_seq[2:]
-    elif clean_seq.startswith("\x1b[<"):
-        clean_seq = clean_seq[1:]
+    clean_seq = re.sub(r"^(?:\x1b|\^\[)+", "", clean_seq)
 
     # SGR Mouse mode: [<Cb;Cx;CyM (press) or [<Cb;Cx;Cym (release)
-    if clean_seq.startswith("[<"):
-        match = re.search(r"\[<(\d+);(\d+);(\d+)([Mm])", clean_seq)
+    if "[<" in clean_seq or (clean_seq.startswith("<") and ";" in clean_seq):
+        match = re.search(r"\[*<(\d+);(\d+);(\d+)([Mm])", clean_seq)
         if match:
             btn = int(match.group(1))
             col = int(match.group(2))
@@ -313,6 +329,8 @@ def _parse_escape_sequence(seq: str) -> str:
                 return Key.MOUSE_WHEEL_UP
             elif btn == 65:
                 return Key.MOUSE_WHEEL_DOWN
+            if btn == 35:
+                return "<MOUSE_IGNORE>"
             return f"<MOUSE_{btn}_{col}_{row}_{action}>"
         return "<MOUSE_IGNORE>"
 
@@ -401,34 +419,28 @@ def _parse_escape_sequence(seq: str) -> str:
 
 
 def _read_escape_sequence_windows() -> str:
-    """Read buffered escape sequence characters following \x1b on Windows."""
+    """Read buffered escape sequence characters following \\x1b on Windows."""
     import msvcrt
-
-    if not msvcrt.kbhit():
-        time.sleep(0.015)
-
-    if not msvcrt.kbhit():
-        return ""
 
     seq = ""
     start_time = time.monotonic()
-    while time.monotonic() - start_time < 0.1:
+    while time.monotonic() - start_time < 0.05:
         if msvcrt.kbhit():
             c = msvcrt.getwch()
             seq += c
-            if seq.startswith("[<") and c in ("M", "m"):
+            if "[<" in seq and c in ("M", "m"):
                 break
             elif seq.startswith("[M") and len(seq) >= 5:
                 break
-            elif seq.startswith("[") and not seq.startswith(("[<", "[M")) and c in ("~", "A", "B", "C", "D", "H", "F", "u"):
+            elif seq.startswith("[") and not (seq.startswith(("[<", "[M")) or "[<" in seq) and c in ("~", "A", "B", "C", "D", "H", "F", "u"):
                 break
             elif seq in ("\r", "\n", "\r\n", "v", "V"):
                 break
         else:
             time.sleep(0.005)
-            if not msvcrt.kbhit():
+            if not msvcrt.kbhit() and seq:
                 # If we've started an escape sequence but haven't received the terminator, keep waiting up to timeout
-                if seq.startswith("[<") and not (seq.endswith("M") or seq.endswith("m")):
+                if "[<" in seq and not (seq.endswith("M") or seq.endswith("m")):
                     continue
                 if seq.startswith("[") and not (seq.endswith("~") or seq[-1] in "ABCDHFu"):
                     continue
@@ -511,16 +523,19 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
             res = _parse_escape_sequence(seq)
         else:
             res = Key.ESCAPE
-    elif ch == "^" and msvcrt.kbhit():
-        ch2 = msvcrt.getwch()
-        if ch2 == "[":
-            seq = _read_escape_sequence_windows()
-            full_seq = "^[[" + seq
-            res = _parse_escape_sequence(full_seq)
-            if res == "<MOUSE_IGNORE>":
-                res = None
+    elif ch == "^":
+        if msvcrt.kbhit():
+            ch2 = msvcrt.getwch()
+            if ch2 == "[":
+                seq = _read_escape_sequence_windows()
+                full_seq = "^[" + seq
+                res = _parse_escape_sequence(full_seq)
+                if res in ("<MOUSE_IGNORE>",) or (isinstance(res, str) and res.startswith("<MOUSE_35_")):
+                    res = None
+            else:
+                _win32_reader._pending_keys.append(ch2)
+                res = ch
         else:
-            _win32_reader._pending_keys.append(ch2)
             res = ch
     elif ch == Key.CTRL_V:
         res = Key.CTRL_V
@@ -528,6 +543,8 @@ def _read_raw_key_windows(timeout: Optional[float] = None) -> Optional[str]:
         res = Key.CTRL_B
     elif ch == Key.CTRL_G:
         res = Key.CTRL_G
+    elif ch == Key.CTRL_U:
+        res = Key.CTRL_U
     elif ch in ("\r", "\n"):
         try:
             import ctypes
@@ -708,6 +725,7 @@ class Win32ConsoleReader:
                     0x43: Key.CTRL_C,  # VK_C -> '\x03' (Cancel / exit)
                     0x44: Key.CTRL_D,  # VK_D -> '\x04' (EOF / exit)
                     0x56: Key.CTRL_V,  # VK_V -> '\x16' (Paste clipboard)
+                    0x55: Key.CTRL_U,  # VK_U -> '\x15' (Kill / clear line)
                     0x57: Key.CTRL_W,  # VK_W -> '\x17' (Toggle scroll focus)
                     0x0D: Key.CTRL_ENTER,  # VK_RETURN
                     0x0A: Key.CTRL_ENTER,  # VK_RETURN (LF)
@@ -790,20 +808,15 @@ class Win32ConsoleReader:
         return None
 
     def _read_escape_sequence(self, h: Any) -> str:
-        """Read buffered escape sequence characters following \x1b from Win32 console buffer."""
+        """Read buffered escape sequence characters following \\x1b from Win32 console buffer."""
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         rec = INPUT_RECORD()
         read_count = ctypes.c_uint32()
         num_events = ctypes.c_uint32()
 
-        # Check if events are immediately available in the console queue
-        if kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
-            if num_events.value == 0:
-                time.sleep(0.015)
-
         seq = ""
         start_time = time.monotonic()
-        while time.monotonic() - start_time < 0.1:
+        while time.monotonic() - start_time < 0.05:
             if not kernel32.GetNumberOfConsoleInputEvents(h, ctypes.byref(num_events)):
                 break
             if num_events.value > 0:
@@ -816,7 +829,7 @@ class Win32ConsoleReader:
                                 if c and c != "\x00":
                                     seq += c
                                     # SGR Mouse mode: [<64;...M or [<65;...m
-                                    if seq.startswith("[<") and c in ("M", "m"):
+                                    if "[<" in seq and c in ("M", "m"):
                                         break
                                     # Arrow keys / Home / End: [A, [B, [C, [D, [H, [F
                                     if len(seq) == 2 and seq[0] == "[" and seq[1] in ("A", "B", "C", "D", "H", "F"):
@@ -841,7 +854,13 @@ class Win32ConsoleReader:
                             if m_parsed:
                                 self._pending_keys.append(m_parsed)
             else:
-                time.sleep(0.002)
+                time.sleep(0.003)
+                if seq:
+                    if "[<" in seq and not (seq.endswith("M") or seq.endswith("m")):
+                        continue
+                    if seq.startswith("[") and not (seq.endswith("~") or seq[-1] in "ABCDHFu"):
+                        continue
+                    break
         return seq
 
     def read_key(self, timeout: float = 0.05) -> Optional[str]:
@@ -874,12 +893,12 @@ class Win32ConsoleReader:
                                 parsed = _parse_escape_sequence(seq)
                         elif parsed == "^":
                             seq = self._read_escape_sequence(h)
-                            if seq and seq.startswith(("[<", "[[<")):
-                                parsed = _parse_escape_sequence("^" + seq)
+                            if seq and ("[<" in seq or seq.startswith(("[<", "[[<"))):
+                                parsed = _parse_escape_sequence("^[" + seq)
                             elif seq:
                                 for sc in seq:
                                     self._pending_keys.append(sc)
-                        if parsed == "<MOUSE_IGNORE>":
+                        if parsed in ("<MOUSE_IGNORE>",) or (isinstance(parsed, str) and parsed.startswith("<MOUSE_35_")):
                             parsed = None
                         if parsed is not None:
                             _log_debug_key(f"[Win32ConsoleReader.read_key] returning parsed={repr(parsed)}")
@@ -1064,6 +1083,8 @@ DEFAULT_COMMANDS: list[tuple[str, str, bool]] = [
     (":govern", "Configure governance verbosity: tree | flat | compact", False),
     (":compact", "Compact older transcript turns", False),
     (":timeout", "Get or set client turn wait timeout", False),
+    (":stream_idle_timeout", "Get or set streaming silence watchdog timeout (default: 600s)", False),
+    (":stream-timeout", "Alias for :stream_idle_timeout", False),
     (":landing", "Display branded landing block", False),
     (":skills", "Display available procedural skills & runbooks", False),
     (":skill", "Display available procedural skills & runbooks", False),
@@ -1571,8 +1592,14 @@ class RawLineEditor:
         cleared_via_callback = False
         if getattr(self, "on_clear_dropdown", None):
             try:
-                res = self.on_clear_dropdown()
+                res = self.on_clear_dropdown(target)
                 cleared_via_callback = (res is True)
+            except TypeError:
+                try:
+                    res = self.on_clear_dropdown()
+                    cleared_via_callback = (res is True)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -2057,8 +2084,16 @@ class RawLineEditor:
             self.paste_from_clipboard()
             return False
 
+        if key == Key.CTRL_U:
+            self.buffer = []
+            self.cursor = 0
+            self._update_state()
+            self._update_dropdown()
+            self._notify_height_change()
+            return False
+
         # Intercept any raw SGR mouse escape sequences in any encoding (e.g. ^[[<0;101;34M, \x1b[<0;101;34M, [<0;101;34M)
-        if isinstance(key, str) and ("<" in key and ";" in key and (key.endswith("M") or key.endswith("m"))):
+        if isinstance(key, str) and "<" in key and ";" in key and ("[<" in key or "\x1b" in key or "^[" in key):
             mouse_matches = list(re.finditer(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)([Mm])", key))
             if mouse_matches:
                 for match in mouse_matches:
@@ -2067,7 +2102,10 @@ class RawLineEditor:
                     row = int(match.group(3))
                     action = match.group(4)
                     self.handle_key(f"<MOUSE_{btn}_{col}_{row}_{action}>")
-                return False
+                clean_key = re.sub(r"(?:\x1b|\^\[)?\[<(\d+);(\d+);(\d+)([Mm])", "", key)
+                if not clean_key:
+                    return False
+                key = clean_key
 
         if key.startswith("<MOUSE_"):
             if key == "<MOUSE_IGNORE>":
@@ -2329,6 +2367,23 @@ class RawLineEditor:
                 try:
                     if c_row is not None:
                         top_border_row = c_row - 1
+                        if prev_H > new_H:
+                            cleared_via_callback = False
+                            if getattr(self, "on_clear_dropdown", None):
+                                try:
+                                    res = self.on_clear_dropdown(target)
+                                    cleared_via_callback = (res is True)
+                                except TypeError:
+                                    try:
+                                        res = self.on_clear_dropdown()
+                                        cleared_via_callback = (res is True)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            if not cleared_via_callback:
+                                for r in range(max(1, top_border_row - prev_H), max(1, top_border_row - new_H)):
+                                    target.write(f"\x1b[{r};1H\x1b[2K")
                         for i, d_line in enumerate(dropdown_lines):
                             d_row = top_border_row - new_H + i
                             target.write(f"\x1b[{d_row};1H\r{d_line}\x1b[K")

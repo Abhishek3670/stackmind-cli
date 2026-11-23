@@ -277,6 +277,52 @@ STANDARD_KERNEL_TOOLS: tuple[ToolDefinition, ...] = (
         },
     ),
     ToolDefinition(
+        name="task_start",
+        description="Start a long-running background task (e.g. npm install, build) with dynamic timeout tiering.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}, "description": "Command arguments (e.g. ['npm', 'install'])"}
+            },
+            "required": ["command"],
+        },
+    ),
+    ToolDefinition(
+        name="task_status",
+        description="Check status, uptime, and remaining timeout budget of an ongoing background task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string", "description": "Task ID handle (e.g. proc-1)"}
+            },
+            "required": ["process_id"],
+        },
+    ),
+    ToolDefinition(
+        name="task_output",
+        description="Read latest standard output lines from an ongoing background task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string", "description": "Task ID handle"},
+                "tail_lines": {"type": "integer", "description": "Max lines to return", "default": 100},
+            },
+            "required": ["process_id"],
+        },
+    ),
+    ToolDefinition(
+        name="task_stop",
+        description="Stop an ongoing background task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string", "description": "Task ID handle"},
+                "timeout": {"type": "number", "description": "Timeout in seconds", "default": 5.0},
+            },
+            "required": ["process_id"],
+        },
+    ),
+    ToolDefinition(
         name="run_tests",
         description="Run test suite using pytest inside the scratch workspace.",
         parameters={
@@ -1379,7 +1425,15 @@ PLANNING_CORE_TOOL_NAMES = (
     "skill_retrieve",
     "skill_list",
 )
-AUTHORING_CORE_TOOL_NAMES = ("read_file", "write_file", "batch_write_files", "delegate_task", "list_directory")
+AUTHORING_CORE_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "batch_write_files",
+    "delegate_task",
+    "list_directory",
+    "git_diff",
+    "git_changed_files",
+)
 ARCHITECTURE_INVESTIGATION_TOOL_NAMES = (
     "read_file",
     "write_file",
@@ -1433,6 +1487,9 @@ WORKER_CODE_CORE_TOOL_NAMES = (
     "list_directory",
     "glob",
     "grep",
+    "query_graph",
+    "git_diff",
+    "git_changed_files",
     "run_command",
 )
 WORKER_QA_CORE_TOOL_NAMES = (
@@ -1441,6 +1498,10 @@ WORKER_QA_CORE_TOOL_NAMES = (
     "batch_write_files",
     "list_directory",
     "glob",
+    "query_graph",
+    "git_diff",
+    "git_changed_files",
+    "verify_diff",
     "run_tests",
     "run_lint",
     "run_security_scan",
@@ -1523,12 +1584,12 @@ DEFAULT_MAX_TOTAL_IDENTICAL_CALLS: int = 3
 # reaches a terminal state even when the transport never closes: silence longer
 # than the idle timeout aborts the stream, and the turn deadline bounds streams
 # that trickle output forever.
-DEFAULT_STREAM_IDLE_TIMEOUT: float = float(os.environ.get("PROVIDER_STREAM_IDLE_TIMEOUT", "120"))
+DEFAULT_STREAM_IDLE_TIMEOUT: float = float(os.environ.get("PROVIDER_STREAM_IDLE_TIMEOUT", "600"))
 # Prompt prefill for a long planning prompt can legitimately take minutes before
 # the first token, so the wait for the first chunk is wider than the gap allowed
 # between chunks once generation has started.
 DEFAULT_STREAM_FIRST_CHUNK_TIMEOUT: float = float(
-    os.environ.get("PROVIDER_STREAM_FIRST_CHUNK_TIMEOUT", "300")
+    os.environ.get("PROVIDER_STREAM_FIRST_CHUNK_TIMEOUT", "600")
 )
 DEFAULT_TURN_TIMEOUT: float = float(os.environ.get("PROVIDER_TURN_TIMEOUT", "1800"))
 _STREAM_POLL_INTERVAL: float = 0.1
@@ -2103,24 +2164,6 @@ class ProviderGateway:
                     return "Error: command must be a list of strings or string"
 
                 result = self.tool_gateway.run_command(cmd)
-                if result.returncode != 0:
-                    self.consecutive_failures += 1
-                    raw_res = (
-                        f"Process finished with returncode {result.returncode}.\n"
-                        f"STDOUT: {result.stdout}\n"
-                        f"STDERR: {result.stderr}"
-                    )
-                    if self.consecutive_failures == DEFAULT_MAX_CONSECUTIVE_FAILURES - 1:
-                        raw_res += (
-                            f"\nWarning: {self.consecutive_failures} consecutive tool failures; "
-                            f"the next will end this run; change approach or finish now."
-                        )
-                    if self.consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_FAILURES:
-                        raise ConsecutiveToolFailureError(
-                            f"Multiple consecutive tool failures ({self.consecutive_failures}): command exited with returncode {result.returncode}",
-                            failures=self.consecutive_failures,
-                        )
-                    return truncate_tool_output(raw_res, max_chars=self.max_tool_output_chars)
                 self.consecutive_failures = 0
                 raw_res = (
                     f"Process finished with returncode {result.returncode}.\n"
@@ -2165,6 +2208,8 @@ class ProviderGateway:
                     "search": {"grep", "glob", "semantic_search", "search_docs", "web_search", "image_search", "web_fetch"},
                     "browser": {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "inspect_screenshot"},
                     "process": {"process_start", "process_status", "process_output", "process_stop"},
+                    "task": {"task_start", "task_status", "task_output", "task_stop", "process_start", "process_status", "process_output", "process_stop"},
+                    "tasks": {"task_start", "task_status", "task_output", "task_stop", "process_start", "process_status", "process_output", "process_stop"},
                     "testing": {"run_tests", "run_lint", "run_typecheck", "run_security_scan", "verify_deliverable", "verify_tests"},
                 }
 
@@ -2354,6 +2399,9 @@ class ProviderGateway:
                         pass
                     files_hint = f" Existing workspace files: {', '.join(sorted(existing_files)[:25])}." if existing_files else ""
                     res = f"Error: FileNotFoundError: File '{target_str}' does not exist in workspace.{files_hint}"
+                    if name == "read_file":
+                        self.consecutive_failures = max(0, self.consecutive_failures - 1)
+                        res += " Use 'list_directory', 'glob', or 'query_graph' to inspect existing files before reading."
             elif isinstance(ex, NotADirectoryError):
                 target_str = args.get("path") or args.get("target") or args.get("file") or "."
                 res = (
@@ -2497,9 +2545,6 @@ class ProviderGateway:
             stream_deadline = (
                 time.monotonic() + effective_timeout if effective_timeout and effective_timeout > 0 else None
             )
-            # Per-read socket timeout: never longer than the stream watchdog
-            # window, so a transport that stops sending releases its reader
-            # (and socket) within a bounded time even if it ignores the abort.
             stream_socket_timeout = effective_timeout
             watchdog_windows = [
                 window
@@ -2514,6 +2559,22 @@ class ProviderGateway:
                     else cap
                 )
 
+            # Watchdog timeout for silence: check settings.json / env if DEFAULT_STREAM_IDLE_TIMEOUT is default
+            stream_idle_to = DEFAULT_STREAM_IDLE_TIMEOUT
+            if stream_idle_to >= 600.0:
+                try:
+                    from validators.kernel.settings import load_settings
+                    s_obj = load_settings()
+                    if getattr(s_obj, "stream_idle_timeout", 0) and s_obj.stream_idle_timeout > 0:
+                        stream_idle_to = float(s_obj.stream_idle_timeout)
+                except Exception:
+                    pass
+                if "PROVIDER_STREAM_IDLE_TIMEOUT" in os.environ:
+                    try:
+                        stream_idle_to = float(os.environ["PROVIDER_STREAM_IDLE_TIMEOUT"])
+                    except ValueError:
+                        pass
+
             try:
                 for chunk in _iter_stream_bounded(
                     self.adapter.stream(
@@ -2523,7 +2584,7 @@ class ProviderGateway:
                         cancellation_token=cancellation_token,
                         **kwargs,
                     ),
-                    idle_timeout=DEFAULT_STREAM_IDLE_TIMEOUT,
+                    idle_timeout=stream_idle_to,
                     first_chunk_timeout=DEFAULT_STREAM_FIRST_CHUNK_TIMEOUT,
                     deadline=stream_deadline,
                     cancellation_token=cancellation_token,
@@ -2792,22 +2853,28 @@ class ProviderGateway:
 
                 actor_str = str(getattr(self.tool_gateway, "actor_id", "") or "").lower()
                 is_arch = any(k in actor_str for k in ("claude", "architect", "architecture"))
-                has_work_orders = any(p.startswith((".sync/work-orders/ACTIVE/", ".sync/contracts/")) for p in norm_written)
+                is_recovery = any("recovery" in str(p).lower() or "decisions" in str(p).lower() for p in (norm_del or "", getattr(self, "required_deliverable", "") or ""))
+                has_work_orders = any(
+                    p.startswith((".sync/work-orders/ACTIVE/", ".sync/contracts/", ".sync/decisions/recovery/", ".sync/decisions/"))
+                    or p.endswith(("INDEX.yaml", "PLAN.md"))
+                    for p in norm_written
+                ) or is_recovery
+                is_authoring_arch = is_arch and bool(getattr(self, "is_authoring", False)) and not is_recovery
 
                 is_adhoc = bool(getattr(self, "is_adhoc", False))
                 should_nudge = bool(
                     not is_adhoc
-                    and (required_deliverable or getattr(self, "is_authoring", False) or is_arch)
+                    and (required_deliverable or getattr(self, "is_authoring", False) or is_authoring_arch)
                     and has_write_tool
                     and empty_tool_nudges < max_empty_tool_nudges
-                    and (self.total_tool_calls == 0 or has_unwritten_deliverable or (is_arch and not has_work_orders))
+                    and (self.total_tool_calls == 0 or has_unwritten_deliverable or (is_authoring_arch and not has_work_orders))
                 )
 
                 if should_nudge:
                     empty_tool_nudges += 1
                     target_hint = f" '{required_deliverable}'" if required_deliverable else " (work orders and contracts)"
                     can_delegate = any(t.name == "delegate_task" for t in active_tools)
-                    if is_arch and not has_work_orders:
+                    if is_authoring_arch and not has_work_orders:
                         nudge_content = (
                             "CRITICAL: You are the Lead Architect. You have not yet authored or saved any Work Orders "
                             "in `.sync/work-orders/ACTIVE/` or Contracts in `.sync/contracts/` for this request. "
@@ -2864,7 +2931,43 @@ class ProviderGateway:
             # 1. Check ping-pong cycles
             cycle_err = detect_tool_cycle(recent_signatures)
             if cycle_err:
+                if (
+                    (required_deliverable or getattr(self, "is_authoring", False))
+                    and loop_nudges < max_loop_nudges
+                ):
+                    loop_nudges += 1
+                    recent_signatures.clear()
+                    target_hint = (
+                        f" You have NOT yet authored your assigned deliverable '{required_deliverable}'. Call write_file now to create '{required_deliverable}'."
+                        if required_deliverable and not self.has_written_deliverable(required_deliverable)
+                        else " Stop alternating repetitive inspection calls. Proceed immediately with authoring or concluding your task."
+                    )
+                    messages.append(Message.user(
+                        f"[SYSTEM WARNING: {cycle_err}. Stop this inspection loop.{target_hint} "
+                        f"Repeated cycle calls will abort your turn.]"
+                    ))
+                    continue
                 raise NoProgressLoopError(cycle_err, pattern=cycle_err)
+
+            # 1b. Anti-Stagnation Circuit Breaker: detect consecutive passive inspection/reads
+            READ_TOOLS = {"read_file", "list_directory", "glob", "grep", "read_many_files", "get_symbol"}
+            if len(recent_signatures) >= 4:
+                last_4_tools = [s[0] for s in recent_signatures[-4:]]
+                if all(t in READ_TOOLS for t in last_4_tools):
+                    if loop_nudges < max_loop_nudges:
+                        loop_nudges += 1
+                        recent_signatures = recent_signatures[:-2]
+                        messages.append(Message.user(
+                            "[SYSTEM WARNING: Anti-Stagnation Circuit Breaker triggered. "
+                            "You have performed 4 consecutive passive read/inspection tool calls without mutating code or progressing execution. "
+                            "Stop repeating file inspections. If an earlier command or dependency failed, resolve it, write your assigned deliverable with write_file, "
+                            "or finalize your turn declaring status 'BLOCKED' detailing the blocker.]"
+                        ))
+                        continue
+                    raise NoProgressLoopError(
+                        "Pathological loop: 4 consecutive passive read/inspection tool calls without progress",
+                        pattern="consecutive_reads",
+                    )
 
             # 2. Check consecutive identical tool calls
             if len(recent_signatures) >= DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:
@@ -2872,7 +2975,7 @@ class ProviderGateway:
                 if all(s == last_sig for s in recent_signatures[-DEFAULT_MAX_CONSECUTIVE_IDENTICAL_CALLS:]):
                     if (
                         last_sig[0] in ("read_file", "list_directory", "glob", "grep")
-                        and (required_deliverable or getattr(self, "is_authoring", False) or loop_nudges < max_loop_nudges)
+                        and (required_deliverable or getattr(self, "is_authoring", False))
                         and loop_nudges < max_loop_nudges
                     ):
                         loop_nudges += 1
@@ -2905,7 +3008,7 @@ class ProviderGateway:
             if triggered_sig is not None:
                 if (
                     triggered_sig[0] in ("read_file", "list_directory", "glob", "grep")
-                    and (required_deliverable or getattr(self, "is_authoring", False) or loop_nudges < max_loop_nudges)
+                    and (required_deliverable or getattr(self, "is_authoring", False))
                     and loop_nudges < max_loop_nudges
                 ):
                     loop_nudges += 1

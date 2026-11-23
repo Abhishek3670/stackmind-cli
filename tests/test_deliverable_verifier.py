@@ -421,4 +421,44 @@ class TestHtmlMediaAssetVerification:
         assert not result.passed
         assert any("Remote URL returned HTML document instead of an image asset" in c.message for c in result.checks)
 
+    def test_valid_js_file_passes(self, tmp_path):
+        """Valid JavaScript deliverable should pass verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        js_file = tmp_path / "server.js"
+        js_file.write_text("const port = 3000;\nasync function start() { return port; }\n")
+
+        result = verifier.verify(js_file)
+
+        assert result.passed
+        assert any(c.name == "javascript_syntax" and c.passed for c in result.checks)
+
+    def test_js_with_typescript_return_type_fails(self, tmp_path):
+        """JavaScript file containing TypeScript return type annotations should fail verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        js_file = tmp_path / "esbuild.config.js"
+        js_file.write_text("async function buildServer(): Promise<void> {\n  console.log('building');\n}\n")
+
+        result = verifier.verify(js_file)
+
+        assert not result.passed
+        assert any(c.name == "javascript_syntax" and not c.passed for c in result.checks)
+
+    def test_js_with_typescript_interface_fails(self, tmp_path):
+        """JavaScript file containing TypeScript interface declaration should fail verification."""
+        from validators.harness.deliverable_verifier import DeliverableVerifier
+
+        verifier = DeliverableVerifier()
+        js_file = tmp_path / "types.js"
+        js_file.write_text("export interface UserState {\n  id: string;\n}\n")
+
+        result = verifier.verify(js_file)
+
+        assert not result.passed
+        assert any(c.name == "javascript_syntax" and not c.passed for c in result.checks)
+
+
 

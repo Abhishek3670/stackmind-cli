@@ -350,6 +350,16 @@ class IntegrationGate:
             if deliv_p.startswith(".sync/") or deliv_p.startswith("schemas/") or deliv_p.startswith(".git/"):
                 continue
 
+            # Skip release packaging manifests governed by GitOps in the release phase
+            assigned = [str(a).lower() for a in (wo_data.get("assigned_agents") or [])]
+            is_gitops_role = any(r in assigned for r in ("gitops", "local-llm"))
+            is_packaging_doc = deliv_p in ("version.md", "version", "changelog.md") or deliv_p.endswith(("/version.md", "/changelog.md"))
+            if is_gitops_role or is_packaging_doc:
+                # If file doesn't exist yet, it will be finalized during GITOPS phase; do not fail pre-release integration gate
+                target_file = self.workspace / deliv_p
+                if not target_file.is_file():
+                    continue
+
             passed, errs, ev = verify_work_order_deliverables(self.workspace, wo_data)
             checked_count += 1
 

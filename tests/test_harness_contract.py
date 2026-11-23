@@ -473,19 +473,22 @@ def test_narrower_ignore_list_no_false_positive_declaration_matches_for_ordinary
     if not (project / "schemas").exists():
         shutil.copytree(src_schemas, project / "schemas")
 
+    from validators.kernel.providers import OpenAICompatibleAdapter
     import json
 
-    # Write deliverable directly to project (simulating harness promoted write after verification)
-    # This test verifies that .sync bookkeeping changes don't cause false-positive declaration mismatches
-    (project / "src").mkdir(parents=True, exist_ok=True)
-    (project / "src" / "auth.py").write_text("def authenticate(): return True\n", encoding="utf-8")
-
-    # Use transport to return a simple ad-hoc completion (no work order task execution)
-    # The deliverable already exists on disk from our setup
+    calls = 0
     def transport(payload, stream, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "w_auth", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({"path": "src/auth.py", "content": "def authenticate(): return True\n"}),
+                },
+            }]}, "finish_reason": "tool_calls"}], "usage": {"total_tokens": 10}}
         return {"choices": [{"message": {"role": "assistant", "content": json.dumps({
-            "status": "completed", "summary": "Setup done", "report_markdown": "auth.py ready.",
-            "blockers": [], "modified_files": [], "release_target": None,
+            "status": "completed", "summary": "Implemented auth service", "report_markdown": "Auth service done.",
+            "blockers": [], "modified_files": ["src/auth.py"], "release_target": "v1.1.0",
             "retrieval_queries": [], "uncertainty": [], "commands": [],
         })}, "finish_reason": "stop"}], "usage": {"total_tokens": 10}}
 
@@ -511,4 +514,42 @@ def test_contract_scope_permits_path_with_py_extension():
     assert module_matches(mod, "src.backend")
     assert module_matches(mod, "src/*")
     assert module_matches(mod, "src/**")
+
+
+def test_contract_exact_allow_dotfile_overrides_deny(tmp_path):
+    import pytest
+    from validators.harness.contract_gate import verify_post_execution, ContractAccessDenied
+    from validators.knowledge.contract import AgentContract
+
+    contract_data = {
+        "agent_id": "codex",
+        "work_order": "WO-094",
+        "identity": {"role": "backend", "reports_to": "claude"},
+        "scope": {
+            "allow": [{"module": ".env.example"}],
+            "deny": [{"module": ".env"}, {"module": ".git/**"}],
+            "write": "read-write",
+        },
+        "budget": {"max_files_touched": 5, "max_tokens": 30000},
+    }
+    contract = AgentContract(contract_data)
+
+    class DummyTask:
+        work_order_id = "WO-094"
+
+    class DummyDecision:
+        modified_files = []
+
+    # 1. Modifying .env.example must succeed because of exact allow rule
+    verify_post_execution(
+        tmp_path, "codex", DummyTask(), DummyDecision(), observed_files=[".env.example"], contract=contract
+    )
+
+    # 2. Modifying .env must be denied because .env is in deny rules and NOT in allow rules
+    with pytest.raises(ContractAccessDenied) as exc_info:
+        verify_post_execution(
+            tmp_path, "codex", DummyTask(), DummyDecision(), observed_files=[".env"], contract=contract
+        )
+    assert "explicitly denied by rule: .env" in str(exc_info.value)
+
 

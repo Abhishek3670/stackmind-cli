@@ -50,6 +50,39 @@ class _ReviewMixin:
 
     _PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_][\w./\\-]*\.[A-Za-z0-9]{1,6}")
 
+    _PASS_INDICATORS = (
+        "✅", "✔", "pass", "passed", "exit 0", "exit code 0", "0 errors",
+        "status: ok", "no issues", "confirmed", "verified complete",
+    )
+    _FAIL_INDICATORS = (
+        "❌", "fail", "failed", "failure", "error", "defect", "broken",
+        "needs_changes", "violation", "rework", "re-open", "reopen", "assertionerror",
+    )
+
+    @classmethod
+    def _path_has_defect(cls, text: str, ref: str) -> bool:
+        """Return True if text contains an active failure/defect finding for ref."""
+        ref_clean = ref.replace("\\", "/").lower()
+        ref_name = Path(ref_clean).name.lower()
+        matching_lines = [
+            ln.strip() for ln in text.splitlines()
+            if ref_clean in ln.replace("\\", "/").lower() or ref_name in ln.lower()
+        ]
+        if not matching_lines:
+            return False
+        for ln in matching_lines:
+            l_lower = ln.lower()
+            has_fail = any(f in l_lower for f in cls._FAIL_INDICATORS)
+            has_pass = any(p in l_lower for p in cls._PASS_INDICATORS)
+            if has_fail:
+                return True
+            if has_pass and not has_fail:
+                continue
+        has_any_pass = any(any(p in ln.lower() for p in cls._PASS_INDICATORS) for ln in matching_lines)
+        if has_any_pass:
+            return False
+        return True
+
     def _route_qa_defect_to_developers(
         self, state: RunState, ws: Path, qa_wo_id: str, op: dict[str, Any],
         err_msg: str, blocker_text: str,
@@ -92,10 +125,13 @@ class _ReviewMixin:
                 if not ref or ref in seen:
                     continue
                 seen.add(ref)
+                if not self._path_has_defect(evidence_text, ref):
+                    continue
                 owner = self._reworkable_wo_for_path(state, ws, qa_wo_id, ref)
                 if owner is not None:
                     snippet = next(
-                        (ln.strip() for ln in evidence_text.splitlines() if ref in ln and ln.strip()),
+                        (ln.strip() for ln in evidence_text.splitlines()
+                         if ref in ln and ln.strip() and self._path_has_defect(ln, ref)),
                         f"QA reported a failing check against '{ref}'",
                     )
                     targets.setdefault(owner, snippet)
@@ -133,7 +169,15 @@ class _ReviewMixin:
             if rework_count > 1:
                 # If worker already attempted rework once and QA is still failing,
                 # escalate to the Lead Architect for direct resolution fix!
-                self.escalate_wo_to_recovery(state, target_id, reason=f"QA defect unresolved after worker rework: {finding}")
+                self.escalate_wo_to_recovery(
+                    state,
+                    target_id,
+                    reason=f"QA defect unresolved after worker rework: {finding}",
+                    details={
+                        "qa_findings": [finding],
+                        "qa_report": feedback,
+                    },
+                )
                 self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
                 return AdvanceResult.TRANSITIONED
             # Rework phase grants a fresh retry budget for fixing defects
@@ -238,7 +282,12 @@ class _ReviewMixin:
                     if not isinstance(json_data, dict):
                         continue
                     v_val = str(json_data.get("verdict", "")).upper()
-                    if v_val not in ("FAIL", "NEEDS_CHANGES", "FAILED", "REJECTED"):
+                    criteria_fails = [
+                        c for c in json_data.get("criteria", [])
+                        if isinstance(c, dict) and str(c.get("outcome", "")).upper() in ("FAIL", "FAILED", "NEEDS_CHANGES")
+                    ]
+                    # Treat as defect if verdict indicates failure OR if any acceptance criterion failed (catches contradictory PASS verdicts)
+                    if v_val not in ("FAIL", "NEEDS_CHANGES", "FAILED", "REJECTED") and not criteria_fails:
                         continue
                     text_parts = []
                     if json_data.get("required_action"):
@@ -248,11 +297,15 @@ class _ReviewMixin:
                             det = finding.get("detail") or ""
                             rep = finding.get("reproduce") or ""
                             text_parts.append(f"{det}\n{rep}".strip())
-                    for crit in json_data.get("criteria", []):
-                        if isinstance(crit, dict):
-                            c_out = str(crit.get("outcome", "")).upper()
-                            if c_out in ("FAIL", "FAILED"):
-                                text_parts.append(f"{crit.get('description', '')}: {crit.get('evidence', '')}")
+                        elif isinstance(finding, str) and finding.strip():
+                            text_parts.append(finding.strip())
+                    for crit in criteria_fails:
+                        desc = crit.get('description') or crit.get('id') or 'Acceptance criterion'
+                        ev = crit.get('evidence') or 'failed'
+                        text_parts.append(f"{desc}: {ev}")
+                    if not text_parts:
+                        wo_field = json_data.get("work_order_id") or json_data.get("work_order") or "work order"
+                        text_parts.append(f"QA review for {wo_field} rejected with outcome FAIL/NEEDS_CHANGES")
                     text = "\n".join(text_parts) or f.read_text(encoding="utf-8")
                 else:
                     if not any(k in name.lower() for k in ("verdict", "review")):
@@ -274,16 +327,23 @@ class _ReviewMixin:
                         if not ref or ref in seen_refs:
                             continue
                         seen_refs.add(ref)
+                        if not self._path_has_defect(text, ref):
+                            continue
                         owner = self._reworkable_wo_for_path(state, ws, qa_wo_id, ref)
                         if owner is not None and owner not in deliverable_targets:
                             deliverable_targets.append(owner)
 
-                # 2. Target named in filename (e.g. WO-001-qa-verdict.md)
+                # 2. Target named in structured JSON, filename (e.g. WO-001-qa-verdict.md), or text
                 named_target = None
-                for target in self._WO_ID_RE.findall(name):
-                    if target != qa_wo_id and target != "WO-000":
-                        named_target = target
-                        break
+                if is_json and isinstance(json_data, dict):
+                    raw_wo_field = json_data.get("work_order_id") or json_data.get("work_order")
+                    if raw_wo_field and self._WO_ID_RE.match(str(raw_wo_field).strip()):
+                        named_target = str(raw_wo_field).strip()
+                if not named_target:
+                    for target in self._WO_ID_RE.findall(name):
+                        if target != qa_wo_id and target != "WO-000":
+                            named_target = target
+                            break
                 # 3. Target named in text body (e.g. file named WO-004-qa-verdict.md
                 # but text discusses WO-001)
                 if not named_target:
@@ -570,7 +630,7 @@ class _ReviewMixin:
             gate_decision = gate.evaluate(state=state, integration_op=op, extra_telemetry=extra_telemetry)
             state.integration_evidence = gate_decision.to_dict()
 
-            llm_blocked = (status == "BLOCKED" or result_status == "blocked")
+            llm_blocked = (status in ("BLOCKED", "FAILED") or result_status in ("blocked", "failed", "rejected"))
             deterministic_blocked = not gate_decision.passed
 
             if llm_blocked or deterministic_blocked:
@@ -601,6 +661,9 @@ class _ReviewMixin:
                     for raw in op_result.get("blockers") or []:
                         if str(raw) not in blockers:
                             blockers.append(str(raw))
+                    for f in op_result.get("findings") or []:
+                        if str(f).strip() and str(f).strip() not in blockers:
+                            blockers.append(str(f).strip())
                     if not blockers and op_result.get("reason"):
                         blockers = [op_result["reason"]]
 
@@ -652,6 +715,7 @@ class _ReviewMixin:
                             "changelog" in b_lower
                             or "readme" in b_lower
                             or "wo-000" in b_lower
+                            or "version" in b_lower
                             or "worker_timeout" in b_lower
                             or "timeout (retry" in b_lower
                             or "packaging" in b_lower
@@ -683,7 +747,7 @@ class _ReviewMixin:
                         self._ensure_release_documentation(ws, state)
                         blockers = [b for b in blockers if not _is_governance_or_packaging_blocker(b)]
                         detail_paths = [p for p in detail_paths if not any(
-                            doc in p.lower() for doc in ("changelog", "readme", "wo-000")
+                            doc in p.lower() for doc in ("changelog", "readme", "wo-000", "version")
                         )]
 
                 if not blockers:
@@ -699,9 +763,33 @@ class _ReviewMixin:
                     else _strip_code_fences(str(op_result.get("summary", "Blockers reported during integration review")))
                 )
 
-                reworkable = self._reworkable_integration_wos(
+                blocker_text = " ".join(str(b) for b in (blockers + detail_paths)).lower()
+                is_plan_deviation = any(
+                    kw in blocker_text
+                    for kw in (
+                        "plan deviation", "plan adherence", "unimplemented",
+                        "missing work order", "no work order", "not authored",
+                        "plan mismatch", "scope gap", "missing requirement"
+                    )
+                )
+
+                reworkable = [] if is_plan_deviation else self._reworkable_integration_wos(
                     state, ws, blockers + detail_paths
                 )
+                if not reworkable:
+                    dev_id = f"PLAN_DEV_INT_{state.integration_rework_rounds}"
+                    rec_attempts = state.recovery_attempts.get(dev_id, 0)
+                    if rec_attempts < state.max_retries and state.global_turn_budget > 0:
+                        state.recovery_attempts[dev_id] = rec_attempts + 1
+                        state.recovery_wo_id = dev_id
+                        state.error = f"INTEGRATION_PLAN_DEVIATION: {err_msg}"
+                        self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                        return AdvanceResult.TRANSITIONED
+                    state.error = f"Integration review blocked: {err_msg} (no authorized work order could be linked to findings)"
+                    state.exit_code = 3
+                    self._transition(state, Phase.WAITING_FOR_HUMAN)
+                    return AdvanceResult.WAITING_FOR_HUMAN
+
                 if state.integration_rework_rounds < state.max_retries and reworkable:
                     state.integration_rework_rounds += 1
                     if state.integration_operation_id and state.integration_operation_id not in state.ignored_operation_ids:
@@ -787,9 +875,10 @@ class _ReviewMixin:
                     self._transition(state, Phase.EXECUTING)
                     return AdvanceResult.WAITING_FOR_OPERATION
 
-                state.error = f"Integration review blocked: {err_msg}"
-                self._transition(state, Phase.BLOCKED)
-                return AdvanceResult.BLOCKED
+                state.error = f"Integration review blocked: {err_msg} — rework rounds exhausted ({state.integration_rework_rounds}/{state.max_retries})"
+                state.exit_code = 3
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
 
             # Both deterministic checks and review completed cleanly
             state.integration_blockers = []
@@ -1191,8 +1280,17 @@ class _ReviewMixin:
 
     def _unarchive_work_order(self, ws: Path, wo_id: str) -> bool:
         """Return a completed or blocked work order to ACTIVE so execution can re-dispatch it."""
+        cancelled = ws / ".sync" / "work-orders" / "CANCELLED" / f"{wo_id}.yaml"
+        if cancelled.is_file():
+            return False  # Never resurrect a cancelled work order
         active = ws / ".sync" / "work-orders" / "ACTIVE" / f"{wo_id}.yaml"
         if active.is_file():
+            try:
+                data = yaml.safe_load(active.read_text(encoding="utf-8")) or {}
+                if isinstance(data, dict) and str(data.get("status", "")).upper() in ("CANCELLED", "SUPERSEDED"):
+                    return False
+            except Exception:
+                pass
             return self._mark_wo_status_on_disk(ws, wo_id, "ACTIVE", clear_error=True)
         for sub in ("COMPLETED", "BLOCKED"):
             cand = ws / ".sync" / "work-orders" / sub / f"{wo_id}.yaml"
@@ -1291,8 +1389,10 @@ class _ReviewMixin:
                     + "; ".join(report.reasons)
                 )
                 state.exit_code = 3
-            self._transition(state, Phase.BLOCKED)
-            return AdvanceResult.BLOCKED
+                self._transition(state, Phase.WAITING_FOR_HUMAN)
+                return AdvanceResult.WAITING_FOR_HUMAN
+            self._transition(state, Phase.WAITING_FOR_HUMAN)
+            return AdvanceResult.WAITING_FOR_HUMAN
 
         required = review_gate.required_wo_ids_for_run(state, ws)
         verdict = review_gate.load_final_verdict(ws, state.run_id)
@@ -1377,12 +1477,44 @@ class _ReviewMixin:
             return AdvanceResult.WAITING_FOR_HUMAN
         state.final_review_rounds += 1
 
-        reworkable = self._reworkable_integration_wos(state, ws, blockers)
+        blocker_text = " ".join(str(b) for b in blockers).lower()
+        is_plan_deviation = any(
+            kw in blocker_text
+            for kw in (
+                "plan deviation",
+                "plan adherence",
+                "plan requires",
+                "unimplemented",
+                "missing work order",
+                "no work order",
+                "not authored",
+                "plan mismatch",
+                "scope gap",
+                "missing requirement",
+            )
+        )
+
+        reworkable = [] if is_plan_deviation else self._reworkable_integration_wos(state, ws, blockers)
         reworkable = [
             w for w in reworkable
             if w not in (state.integration_wo_id, state.gitops_wo_id)
         ]
         if not reworkable:
+            # Plan deviation or unmapped findings: findings could not be mapped to existing work orders.
+            # Escalate to ARCHITECT_RECOVERY_DECISION if recovery budget remains,
+            # enabling the Architect to author new work orders or amend the plan.
+            dev_id = f"PLAN_DEV_FINAL_{state.final_review_rounds}"
+            rec_attempts = state.recovery_attempts.get(dev_id, 0)
+            if rec_attempts < state.max_retries and state.global_turn_budget > 0:
+                state.recovery_attempts[dev_id] = rec_attempts + 1
+                state.recovery_wo_id = dev_id
+                state.error = (
+                    f"FINAL_REVIEW_PLAN_DEVIATION: Findings not linked to existing work orders: "
+                    + "; ".join(blockers[:3])
+                )
+                self._transition(state, Phase.ARCHITECT_RECOVERY_DECISION)
+                return AdvanceResult.TRANSITIONED
+
             state.error += " (no authorized work order could be linked to the findings)"
             state.exit_code = 3
             self._transition(state, Phase.WAITING_FOR_HUMAN)
@@ -1599,6 +1731,7 @@ class _ReviewMixin:
             expected_milestones=expected,
             planning_wo_id=state.planning_wo_id,
             completed_wo_ids=state.completed_wo_ids,
+            superseded_wo_ids=getattr(state, "superseded_wo_ids", None),
         )
         self._persist_readiness_report(state, ws, result)
         return result
