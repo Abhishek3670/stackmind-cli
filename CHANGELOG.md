@@ -5,6 +5,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.19.0] - 2026-11-23
+
+### Added
+- **Worker Knowledge Graph Query Access**:
+  - Exposed `query_graph` tool directly to worker agents in `validators/kernel/gateway.py` and `validators/kernel/tools.py`. Workers can now explore project structure, symbol hierarchies, call chains, and routes via the in-memory compiler knowledge graph even when physical files do not exist yet on disk.
+  - Added smart filtering to prevent non-fatal file-read probe attempts from tripping consecutive tool failure circuit breakers.
+- **TUI Line Clear (`Ctrl+U`) Binding**:
+  - Added `Ctrl+U` (`VK_U`) shortcut across `RawLineEditor` and `Win32ConsoleReader` to instantly kill/clear the composer input line buffer without requiring repeated backspaces.
+- **QA Dependency Assurance**:
+  - Enforced package manifest verification (`package.json`, `requirements.txt`) and automatic dependency installation in the QA verification pipeline prior to running test suites.
+
+### Fixed
+- **Terminal SGR Mouse Tracking Escape Sequence Leakage**:
+  - In `cli/tui/keyboard.py` and `cli/tui/terminal.py`, expanded `DISABLE_MOUSE_REPORTING_SEQ` to extinguish all terminal mouse modes (`\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l`), including any-event motion tracking (`?1003`) and urxvt (`?1015`).
+  - In `cli/tui/settings_panel.py` (`_read_field_input`), added an in-flight pipe drain grace period (20ms) and switched input echoing to full-line clear-and-render (`\r\x1b[2K...`) with continuous mouse artifact purging, eliminating raw mouse escape spam (`^[[<35;...`) from leaking into model name, API key, and URL prompts.
+  - In `cli/tui/keyboard.py` (`_parse_escape_sequence`), classified unclicked mouse motion (`btn == 35`) as `<MOUSE_IGNORE>` and handled caret representations across single, double, and triple bracket formats (`[<`, `^[<`, `^[[<`, `^[[[<`).
+  - In `drain_console_input()`, added explicit flushing of `_win32_reader._pending_keys`.
+  - In `validators/kernel/settings.py` (`sanitize_model_name`), enhanced regex sanitization to strip arbitrary bracket variations and wrapped coordinate suffixes (`;yM`).
+- **Role-Deliverable Compatibility & Work Order Auto-Unblocking**:
+  - In `validators/kernel/daemon/authoring.py`, inverted role-deliverable checks in `reconcile_active_work_orders_with_plan` to enforce deliverable invariants (backend deliverables `.py`/`.sql` to `codex`, frontend `.html`/`.css` to `gemini`, test suites to `gemma`) as authoritative overrides over milestone agent tags, preventing `AuthoringGate` rejections.
+  - Added self-healing in `reconcile_active_work_orders_with_plan` to automatically clear `BLOCKED` status and `blocked_reason` on disk once role-deliverable incompatibilities are reconciled.
+  - Expanded `normalize_work_order_data` in `validators/harness/authoring_yaml.py` to auto-normalize `assigned_agents` across all deliverable file extensions.
+  - Added parser support in `authoring.py` for work order markdown tables embedded in `PLAN.md` and automatic revival of plan tasks erroneously marked cancelled.
+- **Supervisor Recovery & 429 Rate Limit Handling**:
+  - Added exponential backoff and jitter for HTTP 429 / rate limits in `OpenAICompatibleAdapter` and `validators/kernel/daemon/supervisor/recovery.py`.
+  - Isolated transient rate limits from persistent `repair_attempts` counters to prevent premature transitions to `Phase.BLOCKED`.
+  - In `validators/kernel/daemon/manager.py` (`_prepare_run_for_resume`), wrapped session plan listing in safe error handling to prevent `KeyError: 'unknown session'` crashes on mock or external sessions.
+  - Synchronized `published_wo_ids` upon discovery and forwarded detailed QA failure evidence directly to architect recovery contexts.
+- **Sandbox & Windows Compatibility Shims**:
+  - Added Windows platform shims for `grep` and `npx`, and injected non-interactive CI environment variables (`CI=true`, `npm_config_yes=true`) to eliminate prompt hangs during dependency installation and tool execution.
+  - Corrected dotfile exclusions and submodule prefix matching in contract scope rules.
+
 ## [3.18.0] - 2026-11-14
 
 ### Added

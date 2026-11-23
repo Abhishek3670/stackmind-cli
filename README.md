@@ -2,7 +2,7 @@
 
 Compiler-backed multi-agent engineering runtime — governed CLI, local JSON-RPC daemon, and deterministic knowledge compiler. One engine repo, many project instances via `.sync/`.
 
-> **Version:** `3.18.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
+> **Version:** `3.19.0` · Python `>=3.10` · License MIT · See [`STACKMIND-CLI.md`](docs/governance/STACKMIND-CLI.md), [`docs/STACKMIND_ARCHITECTURE.md`](docs/architectures/STACKMIND_ARCHITECTURE.md), [`docs/`](docs/), [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Install
 
@@ -139,6 +139,10 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 - **Test Suite Dual-Syntax Verification**: Python test suite compilation and JavaScript block-comment stripping for `.test.js` files containing Python/pytest suites.
 - **Supervisor Recovery Decision & Invariant 4 Hardening**: Clears stale blockers, prunes cancelled ghost IDs (`WO-007`..`WO-010`), and rediscovers work orders on resume.
 - **Meta-Work Order & Roadmap Classification**: Classifies architecture planning, post-release roadmaps, and audit orders as meta-work orders, eliminating false contract and role rejections for `claude`.
+- **Worker Knowledge Graph Query Access**: Directly exposes `query_graph` to worker agents, allowing exploration of symbol hierarchies, routes, and call trees before files exist physically on disk, while bypassing tripwires on probed reads.
+- **Role-Deliverable Invariants & Self-Healing Reconciliation**: Inverted authoring gate to strictly enforce agent-deliverable mapping (backend deliverables `.py`/`.sql` to `codex`, frontend `.html`/`.css` to `gemini`, tests to `gemma`), auto-clearing `BLOCKED` states on disk when reassignments resolve.
+- **SGR Mouse Mode Eradication & Clean Redraw**: Comprehensive terminal mouse mode disabling (`1000`..`1015`), input pipe drain grace periods, unclicked hover filtering (`btn == 35`), and line-erase rendering (`\r\x1b[2K...`) preventing escape sequences from polluting prompts.
+- **Supervisor 429 Rate Limit Backoff**: Exponential backoff and jitter for transient provider rate limits, isolating temporary capacity errors from permanent repair attempt exhaustion.
 
 ## Docs
 
@@ -150,6 +154,6 @@ The TUI (`cli/tui/`) is a control surface over daemon+supervisor — `:goal`, `:
 
 ## Versioning
 
-- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.18.0`
+- Package/release: `VERSION` / `pyproject.toml` / `cli/__init__.py` — currently `3.19.0`
 - Runtime protocol: `.sync/RUNTIME_VERSION` — currently `3.1.0` (separate from package version)
 - `stackmind migrate --check` / `stackmind graph versions` to inspect
